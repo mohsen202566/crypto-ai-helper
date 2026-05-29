@@ -2,16 +2,19 @@ import telebot
 import threading
 import time
 
-from config import BOT_TOKEN, ALLOWED_USERS, OWNER_ID, AUTO_SCAN_INTERVAL_MINUTES
+from config import BOT_TOKEN, OWNER_ID, AUTO_SCAN_INTERVAL_MINUTES
 from coins_fa import COINS_FA
 from analysis import analyze_symbol
 from scanner import get_best_signals, SCAN_SYMBOLS, should_send_auto_signal
+from users import (
+    is_user_allowed,
+    is_owner,
+    add_user,
+    remove_user,
+    list_users
+)
 
 bot = telebot.TeleBot(BOT_TOKEN)
-
-
-def is_allowed(user_id):
-    return user_id in ALLOWED_USERS
 
 
 def find_symbol(text):
@@ -101,11 +104,26 @@ MACD:
 مقاومت:
 {result['resistance']}
 
+خط روند:
+{result['trendline']}
+
+ساختار بازار:
+{result['market_structure']}
+
 وضعیت بریک‌اوت:
 {result['breakout']}
 
 Fear & Greed:
 {result['fear_value']} - {result['fear_text']}
+
+BTC Dominance:
+{result['btc_dominance']}٪
+
+وضعیت دامیننس:
+{result['dominance_status']}
+
+Alt Season:
+{result['altseason_status']}
 
 🎯 سطوح معامله:
 {trade_levels}
@@ -139,6 +157,7 @@ def send_best_signals(message):
 قیمت: {r['price']}
 قدرت خرید: {r['buy_power']}٪
 قدرت فروش: {r['sell_power']}٪
+آلت‌سیزن: {r['altseason_status']}
 """
 
     bot.reply_to(message, msg)
@@ -186,6 +205,12 @@ def auto_signal_loop():
 Fear & Greed:
 {result['fear_value']} - {result['fear_text']}
 
+BTC Dominance:
+{result['btc_dominance']}٪
+
+Alt Season:
+{result['altseason_status']}
+
 ⚠️ مدیریت ریسک فراموش نشود.
 """)
 
@@ -197,7 +222,7 @@ Fear & Greed:
 
 @bot.message_handler(commands=["start"])
 def start(message):
-    if not is_allowed(message.from_user.id):
+    if not is_user_allowed(message.from_user.id):
         bot.reply_to(message, "⛔ شما مجاز به استفاده از این ربات نیستید.")
         return
 
@@ -212,12 +237,60 @@ def start(message):
 تحلیل دوج
 سیگنال سولانا
 بهترین سیگنال الان
+
+دستورات ادمین:
+/adduser 123456789
+/removeuser 123456789
+/listusers
 """)
+
+
+@bot.message_handler(commands=["adduser"])
+def add_user_command(message):
+    if not is_owner(message.from_user.id):
+        bot.reply_to(message, "⛔ فقط مالک ربات می‌تواند کاربر اضافه کند.")
+        return
+
+    try:
+        user_id = int(message.text.split()[1])
+        add_user(user_id)
+        bot.reply_to(message, f"✅ کاربر {user_id} اضافه شد.")
+    except Exception:
+        bot.reply_to(message, "فرمت درست:\n/adduser 123456789")
+
+
+@bot.message_handler(commands=["removeuser"])
+def remove_user_command(message):
+    if not is_owner(message.from_user.id):
+        bot.reply_to(message, "⛔ فقط مالک ربات می‌تواند کاربر حذف کند.")
+        return
+
+    try:
+        user_id = int(message.text.split()[1])
+        ok = remove_user(user_id)
+
+        if ok:
+            bot.reply_to(message, f"✅ کاربر {user_id} حذف شد.")
+        else:
+            bot.reply_to(message, "❌ مالک اصلی قابل حذف نیست یا کاربر وجود ندارد.")
+    except Exception:
+        bot.reply_to(message, "فرمت درست:\n/removeuser 123456789")
+
+
+@bot.message_handler(commands=["listusers"])
+def list_users_command(message):
+    if not is_owner(message.from_user.id):
+        bot.reply_to(message, "⛔ فقط مالک ربات می‌تواند لیست کاربران را ببیند.")
+        return
+
+    users = list_users()
+    users_text = "\n".join([str(u) for u in users])
+    bot.reply_to(message, f"👥 کاربران مجاز:\n{users_text}")
 
 
 @bot.message_handler(func=lambda message: True)
 def handle_message(message):
-    if not is_allowed(message.from_user.id):
+    if not is_user_allowed(message.from_user.id):
         bot.reply_to(message, "⛔ شما مجاز به استفاده از این ربات نیستید.")
         return
 
@@ -239,4 +312,4 @@ def handle_message(message):
 threading.Thread(target=auto_signal_loop, daemon=True).start()
 
 print("Bot is running...")
-bot.infinity_polling()
+bot.infinity_polling
