@@ -1,6 +1,30 @@
+import json
+import os
+
 from config import OWNER_ID
 
-ALLOWED_USERS_DYNAMIC = set([OWNER_ID])
+USERS_FILE = "users.json"
+
+
+def load_users():
+    if not os.path.exists(USERS_FILE):
+        return [OWNER_ID]
+
+    try:
+        with open(USERS_FILE, "r") as f:
+            users = json.load(f)
+
+        if OWNER_ID not in users:
+            users.append(OWNER_ID)
+
+        return users
+    except Exception:
+        return [OWNER_ID]
+
+
+def save_users(users):
+    with open(USERS_FILE, "w") as f:
+        json.dump(users, f)
 
 
 def is_owner(user_id):
@@ -8,11 +32,16 @@ def is_owner(user_id):
 
 
 def is_user_allowed(user_id):
-    return user_id in ALLOWED_USERS_DYNAMIC
+    return user_id in load_users()
 
 
 def add_user(user_id):
-    ALLOWED_USERS_DYNAMIC.add(user_id)
+    users = load_users()
+
+    if user_id not in users:
+        users.append(user_id)
+        save_users(users)
+
     return True
 
 
@@ -20,12 +49,14 @@ def remove_user(user_id):
     if user_id == OWNER_ID:
         return False
 
-    if user_id in ALLOWED_USERS_DYNAMIC:
-        ALLOWED_USERS_DYNAMIC.remove(user_id)
+    users = load_users()
+
+    if user_id in users:
+        users.remove(user_id)
+        save_users(users)
         return True
 
     return False
 
 
-def list_users():
-    return list(ALLOWED_USERS_DYNAMIC)
+def
