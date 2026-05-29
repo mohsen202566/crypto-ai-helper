@@ -3,7 +3,7 @@ import telebot
 from config import BOT_TOKEN, ALLOWED_USERS
 from coins_fa import COINS_FA
 from analysis import analyze_symbol
-
+from scanner import get_best_signals
 bot = telebot.TeleBot(BOT_TOKEN)
 
 
@@ -58,7 +58,35 @@ def handle_message(message):
     if not is_allowed(message.from_user.id):
         bot.reply_to(message, "⛔ شما مجاز به استفاده از این ربات نیستید.")
         return
+text = message.text.strip()
 
+    if "بهترین سیگنال" in text or "بهترین فرصت" in text:
+        bot.reply_to(message, "⏳ در حال اسکن بازار...")
+
+        results = get_best_signals(limit=5)
+
+        if not results:
+            bot.reply_to(message, "فعلاً سیگنال مناسبی پیدا نشد.")
+            return
+
+        msg = "🏆 بهترین سیگنال‌های الان:\n\n"
+
+        medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+
+        for i, r in enumerate(results):
+            direction_fa = "لانگ" if r["direction"] == "LONG" else "شورت"
+
+            msg += f"""
+{medals[i]} {r['symbol']}
+جهت: {direction_fa}
+امتیاز: {r['score']}/100
+قیمت: {r['price']}
+قدرت خرید: {r['buy_power']}٪
+قدرت فروش: {r['sell_power']}٪
+"""
+
+        bot.reply_to(message, msg)
+        return
     symbol = find_symbol(message.text)
 
     if not symbol:
