@@ -1,17 +1,10 @@
 import time
 from analysis import analyze_symbol
 from config import AUTO_SIGNAL_SCORE, AUTO_SIGNAL_COOLDOWN_MINUTES
+from coins_fa import COINS_FA
 
 
-SCAN_SYMBOLS = [
-    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
-    "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "DOTUSDT",
-    "LTCUSDT", "BCHUSDT", "TRXUSDT", "SUIUSDT", "APTUSDT",
-    "ARBUSDT", "OPUSDT", "UNIUSDT", "AAVEUSDT", "NEARUSDT",
-    "PEPEUSDT", "SHIBUSDT", "INJUSDT", "ATOMUSDT", "TIAUSDT",
-    "FILUSDT", "ICPUSDT", "HBARUSDT", "ETCUSDT", "STXUSDT"
-]
-
+SCAN_SYMBOLS = sorted(list(set(COINS_FA.values())))
 
 last_alerts = {}
 
@@ -40,7 +33,6 @@ def should_send_auto_signal(result):
 
     key = f"{result['symbol']}_{result['direction']}"
     now = time.time()
-
     cooldown_seconds = AUTO_SIGNAL_COOLDOWN_MINUTES * 60
 
     if key in last_alerts:
