@@ -1,9 +1,12 @@
 import telebot
+import threading
+import time
 
-from config import BOT_TOKEN, ALLOWED_USERS
+from config import BOT_TOKEN, ALLOWED_USERS, OWNER_ID, AUTO_SCAN_INTERVAL_MINUTES
 from coins_fa import COINS_FA
 from analysis import analyze_symbol
-from scanner import get_best_signals
+from scanner import get_best_signals, SCAN_SYMBOLS, should_send_auto_signal
+
 bot = telebot.TeleBot(BOT_TOKEN)
 
 
@@ -34,65 +37,7 @@ def fa_direction(direction):
     return "⚪ فعلاً ورود مناسب نیست"
 
 
-@bot.message_handler(commands=["start"])
-def start(message):
-    if not is_allowed(message.from_user.id):
-        bot.reply_to(message, "⛔ شما مجاز به استفاده از این ربات نیستید.")
-        return
-
-    bot.reply_to(message, """
-سلام محسن 👋
-
-ربات دستیار فیوچرز کریپتو فعال است.
-
-مثال:
-بیتکوین
-اتریوم
-تحلیل دوج
-سیگنال سولانا
-""")
-
-
-@bot.message_handler(func=lambda message: True)
-def handle_message(message):
-    if not is_allowed(message.from_user.id):
-        bot.reply_to(message, "⛔ شما مجاز به استفاده از این ربات نیستید.")
-        return
-text = message.text.strip()
-
-    if "بهترین سیگنال" in text or "بهترین فرصت" in text:
-        bot.reply_to(message, "⏳ در حال اسکن بازار...")
-
-        results = get_best_signals(limit=5)
-
-        if not results:
-            bot.reply_to(message, "فعلاً سیگنال مناسبی پیدا نشد.")
-            return
-
-        msg = "🏆 بهترین سیگنال‌های الان:\n\n"
-
-        medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
-
-        for i, r in enumerate(results):
-            direction_fa = "لانگ" if r["direction"] == "LONG" else "شورت"
-
-            msg += f"""
-{medals[i]} {r['symbol']}
-جهت: {direction_fa}
-امتیاز: {r['score']}/100
-قیمت: {r['price']}
-قدرت خرید: {r['buy_power']}٪
-قدرت فروش: {r['sell_power']}٪
-"""
-
-        bot.reply_to(message, msg)
-        return
-    symbol = find_symbol(message.text)
-
-    if not symbol:
-        bot.reply_to(message, "ارز رو متوجه نشدم. مثلا بنویس: بیتکوین یا اتریوم")
-        return
-
+def send_analysis(message, symbol):
     bot.reply_to(message, f"⏳ در حال تحلیل {symbol} ...")
 
     try:
@@ -171,6 +116,127 @@ Fear & Greed:
 ⚠️ این تحلیل تضمین سود نیست. حتماً با حد ضرر، حجم کم و مدیریت ریسک وارد شو.
 """)
 
+
+def send_best_signals(message):
+    bot.reply_to(message, "⏳ در حال اسکن بازار...")
+
+    results = get_best_signals(limit=5)
+
+    if not results:
+        bot.reply_to(message, "فعلاً سیگنال مناسبی پیدا نشد.")
+        return
+
+    msg = "🏆 بهترین سیگنال‌های الان:\n\n"
+    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+
+    for i, r in enumerate(results):
+        direction_fa = "لانگ" if r["direction"] == "LONG" else "شورت"
+
+        msg += f"""
+{medals[i]} {r['symbol']}
+جهت: {direction_fa}
+امتیاز: {r['score']}/100
+قیمت: {r['price']}
+قدرت خرید: {r['buy_power']}٪
+قدرت فروش: {r['sell_power']}٪
+"""
+
+    bot.reply_to(message, msg)
+
+
+def auto_signal_loop():
+    while True:
+        for symbol in SCAN_SYMBOLS:
+            try:
+                result = analyze_symbol(symbol)
+
+                if should_send_auto_signal(result):
+                    direction_fa = "لانگ" if result["direction"] == "LONG" else "شورت"
+
+                    bot.send_message(OWNER_ID, f"""
+🚨 سیگنال خودکار قوی
+
+ارز:
+{result['symbol']}
+
+جهت:
+{direction_fa}
+
+امتیاز:
+{result['score']}/100
+
+قیمت:
+{result['price']}
+
+حد ضرر:
+{result['stop_loss']}
+
+حد سود 1:
+{result['tp1']}
+
+حد سود 2:
+{result['tp2']}
+
+قدرت خرید:
+{result['buy_power']}٪
+
+قدرت فروش:
+{result['sell_power']}٪
+
+Fear & Greed:
+{result['fear_value']} - {result['fear_text']}
+
+⚠️ مدیریت ریسک فراموش نشود.
+""")
+
+            except Exception:
+                continue
+
+        time.sleep(AUTO_SCAN_INTERVAL_MINUTES * 60)
+
+
+@bot.message_handler(commands=["start"])
+def start(message):
+    if not is_allowed(message.from_user.id):
+        bot.reply_to(message, "⛔ شما مجاز به استفاده از این ربات نیستید.")
+        return
+
+    bot.reply_to(message, """
+سلام محسن 👋
+
+ربات دستیار فیوچرز کریپتو فعال است.
+
+مثال:
+بیتکوین
+اتریوم
+تحلیل دوج
+سیگنال سولانا
+بهترین سیگنال الان
+""")
+
+
+@bot.message_handler(func=lambda message: True)
+def handle_message(message):
+    if not is_allowed(message.from_user.id):
+        bot.reply_to(message, "⛔ شما مجاز به استفاده از این ربات نیستید.")
+        return
+
+    text = message.text.strip()
+
+    if "بهترین سیگنال" in text or "بهترین فرصت" in text:
+        send_best_signals(message)
+        return
+
+    symbol = find_symbol(text)
+
+    if not symbol:
+        bot.reply_to(message, "ارز رو متوجه نشدم. مثلا بنویس: بیتکوین یا اتریوم")
+        return
+
+    send_analysis(message, symbol)
+
+
+threading.Thread(target=auto_signal_loop, daemon=True).start()
 
 print("Bot is running...")
 bot.infinity_polling()
