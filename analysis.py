@@ -1,4 +1,4 @@
-import requests
+import ccxt
 import pandas as pd
 import ta
 
@@ -15,36 +15,45 @@ from market_structure import (
 )
 
 
-def get_klines(symbol, interval="15m", limit=250):
-    url = "https://fapi.binance.com/fapi/v1/klines"
-
-    params = {
-        "symbol": symbol,
-        "interval": interval,
-        "limit": limit
+exchange = ccxt.okx({
+    "enableRateLimit": True,
+    "options": {
+        "defaultType": "swap"
     }
+})
 
-    response = requests.get(url, params=params, timeout=20)
-    response.raise_for_status()
 
-    data = response.json()
+def to_okx_symbol(symbol):
+    coin = symbol.replace("USDT", "")
+    return f"{coin}/USDT:USDT"
 
-    if not isinstance(data, list) or len(data) == 0:
-        raise Exception("داده‌ای از بایننس فیوچرز دریافت نشد")
 
-    df = pd.DataFrame(data, columns=[
-        "time", "open", "high", "low", "close", "volume",
-        "close_time", "quote_volume", "trades",
-        "taker_buy_base", "taker_buy_quote", "ignore"
-    ])
+def get_klines(symbol, interval="15m", limit=250):
+    okx_symbol = to_okx_symbol(symbol)
 
-    for col in ["open", "high", "low", "close", "volume", "taker_buy_base"]:
+    ohlcv = exchange.fetch_ohlcv(
+        okx_symbol,
+        timeframe=interval,
+        limit=limit
+    )
+
+    if not ohlcv or len(ohlcv) < 210:
+        raise Exception("داده کافی از OKX دریافت نشد")
+
+    df = pd.DataFrame(
+        ohlcv,
+        columns=["time", "open", "high", "low", "close", "volume"]
+    )
+
+    for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df["taker_buy_base"] = df["volume"] / 2
 
     df = df.dropna()
 
     if len(df) < 210:
-        raise Exception("داده کافی برای تحلیل دریافت نشد")
+        raise Exception("داده کافی برای تحلیل وجود ندارد")
 
     return df
 
