@@ -40,7 +40,8 @@ def send_analysis(message, symbol):
     try:
         result = analyze_symbol(symbol)
     except Exception as e:
-        bot.reply_to(message, f"❌ خطا در تحلیل {symbol}.")
+        print("ANALYSIS ERROR:", str(e))
+        bot.reply_to(message, f"❌ خطا در تحلیل {symbol}\n\nعلت خطا:\n{e}")
         return
 
     reasons_text = "\n".join([f"✅ {r}" for r in result["reasons"]])
@@ -129,7 +130,12 @@ Alt Season:
 def send_best_signals(message):
     bot.reply_to(message, "⏳ در حال اسکن بازار...")
 
-    results = get_best_signals(limit=5)
+    try:
+        results = get_best_signals(limit=5)
+    except Exception as e:
+        print("BEST SIGNAL ERROR:", str(e))
+        bot.reply_to(message, f"❌ خطا در اسکن بازار:\n{e}")
+        return
 
     if not results:
         bot.reply_to(message, "فعلاً سیگنال مناسبی پیدا نشد.")
@@ -158,15 +164,14 @@ def auto_signal_loop():
     time.sleep(60)
 
     while True:
-        try:
-            for symbol in SCAN_SYMBOLS:
-                try:
-                    result = analyze_symbol(symbol)
+        for symbol in SCAN_SYMBOLS:
+            try:
+                result = analyze_symbol(symbol)
 
-                    if should_send_auto_signal(result):
-                        direction_fa = "لانگ" if result["direction"] == "LONG" else "شورت"
+                if should_send_auto_signal(result):
+                    direction_fa = "لانگ" if result["direction"] == "LONG" else "شورت"
 
-                        bot.send_message(OWNER_ID, f"""
+                    bot.send_message(OWNER_ID, f"""
 🚨 سیگنال خودکار قوی
 
 ارز:
@@ -208,11 +213,9 @@ Alt Season:
 ⚠️ مدیریت ریسک فراموش نشود.
 """)
 
-                except Exception:
-                    continue
-
-        except Exception:
-            pass
+            except Exception as e:
+                print("AUTO SIGNAL ERROR:", symbol, str(e))
+                continue
 
         time.sleep(AUTO_SCAN_INTERVAL_MINUTES * 60)
 
