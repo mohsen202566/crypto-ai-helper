@@ -59,4 +59,5 @@ def remove_user(user_id):
     return False
 
 
-def
+def list_users():
+    return load_users()
