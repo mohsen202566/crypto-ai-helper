@@ -312,5 +312,5 @@ def handle_message(message):
 threading.Thread(target=auto_signal_loop, daemon=True).start()
 
 print("Bot is running...")
-bot.
+
 bot.infinity_polling()
