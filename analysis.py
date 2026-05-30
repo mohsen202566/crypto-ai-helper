@@ -49,7 +49,6 @@ def get_klines(symbol, interval="15m", limit=250):
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     df["taker_buy_base"] = df["volume"] / 2
-
     df = df.dropna()
 
     if len(df) < 210:
@@ -121,6 +120,34 @@ def support_resistance(df):
     support = recent["low"].min()
     resistance = recent["high"].max()
     return support, resistance
+
+
+def signal_validity(score, direction):
+    if direction == "NO TRADE":
+        return "سیگنال معتبر نیست"
+
+    if score >= 85:
+        return "4 تا 12 ساعت"
+    elif score >= 75:
+        return "2 تا 6 ساعت"
+    elif score >= 60:
+        return "30 دقیقه تا 2 ساعت"
+    else:
+        return "اعتبار پایین"
+
+
+def signal_timeframe(score, direction):
+    if direction == "NO TRADE":
+        return "بدون تایم‌فریم ورود"
+
+    if score >= 85:
+        return "15M تا 1H"
+    elif score >= 75:
+        return "15M تا 30M"
+    elif score >= 60:
+        return "5M تا 15M"
+    else:
+        return "نامعتبر"
 
 
 def score_timeframe_trends(df_4h, df_1h, df_30m, df_15m, df_5m):
@@ -362,6 +389,9 @@ def analyze_symbol(symbol):
         "price": round(price, 6),
         "direction": direction,
         "score": score,
+
+        "validity": signal_validity(score, direction),
+        "signal_timeframe": signal_timeframe(score, direction),
 
         "rsi": round(float(last["rsi"]), 2),
         "macd": round(float(last["macd"]), 6),
