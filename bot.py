@@ -6,13 +6,7 @@ from config import BOT_TOKEN, OWNER_ID, AUTO_SCAN_INTERVAL_MINUTES
 from coins_fa import COINS_FA
 from analysis import analyze_symbol
 from scanner import get_best_signals, SCAN_SYMBOLS, should_send_auto_signal
-from users import (
-    is_user_allowed,
-    is_owner,
-    add_user,
-    remove_user,
-    list_users
-)
+from users import is_user_allowed, is_owner, add_user, remove_user, list_users
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
@@ -45,8 +39,8 @@ def send_analysis(message, symbol):
 
     try:
         result = analyze_symbol(symbol)
-    except Exception:
-        bot.reply_to(message, f"❌ خطا در تحلیل {symbol}. بعداً دوباره امتحان کن.")
+    except Exception as e:
+        bot.reply_to(message, f"❌ خطا در تحلیل {symbol}.")
         return
 
     reasons_text = "\n".join([f"✅ {r}" for r in result["reasons"]])
@@ -119,9 +113,6 @@ Fear & Greed:
 BTC Dominance:
 {result['btc_dominance']}٪
 
-وضعیت دامیننس:
-{result['dominance_status']}
-
 Alt Season:
 {result['altseason_status']}
 
@@ -131,7 +122,7 @@ Alt Season:
 دلایل تحلیل:
 {reasons_text}
 
-⚠️ این تحلیل تضمین سود نیست. حتماً با حد ضرر، حجم کم و مدیریت ریسک وارد شو.
+⚠️ این تحلیل تضمین سود نیست. حتماً با حد ضرر و مدیریت ریسک وارد شو.
 """)
 
 
@@ -164,15 +155,18 @@ def send_best_signals(message):
 
 
 def auto_signal_loop():
+    time.sleep(60)
+
     while True:
-        for symbol in SCAN_SYMBOLS:
-            try:
-                result = analyze_symbol(symbol)
+        try:
+            for symbol in SCAN_SYMBOLS:
+                try:
+                    result = analyze_symbol(symbol)
 
-                if should_send_auto_signal(result):
-                    direction_fa = "لانگ" if result["direction"] == "LONG" else "شورت"
+                    if should_send_auto_signal(result):
+                        direction_fa = "لانگ" if result["direction"] == "LONG" else "شورت"
 
-                    bot.send_message(OWNER_ID, f"""
+                        bot.send_message(OWNER_ID, f"""
 🚨 سیگنال خودکار قوی
 
 ارز:
@@ -214,8 +208,11 @@ Alt Season:
 ⚠️ مدیریت ریسک فراموش نشود.
 """)
 
-            except Exception:
-                continue
+                except Exception:
+                    continue
+
+        except Exception:
+            pass
 
         time.sleep(AUTO_SCAN_INTERVAL_MINUTES * 60)
 
@@ -312,5 +309,4 @@ def handle_message(message):
 threading.Thread(target=auto_signal_loop, daemon=True).start()
 
 print("Bot is running...")
-
 bot.infinity_polling()
