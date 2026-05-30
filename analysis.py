@@ -16,11 +16,21 @@ from market_structure import (
 
 
 def get_klines(symbol, interval="15m", limit=250):
-    url = "https://api.binance.com/api/v3/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    url = "https://fapi.binance.com/fapi/v1/klines"
 
-    r = requests.get(url, params=params, timeout=15)
-    data = r.json()
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "limit": limit
+    }
+
+    response = requests.get(url, params=params, timeout=20)
+    response.raise_for_status()
+
+    data = response.json()
+
+    if not isinstance(data, list) or len(data) == 0:
+        raise Exception("داده‌ای از بایننس فیوچرز دریافت نشد")
 
     df = pd.DataFrame(data, columns=[
         "time", "open", "high", "low", "close", "volume",
@@ -29,12 +39,19 @@ def get_klines(symbol, interval="15m", limit=250):
     ])
 
     for col in ["open", "high", "low", "close", "volume", "taker_buy_base"]:
-        df[col] = df[col].astype(float)
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.dropna()
+
+    if len(df) < 210:
+        raise Exception("داده کافی برای تحلیل دریافت نشد")
 
     return df
 
 
 def add_indicators(df):
+    df = df.copy()
+
     df["ema20"] = ta.trend.ema_indicator(df["close"], window=20)
     df["ema50"] = ta.trend.ema_indicator(df["close"], window=50)
     df["ema200"] = ta.trend.ema_indicator(df["close"], window=200)
@@ -47,6 +64,11 @@ def add_indicators(df):
     df["atr"] = ta.volatility.average_true_range(
         df["high"], df["low"], df["close"], window=14
     )
+
+    df = df.dropna()
+
+    if len(df) < 30:
+        raise Exception("اندیکاتورها کامل محاسبه نشدند")
 
     return df
 
@@ -206,7 +228,7 @@ def score_market_sentiment(symbol):
     if symbol != "BTCUSDT":
         if altseason == "قوی":
             long_score += 5
-            reasons_long.append("وضعیت آلت‌سیزن برای آلت‌کوین‌ها مناسب است")
+            reasons_long.append("آلت‌سیزن برای آلت‌کوین‌ها مناسب است")
         elif altseason == "ضعیف":
             short_score += 4
             reasons_short.append("آلت‌سیزن ضعیف؛ ریسک آلت‌کوین‌ها بالاتر است")
