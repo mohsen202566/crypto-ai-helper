@@ -34,6 +34,35 @@ def fa_direction(direction):
     return "⚪ فعلاً ورود مناسب نیست"
 
 
+def fa_trendline(value):
+    data = {
+        "uptrend": "صعودی",
+        "downtrend": "نزولی",
+        "sideways": "خنثی",
+    }
+    return data.get(value, value)
+
+
+def fa_structure(value):
+    data = {
+        "bullish_structure": "ساختار صعودی",
+        "bearish_structure": "ساختار نزولی",
+        "range_structure": "رنج / بدون روند واضح",
+    }
+    return data.get(value, value)
+
+
+def fa_breakout(value):
+    data = {
+        "bullish_breakout": "بریک‌اوت صعودی",
+        "bearish_breakout": "بریک‌اوت نزولی",
+        "fake_bullish_breakout": "فیک بریک‌اوت صعودی",
+        "fake_bearish_breakout": "فیک بریک‌اوت نزولی",
+        "no_breakout": "بدون بریک‌اوت",
+    }
+    return data.get(value, value)
+
+
 def send_analysis(message, symbol):
     bot.reply_to(message, f"⏳ در حال تحلیل {symbol} ...")
 
@@ -75,6 +104,12 @@ def send_analysis(message, symbol):
 امتیاز سیگنال:
 {result['score']}/100
 
+⏰ اعتبار سیگنال:
+{result['validity']}
+
+⏱ تایم‌فریم مناسب:
+{result['signal_timeframe']}
+
 امتیاز لانگ:
 {result['long_score']}
 
@@ -100,13 +135,13 @@ MACD:
 {result['resistance']}
 
 خط روند:
-{result['trendline']}
+{fa_trendline(result['trendline'])}
 
 ساختار بازار:
-{result['market_structure']}
+{fa_structure(result['market_structure'])}
 
 وضعیت بریک‌اوت:
-{result['breakout']}
+{fa_breakout(result['breakout'])}
 
 Fear & Greed:
 {result['fear_value']} - {result['fear_text']}
@@ -151,6 +186,8 @@ def send_best_signals(message):
 {medals[i]} {r['symbol']}
 جهت: {direction_fa}
 امتیاز: {r['score']}/100
+اعتبار: {r['validity']}
+تایم‌فریم: {r['signal_timeframe']}
 قیمت: {r['price']}
 قدرت خرید: {r['buy_power']}٪
 قدرت فروش: {r['sell_power']}٪
@@ -182,6 +219,12 @@ def auto_signal_loop():
 
 امتیاز:
 {result['score']}/100
+
+اعتبار سیگنال:
+{result['validity']}
+
+تایم‌فریم مناسب:
+{result['signal_timeframe']}
 
 قیمت:
 {result['price']}
