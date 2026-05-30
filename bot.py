@@ -2,7 +2,7 @@ import telebot
 import threading
 import time
 
-from config import BOT_TOKEN, OWNER_ID, AUTO_SCAN_INTERVAL_MINUTES
+from config import BOT_TOKEN, AUTO_SCAN_INTERVAL_MINUTES
 from coins_fa import COINS_FA
 from analysis import analyze_symbol
 from scanner import get_best_signals, SCAN_SYMBOLS, should_send_auto_signal
@@ -197,18 +197,10 @@ def send_best_signals(message):
     bot.reply_to(message, msg)
 
 
-def auto_signal_loop():
-    time.sleep(60)
+def send_auto_signal_to_all_users(result):
+    direction_fa = "لانگ" if result["direction"] == "LONG" else "شورت"
 
-    while True:
-        for symbol in SCAN_SYMBOLS:
-            try:
-                result = analyze_symbol(symbol)
-
-                if should_send_auto_signal(result):
-                    direction_fa = "لانگ" if result["direction"] == "LONG" else "شورت"
-
-                    bot.send_message(OWNER_ID, f"""
+    text = f"""
 🚨 سیگنال خودکار قوی
 
 ارز:
@@ -254,7 +246,25 @@ Alt Season:
 {result['altseason_status']}
 
 ⚠️ مدیریت ریسک فراموش نشود.
-""")
+"""
+
+    for user_id in list_users():
+        try:
+            bot.send_message(user_id, text)
+        except Exception as e:
+            print("SEND AUTO SIGNAL ERROR:", user_id, str(e))
+
+
+def auto_signal_loop():
+    time.sleep(60)
+
+    while True:
+        for symbol in SCAN_SYMBOLS:
+            try:
+                result = analyze_symbol(symbol)
+
+                if should_send_auto_signal(result):
+                    send_auto_signal_to_all_users(result)
 
             except Exception as e:
                 print("AUTO SIGNAL ERROR:", symbol, str(e))
@@ -270,7 +280,7 @@ def start(message):
         return
 
     bot.reply_to(message, """
-سلام محسن 👋
+سلام 👋
 
 ربات دستیار فیوچرز کریپتو فعال است.
 
