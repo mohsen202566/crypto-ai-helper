@@ -10,42 +10,164 @@ SCAN_SYMBOLS = sorted(list(set(COINS_FA.values())))
 last_alerts = {}
 
 
+def is_opposite_divergence(result):
+    direction = result.get("direction")
+
+    if direction == "LONG":
+        return (
+            result.get("rsi_divergence") == "bearish_rsi_divergence"
+            or result.get("macd_divergence") == "bearish_macd_divergence"
+        )
+
+    if direction == "SHORT":
+        return (
+            result.get("rsi_divergence") == "bullish_rsi_divergence"
+            or result.get("macd_divergence") == "bullish_macd_divergence"
+        )
+
+    return True
+
+
+def is_fake_breakout_against_signal(result):
+    direction = result.get("direction")
+
+    if direction == "LONG":
+        return result.get("fake_breakout") == "fake_bullish_breakout"
+
+    if direction == "SHORT":
+        return result.get("fake_breakout") == "fake_bearish_breakout"
+
+    return True
+
+
+def vwap_poc_confirmed(result):
+    direction = result.get("direction")
+
+    if direction == "LONG":
+        return (
+            result.get("vwap_status") == "above_vwap"
+            and result.get("volume_profile_status") == "above_poc"
+        )
+
+    if direction == "SHORT":
+        return (
+            result.get("vwap_status") == "below_vwap"
+            and result.get("volume_profile_status") == "below_poc"
+        )
+
+    return False
+
+
+def candle_confirmed(result):
+    direction = result.get("direction")
+    candle = result.get("candle_pattern")
+    multi = result.get("multi_candle")
+
+    if direction == "LONG":
+        return (
+            candle in ["bullish_engulfing", "bullish_pinbar", "bullish_strong"]
+            or multi == "bullish"
+        )
+
+    if direction == "SHORT":
+        return (
+            candle in ["bearish_engulfing", "bearish_pinbar", "bearish_strong"]
+            or multi == "bearish"
+        )
+
+    return False
+
+
+def liquidity_confirmed(result):
+    direction = result.get("direction")
+    liquidity = result.get("liquidity_grab")
+    stop_hunt = result.get("stop_hunt")
+    fvg = result.get("fvg")
+    order_block = result.get("order_block")
+
+    if direction == "LONG":
+        return (
+            liquidity == "bullish_liquidity_grab"
+            or stop_hunt == "bullish_stop_hunt"
+            or fvg == "bullish_fvg"
+            or order_block == "bullish_order_block"
+        )
+
+    if direction == "SHORT":
+        return (
+            liquidity == "bearish_liquidity_grab"
+            or stop_hunt == "bearish_stop_hunt"
+            or fvg == "bearish_fvg"
+            or order_block == "bearish_order_block"
+        )
+
+    return False
+
+
+def mtf_alignment_count(result):
+    direction = result.get("direction")
+    trends = result.get("trends", {})
+
+    if direction == "LONG":
+        good = ["bullish", "weak_bullish"]
+    elif direction == "SHORT":
+        good = ["bearish", "weak_bearish"]
+    else:
+        return 0
+
+    count = 0
+
+    for tf in ["1D", "4H", "1H", "30M"]:
+        if trends.get(tf) in good:
+            count += 1
+
+    return count
+
+
 def is_high_quality_signal(result):
-    if result["direction"] == "NO TRADE":
+    if result.get("direction") == "NO TRADE":
         return False
 
-    if result["score"] < 75:
+    if result.get("entry_grade") not in ["A+", "A"]:
         return False
 
-    if result.get("entry_grade") in ["Reject", None]:
+    if result.get("score", 0) < 90:
         return False
 
-    if result.get("risk_level") == "بالا":
+    if result.get("win_probability", 0) < 80:
         return False
 
-    if result.get("risk_reward", 0) < 0.9:
+    if result.get("risk_reward", 0) < 1.8:
         return False
 
-    if result.get("adx", 0) < 18:
+    if result.get("risk_level") != "پایین":
         return False
 
-    if result.get("liquidity_risk") == "بالا":
+    if result.get("liquidity_risk") != "پایین":
         return False
 
-    if result.get("spread_percent") is not None:
-        if result["spread_percent"] > 0.08:
-            return False
-
-    if result.get("fake_breakout") in [
-        "fake_bullish_breakout",
-        "fake_bearish_breakout"
-    ]:
+    if result.get("adx", 0) < 25:
         return False
 
-    if result.get("trend_exhaustion") in [
-        "bullish_exhaustion",
-        "bearish_exhaustion"
-    ]:
+    if result.get("spread_percent") is not None and result.get("spread_percent") > 0.05:
+        return False
+
+    if is_opposite_divergence(result):
+        return False
+
+    if is_fake_breakout_against_signal(result):
+        return False
+
+    if not vwap_poc_confirmed(result):
+        return False
+
+    if not candle_confirmed(result):
+        return False
+
+    if not liquidity_confirmed(result):
+        return False
+
+    if mtf_alignment_count(result) < 3:
         return False
 
     return True
@@ -55,13 +177,7 @@ def is_auto_signal(result):
     if not is_high_quality_signal(result):
         return False
 
-    if result["score"] < AUTO_SIGNAL_SCORE:
-        return False
-
-    if result.get("entry_grade") not in ["A+", "A"]:
-        return False
-
-    if result.get("risk_level") != "پایین":
+    if result.get("score", 0) < AUTO_SIGNAL_SCORE:
         return False
 
     return True
@@ -83,7 +199,7 @@ def get_best_signals(limit=5):
 
     results.sort(
         key=lambda x: (
-            x.get("entry_grade") == "A+",
+            x.get("win_probability", 0),
             x.get("score", 0),
             x.get("risk_reward", 0),
             x.get("adx", 0)
