@@ -47,8 +47,6 @@ def get_klines(symbol, interval="15m", limit=320):
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     df = df.dropna()
-
-    # حذف کندل باز؛ تصمیم فقط با کندل بسته‌شده
     df = df.iloc[:-1]
 
     return df
@@ -802,17 +800,31 @@ def score_vwap_volume_profile(df_15m, df_5m):
     return long_score, short_score, reasons_long, reasons_short, vwap_status, poc_price, volume_profile_status
 
 
-def calculate_trade_levels(raw_direction, price, atr):
+def calculate_trade_levels(raw_direction, price, atr, support=None, resistance=None):
+    buffer = atr * 0.15
+
     if raw_direction == "LONG":
         stop_loss = price - (atr * 1.2)
         tp1 = price + (atr * 1.5)
         tp2 = price + (atr * 2.5)
+
+        if resistance is not None and resistance > price:
+            adjusted_tp1 = resistance - buffer
+            if adjusted_tp1 > price:
+                tp1 = min(tp1, adjusted_tp1)
+
         return stop_loss, tp1, tp2
 
     if raw_direction == "SHORT":
         stop_loss = price + (atr * 1.2)
         tp1 = price - (atr * 1.5)
         tp2 = price - (atr * 2.5)
+
+        if support is not None and support < price:
+            adjusted_tp1 = support + buffer
+            if adjusted_tp1 < price:
+                tp1 = max(tp1, adjusted_tp1)
+
         return stop_loss, tp1, tp2
 
     return None, None, None
@@ -1119,6 +1131,7 @@ def analyze_symbol(symbol):
     price = float(last["close"])
     atr = float(last["atr"])
     adx_value = float(last["adx"])
+    support, resistance = support_resistance(df_15m)
 
     spread_percent = get_spread_percent(symbol)
 
@@ -1135,7 +1148,14 @@ def analyze_symbol(symbol):
         score = max(long_score, short_score)
         reasons = ["اختلاف لانگ و شورت کافی نیست"]
 
-    stop_loss_raw, tp1_raw, tp2_raw = calculate_trade_levels(raw_direction, price, atr)
+    stop_loss_raw, tp1_raw, tp2_raw = calculate_trade_levels(
+        raw_direction,
+        price,
+        atr,
+        support,
+        resistance
+    )
+
     rr = risk_reward(raw_direction, price, stop_loss_raw, tp1_raw)
 
     entry_ok, block_reasons, liquidity_risk, fake_breakout, trend_exhaustion = entry_filter(
@@ -1179,8 +1199,6 @@ def analyze_symbol(symbol):
         tp2 = None
 
     win_prob = win_probability(score, risk_level, rr, adx_value, grade)
-
-    support, resistance = support_resistance(df_15m)
 
     return {
         "symbol": symbol,
