@@ -1,30 +1,68 @@
 import requests
 
 
+def safe_get_json(url, timeout=12):
+    headers = {
+        "accept": "application/json",
+        "user-agent": "CryptoAIHelperBot/1.0"
+    }
+
+    r = requests.get(url, headers=headers, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+
 def get_fear_greed():
     try:
         url = "https://api.alternative.me/fng/"
-        r = requests.get(url, timeout=10)
-        data = r.json()["data"][0]
+        data = safe_get_json(url)
+
+        item = data["data"][0]
 
         return {
-            "value": int(data["value"]),
-            "text": data["value_classification"]
+            "value": int(item["value"]),
+            "text": item["value_classification"]
         }
-    except Exception:
+
+    except Exception as e:
+        print("FEAR GREED ERROR:", str(e))
         return {
             "value": None,
             "text": "نامشخص"
         }
 
 
+def get_btc_dominance_from_coingecko():
+    url = "https://api.coingecko.com/api/v3/global"
+    data = safe_get_json(url)
+
+    dominance = data.get("data", {}).get("market_cap_percentage", {}).get("btc")
+
+    if dominance is None:
+        raise Exception("BTC dominance not found in CoinGecko response")
+
+    return float(dominance)
+
+
+def get_btc_dominance_from_coinstats():
+    url = "https://openapiv1.coinstats.app/coins/bitcoin"
+    data = safe_get_json(url)
+
+    dominance = data.get("marketCapDominance")
+
+    if dominance is None:
+        raise Exception("BTC dominance not found in CoinStats response")
+
+    return float(dominance)
+
+
 def get_btc_dominance():
     try:
-        url = "https://api.coingecko.com/api/v3/global"
-        r = requests.get(url, timeout=10)
-        data = r.json()["data"]
-
-        dominance = data["market_cap_percentage"]["btc"]
+        try:
+            dominance = get_btc_dominance_from_coingecko()
+        except Exception as e:
+            print("COINGECKO DOMINANCE ERROR:", str(e))
+            dominance = get_btc_dominance_from_coinstats()
 
         if dominance >= 55:
             status = "دامیننس بیتکوین بالا است"
@@ -42,7 +80,8 @@ def get_btc_dominance():
             "altseason_status": altseason
         }
 
-    except Exception:
+    except Exception as e:
+        print("BTC DOMINANCE ERROR:", str(e))
         return {
             "btc_dominance": None,
             "dominance_status": "نامشخص",
