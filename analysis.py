@@ -1,3 +1,4 @@
+import os
 import ccxt
 import pandas as pd
 import ta
@@ -18,11 +19,10 @@ def to_okx_symbol(symbol):
     return f"{coin}/USDT:USDT"
 
 
-def get_klines(symbol, interval="15m", limit=260):
-    okx_symbol = to_okx_symbol(symbol)
-    ohlcv = exchange.fetch_ohlcv(okx_symbol, timeframe=interval, limit=limit)
+def get_klines(symbol, interval="15m", limit=300):
+    ohlcv = exchange.fetch_ohlcv(to_okx_symbol(symbol), timeframe=interval, limit=limit)
 
-    if not ohlcv or len(ohlcv) < 220:
+    if not ohlcv or len(ohlcv) < 240:
         raise Exception("داده کافی از OKX دریافت نشد")
 
     df = pd.DataFrame(ohlcv, columns=["time", "open", "high", "low", "close", "volume"])
@@ -32,7 +32,7 @@ def get_klines(symbol, interval="15m", limit=260):
 
     df = df.dropna()
 
-    # حذف کندل باز برای دقت بیشتر
+    # حذف کندل باز
     df = df.iloc[:-1]
 
     return df
@@ -44,13 +44,17 @@ def add_indicators(df):
     df["ema20"] = ta.trend.ema_indicator(df["close"], window=20)
     df["ema50"] = ta.trend.ema_indicator(df["close"], window=50)
     df["ema200"] = ta.trend.ema_indicator(df["close"], window=200)
+
     df["rsi"] = ta.momentum.rsi(df["close"], window=14)
 
     macd = ta.trend.MACD(df["close"])
     df["macd"] = macd.macd()
     df["macd_signal"] = macd.macd_signal()
+    df["macd_hist"] = macd.macd_diff()
 
-    df["atr"] = ta.volatility.average_true_range(df["high"], df["low"], df["close"], window=14)
+    df["atr"] = ta.volatility.average_true_range(
+        df["high"], df["low"], df["close"], window=14
+    )
 
     adx = ta.trend.ADXIndicator(
         high=df["high"],
@@ -65,7 +69,7 @@ def add_indicators(df):
 
     df = df.dropna()
 
-    if len(df) < 50:
+    if len(df) < 80:
         raise Exception("اندیکاتورها کامل محاسبه نشدند")
 
     return df
@@ -74,7 +78,7 @@ def add_indicators(df):
 def get_funding_rate(symbol):
     try:
         data = exchange.fetch_funding_rate(to_okx_symbol(symbol))
-        rate = data.get("fundingRate", None)
+        rate = data.get("fundingRate")
         if rate is None:
             return None
         return round(float(rate) * 100, 5)
@@ -85,10 +89,25 @@ def get_funding_rate(symbol):
 def get_open_interest(symbol):
     try:
         data = exchange.fetch_open_interest(to_okx_symbol(symbol))
-        value = data.get("openInterestAmount", None) or data.get("openInterestValue", None)
+        value = data.get("openInterestAmount") or data.get("openInterestValue")
         if value is None:
             return None
         return float(value)
+    except Exception:
+        return None
+
+
+def get_spread_percent(symbol):
+    try:
+        orderbook = exchange.fetch_order_book(to_okx_symbol(symbol), limit=5)
+        bid = orderbook["bids"][0][0] if orderbook["bids"] else None
+        ask = orderbook["asks"][0][0] if orderbook["asks"] else None
+
+        if not bid or not ask:
+            return None
+
+        mid = (bid + ask) / 2
+        return round(((ask - bid) / mid) * 100, 4)
     except Exception:
         return None
 
@@ -98,10 +117,13 @@ def trend_direction(df):
 
     if last["close"] > last["ema20"] > last["ema50"] > last["ema200"]:
         return "bullish"
+
     if last["close"] < last["ema20"] < last["ema50"] < last["ema200"]:
         return "bearish"
+
     if last["close"] > last["ema200"]:
         return "weak_bullish"
+
     if last["close"] < last["ema200"]:
         return "weak_bearish"
 
@@ -125,16 +147,27 @@ def buy_sell_power(df):
 
 
 def support_resistance(df):
-    recent = df.tail(60)
-    return recent["low"].min(), recent["high"].max()
+    recent = df.tail(80)
+    support = recent["low"].min()
+    resistance = recent["high"].max()
+    return support, resistance
 
 
 def is_near_resistance(price, resistance, atr):
-    return (resistance - price) <= atr * 0.8
+    return (resistance - price) <= atr * 0.9
 
 
 def is_near_support(price, support, atr):
-    return (price - support) <= atr * 0.8
+    return (price - support) <= atr * 0.9
+
+
+def is_middle_of_range(price, support, resistance):
+    if resistance <= support:
+        return False
+
+    position = (price - support) / (resistance - support)
+
+    return 0.38 <= position <= 0.62
 
 
 def candle_pattern(df):
@@ -150,7 +183,6 @@ def candle_pattern(df):
     upper_wick = last["high"] - max(last["close"], last["open"])
     lower_wick = min(last["close"], last["open"]) - last["low"]
 
-    # Engulfing
     if last["close"] > last["open"] and prev["close"] < prev["open"]:
         if last["close"] > prev["open"] and last["open"] < prev["close"]:
             return "bullish_engulfing"
@@ -159,14 +191,12 @@ def candle_pattern(df):
         if last["close"] < prev["open"] and last["open"] > prev["close"]:
             return "bearish_engulfing"
 
-    # Pin Bar
-    if lower_wick > body * 2 and upper_wick < body:
+    if lower_wick > body * 2.2 and upper_wick < body * 1.2:
         return "bullish_pinbar"
 
-    if upper_wick > body * 2 and lower_wick < body:
+    if upper_wick > body * 2.2 and lower_wick < body * 1.2:
         return "bearish_pinbar"
 
-    # Strong candle
     if body / candle_range >= 0.6:
         if last["close"] > last["open"]:
             return "bullish_strong"
@@ -175,9 +205,28 @@ def candle_pattern(df):
     return "weak"
 
 
-def volume_confirmation(df):
+def multi_candle_confirmation(df):
+    recent = df.tail(3)
+
+    bullish = len(recent[recent["close"] > recent["open"]])
+    bearish = len(recent[recent["close"] < recent["open"]])
+
+    if bullish >= 2 and recent.iloc[-1]["close"] > recent.iloc[-2]["close"]:
+        return "bullish"
+
+    if bearish >= 2 and recent.iloc[-1]["close"] < recent.iloc[-2]["close"]:
+        return "bearish"
+
+    return "neutral"
+
+
+def volume_spike(df):
     last = df.iloc[-1]
-    return last["volume"] > last["volume_ma20"] * 1.2
+
+    if last["volume_ma20"] == 0:
+        return False
+
+    return last["volume"] > last["volume_ma20"] * 1.5
 
 
 def atr_compression(df):
@@ -187,6 +236,17 @@ def atr_compression(df):
         return False
 
     return last["atr"] < last["atr_ma50"] * 0.65
+
+
+def minimum_volatility_ok(df):
+    last = df.iloc[-1]
+
+    if last["close"] == 0:
+        return False
+
+    atr_percent = (last["atr"] / last["close"]) * 100
+
+    return atr_percent >= 0.08
 
 
 def market_is_choppy(df_15m, df_5m):
@@ -224,6 +284,29 @@ def detect_liquidity_grab(df):
     return "none"
 
 
+def detect_stop_hunt(df):
+    recent = df.tail(30)
+    last = df.iloc[-1]
+
+    prev_high = recent.iloc[:-1]["high"].max()
+    prev_low = recent.iloc[:-1]["low"].min()
+
+    candle_range = last["high"] - last["low"]
+    if candle_range == 0:
+        return "none"
+
+    upper_wick = last["high"] - max(last["open"], last["close"])
+    lower_wick = min(last["open"], last["close"]) - last["low"]
+
+    if last["high"] > prev_high and upper_wick / candle_range > 0.45:
+        return "bearish_stop_hunt"
+
+    if last["low"] < prev_low and lower_wick / candle_range > 0.45:
+        return "bullish_stop_hunt"
+
+    return "none"
+
+
 def detect_fvg(df):
     if len(df) < 5:
         return "none"
@@ -241,9 +324,9 @@ def detect_fvg(df):
 
 
 def detect_order_block(df):
-    recent = df.tail(12)
+    recent = df.tail(16)
 
-    for i in range(len(recent) - 2, 1, -1):
+    for i in range(len(recent) - 3, 2, -1):
         candle = recent.iloc[i]
         next_candle = recent.iloc[i + 1]
 
@@ -258,25 +341,79 @@ def detect_order_block(df):
     return "none"
 
 
-def signal_validity(score, direction):
-    if direction == "NO TRADE":
-        return "سیگنال معتبر نیست"
+def detect_rsi_divergence(df):
+    recent = df.tail(35)
 
-    if score >= 90:
-        return "30 دقیقه تا 3 ساعت"
-    elif score >= 80:
-        return "15 تا 90 دقیقه"
-    elif score >= 70:
-        return "10 تا 45 دقیقه"
-    else:
-        return "اعتبار پایین"
+    lows = recent.nsmallest(2, "low").sort_index()
+    highs = recent.nlargest(2, "high").sort_index()
+
+    if len(lows) == 2:
+        first = lows.iloc[0]
+        second = lows.iloc[1]
+
+        if second["low"] < first["low"] and second["rsi"] > first["rsi"]:
+            return "bullish_rsi_divergence"
+
+    if len(highs) == 2:
+        first = highs.iloc[0]
+        second = highs.iloc[1]
+
+        if second["high"] > first["high"] and second["rsi"] < first["rsi"]:
+            return "bearish_rsi_divergence"
+
+    return "none"
 
 
-def signal_timeframe(score, direction):
-    if direction == "NO TRADE":
-        return "بدون تایم‌فریم ورود"
+def detect_macd_divergence(df):
+    recent = df.tail(35)
 
-    return "5M تا 15M"
+    lows = recent.nsmallest(2, "low").sort_index()
+    highs = recent.nlargest(2, "high").sort_index()
+
+    if len(lows) == 2:
+        first = lows.iloc[0]
+        second = lows.iloc[1]
+
+        if second["low"] < first["low"] and second["macd_hist"] > first["macd_hist"]:
+            return "bullish_macd_divergence"
+
+    if len(highs) == 2:
+        first = highs.iloc[0]
+        second = highs.iloc[1]
+
+        if second["high"] > first["high"] and second["macd_hist"] < first["macd_hist"]:
+            return "bearish_macd_divergence"
+
+    return "none"
+
+
+def detect_fake_breakout(df):
+    recent = df.tail(25)
+    last = df.iloc[-1]
+
+    prev_high = recent.iloc[:-1]["high"].max()
+    prev_low = recent.iloc[:-1]["low"].min()
+
+    if last["high"] > prev_high and last["close"] < prev_high:
+        return "fake_bullish_breakout"
+
+    if last["low"] < prev_low and last["close"] > prev_low:
+        return "fake_bearish_breakout"
+
+    return "none"
+
+
+def detect_trend_exhaustion(df):
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    if last["rsi"] > 74 and last["macd_hist"] < prev["macd_hist"]:
+        return "bullish_exhaustion"
+
+    if last["rsi"] < 26 and last["macd_hist"] > prev["macd_hist"]:
+        return "bearish_exhaustion"
+
+    return "none"
 
 
 def btc_filter(symbol):
@@ -307,6 +444,27 @@ def btc_filter(symbol):
 
     except Exception:
         return "unknown", 0, 0, [], []
+
+
+def signal_validity(score, direction):
+    if direction == "NO TRADE":
+        return "سیگنال معتبر نیست"
+
+    if score >= 90:
+        return "30 دقیقه تا 3 ساعت"
+    elif score >= 80:
+        return "15 تا 90 دقیقه"
+    elif score >= 70:
+        return "10 تا 45 دقیقه"
+
+    return "اعتبار پایین"
+
+
+def signal_timeframe(score, direction):
+    if direction == "NO TRADE":
+        return "بدون تایم‌فریم ورود"
+
+    return "5M تا 15M"
 
 
 def score_macro_trend(df_1d, df_4h, df_1h, df_30m):
@@ -392,6 +550,7 @@ def score_entry(df_15m, df_5m):
         reasons_short.append("قدرت فروش بالا در تایم ورود")
 
     pattern = candle_pattern(df_5m)
+    multi = multi_candle_confirmation(df_5m)
 
     if pattern in ["bullish_engulfing", "bullish_pinbar", "bullish_strong"]:
         long_score += 10
@@ -401,15 +560,23 @@ def score_entry(df_15m, df_5m):
         short_score += 10
         reasons_short.append(f"کندل تاییدی شورت: {pattern}")
 
-    if volume_confirmation(df_5m):
-        long_score += 4
-        short_score += 4
+    if multi == "bullish":
+        long_score += 8
+        reasons_long.append("تایید چند کندلی صعودی")
+
+    if multi == "bearish":
+        short_score += 8
+        reasons_short.append("تایید چند کندلی نزولی")
+
+    if volume_spike(df_5m):
+        long_score += 6
+        short_score += 6
 
     if last_5["adx"] >= 22:
         long_score += 5
         short_score += 5
 
-    return long_score, short_score, reasons_long, reasons_short, buy_power, sell_power, pattern
+    return long_score, short_score, reasons_long, reasons_short, buy_power, sell_power, pattern, multi
 
 
 def score_smart_money(df_15m, df_5m):
@@ -419,6 +586,7 @@ def score_smart_money(df_15m, df_5m):
     reasons_short = []
 
     liquidity = detect_liquidity_grab(df_5m)
+    stop_hunt = detect_stop_hunt(df_5m)
     fvg = detect_fvg(df_5m)
     order_block = detect_order_block(df_15m)
 
@@ -429,6 +597,14 @@ def score_smart_money(df_15m, df_5m):
     if liquidity == "bearish_liquidity_grab":
         short_score += 12
         reasons_short.append("Liquidity Grab نزولی")
+
+    if stop_hunt == "bullish_stop_hunt":
+        long_score += 10
+        reasons_long.append("Stop Hunt صعودی")
+
+    if stop_hunt == "bearish_stop_hunt":
+        short_score += 10
+        reasons_short.append("Stop Hunt نزولی")
 
     if fvg == "bullish_fvg":
         long_score += 6
@@ -446,17 +622,43 @@ def score_smart_money(df_15m, df_5m):
         short_score += 7
         reasons_short.append("Order Block نزولی")
 
-    return long_score, short_score, reasons_long, reasons_short, liquidity, fvg, order_block
+    return long_score, short_score, reasons_long, reasons_short, liquidity, stop_hunt, fvg, order_block
 
 
-def score_futures_data(symbol, direction):
+def score_divergence(df_5m):
+    long_score = 0
+    short_score = 0
+    reasons_long = []
+    reasons_short = []
+
+    rsi_div = detect_rsi_divergence(df_5m)
+    macd_div = detect_macd_divergence(df_5m)
+
+    if rsi_div == "bullish_rsi_divergence":
+        long_score += 10
+        reasons_long.append("واگرایی مثبت RSI")
+
+    if rsi_div == "bearish_rsi_divergence":
+        short_score += 10
+        reasons_short.append("واگرایی منفی RSI")
+
+    if macd_div == "bullish_macd_divergence":
+        long_score += 10
+        reasons_long.append("واگرایی مثبت MACD")
+
+    if macd_div == "bearish_macd_divergence":
+        short_score += 10
+        reasons_short.append("واگرایی منفی MACD")
+
+    return long_score, short_score, reasons_long, reasons_short, rsi_div, macd_div
+
+
+def score_futures_data(symbol):
     funding_rate = get_funding_rate(symbol)
     open_interest = get_open_interest(symbol)
 
     long_score = 0
     short_score = 0
-    reasons_long = []
-    reasons_short = []
     risk_notes = []
 
     if funding_rate is not None:
@@ -467,12 +669,11 @@ def score_futures_data(symbol, direction):
             long_score += 4
             risk_notes.append("Funding منفی و نسبتاً بالا")
 
-    if open_interest is not None:
-        if open_interest > 0:
-            long_score += 2
-            short_score += 2
+    if open_interest is not None and open_interest > 0:
+        long_score += 2
+        short_score += 2
 
-    return long_score, short_score, reasons_long, reasons_short, funding_rate, open_interest, risk_notes
+    return long_score, short_score, funding_rate, open_interest, risk_notes
 
 
 def score_market_sentiment(symbol):
@@ -515,14 +716,41 @@ def calculate_trade_levels(direction, price, atr):
         tp1 = price - (atr * 1.2)
         tp2 = price - (atr * 2.2)
     else:
-        stop_loss = None
-        tp1 = None
-        tp2 = None
+        return None, None, None
 
     return stop_loss, tp1, tp2
 
 
-def calculate_risk_level(score, direction, liquidity_risk, funding_rate, adx):
+def risk_reward(direction, price, stop_loss, tp1):
+    if direction == "NO TRADE" or stop_loss is None or tp1 is None:
+        return 0
+
+    risk = abs(price - stop_loss)
+    reward = abs(tp1 - price)
+
+    if risk == 0:
+        return 0
+
+    return round(reward / risk, 2)
+
+
+def entry_grade(score, risk_level, rr, direction):
+    if direction == "NO TRADE":
+        return "Reject"
+
+    if score >= 90 and risk_level == "پایین" and rr >= 1:
+        return "A+"
+
+    if score >= 82 and risk_level in ["پایین", "متوسط"]:
+        return "A"
+
+    if score >= 75:
+        return "B"
+
+    return "Reject"
+
+
+def calculate_risk_level(score, direction, liquidity_risk, funding_rate, adx, spread_percent, rr):
     if direction == "NO TRADE":
         return "بالا"
 
@@ -530,22 +758,36 @@ def calculate_risk_level(score, direction, liquidity_risk, funding_rate, adx):
 
     if score < 75:
         risk += 2
+
     if adx < 20:
         risk += 2
+
     if liquidity_risk == "بالا":
         risk += 2
+
     if funding_rate is not None and abs(funding_rate) > 0.07:
         risk += 1
 
+    if spread_percent is not None and spread_percent > 0.08:
+        risk += 2
+
+    if rr < 0.9:
+        risk += 2
+
     if risk >= 4:
         return "بالا"
+
     if risk >= 2:
         return "متوسط"
 
     return "پایین"
 
 
-def entry_filter(direction, score, long_score, short_score, df_15m, df_5m):
+def news_filter_active():
+    return os.getenv("HIGH_IMPACT_NEWS", "0") == "1"
+
+
+def entry_filter(direction, score, long_score, short_score, df_15m, df_5m, spread_percent):
     last_5 = df_5m.iloc[-1]
     price = float(last_5["close"])
     atr = float(last_5["atr"])
@@ -554,39 +796,76 @@ def entry_filter(direction, score, long_score, short_score, df_15m, df_5m):
     reasons_block = []
     liquidity_risk = "پایین"
 
+    if news_filter_active():
+        reasons_block.append("فیلتر خبر فعال است")
+        liquidity_risk = "بالا"
+
     if market_is_choppy(df_15m, df_5m):
         reasons_block.append("بازار رنج، فشرده یا کم‌قدرت است")
         liquidity_risk = "بالا"
 
+    if not minimum_volatility_ok(df_5m):
+        reasons_block.append("نوسان برای اسکالپ کافی نیست")
+        liquidity_risk = "بالا"
+
+    if spread_percent is not None and spread_percent > 0.08:
+        reasons_block.append("اسپرد برای اسکالپ زیاد است")
+        liquidity_risk = "بالا"
+
+    if is_middle_of_range(price, support, resistance):
+        reasons_block.append("قیمت وسط رنج است")
+        liquidity_risk = "بالا"
+
+    fake = detect_fake_breakout(df_5m)
+    exhaustion = detect_trend_exhaustion(df_5m)
+
     if direction == "LONG":
-        if long_score < short_score + 15:
+        if long_score < short_score + 18:
             reasons_block.append("اختلاف امتیاز لانگ و شورت کافی نیست")
+
         if is_near_resistance(price, resistance, atr):
             reasons_block.append("قیمت نزدیک مقاومت است")
             liquidity_risk = "بالا"
+
         if last_5["rsi"] > 72:
             reasons_block.append("RSI برای لانگ بیش از حد بالاست")
+
         if last_5["adx"] < 18:
             reasons_block.append("قدرت روند برای لانگ کافی نیست")
 
+        if fake == "fake_bullish_breakout":
+            reasons_block.append("احتمال فیک بریک‌اوت صعودی")
+
+        if exhaustion == "bullish_exhaustion":
+            reasons_block.append("خستگی روند صعودی")
+
     if direction == "SHORT":
-        if short_score < long_score + 15:
+        if short_score < long_score + 18:
             reasons_block.append("اختلاف امتیاز شورت و لانگ کافی نیست")
+
         if is_near_support(price, support, atr):
             reasons_block.append("قیمت نزدیک حمایت است")
             liquidity_risk = "بالا"
+
         if last_5["rsi"] < 28:
             reasons_block.append("RSI برای شورت بیش از حد پایین است")
+
         if last_5["adx"] < 18:
             reasons_block.append("قدرت روند برای شورت کافی نیست")
 
-    if score < 70:
+        if fake == "fake_bearish_breakout":
+            reasons_block.append("احتمال فیک بریک‌اوت نزولی")
+
+        if exhaustion == "bearish_exhaustion":
+            reasons_block.append("خستگی روند نزولی")
+
+    if score < 72:
         reasons_block.append("امتیاز سیگنال برای ورود کافی نیست")
 
     if reasons_block:
-        return False, reasons_block, liquidity_risk
+        return False, reasons_block, liquidity_risk, fake, exhaustion
 
-    return True, [], liquidity_risk
+    return True, [], liquidity_risk, fake, exhaustion
 
 
 def analyze_symbol(symbol):
@@ -608,13 +887,19 @@ def analyze_symbol(symbol):
     reasons_long += rl
     reasons_short += rs
 
-    l, s, rl, rs, buy_power, sell_power, pattern = score_entry(df_15m, df_5m)
+    l, s, rl, rs, buy_power, sell_power, pattern, multi_candle = score_entry(df_15m, df_5m)
     long_score += l
     short_score += s
     reasons_long += rl
     reasons_short += rs
 
-    l, s, rl, rs, liquidity_grab, fvg, order_block = score_smart_money(df_15m, df_5m)
+    l, s, rl, rs, liquidity_grab, stop_hunt, fvg, order_block = score_smart_money(df_15m, df_5m)
+    long_score += l
+    short_score += s
+    reasons_long += rl
+    reasons_short += rs
+
+    l, s, rl, rs, rsi_divergence, macd_divergence = score_divergence(df_5m)
     long_score += l
     short_score += s
     reasons_long += rl
@@ -666,36 +951,38 @@ def analyze_symbol(symbol):
     reasons_long += rl
     reasons_short += rs
 
+    l, s, funding_rate, open_interest, risk_notes = score_futures_data(symbol)
+    long_score += l
+    short_score += s
+
     last = df_5m.iloc[-1]
     price = float(last["close"])
     atr = float(last["atr"])
 
+    spread_percent = get_spread_percent(symbol)
+
     raw_direction = "NO TRADE"
 
-    if long_score >= short_score + 15:
+    if long_score >= short_score + 18:
         raw_direction = "LONG"
         score = min(long_score, 100)
-        reasons = reasons_long
-    elif short_score >= long_score + 15:
+        reasons = reasons_long + risk_notes
+    elif short_score >= long_score + 18:
         raw_direction = "SHORT"
         score = min(short_score, 100)
-        reasons = reasons_short
+        reasons = reasons_short + risk_notes
     else:
         score = max(long_score, short_score)
         reasons = ["اختلاف لانگ و شورت کافی نیست"]
 
-    l, s, rl, rs, funding_rate, open_interest, risk_notes = score_futures_data(symbol, raw_direction)
-    long_score += l
-    short_score += s
-    reasons += risk_notes
-
-    entry_ok, block_reasons, liquidity_risk = entry_filter(
+    entry_ok, block_reasons, liquidity_risk, fake_breakout, trend_exhaustion = entry_filter(
         raw_direction,
         score,
         long_score,
         short_score,
         df_15m,
-        df_5m
+        df_5m,
+        spread_percent
     )
 
     if raw_direction == "NO TRADE" or not entry_ok:
@@ -704,15 +991,24 @@ def analyze_symbol(symbol):
     else:
         direction = raw_direction
 
+    stop_loss, tp1, tp2 = calculate_trade_levels(direction, price, atr)
+    rr = risk_reward(direction, price, stop_loss, tp1)
+
     risk_level = calculate_risk_level(
         score=score,
         direction=direction,
         liquidity_risk=liquidity_risk,
         funding_rate=funding_rate,
-        adx=float(last["adx"])
+        adx=float(last["adx"]),
+        spread_percent=spread_percent,
+        rr=rr
     )
 
-    stop_loss, tp1, tp2 = calculate_trade_levels(direction, price, atr)
+    grade = entry_grade(score, risk_level, rr, direction)
+
+    if grade == "Reject":
+        direction = "NO TRADE"
+
     support, resistance = support_resistance(df_15m)
 
     return {
@@ -721,12 +1017,16 @@ def analyze_symbol(symbol):
         "direction": direction,
         "score": min(score, 100),
 
+        "entry_grade": grade,
+        "risk_level": risk_level,
+        "risk_reward": rr,
         "validity": signal_validity(score, direction),
         "signal_timeframe": signal_timeframe(score, direction),
 
         "rsi": round(float(last["rsi"]), 2),
         "macd": round(float(last["macd"]), 6),
         "macd_signal": round(float(last["macd_signal"]), 6),
+        "macd_hist": round(float(last["macd_hist"]), 6),
         "ema20": round(float(last["ema20"]), 8),
         "ema50": round(float(last["ema50"]), 8),
         "ema200": round(float(last["ema200"]), 8),
@@ -750,13 +1050,19 @@ def analyze_symbol(symbol):
         "btc_filter": btc_status,
 
         "candle_pattern": pattern,
+        "multi_candle": multi_candle,
         "liquidity_grab": liquidity_grab,
+        "stop_hunt": stop_hunt,
         "fvg": fvg,
         "order_block": order_block,
+        "rsi_divergence": rsi_divergence,
+        "macd_divergence": macd_divergence,
+        "fake_breakout": fake_breakout,
+        "trend_exhaustion": trend_exhaustion,
 
         "funding_rate": funding_rate,
         "open_interest": open_interest,
-        "risk_level": risk_level,
+        "spread_percent": spread_percent,
         "liquidity_risk": liquidity_risk,
 
         "fear_value": market["fear_value"],
@@ -767,5 +1073,5 @@ def analyze_symbol(symbol):
 
         "long_score": long_score,
         "short_score": short_score,
-        "reasons": reasons[:14],
+        "reasons": reasons[:16],
     }
