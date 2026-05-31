@@ -35,38 +35,69 @@ def fa_direction(direction):
 
 
 def fa_trendline(value):
-    data = {
+    return {
         "uptrend": "صعودی",
         "downtrend": "نزولی",
         "sideways": "خنثی",
-    }
-    return data.get(value, value)
+    }.get(value, value)
 
 
 def fa_structure(value):
-    data = {
+    return {
         "bullish_structure": "ساختار صعودی",
         "bearish_structure": "ساختار نزولی",
         "range_structure": "رنج / بدون روند واضح",
-    }
-    return data.get(value, value)
+    }.get(value, value)
 
 
 def fa_breakout(value):
-    data = {
+    return {
         "bullish_breakout": "بریک‌اوت صعودی",
         "bearish_breakout": "بریک‌اوت نزولی",
         "fake_bullish_breakout": "فیک بریک‌اوت صعودی",
         "fake_bearish_breakout": "فیک بریک‌اوت نزولی",
         "no_breakout": "بدون بریک‌اوت",
-    }
-    return data.get(value, value)
+    }.get(value, value)
+
+
+def fa_candle(value):
+    return {
+        "bullish_engulfing": "انگالف صعودی",
+        "bearish_engulfing": "انگالف نزولی",
+        "bullish_pinbar": "پین‌بار صعودی",
+        "bearish_pinbar": "پین‌بار نزولی",
+        "bullish_strong": "کندل صعودی قوی",
+        "bearish_strong": "کندل نزولی قوی",
+        "weak": "کندل ضعیف",
+    }.get(value, value)
+
+
+def fa_smart(value):
+    return {
+        "bullish_liquidity_grab": "جمع‌آوری نقدینگی صعودی",
+        "bearish_liquidity_grab": "جمع‌آوری نقدینگی نزولی",
+        "bullish_fvg": "FVG صعودی",
+        "bearish_fvg": "FVG نزولی",
+        "bullish_order_block": "Order Block صعودی",
+        "bearish_order_block": "Order Block نزولی",
+        "none": "ندارد",
+        "ok": "تأیید شده",
+        "neutral": "خنثی",
+        "unknown": "نامشخص",
+        "bad": "نامناسب",
+    }.get(value, value)
+
+
+def safe(value, default="نامشخص"):
+    if value is None:
+        return default
+    return value
 
 
 def build_analysis_text(result):
-    reasons_text = "\n".join([f"✅ {r}" for r in result["reasons"]])
+    reasons_text = "\n".join([f"✅ {r}" for r in result.get("reasons", [])])
 
-    if result["stop_loss"] is None:
+    if result.get("stop_loss") is None:
         trade_levels = "برای این وضعیت، ورود پیشنهاد نمی‌شود."
     else:
         trade_levels = f"""
@@ -95,6 +126,12 @@ def build_analysis_text(result):
 امتیاز سیگنال:
 {result['score']}/100
 
+سطح ریسک:
+{safe(result.get('risk_level'))}
+
+ریسک لیکوییدیتی:
+{safe(result.get('liquidity_risk'))}
+
 ⏰ اعتبار سیگنال:
 {result['validity']}
 
@@ -116,8 +153,32 @@ def build_analysis_text(result):
 RSI:
 {result['rsi']}
 
+ADX قدرت روند:
+{safe(result.get('adx'))}
+
 MACD:
 {result['macd']}
+
+Funding Rate:
+{safe(result.get('funding_rate'))}٪
+
+Open Interest:
+{safe(result.get('open_interest'))}
+
+BTC Filter:
+{fa_smart(result.get('btc_filter'))}
+
+کندل تاییدی:
+{fa_candle(result.get('candle_pattern'))}
+
+Liquidity Grab:
+{fa_smart(result.get('liquidity_grab'))}
+
+FVG:
+{fa_smart(result.get('fvg'))}
+
+Order Block:
+{fa_smart(result.get('order_block'))}
 
 حمایت:
 {result['support']}
@@ -135,13 +196,13 @@ MACD:
 {fa_breakout(result['breakout'])}
 
 Fear & Greed:
-{result['fear_value']} - {result['fear_text']}
+{safe(result.get('fear_value'))} - {safe(result.get('fear_text'))}
 
 BTC Dominance:
-{result['btc_dominance']}٪
+{safe(result.get('btc_dominance'))}٪
 
 Alt Season:
-{result['altseason_status']}
+{safe(result.get('altseason_status'))}
 
 🎯 سطوح معامله:
 {trade_levels}
@@ -190,9 +251,12 @@ def send_best_signals(message):
 {medals[i]} {r['symbol']}
 جهت: {direction_fa}
 امتیاز: {r['score']}/100
+ریسک: {safe(r.get('risk_level'))}
 اعتبار: {r['validity']}
 تایم‌فریم: {r['signal_timeframe']}
 قیمت: {r['price']}
+ADX: {safe(r.get('adx'))}
+Funding: {safe(r.get('funding_rate'))}٪
 قدرت خرید: {r['buy_power']}٪
 قدرت فروش: {r['sell_power']}٪
 """
@@ -214,6 +278,9 @@ def send_auto_signal_to_all_users(result):
 
 امتیاز:
 {result['score']}/100
+
+ریسک:
+{safe(result.get('risk_level'))}
 
 اعتبار سیگنال:
 {result['validity']}
@@ -238,6 +305,21 @@ def send_auto_signal_to_all_users(result):
 
 قدرت فروش:
 {result['sell_power']}٪
+
+ADX:
+{safe(result.get('adx'))}
+
+Funding:
+{safe(result.get('funding_rate'))}٪
+
+Liquidity:
+{fa_smart(result.get('liquidity_grab'))}
+
+FVG:
+{fa_smart(result.get('fvg'))}
+
+Order Block:
+{fa_smart(result.get('order_block'))}
 
 ⚠️ مدیریت ریسک فراموش نشود.
 """
