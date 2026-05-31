@@ -19,20 +19,36 @@ def to_okx_symbol(symbol):
     return f"{coin}/USDT:USDT"
 
 
-def get_klines(symbol, interval="15m", limit=300):
+def cap_score(value):
+    return max(0, min(int(value), 100))
+
+
+def safe_round(value, digits=8):
+    if value is None:
+        return None
+    try:
+        return round(float(value), digits)
+    except Exception:
+        return None
+
+
+def get_klines(symbol, interval="15m", limit=320):
     ohlcv = exchange.fetch_ohlcv(to_okx_symbol(symbol), timeframe=interval, limit=limit)
 
-    if not ohlcv or len(ohlcv) < 240:
-        raise Exception("داده کافی از OKX دریافت نشد")
+    if not ohlcv or len(ohlcv) < 220:
+        raise Exception(f"داده کافی برای {symbol} در تایم {interval} دریافت نشد")
 
-    df = pd.DataFrame(ohlcv, columns=["time", "open", "high", "low", "close", "volume"])
+    df = pd.DataFrame(
+        ohlcv,
+        columns=["time", "open", "high", "low", "close", "volume"]
+    )
 
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     df = df.dropna()
 
-    # حذف کندل باز
+    # حذف کندل باز؛ تصمیم فقط با کندل بسته‌شده
     df = df.iloc[:-1]
 
     return df
@@ -67,6 +83,9 @@ def add_indicators(df):
     df["volume_ma20"] = df["volume"].rolling(20).mean()
     df["atr_ma50"] = df["atr"].rolling(50).mean()
 
+    typical_price = (df["high"] + df["low"] + df["close"]) / 3
+    df["vwap"] = (typical_price * df["volume"]).cumsum() / df["volume"].cumsum()
+
     df = df.dropna()
 
     if len(df) < 80:
@@ -100,14 +119,19 @@ def get_open_interest(symbol):
 def get_spread_percent(symbol):
     try:
         orderbook = exchange.fetch_order_book(to_okx_symbol(symbol), limit=5)
-        bid = orderbook["bids"][0][0] if orderbook["bids"] else None
-        ask = orderbook["asks"][0][0] if orderbook["asks"] else None
+
+        if not orderbook.get("bids") or not orderbook.get("asks"):
+            return None
+
+        bid = orderbook["bids"][0][0]
+        ask = orderbook["asks"][0][0]
 
         if not bid or not ask:
             return None
 
         mid = (bid + ask) / 2
         return round(((ask - bid) / mid) * 100, 4)
+
     except Exception:
         return None
 
@@ -148,9 +172,7 @@ def buy_sell_power(df):
 
 def support_resistance(df):
     recent = df.tail(80)
-    support = recent["low"].min()
-    resistance = recent["high"].max()
-    return support, resistance
+    return recent["low"].min(), recent["high"].max()
 
 
 def is_near_resistance(price, resistance, atr):
@@ -165,9 +187,8 @@ def is_middle_of_range(price, support, resistance):
     if resistance <= support:
         return False
 
-    position = (price - support) / (resistance - support)
-
-    return 0.38 <= position <= 0.62
+    pos = (price - support) / (resistance - support)
+    return 0.38 <= pos <= 0.62
 
 
 def candle_pattern(df):
@@ -245,7 +266,6 @@ def minimum_volatility_ok(df):
         return False
 
     atr_percent = (last["atr"] / last["close"]) * 100
-
     return atr_percent >= 0.08
 
 
@@ -292,6 +312,7 @@ def detect_stop_hunt(df):
     prev_low = recent.iloc[:-1]["low"].min()
 
     candle_range = last["high"] - last["low"]
+
     if candle_range == 0:
         return "none"
 
@@ -416,6 +437,46 @@ def detect_trend_exhaustion(df):
     return "none"
 
 
+def calculate_vwap_status(df):
+    last = df.iloc[-1]
+
+    if last["close"] > last["vwap"]:
+        return "above_vwap"
+
+    if last["close"] < last["vwap"]:
+        return "below_vwap"
+
+    return "near_vwap"
+
+
+def calculate_volume_profile(df):
+    recent = df.tail(120).copy()
+
+    try:
+        recent["price_bin"] = pd.cut(recent["close"], bins=24)
+        grouped = recent.groupby("price_bin", observed=False)["volume"].sum()
+
+        if grouped.empty:
+            return None, "unknown"
+
+        poc_bin = grouped.idxmax()
+        poc_price = (poc_bin.left + poc_bin.right) / 2
+
+        last_price = float(recent.iloc[-1]["close"])
+
+        if last_price > poc_price:
+            status = "above_poc"
+        elif last_price < poc_price:
+            status = "below_poc"
+        else:
+            status = "near_poc"
+
+        return float(poc_price), status
+
+    except Exception:
+        return None, "unknown"
+
+
 def btc_filter(symbol):
     if symbol == "BTCUSDT":
         return "neutral", 0, 0, [], []
@@ -436,9 +497,12 @@ def btc_filter(symbol):
             long_score += 8
             reasons_long.append("BTC در تایم ورود صعودی است")
 
-        if btc_15_trend in ["bearish", "weak_bearish"] and btc_5_trend in ["bearish", "weak_bearish"]:
+        elif btc_15_trend in ["bearish", "weak_bearish"] and btc_5_trend in ["bearish", "weak_bearish"]:
             short_score += 8
             reasons_short.append("BTC در تایم ورود نزولی است")
+        else:
+            reasons_long.append("BTC جهت واضحی ندارد")
+            reasons_short.append("BTC جهت واضحی ندارد")
 
         return "ok", long_score, short_score, reasons_long, reasons_short
 
@@ -452,9 +516,11 @@ def signal_validity(score, direction):
 
     if score >= 90:
         return "30 دقیقه تا 3 ساعت"
-    elif score >= 80:
+
+    if score >= 80:
         return "15 تا 90 دقیقه"
-    elif score >= 70:
+
+    if score >= 70:
         return "10 تا 45 دقیقه"
 
     return "اعتبار پایین"
@@ -550,7 +616,7 @@ def score_entry(df_15m, df_5m):
         reasons_short.append("قدرت فروش بالا در تایم ورود")
 
     pattern = candle_pattern(df_5m)
-    multi = multi_candle_confirmation(df_5m)
+    multi_candle = multi_candle_confirmation(df_5m)
 
     if pattern in ["bullish_engulfing", "bullish_pinbar", "bullish_strong"]:
         long_score += 10
@@ -560,23 +626,25 @@ def score_entry(df_15m, df_5m):
         short_score += 10
         reasons_short.append(f"کندل تاییدی شورت: {pattern}")
 
-    if multi == "bullish":
+    if multi_candle == "bullish":
         long_score += 8
         reasons_long.append("تایید چند کندلی صعودی")
 
-    if multi == "bearish":
+    if multi_candle == "bearish":
         short_score += 8
         reasons_short.append("تایید چند کندلی نزولی")
 
     if volume_spike(df_5m):
         long_score += 6
         short_score += 6
+        reasons_long.append("افزایش حجم واقعی")
+        reasons_short.append("افزایش حجم واقعی")
 
     if last_5["adx"] >= 22:
         long_score += 5
         short_score += 5
 
-    return long_score, short_score, reasons_long, reasons_short, buy_power, sell_power, pattern, multi
+    return long_score, short_score, reasons_long, reasons_short, buy_power, sell_power, pattern, multi_candle
 
 
 def score_smart_money(df_15m, df_5m):
@@ -585,16 +653,16 @@ def score_smart_money(df_15m, df_5m):
     reasons_long = []
     reasons_short = []
 
-    liquidity = detect_liquidity_grab(df_5m)
+    liquidity_grab = detect_liquidity_grab(df_5m)
     stop_hunt = detect_stop_hunt(df_5m)
     fvg = detect_fvg(df_5m)
     order_block = detect_order_block(df_15m)
 
-    if liquidity == "bullish_liquidity_grab":
+    if liquidity_grab == "bullish_liquidity_grab":
         long_score += 12
         reasons_long.append("Liquidity Grab صعودی")
 
-    if liquidity == "bearish_liquidity_grab":
+    if liquidity_grab == "bearish_liquidity_grab":
         short_score += 12
         reasons_short.append("Liquidity Grab نزولی")
 
@@ -622,7 +690,7 @@ def score_smart_money(df_15m, df_5m):
         short_score += 7
         reasons_short.append("Order Block نزولی")
 
-    return long_score, short_score, reasons_long, reasons_short, liquidity, stop_hunt, fvg, order_block
+    return long_score, short_score, reasons_long, reasons_short, liquidity_grab, stop_hunt, fvg, order_block
 
 
 def score_divergence(df_5m):
@@ -631,26 +699,26 @@ def score_divergence(df_5m):
     reasons_long = []
     reasons_short = []
 
-    rsi_div = detect_rsi_divergence(df_5m)
-    macd_div = detect_macd_divergence(df_5m)
+    rsi_divergence = detect_rsi_divergence(df_5m)
+    macd_divergence = detect_macd_divergence(df_5m)
 
-    if rsi_div == "bullish_rsi_divergence":
+    if rsi_divergence == "bullish_rsi_divergence":
         long_score += 10
         reasons_long.append("واگرایی مثبت RSI")
 
-    if rsi_div == "bearish_rsi_divergence":
+    if rsi_divergence == "bearish_rsi_divergence":
         short_score += 10
         reasons_short.append("واگرایی منفی RSI")
 
-    if macd_div == "bullish_macd_divergence":
+    if macd_divergence == "bullish_macd_divergence":
         long_score += 10
         reasons_long.append("واگرایی مثبت MACD")
 
-    if macd_div == "bearish_macd_divergence":
+    if macd_divergence == "bearish_macd_divergence":
         short_score += 10
         reasons_short.append("واگرایی منفی MACD")
 
-    return long_score, short_score, reasons_long, reasons_short, rsi_div, macd_div
+    return long_score, short_score, reasons_long, reasons_short, rsi_divergence, macd_divergence
 
 
 def score_futures_data(symbol):
@@ -684,8 +752,8 @@ def score_market_sentiment(symbol):
     reasons_long = []
     reasons_short = []
 
-    fear_value = market["fear_value"]
-    altseason = market["altseason_status"]
+    fear_value = market.get("fear_value")
+    altseason = market.get("altseason_status")
 
     if fear_value is not None:
         if fear_value <= 25:
@@ -706,52 +774,65 @@ def score_market_sentiment(symbol):
     return long_score, short_score, reasons_long, reasons_short, market
 
 
-def calculate_trade_levels(direction, price, atr):
-    if direction == "LONG":
+def score_vwap_volume_profile(df_15m, df_5m):
+    long_score = 0
+    short_score = 0
+    reasons_long = []
+    reasons_short = []
+
+    vwap_status = calculate_vwap_status(df_5m)
+    poc_price, volume_profile_status = calculate_volume_profile(df_15m)
+
+    if vwap_status == "above_vwap":
+        long_score += 6
+        reasons_long.append("قیمت بالای VWAP است")
+
+    if vwap_status == "below_vwap":
+        short_score += 6
+        reasons_short.append("قیمت پایین VWAP است")
+
+    if volume_profile_status == "above_poc":
+        long_score += 5
+        reasons_long.append("قیمت بالای POC حجمی است")
+
+    if volume_profile_status == "below_poc":
+        short_score += 5
+        reasons_short.append("قیمت پایین POC حجمی است")
+
+    return long_score, short_score, reasons_long, reasons_short, vwap_status, poc_price, volume_profile_status
+
+
+def calculate_trade_levels(raw_direction, price, atr):
+    if raw_direction == "LONG":
         stop_loss = price - (atr * 1.2)
-        tp1 = price + (atr * 1.2)
-        tp2 = price + (atr * 2.2)
-    elif direction == "SHORT":
+        tp1 = price + (atr * 1.5)
+        tp2 = price + (atr * 2.5)
+        return stop_loss, tp1, tp2
+
+    if raw_direction == "SHORT":
         stop_loss = price + (atr * 1.2)
-        tp1 = price - (atr * 1.2)
-        tp2 = price - (atr * 2.2)
-    else:
-        return None, None, None
+        tp1 = price - (atr * 1.5)
+        tp2 = price - (atr * 2.5)
+        return stop_loss, tp1, tp2
 
-    return stop_loss, tp1, tp2
+    return None, None, None
 
 
-def risk_reward(direction, price, stop_loss, tp1):
-    if direction == "NO TRADE" or stop_loss is None or tp1 is None:
+def risk_reward(raw_direction, price, stop_loss, tp1):
+    if raw_direction == "NO TRADE" or stop_loss is None or tp1 is None:
         return 0
 
     risk = abs(price - stop_loss)
     reward = abs(tp1 - price)
 
-    if risk == 0:
+    if risk <= 0:
         return 0
 
     return round(reward / risk, 2)
 
 
-def entry_grade(score, risk_level, rr, direction):
-    if direction == "NO TRADE":
-        return "Reject"
-
-    if score >= 90 and risk_level == "پایین" and rr >= 1:
-        return "A+"
-
-    if score >= 82 and risk_level in ["پایین", "متوسط"]:
-        return "A"
-
-    if score >= 75:
-        return "B"
-
-    return "Reject"
-
-
-def calculate_risk_level(score, direction, liquidity_risk, funding_rate, adx, spread_percent, rr):
-    if direction == "NO TRADE":
+def calculate_risk_level(raw_direction, score, liquidity_risk, funding_rate, adx, spread_percent, rr):
+    if raw_direction == "NO TRADE":
         return "بالا"
 
     risk = 0
@@ -771,7 +852,7 @@ def calculate_risk_level(score, direction, liquidity_risk, funding_rate, adx, sp
     if spread_percent is not None and spread_percent > 0.08:
         risk += 2
 
-    if rr < 0.9:
+    if rr < 1:
         risk += 2
 
     if risk >= 4:
@@ -783,11 +864,61 @@ def calculate_risk_level(score, direction, liquidity_risk, funding_rate, adx, sp
     return "پایین"
 
 
+def entry_grade(score, risk_level, rr, final_direction):
+    if final_direction == "NO TRADE":
+        return "Reject"
+
+    if score >= 90 and risk_level == "پایین" and rr >= 1:
+        return "A+"
+
+    if score >= 82 and risk_level in ["پایین", "متوسط"] and rr >= 1:
+        return "A"
+
+    if score >= 75 and rr >= 1:
+        return "B"
+
+    return "Reject"
+
+
+def win_probability(score, risk_level, rr, adx, entry_grade_value):
+    probability = 45
+
+    probability += int(score * 0.25)
+
+    if risk_level == "پایین":
+        probability += 10
+    elif risk_level == "متوسط":
+        probability += 4
+    else:
+        probability -= 8
+
+    if rr >= 1.5:
+        probability += 6
+    elif rr >= 1:
+        probability += 3
+    else:
+        probability -= 8
+
+    if adx >= 25:
+        probability += 5
+    elif adx < 18:
+        probability -= 5
+
+    if entry_grade_value == "A+":
+        probability += 5
+    elif entry_grade_value == "A":
+        probability += 3
+    elif entry_grade_value == "Reject":
+        probability -= 15
+
+    return max(0, min(probability, 95))
+
+
 def news_filter_active():
     return os.getenv("HIGH_IMPACT_NEWS", "0") == "1"
 
 
-def entry_filter(direction, score, long_score, short_score, df_15m, df_5m, spread_percent):
+def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, spread_percent):
     last_5 = df_5m.iloc[-1]
     price = float(last_5["close"])
     atr = float(last_5["atr"])
@@ -795,6 +926,10 @@ def entry_filter(direction, score, long_score, short_score, df_15m, df_5m, sprea
 
     reasons_block = []
     liquidity_risk = "پایین"
+
+    if raw_direction == "NO TRADE":
+        reasons_block.append("اختلاف لانگ و شورت کافی نیست")
+        return False, reasons_block, "بالا", "none", "none"
 
     if news_filter_active():
         reasons_block.append("فیلتر خبر فعال است")
@@ -816,10 +951,10 @@ def entry_filter(direction, score, long_score, short_score, df_15m, df_5m, sprea
         reasons_block.append("قیمت وسط رنج است")
         liquidity_risk = "بالا"
 
-    fake = detect_fake_breakout(df_5m)
-    exhaustion = detect_trend_exhaustion(df_5m)
+    fake_breakout = detect_fake_breakout(df_5m)
+    trend_exhaustion = detect_trend_exhaustion(df_5m)
 
-    if direction == "LONG":
+    if raw_direction == "LONG":
         if long_score < short_score + 18:
             reasons_block.append("اختلاف امتیاز لانگ و شورت کافی نیست")
 
@@ -833,13 +968,13 @@ def entry_filter(direction, score, long_score, short_score, df_15m, df_5m, sprea
         if last_5["adx"] < 18:
             reasons_block.append("قدرت روند برای لانگ کافی نیست")
 
-        if fake == "fake_bullish_breakout":
+        if fake_breakout == "fake_bullish_breakout":
             reasons_block.append("احتمال فیک بریک‌اوت صعودی")
 
-        if exhaustion == "bullish_exhaustion":
+        if trend_exhaustion == "bullish_exhaustion":
             reasons_block.append("خستگی روند صعودی")
 
-    if direction == "SHORT":
+    if raw_direction == "SHORT":
         if short_score < long_score + 18:
             reasons_block.append("اختلاف امتیاز شورت و لانگ کافی نیست")
 
@@ -853,19 +988,31 @@ def entry_filter(direction, score, long_score, short_score, df_15m, df_5m, sprea
         if last_5["adx"] < 18:
             reasons_block.append("قدرت روند برای شورت کافی نیست")
 
-        if fake == "fake_bearish_breakout":
+        if fake_breakout == "fake_bearish_breakout":
             reasons_block.append("احتمال فیک بریک‌اوت نزولی")
 
-        if exhaustion == "bearish_exhaustion":
+        if trend_exhaustion == "bearish_exhaustion":
             reasons_block.append("خستگی روند نزولی")
 
     if score < 72:
         reasons_block.append("امتیاز سیگنال برای ورود کافی نیست")
 
     if reasons_block:
-        return False, reasons_block, liquidity_risk, fake, exhaustion
+        return False, reasons_block, liquidity_risk, fake_breakout, trend_exhaustion
 
-    return True, [], liquidity_risk, fake, exhaustion
+    return True, [], liquidity_risk, fake_breakout, trend_exhaustion
+
+
+def apply_conflict_penalties(long_score, short_score, trendline, structure, reasons_long, reasons_short):
+    if trendline == "uptrend" and structure == "bearish_structure":
+        long_score -= 10
+        reasons_long.append("جریمه: خط روند صعودی ولی ساختار بازار نزولی است")
+
+    if trendline == "downtrend" and structure == "bullish_structure":
+        short_score -= 10
+        reasons_short.append("جریمه: خط روند نزولی ولی ساختار بازار صعودی است")
+
+    return long_score, short_score
 
 
 def analyze_symbol(symbol):
@@ -900,6 +1047,12 @@ def analyze_symbol(symbol):
     reasons_short += rs
 
     l, s, rl, rs, rsi_divergence, macd_divergence = score_divergence(df_5m)
+    long_score += l
+    short_score += s
+    reasons_long += rl
+    reasons_short += rs
+
+    l, s, rl, rs, vwap_status, poc_price, volume_profile_status = score_vwap_volume_profile(df_15m, df_5m)
     long_score += l
     short_score += s
     reasons_long += rl
@@ -945,6 +1098,10 @@ def analyze_symbol(symbol):
     elif structure == "bearish_structure":
         reasons_short.append("ساختار بازار 15M نزولی است")
 
+    long_score, short_score = apply_conflict_penalties(
+        long_score, short_score, trendline, structure, reasons_long, reasons_short
+    )
+
     l, s, rl, rs, market = score_market_sentiment(symbol)
     long_score += l
     short_score += s
@@ -955,25 +1112,31 @@ def analyze_symbol(symbol):
     long_score += l
     short_score += s
 
+    long_score = cap_score(long_score)
+    short_score = cap_score(short_score)
+
     last = df_5m.iloc[-1]
     price = float(last["close"])
     atr = float(last["atr"])
+    adx_value = float(last["adx"])
 
     spread_percent = get_spread_percent(symbol)
 
-    raw_direction = "NO TRADE"
-
     if long_score >= short_score + 18:
         raw_direction = "LONG"
-        score = min(long_score, 100)
+        score = long_score
         reasons = reasons_long + risk_notes
     elif short_score >= long_score + 18:
         raw_direction = "SHORT"
-        score = min(short_score, 100)
+        score = short_score
         reasons = reasons_short + risk_notes
     else:
+        raw_direction = "NO TRADE"
         score = max(long_score, short_score)
         reasons = ["اختلاف لانگ و شورت کافی نیست"]
+
+    stop_loss_raw, tp1_raw, tp2_raw = calculate_trade_levels(raw_direction, price, atr)
+    rr = risk_reward(raw_direction, price, stop_loss_raw, tp1_raw)
 
     entry_ok, block_reasons, liquidity_risk, fake_breakout, trend_exhaustion = entry_filter(
         raw_direction,
@@ -985,60 +1148,76 @@ def analyze_symbol(symbol):
         spread_percent
     )
 
-    if raw_direction == "NO TRADE" or not entry_ok:
-        direction = "NO TRADE"
-        reasons = reasons + block_reasons
-    else:
-        direction = raw_direction
-
-    stop_loss, tp1, tp2 = calculate_trade_levels(direction, price, atr)
-    rr = risk_reward(direction, price, stop_loss, tp1)
-
     risk_level = calculate_risk_level(
+        raw_direction=raw_direction,
         score=score,
-        direction=direction,
         liquidity_risk=liquidity_risk,
         funding_rate=funding_rate,
-        adx=float(last["adx"]),
+        adx=adx_value,
         spread_percent=spread_percent,
         rr=rr
     )
 
-    grade = entry_grade(score, risk_level, rr, direction)
+    if raw_direction == "NO TRADE" or not entry_ok:
+        final_direction = "NO TRADE"
+        reasons = reasons + block_reasons
+        stop_loss = None
+        tp1 = None
+        tp2 = None
+    else:
+        final_direction = raw_direction
+        stop_loss = stop_loss_raw
+        tp1 = tp1_raw
+        tp2 = tp2_raw
+
+    grade = entry_grade(score, risk_level, rr, final_direction)
 
     if grade == "Reject":
-        direction = "NO TRADE"
+        final_direction = "NO TRADE"
+        stop_loss = None
+        tp1 = None
+        tp2 = None
+
+    win_prob = win_probability(score, risk_level, rr, adx_value, grade)
 
     support, resistance = support_resistance(df_15m)
 
     return {
         "symbol": symbol,
-        "price": round(price, 8),
-        "direction": direction,
-        "score": min(score, 100),
+        "price": safe_round(price, 8),
+        "direction": final_direction,
+        "raw_direction": raw_direction,
+        "score": cap_score(score),
 
         "entry_grade": grade,
         "risk_level": risk_level,
         "risk_reward": rr,
-        "validity": signal_validity(score, direction),
-        "signal_timeframe": signal_timeframe(score, direction),
+        "win_probability": win_prob,
 
-        "rsi": round(float(last["rsi"]), 2),
-        "macd": round(float(last["macd"]), 6),
-        "macd_signal": round(float(last["macd_signal"]), 6),
-        "macd_hist": round(float(last["macd_hist"]), 6),
-        "ema20": round(float(last["ema20"]), 8),
-        "ema50": round(float(last["ema50"]), 8),
-        "ema200": round(float(last["ema200"]), 8),
-        "atr": round(atr, 8),
-        "adx": round(float(last["adx"]), 2),
+        "validity": signal_validity(score, final_direction),
+        "signal_timeframe": signal_timeframe(score, final_direction),
 
-        "stop_loss": None if stop_loss is None else round(stop_loss, 8),
-        "tp1": None if tp1 is None else round(tp1, 8),
-        "tp2": None if tp2 is None else round(tp2, 8),
+        "rsi": safe_round(last["rsi"], 2),
+        "macd": safe_round(last["macd"], 6),
+        "macd_signal": safe_round(last["macd_signal"], 6),
+        "macd_hist": safe_round(last["macd_hist"], 6),
+        "ema20": safe_round(last["ema20"], 8),
+        "ema50": safe_round(last["ema50"], 8),
+        "ema200": safe_round(last["ema200"], 8),
+        "atr": safe_round(atr, 8),
+        "adx": safe_round(adx_value, 2),
+        "vwap": safe_round(last["vwap"], 8),
 
-        "support": round(float(support), 8),
-        "resistance": round(float(resistance), 8),
+        "stop_loss": None if stop_loss is None else safe_round(stop_loss, 8),
+        "tp1": None if tp1 is None else safe_round(tp1, 8),
+        "tp2": None if tp2 is None else safe_round(tp2, 8),
+
+        "candidate_stop_loss": None if stop_loss_raw is None else safe_round(stop_loss_raw, 8),
+        "candidate_tp1": None if tp1_raw is None else safe_round(tp1_raw, 8),
+        "candidate_tp2": None if tp2_raw is None else safe_round(tp2_raw, 8),
+
+        "support": safe_round(support, 8),
+        "resistance": safe_round(resistance, 8),
 
         "buy_power": buy_power,
         "sell_power": sell_power,
@@ -1060,18 +1239,22 @@ def analyze_symbol(symbol):
         "fake_breakout": fake_breakout,
         "trend_exhaustion": trend_exhaustion,
 
+        "vwap_status": vwap_status,
+        "poc_price": safe_round(poc_price, 8),
+        "volume_profile_status": volume_profile_status,
+
         "funding_rate": funding_rate,
         "open_interest": open_interest,
         "spread_percent": spread_percent,
         "liquidity_risk": liquidity_risk,
 
-        "fear_value": market["fear_value"],
-        "fear_text": market["fear_text"],
-        "btc_dominance": market["btc_dominance"],
-        "dominance_status": market["dominance_status"],
-        "altseason_status": market["altseason_status"],
+        "fear_value": market.get("fear_value"),
+        "fear_text": market.get("fear_text"),
+        "btc_dominance": market.get("btc_dominance"),
+        "dominance_status": market.get("dominance_status"),
+        "altseason_status": market.get("altseason_status"),
 
         "long_score": long_score,
         "short_score": short_score,
-        "reasons": reasons[:16],
+        "reasons": reasons[:18],
     }
