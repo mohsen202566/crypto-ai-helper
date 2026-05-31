@@ -63,16 +63,7 @@ def fa_breakout(value):
     return data.get(value, value)
 
 
-def send_analysis(message, symbol):
-    bot.reply_to(message, f"⏳ در حال تحلیل {symbol} ...")
-
-    try:
-        result = analyze_symbol(symbol)
-    except Exception as e:
-        print("ANALYSIS ERROR:", str(e))
-        bot.reply_to(message, f"❌ خطا در تحلیل {symbol}\n\nعلت خطا:\n{e}")
-        return
-
+def build_analysis_text(result):
     reasons_text = "\n".join([f"✅ {r}" for r in result["reasons"]])
 
     if result["stop_loss"] is None:
@@ -92,7 +83,7 @@ def send_analysis(message, symbol):
 {result['tp2']}
 """
 
-    bot.reply_to(message, f"""
+    return f"""
 📊 تحلیل فیوچرز {result['symbol']}
 
 قیمت فعلی:
@@ -159,7 +150,20 @@ Alt Season:
 {reasons_text}
 
 ⚠️ این تحلیل تضمین سود نیست. حتماً با حد ضرر و مدیریت ریسک وارد شو.
-""")
+"""
+
+
+def send_analysis(message, symbol):
+    bot.reply_to(message, f"⏳ در حال تحلیل {symbol} ...")
+
+    try:
+        result = analyze_symbol(symbol)
+    except Exception as e:
+        print("ANALYSIS ERROR:", str(e))
+        bot.reply_to(message, f"❌ خطا در تحلیل {symbol}\n\nعلت خطا:\n{e}")
+        return
+
+    bot.reply_to(message, build_analysis_text(result))
 
 
 def send_best_signals(message):
@@ -191,7 +195,6 @@ def send_best_signals(message):
 قیمت: {r['price']}
 قدرت خرید: {r['buy_power']}٪
 قدرت فروش: {r['sell_power']}٪
-آلت‌سیزن: {r['altseason_status']}
 """
 
     bot.reply_to(message, msg)
@@ -235,15 +238,6 @@ def send_auto_signal_to_all_users(result):
 
 قدرت فروش:
 {result['sell_power']}٪
-
-Fear & Greed:
-{result['fear_value']} - {result['fear_text']}
-
-BTC Dominance:
-{result['btc_dominance']}٪
-
-Alt Season:
-{result['altseason_status']}
 
 ⚠️ مدیریت ریسک فراموش نشود.
 """
