@@ -3,23 +3,13 @@ import pandas as pd
 import ta
 
 from market_sentiment import get_market_sentiment
-from trend_analysis import (
-    detect_trendline,
-    detect_breakout,
-    trendline_score,
-    breakout_score
-)
-from market_structure import (
-    detect_market_structure,
-    structure_score
-)
+from trend_analysis import detect_trendline, detect_breakout, trendline_score, breakout_score
+from market_structure import detect_market_structure, structure_score
 
 
 exchange = ccxt.okx({
     "enableRateLimit": True,
-    "options": {
-        "defaultType": "swap"
-    }
+    "options": {"defaultType": "swap"}
 })
 
 
@@ -28,16 +18,12 @@ def to_okx_symbol(symbol):
     return f"{coin}/USDT:USDT"
 
 
-def get_klines(symbol, interval="15m", limit=250):
+def get_klines(symbol, interval="15m", limit=260):
     okx_symbol = to_okx_symbol(symbol)
 
-    ohlcv = exchange.fetch_ohlcv(
-        okx_symbol,
-        timeframe=interval,
-        limit=limit
-    )
+    ohlcv = exchange.fetch_ohlcv(okx_symbol, timeframe=interval, limit=limit)
 
-    if not ohlcv or len(ohlcv) < 210:
+    if not ohlcv or len(ohlcv) < 220:
         raise Exception("داده کافی از OKX دریافت نشد")
 
     df = pd.DataFrame(
@@ -50,8 +36,8 @@ def get_klines(symbol, interval="15m", limit=250):
 
     df = df.dropna()
 
-    if len(df) < 210:
-        raise Exception("داده کافی برای تحلیل وجود ندارد")
+    # کندل آخر ممکن است هنوز بسته نشده باشد؛ برای دقت بیشتر حذف می‌شود
+    df = df.iloc[:-1]
 
     return df
 
@@ -72,11 +58,20 @@ def add_indicators(df):
         df["high"], df["low"], df["close"], window=14
     )
 
+    adx = ta.trend.ADXIndicator(
+        high=df["high"],
+        low=df["low"],
+        close=df["close"],
+        window=14
+    )
+    df["adx"] = adx.adx()
+
     df["volume_ma20"] = df["volume"].rolling(20).mean()
+    df["atr_ma50"] = df["atr"].rolling(50).mean()
 
     df = df.dropna()
 
-    if len(df) < 30:
+    if len(df) < 50:
         raise Exception("اندیکاتورها کامل محاسبه نشدند")
 
     return df
@@ -110,23 +105,12 @@ def buy_sell_power(df):
     if total == 0:
         return 50, 50
 
-    buy_power = round((green_volume / total) * 100, 1)
-    sell_power = round((red_volume / total) * 100, 1)
-
-    return buy_power, sell_power
+    return round((green_volume / total) * 100, 1), round((red_volume / total) * 100, 1)
 
 
 def support_resistance(df):
     recent = df.tail(60)
-    support = recent["low"].min()
-    resistance = recent["high"].max()
-    return support, resistance
-
-
-def distance_percent(price, level):
-    if price == 0:
-        return 0
-    return abs((price - level) / price) * 100
+    return recent["low"].min(), recent["high"].max()
 
 
 def is_near_resistance(price, resistance, atr):
@@ -150,19 +134,23 @@ def candle_strength(df):
     if ratio >= 0.6:
         if last["close"] > last["open"]:
             return "bullish_strong"
-        else:
-            return "bearish_strong"
+        return "bearish_strong"
 
     return "weak"
 
 
 def volume_confirmation(df):
     last = df.iloc[-1]
+    return last["volume"] > last["volume_ma20"] * 1.2
 
-    if last["volume"] > last["volume_ma20"] * 1.2:
-        return True
 
-    return False
+def atr_compression(df):
+    last = df.iloc[-1]
+
+    if last["atr_ma50"] == 0:
+        return False
+
+    return last["atr"] < last["atr_ma50"] * 0.65
 
 
 def market_is_choppy(df_15m, df_5m):
@@ -173,6 +161,12 @@ def market_is_choppy(df_15m, df_5m):
     ema_gap_5 = abs(last_5["ema20"] - last_5["ema50"]) / last_5["close"] * 100
 
     if ema_gap_15 < 0.08 and ema_gap_5 < 0.08:
+        return True
+
+    if last_15["adx"] < 18 and last_5["adx"] < 18:
+        return True
+
+    if atr_compression(df_15m) and atr_compression(df_5m):
         return True
 
     return False
@@ -196,14 +190,41 @@ def signal_timeframe(score, direction):
     if direction == "NO TRADE":
         return "بدون تایم‌فریم ورود"
 
-    if score >= 85:
-        return "5M تا 15M"
-    elif score >= 75:
-        return "5M تا 15M"
-    elif score >= 65:
-        return "5M"
-    else:
-        return "نامعتبر"
+    return "5M تا 15M"
+
+
+def btc_filter(symbol):
+    if symbol == "BTCUSDT":
+        return "neutral", 0, 0, [], []
+
+    try:
+        btc_15m = add_indicators(get_klines("BTCUSDT", "15m"))
+        btc_5m = add_indicators(get_klines("BTCUSDT", "5m"))
+
+        btc_15_trend = trend_direction(btc_15m)
+        btc_5_trend = trend_direction(btc_5m)
+
+        long_score = 0
+        short_score = 0
+        reasons_long = []
+        reasons_short = []
+
+        if btc_15_trend in ["bullish", "weak_bullish"] and btc_5_trend in ["bullish", "weak_bullish"]:
+            long_score += 8
+            reasons_long.append("BTC در تایم ورود صعودی است")
+
+        if btc_15_trend in ["bearish", "weak_bearish"] and btc_5_trend in ["bearish", "weak_bearish"]:
+            short_score += 8
+            reasons_short.append("BTC در تایم ورود نزولی است")
+
+        if btc_15m.iloc[-1]["adx"] < 16:
+            reasons_long.append("BTC قدرت روند کمی دارد")
+            reasons_short.append("BTC قدرت روند کمی دارد")
+
+        return "ok", long_score, short_score, reasons_long, reasons_short
+
+    except Exception:
+        return "unknown", 0, 0, [], []
 
 
 def score_macro_trend(df_1d, df_4h, df_1h, df_30m):
@@ -220,9 +241,9 @@ def score_macro_trend(df_1d, df_4h, df_1h, df_30m):
     }
 
     weights = {
-        "1D": 10,
-        "4H": 14,
-        "1H": 16,
+        "1D": 8,
+        "4H": 12,
+        "1H": 14,
         "30M": 14,
     }
 
@@ -292,15 +313,19 @@ def score_entry(df_15m, df_5m):
 
     if strength == "bullish_strong":
         long_score += 8
-        reasons_long.append("کندل 5M صعودی قوی")
+        reasons_long.append("کندل بسته‌شده 5M صعودی قوی")
 
     if strength == "bearish_strong":
         short_score += 8
-        reasons_short.append("کندل 5M نزولی قوی")
+        reasons_short.append("کندل بسته‌شده 5M نزولی قوی")
 
     if volume_confirmation(df_5m):
         long_score += 4
         short_score += 4
+
+    if last_5["adx"] >= 22:
+        long_score += 5
+        short_score += 5
 
     return long_score, short_score, reasons_long, reasons_short, buy_power, sell_power
 
@@ -361,29 +386,29 @@ def entry_filter(direction, score, long_score, short_score, df_15m, df_5m):
     reasons_block = []
 
     if market_is_choppy(df_15m, df_5m):
-        reasons_block.append("بازار رنج و کم‌جهت است")
+        reasons_block.append("بازار رنج، فشرده یا کم‌قدرت است")
 
     if direction == "LONG":
-        if long_score < short_score + 12:
+        if long_score < short_score + 15:
             reasons_block.append("اختلاف امتیاز لانگ و شورت کافی نیست")
-
         if is_near_resistance(price, resistance, atr):
             reasons_block.append("قیمت نزدیک مقاومت است")
-
         if last_5["rsi"] > 72:
             reasons_block.append("RSI برای لانگ بیش از حد بالاست")
+        if last_5["adx"] < 18:
+            reasons_block.append("قدرت روند برای لانگ کافی نیست")
 
     if direction == "SHORT":
-        if short_score < long_score + 12:
+        if short_score < long_score + 15:
             reasons_block.append("اختلاف امتیاز شورت و لانگ کافی نیست")
-
         if is_near_support(price, support, atr):
             reasons_block.append("قیمت نزدیک حمایت است")
-
         if last_5["rsi"] < 28:
             reasons_block.append("RSI برای شورت بیش از حد پایین است")
+        if last_5["adx"] < 18:
+            reasons_block.append("قدرت روند برای شورت کافی نیست")
 
-    if score < 65:
+    if score < 70:
         reasons_block.append("امتیاز سیگنال برای ورود کافی نیست")
 
     if reasons_block:
@@ -412,6 +437,12 @@ def analyze_symbol(symbol):
     reasons_short += rs
 
     l, s, rl, rs, buy_power, sell_power = score_entry(df_15m, df_5m)
+    long_score += l
+    short_score += s
+    reasons_long += rl
+    reasons_short += rs
+
+    btc_status, l, s, rl, rs = btc_filter(symbol)
     long_score += l
     short_score += s
     reasons_long += rl
@@ -463,11 +494,11 @@ def analyze_symbol(symbol):
 
     raw_direction = "NO TRADE"
 
-    if long_score >= short_score + 12:
+    if long_score >= short_score + 15:
         raw_direction = "LONG"
         score = min(long_score, 100)
         reasons = reasons_long
-    elif short_score >= long_score + 12:
+    elif short_score >= long_score + 15:
         raw_direction = "SHORT"
         score = min(short_score, 100)
         reasons = reasons_short
@@ -509,6 +540,7 @@ def analyze_symbol(symbol):
         "ema50": round(float(last["ema50"]), 8),
         "ema200": round(float(last["ema200"]), 8),
         "atr": round(atr, 8),
+        "adx": round(float(last["adx"]), 2),
 
         "stop_loss": None if stop_loss is None else round(stop_loss, 8),
         "tp1": None if tp1 is None else round(tp1, 8),
@@ -524,6 +556,7 @@ def analyze_symbol(symbol):
         "breakout": breakout,
         "market_structure": structure,
         "trends": trends,
+        "btc_filter": btc_status,
 
         "fear_value": market["fear_value"],
         "fear_text": market["fear_text"],
@@ -533,5 +566,5 @@ def analyze_symbol(symbol):
 
         "long_score": long_score,
         "short_score": short_score,
-        "reasons": reasons[:10],
+        "reasons": reasons[:12],
     }
