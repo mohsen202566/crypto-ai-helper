@@ -40,24 +40,6 @@ def is_fake_breakout_against_signal(result):
     return True
 
 
-def vwap_poc_confirmed(result):
-    direction = result.get("direction")
-
-    if direction == "LONG":
-        return (
-            result.get("vwap_status") == "above_vwap"
-            and result.get("volume_profile_status") == "above_poc"
-        )
-
-    if direction == "SHORT":
-        return (
-            result.get("vwap_status") == "below_vwap"
-            and result.get("volume_profile_status") == "below_poc"
-        )
-
-    return False
-
-
 def candle_confirmed(result):
     direction = result.get("direction")
     candle = result.get("candle_pattern")
@@ -73,32 +55,6 @@ def candle_confirmed(result):
         return (
             candle in ["bearish_engulfing", "bearish_pinbar", "bearish_strong"]
             or multi == "bearish"
-        )
-
-    return False
-
-
-def liquidity_confirmed(result):
-    direction = result.get("direction")
-    liquidity = result.get("liquidity_grab")
-    stop_hunt = result.get("stop_hunt")
-    fvg = result.get("fvg")
-    order_block = result.get("order_block")
-
-    if direction == "LONG":
-        return (
-            liquidity == "bullish_liquidity_grab"
-            or stop_hunt == "bullish_stop_hunt"
-            or fvg == "bullish_fvg"
-            or order_block == "bullish_order_block"
-        )
-
-    if direction == "SHORT":
-        return (
-            liquidity == "bearish_liquidity_grab"
-            or stop_hunt == "bearish_stop_hunt"
-            or fvg == "bearish_fvg"
-            or order_block == "bearish_order_block"
         )
 
     return False
@@ -124,33 +80,70 @@ def mtf_alignment_count(result):
     return count
 
 
+def soft_confirmation_bonus(result):
+    bonus = 0
+
+    direction = result.get("direction")
+
+    if direction == "LONG":
+        if result.get("vwap_status") == "above_vwap":
+            bonus += 1
+        if result.get("volume_profile_status") == "above_poc":
+            bonus += 1
+        if result.get("liquidity_grab") == "bullish_liquidity_grab":
+            bonus += 1
+        if result.get("stop_hunt") == "bullish_stop_hunt":
+            bonus += 1
+        if result.get("fvg") == "bullish_fvg":
+            bonus += 1
+        if result.get("order_block") == "bullish_order_block":
+            bonus += 1
+
+    if direction == "SHORT":
+        if result.get("vwap_status") == "below_vwap":
+            bonus += 1
+        if result.get("volume_profile_status") == "below_poc":
+            bonus += 1
+        if result.get("liquidity_grab") == "bearish_liquidity_grab":
+            bonus += 1
+        if result.get("stop_hunt") == "bearish_stop_hunt":
+            bonus += 1
+        if result.get("fvg") == "bearish_fvg":
+            bonus += 1
+        if result.get("order_block") == "bearish_order_block":
+            bonus += 1
+
+    return bonus
+
+
 def is_high_quality_signal(result):
     if result.get("direction") == "NO TRADE":
         return False
 
-    if result.get("entry_grade") not in ["A+", "A"]:
+    if result.get("entry_grade") not in ["A+", "A", "B"]:
         return False
 
-    if result.get("score", 0) < 90:
+    if result.get("score", 0) < 82:
         return False
 
-    if result.get("win_probability", 0) < 80:
+    if result.get("win_probability", 0) < 68:
         return False
 
-    if result.get("risk_reward", 0) < 1.8:
+    if result.get("risk_reward", 0) < 1.2:
         return False
 
-    if result.get("risk_level") != "پایین":
+    if result.get("risk_level") == "بالا":
         return False
 
-    if result.get("liquidity_risk") != "پایین":
+    if result.get("liquidity_risk") == "بالا":
         return False
 
-    if result.get("adx", 0) < 25:
+    if result.get("adx", 0) < 20:
         return False
 
-    if result.get("spread_percent") is not None and result.get("spread_percent") > 0.05:
-        return False
+    if result.get("spread_percent") is not None:
+        if result.get("spread_percent") > 0.08:
+            return False
 
     if is_opposite_divergence(result):
         return False
@@ -158,16 +151,14 @@ def is_high_quality_signal(result):
     if is_fake_breakout_against_signal(result):
         return False
 
-    if not vwap_poc_confirmed(result):
-        return False
-
     if not candle_confirmed(result):
         return False
 
-    if not liquidity_confirmed(result):
+    if mtf_alignment_count(result) < 2:
         return False
 
-    if mtf_alignment_count(result) < 3:
+    # حداقل یکی از تاییدهای نرم مثل VWAP، POC، Liquidity، FVG یا Order Block
+    if soft_confirmation_bonus(result) < 1:
         return False
 
     return True
@@ -177,7 +168,13 @@ def is_auto_signal(result):
     if not is_high_quality_signal(result):
         return False
 
-    if result.get("score", 0) < AUTO_SIGNAL_SCORE:
+    if result.get("score", 0) < max(85, AUTO_SIGNAL_SCORE):
+        return False
+
+    if result.get("win_probability", 0) < 70:
+        return False
+
+    if result.get("risk_reward", 0) < 1.3:
         return False
 
     return True
@@ -202,6 +199,7 @@ def get_best_signals(limit=5):
             x.get("win_probability", 0),
             x.get("score", 0),
             x.get("risk_reward", 0),
+            soft_confirmation_bonus(x),
             x.get("adx", 0)
         ),
         reverse=True
