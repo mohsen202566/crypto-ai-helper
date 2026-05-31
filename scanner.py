@@ -82,7 +82,6 @@ def mtf_alignment_count(result):
 
 def soft_confirmation_bonus(result):
     bonus = 0
-
     direction = result.get("direction")
 
     if direction == "LONG":
@@ -157,7 +156,6 @@ def is_high_quality_signal(result):
     if mtf_alignment_count(result) < 2:
         return False
 
-    # حداقل یکی از تاییدهای نرم مثل VWAP، POC، Liquidity، FVG یا Order Block
     if soft_confirmation_bonus(result) < 1:
         return False
 
@@ -174,7 +172,9 @@ def is_auto_signal(result):
     if result.get("win_probability", 0) < 70:
         return False
 
-    if result.get("risk_reward", 0) < 1.3:
+    # بعد از اصلاح TP با حمایت/مقاومت، R/R ممکنه کمی پایین‌تر بیاد
+    # ولی TP واقعی‌تر میشه، پس 1.2 برای سیگنال خودکار منطقی‌تره
+    if result.get("risk_reward", 0) < 1.2:
         return False
 
     return True
