@@ -11,6 +11,12 @@ from users import is_user_allowed, is_owner, add_user, remove_user, list_users
 bot = telebot.TeleBot(BOT_TOKEN)
 
 
+def safe(value, default="نامشخص"):
+    if value is None:
+        return default
+    return value
+
+
 def find_symbol(text):
     text = text.lower().strip()
 
@@ -26,59 +32,45 @@ def find_symbol(text):
     return None
 
 
-def safe(value, default="نامشخص"):
-    if value is None:
-        return default
-    return value
-
-
 def fa_direction(direction):
-    if direction == "LONG":
-        return "🟢 لانگ"
-    if direction == "SHORT":
-        return "🔴 شورت"
-    return "⚪ فعلاً ورود مناسب نیست"
-
-
-def fa_trendline(value):
     return {
+        "LONG": "🟢 لانگ",
+        "SHORT": "🔴 شورت",
+        "NO TRADE": "⚪ فعلاً ورود مناسب نیست"
+    }.get(direction, direction)
+
+
+def fa_general(value):
+    data = {
+        "bullish": "صعودی",
+        "bearish": "نزولی",
+        "neutral": "خنثی",
+        "range": "رنج",
+        "weak": "ضعیف",
+        "none": "ندارد",
+        "unknown": "نامشخص",
+        "ok": "تأیید شده",
+
         "uptrend": "صعودی",
         "downtrend": "نزولی",
         "sideways": "خنثی",
-    }.get(value, value)
 
-
-def fa_structure(value):
-    return {
         "bullish_structure": "ساختار صعودی",
         "bearish_structure": "ساختار نزولی",
         "range_structure": "رنج / بدون روند واضح",
-    }.get(value, value)
 
-
-def fa_breakout(value):
-    return {
         "bullish_breakout": "بریک‌اوت صعودی",
         "bearish_breakout": "بریک‌اوت نزولی",
         "fake_bullish_breakout": "فیک بریک‌اوت صعودی",
         "fake_bearish_breakout": "فیک بریک‌اوت نزولی",
         "no_breakout": "بدون بریک‌اوت",
-    }.get(value, value)
 
-
-def fa_general(value):
-    return {
         "bullish_engulfing": "انگالف صعودی",
         "bearish_engulfing": "انگالف نزولی",
         "bullish_pinbar": "پین‌بار صعودی",
         "bearish_pinbar": "پین‌بار نزولی",
         "bullish_strong": "کندل صعودی قوی",
         "bearish_strong": "کندل نزولی قوی",
-        "weak": "ضعیف",
-
-        "bullish": "صعودی",
-        "bearish": "نزولی",
-        "neutral": "خنثی",
 
         "bullish_liquidity_grab": "جمع‌آوری نقدینگی صعودی",
         "bearish_liquidity_grab": "جمع‌آوری نقدینگی نزولی",
@@ -96,22 +88,35 @@ def fa_general(value):
         "bullish_macd_divergence": "واگرایی مثبت MACD",
         "bearish_macd_divergence": "واگرایی منفی MACD",
 
-        "fake_bullish_breakout": "فیک بریک‌اوت صعودی",
-        "fake_bearish_breakout": "فیک بریک‌اوت نزولی",
-
         "bullish_exhaustion": "خستگی روند صعودی",
         "bearish_exhaustion": "خستگی روند نزولی",
 
-        "none": "ندارد",
-        "ok": "تأیید شده",
-        "unknown": "نامشخص",
-        "bad": "نامناسب",
-    }.get(value, value)
+        "above_vwap": "بالای VWAP",
+        "below_vwap": "پایین VWAP",
+        "near_vwap": "نزدیک VWAP",
+
+        "above_poc": "بالای ناحیه حجمی اصلی",
+        "below_poc": "پایین ناحیه حجمی اصلی",
+        "near_poc": "نزدیک ناحیه حجمی اصلی",
+    }
+    return data.get(value, value)
 
 
 def build_trade_levels(result):
     if result.get("stop_loss") is None:
-        return "برای این وضعیت، ورود پیشنهاد نمی‌شود."
+        return f"""
+برای این وضعیت، ورود پیشنهاد نمی‌شود.
+
+سطوح احتمالی فقط برای بررسی:
+حد ضرر احتمالی:
+{safe(result.get('candidate_stop_loss'))}
+
+حد سود 1 احتمالی:
+{safe(result.get('candidate_tp1'))}
+
+حد سود 2 احتمالی:
+{safe(result.get('candidate_tp2'))}
+"""
 
     return f"""
 ورود تقریبی:
@@ -138,11 +143,17 @@ def build_analysis_text(result):
 قیمت فعلی:
 {result['price']}
 
-جهت پیشنهادی:
+جهت نهایی:
 {fa_direction(result['direction'])}
+
+جهت خام تحلیل:
+{fa_direction(result.get('raw_direction'))}
 
 امتیاز سیگنال:
 {result['score']}/100
+
+احتمال موفقیت تقریبی:
+{safe(result.get('win_probability'))}٪
 
 گرید ورود:
 {safe(result.get('entry_grade'))}
@@ -185,6 +196,18 @@ MACD:
 
 MACD Histogram:
 {safe(result.get('macd_hist'))}
+
+VWAP:
+{safe(result.get('vwap'))}
+
+وضعیت VWAP:
+{fa_general(result.get('vwap_status'))}
+
+POC حجمی:
+{safe(result.get('poc_price'))}
+
+وضعیت حجم:
+{fa_general(result.get('volume_profile_status'))}
 
 Funding Rate:
 {safe(result.get('funding_rate'))}٪
@@ -235,19 +258,22 @@ Trend Exhaustion:
 {result['resistance']}
 
 خط روند:
-{fa_trendline(result['trendline'])}
+{fa_general(result['trendline'])}
 
 ساختار بازار:
-{fa_structure(result['market_structure'])}
+{fa_general(result['market_structure'])}
 
 وضعیت بریک‌اوت:
-{fa_breakout(result['breakout'])}
+{fa_general(result['breakout'])}
 
 Fear & Greed:
 {safe(result.get('fear_value'))} - {safe(result.get('fear_text'))}
 
 BTC Dominance:
 {safe(result.get('btc_dominance'))}٪
+
+وضعیت دامیننس:
+{safe(result.get('dominance_status'))}
 
 Alt Season:
 {safe(result.get('altseason_status'))}
@@ -258,7 +284,7 @@ Alt Season:
 دلایل تحلیل:
 {reasons_text}
 
-⚠️ این تحلیل تضمین سود نیست. حتماً با حد ضرر و مدیریت ریسک وارد شو.
+⚠️ این تحلیل تضمین سود نیست. حتماً با حد ضرر، حجم کم و مدیریت ریسک وارد شو.
 """
 
 
@@ -299,6 +325,7 @@ def send_best_signals(message):
 {medals[i]} {r['symbol']}
 جهت: {direction_fa}
 امتیاز: {r['score']}/100
+احتمال موفقیت: {safe(r.get('win_probability'))}٪
 گرید: {safe(r.get('entry_grade'))}
 ریسک: {safe(r.get('risk_level'))}
 R/R: {safe(r.get('risk_reward'))}
@@ -306,8 +333,8 @@ R/R: {safe(r.get('risk_reward'))}
 تایم‌فریم: {r['signal_timeframe']}
 قیمت: {r['price']}
 ADX: {safe(r.get('adx'))}
-Funding: {safe(r.get('funding_rate'))}٪
 Spread: {safe(r.get('spread_percent'))}٪
+Funding: {safe(r.get('funding_rate'))}٪
 """
 
     bot.reply_to(message, msg)
@@ -327,6 +354,9 @@ def send_auto_signal_to_all_users(result):
 
 امتیاز:
 {result['score']}/100
+
+احتمال موفقیت:
+{safe(result.get('win_probability'))}٪
 
 گرید:
 {safe(result.get('entry_grade'))}
@@ -367,8 +397,8 @@ ADX:
 Funding:
 {safe(result.get('funding_rate'))}٪
 
-Liquidity:
-{fa_general(result.get('liquidity_grab'))}
+VWAP:
+{fa_general(result.get('vwap_status'))}
 
 FVG:
 {fa_general(result.get('fvg'))}
