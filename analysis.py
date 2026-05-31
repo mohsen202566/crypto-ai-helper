@@ -657,19 +657,19 @@ def score_smart_money(df_15m, df_5m):
     order_block = detect_order_block(df_15m)
 
     if liquidity_grab == "bullish_liquidity_grab":
-        long_score += 12
+        long_score += 6
         reasons_long.append("Liquidity Grab صعودی")
 
     if liquidity_grab == "bearish_liquidity_grab":
-        short_score += 12
+        short_score += 6
         reasons_short.append("Liquidity Grab نزولی")
 
     if stop_hunt == "bullish_stop_hunt":
-        long_score += 10
+        long_score += 5
         reasons_long.append("Stop Hunt صعودی")
 
     if stop_hunt == "bearish_stop_hunt":
-        short_score += 10
+        short_score += 5
         reasons_short.append("Stop Hunt نزولی")
 
     if fvg == "bullish_fvg":
@@ -687,6 +687,16 @@ def score_smart_money(df_15m, df_5m):
     if order_block == "bearish_order_block":
         short_score += 7
         reasons_short.append("Order Block نزولی")
+
+    trend15 = trend_direction(df_15m)
+
+    if trend15 == "bullish" and order_block == "bearish_order_block":
+        short_score -= 8
+        reasons_short.append("جریمه: Order Block نزولی مخالف روند صعودی 15M است")
+
+    if trend15 == "bearish" and order_block == "bullish_order_block":
+        long_score -= 8
+        reasons_long.append("جریمه: Order Block صعودی مخالف روند نزولی 15M است")
 
     return long_score, short_score, reasons_long, reasons_short, liquidity_grab, stop_hunt, fvg, order_block
 
@@ -967,14 +977,14 @@ def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, s
     trend_exhaustion = detect_trend_exhaustion(df_5m)
 
     if raw_direction == "LONG":
-        if long_score < short_score + 18:
+        if long_score < short_score + 25:
             reasons_block.append("اختلاف امتیاز لانگ و شورت کافی نیست")
 
         if is_near_resistance(price, resistance, atr):
             reasons_block.append("قیمت نزدیک مقاومت است")
             liquidity_risk = "بالا"
 
-        if last_5["rsi"] > 72:
+        if last_5["rsi"] > 65:
             reasons_block.append("RSI برای لانگ بیش از حد بالاست")
 
         if last_5["adx"] < 18:
@@ -987,14 +997,14 @@ def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, s
             reasons_block.append("خستگی روند صعودی")
 
     if raw_direction == "SHORT":
-        if short_score < long_score + 18:
+        if short_score < long_score + 25:
             reasons_block.append("اختلاف امتیاز شورت و لانگ کافی نیست")
 
         if is_near_support(price, support, atr):
             reasons_block.append("قیمت نزدیک حمایت است")
             liquidity_risk = "بالا"
 
-        if last_5["rsi"] < 28:
+        if last_5["rsi"] < 35:
             reasons_block.append("RSI برای شورت بیش از حد پایین است")
 
         if last_5["adx"] < 18:
@@ -1015,16 +1025,39 @@ def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, s
     return True, [], liquidity_risk, fake_breakout, trend_exhaustion
 
 
-def apply_conflict_penalties(long_score, short_score, trendline, structure, reasons_long, reasons_short):
-    if trendline == "uptrend" and structure == "bearish_structure":
-        long_score -= 10
-        reasons_long.append("جریمه: خط روند صعودی ولی ساختار بازار نزولی است")
+def apply_conflict_penalties(
+    long_score,
+    short_score,
+    trendline,
+    structure,
+    reasons_long,
+    reasons_short
+):
+    if trendline == "uptrend":
+        long_score += 12
+        short_score -= 15
+        reasons_long.append("تقویت: خط روند صعودی است")
+        reasons_short.append("جریمه: شورت خلاف خط روند صعودی است")
 
-    if trendline == "downtrend" and structure == "bullish_structure":
-        short_score -= 10
-        reasons_short.append("جریمه: خط روند نزولی ولی ساختار بازار صعودی است")
+    elif trendline == "downtrend":
+        short_score += 12
+        long_score -= 15
+        reasons_short.append("تقویت: خط روند نزولی است")
+        reasons_long.append("جریمه: لانگ خلاف خط روند نزولی است")
 
-    return long_score, short_score
+    if structure == "bullish_structure":
+        long_score += 15
+        short_score -= 18
+        reasons_long.append("تقویت: ساختار بازار صعودی است")
+        reasons_short.append("جریمه: شورت خلاف ساختار صعودی بازار است")
+
+    elif structure == "bearish_structure":
+        short_score += 15
+        long_score -= 18
+        reasons_short.append("تقویت: ساختار بازار نزولی است")
+        reasons_long.append("جریمه: لانگ خلاف ساختار نزولی بازار است")
+
+    return max(0, long_score), max(0, short_score)
 
 
 def analyze_symbol(symbol):
@@ -1135,11 +1168,11 @@ def analyze_symbol(symbol):
 
     spread_percent = get_spread_percent(symbol)
 
-    if long_score >= short_score + 18:
+    if long_score >= short_score + 25:
         raw_direction = "LONG"
         score = long_score
         reasons = reasons_long + risk_notes
-    elif short_score >= long_score + 18:
+    elif short_score >= long_score + 25:
         raw_direction = "SHORT"
         score = short_score
         reasons = reasons_short + risk_notes
