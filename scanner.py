@@ -17,16 +17,35 @@ def is_high_quality_signal(result):
     if result["score"] < 75:
         return False
 
-    if result.get("adx", 0) < 18:
+    if result.get("entry_grade") in ["Reject", None]:
         return False
 
     if result.get("risk_level") == "بالا":
         return False
 
-    if result.get("btc_filter") == "bad":
+    if result.get("risk_reward", 0) < 0.9:
+        return False
+
+    if result.get("adx", 0) < 18:
         return False
 
     if result.get("liquidity_risk") == "بالا":
+        return False
+
+    if result.get("spread_percent") is not None:
+        if result["spread_percent"] > 0.08:
+            return False
+
+    if result.get("fake_breakout") in [
+        "fake_bullish_breakout",
+        "fake_bearish_breakout"
+    ]:
+        return False
+
+    if result.get("trend_exhaustion") in [
+        "bullish_exhaustion",
+        "bearish_exhaustion"
+    ]:
         return False
 
     return True
@@ -39,7 +58,10 @@ def is_auto_signal(result):
     if result["score"] < AUTO_SIGNAL_SCORE:
         return False
 
-    if result.get("risk_level") in ["بالا", "خیلی بالا"]:
+    if result.get("entry_grade") not in ["A+", "A"]:
+        return False
+
+    if result.get("risk_level") != "پایین":
         return False
 
     return True
@@ -61,9 +83,10 @@ def get_best_signals(limit=5):
 
     results.sort(
         key=lambda x: (
+            x.get("entry_grade") == "A+",
             x.get("score", 0),
-            x.get("adx", 0),
-            -1 if x.get("risk_level") == "متوسط" else 0
+            x.get("risk_reward", 0),
+            x.get("adx", 0)
         ),
         reverse=True
     )
