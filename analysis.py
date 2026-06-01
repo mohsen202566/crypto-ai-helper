@@ -264,7 +264,7 @@ def minimum_volatility_ok(df):
         return False
 
     atr_percent = (last["atr"] / last["close"]) * 100
-    return atr_percent >= 0.08
+    return atr_percent >= 0.10
 
 
 def market_is_choppy(df_15m, df_5m):
@@ -274,10 +274,11 @@ def market_is_choppy(df_15m, df_5m):
     ema_gap_15 = abs(last_15["ema20"] - last_15["ema50"]) / last_15["close"] * 100
     ema_gap_5 = abs(last_5["ema20"] - last_5["ema50"]) / last_5["close"] * 100
 
-    if ema_gap_15 < 0.08 and ema_gap_5 < 0.08:
+    # برای معاملات 30 تا 60 دقیقه، اگر 15M فشرده باشد سیگنال کیفیت کمی دارد.
+    if ema_gap_15 < 0.10 and ema_gap_5 < 0.06:
         return True
 
-    if last_15["adx"] < 18 and last_5["adx"] < 18:
+    if last_15["adx"] < 20 and last_5["adx"] < 18:
         return True
 
     if atr_compression(df_15m) and atr_compression(df_5m):
@@ -513,13 +514,13 @@ def signal_validity(score, direction):
         return "سیگنال معتبر نیست"
 
     if score >= 90:
-        return "30 دقیقه تا 3 ساعت"
+        return "30 دقیقه تا 1 ساعت"
 
     if score >= 80:
-        return "15 تا 90 دقیقه"
+        return "30 تا 60 دقیقه"
 
     if score >= 70:
-        return "10 تا 45 دقیقه"
+        return "20 تا 45 دقیقه"
 
     return "اعتبار پایین"
 
@@ -528,7 +529,7 @@ def signal_timeframe(score, direction):
     if direction == "NO TRADE":
         return "بدون تایم‌فریم ورود"
 
-    return "5M تا 15M"
+    return "15M تا 30M"
 
 
 def score_macro_trend(df_1d, df_4h, df_1h, df_30m):
@@ -545,10 +546,10 @@ def score_macro_trend(df_1d, df_4h, df_1h, df_30m):
     }
 
     weights = {
-        "1D": 8,
-        "4H": 12,
-        "1H": 14,
-        "30M": 14,
+        "1D": 6,
+        "4H": 10,
+        "1H": 18,
+        "30M": 20,
     }
 
     for tf, trend in trends.items():
@@ -581,66 +582,78 @@ def score_entry(df_15m, df_5m):
 
     buy_power, sell_power = buy_sell_power(df_5m)
 
+    # در نسخه 30 تا 60 دقیقه، 15M تأیید اصلی ورود است و 5M فقط تریگر دقیق‌تر است.
     if last_15["close"] > last_15["ema20"] > last_15["ema50"]:
-        long_score += 15
+        long_score += 20
         reasons_long.append("15M: قیمت بالای EMA20 و EMA50")
 
     if last_15["close"] < last_15["ema20"] < last_15["ema50"]:
-        short_score += 15
+        short_score += 20
         reasons_short.append("15M: قیمت زیر EMA20 و EMA50")
 
+    if last_15["macd"] > last_15["macd_signal"]:
+        long_score += 8
+        reasons_long.append("15M: MACD صعودی است")
+
+    if last_15["macd"] < last_15["macd_signal"]:
+        short_score += 8
+        reasons_short.append("15M: MACD نزولی است")
+
     if last_5["close"] > last_5["ema20"] and last_5["macd"] > last_5["macd_signal"]:
-        long_score += 15
+        long_score += 10
         reasons_long.append("5M: تایید ورود لانگ با EMA و MACD")
 
     if last_5["close"] < last_5["ema20"] and last_5["macd"] < last_5["macd_signal"]:
-        short_score += 15
+        short_score += 10
         reasons_short.append("5M: تایید ورود شورت با EMA و MACD")
 
-    if 45 <= last_5["rsi"] <= 68:
+    # RSI برای ترید 30 تا 60 دقیقه کمی متعادل‌تر شده است.
+    if 42 <= last_15["rsi"] <= 66 and 40 <= last_5["rsi"] <= 68:
         long_score += 10
-        reasons_long.append("RSI مناسب برای لانگ در 5M")
+        reasons_long.append("RSI مناسب برای لانگ در 15M و 5M")
 
-    if 32 <= last_5["rsi"] <= 55:
+    if 34 <= last_15["rsi"] <= 58 and 32 <= last_5["rsi"] <= 60:
         short_score += 10
-        reasons_short.append("RSI مناسب برای شورت در 5M")
+        reasons_short.append("RSI مناسب برای شورت در 15M و 5M")
 
-    if buy_power >= 62:
-        long_score += 10
-        reasons_long.append("قدرت خرید بالا در تایم ورود")
+    # قدرت خرید/فروش هنوز مهم است اما برای تایم بالاتر نباید به تنهایی غالب شود.
+    if buy_power >= 58:
+        long_score += 8
+        reasons_long.append("قدرت خرید مناسب در تایم ورود")
 
-    if sell_power >= 62:
-        short_score += 10
-        reasons_short.append("قدرت فروش بالا در تایم ورود")
+    if sell_power >= 58:
+        short_score += 8
+        reasons_short.append("قدرت فروش مناسب در تایم ورود")
 
     pattern = candle_pattern(df_5m)
     multi_candle = multi_candle_confirmation(df_5m)
 
     if pattern in ["bullish_engulfing", "bullish_pinbar", "bullish_strong"]:
-        long_score += 10
+        long_score += 7
         reasons_long.append(f"کندل تاییدی لانگ: {pattern}")
 
     if pattern in ["bearish_engulfing", "bearish_pinbar", "bearish_strong"]:
-        short_score += 10
+        short_score += 7
         reasons_short.append(f"کندل تاییدی شورت: {pattern}")
 
     if multi_candle == "bullish":
-        long_score += 8
+        long_score += 6
         reasons_long.append("تایید چند کندلی صعودی")
 
     if multi_candle == "bearish":
-        short_score += 8
+        short_score += 6
         reasons_short.append("تایید چند کندلی نزولی")
 
     if volume_spike(df_5m):
-        long_score += 6
-        short_score += 6
+        long_score += 5
+        short_score += 5
         reasons_long.append("افزایش حجم واقعی")
         reasons_short.append("افزایش حجم واقعی")
 
-    if last_5["adx"] >= 22:
-        long_score += 5
-        short_score += 5
+    # برای ترید 30 تا 60 دقیقه، ADX تایم 15M مهم‌تر از 5M است.
+    if last_15["adx"] >= 20:
+        long_score += 6
+        short_score += 6
 
     return long_score, short_score, reasons_long, reasons_short, buy_power, sell_power, pattern, multi_candle
 
@@ -811,13 +824,16 @@ def score_vwap_volume_profile(df_15m, df_5m):
 
 
 def calculate_trade_levels(raw_direction, price, atr, support=None, resistance=None):
-    buffer = atr * 0.15
+    # برای ترید 30 تا 60 دقیقه، ATR تایم 15M از analyze_symbol پاس داده می‌شود.
+    # نسبت‌ها کمی بازتر شده‌اند تا تارگت/استاپ با نویز 5M فعال نشوند.
+    buffer = atr * 0.20
 
     if raw_direction == "LONG":
-        stop_loss = price - (atr * 1.2)
-        tp1 = price + (atr * 1.5)
-        tp2 = price + (atr * 2.5)
+        stop_loss = price - (atr * 1.35)
+        tp1 = price + (atr * 1.8)
+        tp2 = price + (atr * 3.0)
 
+        # TP1 پشت مقاومت نیفتد؛ قبل از مقاومت تنظیم شود.
         if resistance is not None and resistance > price:
             adjusted_tp1 = resistance - buffer
             if adjusted_tp1 > price:
@@ -826,10 +842,11 @@ def calculate_trade_levels(raw_direction, price, atr, support=None, resistance=N
         return stop_loss, tp1, tp2
 
     if raw_direction == "SHORT":
-        stop_loss = price + (atr * 1.2)
-        tp1 = price - (atr * 1.5)
-        tp2 = price - (atr * 2.5)
+        stop_loss = price + (atr * 1.35)
+        tp1 = price - (atr * 1.8)
+        tp2 = price - (atr * 3.0)
 
+        # TP1 پشت حمایت نیفتد؛ قبل از حمایت تنظیم شود.
         if support is not None and support < price:
             adjusted_tp1 = support + buffer
             if adjusted_tp1 < price:
@@ -942,8 +959,9 @@ def news_filter_active():
 
 def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, spread_percent):
     last_5 = df_5m.iloc[-1]
+    last_15 = df_15m.iloc[-1]
     price = float(last_5["close"])
-    atr = float(last_5["atr"])
+    atr = float(last_15["atr"])
     support, resistance = support_resistance(df_15m)
 
     reasons_block = []
@@ -984,10 +1002,10 @@ def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, s
             reasons_block.append("قیمت نزدیک مقاومت است")
             liquidity_risk = "بالا"
 
-        if last_5["rsi"] > 65:
+        if last_15["rsi"] > 66 or last_5["rsi"] > 70:
             reasons_block.append("RSI برای لانگ بیش از حد بالاست")
 
-        if last_5["adx"] < 18:
+        if last_15["adx"] < 20:
             reasons_block.append("قدرت روند برای لانگ کافی نیست")
 
         if fake_breakout == "fake_bullish_breakout":
@@ -1004,10 +1022,10 @@ def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, s
             reasons_block.append("قیمت نزدیک حمایت است")
             liquidity_risk = "بالا"
 
-        if last_5["rsi"] < 35:
+        if last_15["rsi"] < 34 or last_5["rsi"] < 30:
             reasons_block.append("RSI برای شورت بیش از حد پایین است")
 
-        if last_5["adx"] < 18:
+        if last_15["adx"] < 20:
             reasons_block.append("قدرت روند برای شورت کافی نیست")
 
         if fake_breakout == "fake_bearish_breakout":
@@ -1161,9 +1179,16 @@ def analyze_symbol(symbol):
     short_score = cap_score(short_score)
 
     last = df_5m.iloc[-1]
+    last_15 = df_15m.iloc[-1]
+
     price = float(last["close"])
-    atr = float(last["atr"])
-    adx_value = float(last["adx"])
+
+    # ATR اصلی معامله از 15M گرفته می‌شود تا سطوح برای ترید 30 تا 60 دقیقه مناسب باشند.
+    atr = float(last_15["atr"])
+
+    # ADX اصلی از 15M گرفته می‌شود چون تایم معامله 30 تا 60 دقیقه است.
+    adx_value = float(last_15["adx"])
+
     support, resistance = support_resistance(df_15m)
 
     spread_percent = get_spread_percent(symbol)
