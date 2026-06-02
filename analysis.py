@@ -514,13 +514,13 @@ def signal_validity(score, direction):
         return "سیگنال معتبر نیست"
 
     if score >= 90:
-        return "30 دقیقه تا 3 ساعت"
+        return "30 تا 60 دقیقه"
 
     if score >= 80:
-        return "15 تا 90 دقیقه"
+        return "30 تا 60 دقیقه"
 
     if score >= 70:
-        return "10 تا 45 دقیقه"
+        return "20 تا 45 دقیقه"
 
     return "اعتبار پایین"
 
@@ -529,7 +529,7 @@ def signal_timeframe(score, direction):
     if direction == "NO TRADE":
         return "بدون تایم‌فریم ورود"
 
-    return "5M تا 15M"
+    return "15M تا 30M"
 
 
 def score_macro_trend(df_1d, df_4h, df_1h, df_30m):
@@ -546,10 +546,10 @@ def score_macro_trend(df_1d, df_4h, df_1h, df_30m):
     }
 
     weights = {
-        "1D": 8,
-        "4H": 12,
-        "1H": 14,
-        "30M": 14,
+        "1D": 6,
+        "4H": 10,
+        "1H": 18,
+        "30M": 20,
     }
 
     for tf, trend in trends.items():
@@ -811,6 +811,111 @@ def score_vwap_volume_profile(df_15m, df_5m):
     return long_score, short_score, reasons_long, reasons_short, vwap_status, poc_price, volume_profile_status
 
 
+
+def apply_direction_conflict_penalties(
+    long_score,
+    short_score,
+    pattern,
+    multi_candle,
+    order_block,
+    fvg,
+    vwap_status,
+    buy_power,
+    sell_power,
+    reasons_long,
+    reasons_short
+):
+    """
+    جریمه نرم برای تناقض‌های واضح.
+    هدف: سیگنال شورت با کندل/اوردر بلاک صعودی یا لانگ با تاییدهای نزولی، 100/100 نشود.
+    این تابع سیگنال را مستقیم حذف نمی‌کند، فقط امتیاز را واقعی‌تر می‌کند.
+    """
+
+    bullish_candle = pattern in ["bullish_engulfing", "bullish_pinbar", "bullish_strong"] or multi_candle == "bullish"
+    bearish_candle = pattern in ["bearish_engulfing", "bearish_pinbar", "bearish_strong"] or multi_candle == "bearish"
+
+    if bullish_candle:
+        short_score -= 12
+        reasons_short.append("جریمه: کندل یا تایید چندکندلی صعودی، خلاف شورت است")
+
+    if bearish_candle:
+        long_score -= 12
+        reasons_long.append("جریمه: کندل یا تایید چندکندلی نزولی، خلاف لانگ است")
+
+    if order_block == "bullish_order_block":
+        short_score -= 10
+        reasons_short.append("جریمه: اوردر بلاک صعودی، خلاف شورت است")
+
+    if order_block == "bearish_order_block":
+        long_score -= 10
+        reasons_long.append("جریمه: اوردر بلاک نزولی، خلاف لانگ است")
+
+    if fvg == "bullish_fvg":
+        short_score -= 6
+        reasons_short.append("جریمه: ناحیه نقدینگی صعودی، خلاف شورت است")
+
+    if fvg == "bearish_fvg":
+        long_score -= 6
+        reasons_long.append("جریمه: ناحیه نقدینگی نزولی، خلاف لانگ است")
+
+    if vwap_status == "above_vwap":
+        short_score -= 8
+        reasons_short.append("جریمه: قیمت بالای VWAP است و برای شورت ریسک دارد")
+
+    if vwap_status == "below_vwap":
+        long_score -= 8
+        reasons_long.append("جریمه: قیمت پایین VWAP است و برای لانگ ریسک دارد")
+
+    if buy_power >= sell_power + 12:
+        short_score -= 7
+        reasons_short.append("جریمه: قدرت خرید نسبت به فروش بالاتر است")
+
+    if sell_power >= buy_power + 12:
+        long_score -= 7
+        reasons_long.append("جریمه: قدرت فروش نسبت به خرید بالاتر است")
+
+    return max(0, long_score), max(0, short_score)
+
+
+def normalize_score_by_quality(score, rr, raw_direction, pattern, multi_candle, order_block, vwap_status):
+    """
+    محدود کردن امتیازهای خیلی بالا.
+    هدف: 100/100 فقط برای سیگنال‌های واقعاً تمیز باشد، نه هر سیگنال قوی ظاهری.
+    """
+    if raw_direction == "NO TRADE":
+        return score
+
+    if rr < 1.2:
+        score = min(score, 84)
+    elif rr < 1.35:
+        score = min(score, 90)
+    elif rr < 1.5:
+        score = min(score, 94)
+    elif rr < 1.8:
+        score = min(score, 97)
+
+    if raw_direction == "LONG":
+        if pattern in ["bearish_engulfing", "bearish_pinbar", "bearish_strong"] or multi_candle == "bearish":
+            score = min(score, 88)
+
+        if order_block == "bearish_order_block":
+            score = min(score, 90)
+
+        if vwap_status == "below_vwap":
+            score = min(score, 92)
+
+    if raw_direction == "SHORT":
+        if pattern in ["bullish_engulfing", "bullish_pinbar", "bullish_strong"] or multi_candle == "bullish":
+            score = min(score, 88)
+
+        if order_block == "bullish_order_block":
+            score = min(score, 90)
+
+        if vwap_status == "above_vwap":
+            score = min(score, 92)
+
+    return cap_score(score)
+
 def calculate_trade_levels(raw_direction, price, atr, support=None, resistance=None):
     buffer = atr * 0.15
 
@@ -891,22 +996,22 @@ def entry_grade(score, risk_level, rr, final_direction):
     if final_direction == "NO TRADE":
         return "Reject"
 
-    if score >= 90 and risk_level == "پایین" and rr >= 1:
+    if score >= 94 and risk_level == "پایین" and rr >= 1.35:
         return "A+"
 
-    if score >= 82 and risk_level in ["پایین", "متوسط"] and rr >= 1:
+    if score >= 86 and risk_level in ["پایین", "متوسط"] and rr >= 1.2:
         return "A"
 
-    if score >= 75 and rr >= 1:
+    if score >= 78 and rr >= 1:
         return "B"
 
     return "Reject"
 
 
 def win_probability(score, risk_level, rr, adx, entry_grade_value):
-    probability = 45
+    probability = 42
 
-    probability += int(score * 0.25)
+    probability += int(score * 0.22)
 
     if risk_level == "پایین":
         probability += 10
@@ -990,12 +1095,12 @@ def calculate_setup_zone(raw_direction, price, atr):
     if raw_direction == "LONG":
         zone_low = price - (atr * 0.35)
         zone_high = price + (atr * 0.10)
-        trigger = "ورود لانگ فقط بعد از حفظ ناحیه ورود و بسته شدن کندل تاییدی صعودی در 5M/15M"
+        trigger = "ورود لانگ فقط بعد از حفظ ناحیه ورود و تایید کندل صعودی در 15M/30M"
 
     elif raw_direction == "SHORT":
         zone_low = price - (atr * 0.10)
         zone_high = price + (atr * 0.35)
-        trigger = "ورود شورت فقط بعد از حفظ ناحیه ورود و بسته شدن کندل تاییدی نزولی در 5M/15M"
+        trigger = "ورود شورت فقط بعد از حفظ ناحیه ورود و تایید کندل نزولی در 15M/30M"
 
     else:
         return "inactive", None, None, "ستاپ فعالی وجود ندارد"
@@ -1065,8 +1170,9 @@ def very_safe_status(raw_direction, score, win_probability_value, risk_level, rr
 
 def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, spread_percent):
     last_5 = df_5m.iloc[-1]
+    last_15 = df_15m.iloc[-1]
     price = float(last_5["close"])
-    atr = float(last_5["atr"])
+    atr = float(last_15["atr"])
     support, resistance = support_resistance(df_15m)
 
     reasons_block = []
@@ -1111,7 +1217,7 @@ def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, s
         if last_5["rsi"] > 65:
             reasons_block.append("RSI برای لانگ بیش از حد بالاست")
 
-        if last_5["adx"] < 18:
+        if last_15["adx"] < 20:
             reasons_block.append("قدرت روند برای لانگ کافی نیست")
 
         if fake_breakout == "fake_bullish_breakout":
@@ -1131,7 +1237,7 @@ def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, s
         if last_5["rsi"] < 35:
             reasons_block.append("RSI برای شورت بیش از حد پایین است")
 
-        if last_5["adx"] < 18:
+        if last_15["adx"] < 20:
             reasons_block.append("قدرت روند برای شورت کافی نیست")
 
         if fake_breakout == "fake_bearish_breakout":
@@ -1227,6 +1333,20 @@ def analyze_symbol(symbol):
     reasons_long += rl
     reasons_short += rs
 
+    long_score, short_score = apply_direction_conflict_penalties(
+        long_score,
+        short_score,
+        pattern,
+        multi_candle,
+        order_block,
+        fvg,
+        vwap_status,
+        buy_power,
+        sell_power,
+        reasons_long,
+        reasons_short
+    )
+
     btc_status, l, s, rl, rs = btc_filter(symbol)
     long_score += l
     short_score += s
@@ -1285,9 +1405,13 @@ def analyze_symbol(symbol):
     short_score = cap_score(short_score)
 
     last = df_5m.iloc[-1]
+    last_15 = df_15m.iloc[-1]
     price = float(last["close"])
-    atr = float(last["atr"])
-    adx_value = float(last["adx"])
+
+    # برای معاملات 30 تا 60 دقیقه، ATR و ADX تایم 15M مناسب‌تر از 5M است.
+    atr = float(last_15["atr"])
+    adx_value = float(last_15["adx"])
+
     support, resistance = support_resistance(df_15m)
 
     setup_status, entry_zone_low, entry_zone_high, entry_trigger = calculate_setup_zone(
@@ -1326,6 +1450,16 @@ def analyze_symbol(symbol):
     )
 
     rr = risk_reward(raw_direction, price, stop_loss_raw, tp1_raw)
+
+    score = normalize_score_by_quality(
+        score,
+        rr,
+        raw_direction,
+        pattern,
+        multi_candle,
+        order_block,
+        vwap_status
+    )
 
     entry_ok, block_reasons, liquidity_risk, fake_breakout, trend_exhaustion = entry_filter(
         raw_direction,
