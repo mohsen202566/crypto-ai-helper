@@ -13,6 +13,10 @@ from signal_tracker import (
     check_active_signals,
     get_stats_report,
     parse_days_from_text,
+    parse_profit_calc_text,
+    parse_days_from_report_text,
+    get_profit_for_signal_text,
+    get_profit_simulation_report,
 )
 
 bot = telebot.TeleBot(BOT_TOKEN)
@@ -608,6 +612,25 @@ def handle_message(message):
         return
 
     text = message.text.strip()
+
+    profit_calc = parse_profit_calc_text(text)
+    if profit_calc:
+        margin, leverage = profit_calc
+
+        reply_text = None
+        if message.reply_to_message and message.reply_to_message.text:
+            reply_text = message.reply_to_message.text
+
+        single_report = get_profit_for_signal_text(reply_text, margin, leverage)
+
+        if single_report:
+            bot.reply_to(message, single_report)
+            return
+
+        days = parse_days_from_report_text(reply_text) if reply_text else 7
+        report = get_profit_simulation_report(margin, leverage, days)
+        bot.reply_to(message, report)
+        return
 
     if is_track_command(text):
         result = get_replied_signal_result(message)
