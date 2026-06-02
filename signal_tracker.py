@@ -1,9 +1,11 @@
+# -*- coding: utf-8 -*-
 import json
 import os
 import time
 from datetime import datetime, timedelta
 
 import ccxt
+from analysis import analyze_symbol
 
 
 ACTIVE_SIGNALS_FILE = "active_signals.json"
@@ -182,6 +184,57 @@ def close_signal(signal, result_type, exit_price):
     )
 
 
+
+def weakness_warning_for_signal(signal, result, price):
+    direction = signal.get("direction")
+    warnings = []
+
+    if direction == "LONG":
+        if result.get("raw_direction") == "SHORT" or result.get("direction") == "SHORT":
+            warnings.append("جهت تحلیل جدید به شورت تغییر کرده است")
+        if result.get("vwap_status") == "below_vwap":
+            warnings.append("قیمت زیر VWAP رفته است")
+        if result.get("sell_power", 0) >= result.get("buy_power", 0) + 12:
+            warnings.append("قدرت فروش نسبت به خرید بیشتر شده است")
+        if result.get("market_structure") == "bearish_structure":
+            warnings.append("ساختار کوتاه‌مدت نزولی شده است")
+        if result.get("rsi_divergence") == "bearish_rsi_divergence":
+            warnings.append("واگرایی منفی RSI دیده شده است")
+        if result.get("macd_divergence") == "bearish_macd_divergence":
+            warnings.append("واگرایی منفی MACD دیده شده است")
+        if result.get("fake_breakout") == "fake_bullish_breakout":
+            warnings.append("احتمال فیک بریک‌اوت صعودی وجود دارد")
+
+    elif direction == "SHORT":
+        if result.get("raw_direction") == "LONG" or result.get("direction") == "LONG":
+            warnings.append("جهت تحلیل جدید به لانگ تغییر کرده است")
+        if result.get("vwap_status") == "above_vwap":
+            warnings.append("قیمت بالای VWAP رفته است")
+        if result.get("buy_power", 0) >= result.get("sell_power", 0) + 12:
+            warnings.append("قدرت خرید نسبت به فروش بیشتر شده است")
+        if result.get("market_structure") == "bullish_structure":
+            warnings.append("ساختار کوتاه‌مدت صعودی شده است")
+        if result.get("rsi_divergence") == "bullish_rsi_divergence":
+            warnings.append("واگرایی مثبت RSI دیده شده است")
+        if result.get("macd_divergence") == "bullish_macd_divergence":
+            warnings.append("واگرایی مثبت MACD دیده شده است")
+        if result.get("fake_breakout") == "fake_bearish_breakout":
+            warnings.append("احتمال فیک بریک‌اوت نزولی وجود دارد")
+
+    if len(warnings) >= 3:
+        text = "\n".join([f"⚠️ {w}" for w in warnings[:5]])
+        return (
+            f"⚠️ هشدار ضعف سیگنال {signal['symbol']}\n\n"
+            f"جهت سیگنال: {'لانگ' if direction == 'LONG' else 'شورت'}\n"
+            f"ورود: {signal['entry']}\n"
+            f"قیمت فعلی: {price}\n\n"
+            f"{text}\n\n"
+            f"ریسک معامله بالا رفته؛ بستن معامله یا کاهش ریسک را بررسی کن."
+        )
+
+    return None
+
+
 def check_active_signals():
     active = get_active_signals()
     remaining = []
@@ -206,6 +259,21 @@ def check_active_signals():
                     "message": msg
                 })
                 continue
+
+            if not signal.get("warning_sent", False):
+                try:
+                    result = analyze_symbol(signal["symbol"])
+                    warning_msg = weakness_warning_for_signal(signal, result, price)
+
+                    if warning_msg:
+                        signal["warning_sent"] = True
+                        messages.append({
+                            "chat_id": signal["chat_id"],
+                            "message": warning_msg
+                        })
+
+                except Exception as e:
+                    print("WARNING CHECK ERROR:", signal.get("symbol"), str(e))
 
             remaining.append(signal)
 
