@@ -978,12 +978,12 @@ def apply_direction_conflict_penalties(
         reasons_long.append("جریمه: کندل یا تایید چندکندلی نزولی، خلاف لانگ است")
 
     if order_block == "bullish_order_block":
-        short_score -= 10
-        reasons_short.append("جریمه: اوردر بلاک صعودی، خلاف شورت است")
+        short_score -= 18
+        reasons_short.append("جریمه سنگین: اوردر بلاک صعودی، خلاف شورت است")
 
     if order_block == "bearish_order_block":
-        long_score -= 10
-        reasons_long.append("جریمه: اوردر بلاک نزولی، خلاف لانگ است")
+        long_score -= 18
+        reasons_long.append("جریمه سنگین: اوردر بلاک نزولی، خلاف لانگ است")
 
     if fvg == "bullish_fvg":
         short_score -= 6
@@ -1001,18 +1001,24 @@ def apply_direction_conflict_penalties(
         long_score -= 8
         reasons_long.append("جریمه: قیمت پایین VWAP است و برای لانگ ریسک دارد")
 
-    if buy_power >= sell_power + 12:
-        short_score -= 7
+    if buy_power >= sell_power + 10:
+        short_score -= 18
+        reasons_short.append("جریمه سنگین: قدرت خرید واضحاً خلاف شورت است")
+    elif buy_power >= sell_power + 5:
+        short_score -= 10
         reasons_short.append("جریمه: قدرت خرید نسبت به فروش بالاتر است")
 
-    if sell_power >= buy_power + 12:
-        long_score -= 7
+    if sell_power >= buy_power + 10:
+        long_score -= 18
+        reasons_long.append("جریمه سنگین: قدرت فروش واضحاً خلاف لانگ است")
+    elif sell_power >= buy_power + 5:
+        long_score -= 10
         reasons_long.append("جریمه: قدرت فروش نسبت به خرید بالاتر است")
 
     return max(0, long_score), max(0, short_score)
 
 
-def normalize_score_by_quality(score, rr, raw_direction, pattern, multi_candle, order_block, vwap_status):
+def normalize_score_by_quality(score, rr, raw_direction, pattern, multi_candle, order_block, vwap_status, buy_power=50, sell_power=50):
     """
     محدود کردن امتیازهای خیلی بالا.
     هدف: 100/100 فقط برای سیگنال‌های واقعاً تمیز باشد، نه هر سیگنال قوی ظاهری.
@@ -1034,7 +1040,12 @@ def normalize_score_by_quality(score, rr, raw_direction, pattern, multi_candle, 
             score = min(score, 88)
 
         if order_block == "bearish_order_block":
-            score = min(score, 90)
+            score = min(score, 84)
+
+        if sell_power >= buy_power + 10:
+            score = min(score, 84)
+        elif sell_power >= buy_power + 5:
+            score = min(score, 88)
 
         if vwap_status == "below_vwap":
             score = min(score, 92)
@@ -1044,7 +1055,12 @@ def normalize_score_by_quality(score, rr, raw_direction, pattern, multi_candle, 
             score = min(score, 88)
 
         if order_block == "bullish_order_block":
-            score = min(score, 90)
+            score = min(score, 84)
+
+        if buy_power >= sell_power + 10:
+            score = min(score, 84)
+        elif buy_power >= sell_power + 5:
+            score = min(score, 88)
 
         if vwap_status == "above_vwap":
             score = min(score, 92)
@@ -1338,7 +1354,7 @@ def very_safe_status(raw_direction, score, win_probability_value, risk_level, rr
     return len(reasons) == 0, reasons
 
 
-def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, spread_percent, market_regime="neutral"):
+def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, spread_percent, market_regime="neutral", order_block="none", buy_power=50, sell_power=50):
     last_5 = df_5m.iloc[-1]
     last_15 = df_15m.iloc[-1]
     price = float(last_5["close"])
@@ -1351,6 +1367,47 @@ def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, s
     if raw_direction == "NO TRADE":
         reasons_block.append("اختلاف لانگ و شورت کافی نیست")
         return False, reasons_block, "بالا", "none", "none"
+
+    # فیلتر سخت بر اساس آمار واقعی:
+    # اوردر بلاک مخالف جهت سیگنال، سیگنال را رد می‌کند.
+    if raw_direction == "LONG" and order_block == "bearish_order_block":
+        reasons_block.append("اوردر بلاک نزولی خلاف سیگنال لانگ است")
+        liquidity_risk = "بالا"
+
+    if raw_direction == "SHORT" and order_block == "bullish_order_block":
+        reasons_block.append("اوردر بلاک صعودی خلاف سیگنال شورت است")
+        liquidity_risk = "بالا"
+
+    # فیلتر سخت قدرت خرید/فروش:
+    # اختلاف بالای 10٪ خلاف جهت، رد کامل؛ اختلاف 5 تا 10٪ فقط اگر امتیاز خیلی قوی نباشد رد می‌شود.
+    if raw_direction == "LONG":
+        if sell_power >= buy_power + 10:
+            reasons_block.append("قدرت فروش به شکل واضح خلاف سیگنال لانگ است")
+            liquidity_risk = "بالا"
+        elif sell_power >= buy_power + 5 and score < 92:
+            reasons_block.append("قدرت فروش خلاف لانگ است و امتیاز سیگنال برای عبور کافی نیست")
+            liquidity_risk = "بالا"
+
+    if raw_direction == "SHORT":
+        if buy_power >= sell_power + 10:
+            reasons_block.append("قدرت خرید به شکل واضح خلاف سیگنال شورت است")
+            liquidity_risk = "بالا"
+        elif buy_power >= sell_power + 5 and score < 92:
+            reasons_block.append("قدرت خرید خلاف شورت است و امتیاز سیگنال برای عبور کافی نیست")
+            liquidity_risk = "بالا"
+
+    # خلاف روند کلی بازار فقط برای سیگنال‌های خیلی قوی مجاز است.
+    if market_regime == "bearish" and raw_direction == "LONG" and score < 95:
+        reasons_block.append("لانگ خلاف روند کلی نزولی بازار است")
+        liquidity_risk = "بالا"
+
+    if market_regime == "bullish" and raw_direction == "SHORT" and score < 95:
+        reasons_block.append("شورت خلاف روند کلی صعودی بازار است")
+        liquidity_risk = "بالا"
+
+    if market_regime == "neutral" and score < 86:
+        reasons_block.append("بازار کلی خنثی است و سیگنال قدرت کافی ندارد")
+        liquidity_risk = "بالا"
 
     news_active, news_reason = news_filter_status()
     if news_active:
@@ -1645,7 +1702,9 @@ def analyze_symbol(symbol):
         pattern,
         multi_candle,
         order_block,
-        vwap_status
+        vwap_status,
+        buy_power,
+        sell_power
     )
 
     entry_ok, block_reasons, liquidity_risk, fake_breakout, trend_exhaustion = entry_filter(
@@ -1656,7 +1715,10 @@ def analyze_symbol(symbol):
         df_15m,
         df_5m,
         spread_percent,
-        market_regime
+        market_regime,
+        order_block,
+        buy_power,
+        sell_power
     )
 
     risk_level = calculate_risk_level(
