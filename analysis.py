@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os
 import ccxt
 import pandas as pd
@@ -264,7 +265,7 @@ def minimum_volatility_ok(df):
         return False
 
     atr_percent = (last["atr"] / last["close"]) * 100
-    return atr_percent >= 0.10
+    return atr_percent >= 0.08
 
 
 def market_is_choppy(df_15m, df_5m):
@@ -274,11 +275,10 @@ def market_is_choppy(df_15m, df_5m):
     ema_gap_15 = abs(last_15["ema20"] - last_15["ema50"]) / last_15["close"] * 100
     ema_gap_5 = abs(last_5["ema20"] - last_5["ema50"]) / last_5["close"] * 100
 
-    # برای معاملات 30 تا 60 دقیقه، اگر 15M فشرده باشد سیگنال کیفیت کمی دارد.
-    if ema_gap_15 < 0.10 and ema_gap_5 < 0.06:
+    if ema_gap_15 < 0.08 and ema_gap_5 < 0.08:
         return True
 
-    if last_15["adx"] < 20 and last_5["adx"] < 18:
+    if last_15["adx"] < 18 and last_5["adx"] < 18:
         return True
 
     if atr_compression(df_15m) and atr_compression(df_5m):
@@ -514,13 +514,13 @@ def signal_validity(score, direction):
         return "سیگنال معتبر نیست"
 
     if score >= 90:
-        return "30 دقیقه تا 1 ساعت"
+        return "30 دقیقه تا 3 ساعت"
 
     if score >= 80:
-        return "30 تا 60 دقیقه"
+        return "15 تا 90 دقیقه"
 
     if score >= 70:
-        return "20 تا 45 دقیقه"
+        return "10 تا 45 دقیقه"
 
     return "اعتبار پایین"
 
@@ -529,7 +529,7 @@ def signal_timeframe(score, direction):
     if direction == "NO TRADE":
         return "بدون تایم‌فریم ورود"
 
-    return "15M تا 30M"
+    return "5M تا 15M"
 
 
 def score_macro_trend(df_1d, df_4h, df_1h, df_30m):
@@ -546,10 +546,10 @@ def score_macro_trend(df_1d, df_4h, df_1h, df_30m):
     }
 
     weights = {
-        "1D": 6,
-        "4H": 10,
-        "1H": 18,
-        "30M": 20,
+        "1D": 8,
+        "4H": 12,
+        "1H": 14,
+        "30M": 14,
     }
 
     for tf, trend in trends.items():
@@ -582,78 +582,66 @@ def score_entry(df_15m, df_5m):
 
     buy_power, sell_power = buy_sell_power(df_5m)
 
-    # در نسخه 30 تا 60 دقیقه، 15M تأیید اصلی ورود است و 5M فقط تریگر دقیق‌تر است.
     if last_15["close"] > last_15["ema20"] > last_15["ema50"]:
-        long_score += 20
+        long_score += 15
         reasons_long.append("15M: قیمت بالای EMA20 و EMA50")
 
     if last_15["close"] < last_15["ema20"] < last_15["ema50"]:
-        short_score += 20
+        short_score += 15
         reasons_short.append("15M: قیمت زیر EMA20 و EMA50")
 
-    if last_15["macd"] > last_15["macd_signal"]:
-        long_score += 8
-        reasons_long.append("15M: MACD صعودی است")
-
-    if last_15["macd"] < last_15["macd_signal"]:
-        short_score += 8
-        reasons_short.append("15M: MACD نزولی است")
-
     if last_5["close"] > last_5["ema20"] and last_5["macd"] > last_5["macd_signal"]:
-        long_score += 10
+        long_score += 15
         reasons_long.append("5M: تایید ورود لانگ با EMA و MACD")
 
     if last_5["close"] < last_5["ema20"] and last_5["macd"] < last_5["macd_signal"]:
-        short_score += 10
+        short_score += 15
         reasons_short.append("5M: تایید ورود شورت با EMA و MACD")
 
-    # RSI برای ترید 30 تا 60 دقیقه کمی متعادل‌تر شده است.
-    if 42 <= last_15["rsi"] <= 66 and 40 <= last_5["rsi"] <= 68:
+    if 45 <= last_5["rsi"] <= 68:
         long_score += 10
-        reasons_long.append("RSI مناسب برای لانگ در 15M و 5M")
+        reasons_long.append("RSI مناسب برای لانگ در 5M")
 
-    if 34 <= last_15["rsi"] <= 58 and 32 <= last_5["rsi"] <= 60:
+    if 32 <= last_5["rsi"] <= 55:
         short_score += 10
-        reasons_short.append("RSI مناسب برای شورت در 15M و 5M")
+        reasons_short.append("RSI مناسب برای شورت در 5M")
 
-    # قدرت خرید/فروش هنوز مهم است اما برای تایم بالاتر نباید به تنهایی غالب شود.
-    if buy_power >= 58:
-        long_score += 8
-        reasons_long.append("قدرت خرید مناسب در تایم ورود")
+    if buy_power >= 62:
+        long_score += 10
+        reasons_long.append("قدرت خرید بالا در تایم ورود")
 
-    if sell_power >= 58:
-        short_score += 8
-        reasons_short.append("قدرت فروش مناسب در تایم ورود")
+    if sell_power >= 62:
+        short_score += 10
+        reasons_short.append("قدرت فروش بالا در تایم ورود")
 
     pattern = candle_pattern(df_5m)
     multi_candle = multi_candle_confirmation(df_5m)
 
     if pattern in ["bullish_engulfing", "bullish_pinbar", "bullish_strong"]:
-        long_score += 7
+        long_score += 10
         reasons_long.append(f"کندل تاییدی لانگ: {pattern}")
 
     if pattern in ["bearish_engulfing", "bearish_pinbar", "bearish_strong"]:
-        short_score += 7
+        short_score += 10
         reasons_short.append(f"کندل تاییدی شورت: {pattern}")
 
     if multi_candle == "bullish":
-        long_score += 6
+        long_score += 8
         reasons_long.append("تایید چند کندلی صعودی")
 
     if multi_candle == "bearish":
-        short_score += 6
+        short_score += 8
         reasons_short.append("تایید چند کندلی نزولی")
 
     if volume_spike(df_5m):
-        long_score += 5
-        short_score += 5
+        long_score += 6
+        short_score += 6
         reasons_long.append("افزایش حجم واقعی")
         reasons_short.append("افزایش حجم واقعی")
 
-    # برای ترید 30 تا 60 دقیقه، ADX تایم 15M مهم‌تر از 5M است.
-    if last_15["adx"] >= 20:
-        long_score += 6
-        short_score += 6
+    if last_5["adx"] >= 22:
+        long_score += 5
+        short_score += 5
 
     return long_score, short_score, reasons_long, reasons_short, buy_power, sell_power, pattern, multi_candle
 
@@ -824,16 +812,13 @@ def score_vwap_volume_profile(df_15m, df_5m):
 
 
 def calculate_trade_levels(raw_direction, price, atr, support=None, resistance=None):
-    # برای ترید 30 تا 60 دقیقه، ATR تایم 15M از analyze_symbol پاس داده می‌شود.
-    # نسبت‌ها کمی بازتر شده‌اند تا تارگت/استاپ با نویز 5M فعال نشوند.
-    buffer = atr * 0.20
+    buffer = atr * 0.15
 
     if raw_direction == "LONG":
-        stop_loss = price - (atr * 1.35)
-        tp1 = price + (atr * 1.8)
-        tp2 = price + (atr * 3.0)
+        stop_loss = price - (atr * 1.2)
+        tp1 = price + (atr * 1.5)
+        tp2 = price + (atr * 2.5)
 
-        # TP1 پشت مقاومت نیفتد؛ قبل از مقاومت تنظیم شود.
         if resistance is not None and resistance > price:
             adjusted_tp1 = resistance - buffer
             if adjusted_tp1 > price:
@@ -842,11 +827,10 @@ def calculate_trade_levels(raw_direction, price, atr, support=None, resistance=N
         return stop_loss, tp1, tp2
 
     if raw_direction == "SHORT":
-        stop_loss = price + (atr * 1.35)
-        tp1 = price - (atr * 1.8)
-        tp2 = price - (atr * 3.0)
+        stop_loss = price + (atr * 1.2)
+        tp1 = price - (atr * 1.5)
+        tp2 = price - (atr * 2.5)
 
-        # TP1 پشت حمایت نیفتد؛ قبل از حمایت تنظیم شود.
         if support is not None and support < price:
             adjusted_tp1 = support + buffer
             if adjusted_tp1 < price:
@@ -953,15 +937,136 @@ def win_probability(score, risk_level, rr, adx, entry_grade_value):
     return max(0, min(probability, 95))
 
 
+def news_filter_status():
+    """
+    فیلتر خبر مهم.
+    فعلاً بدون API خارجی طراحی شده تا پایدار باشد:
+    اگر HIGH_IMPACT_NEWS=1 یا NEWS_FILTER_ENABLED=1 شود، ورود جدید بلاک می‌شود.
+    بعداً می‌توانیم این تابع را به API تقویم اقتصادی وصل کنیم.
+    """
+    high_impact_env = os.getenv("HIGH_IMPACT_NEWS", "0") == "1"
+    news_enabled_env = os.getenv("NEWS_FILTER_ENABLED", "0") == "1"
+
+    if high_impact_env or news_enabled_env:
+        return True, "فیلتر خبر مهم فعال است"
+
+    return False, "غیرفعال"
+
+
 def news_filter_active():
-    return os.getenv("HIGH_IMPACT_NEWS", "0") == "1"
+    active, _ = news_filter_status()
+    return active
+
+
+def tp_space_validation(raw_direction, price, atr, support, resistance):
+    """
+    بررسی می‌کند تا TP1 فضای کافی وجود داشته باشد.
+    هدف: لانگ نزدیک مقاومت و شورت نزدیک حمایت، بی‌دلیل سیگنال نشود.
+    """
+    if raw_direction == "LONG":
+        if resistance is None or resistance <= price:
+            return True, None
+
+        space = resistance - price
+        if space < atr * 1.15:
+            return False, "فضای کافی تا مقاومت برای TP وجود ندارد"
+
+    if raw_direction == "SHORT":
+        if support is None or support >= price:
+            return True, None
+
+        space = price - support
+        if space < atr * 1.15:
+            return False, "فضای کافی تا حمایت برای TP وجود ندارد"
+
+    return True, None
+
+
+def calculate_setup_zone(raw_direction, price, atr):
+    """
+    ناحیه ورود پیشنهادی برای حالت Setup -> Entry Trigger.
+    این فقط برای راهنمایی ورود بهتر است و به تنهایی سفارش نیست.
+    """
+    if raw_direction == "LONG":
+        zone_low = price - (atr * 0.35)
+        zone_high = price + (atr * 0.10)
+        trigger = "ورود لانگ فقط بعد از حفظ ناحیه ورود و بسته شدن کندل تاییدی صعودی در 5M/15M"
+
+    elif raw_direction == "SHORT":
+        zone_low = price - (atr * 0.10)
+        zone_high = price + (atr * 0.35)
+        trigger = "ورود شورت فقط بعد از حفظ ناحیه ورود و بسته شدن کندل تاییدی نزولی در 5M/15M"
+
+    else:
+        return "inactive", None, None, "ستاپ فعالی وجود ندارد"
+
+    return "ready", zone_low, zone_high, trigger
+
+
+def very_safe_status(raw_direction, score, win_probability_value, risk_level, rr, trends,
+                     vwap_status, buy_power, sell_power, adx_value):
+    """
+    حالت Very Safe Mode:
+    برای سیگنال‌های کم‌تعدادتر اما هم‌راستاتر.
+    این تابع سیگنال معمولی را حذف نمی‌کند؛ فقط وضعیت خیلی امن را مشخص می‌کند.
+    """
+    reasons = []
+
+    if raw_direction not in ["LONG", "SHORT"]:
+        return False, ["جهت مشخص نیست"]
+
+    if score < 88:
+        reasons.append("امتیاز کمتر از حد Very Safe است")
+
+    if win_probability_value is not None and win_probability_value < 75:
+        reasons.append("احتمال موفقیت کمتر از حد Very Safe است")
+
+    if risk_level == "بالا":
+        reasons.append("ریسک بالا است")
+
+    if rr < 1.2:
+        reasons.append("ریسک به ریوارد برای Very Safe کافی نیست")
+
+    if adx_value < 22:
+        reasons.append("ADX برای Very Safe کمی ضعیف است")
+
+    if raw_direction == "LONG":
+        aligned = 0
+        for tf in ["4H", "1H", "30M"]:
+            if trends.get(tf) in ["bullish", "weak_bullish"]:
+                aligned += 1
+
+        if aligned < 2:
+            reasons.append("هم‌جهتی تایم‌فریم‌های بالاتر برای لانگ کافی نیست")
+
+        if vwap_status != "above_vwap":
+            reasons.append("VWAP برای لانگ تایید کامل نمی‌دهد")
+
+        if buy_power < 55:
+            reasons.append("قدرت خرید برای Very Safe کافی نیست")
+
+    if raw_direction == "SHORT":
+        aligned = 0
+        for tf in ["4H", "1H", "30M"]:
+            if trends.get(tf) in ["bearish", "weak_bearish"]:
+                aligned += 1
+
+        if aligned < 2:
+            reasons.append("هم‌جهتی تایم‌فریم‌های بالاتر برای شورت کافی نیست")
+
+        if vwap_status != "below_vwap":
+            reasons.append("VWAP برای شورت تایید کامل نمی‌دهد")
+
+        if sell_power < 55:
+            reasons.append("قدرت فروش برای Very Safe کافی نیست")
+
+    return len(reasons) == 0, reasons
 
 
 def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, spread_percent):
     last_5 = df_5m.iloc[-1]
-    last_15 = df_15m.iloc[-1]
     price = float(last_5["close"])
-    atr = float(last_15["atr"])
+    atr = float(last_5["atr"])
     support, resistance = support_resistance(df_15m)
 
     reasons_block = []
@@ -971,8 +1076,9 @@ def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, s
         reasons_block.append("اختلاف لانگ و شورت کافی نیست")
         return False, reasons_block, "بالا", "none", "none"
 
-    if news_filter_active():
-        reasons_block.append("فیلتر خبر فعال است")
+    news_active, news_reason = news_filter_status()
+    if news_active:
+        reasons_block.append(news_reason)
         liquidity_risk = "بالا"
 
     if market_is_choppy(df_15m, df_5m):
@@ -1002,10 +1108,10 @@ def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, s
             reasons_block.append("قیمت نزدیک مقاومت است")
             liquidity_risk = "بالا"
 
-        if last_15["rsi"] > 66 or last_5["rsi"] > 70:
+        if last_5["rsi"] > 65:
             reasons_block.append("RSI برای لانگ بیش از حد بالاست")
 
-        if last_15["adx"] < 20:
+        if last_5["adx"] < 18:
             reasons_block.append("قدرت روند برای لانگ کافی نیست")
 
         if fake_breakout == "fake_bullish_breakout":
@@ -1022,10 +1128,10 @@ def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, s
             reasons_block.append("قیمت نزدیک حمایت است")
             liquidity_risk = "بالا"
 
-        if last_15["rsi"] < 34 or last_5["rsi"] < 30:
+        if last_5["rsi"] < 35:
             reasons_block.append("RSI برای شورت بیش از حد پایین است")
 
-        if last_15["adx"] < 20:
+        if last_5["adx"] < 18:
             reasons_block.append("قدرت روند برای شورت کافی نیست")
 
         if fake_breakout == "fake_bearish_breakout":
@@ -1179,17 +1285,16 @@ def analyze_symbol(symbol):
     short_score = cap_score(short_score)
 
     last = df_5m.iloc[-1]
-    last_15 = df_15m.iloc[-1]
-
     price = float(last["close"])
-
-    # ATR اصلی معامله از 15M گرفته می‌شود تا سطوح برای ترید 30 تا 60 دقیقه مناسب باشند.
-    atr = float(last_15["atr"])
-
-    # ADX اصلی از 15M گرفته می‌شود چون تایم معامله 30 تا 60 دقیقه است.
-    adx_value = float(last_15["adx"])
-
+    atr = float(last["atr"])
+    adx_value = float(last["adx"])
     support, resistance = support_resistance(df_15m)
+
+    setup_status, entry_zone_low, entry_zone_high, entry_trigger = calculate_setup_zone(
+        "NO TRADE",
+        price,
+        atr
+    )
 
     spread_percent = get_spread_percent(symbol)
 
@@ -1205,6 +1310,12 @@ def analyze_symbol(symbol):
         raw_direction = "NO TRADE"
         score = max(long_score, short_score)
         reasons = ["اختلاف لانگ و شورت کافی نیست"]
+
+    setup_status, entry_zone_low, entry_zone_high, entry_trigger = calculate_setup_zone(
+        raw_direction,
+        price,
+        atr
+    )
 
     stop_loss_raw, tp1_raw, tp2_raw = calculate_trade_levels(
         raw_direction,
@@ -1257,6 +1368,19 @@ def analyze_symbol(symbol):
         tp2 = None
 
     win_prob = win_probability(score, risk_level, rr, adx_value, grade)
+
+    very_safe_ok, very_safe_reasons = very_safe_status(
+        final_direction,
+        score,
+        win_prob,
+        risk_level,
+        rr,
+        trends,
+        vwap_status,
+        buy_power,
+        sell_power,
+        adx_value
+    )
 
     return {
         "symbol": symbol,
@@ -1332,5 +1456,16 @@ def analyze_symbol(symbol):
 
         "long_score": long_score,
         "short_score": short_score,
+
+        "setup_status": setup_status,
+        "entry_zone_low": None if entry_zone_low is None else safe_round(entry_zone_low, 8),
+        "entry_zone_high": None if entry_zone_high is None else safe_round(entry_zone_high, 8),
+        "entry_trigger": entry_trigger,
+
+        "very_safe": very_safe_ok,
+        "very_safe_reasons": very_safe_reasons[:8],
+
+        "news_filter_active": news_filter_active(),
+
         "reasons": reasons[:18],
     }
