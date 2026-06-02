@@ -438,6 +438,243 @@ def check_active_signals():
     return messages
 
 
+
+
+def normalize_number_text_for_calc(text):
+    mapping = {
+        "۰": "0", "۱": "1", "۲": "2", "۳": "3", "۴": "4",
+        "۵": "5", "۶": "6", "۷": "7", "۸": "8", "۹": "9",
+        "٠": "0", "١": "1", "٢": "2", "٣": "3", "٤": "4",
+        "٥": "5", "٦": "6", "٧": "7", "٨": "8", "٩": "9",
+        "٫": ".", ",": "."
+    }
+
+    for src, dst in mapping.items():
+        text = text.replace(src, dst)
+
+    return text
+
+
+def parse_profit_calc_text(text):
+    """
+    استخراج سرمایه و لوریج از متن.
+    مثال‌های قابل قبول:
+    5 دلار لوریج 20
+    7.5 دلار لوریج 25
+    سرمایه 12 لوریج 30
+    10 20
+    """
+    if not text:
+        return None
+
+    normalized = normalize_number_text_for_calc(text.strip().lower())
+
+    has_calc_word = (
+        "لوریج" in normalized
+        or "leverage" in normalized
+        or "اهرم" in normalized
+        or "دلار" in normalized
+        or "$" in normalized
+        or "سرمایه" in normalized
+        or "محاسبه" in normalized
+        or "سود" in normalized
+        or "ضرر" in normalized
+    )
+
+    numbers = re.findall(r"\d+(?:\.\d+)?", normalized)
+
+    if len(numbers) < 2 or not has_calc_word:
+        return None
+
+    margin = None
+    leverage = None
+
+    lev_match = re.search(r"(?:لوریج|leverage|اهرم)\s*(\d+(?:\.\d+)?)", normalized)
+    if lev_match:
+        leverage = float(lev_match.group(1))
+
+        before_lev = normalized[:lev_match.start()]
+        before_numbers = re.findall(r"\d+(?:\.\d+)?", before_lev)
+        if before_numbers:
+            margin = float(before_numbers[-1])
+        else:
+            after_lev = normalized[lev_match.end():]
+            after_numbers = re.findall(r"\d+(?:\.\d+)?", after_lev)
+            if after_numbers:
+                margin = float(after_numbers[0])
+
+    if margin is None or leverage is None:
+        margin = float(numbers[0])
+        leverage = float(numbers[1])
+
+    if margin <= 0 or leverage <= 0:
+        return None
+
+    return margin, leverage
+
+
+def calculate_pnl_usdt(result_percent, margin, leverage):
+    try:
+        result_percent = float(result_percent)
+        margin = float(margin)
+        leverage = float(leverage)
+    except Exception:
+        return 0
+
+    return round((margin * leverage * result_percent) / 100, 4)
+
+
+def format_money(value):
+    try:
+        value = float(value)
+    except Exception:
+        value = 0
+
+    sign = "+" if value > 0 else ""
+    return f"{sign}{round(value, 4)}$"
+
+
+def parse_days_from_report_text(text):
+    if not text:
+        return 7
+
+    normalized = normalize_number_text_for_calc(text)
+
+    if "آمار کل" in normalized:
+        return None
+
+    match = re.search(r"آمار\s+(\d+)\s+روز", normalized)
+    if match:
+        return int(match.group(1))
+
+    return 7
+
+
+def get_profit_for_signal_text(reply_text, margin, leverage):
+    """
+    محاسبه سود/ضرر برای یک پیام نتیجه TP/SL یا یک خط سیگنال.
+    """
+    if not reply_text:
+        return None
+
+    normalized = normalize_number_text_for_calc(reply_text)
+
+    percent_match = re.search(r"درصد حرکت\s*:\s*([+-]?\d+(?:\.\d+)?)\s*٪", normalized)
+    if not percent_match:
+        # برای خط‌های آمار مثل: BTCUSDT | شورت | +1.2٪
+        percent_match = re.search(r"([+-]?\d+(?:\.\d+)?)\s*٪", normalized)
+
+    if not percent_match:
+        return None
+
+    result_percent = float(percent_match.group(1))
+    pnl = calculate_pnl_usdt(result_percent, margin, leverage)
+
+    symbol = "نامشخص"
+    symbol_match = re.search(r"([A-Z0-9]+USDT)", normalized)
+    if symbol_match:
+        symbol = symbol_match.group(1)
+
+    result_text = "سود" if pnl > 0 else "ضرر" if pnl < 0 else "بدون سود/ضرر"
+
+    return (
+        f"💰 محاسبه معامله\n\n"
+        f"ارز: {symbol}\n"
+        f"سرمایه: {margin}$\n"
+        f"لوریج: {leverage}x\n\n"
+        f"درصد حرکت:\n"
+        f"{result_percent}٪\n\n"
+        f"{result_text} تقریبی:\n"
+        f"{format_money(pnl)}"
+    )
+
+
+def get_profit_simulation_report(margin, leverage, days=None):
+    """
+    شبیه‌سازی سود/ضرر کل آمار با سرمایه و لوریج دلخواه.
+    هر سیگنال مثل یک معامله جداگانه با همان سرمایه فرض می‌شود.
+    """
+    stats = get_signal_stats()
+
+    if days is not None:
+        start_ts = now_ts() - (days * 24 * 60 * 60)
+        stats = [s for s in stats if s.get("closed_at", 0) >= start_ts]
+
+    total = len(stats)
+
+    if total == 0:
+        title = "آمار کل" if days is None else f"{days} روز اخیر"
+        return f"📊 برای {title} معامله بسته‌شده‌ای جهت محاسبه وجود ندارد."
+
+    wins = [s for s in stats if s.get("status") == "TP1"]
+    losses = [s for s in stats if s.get("status") == "SL"]
+
+    gross_profit = 0
+    gross_loss = 0
+
+    best_trade = None
+    worst_trade = None
+
+    for s in stats:
+        pnl = calculate_pnl_usdt(s.get("result_percent", 0), margin, leverage)
+        s["_calc_pnl"] = pnl
+
+        if pnl >= 0:
+            gross_profit += pnl
+        else:
+            gross_loss += pnl
+
+        if best_trade is None or pnl > best_trade.get("_calc_pnl", 0):
+            best_trade = s
+
+        if worst_trade is None or pnl < worst_trade.get("_calc_pnl", 0):
+            worst_trade = s
+
+    net = round(gross_profit + gross_loss, 4)
+    total_margin_used = margin * total
+    roi = round((net / total_margin_used) * 100, 2) if total_margin_used > 0 else 0
+
+    title = "آمار کل" if days is None else f"آمار {days} روز اخیر"
+
+    best_text = "نامشخص"
+    if best_trade:
+        best_text = (
+            f"{best_trade.get('symbol')} | "
+            f"{fa_direction(best_trade.get('direction'))} | "
+            f"{format_money(best_trade.get('_calc_pnl', 0))}"
+        )
+
+    worst_text = "نامشخص"
+    if worst_trade:
+        worst_text = (
+            f"{worst_trade.get('symbol')} | "
+            f"{fa_direction(worst_trade.get('direction'))} | "
+            f"{format_money(worst_trade.get('_calc_pnl', 0))}"
+        )
+
+    return (
+        f"💰 شبیه‌سازی سود و ضرر\n\n"
+        f"{title}\n\n"
+        f"سرمایه هر معامله: {margin}$\n"
+        f"لوریج: {leverage}x\n\n"
+        f"تعداد معاملات: {total}\n"
+        f"بردها: {len(wins)}\n"
+        f"استاپ‌ها: {len(losses)}\n\n"
+        f"سود کل TPها:\n"
+        f"{format_money(gross_profit)}\n\n"
+        f"ضرر کل SLها:\n"
+        f"{format_money(gross_loss)}\n\n"
+        f"سود/ضرر خالص:\n"
+        f"{format_money(net)}\n\n"
+        f"بازده نسبت به مجموع سرمایه‌های واردشده:\n"
+        f"{roi}٪\n\n"
+        f"بهترین معامله:\n"
+        f"{best_text}\n\n"
+        f"بدترین معامله:\n"
+        f"{worst_text}\n\n"
+        f"محاسبه بدون کارمزد و اسلیپیج است."
+    )
+
 def parse_days_from_text(text):
     text = text.strip()
 
