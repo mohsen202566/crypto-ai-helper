@@ -1109,7 +1109,8 @@ def calculate_setup_zone(raw_direction, price, atr):
 
 
 def very_safe_status(raw_direction, score, win_probability_value, risk_level, rr, trends,
-                     vwap_status, buy_power, sell_power, adx_value):
+                     vwap_status, buy_power, sell_power, adx_value,
+                     pattern=None, multi_candle=None, order_block=None, fvg=None):
     """
     حالت Very Safe Mode:
     برای سیگنال‌های کم‌تعدادتر اما هم‌راستاتر.
@@ -1150,6 +1151,18 @@ def very_safe_status(raw_direction, score, win_probability_value, risk_level, rr
         if buy_power < 55:
             reasons.append("قدرت خرید برای Very Safe کافی نیست")
 
+        if pattern in ["bearish_engulfing", "bearish_pinbar", "bearish_strong"]:
+            reasons.append("کندل تاییدی مخالف لانگ است")
+
+        if multi_candle == "bearish":
+            reasons.append("تایید چندکندلی مخالف لانگ است")
+
+        if order_block == "bearish_order_block":
+            reasons.append("اوردر بلاک مخالف لانگ است")
+
+        if fvg == "bearish_fvg":
+            reasons.append("ناحیه خالی نقدینگی مخالف لانگ است")
+
     if raw_direction == "SHORT":
         aligned = 0
         for tf in ["4H", "1H", "30M"]:
@@ -1164,6 +1177,18 @@ def very_safe_status(raw_direction, score, win_probability_value, risk_level, rr
 
         if sell_power < 55:
             reasons.append("قدرت فروش برای Very Safe کافی نیست")
+
+        if pattern in ["bullish_engulfing", "bullish_pinbar", "bullish_strong"]:
+            reasons.append("کندل تاییدی مخالف شورت است")
+
+        if multi_candle == "bullish":
+            reasons.append("تایید چندکندلی مخالف شورت است")
+
+        if order_block == "bullish_order_block":
+            reasons.append("اوردر بلاک مخالف شورت است")
+
+        if fvg == "bullish_fvg":
+            reasons.append("ناحیه خالی نقدینگی مخالف شورت است")
 
     return len(reasons) == 0, reasons
 
@@ -1513,7 +1538,11 @@ def analyze_symbol(symbol):
         vwap_status,
         buy_power,
         sell_power,
-        adx_value
+        adx_value,
+        pattern,
+        multi_candle,
+        order_block,
+        fvg
     )
 
     return {
