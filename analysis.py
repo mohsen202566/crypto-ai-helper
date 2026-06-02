@@ -476,6 +476,141 @@ def calculate_volume_profile(df):
         return None, "unknown"
 
 
+
+def detect_market_regime(symbol, df_4h, df_1h, df_30m, df_15m, market=None):
+    """
+    تشخیص روند کلی بازار.
+    خروجی:
+    bullish / bearish / neutral
+
+    این لایه فقط نمایشی نیست؛ روی امتیازدهی و فیلتر ورود اثر می‌گذارد.
+    """
+    score = 0
+    reasons = []
+
+    try:
+        if symbol == "BTCUSDT":
+            btc_4h = df_4h
+            btc_1h = df_1h
+            btc_30m = df_30m
+            btc_15m = df_15m
+        else:
+            btc_4h = add_indicators(get_klines("BTCUSDT", "4h"))
+            btc_1h = add_indicators(get_klines("BTCUSDT", "1h"))
+            btc_30m = add_indicators(get_klines("BTCUSDT", "30m"))
+            btc_15m = add_indicators(get_klines("BTCUSDT", "15m"))
+
+        btc_trends = {
+            "4H": trend_direction(btc_4h),
+            "1H": trend_direction(btc_1h),
+            "30M": trend_direction(btc_30m),
+            "15M": trend_direction(btc_15m),
+        }
+
+        weights = {
+            "4H": 3,
+            "1H": 3,
+            "30M": 2,
+            "15M": 1,
+        }
+
+        for tf, trend in btc_trends.items():
+            weight = weights[tf]
+
+            if trend == "bullish":
+                score += weight
+                reasons.append(f"BTC {tf}: روند صعودی")
+            elif trend == "weak_bullish":
+                score += max(1, int(weight * 0.5))
+                reasons.append(f"BTC {tf}: تمایل صعودی")
+            elif trend == "bearish":
+                score -= weight
+                reasons.append(f"BTC {tf}: روند نزولی")
+            elif trend == "weak_bearish":
+                score -= max(1, int(weight * 0.5))
+                reasons.append(f"BTC {tf}: تمایل نزولی")
+
+        last_btc_1h = btc_1h.iloc[-1]
+        last_btc_30m = btc_30m.iloc[-1]
+
+        if last_btc_1h["close"] > last_btc_1h["ema200"]:
+            score += 2
+            reasons.append("BTC بالای EMA200 یک‌ساعته است")
+        else:
+            score -= 2
+            reasons.append("BTC پایین EMA200 یک‌ساعته است")
+
+        if last_btc_30m["close"] > last_btc_30m["vwap"]:
+            score += 1
+            reasons.append("BTC بالای VWAP سی‌دقیقه است")
+        else:
+            score -= 1
+            reasons.append("BTC پایین VWAP سی‌دقیقه است")
+
+        if market:
+            fear_value = market.get("fear_value")
+            btc_dominance = market.get("btc_dominance")
+
+            if fear_value is not None:
+                if fear_value <= 25:
+                    score -= 1
+                    reasons.append("Fear & Greed در محدوده ترس شدید است")
+                elif fear_value >= 75:
+                    score += 1
+                    reasons.append("Fear & Greed در محدوده طمع شدید است")
+
+            if symbol != "BTCUSDT" and btc_dominance is not None:
+                try:
+                    dominance = float(btc_dominance)
+                    if dominance >= 55:
+                        score -= 1
+                        reasons.append("دامیننس بیتکوین بالا است و برای آلت‌ها فشار ایجاد می‌کند")
+                    elif dominance <= 50:
+                        score += 1
+                        reasons.append("دامیننس بیتکوین پایین‌تر است و برای آلت‌ها بهتر است")
+                except Exception:
+                    pass
+
+        if score >= 5:
+            regime = "bullish"
+            text_value = "صعودی"
+        elif score <= -5:
+            regime = "bearish"
+            text_value = "نزولی"
+        else:
+            regime = "neutral"
+            text_value = "خنثی"
+
+        return regime, text_value, score, reasons[:8]
+
+    except Exception as e:
+        return "neutral", "نامشخص", 0, [f"تشخیص روند کلی بازار ناموفق بود: {str(e)}"]
+
+
+def apply_market_regime_to_scores(long_score, short_score, market_regime, reasons_long, reasons_short):
+    """
+    اعمال روند کلی بازار روی امتیازها.
+    """
+    if market_regime == "bearish":
+        short_score += 10
+        long_score -= 15
+        reasons_short.append("تقویت: روند کلی بازار نزولی است")
+        reasons_long.append("جریمه: لانگ خلاف روند کلی نزولی بازار است")
+
+    elif market_regime == "bullish":
+        long_score += 10
+        short_score -= 15
+        reasons_long.append("تقویت: روند کلی بازار صعودی است")
+        reasons_short.append("جریمه: شورت خلاف روند کلی صعودی بازار است")
+
+    elif market_regime == "neutral":
+        long_score -= 3
+        short_score -= 3
+        reasons_long.append("احتیاط: روند کلی بازار خنثی است")
+        reasons_short.append("احتیاط: روند کلی بازار خنثی است")
+
+    return max(0, long_score), max(0, short_score)
+
 def btc_filter(symbol):
     if symbol == "BTCUSDT":
         return "neutral", 0, 0, [], []
@@ -1110,7 +1245,8 @@ def calculate_setup_zone(raw_direction, price, atr):
 
 def very_safe_status(raw_direction, score, win_probability_value, risk_level, rr, trends,
                      vwap_status, buy_power, sell_power, adx_value,
-                     pattern=None, multi_candle=None, order_block=None, fvg=None):
+                     pattern=None, multi_candle=None, order_block=None, fvg=None,
+                     market_regime="neutral"):
     """
     حالت Very Safe Mode:
     برای سیگنال‌های کم‌تعدادتر اما هم‌راستاتر.
@@ -1120,6 +1256,15 @@ def very_safe_status(raw_direction, score, win_probability_value, risk_level, rr
 
     if raw_direction not in ["LONG", "SHORT"]:
         return False, ["جهت مشخص نیست"]
+
+    if market_regime == "bearish" and raw_direction == "LONG":
+        reasons.append("لانگ خلاف روند کلی نزولی بازار است")
+
+    if market_regime == "bullish" and raw_direction == "SHORT":
+        reasons.append("شورت خلاف روند کلی صعودی بازار است")
+
+    if market_regime == "neutral":
+        reasons.append("روند کلی بازار خنثی است")
 
     if score < 88:
         reasons.append("امتیاز کمتر از حد Very Safe است")
@@ -1193,7 +1338,7 @@ def very_safe_status(raw_direction, score, win_probability_value, risk_level, rr
     return len(reasons) == 0, reasons
 
 
-def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, spread_percent):
+def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, spread_percent, market_regime="neutral"):
     last_5 = df_5m.iloc[-1]
     last_15 = df_15m.iloc[-1]
     price = float(last_5["close"])
@@ -1422,6 +1567,23 @@ def analyze_symbol(symbol):
     reasons_long += rl
     reasons_short += rs
 
+    market_regime, market_regime_text, market_regime_score, market_regime_reasons = detect_market_regime(
+        symbol,
+        df_4h,
+        df_1h,
+        df_30m,
+        df_15m,
+        market
+    )
+
+    long_score, short_score = apply_market_regime_to_scores(
+        long_score,
+        short_score,
+        market_regime,
+        reasons_long,
+        reasons_short
+    )
+
     l, s, funding_rate, open_interest, risk_notes = score_futures_data(symbol)
     long_score += l
     short_score += s
@@ -1493,7 +1655,8 @@ def analyze_symbol(symbol):
         short_score,
         df_15m,
         df_5m,
-        spread_percent
+        spread_percent,
+        market_regime
     )
 
     risk_level = calculate_risk_level(
@@ -1542,7 +1705,8 @@ def analyze_symbol(symbol):
         pattern,
         multi_candle,
         order_block,
-        fvg
+        fvg,
+        market_regime
     )
 
     return {
@@ -1616,6 +1780,11 @@ def analyze_symbol(symbol):
         "btc_dominance": market.get("btc_dominance"),
         "dominance_status": market.get("dominance_status"),
         "altseason_status": market.get("altseason_status"),
+
+        "market_regime": market_regime,
+        "market_regime_text": market_regime_text,
+        "market_regime_score": market_regime_score,
+        "market_regime_reasons": market_regime_reasons,
 
         "long_score": long_score,
         "short_score": short_score,
