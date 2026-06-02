@@ -97,6 +97,30 @@ def add_signal_to_tracking(user_id, chat_id, message_id, result):
         "risk_level": result.get("risk_level"),
         "risk_reward": result.get("risk_reward"),
 
+        "market_regime": result.get("market_regime"),
+        "market_regime_text": result.get("market_regime_text"),
+        "buy_power": result.get("buy_power"),
+        "sell_power": result.get("sell_power"),
+        "adx": result.get("adx"),
+        "rsi": result.get("rsi"),
+        "vwap_status": result.get("vwap_status"),
+        "order_block": result.get("order_block"),
+        "fvg": result.get("fvg"),
+        "candle_pattern": result.get("candle_pattern"),
+        "multi_candle": result.get("multi_candle"),
+        "market_structure": result.get("market_structure"),
+        "trendline": result.get("trendline"),
+        "breakout": result.get("breakout"),
+        "rsi_divergence": result.get("rsi_divergence"),
+        "macd_divergence": result.get("macd_divergence"),
+        "fake_breakout": result.get("fake_breakout"),
+        "trend_exhaustion": result.get("trend_exhaustion"),
+        "reasons": result.get("reasons", []),
+
+        "warning_reasons": [],
+        "warning_time": None,
+        "warning_time_text": None,
+
         "created_at": now_ts(),
         "created_at_text": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
 
@@ -173,6 +197,9 @@ def close_signal(signal, result_type, exit_price):
             f"درصد حرکت: {closed['result_percent']}٪"
         )
 
+    sl_reasons = guess_sl_reasons(closed)
+    reasons_text = "\n".join([f"- {r}" for r in sl_reasons[:4]])
+
     return (
         f"❌ نتیجه سیگنال {signal['symbol']}\n\n"
         f"جهت: {'لانگ' if signal['direction'] == 'LONG' else 'شورت'}\n"
@@ -180,9 +207,129 @@ def close_signal(signal, result_type, exit_price):
         f"SL: {signal['stop_loss']}\n"
         f"قیمت خروج: {exit_price}\n"
         f"نتیجه: حد ضرر ❌\n"
-        f"درصد حرکت: {closed['result_percent']}٪"
+        f"درصد حرکت: {closed['result_percent']}٪\n\n"
+        f"دلایل احتمالی استاپ:\n"
+        f"{reasons_text}"
     )
 
+
+
+
+def fa_direction(direction):
+    if direction == "LONG":
+        return "لانگ"
+    if direction == "SHORT":
+        return "شورت"
+    return "نامشخص"
+
+
+def format_signed_percent(value):
+    try:
+        value = float(value)
+    except Exception:
+        return "0٪"
+
+    sign = "+" if value > 0 else ""
+    return f"{sign}{value}٪"
+
+
+def compact_signal_line(signal):
+    return (
+        f"{signal.get('symbol', 'نامشخص')} | "
+        f"{fa_direction(signal.get('direction'))} | "
+        f"{format_signed_percent(signal.get('result_percent', 0))} | "
+        f"ورود: {signal.get('entry')} | خروج: {signal.get('exit_price')}"
+    )
+
+
+def guess_sl_reasons(signal):
+    reasons = []
+
+    warning_reasons = signal.get("warning_reasons") or []
+    if warning_reasons:
+        reasons.append("قبل از SL هشدار ضعف صادر شده بود")
+        for item in warning_reasons[:3]:
+            reasons.append(item)
+
+    direction = signal.get("direction")
+
+    buy_power = signal.get("buy_power")
+    sell_power = signal.get("sell_power")
+
+    try:
+        buy_power = float(buy_power)
+        sell_power = float(sell_power)
+
+        if direction == "LONG" and sell_power >= buy_power + 10:
+            reasons.append("قدرت فروش هنگام ورود از خرید بیشتر بود")
+
+        if direction == "SHORT" and buy_power >= sell_power + 10:
+            reasons.append("قدرت خرید هنگام ورود از فروش بیشتر بود")
+    except Exception:
+        pass
+
+    if direction == "LONG":
+        if signal.get("vwap_status") == "below_vwap":
+            reasons.append("لانگ زیر VWAP ثبت شده بود")
+        if signal.get("order_block") == "bearish_order_block":
+            reasons.append("اوردر بلاک مخالف لانگ بود")
+        if signal.get("fvg") == "bearish_fvg":
+            reasons.append("FVG مخالف لانگ بود")
+        if signal.get("multi_candle") == "bearish":
+            reasons.append("تایید چندکندلی مخالف لانگ بود")
+        if signal.get("market_regime") == "bearish":
+            reasons.append("لانگ خلاف روند کلی نزولی بازار بود")
+
+    if direction == "SHORT":
+        if signal.get("vwap_status") == "above_vwap":
+            reasons.append("شورت بالای VWAP ثبت شده بود")
+        if signal.get("order_block") == "bullish_order_block":
+            reasons.append("اوردر بلاک مخالف شورت بود")
+        if signal.get("fvg") == "bullish_fvg":
+            reasons.append("FVG مخالف شورت بود")
+        if signal.get("multi_candle") == "bullish":
+            reasons.append("تایید چندکندلی مخالف شورت بود")
+        if signal.get("market_regime") == "bullish":
+            reasons.append("شورت خلاف روند کلی صعودی بازار بود")
+
+    if signal.get("fake_breakout") not in [None, "none"]:
+        reasons.append("احتمال فیک بریک‌اوت در تحلیل ثبت شده بود")
+
+    if signal.get("trend_exhaustion") not in [None, "none"]:
+        reasons.append("نشانه خستگی روند وجود داشت")
+
+    if not reasons:
+        reasons.append("دلیل مشخصی در داده‌های ذخیره‌شده دیده نشد")
+
+    clean = []
+    for item in reasons:
+        if item and item not in clean:
+            clean.append(item)
+
+    return clean[:5]
+
+
+def format_signal_details(items, title, limit=10, include_reasons=False):
+    if not items:
+        return f"\n{title}\nندارد\n"
+
+    out = f"\n{title}\n"
+
+    for signal in items[:limit]:
+        out += f"\n{compact_signal_line(signal)}"
+
+        if include_reasons:
+            reasons = guess_sl_reasons(signal)
+            out += "\nدلیل احتمالی:"
+            for reason in reasons[:4]:
+                out += f"\n- {reason}"
+
+        out += "\n"
+
+    if len(items) > limit:
+        out += f"\n... و {len(items) - limit} مورد دیگر\n"
+
+    return out
 
 
 def weakness_warning_for_signal(signal, result, price):
@@ -223,7 +370,7 @@ def weakness_warning_for_signal(signal, result, price):
 
     if len(warnings) >= 3:
         text = "\n".join([f"⚠️ {w}" for w in warnings[:5]])
-        return (
+        message = (
             f"⚠️ هشدار ضعف سیگنال {signal['symbol']}\n\n"
             f"جهت سیگنال: {'لانگ' if direction == 'LONG' else 'شورت'}\n"
             f"ورود: {signal['entry']}\n"
@@ -232,7 +379,9 @@ def weakness_warning_for_signal(signal, result, price):
             f"ریسک معامله بالا رفته؛ بستن معامله یا کاهش ریسک را بررسی کن."
         )
 
-    return None
+        return message, warnings[:5]
+
+    return None, []
 
 
 def check_active_signals():
@@ -263,10 +412,14 @@ def check_active_signals():
             if not signal.get("warning_sent", False):
                 try:
                     result = analyze_symbol(signal["symbol"])
-                    warning_msg = weakness_warning_for_signal(signal, result, price)
+                    warning_msg, warning_reasons = weakness_warning_for_signal(signal, result, price)
 
                     if warning_msg:
                         signal["warning_sent"] = True
+                        signal["warning_reasons"] = warning_reasons
+                        signal["warning_time"] = now_ts()
+                        signal["warning_time_text"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
                         messages.append({
                             "chat_id": signal["chat_id"],
                             "message": warning_msg
@@ -316,8 +469,11 @@ def get_stats_report(days=None):
             return "📊 هنوز هیچ سیگنال بسته‌شده‌ای در آمار کل وجود ندارد."
         return f"📊 در {days} روز اخیر هیچ سیگنال بسته‌شده‌ای وجود ندارد."
 
-    tp1_count = len([s for s in stats if s.get("status") == "TP1"])
-    sl_count = len([s for s in stats if s.get("status") == "SL"])
+    wins_list = [s for s in stats if s.get("status") == "TP1"]
+    losses_list = [s for s in stats if s.get("status") == "SL"]
+
+    tp1_count = len(wins_list)
+    sl_count = len(losses_list)
 
     win_rate = round((tp1_count / total) * 100, 1)
 
@@ -356,13 +512,22 @@ def get_stats_report(days=None):
 
     top_symbols_text = ""
 
-    for sym, data in sorted_symbols[:5]:
+    for sym, data in sorted_symbols[:7]:
         wr = round((data["wins"] / data["total"]) * 100, 1)
         top_symbols_text += f"\n{sym}: {data['wins']}/{data['total']} برد | {wr}٪"
 
+    avg_win = 0
+    avg_loss = 0
+
+    if wins_list:
+        avg_win = round(sum([abs(float(s.get("result_percent", 0))) for s in wins_list]) / len(wins_list), 3)
+
+    if losses_list:
+        avg_loss = round(sum([abs(float(s.get("result_percent", 0))) for s in losses_list]) / len(losses_list), 3)
+
     title = "آمار کل" if days is None else f"آمار {days} روز اخیر"
 
-    return f"""
+    report = f"""
 📊 {title}
 
 کل سیگنال‌های زیرنظرگرفته‌شده:
@@ -377,6 +542,12 @@ def get_stats_report(days=None):
 Win Rate:
 {win_rate}٪
 
+میانگین برد:
+{avg_win}٪
+
+میانگین باخت:
+{avg_loss}٪
+
 لانگ:
 {direction_report(long_stats)}
 
@@ -386,3 +557,20 @@ Win Rate:
 عملکرد ارزها:
 {top_symbols_text}
 """
+
+    report += format_signal_details(
+        wins_list,
+        f"✅ لیست بردها ({len(wins_list)}):",
+        limit=12,
+        include_reasons=False
+    )
+
+    report += format_signal_details(
+        losses_list,
+        f"❌ لیست استاپ‌ها ({len(losses_list)}):",
+        limit=12,
+        include_reasons=True
+    )
+
+    return report
+
