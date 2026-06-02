@@ -1068,28 +1068,33 @@ def normalize_score_by_quality(score, rr, raw_direction, pattern, multi_candle, 
     return cap_score(score)
 
 def calculate_trade_levels(raw_direction, price, atr, support=None, resistance=None):
-    buffer = atr * 0.15
+    """
+    TP/SL برای معاملات 30 تا 60 دقیقه.
+    بعد از آمار واقعی، مشخص شد جهت خیلی از سیگنال‌ها درست است ولی SL با پولبک کوتاه لمس می‌شود.
+    بنابراین SL کمی بازتر شده و TPها هم متناسب تنظیم شده‌اند تا R/R خراب نشود.
+    """
+    buffer = atr * 0.20
 
     if raw_direction == "LONG":
-        stop_loss = price - (atr * 1.2)
-        tp1 = price + (atr * 1.5)
-        tp2 = price + (atr * 2.5)
+        stop_loss = price - (atr * 1.65)
+        tp1 = price + (atr * 2.05)
+        tp2 = price + (atr * 3.05)
 
         if resistance is not None and resistance > price:
             adjusted_tp1 = resistance - buffer
-            if adjusted_tp1 > price:
+            if adjusted_tp1 > price + (atr * 1.25):
                 tp1 = min(tp1, adjusted_tp1)
 
         return stop_loss, tp1, tp2
 
     if raw_direction == "SHORT":
-        stop_loss = price + (atr * 1.2)
-        tp1 = price - (atr * 1.5)
-        tp2 = price - (atr * 2.5)
+        stop_loss = price + (atr * 1.65)
+        tp1 = price - (atr * 2.05)
+        tp2 = price - (atr * 3.05)
 
         if support is not None and support < price:
             adjusted_tp1 = support + buffer
-            if adjusted_tp1 < price:
+            if adjusted_tp1 < price - (atr * 1.25):
                 tp1 = max(tp1, adjusted_tp1)
 
         return stop_loss, tp1, tp2
@@ -1147,10 +1152,10 @@ def entry_grade(score, risk_level, rr, final_direction):
     if final_direction == "NO TRADE":
         return "Reject"
 
-    if score >= 94 and risk_level == "پایین" and rr >= 1.35:
+    if score >= 94 and risk_level == "پایین" and rr >= 1.30:
         return "A+"
 
-    if score >= 86 and risk_level in ["پایین", "متوسط"] and rr >= 1.2:
+    if score >= 86 and risk_level in ["پایین", "متوسط"] and rr >= 1.15:
         return "A"
 
     if score >= 78 and rr >= 1:
@@ -1224,7 +1229,7 @@ def tp_space_validation(raw_direction, price, atr, support, resistance):
             return True, None
 
         space = resistance - price
-        if space < atr * 1.15:
+        if space < atr * 1.30:
             return False, "فضای کافی تا مقاومت برای TP وجود ندارد"
 
     if raw_direction == "SHORT":
@@ -1232,7 +1237,7 @@ def tp_space_validation(raw_direction, price, atr, support, resistance):
             return True, None
 
         space = price - support
-        if space < atr * 1.15:
+        if space < atr * 1.30:
             return False, "فضای کافی تا حمایت برای TP وجود ندارد"
 
     return True, None
@@ -1241,17 +1246,17 @@ def tp_space_validation(raw_direction, price, atr, support, resistance):
 def calculate_setup_zone(raw_direction, price, atr):
     """
     ناحیه ورود پیشنهادی برای حالت Setup -> Entry Trigger.
-    این فقط برای راهنمایی ورود بهتر است و به تنهایی سفارش نیست.
+    هدف: ورود عجولانه کمتر شود و سیگنال قبل از تایید 15M/30M وارد معامله نشود.
     """
     if raw_direction == "LONG":
-        zone_low = price - (atr * 0.35)
-        zone_high = price + (atr * 0.10)
-        trigger = "ورود لانگ فقط بعد از حفظ ناحیه ورود و تایید کندل صعودی در 15M/30M"
+        zone_low = price - (atr * 0.45)
+        zone_high = price + (atr * 0.05)
+        trigger = "ورود لانگ فقط بعد از پولبک به ناحیه ورود و تایید کندل صعودی در 15M/30M"
 
     elif raw_direction == "SHORT":
-        zone_low = price - (atr * 0.10)
-        zone_high = price + (atr * 0.35)
-        trigger = "ورود شورت فقط بعد از حفظ ناحیه ورود و تایید کندل نزولی در 15M/30M"
+        zone_low = price - (atr * 0.05)
+        zone_high = price + (atr * 0.45)
+        trigger = "ورود شورت فقط بعد از پولبک به ناحیه ورود و تایید کندل نزولی در 15M/30M"
 
     else:
         return "inactive", None, None, "ستاپ فعالی وجود ندارد"
