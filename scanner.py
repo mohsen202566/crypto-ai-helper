@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import time
 
 from analysis import analyze_symbol
@@ -162,6 +163,26 @@ def is_high_quality_signal(result):
     return True
 
 
+
+def is_very_safe_signal(result):
+    if not is_high_quality_signal(result):
+        return False
+
+    if not result.get("very_safe"):
+        return False
+
+    if result.get("score", 0) < 88:
+        return False
+
+    if result.get("win_probability", 0) < 75:
+        return False
+
+    if result.get("risk_reward", 0) < 1.2:
+        return False
+
+    return True
+
+
 def is_auto_signal(result):
     if not is_high_quality_signal(result):
         return False
@@ -180,15 +201,19 @@ def is_auto_signal(result):
     return True
 
 
-def get_best_signals(limit=5):
+def get_best_signals(limit=5, very_safe_only=False):
     results = []
 
     for symbol in SCAN_SYMBOLS:
         try:
             result = analyze_symbol(symbol)
 
-            if is_high_quality_signal(result):
-                results.append(result)
+            if very_safe_only:
+                if is_very_safe_signal(result):
+                    results.append(result)
+            else:
+                if is_high_quality_signal(result):
+                    results.append(result)
 
         except Exception as e:
             print("SCAN ERROR:", symbol, str(e))
