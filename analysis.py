@@ -592,20 +592,20 @@ def apply_market_regime_to_scores(long_score, short_score, market_regime, reason
     اعمال روند کلی بازار روی امتیازها.
     """
     if market_regime == "bearish":
-        short_score += 10
-        long_score -= 15
+        short_score += 6
+        long_score -= 8
         reasons_short.append("تقویت: روند کلی بازار نزولی است")
         reasons_long.append("جریمه: لانگ خلاف روند کلی نزولی بازار است")
 
     elif market_regime == "bullish":
-        long_score += 10
-        short_score -= 15
+        long_score += 6
+        short_score -= 8
         reasons_long.append("تقویت: روند کلی بازار صعودی است")
         reasons_short.append("جریمه: شورت خلاف روند کلی صعودی بازار است")
 
     elif market_regime == "neutral":
-        long_score -= 3
-        short_score -= 3
+        long_score -= 2
+        short_score -= 2
         reasons_long.append("احتیاط: روند کلی بازار خنثی است")
         reasons_short.append("احتیاط: روند کلی بازار خنثی است")
 
@@ -947,6 +947,155 @@ def score_vwap_volume_profile(df_15m, df_5m):
 
 
 
+
+def macd_momentum_status(df):
+    if len(df) < 5:
+        return "neutral"
+
+    h1 = float(df.iloc[-1]["macd_hist"])
+    h2 = float(df.iloc[-2]["macd_hist"])
+    h3 = float(df.iloc[-3]["macd_hist"])
+
+    if h1 > h2 > h3:
+        return "strengthening_bullish"
+
+    if h1 < h2 < h3:
+        return "strengthening_bearish"
+
+    if h1 > h2 and h1 < 0:
+        return "bearish_weakening"
+
+    if h1 < h2 and h1 > 0:
+        return "bullish_weakening"
+
+    return "neutral"
+
+
+def distance_from_vwap_percent(df):
+    last = df.iloc[-1]
+    close = float(last["close"])
+    vwap = float(last["vwap"])
+
+    if close == 0 or vwap == 0:
+        return 0
+
+    return abs(close - vwap) / close * 100
+
+
+def consecutive_directional_candles(df):
+    recent = df.tail(6)
+    bullish = 0
+    bearish = 0
+
+    for _, candle in recent.iloc[::-1].iterrows():
+        if candle["close"] > candle["open"]:
+            if bearish > 0:
+                break
+            bullish += 1
+        elif candle["close"] < candle["open"]:
+            if bullish > 0:
+                break
+            bearish += 1
+        else:
+            break
+
+    return bullish, bearish
+
+
+def score_trend_continuation(df_15m, df_5m, raw_direction, price, support, resistance, atr):
+    long_score = 0
+    short_score = 0
+    reasons_long = []
+    reasons_short = []
+
+    last_15 = df_15m.iloc[-1]
+    adx_value = float(last_15["adx"])
+    macd_momentum = macd_momentum_status(df_5m)
+    vwap_distance = distance_from_vwap_percent(df_5m)
+    bullish_streak, bearish_streak = consecutive_directional_candles(df_5m)
+
+    if adx_value >= 35:
+        long_score += 5
+        short_score += 5
+        reasons_long.append("قدرت روند ADX قوی است")
+        reasons_short.append("قدرت روند ADX قوی است")
+    elif adx_value >= 25:
+        long_score += 3
+        short_score += 3
+        reasons_long.append("قدرت روند ADX مناسب است")
+        reasons_short.append("قدرت روند ADX مناسب است")
+    elif adx_value < 18:
+        long_score -= 5
+        short_score -= 5
+        reasons_long.append("جریمه: ADX ضعیف است")
+        reasons_short.append("جریمه: ADX ضعیف است")
+
+    if macd_momentum == "strengthening_bullish":
+        long_score += 5
+        short_score -= 4
+        reasons_long.append("شتاب MACD صعودی در حال تقویت است")
+        reasons_short.append("جریمه: شتاب MACD خلاف شورت تقویت شده است")
+    elif macd_momentum == "strengthening_bearish":
+        short_score += 5
+        long_score -= 4
+        reasons_short.append("شتاب MACD نزولی در حال تقویت است")
+        reasons_long.append("جریمه: شتاب MACD خلاف لانگ تقویت شده است")
+    elif macd_momentum == "bearish_weakening":
+        short_score -= 4
+        reasons_short.append("جریمه: شتاب نزولی MACD در حال ضعیف شدن است")
+    elif macd_momentum == "bullish_weakening":
+        long_score -= 4
+        reasons_long.append("جریمه: شتاب صعودی MACD در حال ضعیف شدن است")
+
+    if vwap_distance <= 0.45:
+        long_score += 2
+        short_score += 2
+        reasons_long.append("فاصله قیمت از VWAP متعادل است")
+        reasons_short.append("فاصله قیمت از VWAP متعادل است")
+    elif vwap_distance >= 1.2:
+        long_score -= 5
+        short_score -= 5
+        reasons_long.append("جریمه: قیمت از VWAP خیلی دور شده است")
+        reasons_short.append("جریمه: قیمت از VWAP خیلی دور شده است")
+
+    if bullish_streak >= 4:
+        long_score -= 4
+        short_score += 2
+        reasons_long.append("جریمه: چند کندل صعودی پشت سر هم و ریسک پولبک")
+        reasons_short.append("احتمال پولبک بعد از رشد کوتاه‌مدت")
+
+    if bearish_streak >= 4:
+        short_score -= 4
+        long_score += 2
+        reasons_short.append("جریمه: چند کندل نزولی پشت سر هم و ریسک پولبک")
+        reasons_long.append("احتمال پولبک بعد از افت کوتاه‌مدت")
+
+    if raw_direction == "LONG" and resistance is not None and resistance > price:
+        space = resistance - price
+        if space >= atr * 2.0:
+            long_score += 4
+            reasons_long.append("فضای کافی تا مقاومت برای ادامه حرکت وجود دارد")
+        elif space < atr * 1.0:
+            long_score -= 6
+            reasons_long.append("جریمه: فاصله تا مقاومت برای ادامه حرکت کم است")
+
+    if raw_direction == "SHORT" and support is not None and support < price:
+        space = price - support
+        if space >= atr * 2.0:
+            short_score += 4
+            reasons_short.append("فضای کافی تا حمایت برای ادامه حرکت وجود دارد")
+        elif space < atr * 1.0:
+            short_score -= 6
+            reasons_short.append("جریمه: فاصله تا حمایت برای ادامه حرکت کم است")
+
+    return long_score, short_score, reasons_long, reasons_short, {
+        "macd_momentum": macd_momentum,
+        "vwap_distance_percent": round(vwap_distance, 4),
+        "bullish_streak": bullish_streak,
+        "bearish_streak": bearish_streak,
+    }
+
+
 def apply_direction_conflict_penalties(
     long_score,
     short_score,
@@ -1001,19 +1150,29 @@ def apply_direction_conflict_penalties(
         long_score -= 8
         reasons_long.append("جریمه: قیمت پایین VWAP است و برای لانگ ریسک دارد")
 
-    if buy_power >= sell_power + 10:
-        short_score -= 18
-        reasons_short.append("جریمه سنگین: قدرت خرید واضحاً خلاف شورت است")
-    elif buy_power >= sell_power + 5:
-        short_score -= 10
-        reasons_short.append("جریمه: قدرت خرید نسبت به فروش بالاتر است")
+    power_gap = abs(buy_power - sell_power)
 
-    if sell_power >= buy_power + 10:
-        long_score -= 18
-        reasons_long.append("جریمه سنگین: قدرت فروش واضحاً خلاف لانگ است")
-    elif sell_power >= buy_power + 5:
-        long_score -= 10
-        reasons_long.append("جریمه: قدرت فروش نسبت به خرید بالاتر است")
+    if buy_power > sell_power:
+        if power_gap >= 15:
+            short_score -= 12
+            reasons_short.append("جریمه: قدرت خرید خیلی بیشتر از فروش است")
+        elif power_gap >= 10:
+            short_score -= 8
+            reasons_short.append("جریمه: قدرت خرید واضحاً خلاف شورت است")
+        elif power_gap >= 5:
+            short_score -= 4
+            reasons_short.append("جریمه سبک: قدرت خرید کمی بالاتر از فروش است")
+
+    if sell_power > buy_power:
+        if power_gap >= 15:
+            long_score -= 12
+            reasons_long.append("جریمه: قدرت فروش خیلی بیشتر از خرید است")
+        elif power_gap >= 10:
+            long_score -= 8
+            reasons_long.append("جریمه: قدرت فروش واضحاً خلاف لانگ است")
+        elif power_gap >= 5:
+            long_score -= 4
+            reasons_long.append("جریمه سبک: قدرت فروش کمی بالاتر از خرید است")
 
     return max(0, long_score), max(0, short_score)
 
@@ -1042,11 +1201,6 @@ def normalize_score_by_quality(score, rr, raw_direction, pattern, multi_candle, 
         if order_block == "bearish_order_block":
             score = min(score, 84)
 
-        if sell_power >= buy_power + 10:
-            score = min(score, 84)
-        elif sell_power >= buy_power + 5:
-            score = min(score, 88)
-
         if vwap_status == "below_vwap":
             score = min(score, 92)
 
@@ -1056,11 +1210,6 @@ def normalize_score_by_quality(score, rr, raw_direction, pattern, multi_candle, 
 
         if order_block == "bullish_order_block":
             score = min(score, 84)
-
-        if buy_power >= sell_power + 10:
-            score = min(score, 84)
-        elif buy_power >= sell_power + 5:
-            score = min(score, 88)
 
         if vwap_status == "above_vwap":
             score = min(score, 92)
@@ -1389,16 +1538,8 @@ def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, s
     # قدرت خرید/فروش و واگرایی‌ها رد کامل نیستند.
     # این موارد فقط از طریق امتیازدهی و جریمه‌های نرم اثر می‌گذارند.
 
-    # خلاف روند کلی بازار فقط برای سیگنال‌های خیلی قوی مجاز است.
-    if market_regime == "bearish" and raw_direction == "LONG" and score < 95:
-        reasons_block.append("لانگ خلاف روند کلی نزولی بازار است")
-        liquidity_risk = "بالا"
-
-    if market_regime == "bullish" and raw_direction == "SHORT" and score < 95:
-        reasons_block.append("شورت خلاف روند کلی صعودی بازار است")
-        liquidity_risk = "بالا"
-
-    if market_regime == "neutral" and score < 86:
+    # روند کلی بازار رد کامل نیست؛ اثر اصلی آن در امتیازدهی اعمال می‌شود.
+    if market_regime == "neutral" and score < 82:
         reasons_block.append("بازار کلی خنثی است و سیگنال قدرت کافی ندارد")
         liquidity_risk = "بالا"
 
@@ -1484,26 +1625,26 @@ def apply_conflict_penalties(
     reasons_short
 ):
     if trendline == "uptrend":
-        long_score += 12
-        short_score -= 15
+        long_score += 8
+        short_score -= 10
         reasons_long.append("تقویت: خط روند صعودی است")
         reasons_short.append("جریمه: شورت خلاف خط روند صعودی است")
 
     elif trendline == "downtrend":
-        short_score += 12
-        long_score -= 15
+        short_score += 8
+        long_score -= 10
         reasons_short.append("تقویت: خط روند نزولی است")
         reasons_long.append("جریمه: لانگ خلاف خط روند نزولی است")
 
     if structure == "bullish_structure":
-        long_score += 15
-        short_score -= 18
+        long_score += 10
+        short_score -= 12
         reasons_long.append("تقویت: ساختار بازار صعودی است")
         reasons_short.append("جریمه: شورت خلاف ساختار صعودی بازار است")
 
     elif structure == "bearish_structure":
-        short_score += 15
-        long_score -= 18
+        short_score += 10
+        long_score -= 12
         reasons_short.append("تقویت: ساختار بازار نزولی است")
         reasons_long.append("جریمه: لانگ خلاف ساختار نزولی بازار است")
 
@@ -1651,6 +1792,23 @@ def analyze_symbol(symbol):
 
     support, resistance = support_resistance(df_15m)
 
+    l, s, rl, rs, continuation_info = score_trend_continuation(
+        df_15m,
+        df_5m,
+        "UNKNOWN",
+        price,
+        support,
+        resistance,
+        atr
+    )
+    long_score += l
+    short_score += s
+    reasons_long += rl
+    reasons_short += rs
+
+    long_score = cap_score(long_score)
+    short_score = cap_score(short_score)
+
     setup_status, entry_zone_low, entry_zone_high, entry_trigger = calculate_setup_zone(
         "NO TRADE",
         price,
@@ -1744,7 +1902,7 @@ def analyze_symbol(symbol):
 
     grade = entry_grade(score, risk_level, rr, final_direction)
 
-    if grade == "Reject":
+    if grade in ["Reject", "B"]:
         final_direction = "NO TRADE"
         stop_loss = None
         tp1 = None
@@ -1846,6 +2004,8 @@ def analyze_symbol(symbol):
         "market_regime_text": market_regime_text,
         "market_regime_score": market_regime_score,
         "market_regime_reasons": market_regime_reasons,
+
+        "continuation_info": continuation_info,
 
         "long_score": long_score,
         "short_score": short_score,
