@@ -986,12 +986,12 @@ def apply_direction_conflict_penalties(
         reasons_long.append("جریمه سنگین: اوردر بلاک نزولی، خلاف لانگ است")
 
     if fvg == "bullish_fvg":
-        short_score -= 6
-        reasons_short.append("جریمه: ناحیه نقدینگی صعودی، خلاف شورت است")
+        short_score -= 14
+        reasons_short.append("جریمه سنگین: FVG صعودی، خلاف شورت است")
 
     if fvg == "bearish_fvg":
-        long_score -= 6
-        reasons_long.append("جریمه: ناحیه نقدینگی نزولی، خلاف لانگ است")
+        long_score -= 14
+        reasons_long.append("جریمه سنگین: FVG نزولی، خلاف لانگ است")
 
     if vwap_status == "above_vwap":
         short_score -= 8
@@ -1018,7 +1018,7 @@ def apply_direction_conflict_penalties(
     return max(0, long_score), max(0, short_score)
 
 
-def normalize_score_by_quality(score, rr, raw_direction, pattern, multi_candle, order_block, vwap_status, buy_power=50, sell_power=50):
+def normalize_score_by_quality(score, rr, raw_direction, pattern, multi_candle, order_block, fvg, vwap_status, buy_power=50, sell_power=50, rsi_divergence="none", macd_divergence="none"):
     """
     محدود کردن امتیازهای خیلی بالا.
     هدف: 100/100 فقط برای سیگنال‌های واقعاً تمیز باشد، نه هر سیگنال قوی ظاهری.
@@ -1042,10 +1042,17 @@ def normalize_score_by_quality(score, rr, raw_direction, pattern, multi_candle, 
         if order_block == "bearish_order_block":
             score = min(score, 84)
 
-        if sell_power >= buy_power + 10:
+        if fvg == "bearish_fvg":
             score = min(score, 84)
-        elif sell_power >= buy_power + 5:
-            score = min(score, 88)
+
+        if buy_power < sell_power + 10:
+            score = min(score, 84)
+
+        if (
+            rsi_divergence == "bearish_rsi_divergence"
+            and macd_divergence == "bearish_macd_divergence"
+        ):
+            score = min(score, 84)
 
         if vwap_status == "below_vwap":
             score = min(score, 92)
@@ -1057,10 +1064,17 @@ def normalize_score_by_quality(score, rr, raw_direction, pattern, multi_candle, 
         if order_block == "bullish_order_block":
             score = min(score, 84)
 
-        if buy_power >= sell_power + 10:
+        if fvg == "bullish_fvg":
             score = min(score, 84)
-        elif buy_power >= sell_power + 5:
-            score = min(score, 88)
+
+        if sell_power < buy_power + 10:
+            score = min(score, 84)
+
+        if (
+            rsi_divergence == "bullish_rsi_divergence"
+            and macd_divergence == "bullish_macd_divergence"
+        ):
+            score = min(score, 84)
 
         if vwap_status == "above_vwap":
             score = min(score, 92)
@@ -1314,8 +1328,8 @@ def very_safe_status(raw_direction, score, win_probability_value, risk_level, rr
         if vwap_status != "above_vwap":
             reasons.append("VWAP برای لانگ تایید کامل نمی‌دهد")
 
-        if buy_power < 55:
-            reasons.append("قدرت خرید برای Very Safe کافی نیست")
+        if buy_power < sell_power + 10:
+            reasons.append("اختلاف قدرت خرید و فروش برای Very Safe لانگ کافی نیست")
 
         if pattern in ["bearish_engulfing", "bearish_pinbar", "bearish_strong"]:
             reasons.append("کندل تاییدی مخالف لانگ است")
@@ -1341,8 +1355,8 @@ def very_safe_status(raw_direction, score, win_probability_value, risk_level, rr
         if vwap_status != "below_vwap":
             reasons.append("VWAP برای شورت تایید کامل نمی‌دهد")
 
-        if sell_power < 55:
-            reasons.append("قدرت فروش برای Very Safe کافی نیست")
+        if sell_power < buy_power + 10:
+            reasons.append("اختلاف قدرت فروش و خرید برای Very Safe شورت کافی نیست")
 
         if pattern in ["bullish_engulfing", "bullish_pinbar", "bullish_strong"]:
             reasons.append("کندل تاییدی مخالف شورت است")
@@ -1359,7 +1373,7 @@ def very_safe_status(raw_direction, score, win_probability_value, risk_level, rr
     return len(reasons) == 0, reasons
 
 
-def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, spread_percent, market_regime="neutral", order_block="none", buy_power=50, sell_power=50):
+def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, spread_percent, market_regime="neutral", order_block="none", fvg="none", buy_power=50, sell_power=50, rsi_divergence="none", macd_divergence="none"):
     last_5 = df_5m.iloc[-1]
     last_15 = df_15m.iloc[-1]
     price = float(last_5["close"])
@@ -1383,22 +1397,43 @@ def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, s
         reasons_block.append("اوردر بلاک صعودی خلاف سیگنال شورت است")
         liquidity_risk = "بالا"
 
+    # فیلتر سخت FVG:
+    # اگر ناحیه خالی نقدینگی خلاف جهت سیگنال باشد، سیگنال رد می‌شود.
+    if raw_direction == "LONG" and fvg == "bearish_fvg":
+        reasons_block.append("FVG نزولی خلاف سیگنال لانگ است")
+        liquidity_risk = "بالا"
+
+    if raw_direction == "SHORT" and fvg == "bullish_fvg":
+        reasons_block.append("FVG صعودی خلاف سیگنال شورت است")
+        liquidity_risk = "بالا"
+
     # فیلتر سخت قدرت خرید/فروش:
-    # اختلاف بالای 10٪ خلاف جهت، رد کامل؛ اختلاف 5 تا 10٪ فقط اگر امتیاز خیلی قوی نباشد رد می‌شود.
+    # قدرت جهت سیگنال باید حداقل 10٪ برتری داشته باشد.
     if raw_direction == "LONG":
-        if sell_power >= buy_power + 10:
-            reasons_block.append("قدرت فروش به شکل واضح خلاف سیگنال لانگ است")
-            liquidity_risk = "بالا"
-        elif sell_power >= buy_power + 5 and score < 92:
-            reasons_block.append("قدرت فروش خلاف لانگ است و امتیاز سیگنال برای عبور کافی نیست")
+        if buy_power < sell_power + 10:
+            reasons_block.append("اختلاف قدرت خرید و فروش برای لانگ کافی نیست")
             liquidity_risk = "بالا"
 
     if raw_direction == "SHORT":
-        if buy_power >= sell_power + 10:
-            reasons_block.append("قدرت خرید به شکل واضح خلاف سیگنال شورت است")
+        if sell_power < buy_power + 10:
+            reasons_block.append("اختلاف قدرت فروش و خرید برای شورت کافی نیست")
             liquidity_risk = "بالا"
-        elif buy_power >= sell_power + 5 and score < 92:
-            reasons_block.append("قدرت خرید خلاف شورت است و امتیاز سیگنال برای عبور کافی نیست")
+
+    # فیلتر سخت واگرایی دوگانه مخالف:
+    if raw_direction == "LONG":
+        if (
+            rsi_divergence == "bearish_rsi_divergence"
+            and macd_divergence == "bearish_macd_divergence"
+        ):
+            reasons_block.append("واگرایی دوگانه نزولی خلاف سیگنال لانگ است")
+            liquidity_risk = "بالا"
+
+    if raw_direction == "SHORT":
+        if (
+            rsi_divergence == "bullish_rsi_divergence"
+            and macd_divergence == "bullish_macd_divergence"
+        ):
+            reasons_block.append("واگرایی دوگانه صعودی خلاف سیگنال شورت است")
             liquidity_risk = "بالا"
 
     # خلاف روند کلی بازار فقط برای سیگنال‌های خیلی قوی مجاز است.
@@ -1707,9 +1742,12 @@ def analyze_symbol(symbol):
         pattern,
         multi_candle,
         order_block,
+        fvg,
         vwap_status,
         buy_power,
-        sell_power
+        sell_power,
+        rsi_divergence,
+        macd_divergence
     )
 
     entry_ok, block_reasons, liquidity_risk, fake_breakout, trend_exhaustion = entry_filter(
@@ -1722,8 +1760,11 @@ def analyze_symbol(symbol):
         spread_percent,
         market_regime,
         order_block,
+        fvg,
         buy_power,
-        sell_power
+        sell_power,
+        rsi_divergence,
+        macd_divergence
     )
 
     risk_level = calculate_risk_level(
@@ -1866,5 +1907,5 @@ def analyze_symbol(symbol):
 
         "news_filter_active": news_filter_active(),
 
-        "reasons": reasons[:18],
+        "reasons": reasons[:24],
     }
