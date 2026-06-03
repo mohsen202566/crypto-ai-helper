@@ -986,12 +986,12 @@ def apply_direction_conflict_penalties(
         reasons_long.append("جریمه سنگین: اوردر بلاک نزولی، خلاف لانگ است")
 
     if fvg == "bullish_fvg":
-        short_score -= 14
-        reasons_short.append("جریمه سنگین: FVG صعودی، خلاف شورت است")
+        short_score -= 6
+        reasons_short.append("جریمه: ناحیه نقدینگی صعودی، خلاف شورت است")
 
     if fvg == "bearish_fvg":
-        long_score -= 14
-        reasons_long.append("جریمه سنگین: FVG نزولی، خلاف لانگ است")
+        long_score -= 6
+        reasons_long.append("جریمه: ناحیه نقدینگی نزولی، خلاف لانگ است")
 
     if vwap_status == "above_vwap":
         short_score -= 8
@@ -1042,9 +1042,6 @@ def normalize_score_by_quality(score, rr, raw_direction, pattern, multi_candle, 
         if order_block == "bearish_order_block":
             score = min(score, 84)
 
-        if fvg == "bearish_fvg":
-            score = min(score, 84)
-
         if sell_power >= buy_power + 10:
             score = min(score, 84)
         elif sell_power >= buy_power + 5:
@@ -1058,9 +1055,6 @@ def normalize_score_by_quality(score, rr, raw_direction, pattern, multi_candle, 
             score = min(score, 88)
 
         if order_block == "bullish_order_block":
-            score = min(score, 84)
-
-        if fvg == "bullish_fvg":
             score = min(score, 84)
 
         if buy_power >= sell_power + 10:
@@ -1389,15 +1383,8 @@ def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, s
         reasons_block.append("اوردر بلاک صعودی خلاف سیگنال شورت است")
         liquidity_risk = "بالا"
 
-    # فیلتر سخت FVG:
-    # اگر ناحیه خالی نقدینگی خلاف جهت سیگنال باشد، سیگنال رد می‌شود.
-    if raw_direction == "LONG" and fvg == "bearish_fvg":
-        reasons_block.append("FVG نزولی خلاف سیگنال لانگ است")
-        liquidity_risk = "بالا"
-
-    if raw_direction == "SHORT" and fvg == "bullish_fvg":
-        reasons_block.append("FVG صعودی خلاف سیگنال شورت است")
-        liquidity_risk = "بالا"
+    # FVG رد کامل نیست.
+    # اگر خلاف جهت باشد فقط از طریق جریمه امتیاز اثر می‌گذارد.
 
     # قدرت خرید/فروش و واگرایی‌ها رد کامل نیستند.
     # این موارد فقط از طریق امتیازدهی و جریمه‌های نرم اثر می‌گذارند.
