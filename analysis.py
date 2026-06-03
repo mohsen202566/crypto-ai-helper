@@ -1045,8 +1045,10 @@ def normalize_score_by_quality(score, rr, raw_direction, pattern, multi_candle, 
         if fvg == "bearish_fvg":
             score = min(score, 84)
 
-        if buy_power < sell_power + 10:
+        if buy_power < sell_power + 5:
             score = min(score, 84)
+        elif buy_power < sell_power + 10:
+            score = min(score, 90)
 
         if (
             rsi_divergence == "bearish_rsi_divergence"
@@ -1067,8 +1069,10 @@ def normalize_score_by_quality(score, rr, raw_direction, pattern, multi_candle, 
         if fvg == "bullish_fvg":
             score = min(score, 84)
 
-        if sell_power < buy_power + 10:
+        if sell_power < buy_power + 5:
             score = min(score, 84)
+        elif sell_power < buy_power + 10:
+            score = min(score, 90)
 
         if (
             rsi_divergence == "bullish_rsi_divergence"
@@ -1328,7 +1332,7 @@ def very_safe_status(raw_direction, score, win_probability_value, risk_level, rr
         if vwap_status != "above_vwap":
             reasons.append("VWAP برای لانگ تایید کامل نمی‌دهد")
 
-        if buy_power < sell_power + 10:
+        if buy_power < sell_power + 7:
             reasons.append("اختلاف قدرت خرید و فروش برای Very Safe لانگ کافی نیست")
 
         if pattern in ["bearish_engulfing", "bearish_pinbar", "bearish_strong"]:
@@ -1355,7 +1359,7 @@ def very_safe_status(raw_direction, score, win_probability_value, risk_level, rr
         if vwap_status != "below_vwap":
             reasons.append("VWAP برای شورت تایید کامل نمی‌دهد")
 
-        if sell_power < buy_power + 10:
+        if sell_power < buy_power + 7:
             reasons.append("اختلاف قدرت فروش و خرید برای Very Safe شورت کافی نیست")
 
         if pattern in ["bullish_engulfing", "bullish_pinbar", "bullish_strong"]:
@@ -1407,15 +1411,15 @@ def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, s
         reasons_block.append("FVG صعودی خلاف سیگنال شورت است")
         liquidity_risk = "بالا"
 
-    # فیلتر سخت قدرت خرید/فروش:
-    # قدرت جهت سیگنال باید حداقل 10٪ برتری داشته باشد.
+    # فیلتر متعادل قدرت خرید/فروش:
+    # اختلاف کمتر از 5٪ رد می‌شود؛ اختلاف 5 تا 10٪ با جریمه امتیاز مدیریت می‌شود.
     if raw_direction == "LONG":
-        if buy_power < sell_power + 10:
+        if buy_power < sell_power + 5:
             reasons_block.append("اختلاف قدرت خرید و فروش برای لانگ کافی نیست")
             liquidity_risk = "بالا"
 
     if raw_direction == "SHORT":
-        if sell_power < buy_power + 10:
+        if sell_power < buy_power + 5:
             reasons_block.append("اختلاف قدرت فروش و خرید برای شورت کافی نیست")
             liquidity_risk = "بالا"
 
