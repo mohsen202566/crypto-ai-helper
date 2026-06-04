@@ -1,22 +1,4 @@
-import time
 import requests
-
-try:
-    from config import MARKET_SENTIMENT_CACHE_SECONDS
-except Exception:
-    MARKET_SENTIMENT_CACHE_SECONDS = 900
-
-
-_SENTIMENT_CACHE = {
-    "ts": 0,
-    "data": None,
-}
-
-_LAST_DOMINANCE = {
-    "btc_dominance": None,
-    "dominance_status": "نامشخص",
-    "altseason_status": "نامشخص",
-}
 
 
 def safe_get_json(url, timeout=12):
@@ -42,7 +24,8 @@ def get_fear_greed():
             "text": item["value_classification"]
         }
 
-    except Exception:
+    except Exception as e:
+        print("FEAR GREED ERROR:", str(e))
         return {
             "value": None,
             "text": "نامشخص"
@@ -73,66 +56,47 @@ def get_btc_dominance_from_coinstats():
     return float(dominance)
 
 
-def _dominance_to_status(dominance):
-    if dominance is None:
+def get_btc_dominance():
+    try:
+        try:
+            dominance = get_btc_dominance_from_coingecko()
+        except Exception as e:
+            print("COINGECKO DOMINANCE ERROR:", str(e))
+            dominance = get_btc_dominance_from_coinstats()
+
+        if dominance >= 55:
+            status = "دامیننس بیتکوین بالا است"
+            altseason = "ضعیف"
+        elif dominance <= 45:
+            status = "دامیننس بیتکوین پایین است"
+            altseason = "قوی"
+        else:
+            status = "دامیننس بیتکوین خنثی است"
+            altseason = "متوسط"
+
+        return {
+            "btc_dominance": round(dominance, 2),
+            "dominance_status": status,
+            "altseason_status": altseason
+        }
+
+    except Exception as e:
+        print("BTC DOMINANCE ERROR:", str(e))
         return {
             "btc_dominance": None,
             "dominance_status": "نامشخص",
             "altseason_status": "نامشخص"
         }
 
-    if dominance >= 55:
-        status = "دامیننس بیتکوین بالا است"
-        altseason = "ضعیف"
-    elif dominance <= 45:
-        status = "دامیننس بیتکوین پایین است"
-        altseason = "قوی"
-    else:
-        status = "دامیننس بیتکوین خنثی است"
-        altseason = "متوسط"
-
-    return {
-        "btc_dominance": round(float(dominance), 2),
-        "dominance_status": status,
-        "altseason_status": altseason
-    }
-
-
-def get_btc_dominance():
-    global _LAST_DOMINANCE
-
-    try:
-        try:
-            dominance = get_btc_dominance_from_coingecko()
-        except Exception:
-            dominance = get_btc_dominance_from_coinstats()
-
-        _LAST_DOMINANCE = _dominance_to_status(dominance)
-        return _LAST_DOMINANCE
-
-    except Exception:
-        # برای جلوگیری از اسپم لاگ و خطای 429، اگر مقدار قبلی داریم همان را برمی‌گردانیم.
-        return _LAST_DOMINANCE
-
 
 def get_market_sentiment():
-    now = int(time.time())
-
-    if _SENTIMENT_CACHE["data"] is not None:
-        if now - _SENTIMENT_CACHE["ts"] < MARKET_SENTIMENT_CACHE_SECONDS:
-            return _SENTIMENT_CACHE["data"]
-
     fear = get_fear_greed()
     dominance = get_btc_dominance()
 
-    data = {
+    return {
         "fear_value": fear["value"],
         "fear_text": fear["text"],
         "btc_dominance": dominance["btc_dominance"],
         "dominance_status": dominance["dominance_status"],
         "altseason_status": dominance["altseason_status"]
     }
-
-    _SENTIMENT_CACHE["ts"] = now
-    _SENTIMENT_CACHE["data"] = data
-    return data
