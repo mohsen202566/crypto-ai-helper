@@ -1,10 +1,10 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 import os
+import telebot
 import threading
 import time
-import telebot
 
-from config import BOT_TOKEN, AUTO_SCAN_INTERVAL_MINUTES, TRACKER_CHECK_INTERVAL_SECONDS, AUTO_SIGNAL_ENABLED
+from config import BOT_TOKEN, AUTO_SCAN_INTERVAL_MINUTES, TRACKER_CHECK_INTERVAL_SECONDS
 from coins_fa import COINS_FA
 from analysis import analyze_symbol
 from scanner import get_best_signals, SCAN_SYMBOLS, should_send_auto_signal
@@ -24,18 +24,24 @@ if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN تنظیم نشده است. اول روی VPS دستور export BOT_TOKEN را بزن.")
 
 bot = telebot.TeleBot(BOT_TOKEN)
+
+# \u062d\u0627\u0641\u0638\u0647 \u0645\u0648\u0642\u062a \u0628\u0631\u0627\u06cc \u0627\u062a\u0635\u0627\u0644 \u067e\u06cc\u0627\u0645 \u0633\u06cc\u06af\u0646\u0627\u0644 \u0628\u0647 \u062f\u0633\u062a\u0648\u0631 \xab\u0632\u06cc\u0631 \u0646\u0638\u0631\xbb
 MESSAGE_RESULTS = {}
-TRACK_COMMANDS = ["زیر نظر", "زیرنظر", "زیر نظر بگیر", "نظر"]
+
+TRACK_COMMANDS = ["\u0632\u06cc\u0631 \u0646\u0638\u0631", "\u0632\u06cc\u0631\u0646\u0638\u0631", "\u0632\u06cc\u0631 \u0646\u0638\u0631 \u0628\u06af\u06cc\u0631", "\u0646\u0638\u0631"]
 
 
-def safe(value, default="نامشخص"):
-    return default if value is None else value
+def safe(value, default="\u0646\u0627\u0645\u0634\u062e\u0635"):
+    if value is None:
+        return default
+    return value
 
 
 def remember_signal_result(sent_message, result):
     try:
         if result and result.get("direction") != "NO TRADE":
-            MESSAGE_RESULTS[(int(sent_message.chat.id), int(sent_message.message_id))] = result
+            key = (int(sent_message.chat.id), int(sent_message.message_id))
+            MESSAGE_RESULTS[key] = result
     except Exception as e:
         print("REMEMBER SIGNAL ERROR:", str(e))
 
@@ -43,78 +49,106 @@ def remember_signal_result(sent_message, result):
 def get_replied_signal_result(message):
     if not message.reply_to_message:
         return None
-    key = (int(message.reply_to_message.chat.id), int(message.reply_to_message.message_id))
+
+    key = (
+        int(message.reply_to_message.chat.id),
+        int(message.reply_to_message.message_id)
+    )
+
     return MESSAGE_RESULTS.get(key)
 
 
 def is_track_command(text):
-    return text.strip().lower() in TRACK_COMMANDS
+    clean = text.strip().lower()
+    return clean in TRACK_COMMANDS
 
 
 def is_stats_command(text):
     clean = text.strip()
-    return clean == "آمار" or clean.startswith("آمار ")
+    return clean == "\u0622\u0645\u0627\u0631" or clean.startswith("\u0622\u0645\u0627\u0631 ")
 
 
 def find_symbol(text):
     text = text.lower().strip()
+
     for name, symbol in COINS_FA.items():
         if name.lower() in text:
             return symbol
-    text = text.replace("تحلیل", "").replace("سیگنال", "").strip().upper()
+
+    text = text.replace("\u062a\u062d\u0644\u06cc\u0644", "").replace("\u0633\u06cc\u06af\u0646\u0627\u0644", "").strip().upper()
+
     if text.endswith("USDT"):
         return text
+
     return None
 
 
 def fa_direction(direction):
     return {
-        "LONG": "🟢 لانگ",
-        "SHORT": "🔴 شورت",
-        "NO TRADE": "⚪ فعلاً ورود مناسب نیست"
+        "LONG": "\U0001f7e2 \u0644\u0627\u0646\u06af",
+        "SHORT": "\U0001f534 \u0634\u0648\u0631\u062a",
+        "NO TRADE": "\u26aa \u0641\u0639\u0644\u0627\u064b \u0648\u0631\u0648\u062f \u0645\u0646\u0627\u0633\u0628 \u0646\u06cc\u0633\u062a"
     }.get(direction, direction)
 
 
 def fa_general(value):
     data = {
-        "bullish": "صعودی", "bearish": "نزولی", "neutral": "خنثی",
-        "range": "رنج", "weak": "ضعیف", "none": "ندارد",
-        "unknown": "نامشخص", "ok": "تأیید شده",
-        "uptrend": "صعودی", "downtrend": "نزولی", "sideways": "خنثی",
-        "bullish_structure": "ساختار صعودی",
-        "bearish_structure": "ساختار نزولی",
-        "range_structure": "رنج / بدون روند واضح",
-        "bullish_breakout": "بریک‌اوت صعودی",
-        "bearish_breakout": "بریک‌اوت نزولی",
-        "fake_bullish_breakout": "فیک بریک‌اوت صعودی",
-        "fake_bearish_breakout": "فیک بریک‌اوت نزولی",
-        "no_breakout": "بدون بریک‌اوت",
-        "bullish_engulfing": "انگالف صعودی",
-        "bearish_engulfing": "انگالف نزولی",
-        "bullish_pinbar": "پین‌بار صعودی",
-        "bearish_pinbar": "پین‌بار نزولی",
-        "bullish_strong": "کندل صعودی قوی",
-        "bearish_strong": "کندل نزولی قوی",
-        "bullish_liquidity_grab": "جمع‌آوری نقدینگی صعودی",
-        "bearish_liquidity_grab": "جمع‌آوری نقدینگی نزولی",
-        "bullish_stop_hunt": "استاپ‌هانت صعودی",
-        "bearish_stop_hunt": "استاپ‌هانت نزولی",
-        "bullish_fvg": "FVG صعودی",
-        "bearish_fvg": "FVG نزولی",
-        "bullish_order_block": "اوردر بلاک صعودی",
-        "bearish_order_block": "اوردر بلاک نزولی",
-        "bullish_rsi_divergence": "واگرایی مثبت RSI",
-        "bearish_rsi_divergence": "واگرایی منفی RSI",
-        "bullish_macd_divergence": "واگرایی مثبت MACD",
-        "bearish_macd_divergence": "واگرایی منفی MACD",
-        "bullish_exhaustion": "خستگی روند صعودی",
-        "bearish_exhaustion": "خستگی روند نزولی",
-        "above_vwap": "بالای VWAP",
-        "below_vwap": "پایین VWAP",
-        "near_vwap": "نزدیک VWAP",
-        "above_poc": "بالای ناحیه حجمی اصلی",
-        "below_poc": "پایین ناحیه حجمی اصلی",
-        "near_poc": "نزدیک ناحیه حجمی اصلی",
+        "bullish": "\u0635\u0639\u0648\u062f\u06cc",
+        "bearish": "\u0646\u0632\u0648\u0644\u06cc",
+        "neutral": "\u062e\u0646\u062b\u06cc",
+        "range": "\u0631\u0646\u062c",
+        "weak": "\u0636\u0639\u06cc\u0641",
+        "none": "\u0646\u062f\u0627\u0631\u062f",
+        "unknown": "\u0646\u0627\u0645\u0634\u062e\u0635",
+        "ok": "\u062a\u0623\u06cc\u06cc\u062f \u0634\u062f\u0647",
+
+        "uptrend": "\u0635\u0639\u0648\u062f\u06cc",
+        "downtrend": "\u0646\u0632\u0648\u0644\u06cc",
+        "sideways": "\u062e\u0646\u062b\u06cc",
+
+        "bullish_structure": "\u0633\u0627\u062e\u062a\u0627\u0631 \u0635\u0639\u0648\u062f\u06cc",
+        "bearish_structure": "\u0633\u0627\u062e\u062a\u0627\u0631 \u0646\u0632\u0648\u0644\u06cc",
+        "range_structure": "\u0631\u0646\u062c / \u0628\u062f\u0648\u0646 \u0631\u0648\u0646\u062f \u0648\u0627\u0636\u062d",
+
+        "bullish_breakout": "\u0628\u0631\u06cc\u06a9\u200c\u0627\u0648\u062a \u0635\u0639\u0648\u062f\u06cc",
+        "bearish_breakout": "\u0628\u0631\u06cc\u06a9\u200c\u0627\u0648\u062a \u0646\u0632\u0648\u0644\u06cc",
+        "fake_bullish_breakout": "\u0641\u06cc\u06a9 \u0628\u0631\u06cc\u06a9\u200c\u0627\u0648\u062a \u0635\u0639\u0648\u062f\u06cc",
+        "fake_bearish_breakout": "\u0641\u06cc\u06a9 \u0628\u0631\u06cc\u06a9\u200c\u0627\u0648\u062a \u0646\u0632\u0648\u0644\u06cc",
+        "no_breakout": "\u0628\u062f\u0648\u0646 \u0628\u0631\u06cc\u06a9\u200c\u0627\u0648\u062a",
+
+        "bullish_engulfing": "\u0627\u0646\u06af\u0627\u0644\u0641 \u0635\u0639\u0648\u062f\u06cc",
+        "bearish_engulfing": "\u0627\u0646\u06af\u0627\u0644\u0641 \u0646\u0632\u0648\u0644\u06cc",
+        "bullish_pinbar": "\u067e\u06cc\u0646\u200c\u0628\u0627\u0631 \u0635\u0639\u0648\u062f\u06cc",
+        "bearish_pinbar": "\u067e\u06cc\u0646\u200c\u0628\u0627\u0631 \u0646\u0632\u0648\u0644\u06cc",
+        "bullish_strong": "\u06a9\u0646\u062f\u0644 \u0635\u0639\u0648\u062f\u06cc \u0642\u0648\u06cc",
+        "bearish_strong": "\u06a9\u0646\u062f\u0644 \u0646\u0632\u0648\u0644\u06cc \u0642\u0648\u06cc",
+
+        "bullish_liquidity_grab": "\u062c\u0645\u0639\u200c\u0622\u0648\u0631\u06cc \u0646\u0642\u062f\u06cc\u0646\u06af\u06cc \u0635\u0639\u0648\u062f\u06cc",
+        "bearish_liquidity_grab": "\u062c\u0645\u0639\u200c\u0622\u0648\u0631\u06cc \u0646\u0642\u062f\u06cc\u0646\u06af\u06cc \u0646\u0632\u0648\u0644\u06cc",
+        "bullish_stop_hunt": "\u0627\u0633\u062a\u0627\u067e\u200c\u0647\u0627\u0646\u062a \u0635\u0639\u0648\u062f\u06cc",
+        "bearish_stop_hunt": "\u0627\u0633\u062a\u0627\u067e\u200c\u0647\u0627\u0646\u062a \u0646\u0632\u0648\u0644\u06cc",
+
+        "bullish_fvg": "\u0646\u0627\u062d\u06cc\u0647 \u062e\u0627\u0644\u06cc \u0646\u0642\u062f\u06cc\u0646\u06af\u06cc \u0635\u0639\u0648\u062f\u06cc",
+        "bearish_fvg": "\u0646\u0627\u062d\u06cc\u0647 \u062e\u0627\u0644\u06cc \u0646\u0642\u062f\u06cc\u0646\u06af\u06cc \u0646\u0632\u0648\u0644\u06cc",
+
+        "bullish_order_block": "\u0627\u0648\u0631\u062f\u0631 \u0628\u0644\u0627\u06a9 \u0635\u0639\u0648\u062f\u06cc",
+        "bearish_order_block": "\u0627\u0648\u0631\u062f\u0631 \u0628\u0644\u0627\u06a9 \u0646\u0632\u0648\u0644\u06cc",
+
+        "bullish_rsi_divergence": "\u0648\u0627\u06af\u0631\u0627\u06cc\u06cc \u0645\u062b\u0628\u062a RSI",
+        "bearish_rsi_divergence": "\u0648\u0627\u06af\u0631\u0627\u06cc\u06cc \u0645\u0646\u0641\u06cc RSI",
+        "bullish_macd_divergence": "\u0648\u0627\u06af\u0631\u0627\u06cc\u06cc \u0645\u062b\u0628\u062a MACD",
+        "bearish_macd_divergence": "\u0648\u0627\u06af\u0631\u0627\u06cc\u06cc \u0645\u0646\u0641\u06cc MACD",
+
+        "bullish_exhaustion": "\u062e\u0633\u062a\u06af\u06cc \u0631\u0648\u0646\u062f \u0635\u0639\u0648\u062f\u06cc",
+        "bearish_exhaustion": "\u062e\u0633\u062a\u06af\u06cc \u0631\u0648\u0646\u062f \u0646\u0632\u0648\u0644\u06cc",
+
+        "above_vwap": "\u0628\u0627\u0644\u0627\u06cc \u0645\u06cc\u0627\u0646\u06af\u06cc\u0646 \u062d\u062c\u0645\u06cc \u0642\u06cc\u0645\u062a",
+        "below_vwap": "\u067e\u0627\u06cc\u06cc\u0646 \u0645\u06cc\u0627\u0646\u06af\u06cc\u0646 \u062d\u062c\u0645\u06cc \u0642\u06cc\u0645\u062a",
+        "near_vwap": "\u0646\u0632\u062f\u06cc\u06a9 \u0645\u06cc\u0627\u0646\u06af\u06cc\u0646 \u062d\u062c\u0645\u06cc \u0642\u06cc\u0645\u062a",
+
+        "above_poc": "\u0628\u0627\u0644\u0627\u06cc \u0646\u0627\u062d\u06cc\u0647 \u062d\u062c\u0645\u06cc \u0627\u0635\u0644\u06cc",
+        "below_poc": "\u067e\u0627\u06cc\u06cc\u0646 \u0646\u0627\u062d\u06cc\u0647 \u062d\u062c\u0645\u06cc \u0627\u0635\u0644\u06cc",
+        "near_poc": "\u0646\u0632\u062f\u06cc\u06a9 \u0646\u0627\u062d\u06cc\u0647 \u062d\u062c\u0645\u06cc \u0627\u0635\u0644\u06cc",
     }
     return data.get(value, value)
 
@@ -122,301 +156,333 @@ def fa_general(value):
 def build_trade_levels(result):
     if result.get("stop_loss") is None:
         return f"""
-برای این وضعیت، ورود پیشنهاد نمی‌شود.
+\u0628\u0631\u0627\u06cc \u0627\u06cc\u0646 \u0648\u0636\u0639\u06cc\u062a\u060c \u0648\u0631\u0648\u062f \u067e\u06cc\u0634\u0646\u0647\u0627\u062f \u0646\u0645\u06cc\u200c\u0634\u0648\u062f.
 
-سطوح احتمالی فقط برای بررسی:
-حد ضرر احتمالی:
+\u0633\u0637\u0648\u062d \u0627\u062d\u062a\u0645\u0627\u0644\u06cc \u0641\u0642\u0637 \u0628\u0631\u0627\u06cc \u0628\u0631\u0631\u0633\u06cc:
+\u062d\u062f \u0636\u0631\u0631 \u0627\u062d\u062a\u0645\u0627\u0644\u06cc:
 {safe(result.get('candidate_stop_loss'))}
 
-حد سود 1 احتمالی:
+\u062d\u062f \u0633\u0648\u062f 1 \u0627\u062d\u062a\u0645\u0627\u0644\u06cc:
 {safe(result.get('candidate_tp1'))}
 
-حد سود 2 احتمالی:
+\u062d\u062f \u0633\u0648\u062f 2 \u0627\u062d\u062a\u0645\u0627\u0644\u06cc:
 {safe(result.get('candidate_tp2'))}
 """
+
     return f"""
-ورود تقریبی:
+\u0648\u0631\u0648\u062f \u062a\u0642\u0631\u06cc\u0628\u06cc:
 {result['price']}
 
-حد ضرر:
+\u062d\u062f \u0636\u0631\u0631:
 {result['stop_loss']}
 
-حد سود 1:
+\u062d\u062f \u0633\u0648\u062f 1:
 {result['tp1']}
 
-حد سود 2:
+\u062d\u062f \u0633\u0648\u062f 2:
 {result['tp2']}
 """
 
 
 def build_analysis_text(result):
-    reasons_text = "\n".join([f"✅ {r}" for r in result.get("reasons", [])])
+    reasons_text = "\n".join([f"\u2705 {r}" for r in result.get("reasons", [])])
     trade_levels = build_trade_levels(result)
-    return f"""
-📊 تحلیل فیوچرز {result['symbol']}
 
-قیمت فعلی:
+    return f"""
+\U0001f4ca \u062a\u062d\u0644\u06cc\u0644 \u0641\u06cc\u0648\u0686\u0631\u0632 {result['symbol']}
+
+\u0642\u06cc\u0645\u062a \u0641\u0639\u0644\u06cc:
 {result['price']}
 
-جهت نهایی:
+\u062c\u0647\u062a \u0646\u0647\u0627\u06cc\u06cc:
 {fa_direction(result['direction'])}
 
-جهت خام تحلیل:
+\u062c\u0647\u062a \u062e\u0627\u0645 \u062a\u062d\u0644\u06cc\u0644:
 {fa_direction(result.get('raw_direction'))}
 
-امتیاز سیگنال:
+\u0627\u0645\u062a\u06cc\u0627\u0632 \u0633\u06cc\u06af\u0646\u0627\u0644:
 {result['score']}/100
 
-احتمال موفقیت تقریبی:
-{safe(result.get('win_probability'))}٪
+\u0627\u062d\u062a\u0645\u0627\u0644 \u0645\u0648\u0641\u0642\u06cc\u062a \u062a\u0642\u0631\u06cc\u0628\u06cc:
+{safe(result.get('win_probability'))}\u066a
 
-گرید ورود:
+\u06af\u0631\u06cc\u062f \u0648\u0631\u0648\u062f:
 {safe(result.get('entry_grade'))}
 
-سطح ریسک:
+\u0633\u0637\u062d \u0631\u06cc\u0633\u06a9:
 {safe(result.get('risk_level'))}
 
-ریسک به ریوارد:
+\u0631\u06cc\u0633\u06a9 \u0628\u0647 \u0631\u06cc\u0648\u0627\u0631\u062f:
 {safe(result.get('risk_reward'))}
 
-ریسک لیکوییدیتی:
+\u0631\u06cc\u0633\u06a9 \u0644\u06cc\u06a9\u0648\u06cc\u06cc\u062f\u06cc\u062a\u06cc:
 {safe(result.get('liquidity_risk'))}
 
-⏰ اعتبار سیگنال:
+\u23f0 \u0627\u0639\u062a\u0628\u0627\u0631 \u0633\u06cc\u06af\u0646\u0627\u0644:
 {result['validity']}
 
-⏱ تایم‌فریم مناسب:
+\u23f1 \u062a\u0627\u06cc\u0645\u200c\u0641\u0631\u06cc\u0645 \u0645\u0646\u0627\u0633\u0628:
 {result['signal_timeframe']}
 
-امتیاز لانگ:
+\u0627\u0645\u062a\u06cc\u0627\u0632 \u0644\u0627\u0646\u06af:
 {result['long_score']}
 
-امتیاز شورت:
+\u0627\u0645\u062a\u06cc\u0627\u0632 \u0634\u0648\u0631\u062a:
 {result['short_score']}
 
-قدرت خرید:
-{result['buy_power']}٪
+\u0642\u062f\u0631\u062a \u062e\u0631\u06cc\u062f:
+{result['buy_power']}\u066a
 
-قدرت فروش:
-{result['sell_power']}٪
+\u0642\u062f\u0631\u062a \u0641\u0631\u0648\u0634:
+{result['sell_power']}\u066a
 
-RSI:
+\u0634\u0627\u062e\u0635 RSI:
 {result['rsi']}
 
-ADX:
+\u0642\u062f\u0631\u062a \u0631\u0648\u0646\u062f ADX:
 {safe(result.get('adx'))}
 
 MACD:
 {result['macd']}
 
-هیستوگرام MACD:
+\u0647\u06cc\u0633\u062a\u0648\u06af\u0631\u0627\u0645 MACD:
 {safe(result.get('macd_hist'))}
 
-VWAP:
+\u0645\u06cc\u0627\u0646\u06af\u06cc\u0646 \u062d\u062c\u0645\u06cc \u0642\u06cc\u0645\u062a:
 {safe(result.get('vwap'))}
 
-وضعیت VWAP:
+\u0648\u0636\u0639\u06cc\u062a \u0645\u06cc\u0627\u0646\u06af\u06cc\u0646 \u062d\u062c\u0645\u06cc \u0642\u06cc\u0645\u062a:
 {fa_general(result.get('vwap_status'))}
 
-POC حجمی:
+POC \u062d\u062c\u0645\u06cc:
 {safe(result.get('poc_price'))}
 
-وضعیت حجم:
+\u0648\u0636\u0639\u06cc\u062a \u062d\u062c\u0645:
 {fa_general(result.get('volume_profile_status'))}
 
-Funding:
-{safe(result.get('funding_rate'))}٪
+\u0646\u0631\u062e \u0641\u0627\u0646\u062f\u06cc\u0646\u06af:
+{safe(result.get('funding_rate'))}\u066a
 
-Open Interest:
+\u062d\u062c\u0645 \u0642\u0631\u0627\u0631\u062f\u0627\u062f\u0647\u0627\u06cc \u0628\u0627\u0632:
 {safe(result.get('open_interest'))}
 
-Spread:
-{safe(result.get('spread_percent'))}٪
+\u0627\u0633\u067e\u0631\u062f:
+{safe(result.get('spread_percent'))}\u066a
 
-BTC Filter:
+\u0641\u06cc\u0644\u062a\u0631 \u0628\u06cc\u062a\u06a9\u0648\u06cc\u0646:
 {fa_general(result.get('btc_filter'))}
 
-کندل تاییدی:
+\u06a9\u0646\u062f\u0644 \u062a\u0627\u06cc\u06cc\u062f\u06cc:
 {fa_general(result.get('candle_pattern'))}
 
-تایید چند کندلی:
+\u062a\u0627\u06cc\u06cc\u062f \u0686\u0646\u062f \u06a9\u0646\u062f\u0644\u06cc:
 {fa_general(result.get('multi_candle'))}
 
-Liquidity Grab:
+\u062c\u0645\u0639\u200c\u0622\u0648\u0631\u06cc \u0646\u0642\u062f\u06cc\u0646\u06af\u06cc:
 {fa_general(result.get('liquidity_grab'))}
 
-Stop Hunt:
+\u0627\u0633\u062a\u0627\u067e\u200c\u0647\u0627\u0646\u062a:
 {fa_general(result.get('stop_hunt'))}
 
-FVG:
+\u0646\u0627\u062d\u06cc\u0647 \u062e\u0627\u0644\u06cc \u0646\u0642\u062f\u06cc\u0646\u06af\u06cc:
 {fa_general(result.get('fvg'))}
 
-Order Block:
+\u0627\u0648\u0631\u062f\u0631 \u0628\u0644\u0627\u06a9:
 {fa_general(result.get('order_block'))}
 
-واگرایی RSI:
+\u0648\u0627\u06af\u0631\u0627\u06cc\u06cc RSI:
 {fa_general(result.get('rsi_divergence'))}
 
-واگرایی MACD:
+\u0648\u0627\u06af\u0631\u0627\u06cc\u06cc MACD:
 {fa_general(result.get('macd_divergence'))}
 
-فیک بریک‌اوت:
+\u0641\u06cc\u06a9 \u0628\u0631\u06cc\u06a9\u200c\u0627\u0648\u062a:
 {fa_general(result.get('fake_breakout'))}
 
-خستگی روند:
+\u062e\u0633\u062a\u06af\u06cc \u0631\u0648\u0646\u062f:
 {fa_general(result.get('trend_exhaustion'))}
 
-حمایت:
+\u062d\u0645\u0627\u06cc\u062a:
 {result['support']}
 
-مقاومت:
+\u0645\u0642\u0627\u0648\u0645\u062a:
 {result['resistance']}
 
-خط روند:
+\u062e\u0637 \u0631\u0648\u0646\u062f:
 {fa_general(result['trendline'])}
 
-ساختار بازار:
+\u0633\u0627\u062e\u062a\u0627\u0631 \u0628\u0627\u0632\u0627\u0631:
 {fa_general(result['market_structure'])}
 
-وضعیت بریک‌اوت:
+\u0648\u0636\u0639\u06cc\u062a \u0628\u0631\u06cc\u06a9\u200c\u0627\u0648\u062a:
 {fa_general(result['breakout'])}
 
-Fear & Greed:
+\u0634\u0627\u062e\u0635 \u062a\u0631\u0633 \u0648 \u0637\u0645\u0639:
 {safe(result.get('fear_value'))} - {safe(result.get('fear_text'))}
 
-BTC Dominance:
-{safe(result.get('btc_dominance'))}٪
+\u062f\u0627\u0645\u06cc\u0646\u0646\u0633 \u0628\u06cc\u062a\u06a9\u0648\u06cc\u0646:
+{safe(result.get('btc_dominance'))}\u066a
 
-وضعیت دامیننس:
+\u0648\u0636\u0639\u06cc\u062a \u062f\u0627\u0645\u06cc\u0646\u0646\u0633:
 {safe(result.get('dominance_status'))}
 
-Alt Season:
+\u0648\u0636\u0639\u06cc\u062a \u0622\u0644\u062a\u200c\u0633\u06cc\u0632\u0646:
 {safe(result.get('altseason_status'))}
 
-🎯 سطوح معامله:
+\U0001f3af \u0633\u0637\u0648\u062d \u0645\u0639\u0627\u0645\u0644\u0647:
 {trade_levels}
 
-🧭 ناحیه ورود پیشنهادی:
-{safe(result.get('entry_zone_low'))} تا {safe(result.get('entry_zone_high'))}
+\U0001f9ed \u0646\u0627\u062d\u06cc\u0647 \u0648\u0631\u0648\u062f \u067e\u06cc\u0634\u0646\u0647\u0627\u062f\u06cc:
+{safe(result.get('entry_zone_low'))} \u062a\u0627 {safe(result.get('entry_zone_high'))}
 
-تریگر ورود:
+\u062a\u0631\u06cc\u06af\u0631 \u0648\u0631\u0648\u062f:
 {safe(result.get('entry_trigger'))}
 
-حالت خیلی امن:
-{"✅ بله" if result.get("very_safe") else "❌ نه"}
+\u062d\u0627\u0644\u062a \u062e\u06cc\u0644\u06cc \u0627\u0645\u0646:
+{"\u2705 \u0628\u0644\u0647" if result.get("very_safe") else "\u274c \u0646\u0647"}
 
-دلایل تحلیل:
+\u062f\u0644\u0627\u06cc\u0644 \u062a\u062d\u0644\u06cc\u0644:
 {reasons_text}
 
-⚠️ این تحلیل تضمین سود نیست. حتماً با حد ضرر، حجم کم و مدیریت ریسک وارد شو.
+\u26a0\ufe0f \u0627\u06cc\u0646 \u062a\u062d\u0644\u06cc\u0644 \u062a\u0636\u0645\u06cc\u0646 \u0633\u0648\u062f \u0646\u06cc\u0633\u062a. \u062d\u062a\u0645\u0627\u064b \u0628\u0627 \u062d\u062f \u0636\u0631\u0631\u060c \u062d\u062c\u0645 \u06a9\u0645 \u0648 \u0645\u062f\u06cc\u0631\u06cc\u062a \u0631\u06cc\u0633\u06a9 \u0648\u0627\u0631\u062f \u0634\u0648.
 """
 
 
 def send_analysis(message, symbol):
-    bot.reply_to(message, f"⏳ در حال تحلیل {symbol} ...")
+    bot.reply_to(message, f"\u23f3 \u062f\u0631 \u062d\u0627\u0644 \u062a\u062d\u0644\u06cc\u0644 {symbol} ...")
+
     try:
         result = analyze_symbol(symbol)
     except Exception as e:
         print("ANALYSIS ERROR:", str(e))
-        bot.reply_to(message, f"❌ خطا در تحلیل {symbol}\n\nعلت خطا:\n{e}")
+        bot.reply_to(message, f"\u274c \u062e\u0637\u0627 \u062f\u0631 \u062a\u062d\u0644\u06cc\u0644 {symbol}\n\n\u0639\u0644\u062a \u062e\u0637\u0627:\n{e}")
         return
+
     sent = bot.reply_to(message, build_analysis_text(result))
     remember_signal_result(sent, result)
 
 
 def send_best_signals(message, very_safe_only=False):
-    bot.reply_to(message, "⏳ در حال اسکن بازار...")
+    if very_safe_only:
+        bot.reply_to(message, "\u23f3 \u062f\u0631 \u062d\u0627\u0644 \u0627\u0633\u06a9\u0646 \u0628\u0627\u0632\u0627\u0631 \u0628\u0631\u0627\u06cc \u0633\u06cc\u06af\u0646\u0627\u0644\u200c\u0647\u0627\u06cc \u062e\u06cc\u0644\u06cc \u0627\u0645\u0646...")
+    else:
+        bot.reply_to(message, "\u23f3 \u062f\u0631 \u062d\u0627\u0644 \u0627\u0633\u06a9\u0646 \u0628\u0627\u0632\u0627\u0631...")
+
     try:
         results = get_best_signals(limit=5, very_safe_only=very_safe_only)
     except Exception as e:
         print("BEST SIGNAL ERROR:", str(e))
-        bot.reply_to(message, f"❌ خطا در اسکن بازار:\n{e}")
-        return
-    if not results:
-        bot.reply_to(message, "فعلاً سیگنال مناسبی پیدا نشد.")
+        bot.reply_to(message, f"\u274c \u062e\u0637\u0627 \u062f\u0631 \u0627\u0633\u06a9\u0646 \u0628\u0627\u0632\u0627\u0631:\n{e}")
         return
 
-    msg = "🏆 بهترین سیگنال‌های خیلی امن:\n\n" if very_safe_only else "🏆 بهترین سیگنال‌های الان:\n\n"
-    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+    if not results:
+        if very_safe_only:
+            bot.reply_to(message, "\u0641\u0639\u0644\u0627\u064b \u0633\u06cc\u06af\u0646\u0627\u0644 \u062e\u06cc\u0644\u06cc \u0627\u0645\u0646 \u0645\u0646\u0627\u0633\u0628\u06cc \u067e\u06cc\u062f\u0627 \u0646\u0634\u062f.")
+        else:
+            bot.reply_to(message, "\u0641\u0639\u0644\u0627\u064b \u0633\u06cc\u06af\u0646\u0627\u0644 \u0645\u0646\u0627\u0633\u0628\u06cc \u067e\u06cc\u062f\u0627 \u0646\u0634\u062f.")
+        return
+
+    msg = "\U0001f3c6 \u0628\u0647\u062a\u0631\u06cc\u0646 \u0633\u06cc\u06af\u0646\u0627\u0644\u200c\u0647\u0627\u06cc \u062e\u06cc\u0644\u06cc \u0627\u0645\u0646:\n\n" if very_safe_only else "\U0001f3c6 \u0628\u0647\u062a\u0631\u06cc\u0646 \u0633\u06cc\u06af\u0646\u0627\u0644\u200c\u0647\u0627\u06cc \u0627\u0644\u0627\u0646:\n\n"
+    medals = ["\U0001f947", "\U0001f948", "\U0001f949", "4\ufe0f\u20e3", "5\ufe0f\u20e3"]
+
     for i, r in enumerate(results):
-        direction_fa = "لانگ" if r["direction"] == "LONG" else "شورت"
+        direction_fa = "\u0644\u0627\u0646\u06af" if r["direction"] == "LONG" else "\u0634\u0648\u0631\u062a"
+
         msg += f"""
 {medals[i]} {r['symbol']}
-جهت: {direction_fa}
-امتیاز: {r['score']}/100
-احتمال موفقیت: {safe(r.get('win_probability'))}٪
-گرید: {safe(r.get('entry_grade'))}
-ریسک: {safe(r.get('risk_level'))}
-R/R: {safe(r.get('risk_reward'))}
-اعتبار: {r['validity']}
-تایم‌فریم: {r['signal_timeframe']}
-قیمت: {r['price']}
+\u062c\u0647\u062a: {direction_fa}
+\u0627\u0645\u062a\u06cc\u0627\u0632: {r['score']}/100
+\u0627\u062d\u062a\u0645\u0627\u0644 \u0645\u0648\u0641\u0642\u06cc\u062a: {safe(r.get('win_probability'))}\u066a
+\u06af\u0631\u06cc\u062f: {safe(r.get('entry_grade'))}
+\u0631\u06cc\u0633\u06a9: {safe(r.get('risk_level'))}
+\u0631\u06cc\u0633\u06a9 \u0628\u0647 \u0631\u06cc\u0648\u0627\u0631\u062f: {safe(r.get('risk_reward'))}
+\u0627\u0639\u062a\u0628\u0627\u0631: {r['validity']}
+\u062a\u0627\u06cc\u0645\u200c\u0641\u0631\u06cc\u0645: {r['signal_timeframe']}
+\u0642\u06cc\u0645\u062a: {r['price']}
 ADX: {safe(r.get('adx'))}
-Spread: {safe(r.get('spread_percent'))}٪
-Funding: {safe(r.get('funding_rate'))}٪
-Very Safe: {"بله ✅" if r.get("very_safe") else "خیر"}
+\u0627\u0633\u067e\u0631\u062f: {safe(r.get('spread_percent'))}\u066a
+\u0646\u0631\u062e \u0641\u0627\u0646\u062f\u06cc\u0646\u06af: {safe(r.get('funding_rate'))}\u066a
+\u062d\u0627\u0644\u062a \u062e\u06cc\u0644\u06cc \u0627\u0645\u0646: {"\u0628\u0644\u0647 \u2705" if r.get("very_safe") else "\u062e\u06cc\u0631"}
 """
+
     bot.reply_to(message, msg)
 
 
 def send_auto_signal_to_all_users(result):
-    direction_fa = "لانگ" if result["direction"] == "LONG" else "شورت"
-    text = f"""
-🚨 سیگنال خودکار قوی
+    direction_fa = "\u0644\u0627\u0646\u06af" if result["direction"] == "LONG" else "\u0634\u0648\u0631\u062a"
 
-ارز:
+    text = f"""
+\U0001f6a8 \u0633\u06cc\u06af\u0646\u0627\u0644 \u062e\u0648\u062f\u06a9\u0627\u0631 \u0642\u0648\u06cc
+
+\u0627\u0631\u0632:
 {result['symbol']}
 
-جهت:
+\u062c\u0647\u062a:
 {direction_fa}
 
-امتیاز:
+\u0627\u0645\u062a\u06cc\u0627\u0632:
 {result['score']}/100
 
-احتمال موفقیت:
-{safe(result.get('win_probability'))}٪
+\u0627\u062d\u062a\u0645\u0627\u0644 \u0645\u0648\u0641\u0642\u06cc\u062a:
+{safe(result.get('win_probability'))}\u066a
 
-گرید:
+\u06af\u0631\u06cc\u062f:
 {safe(result.get('entry_grade'))}
 
-ریسک:
+\u0631\u06cc\u0633\u06a9:
 {safe(result.get('risk_level'))}
 
-R/R:
+\u0631\u06cc\u0633\u06a9 \u0628\u0647 \u0631\u06cc\u0648\u0627\u0631\u062f:
 {safe(result.get('risk_reward'))}
 
-قیمت:
+\u0627\u0639\u062a\u0628\u0627\u0631 \u0633\u06cc\u06af\u0646\u0627\u0644:
+{result['validity']}
+
+\u062a\u0627\u06cc\u0645\u200c\u0641\u0631\u06cc\u0645 \u0645\u0646\u0627\u0633\u0628:
+{result['signal_timeframe']}
+
+\u0642\u06cc\u0645\u062a:
 {result['price']}
 
-حد ضرر:
+\u062d\u062f \u0636\u0631\u0631:
 {result['stop_loss']}
 
-حد سود 1:
+\u062d\u062f \u0633\u0648\u062f 1:
 {result['tp1']}
 
-حد سود 2:
+\u062d\u062f \u0633\u0648\u062f 2:
 {result['tp2']}
 
-قدرت خرید:
-{result['buy_power']}٪
+\u0642\u062f\u0631\u062a \u062e\u0631\u06cc\u062f:
+{result['buy_power']}\u066a
 
-قدرت فروش:
-{result['sell_power']}٪
+\u0642\u062f\u0631\u062a \u0641\u0631\u0648\u0634:
+{result['sell_power']}\u066a
 
 ADX:
 {safe(result.get('adx'))}
 
-FVG:
+\u0646\u0631\u062e \u0641\u0627\u0646\u062f\u06cc\u0646\u06af:
+{safe(result.get('funding_rate'))}\u066a
+
+\u0645\u06cc\u0627\u0646\u06af\u06cc\u0646 \u062d\u062c\u0645\u06cc \u0642\u06cc\u0645\u062a:
+{fa_general(result.get('vwap_status'))}
+
+\u0646\u0627\u062d\u06cc\u0647 \u062e\u0627\u0644\u06cc \u0646\u0642\u062f\u06cc\u0646\u06af\u06cc:
 {fa_general(result.get('fvg'))}
 
-Order Block:
+\u0627\u0648\u0631\u062f\u0631 \u0628\u0644\u0627\u06a9:
 {fa_general(result.get('order_block'))}
 
-Very Safe:
-{"بله ✅" if result.get("very_safe") else "خیر"}
+\u0646\u0627\u062d\u06cc\u0647 \u0648\u0631\u0648\u062f:
+{safe(result.get('entry_zone_low'))} \u062a\u0627 {safe(result.get('entry_zone_high'))}
 
-⚠️ مدیریت ریسک فراموش نشود.
+\u062d\u0627\u0644\u062a \u062e\u06cc\u0644\u06cc \u0627\u0645\u0646:
+{"\u0628\u0644\u0647 \u2705" if result.get("very_safe") else "\u062e\u06cc\u0631"}
+
+\u26a0\ufe0f \u0645\u062f\u06cc\u0631\u06cc\u062a \u0631\u06cc\u0633\u06a9 \u0641\u0631\u0627\u0645\u0648\u0634 \u0646\u0634\u0648\u062f.
 """
+
     for user_id in list_users():
         try:
             sent = bot.send_message(user_id, text)
@@ -427,108 +493,138 @@ Very Safe:
 
 def auto_signal_loop():
     time.sleep(60)
+
     while True:
         for symbol in SCAN_SYMBOLS:
             try:
                 result = analyze_symbol(symbol)
+
                 if should_send_auto_signal(result):
                     send_auto_signal_to_all_users(result)
+
             except Exception as e:
                 msg = str(e)
-                quiet = ["does not have market symbol", "Too Many Requests", "429", "Unauthorized"]
-                if not any(x in msg for x in quiet):
+                quiet_errors = [
+                    "does not have market symbol",
+                    "Too Many Requests",
+                    "429 Client Error",
+                    "BTC dominance not found",
+                    "Unauthorized for url",
+                    "داده کافی",
+                ]
+                if not any(x in msg for x in quiet_errors):
                     print("AUTO SIGNAL ERROR:", symbol, msg)
                 continue
+
         time.sleep(AUTO_SCAN_INTERVAL_MINUTES * 60)
 
 
 def signal_tracking_loop():
     time.sleep(30)
+
     while True:
         try:
             messages = check_active_signals()
+
             for item in messages:
                 try:
                     bot.send_message(item["chat_id"], item["message"])
                 except Exception as e:
                     print("SEND TRACK RESULT ERROR:", str(e))
+
         except Exception as e:
             print("SIGNAL TRACKING LOOP ERROR:", str(e))
+
         time.sleep(TRACKER_CHECK_INTERVAL_SECONDS)
 
 
 @bot.message_handler(commands=["start"])
 def start(message):
     if not is_user_allowed(message.from_user.id):
-        bot.reply_to(message, "⛔ شما مجاز به استفاده از این ربات نیستید.")
+        bot.reply_to(message, "\u26d4 \u0634\u0645\u0627 \u0645\u062c\u0627\u0632 \u0628\u0647 \u0627\u0633\u062a\u0641\u0627\u062f\u0647 \u0627\u0632 \u0627\u06cc\u0646 \u0631\u0628\u0627\u062a \u0646\u06cc\u0633\u062a\u06cc\u062f.")
         return
+
     bot.reply_to(message, """
-سلام 👋
+\u0633\u0644\u0627\u0645 \U0001f44b
 
-ربات دستیار فیوچرز کریپتو فعال است.
+\u0631\u0628\u0627\u062a \u062f\u0633\u062a\u06cc\u0627\u0631 \u0641\u06cc\u0648\u0686\u0631\u0632 \u06a9\u0631\u06cc\u067e\u062a\u0648 \u0641\u0639\u0627\u0644 \u0627\u0633\u062a.
 
-مثال:
-بیتکوین
-تحلیل دوج
-بهترین سیگنال
-سیگنال خیلی امن
+\u0645\u062b\u0627\u0644:
+\u0628\u06cc\u062a\u06a9\u0648\u06cc\u0646
+\u0627\u062a\u0631\u06cc\u0648\u0645
+\u062a\u062d\u0644\u06cc\u0644 \u062f\u0648\u062c
+\u0633\u06cc\u06af\u0646\u0627\u0644 \u0633\u0648\u0644\u0627\u0646\u0627
+\u0628\u0647\u062a\u0631\u06cc\u0646 \u0633\u06cc\u06af\u0646\u0627\u0644 \u0627\u0644\u0627\u0646
+\u0633\u06cc\u06af\u0646\u0627\u0644 \u062e\u06cc\u0644\u06cc \u0627\u0645\u0646
 
-زیر نظر گرفتن:
-روی پیام تحلیل ریپلای کن و بنویس:
-نظر
-یا
-زیر نظر
+\u0632\u06cc\u0631 \u0646\u0638\u0631 \u06af\u0631\u0641\u062a\u0646 \u0633\u06cc\u06af\u0646\u0627\u0644:
+\u0631\u0648\u06cc \u067e\u06cc\u0627\u0645 \u062a\u062d\u0644\u06cc\u0644 \u06cc\u0627 \u0633\u06cc\u06af\u0646\u0627\u0644 \u062e\u0648\u062f\u06a9\u0627\u0631 \u0631\u06cc\u067e\u0644\u0627\u06cc \u06a9\u0646 \u0648 \u0628\u0646\u0648\u06cc\u0633:
+\u0632\u06cc\u0631 \u0646\u0638\u0631
 
-آمار:
-آمار
-آمار 7 روز
-آمار کل
+\u0622\u0645\u0627\u0631:
+\u0622\u0645\u0627\u0631
+\u0622\u0645\u0627\u0631 3 \u0631\u0648\u0632
+\u0622\u0645\u0627\u0631 7 \u0631\u0648\u0632
+\u0622\u0645\u0627\u0631 14 \u0631\u0648\u0632
+\u0622\u0645\u0627\u0631 30 \u0631\u0648\u0632
+\u0622\u0645\u0627\u0631 \u06a9\u0644
 
-محاسبه سود:
-روی پیام تحلیل یا آمار ریپلای کن و بنویس:
-5 دلار لوریج 10
+\u062f\u0633\u062a\u0648\u0631\u0627\u062a \u0627\u062f\u0645\u06cc\u0646:
+/adduser 123456789
+/removeuser 123456789
+/listusers
 """)
 
 
 @bot.message_handler(commands=["adduser"])
 def add_user_command(message):
     if not is_owner(message.from_user.id):
-        bot.reply_to(message, "⛔ فقط مالک ربات می‌تواند کاربر اضافه کند.")
+        bot.reply_to(message, "\u26d4 \u0641\u0642\u0637 \u0645\u0627\u0644\u06a9 \u0631\u0628\u0627\u062a \u0645\u06cc\u200c\u062a\u0648\u0627\u0646\u062f \u06a9\u0627\u0631\u0628\u0631 \u0627\u0636\u0627\u0641\u0647 \u06a9\u0646\u062f.")
         return
+
     try:
         user_id = int(message.text.split()[1])
         add_user(user_id)
-        bot.reply_to(message, f"✅ کاربر {user_id} اضافه شد.")
+        bot.reply_to(message, f"\u2705 \u06a9\u0627\u0631\u0628\u0631 {user_id} \u0627\u0636\u0627\u0641\u0647 \u0634\u062f.")
     except Exception:
-        bot.reply_to(message, "فرمت درست:\n/adduser 123456789")
+        bot.reply_to(message, "\u0641\u0631\u0645\u062a \u062f\u0631\u0633\u062a:\n/adduser 123456789")
 
 
 @bot.message_handler(commands=["removeuser"])
 def remove_user_command(message):
     if not is_owner(message.from_user.id):
-        bot.reply_to(message, "⛔ فقط مالک ربات می‌تواند کاربر حذف کند.")
+        bot.reply_to(message, "\u26d4 \u0641\u0642\u0637 \u0645\u0627\u0644\u06a9 \u0631\u0628\u0627\u062a \u0645\u06cc\u200c\u062a\u0648\u0627\u0646\u062f \u06a9\u0627\u0631\u0628\u0631 \u062d\u0630\u0641 \u06a9\u0646\u062f.")
         return
+
     try:
         user_id = int(message.text.split()[1])
         ok = remove_user(user_id)
-        bot.reply_to(message, f"✅ کاربر {user_id} حذف شد." if ok else "❌ مالک اصلی قابل حذف نیست یا کاربر وجود ندارد.")
+
+        if ok:
+            bot.reply_to(message, f"\u2705 \u06a9\u0627\u0631\u0628\u0631 {user_id} \u062d\u0630\u0641 \u0634\u062f.")
+        else:
+            bot.reply_to(message, "\u274c \u0645\u0627\u0644\u06a9 \u0627\u0635\u0644\u06cc \u0642\u0627\u0628\u0644 \u062d\u0630\u0641 \u0646\u06cc\u0633\u062a \u06cc\u0627 \u06a9\u0627\u0631\u0628\u0631 \u0648\u062c\u0648\u062f \u0646\u062f\u0627\u0631\u062f.")
     except Exception:
-        bot.reply_to(message, "فرمت درست:\n/removeuser 123456789")
+        bot.reply_to(message, "\u0641\u0631\u0645\u062a \u062f\u0631\u0633\u062a:\n/removeuser 123456789")
 
 
 @bot.message_handler(commands=["listusers"])
 def list_users_command(message):
     if not is_owner(message.from_user.id):
-        bot.reply_to(message, "⛔ فقط مالک ربات می‌تواند لیست کاربران را ببیند.")
+        bot.reply_to(message, "\u26d4 \u0641\u0642\u0637 \u0645\u0627\u0644\u06a9 \u0631\u0628\u0627\u062a \u0645\u06cc\u200c\u062a\u0648\u0627\u0646\u062f \u0644\u06cc\u0633\u062a \u06a9\u0627\u0631\u0628\u0631\u0627\u0646 \u0631\u0627 \u0628\u0628\u06cc\u0646\u062f.")
         return
-    bot.reply_to(message, "👥 کاربران مجاز:\n" + "\n".join([str(u) for u in list_users()]))
+
+    users = list_users()
+    users_text = "\n".join([str(u) for u in users])
+    bot.reply_to(message, f"\U0001f465 \u06a9\u0627\u0631\u0628\u0631\u0627\u0646 \u0645\u062c\u0627\u0632:\n{users_text}")
 
 
 @bot.message_handler(func=lambda message: True)
 def handle_message(message):
     if not is_user_allowed(message.from_user.id):
-        bot.reply_to(message, "⛔ شما مجاز به استفاده از این ربات نیستید.")
+        bot.reply_to(message, "\u26d4 \u0634\u0645\u0627 \u0645\u062c\u0627\u0632 \u0628\u0647 \u0627\u0633\u062a\u0641\u0627\u062f\u0647 \u0627\u0632 \u0627\u06cc\u0646 \u0631\u0628\u0627\u062a \u0646\u06cc\u0633\u062a\u06cc\u062f.")
         return
+
     if not message.text:
         return
 
@@ -537,46 +633,69 @@ def handle_message(message):
     profit_calc = parse_profit_calc_text(text)
     if profit_calc:
         margin, leverage = profit_calc
-        reply_text = message.reply_to_message.text if message.reply_to_message and message.reply_to_message.text else None
+
+        reply_text = None
+        if message.reply_to_message and message.reply_to_message.text:
+            reply_text = message.reply_to_message.text
+
         single_report = get_profit_for_signal_text(reply_text, margin, leverage)
+
         if single_report:
             bot.reply_to(message, single_report)
             return
+
         days = parse_days_from_report_text(reply_text) if reply_text else 7
-        bot.reply_to(message, get_profit_simulation_report(margin, leverage, days))
+        report = get_profit_simulation_report(margin, leverage, days)
+        bot.reply_to(message, report)
         return
 
     if is_track_command(text):
         result = get_replied_signal_result(message)
+
         if not result:
-            bot.reply_to(message, "❌ برای زیر نظر گرفتن، باید روی پیام تحلیل یا سیگنال خودکار ریپلای بزنی.")
+            bot.reply_to(
+                message,
+                "\u274c \u0628\u0631\u0627\u06cc \u0632\u06cc\u0631 \u0646\u0638\u0631 \u06af\u0631\u0641\u062a\u0646\u060c \u0628\u0627\u06cc\u062f \u0631\u0648\u06cc \u067e\u06cc\u0627\u0645 \u062a\u062d\u0644\u06cc\u0644 \u06cc\u0627 \u0633\u06cc\u06af\u0646\u0627\u0644 \u062e\u0648\u062f\u06a9\u0627\u0631 \u0631\u06cc\u067e\u0644\u0627\u06cc \u0628\u0632\u0646\u06cc.\n"
+                "\u0627\u06af\u0631 \u0631\u0628\u0627\u062a \u0631\u06cc\u200c\u0627\u0633\u062a\u0627\u0631\u062a \u0634\u062f\u0647 \u0628\u0627\u0634\u062f\u060c \u062f\u0648\u0628\u0627\u0631\u0647 \u0647\u0645\u0627\u0646 \u0627\u0631\u0632 \u0631\u0627 \u062a\u062d\u0644\u06cc\u0644 \u0628\u06af\u06cc\u0631 \u0648 \u0628\u0639\u062f \u0631\u06cc\u067e\u0644\u0627\u06cc \u06a9\u0646."
+            )
             return
-        ok, msg = add_signal_to_tracking(message.from_user.id, message.chat.id, message.reply_to_message.message_id, result)
+
+        ok, msg = add_signal_to_tracking(
+            user_id=message.from_user.id,
+            chat_id=message.chat.id,
+            message_id=message.reply_to_message.message_id,
+            result=result
+        )
+
         bot.reply_to(message, msg)
         return
 
     if is_stats_command(text):
         days = parse_days_from_text(text)
-        bot.reply_to(message, get_stats_report(days))
+        report = get_stats_report(days)
+        bot.reply_to(message, report)
         return
 
-    if "خیلی امن" in text or "very safe" in text.lower():
+    if "\u062e\u06cc\u0644\u06cc \u0627\u0645\u0646" in text or "very safe" in text.lower():
         send_best_signals(message, very_safe_only=True)
         return
 
-    if "بهترین سیگنال" in text or "بهترین فرصت" in text:
+    if "\u0628\u0647\u062a\u0631\u06cc\u0646 \u0633\u06cc\u06af\u0646\u0627\u0644" in text or "\u0628\u0647\u062a\u0631\u06cc\u0646 \u0641\u0631\u0635\u062a" in text:
         send_best_signals(message)
         return
 
     symbol = find_symbol(text)
+
     if not symbol:
-        bot.reply_to(message, "ارز رو متوجه نشدم. مثلا بنویس: بیتکوین یا اتریوم")
+        bot.reply_to(message, "\u0627\u0631\u0632 \u0631\u0648 \u0645\u062a\u0648\u062c\u0647 \u0646\u0634\u062f\u0645. \u0645\u062b\u0644\u0627 \u0628\u0646\u0648\u06cc\u0633: \u0628\u06cc\u062a\u06a9\u0648\u06cc\u0646 \u06cc\u0627 \u0627\u062a\u0631\u06cc\u0648\u0645")
         return
+
     send_analysis(message, symbol)
 
 
-if AUTO_SIGNAL_ENABLED:
+if os.getenv("AUTO_SIGNAL_ENABLED", "1") == "1":
     threading.Thread(target=auto_signal_loop, daemon=True).start()
+
 threading.Thread(target=signal_tracking_loop, daemon=True).start()
 
 print("Bot is running...")
