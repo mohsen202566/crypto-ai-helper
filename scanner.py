@@ -1,12 +1,52 @@
 # -*- coding: utf-8 -*-
 import time
 
-from analysis import analyze_symbol
+from analysis import analyze_symbol, exchange, to_okx_symbol
 from config import AUTO_SIGNAL_SCORE, AUTO_SIGNAL_COOLDOWN_MINUTES
+try:
+    from config import AUTO_SCAN_MAX_SYMBOLS
+except Exception:
+    AUTO_SCAN_MAX_SYMBOLS = 80
 from coins_fa import COINS_FA
 
 
-SCAN_SYMBOLS = sorted(list(set(COINS_FA.values())))
+RAW_SCAN_SYMBOLS = sorted(list(set(COINS_FA.values())))
+_MARKETS_CACHE = None
+
+
+def _load_okx_symbols():
+    global _MARKETS_CACHE
+
+    if _MARKETS_CACHE is not None:
+        return _MARKETS_CACHE
+
+    try:
+        markets = exchange.load_markets()
+        _MARKETS_CACHE = set(markets.keys())
+        return _MARKETS_CACHE
+    except Exception:
+        _MARKETS_CACHE = set()
+        return _MARKETS_CACHE
+
+
+def symbol_supported(symbol):
+    markets = _load_okx_symbols()
+    if not markets:
+        return True
+    return to_okx_symbol(symbol) in markets
+
+
+def build_scan_symbols():
+    supported = [s for s in RAW_SCAN_SYMBOLS if symbol_supported(s)]
+
+    # محدودیت نرم برای اینکه اسکن خودکار باعث 429 و فشار زیاد روی API نشود.
+    if AUTO_SCAN_MAX_SYMBOLS and len(supported) > AUTO_SCAN_MAX_SYMBOLS:
+        supported = supported[:AUTO_SCAN_MAX_SYMBOLS]
+
+    return supported
+
+
+SCAN_SYMBOLS = build_scan_symbols()
 
 last_alerts = {}
 
@@ -163,7 +203,6 @@ def is_high_quality_signal(result):
     return True
 
 
-
 def is_very_safe_signal(result):
     if not is_high_quality_signal(result):
         return False
@@ -177,24 +216,6 @@ def is_very_safe_signal(result):
     if result.get("win_probability", 0) < 75:
         return False
 
-    if result.get("risk_reward", 0) < 1.2:
-        return False
-
-    return True
-
-
-def is_auto_signal(result):
-    if not is_high_quality_signal(result):
-        return False
-
-    if result.get("score", 0) < max(85, AUTO_SIGNAL_SCORE):
-        return False
-
-    if result.get("win_probability", 0) < 70:
-        return False
-
-    # بعد از اصلاح TP با حمایت/مقاومت، R/R ممکنه کمی پایین‌تر بیاد
-    # ولی TP واقعی‌تر میشه، پس 1.2 برای سیگنال خودکار منطقی‌تره
     if result.get("risk_reward", 0) < 1.2:
         return False
 
@@ -216,16 +237,18 @@ def get_best_signals(limit=5, very_safe_only=False):
                     results.append(result)
 
         except Exception as e:
-            print("SCAN ERROR:", symbol, str(e))
+            # خطاهای نمادهای ناموجود یا API نباید لاگ را پر کنند.
+            msg = str(e)
+            if "does not have market symbol" not in msg:
+                print("SCAN ERROR:", symbol, msg)
             continue
 
-    results.sort(
+    results = sorted(
+        results,
         key=lambda x: (
-            x.get("win_probability", 0),
             x.get("score", 0),
-            x.get("risk_reward", 0),
-            soft_confirmation_bonus(x),
-            x.get("adx", 0)
+            x.get("win_probability", 0),
+            x.get("risk_reward", 0)
         ),
         reverse=True
     )
@@ -234,16 +257,20 @@ def get_best_signals(limit=5, very_safe_only=False):
 
 
 def should_send_auto_signal(result):
-    if not is_auto_signal(result):
+    if not is_high_quality_signal(result):
         return False
 
-    key = f"{result['symbol']}_{result['direction']}"
-    now = time.time()
-    cooldown_seconds = AUTO_SIGNAL_COOLDOWN_MINUTES * 60
+    if result.get("score", 0) < AUTO_SIGNAL_SCORE:
+        return False
 
-    if key in last_alerts:
-        if now - last_alerts[key] < cooldown_seconds:
-            return False
+    symbol = result.get("symbol")
+    now = int(time.time())
 
-    last_alerts[key] = now
+    last_time = last_alerts.get(symbol, 0)
+    cooldown = AUTO_SIGNAL_COOLDOWN_MINUTES * 60
+
+    if now - last_time < cooldown:
+        return False
+
+    last_alerts[symbol] = now
     return True
