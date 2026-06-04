@@ -6,12 +6,14 @@ from config import AUTO_SIGNAL_SCORE, AUTO_SIGNAL_COOLDOWN_MINUTES
 try:
     from config import AUTO_SCAN_MAX_SYMBOLS
 except Exception:
-    AUTO_SCAN_MAX_SYMBOLS = 80
+    AUTO_SCAN_MAX_SYMBOLS = 35
+
 from coins_fa import COINS_FA
 
 
 RAW_SCAN_SYMBOLS = sorted(list(set(COINS_FA.values())))
 _MARKETS_CACHE = None
+last_alerts = {}
 
 
 def _load_okx_symbols():
@@ -39,7 +41,7 @@ def symbol_supported(symbol):
 def build_scan_symbols():
     supported = [s for s in RAW_SCAN_SYMBOLS if symbol_supported(s)]
 
-    # محدودیت نرم برای اینکه اسکن خودکار باعث 429 و فشار زیاد روی API نشود.
+    # اسکن را محدود می‌کنیم تا API خشک نشود و CoinGecko/OKX خطای پشت‌سرهم ندهند.
     if AUTO_SCAN_MAX_SYMBOLS and len(supported) > AUTO_SCAN_MAX_SYMBOLS:
         supported = supported[:AUTO_SCAN_MAX_SYMBOLS]
 
@@ -48,7 +50,14 @@ def build_scan_symbols():
 
 SCAN_SYMBOLS = build_scan_symbols()
 
-last_alerts = {}
+
+def _safe_number(value, default=0):
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
 
 
 def is_opposite_divergence(result):
@@ -112,13 +121,7 @@ def mtf_alignment_count(result):
     else:
         return 0
 
-    count = 0
-
-    for tf in ["1D", "4H", "1H", "30M"]:
-        if trends.get(tf) in good:
-            count += 1
-
-    return count
+    return sum(1 for tf in ["1D", "4H", "1H", "30M"] if trends.get(tf) in good)
 
 
 def soft_confirmation_bonus(result):
@@ -160,16 +163,17 @@ def is_high_quality_signal(result):
     if result.get("direction") == "NO TRADE":
         return False
 
-    if result.get("entry_grade") not in ["A+", "A", "B"]:
+    # طبق درخواست: Reject و B ارسال نشوند.
+    if result.get("entry_grade") not in ["A+", "A"]:
         return False
 
-    if result.get("score", 0) < 82:
+    if _safe_number(result.get("score")) < 82:
         return False
 
-    if result.get("win_probability", 0) < 68:
+    if _safe_number(result.get("win_probability")) < 68:
         return False
 
-    if result.get("risk_reward", 0) < 1.2:
+    if _safe_number(result.get("risk_reward")) < 1.05:
         return False
 
     if result.get("risk_level") == "بالا":
@@ -178,12 +182,11 @@ def is_high_quality_signal(result):
     if result.get("liquidity_risk") == "بالا":
         return False
 
-    if result.get("adx", 0) < 20:
+    if _safe_number(result.get("adx")) < 18:
         return False
 
-    if result.get("spread_percent") is not None:
-        if result.get("spread_percent") > 0.08:
-            return False
+    if result.get("spread_percent") is not None and _safe_number(result.get("spread_percent")) > 0.10:
+        return False
 
     if is_opposite_divergence(result):
         return False
@@ -191,7 +194,7 @@ def is_high_quality_signal(result):
     if is_fake_breakout_against_signal(result):
         return False
 
-    if not candle_confirmed(result):
+    if not candle_confirmed(result) and mtf_alignment_count(result) < 3:
         return False
 
     if mtf_alignment_count(result) < 2:
@@ -210,13 +213,13 @@ def is_very_safe_signal(result):
     if not result.get("very_safe"):
         return False
 
-    if result.get("score", 0) < 88:
+    if _safe_number(result.get("score")) < 88:
         return False
 
-    if result.get("win_probability", 0) < 75:
+    if _safe_number(result.get("win_probability")) < 74:
         return False
 
-    if result.get("risk_reward", 0) < 1.2:
+    if _safe_number(result.get("risk_reward")) < 1.15:
         return False
 
     return True
@@ -237,18 +240,18 @@ def get_best_signals(limit=5, very_safe_only=False):
                     results.append(result)
 
         except Exception as e:
-            # خطاهای نمادهای ناموجود یا API نباید لاگ را پر کنند.
             msg = str(e)
-            if "does not have market symbol" not in msg:
+            if "does not have market symbol" not in msg and "Too Many Requests" not in msg and "429" not in msg:
                 print("SCAN ERROR:", symbol, msg)
             continue
 
-    results = sorted(
-        results,
+    results.sort(
         key=lambda x: (
-            x.get("score", 0),
-            x.get("win_probability", 0),
-            x.get("risk_reward", 0)
+            _safe_number(x.get("win_probability")),
+            _safe_number(x.get("score")),
+            _safe_number(x.get("risk_reward")),
+            soft_confirmation_bonus(x),
+            _safe_number(x.get("adx")),
         ),
         reverse=True
     )
@@ -256,21 +259,33 @@ def get_best_signals(limit=5, very_safe_only=False):
     return results[:limit]
 
 
-def should_send_auto_signal(result):
+def is_auto_signal(result):
     if not is_high_quality_signal(result):
         return False
 
-    if result.get("score", 0) < AUTO_SIGNAL_SCORE:
+    if _safe_number(result.get("score")) < max(85, AUTO_SIGNAL_SCORE):
         return False
 
-    symbol = result.get("symbol")
-    now = int(time.time())
-
-    last_time = last_alerts.get(symbol, 0)
-    cooldown = AUTO_SIGNAL_COOLDOWN_MINUTES * 60
-
-    if now - last_time < cooldown:
+    if _safe_number(result.get("win_probability")) < 70:
         return False
 
-    last_alerts[symbol] = now
+    if _safe_number(result.get("risk_reward")) < 1.10:
+        return False
+
+    return True
+
+
+def should_send_auto_signal(result):
+    if not is_auto_signal(result):
+        return False
+
+    key = f"{result['symbol']}_{result['direction']}"
+    now = time.time()
+    cooldown_seconds = AUTO_SIGNAL_COOLDOWN_MINUTES * 60
+
+    if key in last_alerts:
+        if now - last_alerts[key] < cooldown_seconds:
+            return False
+
+    last_alerts[key] = now
     return True
