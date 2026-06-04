@@ -10,8 +10,35 @@ from market_structure import detect_market_structure, structure_score
 
 exchange = ccxt.okx({
     "enableRateLimit": True,
+    "timeout": 20000,
     "options": {"defaultType": "swap"}
 })
+
+_MARKETS_CACHE = None
+
+
+def get_okx_markets():
+    global _MARKETS_CACHE
+    if _MARKETS_CACHE is not None:
+        return _MARKETS_CACHE
+
+    try:
+        _MARKETS_CACHE = exchange.load_markets()
+    except Exception:
+        _MARKETS_CACHE = {}
+    return _MARKETS_CACHE
+
+
+def symbol_supported(symbol):
+    markets = get_okx_markets()
+    if not markets:
+        return True
+    return to_okx_symbol(symbol) in markets
+
+
+class AnalysisDataError(Exception):
+    pass
+
 
 
 def to_okx_symbol(symbol):
@@ -33,14 +60,26 @@ def cap_score(value):
 
 
 def get_klines(symbol, interval="15m", limit=320):
-    ohlcv = exchange.fetch_ohlcv(to_okx_symbol(symbol), timeframe=interval, limit=limit)
+    if not symbol_supported(symbol):
+        raise AnalysisDataError(f"نماد {symbol} در OKX Swap قابل معامله نیست")
+
+    try:
+        ohlcv = exchange.fetch_ohlcv(to_okx_symbol(symbol), timeframe=interval, limit=limit)
+    except Exception as e:
+        raise AnalysisDataError(f"دریافت داده {symbol} در تایم {interval} ناموفق بود: {e}")
+
+    # برای EMA200 حداقل حدود 220 کندل لازم است؛ اگر کمتر باشد تحلیل قابل اعتماد نیست.
     if not ohlcv or len(ohlcv) < 220:
-        raise Exception(f"داده کافی برای {symbol} در تایم {interval} دریافت نشد")
+        raise AnalysisDataError(f"داده کافی برای {symbol} در تایم {interval} دریافت نشد")
 
     df = pd.DataFrame(ohlcv, columns=["time", "open", "high", "low", "close", "volume"])
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df = df.dropna().iloc[:-1]
+
+    if len(df) < 210:
+        raise AnalysisDataError(f"داده کافی بعد از پاکسازی برای {symbol} در تایم {interval} وجود ندارد")
+
     return df
 
 
@@ -69,7 +108,7 @@ def add_indicators(df):
 
     df = df.dropna()
     if len(df) < 80:
-        raise Exception("اندیکاتورها کامل محاسبه نشدند")
+        raise AnalysisDataError("اندیکاتورها کامل محاسبه نشدند")
     return df
 
 
@@ -734,17 +773,104 @@ def signal_timeframe(score, direction):
     return "بدون تایم‌فریم ورود" if direction == "NO TRADE" else "5M تا 15M"
 
 
+
+def make_no_trade_result(symbol, reason="داده کافی یا بازار قابل تحلیل نیست"):
+    symbol = symbol.upper().strip()
+    if not symbol.endswith("USDT"):
+        symbol += "USDT"
+
+    return {
+        "symbol": symbol,
+        "price": None,
+        "direction": "NO TRADE",
+        "raw_direction": "NO TRADE",
+        "score": 0,
+        "win_probability": 0,
+        "entry_grade": "Reject",
+        "risk_level": "بالا",
+        "risk_reward": 0,
+        "liquidity_risk": "بالا",
+        "validity": "سیگنال معتبر نیست",
+        "signal_timeframe": "بدون تایم‌فریم ورود",
+
+        "long_score": 0,
+        "short_score": 0,
+        "buy_power": 50,
+        "sell_power": 50,
+        "rsi": None,
+        "adx": None,
+        "macd": None,
+        "macd_hist": None,
+        "vwap": None,
+        "vwap_status": "unknown",
+        "poc_price": None,
+        "volume_profile_status": "unknown",
+        "funding_rate": None,
+        "open_interest": None,
+        "spread_percent": None,
+        "btc_filter": "unknown",
+
+        "candle_pattern": "unknown",
+        "multi_candle": "unknown",
+        "liquidity_grab": "none",
+        "stop_hunt": "none",
+        "fvg": "none",
+        "order_block": "none",
+        "rsi_divergence": "none",
+        "macd_divergence": "none",
+        "fake_breakout": "none",
+        "trend_exhaustion": "none",
+        "support": None,
+        "resistance": None,
+        "trendline": "unknown",
+        "market_structure": "unknown",
+        "breakout": "unknown",
+
+        "fear_value": None,
+        "fear_text": "نامشخص",
+        "btc_dominance": None,
+        "dominance_status": "نامشخص",
+        "altseason_status": "نامشخص",
+
+        "stop_loss": None,
+        "tp1": None,
+        "tp2": None,
+        "sl_percent": None,
+        "tp1_percent": None,
+        "tp2_percent": None,
+        "candidate_stop_loss": None,
+        "candidate_tp1": None,
+        "candidate_tp2": None,
+        "entry_zone_low": None,
+        "entry_zone_high": None,
+        "entry_trigger": "ورود پیشنهاد نمی‌شود",
+        "very_safe": False,
+        "very_safe_reasons": [reason],
+        "trends": {},
+        "reasons": [f"رد/عدم تحلیل: {reason}"],
+    }
+
+
+
 def analyze_symbol(symbol):
     symbol = symbol.upper().strip()
     if not symbol.endswith("USDT"):
         symbol += "USDT"
 
-    df_1d = add_indicators(get_klines(symbol, "1d"))
-    df_4h = add_indicators(get_klines(symbol, "4h"))
-    df_1h = add_indicators(get_klines(symbol, "1h"))
-    df_30m = add_indicators(get_klines(symbol, "30m"))
-    df_15m = add_indicators(get_klines(symbol, "15m"))
-    df_5m = add_indicators(get_klines(symbol, "5m"))
+    if not symbol_supported(symbol):
+        return make_no_trade_result(symbol, f"نماد {symbol} در OKX Swap قابل معامله نیست")
+
+    try:
+        df_1d = add_indicators(get_klines(symbol, "1d"))
+        df_4h = add_indicators(get_klines(symbol, "4h"))
+        df_1h = add_indicators(get_klines(symbol, "1h"))
+        df_30m = add_indicators(get_klines(symbol, "30m"))
+        df_15m = add_indicators(get_klines(symbol, "15m"))
+        df_5m = add_indicators(get_klines(symbol, "5m"))
+    except AnalysisDataError as e:
+        return make_no_trade_result(symbol, str(e))
+    except Exception as e:
+        return make_no_trade_result(symbol, f"خطای دریافت یا آماده‌سازی داده: {e}")
 
     price = float(df_5m.iloc[-1]["close"])
     atr = float(df_15m.iloc[-1]["atr"])
@@ -769,7 +895,17 @@ def analyze_symbol(symbol):
     l, s, funding, open_interest, risk_notes = score_futures_data(symbol)
     long_score += l; short_score += s; reasons_long += risk_notes; reasons_short += risk_notes
 
-    l, s, rl, rs, market = score_market_sentiment(symbol)
+    try:
+        l, s, rl, rs, market = score_market_sentiment(symbol)
+    except Exception:
+        l, s, rl, rs = 0, 0, [], []
+        market = {
+            "fear_value": None,
+            "fear_text": "نامشخص",
+            "btc_dominance": None,
+            "dominance_status": "نامشخص",
+            "altseason_status": "نامشخص",
+        }
     long_score += l; short_score += s; reasons_long += rl; reasons_short += rs
 
     l, s, rl, rs, vwap_status, poc_price, volume_profile_status = score_vwap_volume_profile(df_15m, df_5m)
@@ -778,9 +914,18 @@ def analyze_symbol(symbol):
     btc_status, l, s, rl, rs = btc_filter(symbol)
     long_score += l; short_score += s; reasons_long += rl; reasons_short += rs
 
-    trendline = detect_trendline(df_30m)
-    breakout = detect_breakout(df_15m)
-    structure = detect_market_structure(df_30m)
+    try:
+        trendline = detect_trendline(df_30m)
+    except Exception:
+        trendline = "unknown"
+    try:
+        breakout = detect_breakout(df_15m)
+    except Exception:
+        breakout = "unknown"
+    try:
+        structure = detect_market_structure(df_30m)
+    except Exception:
+        structure = "unknown"
     l, s = trendline_score(trendline)
     long_score += l; short_score += s
     l, s = breakout_score(breakout)
