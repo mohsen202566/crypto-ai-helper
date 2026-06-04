@@ -1,10 +1,11 @@
+# -*- coding: utf-8 -*-
 import json
 import os
+import re
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import ccxt
-
 
 ACTIVE_SIGNALS_FILE = "active_signals.json"
 SIGNAL_STATS_FILE = "signal_stats.json"
@@ -27,7 +28,6 @@ def now_ts():
 def load_json(path, default):
     if not os.path.exists(path):
         return default
-
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -43,10 +43,8 @@ def save_json(path, data):
 def get_current_price(symbol):
     ticker = exchange.fetch_ticker(to_okx_symbol(symbol))
     price = ticker.get("last") or ticker.get("close")
-
     if price is None:
         raise Exception(f"قیمت {symbol} دریافت نشد")
-
     return float(price)
 
 
@@ -69,94 +67,86 @@ def save_signal_stats(stats):
 def add_signal_to_tracking(user_id, chat_id, message_id, result):
     if result.get("direction") == "NO TRADE":
         return False, "این تحلیل سیگنال قابل پیگیری ندارد."
-
     if result.get("stop_loss") is None or result.get("tp1") is None:
         return False, "برای این سیگنال TP1 یا SL وجود ندارد."
 
     active = get_active_signals()
-
     signal = {
         "id": f"{result['symbol']}_{message_id}_{now_ts()}",
         "user_id": int(user_id),
         "chat_id": int(chat_id),
         "message_id": int(message_id),
-
         "symbol": result["symbol"],
         "direction": result["direction"],
-
         "entry": float(result["price"]),
         "stop_loss": float(result["stop_loss"]),
         "tp1": float(result["tp1"]),
         "tp2": None if result.get("tp2") is None else float(result["tp2"]),
-
         "score": result.get("score"),
         "win_probability": result.get("win_probability"),
         "entry_grade": result.get("entry_grade"),
         "risk_level": result.get("risk_level"),
         "risk_reward": result.get("risk_reward"),
-
+        "buy_power": result.get("buy_power"),
+        "sell_power": result.get("sell_power"),
+        "adx": result.get("adx"),
+        "rsi": result.get("rsi"),
+        "vwap_status": result.get("vwap_status"),
+        "order_block": result.get("order_block"),
+        "fvg": result.get("fvg"),
+        "candle_pattern": result.get("candle_pattern"),
+        "multi_candle": result.get("multi_candle"),
+        "market_structure": result.get("market_structure"),
+        "trendline": result.get("trendline"),
+        "breakout": result.get("breakout"),
+        "rsi_divergence": result.get("rsi_divergence"),
+        "macd_divergence": result.get("macd_divergence"),
+        "fake_breakout": result.get("fake_breakout"),
+        "trend_exhaustion": result.get("trend_exhaustion"),
         "created_at": now_ts(),
         "created_at_text": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-
         "status": "ACTIVE",
-        "warning_sent": False
     }
-
     active.append(signal)
     save_active_signals(active)
-
     return True, f"✅ سیگنال {signal['symbol']} زیر نظر گرفته شد."
 
 
 def price_hit_tp1(signal, price):
-    direction = signal["direction"]
-
-    if direction == "LONG":
+    if signal["direction"] == "LONG":
         return price >= signal["tp1"]
-
-    if direction == "SHORT":
+    if signal["direction"] == "SHORT":
         return price <= signal["tp1"]
-
     return False
 
 
 def price_hit_sl(signal, price):
-    direction = signal["direction"]
-
-    if direction == "LONG":
+    if signal["direction"] == "LONG":
         return price <= signal["stop_loss"]
-
-    if direction == "SHORT":
+    if signal["direction"] == "SHORT":
         return price >= signal["stop_loss"]
-
     return False
 
 
 def calculate_result_percent(signal, exit_price):
     entry = float(signal["entry"])
-    direction = signal["direction"]
-
     if entry == 0:
         return 0
-
-    if direction == "LONG":
+    if signal["direction"] == "LONG":
         percent = ((exit_price - entry) / entry) * 100
     else:
         percent = ((entry - exit_price) / entry) * 100
-
     return round(percent, 3)
 
 
 def close_signal(signal, result_type, exit_price):
     stats = get_signal_stats()
-
     closed = dict(signal)
     closed["status"] = result_type
     closed["exit_price"] = float(exit_price)
     closed["closed_at"] = now_ts()
     closed["closed_at_text"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     closed["result_percent"] = calculate_result_percent(signal, exit_price)
-
     stats.append(closed)
     save_signal_stats(stats)
 
@@ -190,25 +180,13 @@ def check_active_signals():
     for signal in active:
         try:
             price = get_current_price(signal["symbol"])
-
             if price_hit_tp1(signal, price):
-                msg = close_signal(signal, "TP1", price)
-                messages.append({
-                    "chat_id": signal["chat_id"],
-                    "message": msg
-                })
+                messages.append({"chat_id": signal["chat_id"], "message": close_signal(signal, "TP1", price)})
                 continue
-
             if price_hit_sl(signal, price):
-                msg = close_signal(signal, "SL", price)
-                messages.append({
-                    "chat_id": signal["chat_id"],
-                    "message": msg
-                })
+                messages.append({"chat_id": signal["chat_id"], "message": close_signal(signal, "SL", price)})
                 continue
-
             remaining.append(signal)
-
         except Exception as e:
             print("TRACK SIGNAL ERROR:", signal.get("symbol"), str(e))
             remaining.append(signal)
@@ -219,102 +197,188 @@ def check_active_signals():
 
 def parse_days_from_text(text):
     text = text.strip()
-
     if "کل" in text:
         return None
-
-    digits = ""
-    for ch in text:
-        if ch.isdigit():
-            digits += ch
-
-    if digits:
-        return int(digits)
-
-    return 7
+    digits = "".join(ch for ch in text if ch.isdigit())
+    return int(digits) if digits else 7
 
 
 def get_stats_report(days=None):
     stats = get_signal_stats()
-
     if days is not None:
-        start_ts = now_ts() - (days * 24 * 60 * 60)
-        stats = [s for s in stats if s.get("closed_at", 0) >= start_ts]
+        start = now_ts() - days * 24 * 60 * 60
+        stats = [s for s in stats if s.get("closed_at", 0) >= start]
 
     total = len(stats)
-
     if total == 0:
-        if days is None:
-            return "📊 هنوز هیچ سیگنال بسته‌شده‌ای در آمار کل وجود ندارد."
-        return f"📊 در {days} روز اخیر هیچ سیگنال بسته‌شده‌ای وجود ندارد."
+        return "📊 هنوز هیچ سیگنال بسته‌شده‌ای برای آمار وجود ندارد."
 
-    tp1_count = len([s for s in stats if s.get("status") == "TP1"])
-    sl_count = len([s for s in stats if s.get("status") == "SL"])
+    wins = [s for s in stats if s.get("status") == "TP1"]
+    losses = [s for s in stats if s.get("status") == "SL"]
+    win_rate = round(len(wins) / total * 100, 1)
 
-    win_rate = round((tp1_count / total) * 100, 1)
+    avg_win = round(sum(float(s.get("result_percent", 0)) for s in wins) / len(wins), 3) if wins else 0
+    avg_loss = round(abs(sum(float(s.get("result_percent", 0)) for s in losses) / len(losses)), 3) if losses else 0
 
-    long_stats = [s for s in stats if s.get("direction") == "LONG"]
-    short_stats = [s for s in stats if s.get("direction") == "SHORT"]
-
-    def direction_report(items):
+    def dir_report(direction):
+        items = [s for s in stats if s.get("direction") == direction]
         if not items:
             return "0 سیگنال | برد: 0 | باخت: 0 | Win Rate: 0٪"
+        w = len([s for s in items if s.get("status") == "TP1"])
+        l = len([s for s in items if s.get("status") == "SL"])
+        wr = round(w / len(items) * 100, 1)
+        return f"{len(items)} سیگنال | برد: {w} | باخت: {l} | Win Rate: {wr}٪"
 
-        wins = len([x for x in items if x.get("status") == "TP1"])
-        losses = len([x for x in items if x.get("status") == "SL"])
-        wr = round((wins / len(items)) * 100, 1)
-
-        return f"{len(items)} سیگنال | برد: {wins} | باخت: {losses} | Win Rate: {wr}٪"
-
-    symbols = {}
-
-    for s in stats:
-        sym = s.get("symbol")
-        if sym not in symbols:
-            symbols[sym] = {"total": 0, "wins": 0, "losses": 0}
-
-        symbols[sym]["total"] += 1
-
-        if s.get("status") == "TP1":
-            symbols[sym]["wins"] += 1
-        elif s.get("status") == "SL":
-            symbols[sym]["losses"] += 1
-
-    sorted_symbols = sorted(
-        symbols.items(),
-        key=lambda x: (x[1]["wins"], x[1]["total"]),
-        reverse=True
+    period = "کل" if days is None else f"{days} روز اخیر"
+    out = (
+        f"📊 آمار {period}\n\n"
+        f"کل سیگنال‌های زیرنظرگرفته‌شده: {total}\n"
+        f"✅ TP1: {len(wins)}\n"
+        f"❌ SL: {len(losses)}\n"
+        f"Win Rate: {win_rate}٪\n"
+        f"میانگین برد: {avg_win}٪\n"
+        f"میانگین باخت: {avg_loss}٪\n\n"
+        f"لانگ: {dir_report('LONG')}\n"
+        f"شورت: {dir_report('SHORT')}\n"
     )
+    return out
 
-    top_symbols_text = ""
 
-    for sym, data in sorted_symbols[:5]:
-        wr = round((data["wins"] / data["total"]) * 100, 1)
-        top_symbols_text += f"\n{sym}: {data['wins']}/{data['total']} برد | {wr}٪"
+def normalize_number_text(text):
+    mapping = {
+        "۰": "0", "۱": "1", "۲": "2", "۳": "3", "۴": "4",
+        "۵": "5", "۶": "6", "۷": "7", "۸": "8", "۹": "9",
+        "٠": "0", "١": "1", "٢": "2", "٣": "3", "٤": "4",
+        "٥": "5", "٦": "6", "٧": "7", "٨": "8", "٩": "9",
+        "٫": ".", ",": "."
+    }
+    for a, b in mapping.items():
+        text = text.replace(a, b)
+    return text
 
-    title = "آمار کل" if days is None else f"آمار {days} روز اخیر"
 
-    return f"""
-📊 {title}
+def parse_profit_calc_text(text):
+    if not text:
+        return None
+    clean = normalize_number_text(text.lower()).replace("$", " دلار ").replace("x", " لوریج ")
+    if "لوریج" not in clean and "دلار" not in clean:
+        return None
+    nums = re.findall(r"\d+(?:\.\d+)?", clean)
+    if len(nums) < 2:
+        return None
+    margin = float(nums[0])
+    leverage = float(nums[1])
+    if margin <= 0 or leverage <= 0:
+        return None
+    return margin, leverage
 
-کل سیگنال‌های زیرنظرگرفته‌شده:
-{total}
 
-✅ TP1:
-{tp1_count}
+def extract_number_after_labels(text, labels):
+    text = normalize_number_text(text)
+    for label in labels:
+        m = re.search(rf"{label}\s*[:：]?\s*([0-9]+(?:\.[0-9]+)?)", text, flags=re.IGNORECASE)
+        if m:
+            return float(m.group(1))
+    return None
 
-❌ SL:
-{sl_count}
 
-Win Rate:
-{win_rate}٪
+def format_money(value):
+    sign = "+" if value > 0 else ""
+    return f"{sign}{round(value, 4)}$"
 
-لانگ:
-{direction_report(long_stats)}
 
-شورت:
-{direction_report(short_stats)}
+def calc_percent(direction, entry, level):
+    if direction == "LONG":
+        return ((level - entry) / entry) * 100
+    if direction == "SHORT":
+        return ((entry - level) / entry) * 100
+    return None
 
-عملکرد ارزها:
-{top_symbols_text}
-"""
+
+def get_profit_for_signal_text(reply_text, margin, leverage):
+    if not reply_text:
+        return None
+
+    text = normalize_number_text(reply_text)
+    symbol_match = re.search(r"([A-Z0-9]+USDT)", text)
+    symbol = symbol_match.group(1) if symbol_match else "نامشخص"
+
+    direction = None
+    if "شورت" in text or "SHORT" in text:
+        direction = "SHORT"
+    elif "لانگ" in text or "LONG" in text:
+        direction = "LONG"
+
+    entry = extract_number_after_labels(text, ["ورود تقریبی", "ورود", "قیمت فعلی", "قیمت"])
+    tp1 = extract_number_after_labels(text, ["حد سود 1", "TP1", "تیپی 1", "تی پی 1"])
+    tp2 = extract_number_after_labels(text, ["حد سود 2", "TP2", "تیپی 2", "تی پی 2"])
+    sl = extract_number_after_labels(text, ["حد ضرر", "SL", "استاپ"])
+
+    if not direction or entry is None or (tp1 is None and tp2 is None and sl is None):
+        return None
+
+    lines = [
+        "💰 محاسبه سود و ضرر معامله",
+        f"ارز: {symbol}",
+        f"جهت: {'لانگ' if direction == 'LONG' else 'شورت'}",
+        f"سرمایه: {margin}$",
+        f"لوریج: {leverage}x",
+        f"ورود: {entry}",
+        "",
+    ]
+
+    for title, level in [("TP1", tp1), ("TP2", tp2), ("SL", sl)]:
+        if level is None:
+            continue
+        pct = calc_percent(direction, entry, level)
+        pnl = margin * leverage * (pct / 100)
+        label = "سود" if pnl >= 0 else "ضرر"
+        lines += [
+            f"{title}: {level}",
+            f"درصد حرکت: {round(pct, 3)}٪",
+            f"{label} تقریبی {title}: {format_money(pnl)}",
+            ""
+        ]
+
+    return "\n".join(lines).strip()
+
+
+def parse_days_from_report_text(reply_text):
+    if not reply_text:
+        return 7
+    if "کل" in reply_text:
+        return None
+    m = re.search(r"آمار\s+(\d+)", normalize_number_text(reply_text))
+    return int(m.group(1)) if m else 7
+
+
+def get_profit_simulation_report(margin, leverage, days=None):
+    stats = get_signal_stats()
+    if days is not None:
+        start = now_ts() - days * 24 * 60 * 60
+        stats = [s for s in stats if s.get("closed_at", 0) >= start]
+    if not stats:
+        return "برای محاسبه سود/ضرر، هنوز آمار بسته‌شده‌ای وجود ندارد."
+
+    total_pnl = 0
+    wins = 0
+    losses = 0
+    for s in stats:
+        pct = float(s.get("result_percent", 0))
+        pnl = margin * leverage * (pct / 100)
+        total_pnl += pnl
+        if pnl >= 0:
+            wins += 1
+        else:
+            losses += 1
+
+    period = "کل" if days is None else f"{days} روز اخیر"
+    return (
+        f"💰 شبیه‌سازی سود/ضرر آمار {period}\n\n"
+        f"سرمایه هر معامله: {margin}$\n"
+        f"لوریج: {leverage}x\n"
+        f"تعداد معاملات: {len(stats)}\n"
+        f"بردها: {wins}\n"
+        f"باخت‌ها: {losses}\n"
+        f"سود/ضرر خالص تقریبی: {format_money(total_pnl)}"
+    )
