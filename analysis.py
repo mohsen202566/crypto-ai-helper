@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import time
 import ccxt
 import pandas as pd
 import ta
@@ -6,6 +7,11 @@ import ta
 from market_sentiment import get_market_sentiment
 from trend_analysis import detect_trendline, detect_breakout, trendline_score, breakout_score
 from market_structure import detect_market_structure, structure_score
+
+try:
+    from coins_fa import COINS_FA
+except Exception:
+    COINS_FA = {}
 
 
 exchange = ccxt.okx({
@@ -15,6 +21,8 @@ exchange = ccxt.okx({
 })
 
 _MARKETS_CACHE = None
+_MARKET_CONTEXT_CACHE = {"ts": 0, "data": None}
+MARKET_CONTEXT_CACHE_SECONDS = 900
 
 
 def get_okx_markets():
@@ -359,6 +367,303 @@ def calculate_volume_profile(df):
         return float(poc_price), status
     except Exception:
         return None, "unknown"
+
+
+
+def market_context_default(reason="نامشخص"):
+    return {
+        "market_regime": "neutral",
+        "market_regime_label": "خنثی",
+        "market_regime_score": 0,
+        "market_breadth_status": "unknown",
+        "market_breadth_label": "نامشخص",
+        "market_breadth_bullish_pct": None,
+        "market_breadth_bearish_pct": None,
+        "market_breadth_neutral_pct": None,
+        "market_context_reason": reason,
+        "market_context_long_bias": 0,
+        "market_context_short_bias": 0,
+    }
+
+
+def _market_context_symbols(limit=35):
+    preferred = [
+        "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT",
+        "ADAUSDT", "AVAXUSDT", "LINKUSDT", "DOTUSDT", "TRXUSDT", "TONUSDT",
+        "MATICUSDT", "OPUSDT", "ARBUSDT", "APTUSDT", "NEARUSDT", "ATOMUSDT",
+        "LTCUSDT", "BCHUSDT", "ETCUSDT", "FILUSDT", "INJUSDT", "SUIUSDT",
+        "UNIUSDT", "AAVEUSDT", "RUNEUSDT", "GALAUSDT", "SEIUSDT", "TIAUSDT",
+        "WLDUSDT", "PEPEUSDT", "FETUSDT", "RNDRUSDT", "ORDIUSDT",
+    ]
+
+    all_symbols = []
+    try:
+        all_symbols = sorted(list(set(COINS_FA.values())))
+    except Exception:
+        all_symbols = []
+
+    result = []
+    for s in preferred + all_symbols:
+        if s not in result:
+            result.append(s)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _quick_symbol_trend(symbol):
+    try:
+        if not symbol_supported(symbol):
+            return "unknown"
+        df = add_indicators(get_klines(symbol, "1h", limit=260))
+        last = df.iloc[-1]
+        tr = trend_direction(df)
+
+        if tr in ["bullish", "weak_bullish"] and last["close"] > last["vwap"]:
+            return "bullish"
+        if tr in ["bearish", "weak_bearish"] and last["close"] < last["vwap"]:
+            return "bearish"
+        if tr in ["bullish", "weak_bullish"]:
+            return "weak_bullish"
+        if tr in ["bearish", "weak_bearish"]:
+            return "weak_bearish"
+        return "neutral"
+    except Exception:
+        return "unknown"
+
+
+def calculate_market_breadth(limit=35):
+    symbols = _market_context_symbols(limit=limit)
+    bullish = bearish = neutral = checked = 0
+
+    for symbol in symbols:
+        tr = _quick_symbol_trend(symbol)
+        if tr in ["bullish", "weak_bullish"]:
+            bullish += 1
+            checked += 1
+        elif tr in ["bearish", "weak_bearish"]:
+            bearish += 1
+            checked += 1
+        elif tr == "neutral":
+            neutral += 1
+            checked += 1
+
+    if checked < 8:
+        return {
+            "status": "unknown",
+            "label": "نامشخص",
+            "bullish_pct": None,
+            "bearish_pct": None,
+            "neutral_pct": None,
+            "checked": checked,
+        }
+
+    bullish_pct = round((bullish / checked) * 100, 1)
+    bearish_pct = round((bearish / checked) * 100, 1)
+    neutral_pct = round((neutral / checked) * 100, 1)
+
+    if bullish_pct >= 65:
+        status = "bullish"
+        label = "قدرت کلی بازار صعودی است"
+    elif bearish_pct >= 65:
+        status = "bearish"
+        label = "قدرت کلی بازار نزولی است"
+    elif bullish_pct >= 55:
+        status = "weak_bullish"
+        label = "قدرت کلی بازار کمی صعودی است"
+    elif bearish_pct >= 55:
+        status = "weak_bearish"
+        label = "قدرت کلی بازار کمی نزولی است"
+    else:
+        status = "neutral"
+        label = "قدرت کلی بازار خنثی است"
+
+    return {
+        "status": status,
+        "label": label,
+        "bullish_pct": bullish_pct,
+        "bearish_pct": bearish_pct,
+        "neutral_pct": neutral_pct,
+        "checked": checked,
+    }
+
+
+def detect_market_regime():
+    try:
+        btc_1d = add_indicators(get_klines("BTCUSDT", "1d", limit=260))
+        btc_4h = add_indicators(get_klines("BTCUSDT", "4h", limit=260))
+        btc_1h = add_indicators(get_klines("BTCUSDT", "1h", limit=260))
+
+        t1d = trend_direction(btc_1d)
+        t4h = trend_direction(btc_4h)
+        t1h = trend_direction(btc_1h)
+
+        last_4h = btc_4h.iloc[-1]
+        score = 0
+        reasons = []
+
+        if t1d in ["bullish", "weak_bullish"]:
+            score += 2
+            reasons.append("BTC 1D صعودی/متمایل به صعود است")
+        elif t1d in ["bearish", "weak_bearish"]:
+            score -= 2
+            reasons.append("BTC 1D نزولی/متمایل به نزول است")
+
+        if t4h in ["bullish", "weak_bullish"]:
+            score += 2
+            reasons.append("BTC 4H صعودی/متمایل به صعود است")
+        elif t4h in ["bearish", "weak_bearish"]:
+            score -= 2
+            reasons.append("BTC 4H نزولی/متمایل به نزول است")
+
+        if t1h in ["bullish", "weak_bullish"]:
+            score += 1
+        elif t1h in ["bearish", "weak_bearish"]:
+            score -= 1
+
+        try:
+            if last_4h["close"] > last_4h["ema200"]:
+                score += 1
+                reasons.append("BTC بالای EMA200 در 4H است")
+            elif last_4h["close"] < last_4h["ema200"]:
+                score -= 1
+                reasons.append("BTC زیر EMA200 در 4H است")
+        except Exception:
+            pass
+
+        market = get_market_sentiment()
+        fear = market.get("fear_value")
+        dominance = market.get("btc_dominance")
+        altseason = market.get("altseason_status")
+
+        if fear is not None:
+            if fear >= 70:
+                score += 1
+                reasons.append("Fear & Greed تمایل صعودی دارد")
+            elif fear <= 30:
+                score -= 1
+                reasons.append("Fear & Greed تمایل ترس/ضعف دارد")
+
+        if altseason == "قوی":
+            score += 1
+            reasons.append("آلت‌سیزن قوی است")
+        elif altseason == "ضعیف":
+            score -= 1
+            reasons.append("آلت‌سیزن ضعیف است")
+
+        if dominance is not None:
+            try:
+                dominance = float(dominance)
+                if dominance >= 57:
+                    score -= 1
+                    reasons.append("دامیننس BTC بالا است")
+                elif dominance <= 45:
+                    score += 1
+                    reasons.append("دامیننس BTC پایین‌تر و مناسب‌تر برای آلت‌هاست")
+            except Exception:
+                pass
+
+        if score >= 4:
+            regime = "bullish"
+            label = "بازار کلی صعودی است"
+        elif score <= -4:
+            regime = "bearish"
+            label = "بازار کلی نزولی است"
+        else:
+            regime = "neutral"
+            label = "بازار کلی خنثی/نامطمئن است"
+
+        return {
+            "regime": regime,
+            "label": label,
+            "score": score,
+            "reasons": reasons[:5],
+        }
+    except Exception as e:
+        return {
+            "regime": "neutral",
+            "label": "بازار کلی خنثی/نامشخص است",
+            "score": 0,
+            "reasons": [f"خطا در تشخیص روند کلی بازار: {e}"],
+        }
+
+
+def get_market_context():
+    global _MARKET_CONTEXT_CACHE
+
+    now = int(time.time())
+    cached = _MARKET_CONTEXT_CACHE.get("data")
+    if cached is not None and now - _MARKET_CONTEXT_CACHE.get("ts", 0) < MARKET_CONTEXT_CACHE_SECONDS:
+        return cached
+
+    try:
+        regime = detect_market_regime()
+        breadth = calculate_market_breadth(limit=35)
+
+        long_bias = 0
+        short_bias = 0
+        reasons = []
+
+        if regime["regime"] == "bullish":
+            long_bias += 4
+            short_bias -= 2
+            reasons.append("روند کلی بازار صعودی است: لانگ تقویت نرم شد")
+        elif regime["regime"] == "bearish":
+            short_bias += 4
+            long_bias -= 2
+            reasons.append("روند کلی بازار نزولی است: شورت تقویت نرم شد")
+
+        if breadth["status"] == "bullish":
+            long_bias += 3
+            reasons.append("قدرت کلی بازار صعودی است")
+        elif breadth["status"] == "bearish":
+            short_bias += 3
+            reasons.append("قدرت کلی بازار نزولی است")
+        elif breadth["status"] == "weak_bullish":
+            long_bias += 2
+            reasons.append("قدرت کلی بازار کمی صعودی است")
+        elif breadth["status"] == "weak_bearish":
+            short_bias += 2
+            reasons.append("قدرت کلی بازار کمی نزولی است")
+
+        data = {
+            "market_regime": regime["regime"],
+            "market_regime_label": regime["label"],
+            "market_regime_score": regime["score"],
+            "market_breadth_status": breadth["status"],
+            "market_breadth_label": breadth["label"],
+            "market_breadth_bullish_pct": breadth["bullish_pct"],
+            "market_breadth_bearish_pct": breadth["bearish_pct"],
+            "market_breadth_neutral_pct": breadth["neutral_pct"],
+            "market_context_reason": " | ".join((regime.get("reasons") or [])[:3] + reasons[:3]),
+            "market_context_long_bias": max(-5, min(5, long_bias)),
+            "market_context_short_bias": max(-5, min(5, short_bias)),
+        }
+        _MARKET_CONTEXT_CACHE = {"ts": now, "data": data}
+        return data
+    except Exception as e:
+        data = market_context_default(f"خطا در Market Context: {e}")
+        _MARKET_CONTEXT_CACHE = {"ts": now, "data": data}
+        return data
+
+
+def score_market_context(symbol):
+    context = get_market_context()
+    long_score = int(context.get("market_context_long_bias") or 0)
+    short_score = int(context.get("market_context_short_bias") or 0)
+    rl, rs = [], []
+
+    if long_score > 0:
+        rl.append(f"اثر نرم بازار کلی: {context.get('market_regime_label')} / {context.get('market_breadth_label')} (+{long_score})")
+    elif long_score < 0:
+        rl.append(f"جریمه نرم بازار کلی برای لانگ ({long_score})")
+
+    if short_score > 0:
+        rs.append(f"اثر نرم بازار کلی: {context.get('market_regime_label')} / {context.get('market_breadth_label')} (+{short_score})")
+    elif short_score < 0:
+        rs.append(f"جریمه نرم بازار کلی برای شورت ({short_score})")
+
+    return long_score, short_score, rl, rs, context
 
 
 def btc_filter(symbol):
@@ -908,6 +1213,13 @@ def analyze_symbol(symbol):
         }
     long_score += l; short_score += s; reasons_long += rl; reasons_short += rs
 
+    try:
+        l, s, rl, rs, market_context = score_market_context(symbol)
+    except Exception:
+        l, s, rl, rs = 0, 0, [], []
+        market_context = market_context_default("Market Context نامشخص")
+    long_score += l; short_score += s; reasons_long += rl; reasons_short += rs
+
     l, s, rl, rs, vwap_status, poc_price, volume_profile_status = score_vwap_volume_profile(df_15m, df_5m)
     long_score += l; short_score += s; reasons_long += rl; reasons_short += rs
 
@@ -1038,6 +1350,14 @@ def analyze_symbol(symbol):
         "btc_dominance": market.get("btc_dominance"),
         "dominance_status": market.get("dominance_status"),
         "altseason_status": market.get("altseason_status"),
+        "market_regime": market_context.get("market_regime"),
+        "market_regime_label": market_context.get("market_regime_label"),
+        "market_regime_score": market_context.get("market_regime_score"),
+        "market_breadth_status": market_context.get("market_breadth_status"),
+        "market_breadth_label": market_context.get("market_breadth_label"),
+        "market_breadth_bullish_pct": market_context.get("market_breadth_bullish_pct"),
+        "market_breadth_bearish_pct": market_context.get("market_breadth_bearish_pct"),
+        "market_breadth_neutral_pct": market_context.get("market_breadth_neutral_pct"),
 
         "stop_loss": None if stop_loss is None else safe_round(stop_loss, 8),
         "tp1": None if tp1 is None else safe_round(tp1, 8),
