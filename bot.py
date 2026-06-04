@@ -1,11 +1,16 @@
-﻿# -*- coding: utf-8 -*-
-import os
+# -*- coding: utf-8 -*-
 import re
-import telebot
 import threading
 import time
 
-from config import BOT_TOKEN, AUTO_SCAN_INTERVAL_MINUTES, TRACKER_CHECK_INTERVAL_SECONDS
+import telebot
+
+from config import (
+    BOT_TOKEN,
+    AUTO_SCAN_INTERVAL_MINUTES,
+    TRACKER_CHECK_INTERVAL_SECONDS,
+    AUTO_SIGNAL_ENABLED,
+)
 from coins_fa import COINS_FA
 from analysis import analyze_symbol
 from scanner import get_best_signals, SCAN_SYMBOLS, should_send_auto_signal
@@ -18,17 +23,34 @@ from signal_tracker import (
 )
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN تنظیم نشده است. اول export BOT_TOKEN را روی VPS ست کن.")
+    raise RuntimeError("BOT_TOKEN تنظیم نشده است. اول روی VPS دستور export BOT_TOKEN را بزن.")
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
+# حافظه موقت برای اینکه وقتی روی پیام تحلیل ریپلای می‌کنی و می‌نویسی «زیر نظر»،
+# ربات همان نتیجه تحلیل را زیر نظر بگیرد.
 MESSAGE_RESULTS = {}
+
 TRACK_COMMANDS = ["زیر نظر", "زیرنظر", "زیر نظر بگیر", "نظر"]
+
 
 def safe(value, default="نامشخص"):
     if value is None:
         return default
     return value
+
+
+def normalize_number_text(text):
+    mapping = {
+        "۰": "0", "۱": "1", "۲": "2", "۳": "3", "۴": "4",
+        "۵": "5", "۶": "6", "۷": "7", "۸": "8", "۹": "9",
+        "٠": "0", "١": "1", "٢": "2", "٣": "3", "٤": "4",
+        "٥": "5", "٦": "6", "٧": "7", "٨": "8", "٩": "9",
+        "٫": ".", ",": ".",
+    }
+    for src, dst in mapping.items():
+        text = text.replace(src, dst)
+    return text
 
 
 def find_symbol(text):
@@ -50,7 +72,7 @@ def fa_direction(direction):
     return {
         "LONG": "🟢 لانگ",
         "SHORT": "🔴 شورت",
-        "NO TRADE": "⚪ فعلاً ورود مناسب نیست"
+        "NO TRADE": "⚪ فعلاً ورود مناسب نیست",
     }.get(direction, direction)
 
 
@@ -64,51 +86,40 @@ def fa_general(value):
         "none": "ندارد",
         "unknown": "نامشخص",
         "ok": "تأیید شده",
-
         "uptrend": "صعودی",
         "downtrend": "نزولی",
         "sideways": "خنثی",
-
         "bullish_structure": "ساختار صعودی",
         "bearish_structure": "ساختار نزولی",
         "range_structure": "رنج / بدون روند واضح",
-
         "bullish_breakout": "بریک‌اوت صعودی",
         "bearish_breakout": "بریک‌اوت نزولی",
         "fake_bullish_breakout": "فیک بریک‌اوت صعودی",
         "fake_bearish_breakout": "فیک بریک‌اوت نزولی",
         "no_breakout": "بدون بریک‌اوت",
-
         "bullish_engulfing": "انگالف صعودی",
         "bearish_engulfing": "انگالف نزولی",
         "bullish_pinbar": "پین‌بار صعودی",
         "bearish_pinbar": "پین‌بار نزولی",
         "bullish_strong": "کندل صعودی قوی",
         "bearish_strong": "کندل نزولی قوی",
-
         "bullish_liquidity_grab": "جمع‌آوری نقدینگی صعودی",
         "bearish_liquidity_grab": "جمع‌آوری نقدینگی نزولی",
         "bullish_stop_hunt": "استاپ‌هانت صعودی",
         "bearish_stop_hunt": "استاپ‌هانت نزولی",
-
         "bullish_fvg": "FVG صعودی",
         "bearish_fvg": "FVG نزولی",
-
         "bullish_order_block": "Order Block صعودی",
         "bearish_order_block": "Order Block نزولی",
-
         "bullish_rsi_divergence": "واگرایی مثبت RSI",
         "bearish_rsi_divergence": "واگرایی منفی RSI",
         "bullish_macd_divergence": "واگرایی مثبت MACD",
         "bearish_macd_divergence": "واگرایی منفی MACD",
-
         "bullish_exhaustion": "خستگی روند صعودی",
         "bearish_exhaustion": "خستگی روند نزولی",
-
         "above_vwap": "بالای VWAP",
         "below_vwap": "پایین VWAP",
         "near_vwap": "نزدیک VWAP",
-
         "above_poc": "بالای ناحیه حجمی اصلی",
         "below_poc": "پایین ناحیه حجمی اصلی",
         "near_poc": "نزدیک ناحیه حجمی اصلی",
@@ -292,6 +303,15 @@ BTC Dominance:
 Alt Season:
 {safe(result.get('altseason_status'))}
 
+🧭 ناحیه ورود پیشنهادی:
+{safe(result.get('entry_zone_low'))} تا {safe(result.get('entry_zone_high'))}
+
+تریگر ورود:
+{safe(result.get('entry_trigger'))}
+
+حالت خیلی امن:
+{"✅ بله" if result.get("very_safe") else "❌ نه"}
+
 🎯 سطوح معامله:
 {trade_levels}
 
@@ -300,8 +320,6 @@ Alt Season:
 
 ⚠️ این تحلیل تضمین سود نیست. حتماً با حد ضرر، حجم کم و مدیریت ریسک وارد شو.
 """
-
-
 
 
 def remember_signal_result(sent_message, result):
@@ -319,10 +337,16 @@ def get_replied_signal_result(message):
 
     key = (
         int(message.reply_to_message.chat.id),
-        int(message.reply_to_message.message_id)
+        int(message.reply_to_message.message_id),
     )
 
-    return MESSAGE_RESULTS.get(key)
+    result = MESSAGE_RESULTS.get(key)
+    if result:
+        return result
+
+    # اگر ربات ری‌استارت شده باشد، حافظه پیام‌ها پاک می‌شود.
+    # این قسمت از متن پیام ریپلای‌شده یک نتیجه حداقلی می‌سازد تا «نظر» همچنان کار کند.
+    return parse_signal_result_from_text(message.reply_to_message.text or "")
 
 
 def is_track_command(text):
@@ -332,19 +356,6 @@ def is_track_command(text):
 def is_stats_command(text):
     clean = text.strip()
     return clean == "آمار" or clean.startswith("آمار ")
-
-
-def normalize_number_text(text):
-    mapping = {
-        "۰": "0", "۱": "1", "۲": "2", "۳": "3", "۴": "4",
-        "۵": "5", "۶": "6", "۷": "7", "۸": "8", "۹": "9",
-        "٠": "0", "١": "1", "٢": "2", "٣": "3", "٤": "4",
-        "٥": "5", "٦": "6", "٧": "7", "٨": "8", "٩": "9",
-        "٫": ".", ",": "."
-    }
-    for src, dst in mapping.items():
-        text = text.replace(src, dst)
-    return text
 
 
 def parse_margin_leverage(text):
@@ -450,13 +461,68 @@ def build_profit_calc_from_replied_text(reply_text, margin, leverage):
     return "\n".join(lines).strip()
 
 
+def parse_signal_result_from_text(text):
+    if not text:
+        return None
+
+    text = normalize_number_text(text)
+    symbol_match = re.search(r"([A-Z0-9]+USDT)", text)
+    if not symbol_match:
+        return None
+
+    direction = None
+    if "شورت" in text or "SHORT" in text:
+        direction = "SHORT"
+    elif "لانگ" in text or "LONG" in text:
+        direction = "LONG"
+
+    entry = extract_number_after_labels(text, ["ورود تقریبی", "ورود", "قیمت فعلی", "قیمت"])
+    tp1 = extract_number_after_labels(text, ["حد سود 1", "TP1", "تیپی 1", "تی پی 1"])
+    tp2 = extract_number_after_labels(text, ["حد سود 2", "TP2", "تیپی 2", "تی پی 2"])
+    sl = extract_number_after_labels(text, ["حد ضرر", "SL", "استاپ"])
+
+    if not direction or entry is None or tp1 is None or sl is None:
+        return None
+
+    return {
+        "symbol": symbol_match.group(1),
+        "direction": direction,
+        "price": entry,
+        "stop_loss": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "score": None,
+        "win_probability": None,
+        "entry_grade": None,
+        "risk_level": None,
+        "risk_reward": None,
+        "buy_power": None,
+        "sell_power": None,
+        "adx": None,
+        "rsi": None,
+        "vwap_status": None,
+        "order_block": None,
+        "fvg": None,
+        "candle_pattern": None,
+        "multi_candle": None,
+        "market_structure": None,
+        "trendline": None,
+        "breakout": None,
+        "rsi_divergence": None,
+        "macd_divergence": None,
+        "fake_breakout": None,
+        "trend_exhaustion": None,
+        "reasons": [],
+    }
+
+
 def send_analysis(message, symbol):
     bot.reply_to(message, f"⏳ در حال تحلیل {symbol} ...")
 
     try:
         result = analyze_symbol(symbol)
     except Exception as e:
-        print("ANALYSIS ERROR:", str(e))
+        print("ANALYSIS ERROR:", symbol, str(e))
         bot.reply_to(message, f"❌ خطا در تحلیل {symbol}\n\nعلت خطا:\n{e}")
         return
 
@@ -481,7 +547,7 @@ def send_best_signals(message, very_safe_only=False):
         if very_safe_only:
             bot.reply_to(message, "فعلاً سیگنال خیلی امن مناسبی پیدا نشد.")
         else:
-            bot.reply_to(message, "فعلاً سیگنال مناسبی پیدا نشد.")
+            bot.reply_to(message, "فعلاً سیگنال A یا A+ مناسبی پیدا نشد.")
         return
 
     msg = "🏆 بهترین سیگنال‌های خیلی امن:\n\n" if very_safe_only else "🏆 بهترین سیگنال‌های الان:\n\n"
@@ -504,7 +570,7 @@ R/R: {safe(r.get('risk_reward'))}
 ADX: {safe(r.get('adx'))}
 Spread: {safe(r.get('spread_percent'))}٪
 Funding: {safe(r.get('funding_rate'))}٪
-Very Safe: {"بله ✅" if r.get("very_safe") else "خیر"}
+خیلی امن: {"بله ✅" if r.get("very_safe") else "خیر"}
 """
 
     bot.reply_to(message, msg)
@@ -579,7 +645,7 @@ Order Block:
 ناحیه ورود:
 {safe(result.get('entry_zone_low'))} تا {safe(result.get('entry_zone_high'))}
 
-Very Safe:
+خیلی امن:
 {"بله ✅" if result.get("very_safe") else "خیر"}
 
 ⚠️ مدیریت ریسک فراموش نشود.
@@ -594,6 +660,11 @@ Very Safe:
 
 
 def auto_signal_loop():
+    if not AUTO_SIGNAL_ENABLED:
+        print("Auto signal is disabled.")
+        return
+
+    print(f"Auto signal loop started. Symbols: {len(SCAN_SYMBOLS)}")
     time.sleep(60)
 
     while True:
@@ -606,14 +677,20 @@ def auto_signal_loop():
 
             except Exception as e:
                 msg = str(e)
-                if "does not have market symbol" not in msg:
+                if (
+                    "does not have market symbol" not in msg
+                    and "Too Many Requests" not in msg
+                    and "429" not in msg
+                ):
                     print("AUTO SIGNAL ERROR:", symbol, msg)
-                continue
+
+            time.sleep(3)
 
         time.sleep(AUTO_SCAN_INTERVAL_MINUTES * 60)
 
 
 def signal_tracking_loop():
+    print("Signal tracking loop started.")
     time.sleep(30)
 
     while True:
@@ -643,38 +720,20 @@ def start(message):
 
 ربات دستیار فیوچرز کریپتو فعال است.
 
-مثال:
-بیتکوین
-اتریوم
-تحلیل دوج
-سیگنال سولانا
-بهترین سیگنال الان
+دستورها:
+تحلیل بیتکوین
+بهترین سیگنال
 سیگنال خیلی امن
-
-زیر نظر گرفتن سیگنال:
-روی پیام تحلیل یا سیگنال خودکار ریپلای کن و بنویس:
-زیر نظر
-یا
-زیر نظر بگیر
-یا
-نظر
-
-آمار:
 آمار
-آمار 3 روز
 آمار 7 روز
-آمار 14 روز
 آمار 30 روز
 آمار کل
 
-محاسبه سود:
-روی پیام سیگنال ریپلای کن و بنویس:
-5 دلار لوریج 10
-
-دستورات ادمین:
-/adduser 123456789
-/removeuser 123456789
-/listusers
+برای زیر نظر گرفتن:
+روی پیام تحلیل یا سیگنال ریپلای کن و بنویس:
+نظر
+یا
+زیر نظر
 """)
 
 
@@ -723,27 +782,22 @@ def list_users_command(message):
 
 @bot.message_handler(func=lambda message: True)
 def handle_message(message):
+    if not message.text:
+        return
+
     if not is_user_allowed(message.from_user.id):
         bot.reply_to(message, "⛔ شما مجاز به استفاده از این ربات نیستید.")
         return
 
     text = message.text.strip()
 
-    calc_data = parse_margin_leverage(text)
-    if calc_data:
-        if not message.reply_to_message or not message.reply_to_message.text:
-            bot.reply_to(message, "برای محاسبه سود/ضرر، روی پیام تحلیل یا سیگنال ریپلای کن و مثلا بنویس: 5 دلار لوریج 10")
+    # محاسبه سود/ضرر با ریپلای روی پیام سیگنال
+    margin_leverage = parse_margin_leverage(text)
+    if margin_leverage and message.reply_to_message:
+        calc = build_profit_calc_from_replied_text(message.reply_to_message.text or "", *margin_leverage)
+        if calc:
+            bot.reply_to(message, calc)
             return
-
-        margin, leverage = calc_data
-        report = build_profit_calc_from_replied_text(message.reply_to_message.text, margin, leverage)
-
-        if not report:
-            bot.reply_to(message, "نتونستم ورود، TP1، TP2 یا SL رو از پیام ریپلای‌شده بخونم.")
-            return
-
-        bot.reply_to(message, report)
-        return
 
     if is_track_command(text):
         result = get_replied_signal_result(message)
@@ -752,15 +806,15 @@ def handle_message(message):
             bot.reply_to(
                 message,
                 "❌ برای زیر نظر گرفتن، باید روی پیام تحلیل یا سیگنال خودکار ریپلای بزنی.\n"
-                "اگر ربات ری‌استارت شده، دوباره همان ارز را تحلیل بگیر و بعد ریپلای کن."
+                "اگر ربات ری‌استارت شده باشد، دوباره همان ارز را تحلیل بگیر و بعد ریپلای کن."
             )
             return
 
         ok, msg = add_signal_to_tracking(
             user_id=message.from_user.id,
             chat_id=message.chat.id,
-            message_id=message.reply_to_message.message_id,
-            result=result
+            message_id=message.reply_to_message.message_id if message.reply_to_message else message.message_id,
+            result=result,
         )
 
         bot.reply_to(message, msg)
@@ -772,7 +826,9 @@ def handle_message(message):
         bot.reply_to(message, report)
         return
 
-    if "خیلی امن" in text or "very safe" in text.lower() or "سیگنال امن" in text:
+    lowered = text.lower()
+
+    if "خیلی امن" in text or "very safe" in lowered:
         send_best_signals(message, very_safe_only=True)
         return
 
@@ -793,4 +849,4 @@ threading.Thread(target=auto_signal_loop, daemon=True).start()
 threading.Thread(target=signal_tracking_loop, daemon=True).start()
 
 print("Bot is running...")
-bot.infinity_polling()
+bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
