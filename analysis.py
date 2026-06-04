@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 import os
 import ccxt
 import pandas as pd
@@ -844,26 +843,6 @@ def risk_reward(raw_direction, price, stop_loss, tp1):
     return round(reward / risk, 2)
 
 
-def calculate_level_percent(raw_direction, price, level):
-    """درصد حرکت از ورود تا TP/SL؛ برای شورت پایین رفتن قیمت سود مثبت حساب می‌شود."""
-    if raw_direction not in ["LONG", "SHORT"] or price is None or level is None:
-        return None
-
-    try:
-        price = float(price)
-        level = float(level)
-    except Exception:
-        return None
-
-    if price == 0:
-        return None
-
-    if raw_direction == "LONG":
-        return round(((level - price) / price) * 100, 3)
-
-    return round(((price - level) / price) * 100, 3)
-
-
 def calculate_risk_level(raw_direction, score, liquidity_risk, funding_rate, adx, spread_percent, rr):
     if raw_direction == "NO TRADE":
         return "بالا"
@@ -948,11 +927,10 @@ def win_probability(score, risk_level, rr, adx, entry_grade_value):
 
 
 def news_filter_active():
-    """اخبار از فیلتر ورود حذف شده؛ تحلیل فقط بر اساس داده‌های بازار و تکنیکال انجام می‌شود."""
-    return False
+    return os.getenv("HIGH_IMPACT_NEWS", "0") == "1"
 
 
-def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, spread_percent, order_block="none"):
+def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, spread_percent):
     last_5 = df_5m.iloc[-1]
     price = float(last_5["close"])
     atr = float(last_5["atr"])
@@ -965,13 +943,8 @@ def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, s
         reasons_block.append("اختلاف لانگ و شورت کافی نیست")
         return False, reasons_block, "بالا", "none", "none"
 
-    # فیلتر سخت فقط برای Order Block مخالف جهت سیگنال.
-    if raw_direction == "LONG" and order_block == "bearish_order_block":
-        reasons_block.append("اوردر بلاک نزولی خلاف سیگنال لانگ است")
-        liquidity_risk = "بالا"
-
-    if raw_direction == "SHORT" and order_block == "bullish_order_block":
-        reasons_block.append("اوردر بلاک صعودی خلاف سیگنال شورت است")
+    if news_filter_active():
+        reasons_block.append("فیلتر خبر فعال است")
         liquidity_risk = "بالا"
 
     if market_is_choppy(df_15m, df_5m):
@@ -992,6 +965,16 @@ def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, s
 
     fake_breakout = detect_fake_breakout(df_5m)
     trend_exhaustion = detect_trend_exhaustion(df_5m)
+    order_block_for_filter = detect_order_block(df_15m)
+
+    if raw_direction == "LONG" and order_block_for_filter == "bearish_order_block":
+        reasons_block.append("اوردر بلاک مخالف لانگ است")
+        return False, reasons_block, "بالا", fake_breakout, trend_exhaustion
+
+    if raw_direction == "SHORT" and order_block_for_filter == "bullish_order_block":
+        reasons_block.append("اوردر بلاک مخالف شورت است")
+        return False, reasons_block, "بالا", fake_breakout, trend_exhaustion
+
 
     if raw_direction == "LONG":
         if long_score < short_score + 18:
@@ -1192,8 +1175,7 @@ def analyze_symbol(symbol):
         short_score,
         df_15m,
         df_5m,
-        spread_percent,
-        order_block
+        spread_percent
     )
 
     risk_level = calculate_risk_level(
@@ -1228,14 +1210,6 @@ def analyze_symbol(symbol):
 
     win_prob = win_probability(score, risk_level, rr, adx_value, grade)
 
-    sl_percent = calculate_level_percent(final_direction, price, stop_loss)
-    tp1_percent = calculate_level_percent(final_direction, price, tp1)
-    tp2_percent = calculate_level_percent(final_direction, price, tp2)
-
-    candidate_sl_percent = calculate_level_percent(raw_direction, price, stop_loss_raw)
-    candidate_tp1_percent = calculate_level_percent(raw_direction, price, tp1_raw)
-    candidate_tp2_percent = calculate_level_percent(raw_direction, price, tp2_raw)
-
     return {
         "symbol": symbol,
         "price": safe_round(price, 8),
@@ -1266,17 +1240,9 @@ def analyze_symbol(symbol):
         "tp1": None if tp1 is None else safe_round(tp1, 8),
         "tp2": None if tp2 is None else safe_round(tp2, 8),
 
-        "sl_percent": sl_percent,
-        "tp1_percent": tp1_percent,
-        "tp2_percent": tp2_percent,
-
         "candidate_stop_loss": None if stop_loss_raw is None else safe_round(stop_loss_raw, 8),
         "candidate_tp1": None if tp1_raw is None else safe_round(tp1_raw, 8),
         "candidate_tp2": None if tp2_raw is None else safe_round(tp2_raw, 8),
-
-        "candidate_sl_percent": candidate_sl_percent,
-        "candidate_tp1_percent": candidate_tp1_percent,
-        "candidate_tp2_percent": candidate_tp2_percent,
 
         "support": safe_round(support, 8),
         "resistance": safe_round(resistance, 8),
