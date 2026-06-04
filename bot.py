@@ -1,123 +1,34 @@
+﻿# -*- coding: utf-8 -*-
+import os
+import re
 import telebot
 import threading
 import time
-import re
 
-from config import BOT_TOKEN, AUTO_SCAN_INTERVAL_MINUTES
+from config import BOT_TOKEN, AUTO_SCAN_INTERVAL_MINUTES, TRACKER_CHECK_INTERVAL_SECONDS
 from coins_fa import COINS_FA
 from analysis import analyze_symbol
 from scanner import get_best_signals, SCAN_SYMBOLS, should_send_auto_signal
 from users import is_user_allowed, is_owner, add_user, remove_user, list_users
+from signal_tracker import (
+    add_signal_to_tracking,
+    check_active_signals,
+    get_stats_report,
+    parse_days_from_text,
+)
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN تنظیم نشده است. اول export BOT_TOKEN را روی VPS ست کن.")
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
+MESSAGE_RESULTS = {}
+TRACK_COMMANDS = ["زیر نظر", "زیرنظر", "زیر نظر بگیر", "نظر"]
 
 def safe(value, default="نامشخص"):
     if value is None:
         return default
     return value
-
-
-def parse_margin_leverage(text):
-    """متن‌هایی مثل «5 دلار لوریج 10» یا «5$ 10x» را می‌خواند."""
-    if not text:
-        return None
-
-    clean = text.replace("٫", ".").replace("$", " دلار ").replace("x", " لوریج ").replace("X", " لوریج ")
-    nums = re.findall(r"\d+(?:\.\d+)?", clean)
-
-    if "لوریج" not in clean and "دلار" not in clean and "$" not in text:
-        return None
-
-    if len(nums) < 2:
-        return None
-
-    margin = float(nums[0])
-    leverage = float(nums[1])
-
-    if margin <= 0 or leverage <= 0:
-        return None
-
-    return margin, leverage
-
-
-def extract_number_after_labels(text, labels):
-    for label in labels:
-        pattern = rf"{label}\s*[:：]?\s*([0-9]+(?:\.[0-9]+)?)"
-        m = re.search(pattern, text, flags=re.IGNORECASE)
-        if m:
-            return float(m.group(1))
-    return None
-
-
-def format_money(value):
-    sign = "+" if value > 0 else ""
-    return f"{sign}{round(value, 4)}$"
-
-
-def calc_percent(direction, entry, level):
-    if not direction or entry is None or level is None or entry == 0:
-        return None
-
-    if direction == "LONG":
-        return ((level - entry) / entry) * 100
-
-    if direction == "SHORT":
-        return ((entry - level) / entry) * 100
-
-    return None
-
-
-def build_profit_calc_from_replied_text(reply_text, margin, leverage):
-    """محاسبه سود/ضرر فقط از ورود، TP1، TP2 و SL؛ احتمال موفقیت را درصد حرکت حساب نمی‌کند."""
-    if not reply_text:
-        return None
-
-    text = reply_text.replace("٫", ".")
-    symbol_match = re.search(r"([A-Z0-9]+USDT)", text)
-    symbol = symbol_match.group(1) if symbol_match else "نامشخص"
-
-    direction = None
-    if "شورت" in text or "SHORT" in text:
-        direction = "SHORT"
-    elif "لانگ" in text or "LONG" in text:
-        direction = "LONG"
-
-    entry = extract_number_after_labels(text, ["ورود تقریبی", "ورود", "قیمت فعلی", "قیمت"])
-    tp1 = extract_number_after_labels(text, ["حد سود 1", "TP1", "تیپی 1", "تی پی 1"])
-    tp2 = extract_number_after_labels(text, ["حد سود 2", "TP2", "تیپی 2", "تی پی 2"])
-    sl = extract_number_after_labels(text, ["حد ضرر", "SL", "استاپ"])
-
-    if not direction or entry is None or (tp1 is None and tp2 is None and sl is None):
-        return None
-
-    lines = [
-        "💰 محاسبه سود و ضرر معامله",
-        f"ارز: {symbol}",
-        f"جهت: {'لانگ' if direction == 'LONG' else 'شورت'}",
-        f"سرمایه: {margin}$",
-        f"لوریج: {leverage}x",
-        f"ورود: {entry}",
-        "",
-    ]
-
-    def add_level(title, level, win_label):
-        if level is None:
-            return
-        percent = calc_percent(direction, entry, level)
-        if percent is None:
-            return
-        pnl = margin * leverage * (percent / 100)
-        lines.append(f"{title}: {level}")
-        lines.append(f"درصد حرکت: {round(percent, 3)}٪")
-        lines.append(f"{win_label}: {format_money(pnl)}")
-        lines.append("")
-
-    add_level("TP1", tp1, "سود/ضرر تقریبی TP1")
-    add_level("TP2", tp2, "سود/ضرر تقریبی TP2")
-    add_level("SL", sl, "سود/ضرر تقریبی SL")
-
-    return "\n".join(lines).strip()
 
 
 def find_symbol(text):
@@ -391,6 +302,154 @@ Alt Season:
 """
 
 
+
+
+def remember_signal_result(sent_message, result):
+    try:
+        if result and result.get("direction") != "NO TRADE":
+            key = (int(sent_message.chat.id), int(sent_message.message_id))
+            MESSAGE_RESULTS[key] = result
+    except Exception as e:
+        print("REMEMBER SIGNAL ERROR:", str(e))
+
+
+def get_replied_signal_result(message):
+    if not message.reply_to_message:
+        return None
+
+    key = (
+        int(message.reply_to_message.chat.id),
+        int(message.reply_to_message.message_id)
+    )
+
+    return MESSAGE_RESULTS.get(key)
+
+
+def is_track_command(text):
+    return text.strip().lower() in TRACK_COMMANDS
+
+
+def is_stats_command(text):
+    clean = text.strip()
+    return clean == "آمار" or clean.startswith("آمار ")
+
+
+def normalize_number_text(text):
+    mapping = {
+        "۰": "0", "۱": "1", "۲": "2", "۳": "3", "۴": "4",
+        "۵": "5", "۶": "6", "۷": "7", "۸": "8", "۹": "9",
+        "٠": "0", "١": "1", "٢": "2", "٣": "3", "٤": "4",
+        "٥": "5", "٦": "6", "٧": "7", "٨": "8", "٩": "9",
+        "٫": ".", ",": "."
+    }
+    for src, dst in mapping.items():
+        text = text.replace(src, dst)
+    return text
+
+
+def parse_margin_leverage(text):
+    if not text:
+        return None
+
+    clean = normalize_number_text(text.lower())
+    if "لوریج" not in clean and "دلار" not in clean and "$" not in clean and "x" not in clean:
+        return None
+
+    clean = clean.replace("$", " دلار ").replace("x", " لوریج ")
+    nums = re.findall(r"\d+(?:\.\d+)?", clean)
+
+    if len(nums) < 2:
+        return None
+
+    margin = float(nums[0])
+    leverage = float(nums[1])
+
+    if margin <= 0 or leverage <= 0:
+        return None
+
+    return margin, leverage
+
+
+def extract_number_after_labels(text, labels):
+    text = normalize_number_text(text)
+    for label in labels:
+        pattern = rf"{label}\s*[:：]?\s*([0-9]+(?:\.[0-9]+)?)"
+        m = re.search(pattern, text, flags=re.IGNORECASE)
+        if m:
+            return float(m.group(1))
+    return None
+
+
+def format_money(value):
+    sign = "+" if value > 0 else ""
+    return f"{sign}{round(value, 4)}$"
+
+
+def calc_percent(direction, entry, level):
+    if not direction or entry is None or level is None or entry == 0:
+        return None
+
+    if direction == "LONG":
+        return ((level - entry) / entry) * 100
+
+    if direction == "SHORT":
+        return ((entry - level) / entry) * 100
+
+    return None
+
+
+def build_profit_calc_from_replied_text(reply_text, margin, leverage):
+    if not reply_text:
+        return None
+
+    text = normalize_number_text(reply_text)
+    symbol_match = re.search(r"([A-Z0-9]+USDT)", text)
+    symbol = symbol_match.group(1) if symbol_match else "نامشخص"
+
+    direction = None
+    if "شورت" in text or "SHORT" in text:
+        direction = "SHORT"
+    elif "لانگ" in text or "LONG" in text:
+        direction = "LONG"
+
+    entry = extract_number_after_labels(text, ["ورود تقریبی", "ورود", "قیمت فعلی", "قیمت"])
+    tp1 = extract_number_after_labels(text, ["حد سود 1", "TP1", "تیپی 1", "تی پی 1"])
+    tp2 = extract_number_after_labels(text, ["حد سود 2", "TP2", "تیپی 2", "تی پی 2"])
+    sl = extract_number_after_labels(text, ["حد ضرر", "SL", "استاپ"])
+
+    if not direction or entry is None or (tp1 is None and tp2 is None and sl is None):
+        return None
+
+    lines = [
+        "💰 محاسبه سود و ضرر معامله",
+        f"ارز: {symbol}",
+        f"جهت: {'لانگ' if direction == 'LONG' else 'شورت'}",
+        f"سرمایه: {margin}$",
+        f"لوریج: {leverage}x",
+        f"ورود: {entry}",
+        "",
+    ]
+
+    def add_level(title, level):
+        if level is None:
+            return
+        percent = calc_percent(direction, entry, level)
+        if percent is None:
+            return
+        pnl = margin * leverage * (percent / 100)
+        label = "سود" if pnl >= 0 else "ضرر"
+        lines.append(f"{title}: {level}")
+        lines.append(f"درصد حرکت: {round(percent, 3)}٪")
+        lines.append(f"{label} تقریبی {title}: {format_money(pnl)}")
+        lines.append("")
+
+    add_level("TP1", tp1)
+    add_level("TP2", tp2)
+    add_level("SL", sl)
+
+    return "\n".join(lines).strip()
+
+
 def send_analysis(message, symbol):
     bot.reply_to(message, f"⏳ در حال تحلیل {symbol} ...")
 
@@ -401,24 +460,31 @@ def send_analysis(message, symbol):
         bot.reply_to(message, f"❌ خطا در تحلیل {symbol}\n\nعلت خطا:\n{e}")
         return
 
-    bot.reply_to(message, build_analysis_text(result))
+    sent = bot.reply_to(message, build_analysis_text(result))
+    remember_signal_result(sent, result)
 
 
-def send_best_signals(message):
-    bot.reply_to(message, "⏳ در حال اسکن بازار...")
+def send_best_signals(message, very_safe_only=False):
+    if very_safe_only:
+        bot.reply_to(message, "⏳ در حال اسکن بازار برای سیگنال‌های خیلی امن...")
+    else:
+        bot.reply_to(message, "⏳ در حال اسکن بازار...")
 
     try:
-        results = get_best_signals(limit=5)
+        results = get_best_signals(limit=5, very_safe_only=very_safe_only)
     except Exception as e:
         print("BEST SIGNAL ERROR:", str(e))
         bot.reply_to(message, f"❌ خطا در اسکن بازار:\n{e}")
         return
 
     if not results:
-        bot.reply_to(message, "فعلاً سیگنال مناسبی پیدا نشد.")
+        if very_safe_only:
+            bot.reply_to(message, "فعلاً سیگنال خیلی امن مناسبی پیدا نشد.")
+        else:
+            bot.reply_to(message, "فعلاً سیگنال مناسبی پیدا نشد.")
         return
 
-    msg = "🏆 بهترین سیگنال‌های الان:\n\n"
+    msg = "🏆 بهترین سیگنال‌های خیلی امن:\n\n" if very_safe_only else "🏆 بهترین سیگنال‌های الان:\n\n"
     medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
 
     for i, r in enumerate(results):
@@ -438,6 +504,7 @@ R/R: {safe(r.get('risk_reward'))}
 ADX: {safe(r.get('adx'))}
 Spread: {safe(r.get('spread_percent'))}٪
 Funding: {safe(r.get('funding_rate'))}٪
+Very Safe: {"بله ✅" if r.get("very_safe") else "خیر"}
 """
 
     bot.reply_to(message, msg)
@@ -509,12 +576,19 @@ FVG:
 Order Block:
 {fa_general(result.get('order_block'))}
 
+ناحیه ورود:
+{safe(result.get('entry_zone_low'))} تا {safe(result.get('entry_zone_high'))}
+
+Very Safe:
+{"بله ✅" if result.get("very_safe") else "خیر"}
+
 ⚠️ مدیریت ریسک فراموش نشود.
 """
 
     for user_id in list_users():
         try:
-            bot.send_message(user_id, text)
+            sent = bot.send_message(user_id, text)
+            remember_signal_result(sent, result)
         except Exception as e:
             print("SEND AUTO SIGNAL ERROR:", user_id, str(e))
 
@@ -531,10 +605,31 @@ def auto_signal_loop():
                     send_auto_signal_to_all_users(result)
 
             except Exception as e:
-                print("AUTO SIGNAL ERROR:", symbol, str(e))
+                msg = str(e)
+                if "does not have market symbol" not in msg:
+                    print("AUTO SIGNAL ERROR:", symbol, msg)
                 continue
 
         time.sleep(AUTO_SCAN_INTERVAL_MINUTES * 60)
+
+
+def signal_tracking_loop():
+    time.sleep(30)
+
+    while True:
+        try:
+            messages = check_active_signals()
+
+            for item in messages:
+                try:
+                    bot.send_message(item["chat_id"], item["message"])
+                except Exception as e:
+                    print("SEND TRACK RESULT ERROR:", str(e))
+
+        except Exception as e:
+            print("SIGNAL TRACKING LOOP ERROR:", str(e))
+
+        time.sleep(TRACKER_CHECK_INTERVAL_SECONDS)
 
 
 @bot.message_handler(commands=["start"])
@@ -554,6 +649,27 @@ def start(message):
 تحلیل دوج
 سیگنال سولانا
 بهترین سیگنال الان
+سیگنال خیلی امن
+
+زیر نظر گرفتن سیگنال:
+روی پیام تحلیل یا سیگنال خودکار ریپلای کن و بنویس:
+زیر نظر
+یا
+زیر نظر بگیر
+یا
+نظر
+
+آمار:
+آمار
+آمار 3 روز
+آمار 7 روز
+آمار 14 روز
+آمار 30 روز
+آمار کل
+
+محاسبه سود:
+روی پیام سیگنال ریپلای کن و بنویس:
+5 دلار لوریج 10
 
 دستورات ادمین:
 /adduser 123456789
@@ -621,11 +737,43 @@ def handle_message(message):
 
         margin, leverage = calc_data
         report = build_profit_calc_from_replied_text(message.reply_to_message.text, margin, leverage)
+
         if not report:
             bot.reply_to(message, "نتونستم ورود، TP1، TP2 یا SL رو از پیام ریپلای‌شده بخونم.")
             return
 
         bot.reply_to(message, report)
+        return
+
+    if is_track_command(text):
+        result = get_replied_signal_result(message)
+
+        if not result:
+            bot.reply_to(
+                message,
+                "❌ برای زیر نظر گرفتن، باید روی پیام تحلیل یا سیگنال خودکار ریپلای بزنی.\n"
+                "اگر ربات ری‌استارت شده، دوباره همان ارز را تحلیل بگیر و بعد ریپلای کن."
+            )
+            return
+
+        ok, msg = add_signal_to_tracking(
+            user_id=message.from_user.id,
+            chat_id=message.chat.id,
+            message_id=message.reply_to_message.message_id,
+            result=result
+        )
+
+        bot.reply_to(message, msg)
+        return
+
+    if is_stats_command(text):
+        days = parse_days_from_text(text)
+        report = get_stats_report(days)
+        bot.reply_to(message, report)
+        return
+
+    if "خیلی امن" in text or "very safe" in text.lower() or "سیگنال امن" in text:
+        send_best_signals(message, very_safe_only=True)
         return
 
     if "بهترین سیگنال" in text or "بهترین فرصت" in text:
@@ -642,6 +790,7 @@ def handle_message(message):
 
 
 threading.Thread(target=auto_signal_loop, daemon=True).start()
+threading.Thread(target=signal_tracking_loop, daemon=True).start()
 
 print("Bot is running...")
 bot.infinity_polling()
