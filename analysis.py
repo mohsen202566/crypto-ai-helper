@@ -9,29 +9,6 @@ from market_sentiment import get_market_sentiment
 from trend_analysis import detect_trendline, detect_breakout, trendline_score, breakout_score
 from market_structure import detect_market_structure, structure_score
 
-try:
-    from config import (
-        TECHNICAL_QUALITY_LATE_ENTRY_ATR,
-        TECHNICAL_QUALITY_MIN_TP_SPACE_ATR,
-        TECHNICAL_QUALITY_LOW_ATR_PCT,
-        TECHNICAL_QUALITY_EXTREME_ATR_PCT,
-        SR_ENTRY_NEAR_ATR,
-        SR_ENTRY_REJECTION_WICK_RATIO,
-        SR_ENTRY_MIN_SCORE_BLOCK,
-        BOLLINGER_SQUEEZE_WIDTH_PCT,
-        BOLLINGER_EXTENSION_ATR,
-    )
-except Exception:
-    TECHNICAL_QUALITY_LATE_ENTRY_ATR = 1.65
-    TECHNICAL_QUALITY_MIN_TP_SPACE_ATR = 0.95
-    TECHNICAL_QUALITY_LOW_ATR_PCT = 0.08
-    TECHNICAL_QUALITY_EXTREME_ATR_PCT = 3.5
-    SR_ENTRY_NEAR_ATR = 0.85
-    SR_ENTRY_REJECTION_WICK_RATIO = 1.45
-    SR_ENTRY_MIN_SCORE_BLOCK = 88
-    BOLLINGER_SQUEEZE_WIDTH_PCT = 1.2
-    BOLLINGER_EXTENSION_ATR = 0.9
-
 
 exchange = ccxt.okx({
     "enableRateLimit": True,
@@ -105,12 +82,6 @@ def add_indicators(df):
 
     df["volume_ma20"] = df["volume"].rolling(20).mean()
     df["atr_ma50"] = df["atr"].rolling(50).mean()
-
-    bollinger = ta.volatility.BollingerBands(close=df["close"], window=20, window_dev=2)
-    df["bb_high"] = bollinger.bollinger_hband()
-    df["bb_low"] = bollinger.bollinger_lband()
-    df["bb_mid"] = bollinger.bollinger_mavg()
-    df["bb_width"] = ((df["bb_high"] - df["bb_low"]) / df["bb_mid"].replace(0, pd.NA)) * 100
 
     typical_price = (df["high"] + df["low"] + df["close"]) / 3
     df["vwap"] = (typical_price * df["volume"]).cumsum() / df["volume"].cumsum()
@@ -754,26 +725,54 @@ def late_entry_status(direction, df_15m, df_5m):
 
 
 def tp_space_validation(direction, price, atr, support, resistance):
+    """
+    بررسی هوشمند فضای TP بر اساس نزدیک‌ترین حمایت/مقاومت موثر.
+    این تابع سیگنال را مستقیم رد نمی‌کند؛ فقط وضعیت کمبود فضا را برای جریمه امتیازی گزارش می‌دهد.
+    خروجی همیشه 3 مقدار است تا روی VPS خطای unpack ایجاد نشود:
+    (tp_ok, reason, space_atr)
+    """
     try:
-        price, atr = float(price), float(atr)
-        if direction == "LONG":
-            if resistance is None or resistance <= price:
-                return True, "فضای TP برای لانگ قابل قبول است", None
-            space_atr = (float(resistance) - price) / atr
-            if space_atr < TECHNICAL_QUALITY_MIN_TP_SPACE_ATR:
-                return False, "فضای کافی تا مقاومت/TP1 برای لانگ وجود ندارد", round(space_atr, 2)
-            return True, "فضای TP برای لانگ قابل قبول است", round(space_atr, 2)
-        if direction == "SHORT":
-            if support is None or support >= price:
-                return True, "فضای TP برای شورت قابل قبول است", None
-            space_atr = (price - float(support)) / atr
-            if space_atr < TECHNICAL_QUALITY_MIN_TP_SPACE_ATR:
-                return False, "فضای کافی تا حمایت/TP1 برای شورت وجود ندارد", round(space_atr, 2)
-            return True, "فضای TP برای شورت قابل قبول است", round(space_atr, 2)
-        return True, "بدون جهت", None
-    except Exception:
-        return True, "TP Space نامشخص", None
+        price = float(price)
+        atr = float(atr)
+        if atr <= 0:
+            return True, "TP Space نامشخص است", None
 
+        min_space = float(TECHNICAL_QUALITY_MIN_TP_SPACE_ATR)
+        severe_space = max(0.45, min_space * 0.55)
+
+        if direction == "LONG":
+            if resistance is None:
+                return True, "مقاومت معتبری برای محدود کردن TP لانگ پیدا نشد", None
+
+            resistance = float(resistance)
+            if resistance <= price:
+                return True, "مقاومت فعلی بالای قیمت نیست؛ فضای TP لانگ با ATR سنجیده می‌شود", None
+
+            space_atr = (resistance - price) / atr
+            if space_atr < severe_space:
+                return False, "فضای TP تا مقاومت بسیار کم است؛ فقط جریمه سنگین اعمال می‌شود", round(space_atr, 2)
+            if space_atr < min_space:
+                return False, "فضای کافی تا مقاومت/TP1 برای لانگ کم است؛ جریمه سنگین اعمال می‌شود", round(space_atr, 2)
+            return True, "فضای TP برای لانگ قابل قبول است", round(space_atr, 2)
+
+        if direction == "SHORT":
+            if support is None:
+                return True, "حمایت معتبری برای محدود کردن TP شورت پیدا نشد", None
+
+            support = float(support)
+            if support >= price:
+                return True, "حمایت فعلی پایین قیمت نیست؛ فضای TP شورت با ATR سنجیده می‌شود", None
+
+            space_atr = (price - support) / atr
+            if space_atr < severe_space:
+                return False, "فضای TP تا حمایت بسیار کم است؛ فقط جریمه سنگین اعمال می‌شود", round(space_atr, 2)
+            if space_atr < min_space:
+                return False, "فضای کافی تا حمایت/TP1 برای شورت کم است؛ جریمه سنگین اعمال می‌شود", round(space_atr, 2)
+            return True, "فضای TP برای شورت قابل قبول است", round(space_atr, 2)
+
+        return True, "بدون جهت معتبر برای بررسی TP Space", None
+    except Exception:
+        return True, "TP Space نامشخص است", None
 
 def noise_filter_status(df_15m, df_5m):
     try:
@@ -805,144 +804,6 @@ def mtf_structure_context(df_15m, df_30m, df_1h):
     except Exception:
         return {"status": "unknown", "label": "ساختار چندتایم‌فریم نامشخص است", "structures": {}}
 
-
-
-def bollinger_context(direction, df_15m, df_5m):
-    """تحلیل نرم Bollinger Bands برای تشخیص کشیدگی قیمت و فشردگی بازار."""
-    try:
-        last15 = df_15m.iloc[-1]
-        last5 = df_5m.iloc[-1]
-        price = float(last5["close"])
-        atr = float(last15["atr"])
-        bb_high = float(last5["bb_high"])
-        bb_low = float(last5["bb_low"])
-        bb_mid = float(last5["bb_mid"])
-        bb_width = float(last5["bb_width"])
-
-        status = "normal"
-        label = "وضعیت Bollinger Bands عادی است"
-        long_adj = 0
-        short_adj = 0
-        reasons_long = []
-        reasons_short = []
-
-        if bb_width <= BOLLINGER_SQUEEZE_WIDTH_PCT:
-            status = "squeeze"
-            label = "Bollinger Bands فشرده است؛ احتمال حرکت ناگهانی یا نویز وجود دارد"
-            long_adj -= 1
-            short_adj -= 1
-
-        if price > bb_high:
-            status = "above_upper"
-            label = "قیمت بالای باند بالایی Bollinger است؛ لانگ می‌تواند دیرهنگام باشد"
-            long_adj -= 4
-            short_adj += 1
-            reasons_long.append("Bollinger: قیمت بالای باند بالایی است و ریسک لانگ دیرهنگام دارد")
-        elif price < bb_low:
-            status = "below_lower"
-            label = "قیمت پایین باند پایینی Bollinger است؛ شورت می‌تواند دیرهنگام باشد"
-            short_adj -= 4
-            long_adj += 1
-            reasons_short.append("Bollinger: قیمت پایین باند پایینی است و ریسک شورت دیرهنگام دارد")
-
-        if atr > 0:
-            if direction == "LONG" and price > bb_mid and (price - bb_mid) >= atr * BOLLINGER_EXTENSION_ATR:
-                long_adj -= 2
-                reasons_long.append("Bollinger: فاصله قیمت از میانگین باند برای لانگ زیاد است")
-            if direction == "SHORT" and price < bb_mid and (bb_mid - price) >= atr * BOLLINGER_EXTENSION_ATR:
-                short_adj -= 2
-                reasons_short.append("Bollinger: فاصله قیمت از میانگین باند برای شورت زیاد است")
-
-        return long_adj, short_adj, reasons_long, reasons_short, {
-            "bollinger_status": status,
-            "bollinger_label": label,
-            "bb_high": safe_round(bb_high, 8),
-            "bb_mid": safe_round(bb_mid, 8),
-            "bb_low": safe_round(bb_low, 8),
-            "bb_width": safe_round(bb_width, 2),
-        }
-    except Exception:
-        return 0, 0, [], [], {
-            "bollinger_status": "unknown",
-            "bollinger_label": "Bollinger Bands نامشخص است",
-            "bb_high": None,
-            "bb_mid": None,
-            "bb_low": None,
-            "bb_width": None,
-        }
-
-
-def support_resistance_entry_context(direction, price, atr, support, resistance, df_5m):
-    """ورود را به واکنش قیمت به حمایت/مقاومت نزدیک می‌کند، اما برای حفظ تعداد سیگنال‌ها نرم و بالانس است."""
-    try:
-        if direction not in ["LONG", "SHORT"]:
-            return 0, 0, [], [], {
-                "sr_entry_status": "none",
-                "sr_entry_label": "بدون جهت معتبر برای بررسی ورود بر اساس حمایت/مقاومت",
-                "sr_entry_confirmed": False,
-            }
-
-        last = df_5m.iloc[-1]
-        price = float(price)
-        atr = float(atr)
-        body = abs(float(last["close"]) - float(last["open"]))
-        upper_wick = float(last["high"]) - max(float(last["open"]), float(last["close"]))
-        lower_wick = min(float(last["open"]), float(last["close"])) - float(last["low"])
-        near_atr = max(atr * SR_ENTRY_NEAR_ATR, price * 0.001)
-
-        long_adj = short_adj = 0
-        reasons_long, reasons_short = [], []
-        status = "not_near_level"
-        label = "قیمت هنوز واکنش واضحی به حمایت/مقاومت نداده است"
-        confirmed = False
-
-        if direction == "LONG":
-            near_support = support is not None and (price - float(support)) <= near_atr and price >= float(support) - atr * 0.20
-            rejected_support = near_support and lower_wick >= max(body * SR_ENTRY_REJECTION_WICK_RATIO, atr * 0.18) and float(last["close"]) >= float(last["open"])
-            if rejected_support:
-                long_adj += 5
-                confirmed = True
-                status = "support_rejection"
-                label = "قیمت نزدیک حمایت واکنش مثبت نشان داده است"
-                reasons_long.append("ورود بر اساس حمایت: واکنش مثبت/حفظ حمایت دیده شد")
-            elif near_support:
-                long_adj += 2
-                status = "near_support"
-                label = "قیمت نزدیک حمایت است اما تایید کامل هنوز ضعیف است"
-                reasons_long.append("قیمت نزدیک حمایت است؛ برای ورود لانگ تایید کندلی مهم است")
-            else:
-                long_adj -= 3
-                reasons_long.append("ورود بر اساس حمایت: قیمت هنوز به حمایت واکنش واضح نداده است")
-
-        if direction == "SHORT":
-            near_resistance = resistance is not None and (float(resistance) - price) <= near_atr and price <= float(resistance) + atr * 0.20
-            rejected_resistance = near_resistance and upper_wick >= max(body * SR_ENTRY_REJECTION_WICK_RATIO, atr * 0.18) and float(last["close"]) <= float(last["open"])
-            if rejected_resistance:
-                short_adj += 5
-                confirmed = True
-                status = "resistance_rejection"
-                label = "قیمت نزدیک مقاومت واکنش منفی نشان داده است"
-                reasons_short.append("ورود بر اساس مقاومت: واکنش منفی/رد مقاومت دیده شد")
-            elif near_resistance:
-                short_adj += 2
-                status = "near_resistance"
-                label = "قیمت نزدیک مقاومت است اما تایید کامل هنوز ضعیف است"
-                reasons_short.append("قیمت نزدیک مقاومت است؛ برای ورود شورت تایید کندلی مهم است")
-            else:
-                short_adj -= 3
-                reasons_short.append("ورود بر اساس مقاومت: قیمت هنوز به مقاومت واکنش واضح نداده است")
-
-        return long_adj, short_adj, reasons_long, reasons_short, {
-            "sr_entry_status": status,
-            "sr_entry_label": label,
-            "sr_entry_confirmed": confirmed,
-        }
-    except Exception:
-        return 0, 0, [], [], {
-            "sr_entry_status": "unknown",
-            "sr_entry_label": "بررسی ورود بر اساس حمایت/مقاومت نامشخص است",
-            "sr_entry_confirmed": False,
-        }
 
 def technical_quality_context(raw_direction, price, atr, support, resistance, df_15m, df_5m, df_30m, df_1h):
     volatility, volatility_label = volatility_state(df_15m, df_5m)
@@ -982,9 +843,9 @@ def technical_quality_context(raw_direction, price, atr, support, resistance, df
             short_adj -= 5; reasons_short.append(late_entry_reason)
     if not tp_ok:
         if raw_direction == "LONG":
-            long_adj -= 6; reasons_long.append(tp_space_reason)
+            long_adj -= 8; reasons_long.append(tp_space_reason)
         elif raw_direction == "SHORT":
-            short_adj -= 6; reasons_short.append(tp_space_reason)
+            short_adj -= 8; reasons_short.append(tp_space_reason)
     if mtf["status"] == "bullish":
         long_adj += 3; short_adj -= 2; reasons_long.append("ساختار چندتایم‌فریم صعودی است")
     elif mtf["status"] == "bearish":
@@ -993,14 +854,6 @@ def technical_quality_context(raw_direction, price, atr, support, resistance, df
         short_adj -= 1; reasons_short.append("نقدینگی بالای قیمت می‌تواند ریسک شورت باشد")
     if liquidity["status"] == "downside_liquidity" and raw_direction == "LONG":
         long_adj -= 1; reasons_long.append("نقدینگی پایین قیمت می‌تواند ریسک لانگ باشد")
-
-    sr_l, sr_s, sr_rl, sr_rs, sr_context = support_resistance_entry_context(raw_direction, price, atr, support, resistance, df_5m)
-    bb_l, bb_s, bb_rl, bb_rs, bb_context = bollinger_context(raw_direction, df_15m, df_5m)
-    long_adj += sr_l + bb_l
-    short_adj += sr_s + bb_s
-    reasons_long += sr_rl + bb_rl
-    reasons_short += sr_rs + bb_rs
-
     context = {
         "noise_status": noise_status, "noise_label": noise_label,
         "volatility_status": volatility, "volatility_label": volatility_label,
@@ -1011,8 +864,6 @@ def technical_quality_context(raw_direction, price, atr, support, resistance, df
         "mtf_structure_status": mtf["status"], "mtf_structure_label": mtf["label"], "mtf_structures": mtf["structures"],
         "technical_quality_long_adj": long_adj, "technical_quality_short_adj": short_adj,
     }
-    context.update(sr_context)
-    context.update(bb_context)
     return long_adj, short_adj, reasons_long, reasons_short, context
 
 
@@ -1469,52 +1320,89 @@ def normalize_score_by_quality(score, rr, raw_direction, pattern, multi_candle, 
     return cap_score(score)
 
 def calculate_trade_levels(raw_direction, price, atr, support=None, resistance=None):
-    """TP/SL هوشمندتر بر اساس ATR و حمایت/مقاومت، مناسب معاملات حدود 30 تا 60 دقیقه."""
-    price = float(price)
-    atr = float(atr)
+    """
+    TP/SL هوشمند بر اساس ATR و حمایت/مقاومت 15M/30M.
+    - TP1 نزدیک سطح ساختاری قرار می‌گیرد، نه دقیقاً روی آن.
+    - TP2 با ATR و سطح بعدی/شکست احتمالی سطح تنظیم می‌شود.
+    - SL پشت حمایت/مقاومت با بافر ATR قرار می‌گیرد تا خیلی تنگ نباشد.
+    """
+    try:
+        price = float(price)
+        atr = float(atr)
+    except Exception:
+        return None, None, None
+
+    if atr <= 0:
+        return None, None, None
+
     buffer = atr * 0.22
+    min_tp_space = atr * 0.65
 
     if raw_direction == "LONG":
         atr_sl = price - (atr * 1.45)
         stop_loss = atr_sl
-        if support is not None and float(support) < price:
-            structure_sl = float(support) - buffer
-            # استاپ را پشت حمایت می‌گذاریم، ولی اگر خیلی دور شد اجازه نمی‌دهیم RR نابود شود.
-            max_sl = price - (atr * 2.15)
-            stop_loss = max(structure_sl, max_sl) if structure_sl < atr_sl else structure_sl
+
+        if support is not None:
+            try:
+                support = float(support)
+                if support < price:
+                    structure_sl = support - buffer
+                    max_reasonable_sl = price - (atr * 2.20)
+                    stop_loss = max(structure_sl, max_reasonable_sl)
+            except Exception:
+                pass
 
         risk = abs(price - stop_loss)
-        tp1 = price + max(atr * 1.35, risk * 1.05)
-        tp2 = price + max(atr * 2.25, risk * 1.65)
+        tp1 = price + max(atr * 1.25, risk * 1.05)
+        tp2 = price + max(atr * 2.10, risk * 1.65)
 
-        if resistance is not None and float(resistance) > price:
-            adjusted_tp1 = float(resistance) - buffer
-            if adjusted_tp1 > price + atr * 0.45:
-                tp1 = min(tp1, adjusted_tp1)
-            # TP2 را اگر مقاومت نزدیک است پشت مقاومت نمی‌بریم؛ محافظه‌کارانه‌تر می‌کنیم.
-            if float(resistance) > tp1:
-                tp2 = min(tp2, float(resistance) + atr * 0.35)
+        if resistance is not None:
+            try:
+                resistance = float(resistance)
+                if resistance > price:
+                    structure_tp1 = resistance - buffer
+                    if structure_tp1 > price + min_tp_space:
+                        tp1 = min(tp1, structure_tp1)
+                    else:
+                        # اگر مقاومت خیلی نزدیک است، TP1 را با ATR محافظه‌کارانه‌تر می‌گذاریم؛ رد قطعی نمی‌کنیم.
+                        tp1 = price + min_tp_space
+                    tp2 = max(tp2, resistance + (atr * 0.35))
+            except Exception:
+                pass
 
         return stop_loss, tp1, tp2
 
     if raw_direction == "SHORT":
         atr_sl = price + (atr * 1.45)
         stop_loss = atr_sl
-        if resistance is not None and float(resistance) > price:
-            structure_sl = float(resistance) + buffer
-            max_sl = price + (atr * 2.15)
-            stop_loss = min(structure_sl, max_sl) if structure_sl > atr_sl else structure_sl
+
+        if resistance is not None:
+            try:
+                resistance = float(resistance)
+                if resistance > price:
+                    structure_sl = resistance + buffer
+                    max_reasonable_sl = price + (atr * 2.20)
+                    stop_loss = min(structure_sl, max_reasonable_sl)
+            except Exception:
+                pass
 
         risk = abs(stop_loss - price)
-        tp1 = price - max(atr * 1.35, risk * 1.05)
-        tp2 = price - max(atr * 2.25, risk * 1.65)
+        tp1 = price - max(atr * 1.25, risk * 1.05)
+        tp2 = price - max(atr * 2.10, risk * 1.65)
 
-        if support is not None and float(support) < price:
-            adjusted_tp1 = float(support) + buffer
-            if adjusted_tp1 < price - atr * 0.45:
-                tp1 = max(tp1, adjusted_tp1)
-            if float(support) < tp1:
-                tp2 = max(tp2, float(support) - atr * 0.35)
+        if support is not None:
+            try:
+                support = float(support)
+                if support < price:
+                    structure_tp1 = support + buffer
+                    if structure_tp1 < price - min_tp_space:
+                        tp1 = max(tp1, structure_tp1)
+                    else:
+                        # اگر حمایت خیلی نزدیک است، TP1 را با ATR محافظه‌کارانه‌تر می‌گذاریم؛ رد قطعی نمی‌کنیم.
+                        tp1 = price - min_tp_space
+                    tp2 = min(tp2, support - (atr * 0.35))
+            except Exception:
+                pass
 
         return stop_loss, tp1, tp2
 
@@ -1596,29 +1484,6 @@ def news_filter_active():
     return False
 
 
-
-def tp_space_validation(raw_direction, price, atr, support, resistance):
-    """
-    بررسی می‌کند تا TP1 فضای کافی وجود داشته باشد.
-    هدف: لانگ نزدیک مقاومت و شورت نزدیک حمایت، بی‌دلیل سیگنال نشود.
-    """
-    if raw_direction == "LONG":
-        if resistance is None or resistance <= price:
-            return True, None
-
-        space = resistance - price
-        if space < atr * 1.15:
-            return False, "فضای کافی تا مقاومت برای TP وجود ندارد"
-
-    if raw_direction == "SHORT":
-        if support is None or support >= price:
-            return True, None
-
-        space = price - support
-        if space < atr * 1.15:
-            return False, "فضای کافی تا حمایت برای TP وجود ندارد"
-
-    return True, None
 
 
 def calculate_setup_zone(raw_direction, price, atr):
@@ -1837,14 +1702,6 @@ def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, s
 
     if is_middle_of_range(price, support, resistance) and score < 88:
         reasons_block.append("قیمت وسط رنج است و امتیاز برای عبور از این ریسک کافی نیست")
-        liquidity_risk = "متوسط"
-
-    sr_l, sr_s, sr_rl, sr_rs, sr_context = support_resistance_entry_context(raw_direction, price, atr, support, resistance, df_5m)
-    if raw_direction == "LONG" and sr_context.get("sr_entry_status") == "not_near_level" and score < SR_ENTRY_MIN_SCORE_BLOCK:
-        reasons_block.append("ورود بر اساس حمایت هنوز تایید کافی ندارد")
-        liquidity_risk = "متوسط"
-    if raw_direction == "SHORT" and sr_context.get("sr_entry_status") == "not_near_level" and score < SR_ENTRY_MIN_SCORE_BLOCK:
-        reasons_block.append("ورود بر اساس مقاومت هنوز تایید کافی ندارد")
         liquidity_risk = "متوسط"
 
     fake_breakout = detect_fake_breakout(df_5m)
@@ -2085,7 +1942,30 @@ def analyze_symbol(symbol):
     atr = float(last_15["atr"])
     adx_value = float(last_15["adx"])
 
-    support, resistance = support_resistance(df_15m)
+    support_15m, resistance_15m = support_resistance(df_15m)
+    support_30m, resistance_30m = support_resistance(df_30m)
+
+    # ترکیب نرم سطوح 15M و 30M برای معاملات 30 تا 60 دقیقه‌ای.
+    # نزدیک‌ترین حمایت پایین قیمت و نزدیک‌ترین مقاومت بالای قیمت مبنای TP/SL و TP Space می‌شود.
+    support_candidates = []
+    resistance_candidates = []
+    for level in [support_15m, support_30m]:
+        try:
+            level = float(level)
+            if level < price:
+                support_candidates.append(level)
+        except Exception:
+            pass
+    for level in [resistance_15m, resistance_30m]:
+        try:
+            level = float(level)
+            if level > price:
+                resistance_candidates.append(level)
+        except Exception:
+            pass
+
+    support = max(support_candidates) if support_candidates else support_15m
+    resistance = min(resistance_candidates) if resistance_candidates else resistance_15m
 
     setup_status, entry_zone_low, entry_zone_high, entry_trigger = calculate_setup_zone(
         "NO TRADE",
@@ -2318,25 +2198,6 @@ def analyze_symbol(symbol):
         "very_safe_reasons": very_safe_reasons[:8],
 
         "news_filter_active": news_filter_active(),
-
-        "noise_status": technical_context.get("noise_status"),
-        "noise_label": technical_context.get("noise_label"),
-        "volatility_status": technical_context.get("volatility_status"),
-        "volatility_label": technical_context.get("volatility_label"),
-        "late_entry": technical_context.get("late_entry"),
-        "late_entry_reason": technical_context.get("late_entry_reason"),
-        "tp_space_ok": technical_context.get("tp_space_ok"),
-        "tp_space_reason": technical_context.get("tp_space_reason"),
-        "tp_space_atr": technical_context.get("tp_space_atr"),
-        "sr_entry_status": technical_context.get("sr_entry_status"),
-        "sr_entry_label": technical_context.get("sr_entry_label"),
-        "sr_entry_confirmed": technical_context.get("sr_entry_confirmed"),
-        "bollinger_status": technical_context.get("bollinger_status"),
-        "bollinger_label": technical_context.get("bollinger_label"),
-        "bb_high": technical_context.get("bb_high"),
-        "bb_mid": technical_context.get("bb_mid"),
-        "bb_low": technical_context.get("bb_low"),
-        "bb_width": technical_context.get("bb_width"),
 
         "reasons": reasons[:18],
     }
