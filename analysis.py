@@ -1588,13 +1588,13 @@ def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, s
         buy_power_value = 50
         sell_power_value = 50
 
-    if raw_direction == "LONG" and sell_power_value >= buy_power_value + 18:
-        reasons_block.append("هشدار: قدرت فروش نسبت به خرید بیشتر است")
-        liquidity_risk = "متوسط"
+    if raw_direction == "LONG" and sell_power_value > buy_power_value:
+        reasons_block.append("قدرت فروش از قدرت خرید بیشتر است؛ لانگ رد شد")
+        return False, reasons_block, "بالا", "none", "none"
 
-    if raw_direction == "SHORT" and buy_power_value >= sell_power_value + 18:
-        reasons_block.append("هشدار: قدرت خرید نسبت به فروش بیشتر است")
-        liquidity_risk = "متوسط"
+    if raw_direction == "SHORT" and buy_power_value > sell_power_value:
+        reasons_block.append("قدرت خرید از قدرت فروش بیشتر است؛ شورت رد شد")
+        return False, reasons_block, "بالا", "none", "none"
 
     # فقط واگرایی دوگانه مخالف رد می‌کند.
     if raw_direction == "LONG":
