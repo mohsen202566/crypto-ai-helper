@@ -335,6 +335,23 @@ POC \u062d\u062c\u0645\u06cc:
 \u0648\u0636\u0639\u06cc\u062a \u0622\u0644\u062a\u200c\u0633\u06cc\u0632\u0646:
 {safe(result.get('altseason_status'))}
 
+\U0001f4cc \u0648\u0631\u0648\u062f \u0628\u0631 \u0627\u0633\u0627\u0633 \u062d\u0645\u0627\u06cc\u062a/\u0645\u0642\u0627\u0648\u0645\u062a:
+{safe(result.get('sr_entry_label'))}
+\u0648\u0636\u0639\u06cc\u062a \u062a\u0627\u06cc\u06cc\u062f: {"\u062a\u0627\u06cc\u06cc\u062f \u0634\u062f\u0647 \u2705" if result.get("sr_entry_confirmed") else "\u0646\u06cc\u0627\u0632\u0645\u0646\u062f \u0627\u062d\u062a\u06cc\u0627\u0637"}
+
+\u23f3 Late Entry:
+{safe(result.get('late_entry_reason'))}
+
+\U0001f4ca Bollinger Bands:
+{safe(result.get('bollinger_label'))}
+\u0628\u0627\u0646\u062f \u0628\u0627\u0644\u0627: {safe(result.get('bb_high'))}
+\u0645\u06cc\u0627\u0646\u06af\u06cc\u0646: {safe(result.get('bb_mid'))}
+\u0628\u0627\u0646\u062f \u067e\u0627\u06cc\u06cc\u0646: {safe(result.get('bb_low'))}
+\u0639\u0631\u0636 \u0628\u0627\u0646\u062f: {safe(result.get('bb_width'))}%
+
+\U0001f3af \u0641\u0636\u0627\u06cc TP:
+{safe(result.get('tp_space_reason'))}
+
 \U0001f3af \u0633\u0637\u0648\u062d \u0645\u0639\u0627\u0645\u0644\u0647:
 {trade_levels}
 
