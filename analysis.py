@@ -1379,24 +1379,41 @@ def tp_space_validation(raw_direction, price, atr, support, resistance):
     """
     بررسی می‌کند تا TP1 فضای کافی وجود داشته باشد.
     هدف: لانگ نزدیک مقاومت و شورت نزدیک حمایت، بی‌دلیل سیگنال نشود.
+    خروجی همیشه باید ۳ مقدار باشد:
+    tp_ok, tp_space_reason, tp_space_atr
     """
-    if raw_direction == "LONG":
-        if resistance is None or resistance <= price:
-            return True, None
+    try:
+        price = float(price)
+        atr = float(atr)
 
-        space = resistance - price
-        if space < atr * 1.15:
-            return False, "فضای کافی تا مقاومت برای TP وجود ندارد"
+        if raw_direction == "LONG":
+            if resistance is None or resistance <= price:
+                return True, "فضای TP برای لانگ قابل قبول است", None
 
-    if raw_direction == "SHORT":
-        if support is None or support >= price:
-            return True, None
+            space = float(resistance) - price
+            space_atr = space / atr if atr else None
 
-        space = price - support
-        if space < atr * 1.15:
-            return False, "فضای کافی تا حمایت برای TP وجود ندارد"
+            if space < atr * 1.15:
+                return False, "فضای کافی تا مقاومت برای TP وجود ندارد", None if space_atr is None else round(space_atr, 2)
 
-    return True, None
+            return True, "فضای TP برای لانگ قابل قبول است", None if space_atr is None else round(space_atr, 2)
+
+        if raw_direction == "SHORT":
+            if support is None or support >= price:
+                return True, "فضای TP برای شورت قابل قبول است", None
+
+            space = price - float(support)
+            space_atr = space / atr if atr else None
+
+            if space < atr * 1.15:
+                return False, "فضای کافی تا حمایت برای TP وجود ندارد", None if space_atr is None else round(space_atr, 2)
+
+            return True, "فضای TP برای شورت قابل قبول است", None if space_atr is None else round(space_atr, 2)
+
+        return True, "بدون جهت", None
+
+    except Exception:
+        return True, "TP Space نامشخص", None
 
 
 def calculate_setup_zone(raw_direction, price, atr):
