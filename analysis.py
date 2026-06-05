@@ -592,14 +592,14 @@ def apply_market_regime_to_scores(long_score, short_score, market_regime, reason
     اعمال روند کلی بازار روی امتیازها.
     """
     if market_regime == "bearish":
-        short_score += 10
-        long_score -= 15
+        short_score += 5
+        long_score -= 7
         reasons_short.append("تقویت: روند کلی بازار نزولی است")
         reasons_long.append("جریمه: لانگ خلاف روند کلی نزولی بازار است")
 
     elif market_regime == "bullish":
-        long_score += 10
-        short_score -= 15
+        long_score += 5
+        short_score -= 7
         reasons_long.append("تقویت: روند کلی بازار صعودی است")
         reasons_short.append("جریمه: شورت خلاف روند کلی صعودی بازار است")
 
@@ -799,14 +799,14 @@ def technical_quality_context(raw_direction, price, atr, support, resistance, df
         (reasons_long if raw_direction == "LONG" else reasons_short).append("فیلتر نوسان: ATR خیلی زیاد است")
     if late_entry:
         if raw_direction == "LONG":
-            long_adj -= 5; reasons_long.append(late_entry_reason)
+            long_adj -= 8; reasons_long.append(late_entry_reason)
         elif raw_direction == "SHORT":
-            short_adj -= 5; reasons_short.append(late_entry_reason)
+            short_adj -= 8; reasons_short.append(late_entry_reason)
     if not tp_ok:
         if raw_direction == "LONG":
-            long_adj -= 6; reasons_long.append(tp_space_reason)
+            long_adj -= 10; reasons_long.append(tp_space_reason)
         elif raw_direction == "SHORT":
-            short_adj -= 6; reasons_short.append(tp_space_reason)
+            short_adj -= 10; reasons_short.append(tp_space_reason)
     if mtf["status"] == "bullish":
         long_adj += 3; short_adj -= 2; reasons_long.append("ساختار چندتایم‌فریم صعودی است")
     elif mtf["status"] == "bearish":
@@ -898,10 +898,10 @@ def score_macro_trend(df_1d, df_4h, df_1h, df_30m):
     }
 
     weights = {
-        "1D": 6,
-        "4H": 10,
-        "1H": 18,
-        "30M": 20,
+        "1D": 5,
+        "4H": 8,
+        "1H": 12,
+        "30M": 12,
     }
 
     for tf, trend in trends.items():
@@ -1697,14 +1697,14 @@ def apply_conflict_penalties(
     reasons_short
 ):
     if trendline == "uptrend":
-        long_score += 12
-        short_score -= 15
+        long_score += 6
+        short_score -= 8
         reasons_long.append("تقویت: خط روند صعودی است")
         reasons_short.append("جریمه: شورت خلاف خط روند صعودی است")
 
     elif trendline == "downtrend":
-        short_score += 12
-        long_score -= 15
+        short_score += 6
+        long_score -= 8
         reasons_short.append("تقویت: خط روند نزولی است")
         reasons_long.append("جریمه: لانگ خلاف خط روند نزولی است")
 
