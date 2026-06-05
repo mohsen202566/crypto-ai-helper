@@ -780,7 +780,18 @@ def mtf_structure_context(df_15m, df_30m, df_1h):
 def technical_quality_context(raw_direction, price, atr, support, resistance, df_15m, df_5m, df_30m, df_1h):
     volatility, volatility_label = volatility_state(df_15m, df_5m)
     late_entry, late_entry_reason = late_entry_status(raw_direction, df_15m, df_5m)
-    tp_ok, tp_space_reason, tp_space_atr = tp_space_validation(raw_direction, price, atr, support, resistance)
+    # VPS-safe unpack: older/duplicate tp_space_validation variants may return 2 values.
+    tp_space_result = tp_space_validation(raw_direction, price, atr, support, resistance)
+    if isinstance(tp_space_result, (list, tuple)):
+        if len(tp_space_result) >= 3:
+            tp_ok, tp_space_reason, tp_space_atr = tp_space_result[:3]
+        elif len(tp_space_result) == 2:
+            tp_ok, tp_space_reason = tp_space_result
+            tp_space_atr = None
+        else:
+            tp_ok, tp_space_reason, tp_space_atr = True, "TP Space نامشخص", None
+    else:
+        tp_ok, tp_space_reason, tp_space_atr = True, "TP Space نامشخص", None
     noise_status, noise_label = noise_filter_status(df_15m, df_5m)
     liquidity = detect_liquidity_pools(df_15m)
     mtf = mtf_structure_context(df_15m, df_30m, df_1h)
