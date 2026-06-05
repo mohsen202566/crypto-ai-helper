@@ -218,6 +218,16 @@ def is_high_quality_signal(result):
     if spread is not None and spread > 0.08:
         return False
 
+    # هماهنگ با آپدیت جدید: سیگنال خودکار نباید روی ورود دیرهنگام یا بدون واکنش سطحی ارسال شود.
+    if result.get("late_entry") and result.get("score", 0) < 92:
+        return False
+
+    if result.get("sr_entry_status") == "not_near_level" and result.get("score", 0) < 90:
+        return False
+
+    if result.get("bollinger_status") in ["above_upper", "below_lower"] and result.get("score", 0) < 92:
+        return False
+
     if is_opposite_divergence(result):
         return False
 
