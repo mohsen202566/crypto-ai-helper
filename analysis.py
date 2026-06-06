@@ -994,12 +994,19 @@ def technical_quality_context(raw_direction, price, atr, support, resistance, df
     if liquidity["status"] == "downside_liquidity" and raw_direction == "LONG":
         long_adj -= 1; reasons_long.append("نقدینگی پایین قیمت می‌تواند ریسک لانگ باشد")
 
-    sr_l, sr_s, sr_rl, sr_rs, sr_context = support_resistance_entry_context(raw_direction, price, atr, support, resistance, df_5m)
+    # SR Entry طبق تنظیم جدید از امتیازدهی/رد سیگنال حذف شده است.
+    # حمایت/مقاومت همچنان برای TP/SL هوشمند استفاده می‌شود، اما شرط ورود نیست.
+    sr_context = {
+        "sr_entry_status": "disabled",
+        "sr_entry_label": "ورود بر اساس حمایت/مقاومت غیرفعال است؛ حمایت/مقاومت فقط برای TP/SL استفاده می‌شود",
+        "sr_entry_confirmed": False,
+    }
+
     bb_l, bb_s, bb_rl, bb_rs, bb_context = bollinger_context(raw_direction, df_15m, df_5m)
-    long_adj += sr_l + bb_l
-    short_adj += sr_s + bb_s
-    reasons_long += sr_rl + bb_rl
-    reasons_short += sr_rs + bb_rs
+    long_adj += bb_l
+    short_adj += bb_s
+    reasons_long += bb_rl
+    reasons_short += bb_rs
 
     context = {
         "noise_status": noise_status, "noise_label": noise_label,
@@ -1165,13 +1172,8 @@ def score_entry(df_15m, df_5m):
         short_score += 10
         reasons_short.append(f"کندل تاییدی شورت: {pattern}")
 
-    if multi_candle == "bullish":
-        long_score += 8
-        reasons_long.append("تایید چند کندلی صعودی")
-
-    if multi_candle == "bearish":
-        short_score += 8
-        reasons_short.append("تایید چند کندلی نزولی")
+    # تایید چندکندلی طبق تنظیم جدید از امتیازدهی حذف شده است.
+    # برای جلوگیری از از دست رفتن شروع حرکت‌ها، فقط کندل فعلی و سایر تاییدها اثر دارند.
 
     if volume_spike(df_5m):
         long_score += 6
@@ -1371,16 +1373,16 @@ def apply_direction_conflict_penalties(
     این تابع سیگنال را مستقیم حذف نمی‌کند، فقط امتیاز را واقعی‌تر می‌کند.
     """
 
-    bullish_candle = pattern in ["bullish_engulfing", "bullish_pinbar", "bullish_strong"] or multi_candle == "bullish"
-    bearish_candle = pattern in ["bearish_engulfing", "bearish_pinbar", "bearish_strong"] or multi_candle == "bearish"
+    bullish_candle = pattern in ["bullish_engulfing", "bullish_pinbar", "bullish_strong"]
+    bearish_candle = pattern in ["bearish_engulfing", "bearish_pinbar", "bearish_strong"]
 
     if bullish_candle:
         short_score -= 12
-        reasons_short.append("جریمه: کندل یا تایید چندکندلی صعودی، خلاف شورت است")
+        reasons_short.append("جریمه: کندل صعودی، خلاف شورت است")
 
     if bearish_candle:
         long_score -= 12
-        reasons_long.append("جریمه: کندل یا تایید چندکندلی نزولی، خلاف لانگ است")
+        reasons_long.append("جریمه: کندل نزولی، خلاف لانگ است")
 
     if order_block == "bullish_order_block":
         short_score -= 10
@@ -1435,7 +1437,7 @@ def normalize_score_by_quality(score, rr, raw_direction, pattern, multi_candle, 
         score = min(score, 97)
 
     if raw_direction == "LONG":
-        if pattern in ["bearish_engulfing", "bearish_pinbar", "bearish_strong"] or multi_candle == "bearish":
+        if pattern in ["bearish_engulfing", "bearish_pinbar", "bearish_strong"]:
             score = min(score, 88)
 
         if order_block == "bearish_order_block":
@@ -1444,14 +1446,14 @@ def normalize_score_by_quality(score, rr, raw_direction, pattern, multi_candle, 
         if fvg == "bearish_fvg":
             score = min(score, 82)
 
-        if fvg == "bearish_fvg" and (pattern in ["bearish_engulfing", "bearish_pinbar", "bearish_strong"] or multi_candle == "bearish"):
+        if fvg == "bearish_fvg" and pattern in ["bearish_engulfing", "bearish_pinbar", "bearish_strong"]:
             score = min(score, 74)
 
         if vwap_status == "below_vwap":
             score = min(score, 92)
 
     if raw_direction == "SHORT":
-        if pattern in ["bullish_engulfing", "bullish_pinbar", "bullish_strong"] or multi_candle == "bullish":
+        if pattern in ["bullish_engulfing", "bullish_pinbar", "bullish_strong"]:
             score = min(score, 88)
 
         if order_block == "bullish_order_block":
@@ -1460,7 +1462,7 @@ def normalize_score_by_quality(score, rr, raw_direction, pattern, multi_candle, 
         if fvg == "bullish_fvg":
             score = min(score, 82)
 
-        if fvg == "bullish_fvg" and (pattern in ["bullish_engulfing", "bullish_pinbar", "bullish_strong"] or multi_candle == "bullish"):
+        if fvg == "bullish_fvg" and pattern in ["bullish_engulfing", "bullish_pinbar", "bullish_strong"]:
             score = min(score, 74)
 
         if vwap_status == "above_vwap":
@@ -1698,9 +1700,6 @@ def very_safe_status(raw_direction, score, win_probability_value, risk_level, rr
         if pattern in ["bearish_engulfing", "bearish_pinbar", "bearish_strong"]:
             reasons.append("کندل تاییدی مخالف لانگ است")
 
-        if multi_candle == "bearish":
-            reasons.append("تایید چندکندلی مخالف لانگ است")
-
         if order_block == "bearish_order_block":
             reasons.append("اوردر بلاک مخالف لانگ است")
 
@@ -1724,9 +1723,6 @@ def very_safe_status(raw_direction, score, win_probability_value, risk_level, rr
 
         if pattern in ["bullish_engulfing", "bullish_pinbar", "bullish_strong"]:
             reasons.append("کندل تاییدی مخالف شورت است")
-
-        if multi_candle == "bullish":
-            reasons.append("تایید چندکندلی مخالف شورت است")
 
         if order_block == "bullish_order_block":
             reasons.append("اوردر بلاک مخالف شورت است")
@@ -1763,20 +1759,19 @@ def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, s
     # FVG مخالف به‌تنهایی رد قطعی نیست، اما ریسک را بالا می‌برد.
     # اگر FVG مخالف همراه با تایید چندکندلی/کندلی مخالف باشد، برای کاهش استاپ‌های بی‌کیفیت رد می‌شود.
     current_pattern = candle_pattern(df_5m)
-    current_multi_candle = multi_candle_confirmation(df_5m)
 
     if raw_direction == "LONG" and fvg == "bearish_fvg":
         reasons_block.append("FVG نزولی خلاف سیگنال لانگ است")
         liquidity_risk = "بالا"
-        if current_multi_candle == "bearish" or current_pattern in ["bearish_engulfing", "bearish_pinbar", "bearish_strong"]:
-            reasons_block.append("FVG و تایید کندلی هر دو خلاف لانگ هستند")
+        if current_pattern in ["bearish_engulfing", "bearish_pinbar", "bearish_strong"]:
+            reasons_block.append("FVG و کندل مخالف هر دو خلاف لانگ هستند")
             return False, reasons_block, "بالا", "none", "none"
 
     if raw_direction == "SHORT" and fvg == "bullish_fvg":
         reasons_block.append("FVG صعودی خلاف سیگنال شورت است")
         liquidity_risk = "بالا"
-        if current_multi_candle == "bullish" or current_pattern in ["bullish_engulfing", "bullish_pinbar", "bullish_strong"]:
-            reasons_block.append("FVG و تایید کندلی هر دو خلاف شورت هستند")
+        if current_pattern in ["bullish_engulfing", "bullish_pinbar", "bullish_strong"]:
+            reasons_block.append("FVG و کندل مخالف هر دو خلاف شورت هستند")
             return False, reasons_block, "بالا", "none", "none"
 
     # قدرت خرید/فروش فقط وقتی خیلی مخالف باشد ریسک را بالا می‌برد؛ سختگیرانه نیست.
@@ -1854,9 +1849,6 @@ def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, s
         if long_score < short_score + 20:
             reasons_block.append("اختلاف امتیاز لانگ و شورت کافی نیست")
 
-        if is_near_resistance(price, resistance, atr) and score < 88:
-            reasons_block.append("قیمت نزدیک مقاومت است")
-            liquidity_risk = "متوسط"
 
         if last_5["rsi"] > 68:
             reasons_block.append("RSI برای لانگ کمی بالاست")
@@ -1874,9 +1866,6 @@ def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, s
         if short_score < long_score + 20:
             reasons_block.append("اختلاف امتیاز شورت و لانگ کافی نیست")
 
-        if is_near_support(price, support, atr) and score < 88:
-            reasons_block.append("قیمت نزدیک حمایت است")
-            liquidity_risk = "متوسط"
 
         if last_5["rsi"] < 32:
             reasons_block.append("RSI برای شورت کمی پایین است")
