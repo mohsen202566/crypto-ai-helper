@@ -711,7 +711,7 @@ def score_entry(df_15m, df_5m):
         reasons_long.append("افزایش حجم واقعی")
         reasons_short.append("افزایش حجم واقعی")
 
-    if last_15["adx"] >= 25:
+    if last_15["adx"] >= 22:
         long_score += 6
         short_score += 6
         reasons_long.append("ADX قوی در 15M")
@@ -1343,7 +1343,7 @@ def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, s
     فیلتر ورود ساده ولی سختگیر برای جلوگیری از سیگنال‌های چرت.
     قانون‌های اصلی:
     - امتیاز حداقل 80 برای ورود دستی/لیست سیگنال
-    - ADX تایم 15M باید حداقل 25 باشد
+    - ADX تایم 15M باید حداقل 22 باشد
     - اختلاف Buy/Sell Power باید حداقل 8 درصد هم‌جهت باشد
     - Order Block خلاف جهت، سیگنال را حذف می‌کند
     - FVG خلاف جهت حذف کامل نیست، اما اگر امتیاز خیلی قوی نباشد بلاک می‌کند
@@ -1365,7 +1365,7 @@ def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, s
     except Exception:
         adx_15m = 0
 
-    if adx_15m < 25:
+    if adx_15m < 22:
         reasons_block.append("ADX در 15M به اندازه کافی قوی نیست")
         return False, reasons_block, "متوسط", "none", "none"
 
