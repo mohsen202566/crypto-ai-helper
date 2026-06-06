@@ -9,29 +9,6 @@ from market_sentiment import get_market_sentiment
 from trend_analysis import detect_trendline, detect_breakout, trendline_score, breakout_score
 from market_structure import detect_market_structure, structure_score
 
-try:
-    from config import (
-        TECHNICAL_QUALITY_LATE_ENTRY_ATR,
-        TECHNICAL_QUALITY_MIN_TP_SPACE_ATR,
-        TECHNICAL_QUALITY_LOW_ATR_PCT,
-        TECHNICAL_QUALITY_EXTREME_ATR_PCT,
-        SR_ENTRY_NEAR_ATR,
-        SR_ENTRY_REJECTION_WICK_RATIO,
-        SR_ENTRY_MIN_SCORE_BLOCK,
-        BOLLINGER_SQUEEZE_WIDTH_PCT,
-        BOLLINGER_EXTENSION_ATR,
-    )
-except Exception:
-    TECHNICAL_QUALITY_LATE_ENTRY_ATR = 1.65
-    TECHNICAL_QUALITY_MIN_TP_SPACE_ATR = 0.95
-    TECHNICAL_QUALITY_LOW_ATR_PCT = 0.08
-    TECHNICAL_QUALITY_EXTREME_ATR_PCT = 3.5
-    SR_ENTRY_NEAR_ATR = 0.85
-    SR_ENTRY_REJECTION_WICK_RATIO = 1.45
-    SR_ENTRY_MIN_SCORE_BLOCK = 88
-    BOLLINGER_SQUEEZE_WIDTH_PCT = 1.2
-    BOLLINGER_EXTENSION_ATR = 0.9
-
 
 exchange = ccxt.okx({
     "enableRateLimit": True,
@@ -105,12 +82,6 @@ def add_indicators(df):
 
     df["volume_ma20"] = df["volume"].rolling(20).mean()
     df["atr_ma50"] = df["atr"].rolling(50).mean()
-
-    bollinger = ta.volatility.BollingerBands(close=df["close"], window=20, window_dev=2)
-    df["bb_high"] = bollinger.bollinger_hband()
-    df["bb_low"] = bollinger.bollinger_lband()
-    df["bb_mid"] = bollinger.bollinger_mavg()
-    df["bb_width"] = ((df["bb_high"] - df["bb_low"]) / df["bb_mid"].replace(0, pd.NA)) * 100
 
     typical_price = (df["high"] + df["low"] + df["close"]) / 3
     df["vwap"] = (typical_price * df["volume"]).cumsum() / df["volume"].cumsum()
@@ -618,28 +589,21 @@ def detect_market_regime(symbol, df_4h, df_1h, df_30m, df_15m, market=None):
 
 def apply_market_regime_to_scores(long_score, short_score, market_regime, reasons_long, reasons_short):
     """
-    اعمال روند کلی بازار روی امتیازها.
+    روند کلی بازار فقط بایاس نرم می‌دهد تا جهت اصلی خراب نشود.
     """
     if market_regime == "bearish":
-        short_score += 10
-        long_score -= 15
-        reasons_short.append("تقویت: روند کلی بازار نزولی است")
-        reasons_long.append("جریمه: لانگ خلاف روند کلی نزولی بازار است")
+        short_score += 2
+        long_score -= 2
+        reasons_short.append("تقویت نرم: روند کلی بازار نزولی است")
+        reasons_long.append("جریمه نرم: لانگ خلاف روند کلی نزولی بازار است")
 
     elif market_regime == "bullish":
-        long_score += 10
-        short_score -= 15
-        reasons_long.append("تقویت: روند کلی بازار صعودی است")
-        reasons_short.append("جریمه: شورت خلاف روند کلی صعودی بازار است")
-
-    elif market_regime == "neutral":
-        long_score -= 3
-        short_score -= 3
-        reasons_long.append("احتیاط: روند کلی بازار خنثی است")
-        reasons_short.append("احتیاط: روند کلی بازار خنثی است")
+        long_score += 2
+        short_score -= 2
+        reasons_long.append("تقویت نرم: روند کلی بازار صعودی است")
+        reasons_short.append("جریمه نرم: شورت خلاف روند کلی صعودی بازار است")
 
     return max(0, long_score), max(0, short_score)
-
 
 def find_swing_levels(df, lookback=140, window=3):
     try:
@@ -806,148 +770,14 @@ def mtf_structure_context(df_15m, df_30m, df_1h):
         return {"status": "unknown", "label": "ساختار چندتایم‌فریم نامشخص است", "structures": {}}
 
 
-
-def bollinger_context(direction, df_15m, df_5m):
-    """تحلیل نرم Bollinger Bands برای تشخیص کشیدگی قیمت و فشردگی بازار."""
-    try:
-        last15 = df_15m.iloc[-1]
-        last5 = df_5m.iloc[-1]
-        price = float(last5["close"])
-        atr = float(last15["atr"])
-        bb_high = float(last5["bb_high"])
-        bb_low = float(last5["bb_low"])
-        bb_mid = float(last5["bb_mid"])
-        bb_width = float(last5["bb_width"])
-
-        status = "normal"
-        label = "وضعیت Bollinger Bands عادی است"
-        long_adj = 0
-        short_adj = 0
-        reasons_long = []
-        reasons_short = []
-
-        if bb_width <= BOLLINGER_SQUEEZE_WIDTH_PCT:
-            status = "squeeze"
-            label = "Bollinger Bands فشرده است؛ احتمال حرکت ناگهانی یا نویز وجود دارد"
-            long_adj -= 1
-            short_adj -= 1
-
-        if price > bb_high:
-            status = "above_upper"
-            label = "قیمت بالای باند بالایی Bollinger است؛ لانگ می‌تواند دیرهنگام باشد"
-            long_adj -= 4
-            short_adj += 1
-            reasons_long.append("Bollinger: قیمت بالای باند بالایی است و ریسک لانگ دیرهنگام دارد")
-        elif price < bb_low:
-            status = "below_lower"
-            label = "قیمت پایین باند پایینی Bollinger است؛ شورت می‌تواند دیرهنگام باشد"
-            short_adj -= 4
-            long_adj += 1
-            reasons_short.append("Bollinger: قیمت پایین باند پایینی است و ریسک شورت دیرهنگام دارد")
-
-        if atr > 0:
-            if direction == "LONG" and price > bb_mid and (price - bb_mid) >= atr * BOLLINGER_EXTENSION_ATR:
-                long_adj -= 2
-                reasons_long.append("Bollinger: فاصله قیمت از میانگین باند برای لانگ زیاد است")
-            if direction == "SHORT" and price < bb_mid and (bb_mid - price) >= atr * BOLLINGER_EXTENSION_ATR:
-                short_adj -= 2
-                reasons_short.append("Bollinger: فاصله قیمت از میانگین باند برای شورت زیاد است")
-
-        return long_adj, short_adj, reasons_long, reasons_short, {
-            "bollinger_status": status,
-            "bollinger_label": label,
-            "bb_high": safe_round(bb_high, 8),
-            "bb_mid": safe_round(bb_mid, 8),
-            "bb_low": safe_round(bb_low, 8),
-            "bb_width": safe_round(bb_width, 2),
-        }
-    except Exception:
-        return 0, 0, [], [], {
-            "bollinger_status": "unknown",
-            "bollinger_label": "Bollinger Bands نامشخص است",
-            "bb_high": None,
-            "bb_mid": None,
-            "bb_low": None,
-            "bb_width": None,
-        }
-
-
-def support_resistance_entry_context(direction, price, atr, support, resistance, df_5m):
-    """ورود را به واکنش قیمت به حمایت/مقاومت نزدیک می‌کند، اما برای حفظ تعداد سیگنال‌ها نرم و بالانس است."""
-    try:
-        if direction not in ["LONG", "SHORT"]:
-            return 0, 0, [], [], {
-                "sr_entry_status": "none",
-                "sr_entry_label": "بدون جهت معتبر برای بررسی ورود بر اساس حمایت/مقاومت",
-                "sr_entry_confirmed": False,
-            }
-
-        last = df_5m.iloc[-1]
-        price = float(price)
-        atr = float(atr)
-        body = abs(float(last["close"]) - float(last["open"]))
-        upper_wick = float(last["high"]) - max(float(last["open"]), float(last["close"]))
-        lower_wick = min(float(last["open"]), float(last["close"])) - float(last["low"])
-        near_atr = max(atr * SR_ENTRY_NEAR_ATR, price * 0.001)
-
-        long_adj = short_adj = 0
-        reasons_long, reasons_short = [], []
-        status = "not_near_level"
-        label = "قیمت هنوز واکنش واضحی به حمایت/مقاومت نداده است"
-        confirmed = False
-
-        if direction == "LONG":
-            near_support = support is not None and (price - float(support)) <= near_atr and price >= float(support) - atr * 0.20
-            rejected_support = near_support and lower_wick >= max(body * SR_ENTRY_REJECTION_WICK_RATIO, atr * 0.18) and float(last["close"]) >= float(last["open"])
-            if rejected_support:
-                long_adj += 5
-                confirmed = True
-                status = "support_rejection"
-                label = "قیمت نزدیک حمایت واکنش مثبت نشان داده است"
-                reasons_long.append("ورود بر اساس حمایت: واکنش مثبت/حفظ حمایت دیده شد")
-            elif near_support:
-                long_adj += 2
-                status = "near_support"
-                label = "قیمت نزدیک حمایت است اما تایید کامل هنوز ضعیف است"
-                reasons_long.append("قیمت نزدیک حمایت است؛ برای ورود لانگ تایید کندلی مهم است")
-            else:
-                long_adj -= 3
-                reasons_long.append("ورود بر اساس حمایت: قیمت هنوز به حمایت واکنش واضح نداده است")
-
-        if direction == "SHORT":
-            near_resistance = resistance is not None and (float(resistance) - price) <= near_atr and price <= float(resistance) + atr * 0.20
-            rejected_resistance = near_resistance and upper_wick >= max(body * SR_ENTRY_REJECTION_WICK_RATIO, atr * 0.18) and float(last["close"]) <= float(last["open"])
-            if rejected_resistance:
-                short_adj += 5
-                confirmed = True
-                status = "resistance_rejection"
-                label = "قیمت نزدیک مقاومت واکنش منفی نشان داده است"
-                reasons_short.append("ورود بر اساس مقاومت: واکنش منفی/رد مقاومت دیده شد")
-            elif near_resistance:
-                short_adj += 2
-                status = "near_resistance"
-                label = "قیمت نزدیک مقاومت است اما تایید کامل هنوز ضعیف است"
-                reasons_short.append("قیمت نزدیک مقاومت است؛ برای ورود شورت تایید کندلی مهم است")
-            else:
-                short_adj -= 3
-                reasons_short.append("ورود بر اساس مقاومت: قیمت هنوز به مقاومت واکنش واضح نداده است")
-
-        return long_adj, short_adj, reasons_long, reasons_short, {
-            "sr_entry_status": status,
-            "sr_entry_label": label,
-            "sr_entry_confirmed": confirmed,
-        }
-    except Exception:
-        return 0, 0, [], [], {
-            "sr_entry_status": "unknown",
-            "sr_entry_label": "بررسی ورود بر اساس حمایت/مقاومت نامشخص است",
-            "sr_entry_confirmed": False,
-        }
-
 def technical_quality_context(raw_direction, price, atr, support, resistance, df_15m, df_5m, df_30m, df_1h):
+    """
+    نسخه ساده:
+    این بخش فقط وضعیت‌ها را برای گزارش داخلی نگه می‌دارد و دیگر روی امتیاز اثر سنگین ندارد.
+    """
     volatility, volatility_label = volatility_state(df_15m, df_5m)
     late_entry, late_entry_reason = late_entry_status(raw_direction, df_15m, df_5m)
-    # VPS-safe unpack: older/duplicate tp_space_validation variants may return 2 values.
+
     tp_space_result = tp_space_validation(raw_direction, price, atr, support, resistance)
     if isinstance(tp_space_result, (list, tuple)):
         if len(tp_space_result) >= 3:
@@ -959,47 +789,18 @@ def technical_quality_context(raw_direction, price, atr, support, resistance, df
             tp_ok, tp_space_reason, tp_space_atr = True, "TP Space نامشخص", None
     else:
         tp_ok, tp_space_reason, tp_space_atr = True, "TP Space نامشخص", None
+
     noise_status, noise_label = noise_filter_status(df_15m, df_5m)
     liquidity = detect_liquidity_pools(df_15m)
     mtf = mtf_structure_context(df_15m, df_30m, df_1h)
-    long_adj = short_adj = 0
-    reasons_long, reasons_short = [], []
-    if noise_status == "high_noise":
-        long_adj -= 3; short_adj -= 3
-        (reasons_long if raw_direction == "LONG" else reasons_short).append("فیلتر نویز: بازار رنج/نویزی است")
-    elif noise_status == "medium_noise":
-        long_adj -= 1; short_adj -= 1
-    if volatility == "too_low":
-        long_adj -= 3; short_adj -= 3
-        (reasons_long if raw_direction == "LONG" else reasons_short).append("فیلتر نوسان: ATR خیلی کم است")
-    elif volatility == "too_high":
-        long_adj -= 2; short_adj -= 2
-        (reasons_long if raw_direction == "LONG" else reasons_short).append("فیلتر نوسان: ATR خیلی زیاد است")
-    if late_entry:
-        if raw_direction == "LONG":
-            long_adj -= 5; reasons_long.append(late_entry_reason)
-        elif raw_direction == "SHORT":
-            short_adj -= 5; reasons_short.append(late_entry_reason)
-    if not tp_ok:
-        if raw_direction == "LONG":
-            long_adj -= 6; reasons_long.append(tp_space_reason)
-        elif raw_direction == "SHORT":
-            short_adj -= 6; reasons_short.append(tp_space_reason)
-    if mtf["status"] == "bullish":
-        long_adj += 3; short_adj -= 2; reasons_long.append("ساختار چندتایم‌فریم صعودی است")
-    elif mtf["status"] == "bearish":
-        short_adj += 3; long_adj -= 2; reasons_short.append("ساختار چندتایم‌فریم نزولی است")
-    if liquidity["status"] == "upside_liquidity" and raw_direction == "SHORT":
-        short_adj -= 1; reasons_short.append("نقدینگی بالای قیمت می‌تواند ریسک شورت باشد")
-    if liquidity["status"] == "downside_liquidity" and raw_direction == "LONG":
-        long_adj -= 1; reasons_long.append("نقدینگی پایین قیمت می‌تواند ریسک لانگ باشد")
 
-    sr_l, sr_s, sr_rl, sr_rs, sr_context = support_resistance_entry_context(raw_direction, price, atr, support, resistance, df_5m)
-    bb_l, bb_s, bb_rl, bb_rs, bb_context = bollinger_context(raw_direction, df_15m, df_5m)
-    long_adj += sr_l + bb_l
-    short_adj += sr_s + bb_s
-    reasons_long += sr_rl + bb_rl
-    reasons_short += sr_rs + bb_rs
+    sr_context = {
+        "sr_entry_status": "disabled",
+        "sr_entry_label": "غیرفعال؛ حمایت/مقاومت فقط برای TP/SL استفاده می‌شود",
+        "sr_entry_confirmed": False,
+    }
+
+    _, _, _, _, bb_context = bollinger_context(raw_direction, df_15m, df_5m)
 
     context = {
         "noise_status": noise_status, "noise_label": noise_label,
@@ -1009,12 +810,12 @@ def technical_quality_context(raw_direction, price, atr, support, resistance, df
         "liquidity_pool_status": liquidity["status"], "liquidity_pool_label": liquidity["label"],
         "liquidity_upside_level": liquidity["upside_level"], "liquidity_downside_level": liquidity["downside_level"],
         "mtf_structure_status": mtf["status"], "mtf_structure_label": mtf["label"], "mtf_structures": mtf["structures"],
-        "technical_quality_long_adj": long_adj, "technical_quality_short_adj": short_adj,
+        "technical_quality_long_adj": 0, "technical_quality_short_adj": 0,
     }
     context.update(sr_context)
     context.update(bb_context)
-    return long_adj, short_adj, reasons_long, reasons_short, context
 
+    return 0, 0, [], [], context
 
 def btc_filter(symbol):
     if symbol == "BTCUSDT":
@@ -1187,6 +988,10 @@ def score_entry(df_15m, df_5m):
 
 
 def score_smart_money(df_15m, df_5m):
+    """
+    نسخه متعادل:
+    FVG و Order Block فقط اثر بسیار نرم دارند.
+    """
     long_score = 0
     short_score = 0
     reasons_long = []
@@ -1197,50 +1002,23 @@ def score_smart_money(df_15m, df_5m):
     fvg = detect_fvg(df_5m)
     order_block = detect_order_block(df_15m)
 
-    if liquidity_grab == "bullish_liquidity_grab":
-        long_score += 6
-        reasons_long.append("Liquidity Grab صعودی")
-
-    if liquidity_grab == "bearish_liquidity_grab":
-        short_score += 6
-        reasons_short.append("Liquidity Grab نزولی")
-
-    if stop_hunt == "bullish_stop_hunt":
-        long_score += 5
-        reasons_long.append("Stop Hunt صعودی")
-
-    if stop_hunt == "bearish_stop_hunt":
-        short_score += 5
-        reasons_short.append("Stop Hunt نزولی")
-
     if fvg == "bullish_fvg":
-        long_score += 6
+        long_score += 1
         reasons_long.append("FVG صعودی")
 
     if fvg == "bearish_fvg":
-        short_score += 6
+        short_score += 1
         reasons_short.append("FVG نزولی")
 
     if order_block == "bullish_order_block":
-        long_score += 7
+        long_score += 1
         reasons_long.append("Order Block صعودی")
 
     if order_block == "bearish_order_block":
-        short_score += 7
+        short_score += 1
         reasons_short.append("Order Block نزولی")
 
-    trend15 = trend_direction(df_15m)
-
-    if trend15 == "bullish" and order_block == "bearish_order_block":
-        short_score -= 8
-        reasons_short.append("جریمه: Order Block نزولی مخالف روند صعودی 15M است")
-
-    if trend15 == "bearish" and order_block == "bullish_order_block":
-        long_score -= 8
-        reasons_long.append("جریمه: Order Block صعودی مخالف روند نزولی 15M است")
-
     return long_score, short_score, reasons_long, reasons_short, liquidity_grab, stop_hunt, fvg, order_block
-
 
 def score_divergence(df_5m):
     long_score = 0
@@ -1294,6 +1072,9 @@ def score_futures_data(symbol):
 
 
 def score_market_sentiment(symbol):
+    """
+    ترس و طمع و آلت‌سیزن فقط اثر ناچیز دارند.
+    """
     market = get_market_sentiment()
 
     long_score = 0
@@ -1306,22 +1087,21 @@ def score_market_sentiment(symbol):
 
     if fear_value is not None:
         if fear_value <= 25:
-            long_score += 3
+            long_score += 1
             reasons_long.append("Fear & Greed در ترس شدید")
         elif fear_value >= 80:
-            short_score += 3
+            short_score += 1
             reasons_short.append("Fear & Greed در طمع شدید")
 
     if symbol != "BTCUSDT":
         if altseason == "قوی":
-            long_score += 3
+            long_score += 1
             reasons_long.append("آلت‌سیزن برای آلت‌کوین‌ها مناسب است")
         elif altseason == "ضعیف":
-            short_score += 3
+            short_score += 1
             reasons_short.append("آلت‌سیزن ضعیف است")
 
     return long_score, short_score, reasons_long, reasons_short, market
-
 
 def score_vwap_volume_profile(df_15m, df_5m):
     long_score = 0
@@ -1366,183 +1146,99 @@ def apply_direction_conflict_penalties(
     reasons_short
 ):
     """
-    جریمه نرم برای تناقض‌های واضح.
-    هدف: سیگنال شورت با کندل/اوردر بلاک صعودی یا لانگ با تاییدهای نزولی، 100/100 نشود.
-    این تابع سیگنال را مستقیم حذف نمی‌کند، فقط امتیاز را واقعی‌تر می‌کند.
+    جریمه‌های خلاف جهت در نسخه متعادل نرم‌تر هستند.
+    تایید چندکندلی اثر ندارد.
     """
-
-    bullish_candle = pattern in ["bullish_engulfing", "bullish_pinbar", "bullish_strong"] or multi_candle == "bullish"
-    bearish_candle = pattern in ["bearish_engulfing", "bearish_pinbar", "bearish_strong"] or multi_candle == "bearish"
+    bullish_candle = pattern in ["bullish_engulfing", "bullish_pinbar", "bullish_strong"]
+    bearish_candle = pattern in ["bearish_engulfing", "bearish_pinbar", "bearish_strong"]
 
     if bullish_candle:
-        short_score -= 12
-        reasons_short.append("جریمه: کندل یا تایید چندکندلی صعودی، خلاف شورت است")
+        short_score -= 4
+        reasons_short.append("جریمه نرم: کندل صعودی خلاف شورت است")
 
     if bearish_candle:
-        long_score -= 12
-        reasons_long.append("جریمه: کندل یا تایید چندکندلی نزولی، خلاف لانگ است")
+        long_score -= 4
+        reasons_long.append("جریمه نرم: کندل نزولی خلاف لانگ است")
 
     if order_block == "bullish_order_block":
-        short_score -= 10
-        reasons_short.append("جریمه: اوردر بلاک صعودی، خلاف شورت است")
+        short_score -= 1
+        reasons_short.append("جریمه ناچیز: اوردر بلاک صعودی خلاف شورت است")
 
     if order_block == "bearish_order_block":
-        long_score -= 10
-        reasons_long.append("جریمه: اوردر بلاک نزولی، خلاف لانگ است")
+        long_score -= 1
+        reasons_long.append("جریمه ناچیز: اوردر بلاک نزولی خلاف لانگ است")
 
     if fvg == "bullish_fvg":
-        short_score -= 12
-        reasons_short.append("جریمه سنگین: ناحیه نقدینگی صعودی، خلاف شورت است")
+        short_score -= 1
+        reasons_short.append("جریمه ناچیز: FVG صعودی خلاف شورت است")
 
     if fvg == "bearish_fvg":
-        long_score -= 12
-        reasons_long.append("جریمه سنگین: ناحیه نقدینگی نزولی، خلاف لانگ است")
+        long_score -= 1
+        reasons_long.append("جریمه ناچیز: FVG نزولی خلاف لانگ است")
 
     if vwap_status == "above_vwap":
-        short_score -= 8
+        short_score -= 4
         reasons_short.append("جریمه: قیمت بالای VWAP است و برای شورت ریسک دارد")
 
     if vwap_status == "below_vwap":
-        long_score -= 8
+        long_score -= 4
         reasons_long.append("جریمه: قیمت پایین VWAP است و برای لانگ ریسک دارد")
 
-    if buy_power >= sell_power + 12:
-        short_score -= 7
+    if buy_power >= sell_power + 15:
+        short_score -= 5
         reasons_short.append("جریمه: قدرت خرید نسبت به فروش بالاتر است")
 
-    if sell_power >= buy_power + 12:
-        long_score -= 7
+    if sell_power >= buy_power + 15:
+        long_score -= 5
         reasons_long.append("جریمه: قدرت فروش نسبت به خرید بالاتر است")
 
     return max(0, long_score), max(0, short_score)
 
-
 def normalize_score_by_quality(score, rr, raw_direction, pattern, multi_candle, order_block, vwap_status, fvg="none"):
     """
-    محدود کردن امتیازهای خیلی بالا.
-    هدف: 100/100 فقط برای سیگنال‌های واقعاً تمیز باشد، نه هر سیگنال قوی ظاهری.
+    در نسخه متعادل، امتیاز فقط وقتی RR خیلی بد باشد محدود می‌شود.
     """
     if raw_direction == "NO TRADE":
         return score
 
-    if rr < 1.2:
-        score = min(score, 84)
-    elif rr < 1.35:
-        score = min(score, 90)
-    elif rr < 1.5:
-        score = min(score, 94)
-    elif rr < 1.8:
-        score = min(score, 97)
-
-    if raw_direction == "LONG":
-        if pattern in ["bearish_engulfing", "bearish_pinbar", "bearish_strong"] or multi_candle == "bearish":
-            score = min(score, 88)
-
-        if order_block == "bearish_order_block":
-            score = min(score, 72)
-
-        if fvg == "bearish_fvg":
-            score = min(score, 82)
-
-        if fvg == "bearish_fvg" and (pattern in ["bearish_engulfing", "bearish_pinbar", "bearish_strong"] or multi_candle == "bearish"):
-            score = min(score, 74)
-
-        if vwap_status == "below_vwap":
-            score = min(score, 92)
-
-    if raw_direction == "SHORT":
-        if pattern in ["bullish_engulfing", "bullish_pinbar", "bullish_strong"] or multi_candle == "bullish":
-            score = min(score, 88)
-
-        if order_block == "bullish_order_block":
-            score = min(score, 72)
-
-        if fvg == "bullish_fvg":
-            score = min(score, 82)
-
-        if fvg == "bullish_fvg" and (pattern in ["bullish_engulfing", "bullish_pinbar", "bullish_strong"] or multi_candle == "bullish"):
-            score = min(score, 74)
-
-        if vwap_status == "above_vwap":
-            score = min(score, 92)
+    if rr < 0.8:
+        score = min(score, 78)
+    elif rr < 1.0:
+        score = min(score, 86)
+    elif rr < 1.2:
+        score = min(score, 92)
 
     return cap_score(score)
 
 def calculate_trade_levels(raw_direction, price, atr, support=None, resistance=None):
-    """
-    TP/SL هوشمندتر بر اساس ATR و حمایت/مقاومت، مناسب معاملات حدود 30 تا 60 دقیقه.
-    اصلاح جدید:
-    - TPها مثل نسخه قدیمی خیلی دور نیستند.
-    - TP1 آنقدر نزدیک نمی‌شود که RR معمولاً زیر 1 بیاید.
-    - حمایت/مقاومت فقط وقتی TP را نزدیک‌تر می‌کند که حداقل RR منطقی حفظ شود.
-    """
-    price = float(price)
-    atr = float(atr)
-    buffer = atr * 0.22
+    buffer = atr * 0.15
 
     if raw_direction == "LONG":
-        atr_sl = price - (atr * 1.45)
-        stop_loss = atr_sl
+        stop_loss = price - (atr * 1.2)
+        tp1 = price + (atr * 1.5)
+        tp2 = price + (atr * 2.5)
 
-        if support is not None and float(support) < price:
-            structure_sl = float(support) - buffer
-            max_sl = price - (atr * 2.15)
-            stop_loss = max(structure_sl, max_sl) if structure_sl < atr_sl else structure_sl
-
-        risk = abs(price - stop_loss)
-        min_tp1_reward = max(atr * 1.05, risk * 1.15)
-        min_tp2_reward = max(atr * 1.80, risk * 1.65)
-
-        tp1 = price + min_tp1_reward
-        tp2 = price + min_tp2_reward
-
-        if resistance is not None and float(resistance) > price:
-            adjusted_tp1 = float(resistance) - buffer
-            adjusted_reward = adjusted_tp1 - price
-
-            # فقط اگر TP نزدیک مقاومت هنوز RR منطقی بدهد، TP1 را قبل مقاومت می‌گذاریم.
-            if adjusted_reward >= max(atr * 0.75, risk * 1.05):
+        if resistance is not None and resistance > price:
+            adjusted_tp1 = resistance - buffer
+            if adjusted_tp1 > price:
                 tp1 = min(tp1, adjusted_tp1)
-
-            # TP2 محافظه‌کارانه بماند ولی از TP1 پایین‌تر/خیلی نزدیک‌تر نشود.
-            resistance_tp2 = float(resistance) + atr * 0.35
-            if resistance_tp2 > tp1:
-                tp2 = min(tp2, max(resistance_tp2, price + min_tp1_reward * 1.25))
 
         return stop_loss, tp1, tp2
 
     if raw_direction == "SHORT":
-        atr_sl = price + (atr * 1.45)
-        stop_loss = atr_sl
+        stop_loss = price + (atr * 1.2)
+        tp1 = price - (atr * 1.5)
+        tp2 = price - (atr * 2.5)
 
-        if resistance is not None and float(resistance) > price:
-            structure_sl = float(resistance) + buffer
-            max_sl = price + (atr * 2.15)
-            stop_loss = min(structure_sl, max_sl) if structure_sl > atr_sl else structure_sl
-
-        risk = abs(stop_loss - price)
-        min_tp1_reward = max(atr * 1.05, risk * 1.15)
-        min_tp2_reward = max(atr * 1.80, risk * 1.65)
-
-        tp1 = price - min_tp1_reward
-        tp2 = price - min_tp2_reward
-
-        if support is not None and float(support) < price:
-            adjusted_tp1 = float(support) + buffer
-            adjusted_reward = price - adjusted_tp1
-
-            # فقط اگر TP نزدیک حمایت هنوز RR منطقی بدهد، TP1 را قبل حمایت می‌گذاریم.
-            if adjusted_reward >= max(atr * 0.75, risk * 1.05):
+        if support is not None and support < price:
+            adjusted_tp1 = support + buffer
+            if adjusted_tp1 < price:
                 tp1 = max(tp1, adjusted_tp1)
-
-            # TP2 محافظه‌کارانه بماند ولی از TP1 بالاتر/خیلی نزدیک‌تر نشود.
-            support_tp2 = float(support) - atr * 0.35
-            if support_tp2 < tp1:
-                tp2 = max(tp2, min(support_tp2, price - min_tp1_reward * 1.25))
 
         return stop_loss, tp1, tp2
 
     return None, None, None
+
 
 def risk_reward(raw_direction, price, stop_loss, tp1):
     if raw_direction == "NO TRADE" or stop_loss is None or tp1 is None:
@@ -1594,23 +1290,24 @@ def entry_grade(score, risk_level, rr, final_direction):
     if final_direction == "NO TRADE":
         return "Reject"
 
-    if score >= 92 and risk_level == "پایین" and rr >= 1.20:
+    if score >= 92 and rr >= 1.0:
         return "A+"
 
-    if score >= 82 and risk_level in ["پایین", "متوسط"] and rr >= 1.05:
+    if score >= 80 and rr >= 0.85:
         return "A"
 
-    # طبق درخواست، گرید B ارسال/قبول نمی‌شود.
     return "Reject"
 
 def win_probability(score, risk_level, rr, adx, grade):
-    p = 42 + int(score * 0.22)
-    p += 8 if risk_level == "پایین" else 3 if risk_level == "متوسط" else -10
-    p += 5 if rr >= 1.5 else 2 if rr >= 1 else -10
-    p += 4 if adx >= 25 else -6 if adx < 19 else 0
-    p += 4 if grade == "A+" else 2 if grade == "A" else -15 if grade == "Reject" else 0
+    """
+    احتمال موفقیت متعادل و کمتر خشک.
+    """
+    p = 40 + int(score * 0.28)
+    p += 6 if risk_level == "پایین" else 2 if risk_level == "متوسط" else -4
+    p += 5 if rr >= 1.3 else 2 if rr >= 1.0 else -5
+    p += 3 if adx >= 23 else -2 if adx < 17 else 0
+    p += 4 if grade == "A+" else 2 if grade == "A" else -5
     return max(0, min(p, 92))
-
 
 def news_filter_status():
     """اخبار از تصمیم‌گیری حذف شده است."""
@@ -1762,12 +1459,9 @@ def very_safe_status(raw_direction, score, win_probability_value, risk_level, rr
 
 
 def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, spread_percent, market_regime="neutral", order_block="none", fvg="none", buy_power=50, sell_power=50, rsi_divergence="none", macd_divergence="none"):
-    last_5 = df_5m.iloc[-1]
-    last_15 = df_15m.iloc[-1]
-    price = float(last_5["close"])
-    atr = float(last_15["atr"])
-    support, resistance = support_resistance(df_15m)
-
+    """
+    فیلتر ورود ساده و متعادل.
+    """
     reasons_block = []
     liquidity_risk = "پایین"
 
@@ -1775,35 +1469,10 @@ def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, s
         reasons_block.append("اختلاف لانگ و شورت کافی نیست")
         return False, reasons_block, "بالا", "none", "none"
 
-    # طبق درخواست: فقط اوردر بلاک مخالف رد قطعی است.
-    if raw_direction == "LONG" and order_block == "bearish_order_block":
-        reasons_block.append("اوردر بلاک نزولی خلاف سیگنال لانگ است")
-        return False, reasons_block, "بالا", "none", "none"
+    if score < 70:
+        reasons_block.append("امتیاز سیگنال برای ورود کافی نیست")
+        return False, reasons_block, "متوسط", "none", "none"
 
-    if raw_direction == "SHORT" and order_block == "bullish_order_block":
-        reasons_block.append("اوردر بلاک صعودی خلاف سیگنال شورت است")
-        return False, reasons_block, "بالا", "none", "none"
-
-    # FVG مخالف به‌تنهایی رد قطعی نیست، اما ریسک را بالا می‌برد.
-    # اگر FVG مخالف همراه با تایید چندکندلی/کندلی مخالف باشد، برای کاهش استاپ‌های بی‌کیفیت رد می‌شود.
-    current_pattern = candle_pattern(df_5m)
-    current_multi_candle = multi_candle_confirmation(df_5m)
-
-    if raw_direction == "LONG" and fvg == "bearish_fvg":
-        reasons_block.append("FVG نزولی خلاف سیگنال لانگ است")
-        liquidity_risk = "بالا"
-        if current_multi_candle == "bearish" or current_pattern in ["bearish_engulfing", "bearish_pinbar", "bearish_strong"]:
-            reasons_block.append("FVG و تایید کندلی هر دو خلاف لانگ هستند")
-            return False, reasons_block, "بالا", "none", "none"
-
-    if raw_direction == "SHORT" and fvg == "bullish_fvg":
-        reasons_block.append("FVG صعودی خلاف سیگنال شورت است")
-        liquidity_risk = "بالا"
-        if current_multi_candle == "bullish" or current_pattern in ["bullish_engulfing", "bullish_pinbar", "bullish_strong"]:
-            reasons_block.append("FVG و تایید کندلی هر دو خلاف شورت هستند")
-            return False, reasons_block, "بالا", "none", "none"
-
-    # قدرت خرید/فروش فقط وقتی خیلی مخالف باشد ریسک را بالا می‌برد؛ سختگیرانه نیست.
     try:
         buy_power_value = float(buy_power)
         sell_power_value = float(sell_power)
@@ -1811,129 +1480,22 @@ def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, s
         buy_power_value = 50
         sell_power_value = 50
 
-    if raw_direction == "LONG" and sell_power_value > buy_power_value:
-        reasons_block.append("قدرت فروش از قدرت خرید بیشتر است؛ لانگ رد شد")
-        return False, reasons_block, "بالا", "none", "none"
-
-    if raw_direction == "SHORT" and buy_power_value > sell_power_value:
-        reasons_block.append("قدرت خرید از قدرت فروش بیشتر است؛ شورت رد شد")
-        return False, reasons_block, "بالا", "none", "none"
-
-    # فقط واگرایی دوگانه مخالف رد می‌کند.
-    if raw_direction == "LONG":
-        if (
-            rsi_divergence == "bearish_rsi_divergence"
-            and macd_divergence == "bearish_macd_divergence"
-        ):
-            reasons_block.append("واگرایی دوگانه نزولی خلاف سیگنال لانگ است")
-            return False, reasons_block, "بالا", "none", "none"
-
-    if raw_direction == "SHORT":
-        if (
-            rsi_divergence == "bullish_rsi_divergence"
-            and macd_divergence == "bullish_macd_divergence"
-        ):
-            reasons_block.append("واگرایی دوگانه صعودی خلاف سیگنال شورت است")
-            return False, reasons_block, "بالا", "none", "none"
-
-    # خلاف روند کلی بازار فقط ریسک را بالا می‌برد؛ برای اینکه ربات خشک نشود رد قطعی نیست.
-    if market_regime == "bearish" and raw_direction == "LONG" and score < 90:
-        reasons_block.append("لانگ خلاف روند کلی نزولی بازار است")
+    if raw_direction == "LONG" and sell_power_value >= buy_power_value + 22 and score < 88:
+        reasons_block.append("قدرت فروش خیلی بیشتر از خرید است")
         liquidity_risk = "متوسط"
 
-    if market_regime == "bullish" and raw_direction == "SHORT" and score < 90:
-        reasons_block.append("شورت خلاف روند کلی صعودی بازار است")
+    if raw_direction == "SHORT" and buy_power_value >= sell_power_value + 22 and score < 88:
+        reasons_block.append("قدرت خرید خیلی بیشتر از فروش است")
         liquidity_risk = "متوسط"
 
-    # اخبار از تصمیم‌گیری حذف شد؛ ترس‌وطمع، دامیننس و آلت‌سیزن در تحلیل باقی می‌مانند.
-
-    if market_is_choppy(df_15m, df_5m):
-        reasons_block.append("بازار رنج، فشرده یا کم‌قدرت است")
-        liquidity_risk = "بالا"
-
-    if not minimum_volatility_ok(df_5m):
-        reasons_block.append("نوسان برای معامله کافی نیست")
-        liquidity_risk = "بالا"
-
-    if spread_percent is not None and spread_percent > 0.10:
+    if spread_percent is not None and spread_percent > 0.12:
         reasons_block.append("اسپرد برای معامله زیاد است")
-        liquidity_risk = "بالا"
-
-    if is_middle_of_range(price, support, resistance) and score < 88:
-        reasons_block.append("قیمت وسط رنج است و امتیاز برای عبور از این ریسک کافی نیست")
-        liquidity_risk = "متوسط"
-
-    sr_l, sr_s, sr_rl, sr_rs, sr_context = support_resistance_entry_context(raw_direction, price, atr, support, resistance, df_5m)
-    if raw_direction == "LONG" and sr_context.get("sr_entry_status") == "not_near_level" and score < SR_ENTRY_MIN_SCORE_BLOCK:
-        reasons_block.append("ورود بر اساس حمایت هنوز تایید کافی ندارد")
-        liquidity_risk = "متوسط"
-    if raw_direction == "SHORT" and sr_context.get("sr_entry_status") == "not_near_level" and score < SR_ENTRY_MIN_SCORE_BLOCK:
-        reasons_block.append("ورود بر اساس مقاومت هنوز تایید کافی ندارد")
-        liquidity_risk = "متوسط"
+        return False, reasons_block, "بالا", "none", "none"
 
     fake_breakout = detect_fake_breakout(df_5m)
     trend_exhaustion = detect_trend_exhaustion(df_5m)
 
-    if raw_direction == "LONG":
-        if long_score < short_score + 20:
-            reasons_block.append("اختلاف امتیاز لانگ و شورت کافی نیست")
-
-        if is_near_resistance(price, resistance, atr) and score < 88:
-            reasons_block.append("قیمت نزدیک مقاومت است")
-            liquidity_risk = "متوسط"
-
-        if last_5["rsi"] > 68:
-            reasons_block.append("RSI برای لانگ کمی بالاست")
-
-        if last_15["adx"] < 18:
-            reasons_block.append("قدرت روند برای لانگ کافی نیست")
-
-        if fake_breakout == "fake_bullish_breakout":
-            reasons_block.append("احتمال فیک بریک‌اوت صعودی")
-
-        if trend_exhaustion == "bullish_exhaustion":
-            reasons_block.append("خستگی روند صعودی")
-
-    if raw_direction == "SHORT":
-        if short_score < long_score + 20:
-            reasons_block.append("اختلاف امتیاز شورت و لانگ کافی نیست")
-
-        if is_near_support(price, support, atr) and score < 88:
-            reasons_block.append("قیمت نزدیک حمایت است")
-            liquidity_risk = "متوسط"
-
-        if last_5["rsi"] < 32:
-            reasons_block.append("RSI برای شورت کمی پایین است")
-
-        if last_15["adx"] < 18:
-            reasons_block.append("قدرت روند برای شورت کافی نیست")
-
-        if fake_breakout == "fake_bearish_breakout":
-            reasons_block.append("احتمال فیک بریک‌اوت نزولی")
-
-        if trend_exhaustion == "bearish_exhaustion":
-            reasons_block.append("خستگی روند نزولی")
-
-    if score < 74:
-        reasons_block.append("امتیاز سیگنال برای ورود کافی نیست")
-
-    # هشدارهای نرم به‌تنهایی باعث رد نمی‌شوند.
-    hard_block_words = [
-        "اختلاف امتیاز",
-        "قدرت روند",
-        "امتیاز سیگنال",
-        "فیک بریک",
-        "خستگی روند",
-        "نوسان",
-        "اسپرد",
-    ]
-    hard_blocks = [r for r in reasons_block if any(w in r for w in hard_block_words)]
-
-    if hard_blocks:
-        return False, reasons_block, liquidity_risk, fake_breakout, trend_exhaustion
-
     return True, reasons_block, liquidity_risk, fake_breakout, trend_exhaustion
-
 
 def apply_conflict_penalties(
     long_score,
@@ -2033,43 +1595,10 @@ def analyze_symbol(symbol):
     reasons_long += rl
     reasons_short += rs
 
+    # موارد زیر فقط برای گزارش داخلی محاسبه می‌شوند و در نسخه متعادل امتیاز سنگین نمی‌دهند.
     trendline = detect_trendline(df_15m)
-    l, s = trendline_score(trendline)
-    long_score += l
-    short_score += s
-
-    if trendline == "uptrend":
-        reasons_long.append("خط روند 15M صعودی است")
-    elif trendline == "downtrend":
-        reasons_short.append("خط روند 15M نزولی است")
-
     breakout = detect_breakout(df_5m)
-    l, s = breakout_score(breakout)
-    long_score += l
-    short_score += s
-
-    if breakout == "bullish_breakout":
-        reasons_long.append("بریک‌اوت صعودی در 5M")
-    elif breakout == "bearish_breakout":
-        reasons_short.append("بریک‌اوت نزولی در 5M")
-    elif breakout == "fake_bullish_breakout":
-        reasons_short.append("احتمال فیک بریک‌اوت صعودی")
-    elif breakout == "fake_bearish_breakout":
-        reasons_long.append("احتمال فیک بریک‌اوت نزولی")
-
     structure = detect_market_structure(df_15m)
-    l, s = structure_score(structure)
-    long_score += l
-    short_score += s
-
-    if structure == "bullish_structure":
-        reasons_long.append("ساختار بازار 15M صعودی است")
-    elif structure == "bearish_structure":
-        reasons_short.append("ساختار بازار 15M نزولی است")
-
-    long_score, short_score = apply_conflict_penalties(
-        long_score, short_score, trendline, structure, reasons_long, reasons_short
-    )
 
     l, s, rl, rs, market = score_market_sentiment(symbol)
     long_score += l
@@ -2222,17 +1751,6 @@ def analyze_symbol(symbol):
 
     win_prob = win_probability(score, risk_level, rr, adx_value, grade)
 
-    # واقعی‌تر کردن احتمال موفقیت وقتی نشانه‌های مهم خلاف جهت سیگنال هستند.
-    if final_direction == "LONG":
-        if fvg == "bearish_fvg":
-            win_prob -= 8
-        if multi_candle == "bearish" or pattern in ["bearish_engulfing", "bearish_pinbar", "bearish_strong"]:
-            win_prob -= 6
-    elif final_direction == "SHORT":
-        if fvg == "bullish_fvg":
-            win_prob -= 8
-        if multi_candle == "bullish" or pattern in ["bullish_engulfing", "bullish_pinbar", "bullish_strong"]:
-            win_prob -= 6
     win_prob = max(0, min(int(win_prob), 92))
 
     very_safe_ok, very_safe_reasons = very_safe_status(
@@ -2342,25 +1860,6 @@ def analyze_symbol(symbol):
         "very_safe_reasons": very_safe_reasons[:8],
 
         "news_filter_active": news_filter_active(),
-
-        "noise_status": technical_context.get("noise_status"),
-        "noise_label": technical_context.get("noise_label"),
-        "volatility_status": technical_context.get("volatility_status"),
-        "volatility_label": technical_context.get("volatility_label"),
-        "late_entry": technical_context.get("late_entry"),
-        "late_entry_reason": technical_context.get("late_entry_reason"),
-        "tp_space_ok": technical_context.get("tp_space_ok"),
-        "tp_space_reason": technical_context.get("tp_space_reason"),
-        "tp_space_atr": technical_context.get("tp_space_atr"),
-        "sr_entry_status": technical_context.get("sr_entry_status"),
-        "sr_entry_label": technical_context.get("sr_entry_label"),
-        "sr_entry_confirmed": technical_context.get("sr_entry_confirmed"),
-        "bollinger_status": technical_context.get("bollinger_status"),
-        "bollinger_label": technical_context.get("bollinger_label"),
-        "bb_high": technical_context.get("bb_high"),
-        "bb_mid": technical_context.get("bb_mid"),
-        "bb_low": technical_context.get("bb_low"),
-        "bb_width": technical_context.get("bb_width"),
 
         "reasons": reasons[:18],
     }
