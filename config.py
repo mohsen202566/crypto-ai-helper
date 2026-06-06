@@ -60,16 +60,3 @@ RISK_PER_TRADE_PERCENT = get_env_int("RISK_PER_TRADE_PERCENT", 1)
 # Technical quality filters - مقادیر نرم برای حفظ تعداد سیگنال
 TECHNICAL_QUALITY_LATE_ENTRY_ATR = get_env_int("TECHNICAL_QUALITY_LATE_ENTRY_ATR", 165) / 100
 TECHNICAL_QUALITY_MIN_TP_SPACE_ATR = get_env_int("TECHNICAL_QUALITY_MIN_TP_SPACE_ATR", 75) / 100
-
-# دامنه نوسان قابل قبول برای فیلتر کیفیت تکنیکال (نرم و قابل تنظیم از VPS)
-TECHNICAL_QUALITY_LOW_ATR_PCT = get_env_int("TECHNICAL_QUALITY_LOW_ATR_PCT", 8) / 100
-TECHNICAL_QUALITY_EXTREME_ATR_PCT = get_env_int("TECHNICAL_QUALITY_EXTREME_ATR_PCT", 350) / 100
-
-# ورود بر اساس حمایت/مقاومت - مقادیر نرم برای حفظ تعداد سیگنال
-SR_ENTRY_NEAR_ATR = get_env_int("SR_ENTRY_NEAR_ATR", 85) / 100
-SR_ENTRY_REJECTION_WICK_RATIO = get_env_int("SR_ENTRY_REJECTION_WICK_RATIO", 145) / 100
-SR_ENTRY_MIN_SCORE_BLOCK = get_env_int("SR_ENTRY_MIN_SCORE_BLOCK", 85)
-
-# Bollinger Bands - فیلتر نرم برای تشخیص کشیدگی و فشردگی
-BOLLINGER_SQUEEZE_WIDTH_PCT = get_env_int("BOLLINGER_SQUEEZE_WIDTH_PCT", 120) / 100
-BOLLINGER_EXTENSION_ATR = get_env_int("BOLLINGER_EXTENSION_ATR", 90) / 100
