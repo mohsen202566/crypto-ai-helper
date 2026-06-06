@@ -1484,8 +1484,8 @@ def calculate_trade_levels(raw_direction, price, atr, support=None, resistance=N
             stop_loss = max(structure_sl, max_sl) if structure_sl < atr_sl else structure_sl
 
         risk = abs(price - stop_loss)
-        tp1 = price + max(atr * 1.35, risk * 1.05)
-        tp2 = price + max(atr * 2.25, risk * 1.65)
+        tp1 = price + max(atr * 0.90, risk * 0.85)
+        tp2 = price + max(atr * 1.60, risk * 1.30)
 
         if resistance is not None and float(resistance) > price:
             adjusted_tp1 = float(resistance) - buffer
@@ -1506,8 +1506,8 @@ def calculate_trade_levels(raw_direction, price, atr, support=None, resistance=N
             stop_loss = min(structure_sl, max_sl) if structure_sl > atr_sl else structure_sl
 
         risk = abs(stop_loss - price)
-        tp1 = price - max(atr * 1.35, risk * 1.05)
-        tp2 = price - max(atr * 2.25, risk * 1.65)
+        tp1 = price - max(atr * 0.90, risk * 0.85)
+        tp2 = price - max(atr * 1.60, risk * 1.30)
 
         if support is not None and float(support) < price:
             adjusted_tp1 = float(support) + buffer
