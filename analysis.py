@@ -786,27 +786,28 @@ def apply_direction_conflict_penalties(
     bearish_candle = pattern in ["bearish_engulfing", "bearish_pinbar", "bearish_strong"]
 
     if bullish_candle:
-        short_score -= 4
+        short_score -= 5
         reasons_short.append("کندل صعودی خلاف شورت است")
 
     if bearish_candle:
-        long_score -= 4
+        long_score -= 5
         reasons_long.append("کندل نزولی خلاف لانگ است")
 
     if vwap_status == "above_vwap":
-        short_score -= 4
+        short_score -= 6
         reasons_short.append("قیمت بالای VWAP است و برای شورت ریسک دارد")
 
     if vwap_status == "below_vwap":
-        long_score -= 4
+        long_score -= 6
         reasons_long.append("قیمت پایین VWAP است و برای لانگ ریسک دارد")
 
-    if buy_power >= sell_power + 15:
-        short_score -= 5
+    # کمی سختگیرتر: اگر قدرت بازار خلاف جهت سیگنال باشد، جریمه زودتر و کمی قوی‌تر اعمال می‌شود.
+    if buy_power >= sell_power + 8:
+        short_score -= 8
         reasons_short.append("قدرت خرید نسبت به فروش بالاتر است")
 
-    if sell_power >= buy_power + 15:
-        long_score -= 5
+    if sell_power >= buy_power + 8:
+        long_score -= 8
         reasons_long.append("قدرت فروش نسبت به خرید بالاتر است")
 
     return max(0, long_score), max(0, short_score)
@@ -819,11 +820,11 @@ def normalize_score_by_quality(score, rr, raw_direction, pattern, multi_candle, 
         return score
 
     if rr < 0.8:
-        score = min(score, 78)
+        score = min(score, 74)
     elif rr < 1.0:
-        score = min(score, 86)
+        score = min(score, 82)
     elif rr < 1.2:
-        score = min(score, 92)
+        score = min(score, 90)
 
     return cap_score(score)
 
@@ -879,11 +880,17 @@ def calculate_risk_level(raw_direction, score, liquidity_risk, funding_rate, adx
     if score < 75:
         risk += 2
 
-    if adx < 20:
+    if adx < 18:
+        risk += 3
+    elif adx < 20:
         risk += 2
+    elif adx < 22:
+        risk += 1
 
     if liquidity_risk == "بالا":
         risk += 2
+    elif liquidity_risk == "متوسط":
+        risk += 1
 
     if funding_rate is not None and abs(funding_rate) > 0.07:
         risk += 1
@@ -907,10 +914,10 @@ def entry_grade(score, risk_level, rr, final_direction):
     if final_direction == "NO TRADE":
         return "Reject"
 
-    if score >= 92 and rr >= 1.0:
+    if score >= 94 and rr >= 1.05:
         return "A+"
 
-    if score >= 80 and rr >= 0.85:
+    if score >= 84 and rr >= 0.90:
         return "A"
 
     return "Reject"
@@ -922,7 +929,7 @@ def win_probability(score, risk_level, rr, adx, grade):
     p = 40 + int(score * 0.28)
     p += 6 if risk_level == "پایین" else 2 if risk_level == "متوسط" else -4
     p += 5 if rr >= 1.3 else 2 if rr >= 1.0 else -5
-    p += 3 if adx >= 23 else -2 if adx < 17 else 0
+    p += 3 if adx >= 24 else -5 if adx < 18 else -2 if adx < 20 else 0
     p += 4 if grade == "A+" else 2 if grade == "A" else -5
     return max(0, min(p, 92))
 
@@ -1000,7 +1007,7 @@ def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, s
         reasons_block.append("اختلاف لانگ و شورت کافی نیست")
         return False, reasons_block, "بالا", "none", "none"
 
-    if score < 70:
+    if score < 75:
         reasons_block.append("امتیاز سیگنال برای ورود کافی نیست")
         return False, reasons_block, "متوسط", "none", "none"
 
@@ -1011,13 +1018,20 @@ def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, s
         buy_power_value = 50
         sell_power_value = 50
 
-    if raw_direction == "LONG" and sell_power_value >= buy_power_value + 22 and score < 88:
-        reasons_block.append("قدرت فروش خیلی بیشتر از خرید است")
+    # سختگیری ملایم‌تر از Reject کامل: اول ریسک را بالا می‌بریم؛ فقط در تضاد خیلی شدید و امتیاز پایین‌تر بلاک می‌کنیم.
+    if raw_direction == "LONG" and sell_power_value >= buy_power_value + 12:
+        reasons_block.append("قدرت فروش برای لانگ کمی نگران‌کننده است")
         liquidity_risk = "متوسط"
+        if score < 82 or sell_power_value >= buy_power_value + 22:
+            reasons_block.append("قدرت فروش خیلی بیشتر از خرید است")
+            return False, reasons_block, "متوسط", "none", "none"
 
-    if raw_direction == "SHORT" and buy_power_value >= sell_power_value + 22 and score < 88:
-        reasons_block.append("قدرت خرید خیلی بیشتر از فروش است")
+    if raw_direction == "SHORT" and buy_power_value >= sell_power_value + 12:
+        reasons_block.append("قدرت خرید برای شورت کمی نگران‌کننده است")
         liquidity_risk = "متوسط"
+        if score < 82 or buy_power_value >= sell_power_value + 22:
+            reasons_block.append("قدرت خرید خیلی بیشتر از فروش است")
+            return False, reasons_block, "متوسط", "none", "none"
 
     if spread_percent is not None and spread_percent > 0.12:
         reasons_block.append("اسپرد برای معامله زیاد است")
@@ -1218,6 +1232,20 @@ def analyze_symbol(symbol):
     )
 
     rr = risk_reward(raw_direction, price, stop_loss_raw, tp1_raw)
+
+    # سختگیری سراسری ملایم: اگر روند در 15M قدرت کافی نداشته باشد، امتیاز نهایی کمی کاهش می‌یابد.
+    # این Reject مستقیم نیست؛ فقط جلوی A+ شدن سیگنال‌های کم‌مومنتوم را می‌گیرد.
+    if raw_direction != "NO TRADE":
+        if adx_value < 18:
+            score -= 10
+            reasons.append("ADX تایم 15M ضعیف است؛ قدرت روند کافی نیست")
+        elif adx_value < 20:
+            score -= 6
+            reasons.append("ADX تایم 15M کمی ضعیف است")
+        elif adx_value < 22:
+            score -= 3
+            reasons.append("ADX تایم 15M متوسط رو به ضعیف است")
+        score = cap_score(score)
 
     score = normalize_score_by_quality(
         score,
