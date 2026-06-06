@@ -1558,9 +1558,9 @@ def analyze_symbol(symbol):
     spread_percent = get_spread_percent(symbol)
 
     pre_direction = "NO TRADE"
-    if long_score >= short_score + 25:
+    if long_score >= short_score + 23:
         pre_direction = "LONG"
-    elif short_score >= long_score + 25:
+    elif short_score >= long_score + 23:
         pre_direction = "SHORT"
 
     tq_l, tq_s, tq_rl, tq_rs, technical_context = technical_quality_context(
@@ -1582,11 +1582,11 @@ def analyze_symbol(symbol):
     candle_forecast = technical_context.get("candle_forecast")
     candle_forecast_reason = technical_context.get("candle_forecast_reason")
 
-    if long_score >= short_score + 25:
+    if long_score >= short_score + 23:
         raw_direction = "LONG"
         score = long_score
         reasons = reasons_long + risk_notes
-    elif short_score >= long_score + 25:
+    elif short_score >= long_score + 23:
         raw_direction = "SHORT"
         score = short_score
         reasons = reasons_short + risk_notes
