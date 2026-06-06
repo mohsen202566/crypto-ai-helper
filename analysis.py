@@ -597,7 +597,9 @@ def score_entry(df_15m, df_5m):
         reasons_short.append("قدرت فروش بالا در تایم ورود")
 
     pattern = candle_pattern(df_5m)
-    multi_candle = multi_candle_confirmation(df_5m)
+    # Multi-candle confirmation was intentionally removed in the simple balanced version.
+    # Keep this field as "disabled" only for compatibility with the rest of the bot.
+    multi_candle = "disabled"
 
     if pattern in ["bullish_engulfing", "bullish_pinbar", "bullish_strong"]:
         long_score += 10
@@ -606,14 +608,6 @@ def score_entry(df_15m, df_5m):
     if pattern in ["bearish_engulfing", "bearish_pinbar", "bearish_strong"]:
         short_score += 10
         reasons_short.append(f"کندل تاییدی شورت: {pattern}")
-
-    if multi_candle == "bullish":
-        long_score += 8
-        reasons_long.append("تایید چند کندلی صعودی")
-
-    if multi_candle == "bearish":
-        short_score += 8
-        reasons_short.append("تایید چند کندلی نزولی")
 
     if volume_spike(df_5m):
         long_score += 6
