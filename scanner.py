@@ -200,11 +200,35 @@ def is_high_quality_signal(result):
     if result.get("score", 0) < AUTO_SCAN_MIN_SCORE:
         return False
 
-    if result.get("win_probability", 0) < 58:
+    if result.get("win_probability", 0) < 62:
         return False
 
-    if result.get("risk_reward", 0) < 0.85:
+    if result.get("risk_reward", 0) < 0.90:
         return False
+
+    if result.get("adx", 0) < 25:
+        return False
+
+    try:
+        buy_power = float(result.get("buy_power", 50))
+        sell_power = float(result.get("sell_power", 50))
+    except Exception:
+        buy_power = 50
+        sell_power = 50
+
+    direction = result.get("direction")
+    power_gap = buy_power - sell_power
+
+    if direction == "LONG":
+        if power_gap < 8:
+            return False
+        if result.get("order_block") == "bearish_order_block":
+            return False
+    elif direction == "SHORT":
+        if power_gap > -8:
+            return False
+        if result.get("order_block") == "bullish_order_block":
+            return False
 
     spread = result.get("spread_percent")
     if spread is not None and spread > 0.12:
@@ -218,9 +242,10 @@ def is_high_quality_signal(result):
 def is_very_safe_signal(result):
     return (
         is_high_quality_signal(result)
-        and result.get("score", 0) >= 90
-        and result.get("win_probability", 0) >= 68
+        and result.get("score", 0) >= 92
+        and result.get("win_probability", 0) >= 70
         and result.get("risk_reward", 0) >= 1.0
+        and result.get("adx", 0) >= 27
     )
 
 def analyze_symbol_safe(symbol):
