@@ -185,63 +185,43 @@ def soft_confirmation_bonus(result):
 
 
 def is_high_quality_signal(result):
+    """
+    نسخه متعادل سیگنال خودکار/بهترین سیگنال.
+    """
     if not result:
         return False
 
     if result.get("direction") == "NO TRADE":
         return False
 
-    # طبق خواسته: B و Reject ارسال نشوند.
     if result.get("entry_grade") not in ["A+", "A"]:
         return False
 
     if result.get("score", 0) < AUTO_SCAN_MIN_SCORE:
         return False
 
-    if result.get("win_probability", 0) < 70:
+    if result.get("win_probability", 0) < 58:
         return False
 
-    if result.get("risk_reward", 0) < 1.0:
-        return False
-
-    if result.get("risk_level") == "بالا":
-        return False
-
-    # Liquidity Risk طبق تنظیم جدید فقط در analysis.py جریمه نرم می‌گیرد؛
-    # اینجا باعث رد مستقیم سیگنال خودکار نمی‌شود.
-
-    adx = result.get("adx")
-    if adx is not None and adx < 18:
+    if result.get("risk_reward", 0) < 0.85:
         return False
 
     spread = result.get("spread_percent")
-    if spread is not None and spread > 0.08:
-        return False
-
-    if is_opposite_divergence(result):
-        return False
-
-    if is_fake_breakout_against_signal(result):
+    if spread is not None and spread > 0.12:
         return False
 
     if mtf_alignment_count(result) < 2:
         return False
 
-    if soft_confirmation_bonus(result) < 1:
-        return False
-
     return True
-
 
 def is_very_safe_signal(result):
     return (
         is_high_quality_signal(result)
-        and result.get("very_safe")
-        and result.get("score", 0) >= 88
-        and result.get("win_probability", 0) >= 75
-        and result.get("risk_reward", 0) >= 1.1
+        and result.get("score", 0) >= 90
+        and result.get("win_probability", 0) >= 68
+        and result.get("risk_reward", 0) >= 1.0
     )
-
 
 def analyze_symbol_safe(symbol):
     try:
