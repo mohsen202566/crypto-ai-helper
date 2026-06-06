@@ -1139,11 +1139,15 @@ def very_safe_status(raw_direction, score, win_probability_value, risk_level, rr
 
     return len(reasons) == 0, reasons
 
-def apply_final_momentum_balance(score, raw_direction, adx_value, buy_power, sell_power, reasons):
+def apply_final_momentum_balance(score, raw_direction, adx_value, buy_power, sell_power, rsi_value, reasons):
     """
-    لایه نهایی بالانس امتیاز برای جلوگیری از امتیازهای بادکرده.
-    اصل طراحی: سیگنال را خشک نکنیم، اما ترکیب‌های کم‌مومنتوم/خلاف قدرت بازار
-    نباید A/A+ یا امتیاز خیلی بالا بگیرند.
+    بالانس نهایی مومنتوم برای جلوگیری از score inflation.
+    منطق طراحی:
+    - ربات خشک نشود: اگر مومنتوم هم‌جهت باشد، سیگنال حذف نمی‌شود.
+    - اما ADX خیلی ضعیف یا قدرت خلاف جهت، اجازه امتیاز 90/100/A+ نمی‌دهد.
+    - نمونه‌ها:
+      * شورت + ADX زیر 15 + BuyPower بیشتر => Setup/Reject
+      * شورت + ADX زیر 15 + SellPower خیلی قوی => سیگنال می‌ماند، ولی A+ نمی‌شود
     """
     if raw_direction == "NO TRADE":
         return cap_score(score)
@@ -1151,84 +1155,168 @@ def apply_final_momentum_balance(score, raw_direction, adx_value, buy_power, sel
     try:
         adx_value = float(adx_value)
     except Exception:
-        adx_value = 20
+        adx_value = 20.0
 
     try:
         buy_power = float(buy_power)
         sell_power = float(sell_power)
     except Exception:
-        buy_power = 50
-        sell_power = 50
+        buy_power = 50.0
+        sell_power = 50.0
 
-    power_gap = buy_power - sell_power
+    try:
+        rsi_value = float(rsi_value)
+    except Exception:
+        rsi_value = 50.0
 
-    # ADX تایم 15M برای معاملات 30 تا 60 دقیقه‌ای مهم است.
-    # ADX خیلی پایین یعنی روند ضعیف/رنج؛ اینجا score باید سقف داشته باشد، نه فقط چند امتیاز کم شود.
+    power_gap = buy_power - sell_power  # positive = buy stronger, negative = sell stronger
+
+    aligned_power = False
+    opposite_power = False
+    neutral_power = False
+
+    if raw_direction == "SHORT":
+        aligned_power = power_gap <= -8
+        opposite_power = power_gap >= 5
+        neutral_power = not aligned_power and not opposite_power
+    elif raw_direction == "LONG":
+        aligned_power = power_gap >= 8
+        opposite_power = power_gap <= -5
+        neutral_power = not aligned_power and not opposite_power
+
+    # 1) ADX cap: ADX خیلی پایین نباید اجازه score بالا بدهد.
+    # اگر قدرت بازار هم‌جهت باشد، سیگنال را نگه می‌داریم ولی سقف می‌گذاریم.
     if adx_value < 14:
-        score -= 22
-        score = min(score, 78)
-        reasons.append("ADX تایم 15M بسیار ضعیف است؛ سقف امتیاز محدود شد")
-    elif adx_value < 16:
-        score -= 18
-        score = min(score, 82)
-        reasons.append("ADX تایم 15M خیلی ضعیف است؛ امتیاز نهایی محدود شد")
-    elif adx_value < 18:
-        score -= 14
-        score = min(score, 86)
-        reasons.append("ADX تایم 15M ضعیف است؛ امتیاز نهایی محدود شد")
-    elif adx_value < 20:
-        score -= 8
-        score = min(score, 90)
-        reasons.append("ADX تایم 15M کمی ضعیف است؛ امتیاز نهایی کاهش یافت")
-    elif adx_value < 22:
-        score -= 4
-        reasons.append("ADX تایم 15M متوسط رو به ضعیف است")
-
-    # Buy/Sell Power خلاف جهت باید زودتر اثر بگذارد؛ مخصوصاً وقتی ADX هم ضعیف است.
-    if raw_direction == "SHORT" and power_gap > 0:
-        if power_gap >= 15:
+        if opposite_power:
+            score -= 24
+            score = min(score, 76)
+            reasons.append("ADX بسیار ضعیف و قدرت بازار خلاف جهت است؛ سیگنال به سطح Setup/Reject محدود شد")
+        elif neutral_power:
+            score -= 20
+            score = min(score, 80)
+            reasons.append("ADX بسیار ضعیف و قدرت بازار تایید قوی ندارد؛ امتیاز محدود شد")
+        else:
             score -= 14
-            score = min(score, 76 if adx_value < 16 else 82 if adx_value < 18 else 86)
-            reasons.append("قدرت خرید به‌وضوح خلاف شورت است؛ سقف امتیاز محدود شد")
-        elif power_gap >= 10:
+            score = min(score, 84)
+            reasons.append("ADX بسیار ضعیف است؛ با وجود قدرت هم‌جهت، سقف امتیاز محدود شد")
+
+    elif adx_value < 15:
+        if opposite_power:
+            score -= 22
+            score = min(score, 78)
+            reasons.append("ADX خیلی ضعیف و قدرت بازار خلاف جهت است؛ سیگنال به سطح Setup محدود شد")
+        elif neutral_power:
+            score -= 16
+            score = min(score, 82)
+            reasons.append("ADX خیلی ضعیف و قدرت بازار خنثی است؛ امتیاز محدود شد")
+        else:
             score -= 10
-            score = min(score, 78 if adx_value < 16 else 82 if adx_value < 18 else 86)
-            reasons.append("قدرت خرید خلاف شورت است؛ امتیاز نهایی محدود شد")
+            score = min(score, 88)
+            reasons.append("ADX خیلی ضعیف است؛ با وجود قدرت هم‌جهت، سیگنال A+ نمی‌شود")
+
+    elif adx_value < 16:
+        if opposite_power:
+            score -= 18
+            score = min(score, 80)
+            reasons.append("ADX ضعیف و قدرت بازار خلاف جهت است؛ امتیاز به Setup محدود شد")
+        elif neutral_power:
+            score -= 12
+            score = min(score, 84)
+            reasons.append("ADX ضعیف و قدرت بازار خنثی است؛ امتیاز محدود شد")
+        else:
+            score -= 8
+            score = min(score, 90)
+            reasons.append("ADX ضعیف است؛ سقف امتیاز کنترل شد")
+
+    elif adx_value < 18:
+        if opposite_power:
+            score -= 14
+            score = min(score, 84)
+            reasons.append("ADX زیر 18 و قدرت بازار خلاف جهت است؛ امتیاز محدود شد")
+        elif neutral_power:
+            score -= 8
+            score = min(score, 88)
+            reasons.append("ADX زیر 18 و قدرت بازار خنثی است؛ امتیاز تعدیل شد")
+        else:
+            score -= 5
+            score = min(score, 92)
+            reasons.append("ADX زیر 18 است؛ امتیاز کمی محدود شد")
+
+    elif adx_value < 20:
+        if opposite_power:
+            score -= 10
+            score = min(score, 86)
+            reasons.append("ADX کمی ضعیف و قدرت بازار خلاف جهت است")
+        else:
+            score -= 4
+            score = min(score, 94)
+            reasons.append("ADX کمی ضعیف است")
+
+    elif adx_value < 22:
+        if opposite_power:
+            score -= 6
+            score = min(score, 90)
+            reasons.append("قدرت بازار کمی خلاف جهت است و ADX هنوز قوی نیست")
+        else:
+            score -= 2
+            reasons.append("ADX متوسط است")
+
+    # 2) Buy/Sell Power مستقل از ADX هم روی امتیاز اثر بگذارد.
+    if raw_direction == "SHORT":
+        if power_gap >= 15:
+            score -= 12
+            score = min(score, 78 if adx_value < 18 else 84)
+            reasons.append("قدرت خرید به‌وضوح خلاف شورت است")
+        elif power_gap >= 10:
+            score -= 9
+            score = min(score, 80 if adx_value < 18 else 86)
+            reasons.append("قدرت خرید خلاف شورت است")
         elif power_gap >= 5:
             score -= 6
             score = min(score, 82 if adx_value < 16 else 86 if adx_value < 18 else 90)
-            reasons.append("قدرت خرید کمی خلاف شورت است؛ امتیاز نهایی تعدیل شد")
-        else:
+            reasons.append("قدرت خرید کمی خلاف شورت است")
+        elif power_gap > 0:
             score -= 3
-            reasons.append("قدرت خرید اندکی خلاف شورت است")
+            reasons.append("قدرت خرید اندکی از فروش بیشتر است")
 
-    if raw_direction == "LONG" and power_gap < 0:
-        sell_gap = abs(power_gap)
+        if rsi_value > 55:
+            score -= 5
+            reasons.append("RSI برای شورت کمی بالاست")
+        elif rsi_value > 50 and adx_value < 18:
+            score -= 4
+            score = min(score, 82 if adx_value < 15 else 86)
+            reasons.append("RSI خنثی/روبه‌بالا با ADX ضعیف، تایید شورت را کم می‌کند")
+
+    elif raw_direction == "LONG":
+        sell_gap = -power_gap
         if sell_gap >= 15:
-            score -= 14
-            score = min(score, 76 if adx_value < 16 else 82 if adx_value < 18 else 86)
-            reasons.append("قدرت فروش به‌وضوح خلاف لانگ است؛ سقف امتیاز محدود شد")
+            score -= 12
+            score = min(score, 78 if adx_value < 18 else 84)
+            reasons.append("قدرت فروش به‌وضوح خلاف لانگ است")
         elif sell_gap >= 10:
-            score -= 10
-            score = min(score, 78 if adx_value < 16 else 82 if adx_value < 18 else 86)
-            reasons.append("قدرت فروش خلاف لانگ است؛ امتیاز نهایی محدود شد")
+            score -= 9
+            score = min(score, 80 if adx_value < 18 else 86)
+            reasons.append("قدرت فروش خلاف لانگ است")
         elif sell_gap >= 5:
             score -= 6
             score = min(score, 82 if adx_value < 16 else 86 if adx_value < 18 else 90)
-            reasons.append("قدرت فروش کمی خلاف لانگ است؛ امتیاز نهایی تعدیل شد")
-        else:
+            reasons.append("قدرت فروش کمی خلاف لانگ است")
+        elif sell_gap > 0:
             score -= 3
-            reasons.append("قدرت فروش اندکی خلاف لانگ است")
+            reasons.append("قدرت فروش اندکی از خرید بیشتر است")
 
-    # ترکیب خطرناک: ADX خیلی ضعیف + قدرت بازار خلاف جهت.
-    # این حالت در آمار SLها زیاد دیده شد؛ بهتر است به Setup تبدیل شود نه سیگنال ورود.
-    if adx_value < 16:
-        if raw_direction == "SHORT" and power_gap >= 5:
-            score = min(score, 78)
-            reasons.append("ترکیب ADX خیلی ضعیف و قدرت خرید خلاف شورت؛ سیگنال به سطح Setup محدود شد")
-        if raw_direction == "LONG" and power_gap <= -5:
-            score = min(score, 78)
-            reasons.append("ترکیب ADX خیلی ضعیف و قدرت فروش خلاف لانگ؛ سیگنال به سطح Setup محدود شد")
+        if rsi_value < 45:
+            score -= 5
+            reasons.append("RSI برای لانگ کمی پایین است")
+        elif rsi_value < 50 and adx_value < 18:
+            score -= 4
+            score = min(score, 82 if adx_value < 15 else 86)
+            reasons.append("RSI خنثی/روبه‌پایین با ADX ضعیف، تایید لانگ را کم می‌کند")
+
+    # 3) ترکیب خطرناک نهایی: ADX خیلی ضعیف + مومنتوم خلاف جهت.
+    if adx_value < 15 and opposite_power:
+        score = min(score, 76)
+        reasons.append("ترکیب ADX زیر 15 و قدرت خلاف جهت؛ ورود مستقیم مناسب نیست")
 
     return cap_score(score)
 
@@ -1498,6 +1586,7 @@ def analyze_symbol(symbol):
         adx_value,
         buy_power,
         sell_power,
+        last.get("rsi", 50),
         reasons
     )
 
