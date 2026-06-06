@@ -726,8 +726,9 @@ def late_entry_status(direction, df_15m, df_5m):
 
 def tp_space_validation(direction, price, atr, support, resistance):
     """
-    بررسی هوشمند فضای TP بر اساس نزدیک‌ترین حمایت/مقاومت موثر.
-    این تابع سیگنال را مستقیم رد نمی‌کند؛ فقط وضعیت کمبود فضا را برای جریمه امتیازی گزارش می‌دهد.
+    بررسی نمایشی/اطلاعاتی فضای TP بر اساس نزدیک‌ترین حمایت/مقاومت.
+    این تابع دیگر هیچ اثری روی امتیاز، Reject، گرید یا تولید سیگنال ندارد.
+    فقط برای گزارش و کمک به چیدن TPهای هوشمند استفاده می‌شود.
     خروجی همیشه 3 مقدار است تا روی VPS خطای unpack ایجاد نشود:
     (tp_ok, reason, space_atr)
     """
@@ -735,44 +736,30 @@ def tp_space_validation(direction, price, atr, support, resistance):
         price = float(price)
         atr = float(atr)
         if atr <= 0:
-            return True, "TP Space نامشخص است", None
-
-        min_space = float(TECHNICAL_QUALITY_MIN_TP_SPACE_ATR)
-        severe_space = max(0.45, min_space * 0.55)
+            return True, "TP Space فقط نمایشی است؛ ATR نامشخص است", None
 
         if direction == "LONG":
             if resistance is None:
-                return True, "مقاومت معتبری برای محدود کردن TP لانگ پیدا نشد", None
-
+                return True, "TP Space فقط نمایشی است؛ مقاومت معتبری بالای قیمت پیدا نشد", None
             resistance = float(resistance)
             if resistance <= price:
-                return True, "مقاومت فعلی بالای قیمت نیست؛ فضای TP لانگ با ATR سنجیده می‌شود", None
-
+                return True, "TP Space فقط نمایشی است؛ مقاومت فعلی بالای قیمت نیست", None
             space_atr = (resistance - price) / atr
-            if space_atr < severe_space:
-                return False, "فضای TP تا مقاومت بسیار کم است؛ فقط جریمه سنگین اعمال می‌شود", round(space_atr, 2)
-            if space_atr < min_space:
-                return False, "فضای کافی تا مقاومت/TP1 برای لانگ کم است؛ جریمه سنگین اعمال می‌شود", round(space_atr, 2)
-            return True, "فضای TP برای لانگ قابل قبول است", round(space_atr, 2)
+            return True, "TP Space فقط برای چیدن هوشمند TP استفاده می‌شود و سیگنال را رد یا جریمه نمی‌کند", round(space_atr, 2)
 
         if direction == "SHORT":
             if support is None:
-                return True, "حمایت معتبری برای محدود کردن TP شورت پیدا نشد", None
-
+                return True, "TP Space فقط نمایشی است؛ حمایت معتبری پایین قیمت پیدا نشد", None
             support = float(support)
             if support >= price:
-                return True, "حمایت فعلی پایین قیمت نیست؛ فضای TP شورت با ATR سنجیده می‌شود", None
-
+                return True, "TP Space فقط نمایشی است؛ حمایت فعلی پایین قیمت نیست", None
             space_atr = (price - support) / atr
-            if space_atr < severe_space:
-                return False, "فضای TP تا حمایت بسیار کم است؛ فقط جریمه سنگین اعمال می‌شود", round(space_atr, 2)
-            if space_atr < min_space:
-                return False, "فضای کافی تا حمایت/TP1 برای شورت کم است؛ جریمه سنگین اعمال می‌شود", round(space_atr, 2)
-            return True, "فضای TP برای شورت قابل قبول است", round(space_atr, 2)
+            return True, "TP Space فقط برای چیدن هوشمند TP استفاده می‌شود و سیگنال را رد یا جریمه نمی‌کند", round(space_atr, 2)
 
-        return True, "بدون جهت معتبر برای بررسی TP Space", None
+        return True, "TP Space فقط نمایشی است؛ بدون جهت معتبر", None
     except Exception:
-        return True, "TP Space نامشخص است", None
+        return True, "TP Space فقط نمایشی است؛ بررسی نامشخص", None
+
 
 def noise_filter_status(df_15m, df_5m):
     try:
@@ -841,11 +828,8 @@ def technical_quality_context(raw_direction, price, atr, support, resistance, df
             long_adj -= 5; reasons_long.append(late_entry_reason)
         elif raw_direction == "SHORT":
             short_adj -= 5; reasons_short.append(late_entry_reason)
-    if not tp_ok:
-        if raw_direction == "LONG":
-            long_adj -= 8; reasons_long.append(tp_space_reason)
-        elif raw_direction == "SHORT":
-            short_adj -= 8; reasons_short.append(tp_space_reason)
+    # TP Space طبق تنظیم جدید فقط برای گزارش و چیدن TP استفاده می‌شود؛
+    # هیچ جریمه، Reject یا اثر مستقیم روی امتیاز سیگنال ندارد.
     if mtf["status"] == "bullish":
         long_adj += 3; short_adj -= 2; reasons_long.append("ساختار چندتایم‌فریم صعودی است")
     elif mtf["status"] == "bearish":
@@ -1319,12 +1303,13 @@ def normalize_score_by_quality(score, rr, raw_direction, pattern, multi_candle, 
 
     return cap_score(score)
 
-def calculate_trade_levels(raw_direction, price, atr, support=None, resistance=None):
+def calculate_trade_levels(raw_direction, price, atr, support=None, resistance=None, support_30m=None, resistance_30m=None):
     """
     TP/SL هوشمند بر اساس ATR و حمایت/مقاومت 15M/30M.
-    - TP1 نزدیک سطح ساختاری قرار می‌گیرد، نه دقیقاً روی آن.
-    - TP2 با ATR و سطح بعدی/شکست احتمالی سطح تنظیم می‌شود.
-    - SL پشت حمایت/مقاومت با بافر ATR قرار می‌گیرد تا خیلی تنگ نباشد.
+    TP Space در این نسخه فیلتر یا جریمه نیست؛ فقط کمک می‌کند TPها روی خود سطح قرار نگیرند:
+    - برای LONG: TP نزدیک مقاومت، کمی پایین‌تر از مقاومت قرار می‌گیرد.
+    - برای SHORT: TP نزدیک حمایت، کمی بالاتر از حمایت قرار می‌گیرد.
+    - اگر سطح 30M هم موجود باشد، برای TP2/سطح بعدی در نظر گرفته می‌شود.
     """
     try:
         price = float(price)
@@ -1335,40 +1320,55 @@ def calculate_trade_levels(raw_direction, price, atr, support=None, resistance=N
     if atr <= 0:
         return None, None, None
 
-    buffer = atr * 0.22
-    min_tp_space = atr * 0.65
+    def _valid_level(value):
+        try:
+            value = float(value)
+            if value > 0:
+                return value
+        except Exception:
+            pass
+        return None
+
+    support = _valid_level(support)
+    resistance = _valid_level(resistance)
+    support_30m = _valid_level(support_30m)
+    resistance_30m = _valid_level(resistance_30m)
+
+    # بافر طوری انتخاب شده که TP دقیقاً روی حمایت/مقاومت نباشد.
+    buffer = max(atr * 0.18, price * 0.001)
 
     if raw_direction == "LONG":
         atr_sl = price - (atr * 1.45)
         stop_loss = atr_sl
 
-        if support is not None:
-            try:
-                support = float(support)
-                if support < price:
-                    structure_sl = support - buffer
-                    max_reasonable_sl = price - (atr * 2.20)
-                    stop_loss = max(structure_sl, max_reasonable_sl)
-            except Exception:
-                pass
+        supports_below = sorted([x for x in [support, support_30m] if x is not None and x < price], reverse=True)
+        resistances_above = sorted([x for x in [resistance, resistance_30m] if x is not None and x > price])
+
+        if supports_below:
+            structure_sl = supports_below[0] - buffer
+            max_reasonable_sl = price - (atr * 2.20)
+            stop_loss = max(structure_sl, max_reasonable_sl)
 
         risk = abs(price - stop_loss)
         tp1 = price + max(atr * 1.25, risk * 1.05)
         tp2 = price + max(atr * 2.10, risk * 1.65)
 
-        if resistance is not None:
-            try:
-                resistance = float(resistance)
-                if resistance > price:
-                    structure_tp1 = resistance - buffer
-                    if structure_tp1 > price + min_tp_space:
-                        tp1 = min(tp1, structure_tp1)
-                    else:
-                        # اگر مقاومت خیلی نزدیک است، TP1 را با ATR محافظه‌کارانه‌تر می‌گذاریم؛ رد قطعی نمی‌کنیم.
-                        tp1 = price + min_tp_space
-                    tp2 = max(tp2, resistance + (atr * 0.35))
-            except Exception:
-                pass
+        if resistances_above:
+            nearest_resistance = resistances_above[0]
+            structure_tp1 = nearest_resistance - buffer
+            if structure_tp1 > price:
+                tp1 = structure_tp1
+
+            if len(resistances_above) >= 2:
+                second_resistance = resistances_above[1]
+                structure_tp2 = second_resistance - buffer
+                if structure_tp2 > tp1:
+                    tp2 = structure_tp2
+                else:
+                    tp2 = max(tp2, nearest_resistance + atr * 0.35)
+            else:
+                # اگر فقط یک مقاومت داریم، TP2 بعد از شکست احتمالی سطح اول قرار می‌گیرد.
+                tp2 = max(tp2, nearest_resistance + atr * 0.35)
 
         return stop_loss, tp1, tp2
 
@@ -1376,37 +1376,39 @@ def calculate_trade_levels(raw_direction, price, atr, support=None, resistance=N
         atr_sl = price + (atr * 1.45)
         stop_loss = atr_sl
 
-        if resistance is not None:
-            try:
-                resistance = float(resistance)
-                if resistance > price:
-                    structure_sl = resistance + buffer
-                    max_reasonable_sl = price + (atr * 2.20)
-                    stop_loss = min(structure_sl, max_reasonable_sl)
-            except Exception:
-                pass
+        resistances_above = sorted([x for x in [resistance, resistance_30m] if x is not None and x > price])
+        supports_below = sorted([x for x in [support, support_30m] if x is not None and x < price], reverse=True)
+
+        if resistances_above:
+            structure_sl = resistances_above[0] + buffer
+            max_reasonable_sl = price + (atr * 2.20)
+            stop_loss = min(structure_sl, max_reasonable_sl)
 
         risk = abs(stop_loss - price)
         tp1 = price - max(atr * 1.25, risk * 1.05)
         tp2 = price - max(atr * 2.10, risk * 1.65)
 
-        if support is not None:
-            try:
-                support = float(support)
-                if support < price:
-                    structure_tp1 = support + buffer
-                    if structure_tp1 < price - min_tp_space:
-                        tp1 = max(tp1, structure_tp1)
-                    else:
-                        # اگر حمایت خیلی نزدیک است، TP1 را با ATR محافظه‌کارانه‌تر می‌گذاریم؛ رد قطعی نمی‌کنیم.
-                        tp1 = price - min_tp_space
-                    tp2 = min(tp2, support - (atr * 0.35))
-            except Exception:
-                pass
+        if supports_below:
+            nearest_support = supports_below[0]
+            structure_tp1 = nearest_support + buffer
+            if structure_tp1 < price:
+                tp1 = structure_tp1
+
+            if len(supports_below) >= 2:
+                second_support = supports_below[1]
+                structure_tp2 = second_support + buffer
+                if structure_tp2 < tp1:
+                    tp2 = structure_tp2
+                else:
+                    tp2 = min(tp2, nearest_support - atr * 0.35)
+            else:
+                # اگر فقط یک حمایت داریم، TP2 بعد از شکست احتمالی سطح اول قرار می‌گیرد.
+                tp2 = min(tp2, nearest_support - atr * 0.35)
 
         return stop_loss, tp1, tp2
 
     return None, None, None
+
 
 def risk_reward(raw_direction, price, stop_loss, tp1):
     if raw_direction == "NO TRADE" or stop_loss is None or tp1 is None:
@@ -1482,7 +1484,6 @@ def news_filter_status():
 
 def news_filter_active():
     return False
-
 
 
 
@@ -1942,30 +1943,8 @@ def analyze_symbol(symbol):
     atr = float(last_15["atr"])
     adx_value = float(last_15["adx"])
 
-    support_15m, resistance_15m = support_resistance(df_15m)
+    support, resistance = support_resistance(df_15m)
     support_30m, resistance_30m = support_resistance(df_30m)
-
-    # ترکیب نرم سطوح 15M و 30M برای معاملات 30 تا 60 دقیقه‌ای.
-    # نزدیک‌ترین حمایت پایین قیمت و نزدیک‌ترین مقاومت بالای قیمت مبنای TP/SL و TP Space می‌شود.
-    support_candidates = []
-    resistance_candidates = []
-    for level in [support_15m, support_30m]:
-        try:
-            level = float(level)
-            if level < price:
-                support_candidates.append(level)
-        except Exception:
-            pass
-    for level in [resistance_15m, resistance_30m]:
-        try:
-            level = float(level)
-            if level > price:
-                resistance_candidates.append(level)
-        except Exception:
-            pass
-
-    support = max(support_candidates) if support_candidates else support_15m
-    resistance = min(resistance_candidates) if resistance_candidates else resistance_15m
 
     setup_status, entry_zone_low, entry_zone_high, entry_trigger = calculate_setup_zone(
         "NO TRADE",
@@ -2013,7 +1992,9 @@ def analyze_symbol(symbol):
         price,
         atr,
         support,
-        resistance
+        resistance,
+        support_30m,
+        resistance_30m
     )
 
     rr = risk_reward(raw_direction, price, stop_loss_raw, tp1_raw)
