@@ -202,185 +202,50 @@ def build_trade_levels(result):
 
 
 def build_analysis_text(result):
-    reasons_text = "\n".join([f"\u2705 {r}" for r in result.get("reasons", [])])
+    reasons = result.get("reasons", [])[:10]
+    reasons_text = chr(10).join([f"✅ {r}" for r in reasons])
     trade_levels = build_trade_levels(result)
 
+    direction = result.get("direction")
+    raw_direction = result.get("raw_direction")
+
     return f"""
-\U0001f4ca \u062a\u062d\u0644\u06cc\u0644 \u0641\u06cc\u0648\u0686\u0631\u0632 {result['symbol']}
+📊 تحلیل فیوچرز {result['symbol']}
 
-\u0642\u06cc\u0645\u062a \u0641\u0639\u0644\u06cc:
-{result['price']}
+قیمت فعلی: {result['price']}
+جهت نهایی: {fa_direction(direction)}
+جهت تحلیل: {fa_direction(raw_direction)}
 
-\u062c\u0647\u062a \u0646\u0647\u0627\u06cc\u06cc:
-{fa_direction(result['direction'])}
+امتیاز: {result['score']}/100
+احتمال موفقیت: {safe(result.get('win_probability'))}٪
+گرید: {safe(result.get('entry_grade'))}
+ریسک: {safe(result.get('risk_level'))}
+ریسک به ریوارد: {safe(result.get('risk_reward'))}
 
-\u062c\u0647\u062a \u062e\u0627\u0645 \u062a\u062d\u0644\u06cc\u0644:
-{fa_direction(result.get('raw_direction'))}
+لانگ: {result['long_score']} | شورت: {result['short_score']}
 
-\u0627\u0645\u062a\u06cc\u0627\u0632 \u0633\u06cc\u06af\u0646\u0627\u0644:
-{result['score']}/100
+قدرت خرید: {result['buy_power']}٪
+قدرت فروش: {result['sell_power']}٪
 
-\u0627\u062d\u062a\u0645\u0627\u0644 \u0645\u0648\u0641\u0642\u06cc\u062a \u062a\u0642\u0631\u06cc\u0628\u06cc:
-{safe(result.get('win_probability'))}\u066a
+RSI: {result['rsi']}
+MACD: {result['macd']}
+ADX: {safe(result.get('adx'))}
+VWAP: {fa_general(result.get('vwap_status'))}
 
-\u06af\u0631\u06cc\u062f \u0648\u0631\u0648\u062f:
-{safe(result.get('entry_grade'))}
+حمایت: {result['support']}
+مقاومت: {result['resistance']}
 
-\u0633\u0637\u062d \u0631\u06cc\u0633\u06a9:
-{safe(result.get('risk_level'))}
-
-\u0631\u06cc\u0633\u06a9 \u0628\u0647 \u0631\u06cc\u0648\u0627\u0631\u062f:
-{safe(result.get('risk_reward'))}
-
-\u0631\u06cc\u0633\u06a9 \u0644\u06cc\u06a9\u0648\u06cc\u06cc\u062f\u06cc\u062a\u06cc:
-{safe(result.get('liquidity_risk'))}
-
-\u23f0 \u0627\u0639\u062a\u0628\u0627\u0631 \u0633\u06cc\u06af\u0646\u0627\u0644:
-{result['validity']}
-
-\u23f1 \u062a\u0627\u06cc\u0645\u200c\u0641\u0631\u06cc\u0645 \u0645\u0646\u0627\u0633\u0628:
-{result['signal_timeframe']}
-
-\u0627\u0645\u062a\u06cc\u0627\u0632 \u0644\u0627\u0646\u06af:
-{result['long_score']}
-
-\u0627\u0645\u062a\u06cc\u0627\u0632 \u0634\u0648\u0631\u062a:
-{result['short_score']}
-
-\u0642\u062f\u0631\u062a \u062e\u0631\u06cc\u062f:
-{result['buy_power']}\u066a
-
-\u0642\u062f\u0631\u062a \u0641\u0631\u0648\u0634:
-{result['sell_power']}\u066a
-
-\u0634\u0627\u062e\u0635 RSI:
-{result['rsi']}
-
-\u0642\u062f\u0631\u062a \u0631\u0648\u0646\u062f ADX:
-{safe(result.get('adx'))}
-
-MACD:
-{result['macd']}
-
-\u0647\u06cc\u0633\u062a\u0648\u06af\u0631\u0627\u0645 MACD:
-{safe(result.get('macd_hist'))}
-
-\u0645\u06cc\u0627\u0646\u06af\u06cc\u0646 \u062d\u062c\u0645\u06cc \u0642\u06cc\u0645\u062a:
-{safe(result.get('vwap'))}
-
-\u0648\u0636\u0639\u06cc\u062a \u0645\u06cc\u0627\u0646\u06af\u06cc\u0646 \u062d\u062c\u0645\u06cc \u0642\u06cc\u0645\u062a:
-{fa_general(result.get('vwap_status'))}
-
-POC \u062d\u062c\u0645\u06cc:
-{safe(result.get('poc_price'))}
-
-\u0648\u0636\u0639\u06cc\u062a \u062d\u062c\u0645:
-{fa_general(result.get('volume_profile_status'))}
-
-\u0646\u0631\u062e \u0641\u0627\u0646\u062f\u06cc\u0646\u06af:
-{safe(result.get('funding_rate'))}\u066a
-
-\u062d\u062c\u0645 \u0642\u0631\u0627\u0631\u062f\u0627\u062f\u0647\u0627\u06cc \u0628\u0627\u0632:
-{safe(result.get('open_interest'))}
-
-\u0627\u0633\u067e\u0631\u062f:
-{safe(result.get('spread_percent'))}\u066a
-
-\u0641\u06cc\u0644\u062a\u0631 \u0628\u06cc\u062a\u06a9\u0648\u06cc\u0646:
-{fa_general(result.get('btc_filter'))}
-
-\u06a9\u0646\u062f\u0644 \u062a\u0627\u06cc\u06cc\u062f\u06cc:
-{fa_general(result.get('candle_pattern'))}
-
-\u062a\u0627\u06cc\u06cc\u062f \u0686\u0646\u062f \u06a9\u0646\u062f\u0644\u06cc:
-{fa_general(result.get('multi_candle'))}
-
-\u062c\u0645\u0639\u200c\u0622\u0648\u0631\u06cc \u0646\u0642\u062f\u06cc\u0646\u06af\u06cc:
-{fa_general(result.get('liquidity_grab'))}
-
-\u0627\u0633\u062a\u0627\u067e\u200c\u0647\u0627\u0646\u062a:
-{fa_general(result.get('stop_hunt'))}
-
-\u0646\u0627\u062d\u06cc\u0647 \u062e\u0627\u0644\u06cc \u0646\u0642\u062f\u06cc\u0646\u06af\u06cc:
-{fa_general(result.get('fvg'))}
-
-\u0627\u0648\u0631\u062f\u0631 \u0628\u0644\u0627\u06a9:
-{fa_general(result.get('order_block'))}
-
-\u0648\u0627\u06af\u0631\u0627\u06cc\u06cc RSI:
-{fa_general(result.get('rsi_divergence'))}
-
-\u0648\u0627\u06af\u0631\u0627\u06cc\u06cc MACD:
-{fa_general(result.get('macd_divergence'))}
-
-\u0641\u06cc\u06a9 \u0628\u0631\u06cc\u06a9\u200c\u0627\u0648\u062a:
-{fa_general(result.get('fake_breakout'))}
-
-\u062e\u0633\u062a\u06af\u06cc \u0631\u0648\u0646\u062f:
-{fa_general(result.get('trend_exhaustion'))}
-
-\u062d\u0645\u0627\u06cc\u062a:
-{result['support']}
-
-\u0645\u0642\u0627\u0648\u0645\u062a:
-{result['resistance']}
-
-\u062e\u0637 \u0631\u0648\u0646\u062f:
-{fa_general(result['trendline'])}
-
-\u0633\u0627\u062e\u062a\u0627\u0631 \u0628\u0627\u0632\u0627\u0631:
-{fa_general(result['market_structure'])}
-
-\u0648\u0636\u0639\u06cc\u062a \u0628\u0631\u06cc\u06a9\u200c\u0627\u0648\u062a:
-{fa_general(result['breakout'])}
-
-\u0634\u0627\u062e\u0635 \u062a\u0631\u0633 \u0648 \u0637\u0645\u0639:
-{safe(result.get('fear_value'))} - {safe(result.get('fear_text'))}
-
-\u062f\u0627\u0645\u06cc\u0646\u0646\u0633 \u0628\u06cc\u062a\u06a9\u0648\u06cc\u0646:
-{safe(result.get('btc_dominance'))}\u066a
-
-\u0648\u0636\u0639\u06cc\u062a \u062f\u0627\u0645\u06cc\u0646\u0646\u0633:
-{safe(result.get('dominance_status'))}
-
-\u0648\u0636\u0639\u06cc\u062a \u0622\u0644\u062a\u200c\u0633\u06cc\u0632\u0646:
-{safe(result.get('altseason_status'))}
-
-\U0001f4cc \u0648\u0631\u0648\u062f \u0628\u0631 \u0627\u0633\u0627\u0633 \u062d\u0645\u0627\u06cc\u062a/\u0645\u0642\u0627\u0648\u0645\u062a:
-{safe(result.get('sr_entry_label'))}
-\u0648\u0636\u0639\u06cc\u062a \u062a\u0627\u06cc\u06cc\u062f: {"\u062a\u0627\u06cc\u06cc\u062f \u0634\u062f\u0647 \u2705" if result.get("sr_entry_confirmed") else "\u0646\u06cc\u0627\u0632\u0645\u0646\u062f \u0627\u062d\u062a\u06cc\u0627\u0637"}
-
-\u23f3 Late Entry:
-{safe(result.get('late_entry_reason'))}
-
-\U0001f4ca Bollinger Bands:
-{safe(result.get('bollinger_label'))}
-\u0628\u0627\u0646\u062f \u0628\u0627\u0644\u0627: {safe(result.get('bb_high'))}
-\u0645\u06cc\u0627\u0646\u06af\u06cc\u0646: {safe(result.get('bb_mid'))}
-\u0628\u0627\u0646\u062f \u067e\u0627\u06cc\u06cc\u0646: {safe(result.get('bb_low'))}
-\u0639\u0631\u0636 \u0628\u0627\u0646\u062f: {safe(result.get('bb_width'))}%
-
-\U0001f3af \u0641\u0636\u0627\u06cc TP:
-{safe(result.get('tp_space_reason'))}
-
-\U0001f3af \u0633\u0637\u0648\u062d \u0645\u0639\u0627\u0645\u0644\u0647:
+🎯 سطوح معامله:
 {trade_levels}
 
-\U0001f9ed \u0646\u0627\u062d\u06cc\u0647 \u0648\u0631\u0648\u062f \u067e\u06cc\u0634\u0646\u0647\u0627\u062f\u06cc:
-{safe(result.get('entry_zone_low'))} \u062a\u0627 {safe(result.get('entry_zone_high'))}
+⏱ تایم‌فریم: {result['signal_timeframe']}
+⏰ اعتبار: {result['validity']}
 
-\u062a\u0631\u06cc\u06af\u0631 \u0648\u0631\u0648\u062f:
-{safe(result.get('entry_trigger'))}
-
-\u062d\u0627\u0644\u062a \u062e\u06cc\u0644\u06cc \u0627\u0645\u0646:
-{"\u2705 \u0628\u0644\u0647" if result.get("very_safe") else "\u274c \u0646\u0647"}
-
-\u062f\u0644\u0627\u06cc\u0644 \u062a\u062d\u0644\u06cc\u0644:
+دلایل اصلی:
 {reasons_text}
 
-\u26a0\ufe0f \u0627\u06cc\u0646 \u062a\u062d\u0644\u06cc\u0644 \u062a\u0636\u0645\u06cc\u0646 \u0633\u0648\u062f \u0646\u06cc\u0633\u062a. \u062d\u062a\u0645\u0627\u064b \u0628\u0627 \u062d\u062f \u0636\u0631\u0631\u060c \u062d\u062c\u0645 \u06a9\u0645 \u0648 \u0645\u062f\u06cc\u0631\u06cc\u062a \u0631\u06cc\u0633\u06a9 \u0648\u0627\u0631\u062f \u0634\u0648.
+⚠️ این تحلیل تضمین سود نیست؛ با حد ضرر، حجم کم و مدیریت ریسک وارد شو.
 """
-
 
 def send_analysis(message, symbol):
     bot.reply_to(message, f"\u23f3 \u062f\u0631 \u062d\u0627\u0644 \u062a\u062d\u0644\u06cc\u0644 {symbol} ...")
@@ -443,78 +308,30 @@ ADX: {safe(r.get('adx'))}
 
 
 def send_auto_signal_to_all_users(result):
-    direction_fa = "\u0644\u0627\u0646\u06af" if result["direction"] == "LONG" else "\u0634\u0648\u0631\u062a"
+    direction_fa = "لانگ" if result["direction"] == "LONG" else "شورت"
 
     text = f"""
-\U0001f6a8 \u0633\u06cc\u06af\u0646\u0627\u0644 \u062e\u0648\u062f\u06a9\u0627\u0631 \u0642\u0648\u06cc
+🚨 سیگنال خودکار
 
-\u0627\u0631\u0632:
-{result['symbol']}
+ارز: {result['symbol']}
+جهت: {direction_fa}
+امتیاز: {result['score']}/100
+احتمال موفقیت: {safe(result.get('win_probability'))}٪
+گرید: {safe(result.get('entry_grade'))}
+ریسک: {safe(result.get('risk_level'))}
+ریسک به ریوارد: {safe(result.get('risk_reward'))}
 
-\u062c\u0647\u062a:
-{direction_fa}
+قیمت: {result['price']}
+حد ضرر: {result['stop_loss']}
+حد سود 1: {result['tp1']}
+حد سود 2: {result['tp2']}
 
-\u0627\u0645\u062a\u06cc\u0627\u0632:
-{result['score']}/100
+قدرت خرید: {result['buy_power']}٪
+قدرت فروش: {result['sell_power']}٪
+RSI: {result['rsi']}
+ADX: {safe(result.get('adx'))}
 
-\u0627\u062d\u062a\u0645\u0627\u0644 \u0645\u0648\u0641\u0642\u06cc\u062a:
-{safe(result.get('win_probability'))}\u066a
-
-\u06af\u0631\u06cc\u062f:
-{safe(result.get('entry_grade'))}
-
-\u0631\u06cc\u0633\u06a9:
-{safe(result.get('risk_level'))}
-
-\u0631\u06cc\u0633\u06a9 \u0628\u0647 \u0631\u06cc\u0648\u0627\u0631\u062f:
-{safe(result.get('risk_reward'))}
-
-\u0627\u0639\u062a\u0628\u0627\u0631 \u0633\u06cc\u06af\u0646\u0627\u0644:
-{result['validity']}
-
-\u062a\u0627\u06cc\u0645\u200c\u0641\u0631\u06cc\u0645 \u0645\u0646\u0627\u0633\u0628:
-{result['signal_timeframe']}
-
-\u0642\u06cc\u0645\u062a:
-{result['price']}
-
-\u062d\u062f \u0636\u0631\u0631:
-{result['stop_loss']}
-
-\u062d\u062f \u0633\u0648\u062f 1:
-{result['tp1']}
-
-\u062d\u062f \u0633\u0648\u062f 2:
-{result['tp2']}
-
-\u0642\u062f\u0631\u062a \u062e\u0631\u06cc\u062f:
-{result['buy_power']}\u066a
-
-\u0642\u062f\u0631\u062a \u0641\u0631\u0648\u0634:
-{result['sell_power']}\u066a
-
-ADX:
-{safe(result.get('adx'))}
-
-\u0646\u0631\u062e \u0641\u0627\u0646\u062f\u06cc\u0646\u06af:
-{safe(result.get('funding_rate'))}\u066a
-
-\u0645\u06cc\u0627\u0646\u06af\u06cc\u0646 \u062d\u062c\u0645\u06cc \u0642\u06cc\u0645\u062a:
-{fa_general(result.get('vwap_status'))}
-
-\u0646\u0627\u062d\u06cc\u0647 \u062e\u0627\u0644\u06cc \u0646\u0642\u062f\u06cc\u0646\u06af\u06cc:
-{fa_general(result.get('fvg'))}
-
-\u0627\u0648\u0631\u062f\u0631 \u0628\u0644\u0627\u06a9:
-{fa_general(result.get('order_block'))}
-
-\u0646\u0627\u062d\u06cc\u0647 \u0648\u0631\u0648\u062f:
-{safe(result.get('entry_zone_low'))} \u062a\u0627 {safe(result.get('entry_zone_high'))}
-
-\u062d\u0627\u0644\u062a \u062e\u06cc\u0644\u06cc \u0627\u0645\u0646:
-{"\u0628\u0644\u0647 \u2705" if result.get("very_safe") else "\u062e\u06cc\u0631"}
-
-\u26a0\ufe0f \u0645\u062f\u06cc\u0631\u06cc\u062a \u0631\u06cc\u0633\u06a9 \u0641\u0631\u0627\u0645\u0648\u0634 \u0646\u0634\u0648\u062f.
+⚠️ مدیریت ریسک فراموش نشود.
 """
 
     for user_id in list_users():
@@ -523,7 +340,6 @@ ADX:
             remember_signal_result(sent, result)
         except Exception as e:
             print("SEND AUTO SIGNAL ERROR:", user_id, str(e))
-
 
 def auto_signal_loop():
     time.sleep(60)
