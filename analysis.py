@@ -442,12 +442,19 @@ def support_resistance_swing(df):
 
 def technical_quality_context(raw_direction, price, atr, support, resistance, df_15m, df_5m, df_30m, df_1h):
     """
-    در نسخه ساده، فیلترهای سنگین کیفی حذف شده‌اند.
+    لایه حرفه‌ای اما نرم برای فیوچرز.
+    بیشتر موارد فقط امتیاز را کم می‌کنند و برای آمار/دلایل SL ذخیره می‌شوند؛
+    ربات را خشک نمی‌کند، اما ورودهای خیلی دیر یا TP بدون فضا را مشخص می‌کند.
     """
+    long_adj = 0
+    short_adj = 0
+    reasons_long = []
+    reasons_short = []
+
     context = {
         "technical_quality_long_adj": 0,
         "technical_quality_short_adj": 0,
-        "sr_entry_status": "disabled",
+        "sr_entry_status": "soft",
         "sr_entry_label": None,
         "sr_entry_confirmed": False,
         "tp_space_ok": True,
@@ -455,8 +462,97 @@ def technical_quality_context(raw_direction, price, atr, support, resistance, df
         "tp_space_atr": None,
         "late_entry": False,
         "late_entry_reason": None,
+        "trap_risk": False,
+        "trap_reason": None,
+        "distance_from_vwap_atr": None,
+        "distance_from_ema20_atr": None,
+        "candle_forecast": "neutral",
+        "candle_forecast_reason": None,
     }
-    return 0, 0, [], [], context
+
+    try:
+        last_15 = df_15m.iloc[-1]
+        last_5 = df_5m.iloc[-1]
+        prev_5 = df_5m.iloc[-2]
+        atr_value = float(atr) if atr and atr > 0 else float(last_15.get("atr", 0))
+        if atr_value <= 0:
+            return 0, 0, [], [], context
+
+        vwap_distance = abs(float(price) - float(last_5["vwap"])) / atr_value
+        ema_distance = abs(float(price) - float(last_5["ema20"])) / atr_value
+        context["distance_from_vwap_atr"] = round(vwap_distance, 2)
+        context["distance_from_ema20_atr"] = round(ema_distance, 2)
+
+        candle_body = abs(float(last_5["close"]) - float(last_5["open"]))
+        candle_range = max(float(last_5["high"]) - float(last_5["low"]), 0)
+        large_candle = candle_range >= atr_value * 0.85 or candle_body >= atr_value * 0.55
+
+        # Anti Late Entry: فقط اگر فاصله خیلی زیاد یا کندل جهشی باشد، جریمه نرم می‌دهد.
+        if raw_direction == "LONG" and price > last_5["ema20"] and (vwap_distance > 1.35 or ema_distance > 1.20 or large_candle):
+            long_adj -= 7
+            context["late_entry"] = True
+            context["late_entry_reason"] = "فاصله قیمت از EMA/VWAP یا اندازه کندل برای لانگ زیاد بود"
+            reasons_long.append("ورود لانگ کمی دیر است؛ امتیاز کاهش یافت")
+        elif raw_direction == "SHORT" and price < last_5["ema20"] and (vwap_distance > 1.35 or ema_distance > 1.20 or large_candle):
+            short_adj -= 7
+            context["late_entry"] = True
+            context["late_entry_reason"] = "فاصله قیمت از EMA/VWAP یا اندازه کندل برای شورت زیاد بود"
+            reasons_short.append("ورود شورت کمی دیر است؛ امتیاز کاهش یافت")
+
+        # TP Space / Trap: TP نباید روی حمایت/مقاومت بیفتد. اینجا نرم است؛ فقط اگر خیلی نزدیک باشد امتیاز کم می‌کند.
+        if raw_direction == "LONG" and resistance is not None and resistance > price:
+            space_atr = (float(resistance) - float(price)) / atr_value
+            context["tp_space_atr"] = round(space_atr, 2)
+            if space_atr < 0.70:
+                long_adj -= 10
+                context["tp_space_ok"] = False
+                context["tp_space_reason"] = "مقاومت خیلی نزدیک است و فضای TP برای لانگ کم است"
+                context["trap_risk"] = True
+                context["trap_reason"] = "لانگ نزدیک مقاومت مهم ثبت شده بود"
+                reasons_long.append("مقاومت نزدیک است؛ TP Space برای لانگ ضعیف است")
+            elif space_atr < 1.00:
+                long_adj -= 5
+                context["tp_space_reason"] = "مقاومت نسبتاً نزدیک است"
+                reasons_long.append("مقاومت نسبتاً نزدیک است؛ امتیاز لانگ کمی کاهش یافت")
+
+        if raw_direction == "SHORT" and support is not None and support < price:
+            space_atr = (float(price) - float(support)) / atr_value
+            context["tp_space_atr"] = round(space_atr, 2)
+            if space_atr < 0.70:
+                short_adj -= 10
+                context["tp_space_ok"] = False
+                context["tp_space_reason"] = "حمایت خیلی نزدیک است و فضای TP برای شورت کم است"
+                context["trap_risk"] = True
+                context["trap_reason"] = "شورت نزدیک حمایت مهم ثبت شده بود"
+                reasons_short.append("حمایت نزدیک است؛ TP Space برای شورت ضعیف است")
+            elif space_atr < 1.00:
+                short_adj -= 5
+                context["tp_space_reason"] = "حمایت نسبتاً نزدیک است"
+                reasons_short.append("حمایت نسبتاً نزدیک است؛ امتیاز شورت کمی کاهش یافت")
+
+        # Candle Forecast ساده و سبک: فقط برای تصمیم داخلی و دلایل SL ذخیره می‌شود.
+        if last_5["close"] > last_5["ema20"] and last_5["macd_hist"] > prev_5["macd_hist"] and last_5["close"] > last_5["vwap"]:
+            context["candle_forecast"] = "bullish_continuation"
+            context["candle_forecast_reason"] = "کندل، EMA، VWAP و شیب MACD به نفع ادامه صعود بودند"
+            if raw_direction == "SHORT":
+                short_adj -= 6
+                reasons_short.append("پیش‌بینی کندلی کوتاه‌مدت خلاف شورت است")
+        elif last_5["close"] < last_5["ema20"] and last_5["macd_hist"] < prev_5["macd_hist"] and last_5["close"] < last_5["vwap"]:
+            context["candle_forecast"] = "bearish_continuation"
+            context["candle_forecast_reason"] = "کندل، EMA، VWAP و شیب MACD به نفع ادامه نزول بودند"
+            if raw_direction == "LONG":
+                long_adj -= 6
+                reasons_long.append("پیش‌بینی کندلی کوتاه‌مدت خلاف لانگ است")
+        else:
+            context["candle_forecast"] = "neutral_or_pullback"
+            context["candle_forecast_reason"] = "کندل بعدی قطعیت کافی ندارد یا احتمال پولبک وجود دارد"
+
+    except Exception:
+        return 0, 0, [], [], context
+
+    context["technical_quality_long_adj"] = long_adj
+    context["technical_quality_short_adj"] = short_adj
+    return long_adj, short_adj, reasons_long, reasons_short, context
 
 def btc_filter(symbol):
     if symbol == "BTCUSDT":
@@ -829,29 +925,51 @@ def normalize_score_by_quality(score, rr, raw_direction, pattern, multi_candle, 
     return cap_score(score)
 
 def calculate_trade_levels(raw_direction, price, atr, support=None, resistance=None):
-    buffer = atr * 0.15
+    """
+    TP/SL حرفه‌ای و نرم:
+    - TP1 قبل از حمایت/مقاومت قرار می‌گیرد، نه روی خود سطح.
+    - SL کمی پشت ناحیه ساختاری/ATR قرار می‌گیرد تا با نویز کوچک نخورد.
+    """
+    buffer = atr * 0.22
 
     if raw_direction == "LONG":
-        stop_loss = price - (atr * 1.2)
-        tp1 = price + (atr * 1.5)
-        tp2 = price + (atr * 2.5)
+        stop_loss = price - (atr * 1.30)
+        tp1 = price + (atr * 1.55)
+        tp2 = price + (atr * 2.55)
+
+        if support is not None and support < price:
+            structural_sl = float(support) - buffer
+            # اگر حمایت خیلی دور است، SL بیش از حد بزرگ نشود؛ اگر نزدیک است، پشت حمایت برود.
+            if abs(price - structural_sl) <= atr * 1.85:
+                stop_loss = min(stop_loss, structural_sl)
 
         if resistance is not None and resistance > price:
-            adjusted_tp1 = resistance - buffer
+            adjusted_tp1 = float(resistance) - buffer
             if adjusted_tp1 > price:
                 tp1 = min(tp1, adjusted_tp1)
+            adjusted_tp2 = float(resistance) + (atr * 0.35)
+            if adjusted_tp2 > price:
+                tp2 = min(tp2, adjusted_tp2)
 
         return stop_loss, tp1, tp2
 
     if raw_direction == "SHORT":
-        stop_loss = price + (atr * 1.2)
-        tp1 = price - (atr * 1.5)
-        tp2 = price - (atr * 2.5)
+        stop_loss = price + (atr * 1.30)
+        tp1 = price - (atr * 1.55)
+        tp2 = price - (atr * 2.55)
+
+        if resistance is not None and resistance > price:
+            structural_sl = float(resistance) + buffer
+            if abs(structural_sl - price) <= atr * 1.85:
+                stop_loss = max(stop_loss, structural_sl)
 
         if support is not None and support < price:
-            adjusted_tp1 = support + buffer
+            adjusted_tp1 = float(support) + buffer
             if adjusted_tp1 < price:
                 tp1 = max(tp1, adjusted_tp1)
+            adjusted_tp2 = float(support) - (atr * 0.35)
+            if adjusted_tp2 < price:
+                tp2 = max(tp2, adjusted_tp2)
 
         return stop_loss, tp1, tp2
 
@@ -914,10 +1032,11 @@ def entry_grade(score, risk_level, rr, final_direction):
     if final_direction == "NO TRADE":
         return "Reject"
 
-    if score >= 94 and rr >= 1.05:
+    # حرفه‌ای اما خشک نشود: گریدها کمی سخت‌تر از نسخه ساده‌اند، ولی سیگنال‌های خوب حذف نمی‌شوند.
+    if score >= 92 and rr >= 1.05 and risk_level != "بالا":
         return "A+"
 
-    if score >= 84 and rr >= 0.90:
+    if score >= 82 and rr >= 0.90:
         return "A"
 
     return "Reject"
@@ -1007,7 +1126,7 @@ def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, s
         reasons_block.append("اختلاف لانگ و شورت کافی نیست")
         return False, reasons_block, "بالا", "none", "none"
 
-    if score < 75:
+    if score < 73:
         reasons_block.append("امتیاز سیگنال برای ورود کافی نیست")
         return False, reasons_block, "متوسط", "none", "none"
 
@@ -1204,6 +1323,17 @@ def analyze_symbol(symbol):
     reasons_long += tq_rl
     reasons_short += tq_rs
 
+    # داده‌های حرفه‌ای پنهان برای ثبت در Tracker و تحلیل علت SL؛ در نمایش سیگنال نشان داده نمی‌شوند.
+    late_entry = technical_context.get("late_entry", False)
+    late_entry_reason = technical_context.get("late_entry_reason")
+    tp_space_ok = technical_context.get("tp_space_ok", True)
+    tp_space_reason = technical_context.get("tp_space_reason")
+    tp_space_atr = technical_context.get("tp_space_atr")
+    trap_risk = technical_context.get("trap_risk", False)
+    trap_reason = technical_context.get("trap_reason")
+    candle_forecast = technical_context.get("candle_forecast")
+    candle_forecast_reason = technical_context.get("candle_forecast_reason")
+
     if long_score >= short_score + 25:
         raw_direction = "LONG"
         score = long_score
@@ -1257,6 +1387,11 @@ def analyze_symbol(symbol):
         vwap_status,
         fvg
     )
+
+    # اگر TP Space ضعیف است حذف فوری نمی‌کنیم؛ فقط جلوی گرید خیلی بالا را می‌گیریم.
+    if raw_direction != "NO TRADE" and tp_space_ok is False:
+        score = min(score, 86)
+        reasons.append(tp_space_reason or "فضای TP نسبت به حمایت/مقاومت ضعیف است")
 
     entry_ok, block_reasons, liquidity_risk, fake_breakout, trend_exhaustion = entry_filter(
         raw_direction,
@@ -1414,6 +1549,18 @@ def analyze_symbol(symbol):
 
         "very_safe": very_safe_ok,
         "very_safe_reasons": very_safe_reasons[:8],
+
+        # Hidden professional diagnostics: bot.py does not display these in signal text,
+        # but signal_tracker stores them for SL reasons and statistics.
+        "late_entry": late_entry,
+        "late_entry_reason": late_entry_reason,
+        "tp_space_ok": tp_space_ok,
+        "tp_space_reason": tp_space_reason,
+        "tp_space_atr": tp_space_atr,
+        "trap_risk": trap_risk,
+        "trap_reason": trap_reason,
+        "candle_forecast": candle_forecast,
+        "candle_forecast_reason": candle_forecast_reason,
 
         "news_filter_active": news_filter_active(),
 
