@@ -1352,7 +1352,8 @@ def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, s
     liquidity_risk = "پایین"
 
     if raw_direction == "NO TRADE":
-        reasons_block.append("اختلاف لانگ و شورت کافی نیست")
+        # این دلیل قبلاً در analyze_symbol اضافه شده است؛
+        # اینجا دوباره اضافه نمی‌کنیم تا در خروجی تکراری نمایش داده نشود.
         return False, reasons_block, "بالا", "none", "none"
 
     if score < 80:
@@ -1813,5 +1814,6 @@ def analyze_symbol(symbol):
 
         "news_filter_active": news_filter_active(),
 
-        "reasons": reasons[:18],
+        # حذف دلیل‌های تکراری بدون تغییر منطق امتیازدهی/فیلترها
+        "reasons": list(dict.fromkeys(reasons))[:18],
     }
