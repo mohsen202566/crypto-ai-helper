@@ -133,6 +133,19 @@ def add_signal_to_tracking(user_id, chat_id, message_id, result):
         "market_breadth_bearish_pct": result.get("market_breadth_bearish_pct"),
         "fake_breakout": result.get("fake_breakout"),
         "trend_exhaustion": result.get("trend_exhaustion"),
+
+        # Hidden professional diagnostics from analysis.py.
+        # These are NOT shown in signal text, but are saved for SL analysis/statistics.
+        "late_entry": result.get("late_entry"),
+        "late_entry_reason": result.get("late_entry_reason"),
+        "tp_space_ok": result.get("tp_space_ok"),
+        "tp_space_reason": result.get("tp_space_reason"),
+        "tp_space_atr": result.get("tp_space_atr"),
+        "trap_risk": result.get("trap_risk"),
+        "trap_reason": result.get("trap_reason"),
+        "candle_forecast": result.get("candle_forecast"),
+        "candle_forecast_reason": result.get("candle_forecast_reason"),
+
         "reasons": result.get("reasons", []),
 
         "warning_reasons": [],
@@ -316,9 +329,17 @@ def guess_sl_reasons(signal):
     if signal.get("trend_exhaustion") not in [None, "none"]:
         reasons.append("نشانه خستگی روند وجود داشت")
     if signal.get("late_entry"):
-        reasons.append("ورود دیرهنگام در تحلیل اولیه دیده شده بود")
+        reasons.append(signal.get("late_entry_reason") or "ورود دیرهنگام در تحلیل اولیه دیده شده بود")
     if signal.get("tp_space_ok") is False:
-        reasons.append("فضای کافی تا TP وجود نداشت")
+        reasons.append(signal.get("tp_space_reason") or "فضای کافی تا TP وجود نداشت")
+    if signal.get("trap_risk"):
+        reasons.append(signal.get("trap_reason") or "ورود نزدیک حمایت/مقاومت مهم انجام شده بود")
+    candle_forecast = signal.get("candle_forecast")
+    direction = signal.get("direction")
+    if direction == "LONG" and candle_forecast == "bearish_continuation":
+        reasons.append(signal.get("candle_forecast_reason") or "پیش‌بینی کندلی خلاف لانگ بود")
+    if direction == "SHORT" and candle_forecast == "bullish_continuation":
+        reasons.append(signal.get("candle_forecast_reason") or "پیش‌بینی کندلی خلاف شورت بود")
     if signal.get("noise_status") in ["high_noise", "medium_noise"]:
         reasons.append("بازار هنگام ورود نویزی/رنج بوده است")
     if signal.get("volatility_status") in ["too_low", "too_high"]:
@@ -378,8 +399,13 @@ def weakness_warning_for_signal(signal, result, price):
         if result.get("macd_divergence") == "bearish_macd_divergence":
             warnings.append("واگرایی منفی MACD دیده شده است")
         try:
-            if float(result.get("macd_hist", 0)) < 0:
-                warnings.append("MACD هیستوگرام برای لانگ ضعیف شده است")
+            macd_hist_now = float(result.get("macd_hist", 0))
+            # MACD Histogram به‌تنهایی هشدار ندهد؛ فقط وقتی با VWAP یا قدرت فروش همراه شود.
+            if macd_hist_now < 0 and (
+                result.get("vwap_status") == "below_vwap"
+                or result.get("sell_power", 0) >= result.get("buy_power", 0) + 8
+            ):
+                warnings.append("MACD هیستوگرام برای لانگ با تایید VWAP/قدرت فروش ضعیف شده است")
         except Exception:
             pass
         if result.get("fake_breakout") == "fake_bullish_breakout":
@@ -399,8 +425,13 @@ def weakness_warning_for_signal(signal, result, price):
         if result.get("macd_divergence") == "bullish_macd_divergence":
             warnings.append("واگرایی مثبت MACD دیده شده است")
         try:
-            if float(result.get("macd_hist", 0)) > 0:
-                warnings.append("MACD هیستوگرام برای شورت ضعیف شده است")
+            macd_hist_now = float(result.get("macd_hist", 0))
+            # MACD Histogram به‌تنهایی هشدار ندهد؛ فقط وقتی با VWAP یا قدرت خرید همراه شود.
+            if macd_hist_now > 0 and (
+                result.get("vwap_status") == "above_vwap"
+                or result.get("buy_power", 0) >= result.get("sell_power", 0) + 8
+            ):
+                warnings.append("MACD هیستوگرام برای شورت با تایید VWAP/قدرت خرید ضعیف شده است")
         except Exception:
             pass
         if result.get("fake_breakout") == "fake_bearish_breakout":
@@ -410,6 +441,12 @@ def weakness_warning_for_signal(signal, result, price):
         warnings.append("ورود از نظر Late Entry پرریسک شده است")
     if result.get("tp_space_ok") is False:
         warnings.append("فضای TP ضعیف شده یا حمایت/مقاومت نزدیک است")
+    if result.get("trap_risk"):
+        warnings.append(result.get("trap_reason") or "قیمت نزدیک حمایت/مقاومت مهم است")
+    if direction == "LONG" and result.get("candle_forecast") == "bearish_continuation":
+        warnings.append("پیش‌بینی کندلی کوتاه‌مدت خلاف لانگ شده است")
+    if direction == "SHORT" and result.get("candle_forecast") == "bullish_continuation":
+        warnings.append("پیش‌بینی کندلی کوتاه‌مدت خلاف شورت شده است")
     if result.get("noise_status") == "high_noise":
         warnings.append("بازار نویزی/رنج شده است")
     if result.get("volatility_status") in ["too_low", "too_high"]:
