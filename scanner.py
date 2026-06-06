@@ -186,7 +186,7 @@ def soft_confirmation_bonus(result):
 
 def is_high_quality_signal(result):
     """
-    نسخه متعادل سیگنال خودکار/بهترین سیگنال.
+    نسخه ساده و متعادل سیگنال خودکار/بهترین سیگنال.
     """
     if not result:
         return False
