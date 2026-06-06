@@ -711,9 +711,11 @@ def score_entry(df_15m, df_5m):
         reasons_long.append("افزایش حجم واقعی")
         reasons_short.append("افزایش حجم واقعی")
 
-    if last_5["adx"] >= 22:
-        long_score += 5
-        short_score += 5
+    if last_15["adx"] >= 25:
+        long_score += 6
+        short_score += 6
+        reasons_long.append("ADX قوی در 15M")
+        reasons_short.append("ADX قوی در 15M")
 
     return long_score, short_score, reasons_long, reasons_short, buy_power, sell_power, pattern, multi_candle
 
@@ -733,20 +735,20 @@ def score_smart_money(df_15m, df_5m):
     order_block = detect_order_block(df_15m)
 
     if fvg == "bullish_fvg":
-        long_score += 1
-        reasons_long.append("FVG صعودی، اثر ناچیز")
+        long_score += 2
+        reasons_long.append("FVG صعودی، اثر سبک")
 
     if fvg == "bearish_fvg":
-        short_score += 1
-        reasons_short.append("FVG نزولی، اثر ناچیز")
+        short_score += 2
+        reasons_short.append("FVG نزولی، اثر سبک")
 
     if order_block == "bullish_order_block":
-        long_score += 1
-        reasons_long.append("Order Block صعودی، اثر ناچیز")
+        long_score += 3
+        reasons_long.append("Order Block صعودی هم‌جهت")
 
     if order_block == "bearish_order_block":
-        short_score += 1
-        reasons_short.append("Order Block نزولی، اثر ناچیز")
+        short_score += 3
+        reasons_short.append("Order Block نزولی هم‌جهت")
 
     return long_score, short_score, reasons_long, reasons_short, "none", "none", fvg, order_block
 
@@ -930,6 +932,22 @@ def apply_direction_conflict_penalties(
             long_score -= 3
             reasons_long.append("قدرت فروش اندکی از خرید بالاتر است")
 
+    # Order Block خلاف جهت، قبل از فیلتر نهایی هم امتیاز طرف اشتباه را سنگین کم می‌کند.
+    if order_block == "bullish_order_block":
+        short_score -= 18
+        reasons_short.append("Order Block صعودی خلاف شورت است")
+    elif order_block == "bearish_order_block":
+        long_score -= 18
+        reasons_long.append("Order Block نزولی خلاف لانگ است")
+
+    # FVG خلاف جهت اثر سبک ولی واقعی دارد.
+    if fvg == "bullish_fvg":
+        short_score -= 5
+        reasons_short.append("FVG صعودی کمی خلاف شورت است")
+    elif fvg == "bearish_fvg":
+        long_score -= 5
+        reasons_long.append("FVG نزولی کمی خلاف لانگ است")
+
     return max(0, long_score), max(0, short_score)
 
 def normalize_score_by_quality(score, rr, raw_direction, pattern, multi_candle, order_block, vwap_status, fvg="none"):
@@ -1057,10 +1075,10 @@ def entry_grade(score, risk_level, rr, final_direction):
         return "Reject"
 
     # حرفه‌ای اما خشک نشود: گریدها کمی سخت‌تر از نسخه ساده‌اند، ولی سیگنال‌های خوب حذف نمی‌شوند.
-    if score >= 92 and rr >= 1.05 and risk_level != "بالا":
+    if score >= 94 and rr >= 1.05 and risk_level != "بالا":
         return "A+"
 
-    if score >= 82 and rr >= 0.90:
+    if score >= 85 and rr >= 0.90 and risk_level != "بالا":
         return "A"
 
     return "Reject"
@@ -1128,13 +1146,13 @@ def very_safe_status(raw_direction, score, win_probability_value, risk_level, rr
     if rr < 1.0:
         reasons.append("ریسک به ریوارد برای Very Safe کافی نیست")
 
-    if adx_value < 20:
-        reasons.append("ADX برای Very Safe کمی ضعیف است")
+    if adx_value < 25:
+        reasons.append("ADX برای Very Safe قوی نیست")
 
-    if raw_direction == "LONG" and buy_power < 52:
+    if raw_direction == "LONG" and buy_power < 60:
         reasons.append("قدرت خرید برای Very Safe کافی نیست")
 
-    if raw_direction == "SHORT" and sell_power < 52:
+    if raw_direction == "SHORT" and sell_power < 60:
         reasons.append("قدرت فروش برای Very Safe کافی نیست")
 
     return len(reasons) == 0, reasons
@@ -1322,7 +1340,13 @@ def apply_final_momentum_balance(score, raw_direction, adx_value, buy_power, sel
 
 def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, spread_percent, market_regime="neutral", order_block="none", fvg="none", buy_power=50, sell_power=50, rsi_divergence="none", macd_divergence="none"):
     """
-    فیلتر ورود ساده و متعادل.
+    فیلتر ورود ساده ولی سختگیر برای جلوگیری از سیگنال‌های چرت.
+    قانون‌های اصلی:
+    - امتیاز حداقل 80 برای ورود دستی/لیست سیگنال
+    - ADX تایم 15M باید حداقل 25 باشد
+    - اختلاف Buy/Sell Power باید حداقل 8 درصد هم‌جهت باشد
+    - Order Block خلاف جهت، سیگنال را حذف می‌کند
+    - FVG خلاف جهت حذف کامل نیست، اما اگر امتیاز خیلی قوی نباشد بلاک می‌کند
     """
     reasons_block = []
     liquidity_risk = "پایین"
@@ -1331,8 +1355,17 @@ def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, s
         reasons_block.append("اختلاف لانگ و شورت کافی نیست")
         return False, reasons_block, "بالا", "none", "none"
 
-    if score < 73:
-        reasons_block.append("امتیاز سیگنال برای ورود کافی نیست")
+    if score < 80:
+        reasons_block.append("امتیاز سیگنال برای ورود سختگیرانه کافی نیست")
+        return False, reasons_block, "متوسط", "none", "none"
+
+    try:
+        adx_15m = float(df_15m.iloc[-1].get("adx", 0))
+    except Exception:
+        adx_15m = 0
+
+    if adx_15m < 25:
+        reasons_block.append("ADX در 15M به اندازه کافی قوی نیست")
         return False, reasons_block, "متوسط", "none", "none"
 
     try:
@@ -1342,29 +1375,28 @@ def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, s
         buy_power_value = 50
         sell_power_value = 50
 
-    # سختگیری ملایم‌تر از Reject کامل: اول ریسک را بالا می‌بریم؛ فقط در تضاد خیلی شدید و امتیاز پایین‌تر بلاک می‌کنیم.
-    if raw_direction == "LONG" and sell_power_value > buy_power_value:
-        if sell_power_value >= buy_power_value + 8:
-            reasons_block.append("قدرت فروش برای لانگ کمی نگران‌کننده است")
-            liquidity_risk = "متوسط"
-        # فقط تضاد خیلی شدید را بلاک می‌کنیم؛ بقیه با امتیاز/ریسک کنترل می‌شوند.
-        if score < 80 and sell_power_value >= buy_power_value + 12:
-            reasons_block.append("قدرت فروش نسبت به خرید برای لانگ زیاد است")
+    power_gap = buy_power_value - sell_power_value
+
+    if raw_direction == "LONG":
+        if power_gap < 8:
+            reasons_block.append("اختلاف قدرت خرید نسبت به فروش برای لانگ حداقل ۸٪ نیست")
             return False, reasons_block, "متوسط", "none", "none"
-        if sell_power_value >= buy_power_value + 24:
-            reasons_block.append("قدرت فروش خیلی بیشتر از خرید است")
+        if order_block == "bearish_order_block":
+            reasons_block.append("Order Block نزولی خلاف لانگ است؛ سیگنال حذف شد")
+            return False, reasons_block, "بالا", "none", "none"
+        if fvg == "bearish_fvg" and score < 88:
+            reasons_block.append("FVG نزولی خلاف لانگ است و امتیاز برای عبور کافی نیست")
             return False, reasons_block, "متوسط", "none", "none"
 
-    if raw_direction == "SHORT" and buy_power_value > sell_power_value:
-        if buy_power_value >= sell_power_value + 8:
-            reasons_block.append("قدرت خرید برای شورت کمی نگران‌کننده است")
-            liquidity_risk = "متوسط"
-        # فقط تضاد خیلی شدید را بلاک می‌کنیم؛ بقیه با امتیاز/ریسک کنترل می‌شوند.
-        if score < 80 and buy_power_value >= sell_power_value + 12:
-            reasons_block.append("قدرت خرید نسبت به فروش برای شورت زیاد است")
+    if raw_direction == "SHORT":
+        if power_gap > -8:
+            reasons_block.append("اختلاف قدرت فروش نسبت به خرید برای شورت حداقل ۸٪ نیست")
             return False, reasons_block, "متوسط", "none", "none"
-        if buy_power_value >= sell_power_value + 24:
-            reasons_block.append("قدرت خرید خیلی بیشتر از فروش است")
+        if order_block == "bullish_order_block":
+            reasons_block.append("Order Block صعودی خلاف شورت است؛ سیگنال حذف شد")
+            return False, reasons_block, "بالا", "none", "none"
+        if fvg == "bullish_fvg" and score < 88:
+            reasons_block.append("FVG صعودی خلاف شورت است و امتیاز برای عبور کافی نیست")
             return False, reasons_block, "متوسط", "none", "none"
 
     if spread_percent is not None and spread_percent > 0.12:
