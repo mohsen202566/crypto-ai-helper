@@ -206,15 +206,13 @@ def build_analysis_text(result):
     reasons_text = chr(10).join([f"✅ {r}" for r in reasons])
     trade_levels = build_trade_levels(result)
 
-    direction = result.get("direction")
-    raw_direction = result.get("raw_direction")
-
     return f"""
 📊 تحلیل فیوچرز {result['symbol']}
 
 قیمت فعلی: {result['price']}
-جهت نهایی: {fa_direction(direction)}
-جهت تحلیل: {fa_direction(raw_direction)}
+
+جهت نهایی: {fa_direction(result['direction'])}
+جهت تحلیل: {fa_direction(result.get('raw_direction'))}
 
 امتیاز: {result['score']}/100
 احتمال موفقیت: {safe(result.get('win_probability'))}٪
