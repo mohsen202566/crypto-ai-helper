@@ -897,14 +897,38 @@ def apply_direction_conflict_penalties(
         long_score -= 6
         reasons_long.append("قیمت پایین VWAP است و برای لانگ ریسک دارد")
 
-    # کمی سختگیرتر: اگر قدرت بازار خلاف جهت سیگنال باشد، جریمه زودتر و کمی قوی‌تر اعمال می‌شود.
-    if buy_power >= sell_power + 8:
-        short_score -= 8
-        reasons_short.append("قدرت خرید نسبت به فروش بالاتر است")
+    # بالانس نرم‌تر ولی واقعی‌تر برای فیوچرز:
+    # حتی اختلاف کمِ قدرت خرید/فروش خلاف جهت، امتیاز را کمی کم می‌کند؛
+    # اما فقط اختلاف‌های خیلی شدید باعث افت جدی می‌شوند تا ربات خشک نشود.
+    try:
+        power_gap = float(buy_power) - float(sell_power)
+    except Exception:
+        power_gap = 0
 
-    if sell_power >= buy_power + 8:
-        long_score -= 8
-        reasons_long.append("قدرت فروش نسبت به خرید بالاتر است")
+    if power_gap > 0:
+        # برای شورت، بیشتر بودن قدرت خرید خلاف جهت است.
+        if power_gap >= 12:
+            short_score -= 12
+            reasons_short.append("قدرت خرید به‌طور واضح از فروش بالاتر است")
+        elif power_gap >= 5:
+            short_score -= 7
+            reasons_short.append("قدرت خرید نسبت به فروش کمی بالاتر است")
+        else:
+            short_score -= 3
+            reasons_short.append("قدرت خرید اندکی از فروش بالاتر است")
+
+    elif power_gap < 0:
+        # برای لانگ، بیشتر بودن قدرت فروش خلاف جهت است.
+        sell_gap = abs(power_gap)
+        if sell_gap >= 12:
+            long_score -= 12
+            reasons_long.append("قدرت فروش به‌طور واضح از خرید بالاتر است")
+        elif sell_gap >= 5:
+            long_score -= 7
+            reasons_long.append("قدرت فروش نسبت به خرید کمی بالاتر است")
+        else:
+            long_score -= 3
+            reasons_long.append("قدرت فروش اندکی از خرید بالاتر است")
 
     return max(0, long_score), max(0, short_score)
 
@@ -1115,6 +1139,75 @@ def very_safe_status(raw_direction, score, win_probability_value, risk_level, rr
 
     return len(reasons) == 0, reasons
 
+def apply_final_momentum_balance(score, raw_direction, adx_value, buy_power, sell_power, reasons):
+    """
+    لایه نهایی بالانس امتیاز برای جلوگیری از امتیازهای بادکرده.
+    سیگنال را خشک نمی‌کند؛ فقط اجازه نمی‌دهد سیگنال کم‌مومنتوم یا خلاف قدرت بازار، 100/A+ شود.
+    """
+    if raw_direction == "NO TRADE":
+        return cap_score(score)
+
+    try:
+        adx_value = float(adx_value)
+    except Exception:
+        adx_value = 20
+
+    try:
+        buy_power = float(buy_power)
+        sell_power = float(sell_power)
+    except Exception:
+        buy_power = 50
+        sell_power = 50
+
+    power_gap = buy_power - sell_power
+
+    # ADX در تایم 15M برای معاملات 30 تا 60 دقیقه‌ای نباید فقط نمایشی باشد.
+    if adx_value < 16:
+        score -= 18
+        score = min(score, 84)
+        reasons.append("ADX تایم 15M خیلی ضعیف است؛ امتیاز نهایی محدود شد")
+    elif adx_value < 18:
+        score -= 14
+        score = min(score, 88)
+        reasons.append("ADX تایم 15M ضعیف است؛ امتیاز نهایی محدود شد")
+    elif adx_value < 20:
+        score -= 8
+        score = min(score, 92)
+        reasons.append("ADX تایم 15M کمی ضعیف است؛ امتیاز نهایی کاهش یافت")
+    elif adx_value < 22:
+        score -= 4
+        reasons.append("ADX تایم 15M متوسط رو به ضعیف است")
+
+    # ترکیب ADX ضعیف + قدرت بازار خلاف جهت، خطرناک‌ترین حالت بود که در آمار SLها دیدیم.
+    if raw_direction == "SHORT" and power_gap > 0:
+        if power_gap >= 10:
+            score -= 10
+            score = min(score, 82 if adx_value < 18 else 86)
+            reasons.append("قدرت خرید خلاف شورت است و همراه با مومنتوم ضعیف، امتیاز محدود شد")
+        elif power_gap >= 5:
+            score -= 6
+            score = min(score, 86 if adx_value < 18 else 90)
+            reasons.append("قدرت خرید کمی خلاف شورت است؛ امتیاز نهایی تعدیل شد")
+        else:
+            score -= 3
+            reasons.append("قدرت خرید اندکی خلاف شورت است")
+
+    if raw_direction == "LONG" and power_gap < 0:
+        sell_gap = abs(power_gap)
+        if sell_gap >= 10:
+            score -= 10
+            score = min(score, 82 if adx_value < 18 else 86)
+            reasons.append("قدرت فروش خلاف لانگ است و همراه با مومنتوم ضعیف، امتیاز محدود شد")
+        elif sell_gap >= 5:
+            score -= 6
+            score = min(score, 86 if adx_value < 18 else 90)
+            reasons.append("قدرت فروش کمی خلاف لانگ است؛ امتیاز نهایی تعدیل شد")
+        else:
+            score -= 3
+            reasons.append("قدرت فروش اندکی خلاف لانگ است")
+
+    return cap_score(score)
+
 def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, spread_percent, market_regime="neutral", order_block="none", fvg="none", buy_power=50, sell_power=50, rsi_divergence="none", macd_divergence="none"):
     """
     فیلتر ورود ساده و متعادل.
@@ -1138,17 +1231,27 @@ def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, s
         sell_power_value = 50
 
     # سختگیری ملایم‌تر از Reject کامل: اول ریسک را بالا می‌بریم؛ فقط در تضاد خیلی شدید و امتیاز پایین‌تر بلاک می‌کنیم.
-    if raw_direction == "LONG" and sell_power_value >= buy_power_value + 12:
-        reasons_block.append("قدرت فروش برای لانگ کمی نگران‌کننده است")
-        liquidity_risk = "متوسط"
-        if score < 82 or sell_power_value >= buy_power_value + 22:
+    if raw_direction == "LONG" and sell_power_value > buy_power_value:
+        if sell_power_value >= buy_power_value + 8:
+            reasons_block.append("قدرت فروش برای لانگ کمی نگران‌کننده است")
+            liquidity_risk = "متوسط"
+        # فقط تضاد خیلی شدید را بلاک می‌کنیم؛ بقیه با امتیاز/ریسک کنترل می‌شوند.
+        if score < 80 and sell_power_value >= buy_power_value + 12:
+            reasons_block.append("قدرت فروش نسبت به خرید برای لانگ زیاد است")
+            return False, reasons_block, "متوسط", "none", "none"
+        if sell_power_value >= buy_power_value + 24:
             reasons_block.append("قدرت فروش خیلی بیشتر از خرید است")
             return False, reasons_block, "متوسط", "none", "none"
 
-    if raw_direction == "SHORT" and buy_power_value >= sell_power_value + 12:
-        reasons_block.append("قدرت خرید برای شورت کمی نگران‌کننده است")
-        liquidity_risk = "متوسط"
-        if score < 82 or buy_power_value >= sell_power_value + 22:
+    if raw_direction == "SHORT" and buy_power_value > sell_power_value:
+        if buy_power_value >= sell_power_value + 8:
+            reasons_block.append("قدرت خرید برای شورت کمی نگران‌کننده است")
+            liquidity_risk = "متوسط"
+        # فقط تضاد خیلی شدید را بلاک می‌کنیم؛ بقیه با امتیاز/ریسک کنترل می‌شوند.
+        if score < 80 and buy_power_value >= sell_power_value + 12:
+            reasons_block.append("قدرت خرید نسبت به فروش برای شورت زیاد است")
+            return False, reasons_block, "متوسط", "none", "none"
+        if buy_power_value >= sell_power_value + 24:
             reasons_block.append("قدرت خرید خیلی بیشتر از فروش است")
             return False, reasons_block, "متوسط", "none", "none"
 
@@ -1363,19 +1466,16 @@ def analyze_symbol(symbol):
 
     rr = risk_reward(raw_direction, price, stop_loss_raw, tp1_raw)
 
-    # سختگیری سراسری ملایم: اگر روند در 15M قدرت کافی نداشته باشد، امتیاز نهایی کمی کاهش می‌یابد.
-    # این Reject مستقیم نیست؛ فقط جلوی A+ شدن سیگنال‌های کم‌مومنتوم را می‌گیرد.
-    if raw_direction != "NO TRADE":
-        if adx_value < 18:
-            score -= 10
-            reasons.append("ADX تایم 15M ضعیف است؛ قدرت روند کافی نیست")
-        elif adx_value < 20:
-            score -= 6
-            reasons.append("ADX تایم 15M کمی ضعیف است")
-        elif adx_value < 22:
-            score -= 3
-            reasons.append("ADX تایم 15M متوسط رو به ضعیف است")
-        score = cap_score(score)
+    # بالانس نهایی مومنتوم/قدرت بازار:
+    # جلوی score inflation را می‌گیرد؛ اما hard block نیست تا ربات خشک نشود.
+    score = apply_final_momentum_balance(
+        score,
+        raw_direction,
+        adx_value,
+        buy_power,
+        sell_power,
+        reasons
+    )
 
     score = normalize_score_by_quality(
         score,
@@ -1433,6 +1533,10 @@ def analyze_symbol(symbol):
         tp2 = tp2_raw
 
     grade = entry_grade(score, risk_level, rr, final_direction)
+
+    # سیگنال با ADX ضعیف نباید A+ شود؛ حذف نمی‌کنیم، فقط گرید را واقعی‌تر می‌کنیم.
+    if grade == "A+" and adx_value < 20:
+        grade = "A"
 
     if grade == "Reject":
         final_direction = "NO TRADE"
