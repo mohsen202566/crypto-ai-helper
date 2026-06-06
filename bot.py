@@ -8,6 +8,7 @@ from config import BOT_TOKEN, AUTO_SCAN_INTERVAL_MINUTES, TRACKER_CHECK_INTERVAL
 from coins_fa import COINS_FA
 from analysis import analyze_symbol
 from scanner import get_best_signals, SCAN_SYMBOLS, should_send_auto_signal
+from market_scanner import get_market_status_text
 from users import is_user_allowed, is_owner, add_user, remove_user, list_users
 from signal_tracker import (
     add_signal_to_tracking,
@@ -72,6 +73,16 @@ def is_stats_command(text):
 def is_reset_stats_command(text):
     clean = text.strip().lower()
     return clean in ["حذف آمار", "ریست آمار", "پاک کردن آمار", "صفر کردن آمار", "پاکسازی آمار"]
+
+
+def is_market_status_command(text):
+    clean = text.strip().lower()
+    return clean in [
+        "وضعیت بازار",
+        "وضعیت ارزها",
+        "محاسبه وضعیت بازار",
+        "بررسی",
+    ]
 
 
 def find_symbol(text):
@@ -652,6 +663,16 @@ def handle_message(message):
         return
 
     text = message.text.strip()
+
+    if is_market_status_command(text):
+        bot.reply_to(message, "⏳ در حال محاسبه وضعیت بازار...")
+        try:
+            report = get_market_status_text()
+            bot.reply_to(message, report)
+        except Exception as e:
+            print("MARKET STATUS ERROR:", str(e))
+            bot.reply_to(message, f"❌ خطا در محاسبه وضعیت بازار:\n{e}")
+        return
     if is_reset_stats_command(text):
         if not is_owner(message.from_user.id):
             bot.reply_to(message, "⛔ فقط مالک ربات می‌تواند آمار را پاک کند.")
