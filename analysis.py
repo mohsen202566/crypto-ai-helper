@@ -1582,11 +1582,18 @@ def entry_grade(score, risk_level, rr, final_direction):
     return "Reject"
 
 def win_probability(score, risk_level, rr, adx, grade):
+    """
+    تخمین نرم‌تر احتمال موفقیت.
+    تغییرات:
+    - ریسک بالا هنوز جریمه دارد، اما کمتر از قبل.
+    - ADX ضعیف هنوز جریمه دارد، اما بیش از حد سیگنال را نابود نمی‌کند.
+    - Reject دوباره خیلی سنگین جریمه نمی‌شود، چون خود گرید قبلاً سیگنال را رد کرده است.
+    """
     p = 42 + int(score * 0.22)
-    p += 8 if risk_level == "پایین" else 3 if risk_level == "متوسط" else -10
+    p += 8 if risk_level == "پایین" else 3 if risk_level == "متوسط" else -6
     p += 5 if rr >= 1.5 else 2 if rr >= 1 else -10
-    p += 4 if adx >= 25 else -6 if adx < 19 else 0
-    p += 4 if grade == "A+" else 2 if grade == "A" else -15 if grade == "Reject" else 0
+    p += 4 if adx >= 25 else -3 if adx < 19 else 0
+    p += 4 if grade == "A+" else 2 if grade == "A" else -8 if grade == "Reject" else 0
     return max(0, min(p, 92))
 
 
