@@ -12,6 +12,16 @@ from analysis import analyze_symbol
 ACTIVE_SIGNALS_FILE = "active_signals.json"
 SIGNAL_STATS_FILE = "signal_stats.json"
 
+# Tracker برای اسکالپ نباید فقط Last Price را ببیند.
+# با کندل 1m مسیر قیمت از آخرین چک بررسی می‌شود تا لمس سریع TP/SL جا نیفتد.
+TRACKER_OHLCV_TIMEFRAME = "1m"
+TRACKER_LOOKBACK_BUFFER_SECONDS = 90
+TRACKER_MAX_OHLCV_LIMIT = 180
+
+# اگر داخل یک کندل هم TP و هم SL لمس شده باشد، ترتیب واقعی مشخص نیست.
+# حالت محافظه‌کارانه: SL اولویت دارد تا آمار بیش از حد خوش‌بینانه نشود.
+SAME_CANDLE_HIT_POLICY = "SL_FIRST"
+
 exchange = ccxt.okx({
     "enableRateLimit": True,
     "timeout": 20000,
@@ -52,6 +62,114 @@ def get_current_price(symbol):
         raise Exception(f"قیمت {symbol} دریافت نشد")
 
     return float(price)
+
+
+def get_recent_1m_candles_since(symbol, since_ts):
+    """
+    کندل‌های 1 دقیقه‌ای از آخرین زمان بررسی تا الان را می‌گیرد.
+    خروجی ccxt: [timestamp_ms, open, high, low, close, volume]
+    """
+    now = now_ts()
+
+    try:
+        since_ts = int(since_ts or 0)
+    except Exception:
+        since_ts = 0
+
+    if since_ts <= 0:
+        since_ts = now - 5 * 60
+
+    since_ms = max(0, (since_ts - TRACKER_LOOKBACK_BUFFER_SECONDS) * 1000)
+    minutes = max(5, int((now - since_ts) / 60) + 4)
+    limit = min(TRACKER_MAX_OHLCV_LIMIT, max(10, minutes))
+
+    candles = exchange.fetch_ohlcv(
+        to_okx_symbol(symbol),
+        timeframe=TRACKER_OHLCV_TIMEFRAME,
+        since=since_ms,
+        limit=limit
+    )
+
+    clean = []
+    min_allowed_ms = max(0, (since_ts - TRACKER_LOOKBACK_BUFFER_SECONDS) * 1000)
+
+    for c in candles or []:
+        if not c or len(c) < 5:
+            continue
+        if int(c[0]) >= min_allowed_ms:
+            clean.append(c)
+
+    return clean
+
+
+def candle_path_hit(signal, candle):
+    """
+    با high/low کندل 1m بررسی می‌کند که TP1 یا SL لمس شده یا نه.
+    اگر هر دو داخل یک کندل لمس شده باشند، طبق SAME_CANDLE_HIT_POLICY تصمیم می‌گیرد.
+    """
+    direction = signal.get("direction")
+    high = float(candle[2])
+    low = float(candle[3])
+
+    tp_hit = False
+    sl_hit = False
+
+    if direction == "LONG":
+        tp_hit = high >= float(signal["tp1"])
+        sl_hit = low <= float(signal["stop_loss"])
+    elif direction == "SHORT":
+        tp_hit = low <= float(signal["tp1"])
+        sl_hit = high >= float(signal["stop_loss"])
+
+    if tp_hit and sl_hit:
+        if SAME_CANDLE_HIT_POLICY == "TP_FIRST":
+            return "TP1", float(signal["tp1"]), "same_candle"
+        return "SL", float(signal["stop_loss"]), "same_candle"
+
+    if tp_hit:
+        return "TP1", float(signal["tp1"]), "candle_path"
+
+    if sl_hit:
+        return "SL", float(signal["stop_loss"]), "candle_path"
+
+    return None, None, None
+
+
+def detect_signal_hit_from_candles(signal):
+    last_checked_at = signal.get("last_checked_at") or signal.get("created_at") or now_ts() - 5 * 60
+    candles = get_recent_1m_candles_since(signal["symbol"], last_checked_at)
+
+    last_candle_ts = None
+
+    for candle in candles:
+        last_candle_ts = int(candle[0] / 1000)
+        result_type, exit_price, hit_source = candle_path_hit(signal, candle)
+        if result_type:
+            signal["last_checked_at"] = now_ts()
+            signal["last_checked_at_text"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            signal["hit_source"] = hit_source
+            signal["hit_candle_time"] = datetime.fromtimestamp(last_candle_ts).strftime("%Y-%m-%d %H:%M:%S")
+            return result_type, exit_price
+
+    # حتی اگر کندل جدیدی نبود، زمان چک آپدیت شود تا loop گیر نکند.
+    signal["last_checked_at"] = now_ts()
+    signal["last_checked_at_text"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    return None, None
+
+
+def get_last_close_from_1m_or_ticker(symbol, signal=None):
+    try:
+        last_checked_at = None
+        if signal:
+            last_checked_at = signal.get("last_checked_at") or signal.get("created_at")
+        candles = get_recent_1m_candles_since(symbol, last_checked_at or now_ts() - 3 * 60)
+        if candles:
+            return float(candles[-1][4])
+    except Exception:
+        pass
+
+    return get_current_price(symbol)
 
 
 def get_active_signals():
@@ -154,6 +272,10 @@ def add_signal_to_tracking(user_id, chat_id, message_id, result):
 
         "created_at": now_ts(),
         "created_at_text": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "last_checked_at": now_ts(),
+        "last_checked_at_text": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "hit_source": None,
+        "hit_candle_time": None,
 
         "status": "ACTIVE",
         "warning_sent": False
@@ -213,6 +335,8 @@ def close_signal(signal, result_type, exit_price):
     closed["closed_at"] = now_ts()
     closed["closed_at_text"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     closed["result_percent"] = calculate_result_percent(signal, exit_price)
+    closed["hit_source"] = signal.get("hit_source")
+    closed["hit_candle_time"] = signal.get("hit_candle_time")
 
     stats.append(closed)
     save_signal_stats(stats)
@@ -475,23 +599,19 @@ def check_active_signals():
 
     for signal in active:
         try:
-            price = get_current_price(signal["symbol"])
+            result_type, exit_price = detect_signal_hit_from_candles(signal)
 
-            if price_hit_tp1(signal, price):
-                msg = close_signal(signal, "TP1", price)
+            if result_type:
+                msg = close_signal(signal, result_type, exit_price)
                 messages.append({
                     "chat_id": signal["chat_id"],
                     "message": msg
                 })
                 continue
 
-            if price_hit_sl(signal, price):
-                msg = close_signal(signal, "SL", price)
-                messages.append({
-                    "chat_id": signal["chat_id"],
-                    "message": msg
-                })
-                continue
+            # برای هشدار ضعف، قیمت فعلی فقط جهت نمایش استفاده می‌شود؛
+            # تشخیص TP/SL با مسیر کندل‌های 1m انجام شده است.
+            price = get_last_close_from_1m_or_ticker(signal["symbol"], signal)
 
             if not signal.get("warning_sent", False):
                 try:
