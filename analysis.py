@@ -489,12 +489,12 @@ def technical_quality_context(raw_direction, price, atr, support, resistance, df
 
         # Anti Late Entry: فقط اگر فاصله خیلی زیاد یا کندل جهشی باشد، جریمه نرم می‌دهد.
         if raw_direction == "LONG" and price > last_5["ema20"] and (vwap_distance > 1.35 or ema_distance > 1.20 or large_candle):
-            long_adj -= 7
+            long_adj -= 5
             context["late_entry"] = True
             context["late_entry_reason"] = "فاصله قیمت از EMA/VWAP یا اندازه کندل برای لانگ زیاد بود"
             reasons_long.append("ورود لانگ کمی دیر است؛ امتیاز کاهش یافت")
         elif raw_direction == "SHORT" and price < last_5["ema20"] and (vwap_distance > 1.35 or ema_distance > 1.20 or large_candle):
-            short_adj -= 7
+            short_adj -= 5
             context["late_entry"] = True
             context["late_entry_reason"] = "فاصله قیمت از EMA/VWAP یا اندازه کندل برای شورت زیاد بود"
             reasons_short.append("ورود شورت کمی دیر است؛ امتیاز کاهش یافت")
@@ -662,6 +662,7 @@ def score_entry(df_15m, df_5m):
 
     buy_power, sell_power = buy_sell_power(df_5m, candles=20)
     fast_buy_power, fast_sell_power = buy_sell_power(df_5m, candles=6)
+    ultra_buy_power, ultra_sell_power = buy_sell_power(df_5m, candles=3)
 
     if last_15["close"] > last_15["ema20"] > last_15["ema50"]:
         long_score += 24
@@ -672,11 +673,11 @@ def score_entry(df_15m, df_5m):
         reasons_short.append("15M: قیمت زیر EMA20 و EMA50")
 
     if last_5["close"] > last_5["ema20"] and last_5["macd"] > last_5["macd_signal"]:
-        long_score += 30
+        long_score += 34
         reasons_long.append("5M: تایید ورود لانگ با EMA و MACD")
 
     if last_5["close"] < last_5["ema20"] and last_5["macd"] < last_5["macd_signal"]:
-        short_score += 30
+        short_score += 34
         reasons_short.append("5M: تایید ورود شورت با EMA و MACD")
 
     if 45 <= last_5["rsi"] <= 68:
@@ -695,6 +696,10 @@ def score_entry(df_15m, df_5m):
         long_score += 14
         reasons_long.append("قدرت خرید سریع در 5M بالا است")
 
+    if ultra_buy_power >= 68:
+        long_score += 12
+        reasons_long.append("قدرت خرید خیلی سریع 3 کندلی بالا است")
+
     if sell_power >= 62:
         short_score += 10
         reasons_short.append("قدرت فروش کلی بالا در تایم ورود")
@@ -703,17 +708,21 @@ def score_entry(df_15m, df_5m):
         short_score += 14
         reasons_short.append("قدرت فروش سریع در 5M بالا است")
 
+    if ultra_sell_power >= 68:
+        short_score += 12
+        reasons_short.append("قدرت فروش خیلی سریع 3 کندلی بالا است")
+
     pattern = candle_pattern(df_5m)
     # Multi-candle confirmation was intentionally removed in the simple balanced version.
     # Keep this field as "disabled" only for compatibility with the rest of the bot.
     multi_candle = "disabled"
 
     if pattern in ["bullish_engulfing", "bullish_pinbar", "bullish_strong"]:
-        long_score += 10
+        long_score += 12
         reasons_long.append(f"کندل تاییدی لانگ: {pattern}")
 
     if pattern in ["bearish_engulfing", "bearish_pinbar", "bearish_strong"]:
-        short_score += 10
+        short_score += 12
         reasons_short.append(f"کندل تاییدی شورت: {pattern}")
 
     if volume_spike(df_5m):
@@ -729,26 +738,31 @@ def score_entry(df_15m, df_5m):
         reasons_short.append("ADX قوی در 15M")
 
     # تریگر سریع مومنتوم برای اسکالپ:
-    # شیب MACD Histogram + EMA + VWAP + Power سریع 5M
+    # شیب MACD Histogram + EMA + VWAP + Power سریع/3 کندلی 5M.
     try:
         prev_5 = df_5m.iloc[-2]
+        prev2_5 = df_5m.iloc[-3]
+
+        macd_hist_rising = last_5["macd_hist"] > prev_5["macd_hist"] > prev2_5["macd_hist"]
+        macd_hist_falling = last_5["macd_hist"] < prev_5["macd_hist"] < prev2_5["macd_hist"]
+
         if (
             last_5["close"] > last_5["ema20"]
-            and last_5["close"] > last_5["vwap"]
-            and last_5["macd_hist"] > prev_5["macd_hist"]
-            and fast_buy_power >= 58
+            and (last_5["close"] > last_5["vwap"] or ultra_buy_power >= 72)
+            and macd_hist_rising
+            and (fast_buy_power >= 58 or ultra_buy_power >= 68)
         ):
-            long_score += 12
-            reasons_long.append("تریگر سریع لانگ در 5M فعال است")
+            long_score += 18
+            reasons_long.append("تریگر زودهنگام لانگ در 5M فعال است")
 
         if (
             last_5["close"] < last_5["ema20"]
-            and last_5["close"] < last_5["vwap"]
-            and last_5["macd_hist"] < prev_5["macd_hist"]
-            and fast_sell_power >= 58
+            and (last_5["close"] < last_5["vwap"] or ultra_sell_power >= 72)
+            and macd_hist_falling
+            and (fast_sell_power >= 58 or ultra_sell_power >= 68)
         ):
-            short_score += 12
-            reasons_short.append("تریگر سریع شورت در 5M فعال است")
+            short_score += 18
+            reasons_short.append("تریگر زودهنگام شورت در 5M فعال است")
     except Exception:
         pass
 
@@ -1293,9 +1307,9 @@ def apply_final_momentum_balance(score, raw_direction, adx_value, buy_power, sel
             score = min(score, 91)
             reasons.append("ADX زیر 18 و قدرت بازار خنثی است؛ امتیاز کمی تعدیل شد")
         else:
-            score -= 3
-            score = min(score, 94)
-            reasons.append("ADX زیر 18 است؛ امتیاز کمی کنترل شد")
+            score -= 1
+            score = min(score, 96)
+            reasons.append("ADX زیر 18 است؛ با قدرت هم‌جهت فقط کمی کنترل شد")
 
     elif adx_value < 20:
         if opposite_power:
@@ -1303,8 +1317,8 @@ def apply_final_momentum_balance(score, raw_direction, adx_value, buy_power, sel
             score = min(score, 90)
             reasons.append("ADX کمی ضعیف و قدرت بازار خلاف جهت است")
         else:
-            score -= 2
-            score = min(score, 96)
+            score -= 1
+            score = min(score, 97)
             reasons.append("ADX کمی ضعیف است")
 
     elif adx_value < 22:
@@ -1410,11 +1424,19 @@ def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, s
 
     power_gap = buy_power_value - sell_power_value
 
-    # ADX هنوز مهم است، اما در نسخه نرم‌تر برای ستاپ‌های قوی کاملاً hard block نیست.
-    # زیر 18 همچنان رد می‌شود؛ 18 تا 22 فقط وقتی عبور می‌کند که امتیاز و قدرت بازار خوب باشد.
-    if adx_15m < 18:
+    # ADX هنوز مهم است، اما برای اسکالپ 5 تا 15 دقیقه نباید شروع حرکت را کامل خفه کند.
+    # زیر 16 همچنان رد می‌شود؛ 16 تا 20 فقط با امتیاز و قدرت بسیار خوب عبور می‌کند.
+    if adx_15m < 16:
         reasons_block.append("ADX در 15M خیلی ضعیف است")
         return False, reasons_block, "متوسط", "none", "none"
+
+    if adx_15m < 18:
+        if raw_direction == "LONG" and not (score >= 88 and power_gap >= 12):
+            reasons_block.append("ADX در 15M ضعیف است و تایید قدرت خرید خیلی قوی نیست")
+            return False, reasons_block, "متوسط", "none", "none"
+        if raw_direction == "SHORT" and not (score >= 88 and power_gap <= -12):
+            reasons_block.append("ADX در 15M ضعیف است و تایید قدرت فروش خیلی قوی نیست")
+            return False, reasons_block, "متوسط", "none", "none"
 
     if adx_15m < 20:
         if raw_direction == "LONG" and not (score >= 84 and power_gap >= 8):
