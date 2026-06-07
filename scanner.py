@@ -131,7 +131,11 @@ def is_fake_breakout_against_signal(result):
     return True
 
 
-def mtf_alignment_count(result):
+def mtf_alignment_score(result):
+    """
+    MTF وزنی برای اسکالپ:
+    30M مهم‌ترین تایم بالادستی، 1H/4H فقط جهت کلی هستند.
+    """
     direction = result.get("direction")
     trends = result.get("trends", {}) or {}
 
@@ -142,12 +146,25 @@ def mtf_alignment_count(result):
     else:
         return 0
 
-    count = 0
-    for tf in ["1D", "4H", "1H", "30M"]:
-        if trends.get(tf) in good:
-            count += 1
+    weights = {
+        "30M": 35,
+        "1H": 25,
+        "4H": 15,
+        "1D": 5,
+    }
 
-    return count
+    score = 0
+    for tf, weight in weights.items():
+        trend = trends.get(tf)
+        if trend in good:
+            score += weight if "weak" not in str(trend) else int(weight * 0.6)
+
+    return score
+
+
+def mtf_alignment_count(result):
+    # برای سازگاری با کدهای قدیمی نگه داشته شده.
+    return mtf_alignment_score(result)
 
 
 def soft_confirmation_bonus(result):
@@ -186,8 +203,8 @@ def soft_confirmation_bonus(result):
 
 def is_high_quality_signal(result):
     """
-    نسخه هماهنگ با analysis.py اسکالپ سریع:
-    هدف، ارسال سیگنال‌های 5 تا 15 دقیقه‌ای زودتر است، نه انتظار برای تاییدهای دیرهنگام.
+    دروازه اتوسیگنال هماهنگ با analysis.py اسکالپ سریع:
+    سرعت ورود مهم‌تر از تایید دیرهنگام است، اما ریسک‌های خیلی ضعیف هنوز رد می‌شوند.
     """
     if not result:
         return False
@@ -201,13 +218,13 @@ def is_high_quality_signal(result):
     if result.get("score", 0) < AUTO_SCAN_MIN_SCORE:
         return False
 
-    if result.get("win_probability", 0) < 60:
+    if result.get("win_probability", 0) < 58:
         return False
 
-    if result.get("risk_reward", 0) < 0.70:
+    if result.get("risk_reward", 0) < 0.65:
         return False
 
-    if result.get("adx", 0) < 18:
+    if result.get("adx", 0) < 15:
         return False
 
     try:
@@ -221,17 +238,17 @@ def is_high_quality_signal(result):
     power_gap = buy_power - sell_power
 
     if direction == "LONG":
-        if power_gap < 6:
+        if power_gap < 5:
             return False
     elif direction == "SHORT":
-        if power_gap > -6:
+        if power_gap > -5:
             return False
 
     spread = result.get("spread_percent")
     if spread is not None and spread > 0.12:
         return False
 
-    if mtf_alignment_count(result) < 1:
+    if mtf_alignment_score(result) < 20:
         return False
 
     return True
@@ -241,8 +258,8 @@ def is_very_safe_signal(result):
         is_high_quality_signal(result)
         and result.get("score", 0) >= 92
         and result.get("win_probability", 0) >= 70
-        and result.get("risk_reward", 0) >= 0.90
-        and result.get("adx", 0) >= 24
+        and result.get("risk_reward", 0) >= 0.80
+        and result.get("adx", 0) >= 22
     )
 
 def analyze_symbol_safe(symbol):
