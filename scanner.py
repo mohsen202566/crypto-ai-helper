@@ -133,8 +133,8 @@ def is_fake_breakout_against_signal(result):
 
 def mtf_alignment_score(result):
     """
-    MTF وزنی برای اسکالپ:
-    30M مهم‌ترین تایم بالادستی، 1H/4H فقط جهت کلی هستند.
+    MTF وزنی برای اسکالپ سریع:
+    30M کیفیت ستاپ، 1H/4H جهت کلی هستند.
     """
     direction = result.get("direction")
     trends = result.get("trends", {}) or {}
@@ -148,9 +148,9 @@ def mtf_alignment_score(result):
 
     weights = {
         "30M": 35,
-        "1H": 25,
-        "4H": 15,
-        "1D": 5,
+        "1H": 22,
+        "4H": 12,
+        "1D": 4,
     }
 
     score = 0
@@ -163,7 +163,6 @@ def mtf_alignment_score(result):
 
 
 def mtf_alignment_count(result):
-    # برای سازگاری با کدهای قدیمی نگه داشته شده.
     return mtf_alignment_score(result)
 
 
@@ -203,8 +202,7 @@ def soft_confirmation_bonus(result):
 
 def is_high_quality_signal(result):
     """
-    دروازه اتوسیگنال هماهنگ با analysis.py اسکالپ سریع:
-    سرعت ورود مهم‌تر از تایید دیرهنگام است، اما ریسک‌های خیلی ضعیف هنوز رد می‌شوند.
+    دروازه اتوسیگنال برای Fast Pump/Dump Scalp Mode.
     """
     if not result:
         return False
@@ -218,13 +216,13 @@ def is_high_quality_signal(result):
     if result.get("score", 0) < AUTO_SCAN_MIN_SCORE:
         return False
 
-    if result.get("win_probability", 0) < 58:
+    if result.get("win_probability", 0) < 56:
         return False
 
-    if result.get("risk_reward", 0) < 0.65:
+    if result.get("risk_reward", 0) < 0.60:
         return False
 
-    if result.get("adx", 0) < 15:
+    if result.get("adx", 0) < 13:
         return False
 
     try:
@@ -238,28 +236,29 @@ def is_high_quality_signal(result):
     power_gap = buy_power - sell_power
 
     if direction == "LONG":
-        if power_gap < 5:
+        if power_gap < 4:
             return False
     elif direction == "SHORT":
-        if power_gap > -5:
+        if power_gap > -4:
             return False
 
     spread = result.get("spread_percent")
     if spread is not None and spread > 0.12:
         return False
 
-    if mtf_alignment_score(result) < 20:
+    if mtf_alignment_score(result) < 12:
         return False
 
     return True
+
 
 def is_very_safe_signal(result):
     return (
         is_high_quality_signal(result)
         and result.get("score", 0) >= 92
         and result.get("win_probability", 0) >= 70
-        and result.get("risk_reward", 0) >= 0.80
-        and result.get("adx", 0) >= 22
+        and result.get("risk_reward", 0) >= 1.0
+        and result.get("adx", 0) >= 27
     )
 
 def analyze_symbol_safe(symbol):
