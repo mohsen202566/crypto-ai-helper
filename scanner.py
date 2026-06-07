@@ -186,7 +186,8 @@ def soft_confirmation_bonus(result):
 
 def is_high_quality_signal(result):
     """
-    نسخه ساده و متعادل سیگنال خودکار/بهترین سیگنال.
+    نسخه هماهنگ با analysis.py اسکالپ سریع:
+    هدف، ارسال سیگنال‌های 5 تا 15 دقیقه‌ای زودتر است، نه انتظار برای تاییدهای دیرهنگام.
     """
     if not result:
         return False
@@ -200,13 +201,13 @@ def is_high_quality_signal(result):
     if result.get("score", 0) < AUTO_SCAN_MIN_SCORE:
         return False
 
-    if result.get("win_probability", 0) < 62:
+    if result.get("win_probability", 0) < 60:
         return False
 
-    if result.get("risk_reward", 0) < 0.90:
+    if result.get("risk_reward", 0) < 0.70:
         return False
 
-    if result.get("adx", 0) < 25:
+    if result.get("adx", 0) < 18:
         return False
 
     try:
@@ -220,21 +221,17 @@ def is_high_quality_signal(result):
     power_gap = buy_power - sell_power
 
     if direction == "LONG":
-        if power_gap < 8:
-            return False
-        if result.get("order_block") == "bearish_order_block":
+        if power_gap < 6:
             return False
     elif direction == "SHORT":
-        if power_gap > -8:
-            return False
-        if result.get("order_block") == "bullish_order_block":
+        if power_gap > -6:
             return False
 
     spread = result.get("spread_percent")
     if spread is not None and spread > 0.12:
         return False
 
-    if mtf_alignment_count(result) < 2:
+    if mtf_alignment_count(result) < 1:
         return False
 
     return True
@@ -244,8 +241,8 @@ def is_very_safe_signal(result):
         is_high_quality_signal(result)
         and result.get("score", 0) >= 92
         and result.get("win_probability", 0) >= 70
-        and result.get("risk_reward", 0) >= 1.0
-        and result.get("adx", 0) >= 27
+        and result.get("risk_reward", 0) >= 0.90
+        and result.get("adx", 0) >= 24
     )
 
 def analyze_symbol_safe(symbol):
