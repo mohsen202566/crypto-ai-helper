@@ -165,7 +165,6 @@ def mtf_alignment_score(result):
 def mtf_alignment_count(result):
     return mtf_alignment_score(result)
 
-
 def soft_confirmation_bonus(result):
     bonus = 0
     direction = result.get("direction")
@@ -251,14 +250,13 @@ def is_high_quality_signal(result):
 
     return True
 
-
 def is_very_safe_signal(result):
     return (
         is_high_quality_signal(result)
-        and result.get("score", 0) >= 92
-        and result.get("win_probability", 0) >= 70
-        and result.get("risk_reward", 0) >= 1.0
-        and result.get("adx", 0) >= 27
+        and result.get("score", 0) >= 90
+        and result.get("win_probability", 0) >= 68
+        and result.get("risk_reward", 0) >= 0.75
+        and result.get("adx", 0) >= 18
     )
 
 def analyze_symbol_safe(symbol):
