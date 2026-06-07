@@ -157,8 +157,8 @@ def trend_direction(df):
     return "range"
 
 
-def buy_sell_power(df):
-    recent = df.tail(20)
+def buy_sell_power(df, candles=20):
+    recent = df.tail(candles)
 
     green_volume = recent[recent["close"] > recent["open"]]["volume"].sum()
     red_volume = recent[recent["close"] < recent["open"]]["volume"].sum()
@@ -623,8 +623,8 @@ def score_macro_trend(df_1d, df_4h, df_1h, df_30m):
         "30M": trend_direction(df_30m),
     }
 
-    # وزن‌دهی نسخه اسکالپ 5 تا 15 دقیقه:
-    # 30M ساختار مهم می‌دهد، 1H/4H فقط جهت کلی را سنگین ولی کنترل‌شده مشخص می‌کنند.
+    # نسخه اسکالپ 5 تا 15 دقیقه:
+    # 4H و 1H جهت کلی می‌دهند، 30M کیفیت ستاپ را می‌سنجد.
     weights = {
         "1D": 2,
         "4H": 5,
@@ -660,7 +660,8 @@ def score_entry(df_15m, df_5m):
     last_15 = df_15m.iloc[-1]
     last_5 = df_5m.iloc[-1]
 
-    buy_power, sell_power = buy_sell_power(df_5m)
+    buy_power, sell_power = buy_sell_power(df_5m, candles=20)
+    fast_buy_power, fast_sell_power = buy_sell_power(df_5m, candles=6)
 
     if last_15["close"] > last_15["ema20"] > last_15["ema50"]:
         long_score += 24
@@ -687,12 +688,20 @@ def score_entry(df_15m, df_5m):
         reasons_short.append("RSI مناسب برای شورت در 5M")
 
     if buy_power >= 62:
+        long_score += 10
+        reasons_long.append("قدرت خرید کلی بالا در تایم ورود")
+
+    if fast_buy_power >= 62:
         long_score += 14
-        reasons_long.append("قدرت خرید بالا در تایم ورود")
+        reasons_long.append("قدرت خرید سریع در 5M بالا است")
 
     if sell_power >= 62:
+        short_score += 10
+        reasons_short.append("قدرت فروش کلی بالا در تایم ورود")
+
+    if fast_sell_power >= 62:
         short_score += 14
-        reasons_short.append("قدرت فروش بالا در تایم ورود")
+        reasons_short.append("قدرت فروش سریع در 5M بالا است")
 
     pattern = candle_pattern(df_5m)
     # Multi-candle confirmation was intentionally removed in the simple balanced version.
@@ -718,6 +727,30 @@ def score_entry(df_15m, df_5m):
         short_score += 6
         reasons_long.append("ADX قوی در 15M")
         reasons_short.append("ADX قوی در 15M")
+
+    # تریگر سریع مومنتوم برای اسکالپ:
+    # شیب MACD Histogram + EMA + VWAP + Power سریع 5M
+    try:
+        prev_5 = df_5m.iloc[-2]
+        if (
+            last_5["close"] > last_5["ema20"]
+            and last_5["close"] > last_5["vwap"]
+            and last_5["macd_hist"] > prev_5["macd_hist"]
+            and fast_buy_power >= 58
+        ):
+            long_score += 12
+            reasons_long.append("تریگر سریع لانگ در 5M فعال است")
+
+        if (
+            last_5["close"] < last_5["ema20"]
+            and last_5["close"] < last_5["vwap"]
+            and last_5["macd_hist"] < prev_5["macd_hist"]
+            and fast_sell_power >= 58
+        ):
+            short_score += 12
+            reasons_short.append("تریگر سریع شورت در 5M فعال است")
+    except Exception:
+        pass
 
     return long_score, short_score, reasons_long, reasons_short, buy_power, sell_power, pattern, multi_candle
 
@@ -934,8 +967,7 @@ def apply_direction_conflict_penalties(
             long_score -= 3
             reasons_long.append("قدرت فروش اندکی از خرید بالاتر است")
 
-    # Order Block در نسخه اسکالپ فقط اثر نرم دارد:
-    # هم‌جهت امتیاز مثبت سبک می‌دهد و خلاف جهت فقط جریمه 6 امتیازی است، نه رد کامل سیگنال.
+    # Order Block در نسخه اسکالپ فقط اثر نرم دارد: هم‌جهت +5 و خلاف جهت -6.
     if order_block == "bullish_order_block":
         short_score -= 6
         reasons_short.append("Order Block صعودی خلاف شورت است؛ جریمه نرم اعمال شد")
@@ -960,27 +992,27 @@ def normalize_score_by_quality(score, rr, raw_direction, pattern, multi_candle, 
     if raw_direction == "NO TRADE":
         return score
 
-    if rr < 0.8:
+    if rr < 0.60:
         score = min(score, 74)
-    elif rr < 1.0:
+    elif rr < 0.75:
         score = min(score, 82)
-    elif rr < 1.2:
+    elif rr < 0.95:
         score = min(score, 90)
 
     return cap_score(score)
 
 def calculate_trade_levels(raw_direction, price, atr, support=None, resistance=None):
     """
-    TP/SL حرفه‌ای و نرم:
-    - TP1 قبل از حمایت/مقاومت قرار می‌گیرد، نه روی خود سطح.
+    TP/SL اسکالپی و نرم:
+    - TP1 برای اسکالپ نزدیک‌تر محاسبه می‌شود و قبل از حمایت/مقاومت قرار می‌گیرد.
     - SL کمی پشت ناحیه ساختاری/ATR قرار می‌گیرد تا با نویز کوچک نخورد.
     """
     buffer = atr * 0.22
 
     if raw_direction == "LONG":
         stop_loss = price - (atr * 1.30)
-        tp1 = price + (atr * 1.55)
-        tp2 = price + (atr * 2.55)
+        tp1 = price + (atr * 0.95)
+        tp2 = price + (atr * 1.65)
 
         if support is not None and support < price:
             structural_sl = float(support) - buffer
@@ -992,7 +1024,7 @@ def calculate_trade_levels(raw_direction, price, atr, support=None, resistance=N
             adjusted_tp1 = float(resistance) - buffer
             if adjusted_tp1 > price:
                 tp1 = min(tp1, adjusted_tp1)
-            adjusted_tp2 = float(resistance) + (atr * 0.35)
+            adjusted_tp2 = float(resistance) + (atr * 0.25)
             if adjusted_tp2 > price:
                 tp2 = min(tp2, adjusted_tp2)
 
@@ -1000,8 +1032,8 @@ def calculate_trade_levels(raw_direction, price, atr, support=None, resistance=N
 
     if raw_direction == "SHORT":
         stop_loss = price + (atr * 1.30)
-        tp1 = price - (atr * 1.55)
-        tp2 = price - (atr * 2.55)
+        tp1 = price - (atr * 0.95)
+        tp2 = price - (atr * 1.65)
 
         if resistance is not None and resistance > price:
             structural_sl = float(resistance) + buffer
@@ -1012,7 +1044,7 @@ def calculate_trade_levels(raw_direction, price, atr, support=None, resistance=N
             adjusted_tp1 = float(support) + buffer
             if adjusted_tp1 < price:
                 tp1 = max(tp1, adjusted_tp1)
-            adjusted_tp2 = float(support) - (atr * 0.35)
+            adjusted_tp2 = float(support) - (atr * 0.25)
             if adjusted_tp2 < price:
                 tp2 = max(tp2, adjusted_tp2)
 
@@ -1061,8 +1093,10 @@ def calculate_risk_level(raw_direction, score, liquidity_risk, funding_rate, adx
     if spread_percent is not None and spread_percent > 0.08:
         risk += 2
 
-    if rr < 1:
+    if rr < 0.70:
         risk += 2
+    elif rr < 0.90:
+        risk += 1
 
     if risk >= 4:
         return "بالا"
@@ -1078,10 +1112,10 @@ def entry_grade(score, risk_level, rr, final_direction):
         return "Reject"
 
     # حرفه‌ای اما خشک نشود: گریدها کمی سخت‌تر از نسخه ساده‌اند، ولی سیگنال‌های خوب حذف نمی‌شوند.
-    if score >= 94 and rr >= 1.05 and risk_level != "بالا":
+    if score >= 94 and rr >= 0.90 and risk_level != "بالا":
         return "A+"
 
-    if score >= 85 and rr >= 0.90 and risk_level != "بالا":
+    if score >= 85 and rr >= 0.70 and risk_level != "بالا":
         return "A"
 
     return "Reject"
@@ -1092,7 +1126,7 @@ def win_probability(score, risk_level, rr, adx, grade):
     """
     p = 40 + int(score * 0.28)
     p += 6 if risk_level == "پایین" else 2 if risk_level == "متوسط" else -4
-    p += 5 if rr >= 1.3 else 2 if rr >= 1.0 else -5
+    p += 5 if rr >= 1.0 else 2 if rr >= 0.75 else -5
     p += 3 if adx >= 24 else -5 if adx < 18 else -2 if adx < 20 else 0
     p += 4 if grade == "A+" else 2 if grade == "A" else -5
     return max(0, min(p, 92))
@@ -1394,7 +1428,7 @@ def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, s
         if power_gap < 6:
             reasons_block.append("اختلاف قدرت خرید نسبت به فروش برای لانگ حداقل ۶٪ نیست")
             return False, reasons_block, "متوسط", "none", "none"
-        # Order Block خلاف لانگ دیگر رد کامل نیست؛ اثر آن قبلاً به صورت جریمه نرم در امتیاز اعمال شده است.
+        # Order Block خلاف لانگ دیگر رد کامل نیست؛ اثر آن قبلاً به صورت جریمه نرم اعمال شده است.
         if fvg == "bearish_fvg" and score < 88:
             reasons_block.append("FVG نزولی خلاف لانگ است و امتیاز برای عبور کافی نیست")
             return False, reasons_block, "متوسط", "none", "none"
@@ -1403,7 +1437,7 @@ def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, s
         if power_gap > -6:
             reasons_block.append("اختلاف قدرت فروش نسبت به خرید برای شورت حداقل ۶٪ نیست")
             return False, reasons_block, "متوسط", "none", "none"
-        # Order Block خلاف شورت دیگر رد کامل نیست؛ اثر آن قبلاً به صورت جریمه نرم در امتیاز اعمال شده است.
+        # Order Block خلاف شورت دیگر رد کامل نیست؛ اثر آن قبلاً به صورت جریمه نرم اعمال شده است.
         if fvg == "bullish_fvg" and score < 88:
             reasons_block.append("FVG صعودی خلاف شورت است و امتیاز برای عبور کافی نیست")
             return False, reasons_block, "متوسط", "none", "none"
