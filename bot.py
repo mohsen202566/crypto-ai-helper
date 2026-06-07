@@ -212,18 +212,17 @@ def build_analysis_text(result):
 قیمت فعلی: {result['price']}
 
 جهت نهایی: {fa_direction(result['direction'])}
-جهت تحلیل: {fa_direction(result.get('raw_direction'))}
-
-امتیاز: {result['score']}/100
-احتمال موفقیت: {safe(result.get('win_probability'))}٪
-گرید: {safe(result.get('entry_grade'))}
+حالت ورود: {safe(result.get('entry_mode'))}
+تازگی حرکت: {safe(result.get('freshness'))}
+تعداد تاییدیه ورود: {safe(result.get('predictive_confirmations'))}
 ریسک: {safe(result.get('risk_level'))}
 ریسک به ریوارد: {safe(result.get('risk_reward'))}
 
-لانگ: {result['long_score']} | شورت: {result['short_score']}
-
-قدرت خرید: {result['buy_power']}٪
-قدرت فروش: {result['sell_power']}٪
+قدرت خرید 2 کندلی: {safe(result.get('power2_buy'))}٪
+قدرت فروش 2 کندلی: {safe(result.get('power2_sell'))}٪
+قدرت خرید 3 کندلی: {safe(result.get('power3_buy'))}٪
+قدرت فروش 3 کندلی: {safe(result.get('power3_sell'))}٪
+شتاب قدرت: {safe(result.get('power_acceleration'))}
 
 RSI: {result['rsi']}
 MACD: {result['macd']}
@@ -287,19 +286,21 @@ def send_best_signals(message, very_safe_only=False):
 
         msg += f"""
 {medals[i]} {r['symbol']}
-\u062c\u0647\u062a: {direction_fa}
-\u0627\u0645\u062a\u06cc\u0627\u0632: {r['score']}/100
-\u0627\u062d\u062a\u0645\u0627\u0644 \u0645\u0648\u0641\u0642\u06cc\u062a: {safe(r.get('win_probability'))}\u066a
-\u06af\u0631\u06cc\u062f: {safe(r.get('entry_grade'))}
-\u0631\u06cc\u0633\u06a9: {safe(r.get('risk_level'))}
-\u0631\u06cc\u0633\u06a9 \u0628\u0647 \u0631\u06cc\u0648\u0627\u0631\u062f: {safe(r.get('risk_reward'))}
-\u0627\u0639\u062a\u0628\u0627\u0631: {r['validity']}
-\u062a\u0627\u06cc\u0645\u200c\u0641\u0631\u06cc\u0645: {r['signal_timeframe']}
-\u0642\u06cc\u0645\u062a: {r['price']}
+جهت: {direction_fa}
+حالت ورود: {safe(r.get('entry_mode'))}
+تازگی حرکت: {safe(r.get('freshness'))}
+تاییدیه‌های ورود: {safe(r.get('predictive_confirmations'))}
+ریسک: {safe(r.get('risk_level'))}
+ریسک به ریوارد: {safe(r.get('risk_reward'))}
+اعتبار: {r['validity']}
+تایم‌فریم: {r['signal_timeframe']}
+قیمت: {r['price']}
+قدرت 2کندلی: خرید {safe(r.get('power2_buy'))}٪ / فروش {safe(r.get('power2_sell'))}٪
+قدرت 3کندلی: خرید {safe(r.get('power3_buy'))}٪ / فروش {safe(r.get('power3_sell'))}٪
 ADX: {safe(r.get('adx'))}
-\u0627\u0633\u067e\u0631\u062f: {safe(r.get('spread_percent'))}\u066a
-\u0646\u0631\u062e \u0641\u0627\u0646\u062f\u06cc\u0646\u06af: {safe(r.get('funding_rate'))}\u066a
-\u062d\u0627\u0644\u062a \u062e\u06cc\u0644\u06cc \u0627\u0645\u0646: {"\u0628\u0644\u0647 \u2705" if r.get("very_safe") else "\u062e\u06cc\u0631"}
+اسپرد: {safe(r.get('spread_percent'))}٪
+نرخ فاندینگ: {safe(r.get('funding_rate'))}٪
+حالت خیلی امن: {"بله ✅" if r.get("very_safe") else "خیر"}
 """
 
     bot.reply_to(message, msg)
@@ -313,9 +314,9 @@ def send_auto_signal_to_all_users(result):
 
 ارز: {result['symbol']}
 جهت: {direction_fa}
-امتیاز: {result['score']}/100
-احتمال موفقیت: {safe(result.get('win_probability'))}٪
-گرید: {safe(result.get('entry_grade'))}
+حالت ورود: {safe(result.get('entry_mode'))}
+تازگی حرکت: {safe(result.get('freshness'))}
+تاییدیه‌های ورود: {safe(result.get('predictive_confirmations'))}
 ریسک: {safe(result.get('risk_level'))}
 ریسک به ریوارد: {safe(result.get('risk_reward'))}
 
@@ -324,8 +325,11 @@ def send_auto_signal_to_all_users(result):
 حد سود 1: {result['tp1']}
 حد سود 2: {result['tp2']}
 
-قدرت خرید: {result['buy_power']}٪
-قدرت فروش: {result['sell_power']}٪
+قدرت خرید 2 کندلی: {safe(result.get('power2_buy'))}٪
+قدرت فروش 2 کندلی: {safe(result.get('power2_sell'))}٪
+قدرت خرید 3 کندلی: {safe(result.get('power3_buy'))}٪
+قدرت فروش 3 کندلی: {safe(result.get('power3_sell'))}٪
+شتاب قدرت: {safe(result.get('power_acceleration'))}
 RSI: {result['rsi']}
 ADX: {safe(result.get('adx'))}
 
