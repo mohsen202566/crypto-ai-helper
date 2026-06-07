@@ -592,13 +592,13 @@ def signal_validity(score, direction):
         return "سیگنال معتبر نیست"
 
     if score >= 90:
-        return "30 تا 60 دقیقه"
+        return "5 تا 15 دقیقه"
 
     if score >= 80:
-        return "30 تا 60 دقیقه"
+        return "5 تا 15 دقیقه"
 
     if score >= 70:
-        return "20 تا 45 دقیقه"
+        return "5 تا 10 دقیقه"
 
     return "اعتبار پایین"
 
@@ -607,7 +607,7 @@ def signal_timeframe(score, direction):
     if direction == "NO TRADE":
         return "بدون تایم‌فریم ورود"
 
-    return "15M تا 30M"
+    return "5M تا 15M"
 
 
 def score_macro_trend(df_1d, df_4h, df_1h, df_30m):
@@ -623,11 +623,13 @@ def score_macro_trend(df_1d, df_4h, df_1h, df_30m):
         "30M": trend_direction(df_30m),
     }
 
+    # وزن‌دهی نسخه اسکالپ 5 تا 15 دقیقه:
+    # 30M ساختار مهم می‌دهد، 1H/4H فقط جهت کلی را سنگین ولی کنترل‌شده مشخص می‌کنند.
     weights = {
-        "1D": 6,
-        "4H": 10,
-        "1H": 18,
-        "30M": 20,
+        "1D": 2,
+        "4H": 5,
+        "1H": 9,
+        "30M": 16,
     }
 
     for tf, trend in trends.items():
@@ -661,35 +663,35 @@ def score_entry(df_15m, df_5m):
     buy_power, sell_power = buy_sell_power(df_5m)
 
     if last_15["close"] > last_15["ema20"] > last_15["ema50"]:
-        long_score += 15
+        long_score += 24
         reasons_long.append("15M: قیمت بالای EMA20 و EMA50")
 
     if last_15["close"] < last_15["ema20"] < last_15["ema50"]:
-        short_score += 15
+        short_score += 24
         reasons_short.append("15M: قیمت زیر EMA20 و EMA50")
 
     if last_5["close"] > last_5["ema20"] and last_5["macd"] > last_5["macd_signal"]:
-        long_score += 15
+        long_score += 30
         reasons_long.append("5M: تایید ورود لانگ با EMA و MACD")
 
     if last_5["close"] < last_5["ema20"] and last_5["macd"] < last_5["macd_signal"]:
-        short_score += 15
+        short_score += 30
         reasons_short.append("5M: تایید ورود شورت با EMA و MACD")
 
     if 45 <= last_5["rsi"] <= 68:
-        long_score += 10
+        long_score += 12
         reasons_long.append("RSI مناسب برای لانگ در 5M")
 
     if 32 <= last_5["rsi"] <= 55:
-        short_score += 10
+        short_score += 12
         reasons_short.append("RSI مناسب برای شورت در 5M")
 
     if buy_power >= 62:
-        long_score += 10
+        long_score += 14
         reasons_long.append("قدرت خرید بالا در تایم ورود")
 
     if sell_power >= 62:
-        short_score += 10
+        short_score += 14
         reasons_short.append("قدرت فروش بالا در تایم ورود")
 
     pattern = candle_pattern(df_5m)
@@ -743,11 +745,11 @@ def score_smart_money(df_15m, df_5m):
         reasons_short.append("FVG نزولی، اثر سبک")
 
     if order_block == "bullish_order_block":
-        long_score += 3
+        long_score += 5
         reasons_long.append("Order Block صعودی هم‌جهت")
 
     if order_block == "bearish_order_block":
-        short_score += 3
+        short_score += 5
         reasons_short.append("Order Block نزولی هم‌جهت")
 
     return long_score, short_score, reasons_long, reasons_short, "none", "none", fvg, order_block
@@ -932,13 +934,14 @@ def apply_direction_conflict_penalties(
             long_score -= 3
             reasons_long.append("قدرت فروش اندکی از خرید بالاتر است")
 
-    # Order Block خلاف جهت، قبل از فیلتر نهایی هم امتیاز طرف اشتباه را سنگین کم می‌کند.
+    # Order Block در نسخه اسکالپ فقط اثر نرم دارد:
+    # هم‌جهت امتیاز مثبت سبک می‌دهد و خلاف جهت فقط جریمه 6 امتیازی است، نه رد کامل سیگنال.
     if order_block == "bullish_order_block":
-        short_score -= 18
-        reasons_short.append("Order Block صعودی خلاف شورت است")
+        short_score -= 6
+        reasons_short.append("Order Block صعودی خلاف شورت است؛ جریمه نرم اعمال شد")
     elif order_block == "bearish_order_block":
-        long_score -= 18
-        reasons_long.append("Order Block نزولی خلاف لانگ است")
+        long_score -= 6
+        reasons_long.append("Order Block نزولی خلاف لانگ است؛ جریمه نرم اعمال شد")
 
     # FVG خلاف جهت اثر سبک ولی واقعی دارد.
     if fvg == "bullish_fvg":
@@ -1112,12 +1115,12 @@ def calculate_setup_zone(raw_direction, price, atr):
     if raw_direction == "LONG":
         zone_low = price - (atr * 0.35)
         zone_high = price + (atr * 0.10)
-        trigger = "ورود لانگ فقط بعد از حفظ ناحیه ورود و تایید کندل صعودی در 15M/30M"
+        trigger = "ورود لانگ فقط بعد از حفظ ناحیه ورود و تایید کندل صعودی در 5M/15M"
 
     elif raw_direction == "SHORT":
         zone_low = price - (atr * 0.10)
         zone_high = price + (atr * 0.35)
-        trigger = "ورود شورت فقط بعد از حفظ ناحیه ورود و تایید کندل نزولی در 15M/30M"
+        trigger = "ورود شورت فقط بعد از حفظ ناحیه ورود و تایید کندل نزولی در 5M/15M"
 
     else:
         return "inactive", None, None, "ستاپ فعالی وجود ندارد"
@@ -1344,7 +1347,7 @@ def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, s
     - امتیاز حداقل 80 برای ورود دستی/لیست سیگنال
     - ADX تایم 15M باید حداقل 20 باشد
     - اختلاف Buy/Sell Power باید حداقل 6 درصد هم‌جهت باشد
-    - Order Block خلاف جهت، سیگنال را حذف می‌کند
+    - Order Block خلاف جهت فقط جریمه نرم دارد
     - FVG خلاف جهت حذف کامل نیست، اما اگر امتیاز خیلی قوی نباشد بلاک می‌کند
     """
     reasons_block = []
@@ -1391,9 +1394,7 @@ def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, s
         if power_gap < 6:
             reasons_block.append("اختلاف قدرت خرید نسبت به فروش برای لانگ حداقل ۶٪ نیست")
             return False, reasons_block, "متوسط", "none", "none"
-        if order_block == "bearish_order_block":
-            reasons_block.append("Order Block نزولی خلاف لانگ است؛ سیگنال حذف شد")
-            return False, reasons_block, "بالا", "none", "none"
+        # Order Block خلاف لانگ دیگر رد کامل نیست؛ اثر آن قبلاً به صورت جریمه نرم در امتیاز اعمال شده است.
         if fvg == "bearish_fvg" and score < 88:
             reasons_block.append("FVG نزولی خلاف لانگ است و امتیاز برای عبور کافی نیست")
             return False, reasons_block, "متوسط", "none", "none"
@@ -1402,9 +1403,7 @@ def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, s
         if power_gap > -6:
             reasons_block.append("اختلاف قدرت فروش نسبت به خرید برای شورت حداقل ۶٪ نیست")
             return False, reasons_block, "متوسط", "none", "none"
-        if order_block == "bullish_order_block":
-            reasons_block.append("Order Block صعودی خلاف شورت است؛ سیگنال حذف شد")
-            return False, reasons_block, "بالا", "none", "none"
+        # Order Block خلاف شورت دیگر رد کامل نیست؛ اثر آن قبلاً به صورت جریمه نرم در امتیاز اعمال شده است.
         if fvg == "bullish_fvg" and score < 88:
             reasons_block.append("FVG صعودی خلاف شورت است و امتیاز برای عبور کافی نیست")
             return False, reasons_block, "متوسط", "none", "none"
@@ -1552,7 +1551,7 @@ def analyze_symbol(symbol):
     last_15 = df_15m.iloc[-1]
     price = float(last["close"])
 
-    # برای معاملات 30 تا 60 دقیقه، ATR و ADX تایم 15M مناسب‌تر از 5M است.
+    # برای اسکالپ 5 تا 15 دقیقه، ATR و ADX تایم 15M مناسب‌تر از 5M است.
     atr = float(last_15["atr"])
     adx_value = float(last_15["adx"])
 
