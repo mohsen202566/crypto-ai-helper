@@ -201,7 +201,8 @@ def soft_confirmation_bonus(result):
 
 def is_high_quality_signal(result):
     """
-    دروازه اتوسیگنال برای Fast Pump/Dump Scalp Mode.
+    دروازه اتوسیگنال نسخه Predictive Trigger.
+    امتیاز 0 تا 100 دیگر شرط صدور سیگنال نیست؛ فقط تاییدیه ورود تازه مهم است.
     """
     if not result:
         return False
@@ -209,43 +210,43 @@ def is_high_quality_signal(result):
     if result.get("direction") == "NO TRADE":
         return False
 
-    if result.get("entry_grade") not in ["A+", "A"]:
+    if not result.get("entry_confirmed"):
         return False
 
-    if result.get("score", 0) < AUTO_SCAN_MIN_SCORE:
+    if result.get("entry_mode") != "PREDICTIVE_TRIGGER":
         return False
 
-    if result.get("win_probability", 0) < 56:
+    if result.get("freshness") not in ["HIGH", "MEDIUM"]:
         return False
 
-    if result.get("risk_reward", 0) < 0.60:
+    if int(result.get("predictive_confirmations") or 0) < 4:
         return False
 
-    if result.get("adx", 0) < 13:
+    if result.get("late_entry"):
         return False
 
-    try:
-        buy_power = float(result.get("buy_power", 50))
-        sell_power = float(result.get("sell_power", 50))
-    except Exception:
-        buy_power = 50
-        sell_power = 50
+    if result.get("risk_reward", 0) < 0.50:
+        return False
 
-    direction = result.get("direction")
-    power_gap = buy_power - sell_power
-
-    if direction == "LONG":
-        if power_gap < 4:
-            return False
-    elif direction == "SHORT":
-        if power_gap > -4:
-            return False
+    if result.get("adx", 0) < 10:
+        return False
 
     spread = result.get("spread_percent")
     if spread is not None and spread > 0.12:
         return False
 
-    if mtf_alignment_score(result) < 12:
+    try:
+        buy2 = float(result.get("power2_buy", 50))
+        sell2 = float(result.get("power2_sell", 50))
+        buy3 = float(result.get("power3_buy", 50))
+        sell3 = float(result.get("power3_sell", 50))
+    except Exception:
+        buy2 = sell2 = buy3 = sell3 = 50
+
+    direction = result.get("direction")
+    if direction == "LONG" and not (buy2 >= 58 and buy3 >= 55):
+        return False
+    if direction == "SHORT" and not (sell2 >= 58 and sell3 >= 55):
         return False
 
     return True
@@ -253,10 +254,10 @@ def is_high_quality_signal(result):
 def is_very_safe_signal(result):
     return (
         is_high_quality_signal(result)
-        and result.get("score", 0) >= 90
-        and result.get("win_probability", 0) >= 68
-        and result.get("risk_reward", 0) >= 0.75
-        and result.get("adx", 0) >= 18
+        and result.get("freshness") == "HIGH"
+        and int(result.get("predictive_confirmations") or 0) >= 5
+        and result.get("risk_reward", 0) >= 0.60
+        and result.get("adx", 0) >= 13
     )
 
 def analyze_symbol_safe(symbol):
@@ -291,11 +292,12 @@ def get_best_signals(limit=5, very_safe_only=False):
             if is_high_quality_signal(result):
                 results.append(result)
 
+    freshness_rank = {"HIGH": 2, "MEDIUM": 1, "LOW": 0}
     results = sorted(
         results,
         key=lambda x: (
-            x.get("score", 0),
-            x.get("win_probability", 0),
+            freshness_rank.get(x.get("freshness"), 0),
+            int(x.get("predictive_confirmations") or 0),
             x.get("risk_reward", 0),
         ),
         reverse=True,
@@ -306,9 +308,6 @@ def get_best_signals(limit=5, very_safe_only=False):
 
 def should_send_auto_signal(result):
     if not is_high_quality_signal(result):
-        return False
-
-    if result.get("score", 0) < AUTO_SIGNAL_SCORE:
         return False
 
     symbol = result.get("symbol")
