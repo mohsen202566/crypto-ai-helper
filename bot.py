@@ -233,6 +233,64 @@ def fa_general(value):
     return data.get(value, value)
 
 
+
+def signal_risk_badge(result):
+    """
+    فقط برچسب نمایشی سیگنال را می‌سازد.
+    این تابع روی تحلیل، ورود، اسکن، آمار یا مانیتورینگ هیچ اثری ندارد.
+    """
+    try:
+        if not result or result.get("direction") == "NO TRADE":
+            return ""
+
+        risky_reasons = []
+
+        risk_level = result.get("risk_level")
+        if risk_level and risk_level != "پایین":
+            risky_reasons.append("ریسک پایین نیست")
+
+        try:
+            rr = float(result.get("risk_reward", 0) or 0)
+            if rr < 0.70:
+                risky_reasons.append("ریسک به ریوارد ضعیف است")
+        except Exception:
+            pass
+
+        try:
+            confirmations = int(result.get("predictive_confirmations", 0) or 0)
+            if confirmations <= 4:
+                risky_reasons.append("تاییدیه‌های ورود حداقلی است")
+        except Exception:
+            pass
+
+        freshness = result.get("freshness")
+        if freshness == "LOW":
+            risky_reasons.append("تازگی حرکت پایین است")
+
+        if result.get("late_entry"):
+            risky_reasons.append("ورود دیرهنگام است")
+
+        if result.get("tp_space_ok") is False:
+            risky_reasons.append("فضای TP ضعیف است")
+
+        if result.get("trap_risk"):
+            risky_reasons.append("نزدیک حمایت/مقاومت مهم است")
+
+        try:
+            spread = float(result.get("spread_percent", 0) or 0)
+            if spread > 0.08:
+                risky_reasons.append("اسپرد بالاست")
+        except Exception:
+            pass
+
+        if risky_reasons:
+            return "⚠️ سیگنال پرریسک"
+
+        return "✅ سیگنال عادی"
+
+    except Exception:
+        return "✅ سیگنال عادی"
+
 def build_trade_levels(result):
     if result.get("stop_loss") is None:
         return f"""
@@ -270,6 +328,8 @@ def build_analysis_text(result):
     trade_levels = build_trade_levels(result)
 
     return f"""
+{signal_risk_badge(result)}
+
 📊 تحلیل فیوچرز {result['symbol']}
 
 قیمت فعلی: {result['price']}
@@ -349,6 +409,7 @@ def send_best_signals(message, very_safe_only=False):
 
         msg += f"""
 {medals[i]} {r['symbol']}
+{signal_risk_badge(r)}
 جهت: {direction_fa}
 حالت ورود: {safe(r.get('entry_mode'))}
 تازگی حرکت: {safe(r.get('freshness'))}
@@ -373,6 +434,8 @@ def send_auto_signal_to_all_users(result):
     direction_fa = "لانگ" if result["direction"] == "LONG" else "شورت"
 
     text = f"""
+{signal_risk_badge(result)}
+
 🚨 سیگنال خودکار
 
 ارز: {result['symbol']}
