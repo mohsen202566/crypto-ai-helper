@@ -1024,7 +1024,7 @@ def calculate_trade_levels(raw_direction, price, atr, support=None, resistance=N
 
     if raw_direction == "LONG":
         stop_loss = price - (atr * 1.20)
-        tp1 = price + (atr * 0.70)
+        tp1 = price + (atr * 0.80)
         tp2 = price + (atr * 1.80)
 
         if support is not None and support < price:
@@ -1044,7 +1044,7 @@ def calculate_trade_levels(raw_direction, price, atr, support=None, resistance=N
 
     if raw_direction == "SHORT":
         stop_loss = price + (atr * 1.20)
-        tp1 = price - (atr * 0.70)
+        tp1 = price - (atr * 0.80)
         tp2 = price - (atr * 1.80)
 
         if resistance is not None and resistance > price:
@@ -1387,15 +1387,13 @@ def apply_conflict_penalties(
 
 
 def _power_snapshot(df_5m):
-    """قدرت خرید/فروش سریع برای موتور پیش‌بینی؛ تصمیم اصلی تستی با 1 و 2 کندل است."""
-    buy1, sell1 = buy_sell_power(df_5m, candles=1)
+    """قدرت خرید/فروش سریع برای موتور پیش‌بینی؛ تصمیم اصلی با 2 و 3 کندل است."""
     buy2, sell2 = buy_sell_power(df_5m, candles=2)
     buy3, sell3 = buy_sell_power(df_5m, candles=3)
     buy6, sell6 = buy_sell_power(df_5m, candles=6)
     prev3 = df_5m.iloc[:-1]
     prev_buy3, prev_sell3 = buy_sell_power(prev3, candles=3)
     return {
-        "buy1": float(buy1), "sell1": float(sell1),
         "buy2": float(buy2), "sell2": float(sell2),
         "buy3": float(buy3), "sell3": float(sell3),
         "buy6": float(buy6), "sell6": float(sell6),
@@ -1457,8 +1455,8 @@ def predictive_entry_decision(df_4h, df_1h, df_30m, df_15m, df_5m, price, atr, s
     strong_context_long_block = trend_1h in ["bearish"] and trend_4h in ["bearish", "weak_bearish"]
     strong_context_short_block = trend_1h in ["bullish"] and trend_4h in ["bullish", "weak_bullish"]
 
-    if p["buy1"] >= 100 and p["buy2"] >= 58:
-        confirmations_long += 1; reasons_long.append("قدرت خرید 1 تا 2 کندلی فعال است")
+    if p["buy2"] >= 58 and p["buy3"] >= 55:
+        confirmations_long += 1; reasons_long.append("قدرت خرید 2 تا 3 کندلی فعال است")
     if p["buy_accel"] >= 5 or p["buy2"] >= 66:
         confirmations_long += 1; reasons_long.append("شتاب قدرت خرید تازه دیده شد")
     if macd_rising or macd_turn_up:
@@ -1470,8 +1468,8 @@ def predictive_entry_decision(df_4h, df_1h, df_30m, df_15m, df_5m, price, atr, s
     if float(last15["close"]) >= float(last15["ema20"]):
         confirmations_long += 1; reasons_long.append("15M تایید نرم لانگ می‌دهد")
 
-    if p["sell1"] >= 100 and p["sell2"] >= 58:
-        confirmations_short += 1; reasons_short.append("قدرت فروش 1 تا 2 کندلی فعال است")
+    if p["sell2"] >= 58 and p["sell3"] >= 55:
+        confirmations_short += 1; reasons_short.append("قدرت فروش 2 تا 3 کندلی فعال است")
     if p["sell_accel"] >= 5 or p["sell2"] >= 66:
         confirmations_short += 1; reasons_short.append("شتاب قدرت فروش تازه دیده شد")
     if macd_falling or macd_turn_down:
