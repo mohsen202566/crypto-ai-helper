@@ -39,6 +39,54 @@ def safe(value, default="\u0646\u0627\u0645\u0634\u062e\u0635"):
     return value
 
 
+def send_long_message(chat_id, text, reply_to_message_id=None, limit=3800):
+    """
+    ارسال امن پیام‌های بلند تلگرام.
+    اگر گزارش آمار بلند باشد، به چند پیام کوچک‌تر تقسیم می‌شود
+    تا ربات به خاطر محدودیت تلگرام ساکت نماند.
+    """
+    if text is None:
+        text = "گزارش خالی است."
+
+    text = str(text)
+
+    if not text.strip():
+        text = "گزارش خالی است."
+
+    chunks = []
+    current = ""
+
+    for line in text.split("\n"):
+        while len(line) > limit:
+            part = line[:limit]
+            line = line[limit:]
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(part)
+
+        candidate = current + ("\n" if current else "") + line
+
+        if len(candidate) > limit:
+            if current:
+                chunks.append(current)
+            current = line
+        else:
+            current = candidate
+
+    if current:
+        chunks.append(current)
+
+    if not chunks:
+        chunks = ["گزارش خالی است."]
+
+    for i, chunk in enumerate(chunks):
+        if i == 0 and reply_to_message_id:
+            bot.send_message(chat_id, chunk, reply_to_message_id=reply_to_message_id)
+        else:
+            bot.send_message(chat_id, chunk)
+
+
 def remember_signal_result(sent_message, result):
     try:
         if result and result.get("direction") != "NO TRADE":
@@ -517,9 +565,23 @@ def handle_message(message):
         return
 
     if is_stats_command(text):
-        days = parse_days_from_text(text)
-        report = get_stats_report(days)
-        bot.reply_to(message, report)
+        try:
+            days = parse_days_from_text(text)
+            report = get_stats_report(days)
+
+            if not report or not str(report).strip():
+                report = "📊 آمار خالی است یا هنوز سیگنال بسته‌شده‌ای ثبت نشده."
+
+            send_long_message(
+                message.chat.id,
+                report,
+                reply_to_message_id=message.message_id
+            )
+
+        except Exception as e:
+            print("STATS REPORT ERROR:", str(e))
+            bot.reply_to(message, f"❌ خطا در دریافت آمار:\n{e}")
+
         return
 
     profit_calc = parse_profit_calc_text(text)
