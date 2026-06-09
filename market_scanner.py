@@ -41,21 +41,13 @@ def _analyze_symbol_market(symbol):
         return None
 
 
-def get_market_status_text():
-    now = int(time.time())
-
-    if MARKET_STATUS_CACHE["text"] and now - MARKET_STATUS_CACHE["time"] < CACHE_SECONDS:
-        return MARKET_STATUS_CACHE["text"]
-
+def get_market_breadth():
     symbols = sorted(list(set(COINS_FA.values())))[:MAX_MARKET_SCAN_SYMBOLS]
 
     bullish = 0
     bearish = 0
     ranging = 0
     checked = 0
-
-    btc_status = "نامشخص"
-    eth_status = "نامشخص"
 
     for symbol in symbols:
         status = _analyze_symbol_market(symbol)
@@ -72,12 +64,72 @@ def get_market_status_text():
         else:
             ranging += 1
 
-        if symbol == "BTCUSDT":
-            btc_status = _market_label(status)
-        elif symbol == "ETHUSDT":
-            eth_status = _market_label(status)
-
     if checked == 0:
+        return {
+            "checked": 0,
+            "bullish": 0,
+            "bearish": 0,
+            "range": 0,
+            "bullish_pct": 0,
+            "bearish_pct": 0,
+            "range_pct": 0,
+            "bias": "unknown",
+            "bias_text": "نامشخص",
+            "power": "ضعیف",
+        }
+
+    bullish_pct = round((bullish / checked) * 100)
+    bearish_pct = round((bearish / checked) * 100)
+    range_pct = round((ranging / checked) * 100)
+
+    if bullish_pct >= 60:
+        bias = "bullish"
+        bias_text = "صعودی"
+        power = "قوی" if bullish_pct >= 70 else "متوسط"
+    elif bearish_pct >= 60:
+        bias = "bearish"
+        bias_text = "نزولی"
+        power = "قوی" if bearish_pct >= 70 else "متوسط"
+    elif range_pct >= 50:
+        bias = "range"
+        bias_text = "رنج"
+        power = "ضعیف"
+    elif bullish_pct > bearish_pct:
+        bias = "weak_bullish"
+        bias_text = "رنج متمایل به صعود"
+        power = "متوسط"
+    elif bearish_pct > bullish_pct:
+        bias = "weak_bearish"
+        bias_text = "رنج متمایل به نزول"
+        power = "متوسط"
+    else:
+        bias = "neutral"
+        bias_text = "خنثی"
+        power = "ضعیف"
+
+    return {
+        "checked": checked,
+        "bullish": bullish,
+        "bearish": bearish,
+        "range": ranging,
+        "bullish_pct": bullish_pct,
+        "bearish_pct": bearish_pct,
+        "range_pct": range_pct,
+        "bias": bias,
+        "bias_text": bias_text,
+        "power": power,
+    }
+
+
+def get_market_status_text():
+    now = int(time.time())
+
+    if MARKET_STATUS_CACHE["text"] and now - MARKET_STATUS_CACHE["time"] < CACHE_SECONDS:
+        return MARKET_STATUS_CACHE["text"]
+
+    data = get_market_breadth()
+
+    if data["checked"] == 0:
         text = (
             "📊 وضعیت بازار\n\n"
             "داده کافی برای محاسبه وضعیت بازار دریافت نشد.\n"
@@ -87,41 +139,17 @@ def get_market_status_text():
         MARKET_STATUS_CACHE["text"] = text
         return text
 
-    bullish_pct = round((bullish / checked) * 100)
-    bearish_pct = round((bearish / checked) * 100)
-    range_pct = round((ranging / checked) * 100)
-
-    if bullish_pct >= 60:
-        market_result = "بازار صعودی است؛ لانگ‌ها برتری دارند."
-        market_power = "قوی" if bullish_pct >= 70 else "متوسط"
-    elif bearish_pct >= 60:
-        market_result = "بازار نزولی است؛ شورت‌ها برتری دارند."
-        market_power = "قوی" if bearish_pct >= 70 else "متوسط"
-    elif range_pct >= 50:
-        market_result = "بازار فعلاً رنج است و جهت واضحی ندارد."
-        market_power = "ضعیف"
-    elif bullish_pct > bearish_pct:
-        market_result = "بازار رنج متمایل به صعود است."
-        market_power = "متوسط"
-    elif bearish_pct > bullish_pct:
-        market_result = "بازار رنج متمایل به نزول است."
-        market_power = "متوسط"
-    else:
-        market_result = "بازار خنثی است."
-        market_power = "ضعیف"
-
     text = (
         "📊 وضعیت بازار\n\n"
-        f"🟢 صعودی: {bullish_pct}٪\n"
-        f"🔴 نزولی: {bearish_pct}٪\n"
-        f"⚪ رنج: {range_pct}٪\n\n"
-        f"قدرت بازار: {market_power}\n\n"
-        f"BTC: {btc_status}\n"
-        f"ETH: {eth_status}\n\n"
-        f"نتیجه:\n{market_result}"
+        f"تعداد ارزهای بررسی‌شده: {data['checked']}\n"
+        f"🟢 صعودی: {data['bullish']} ارز | {data['bullish_pct']}٪\n"
+        f"🔴 نزولی: {data['bearish']} ارز | {data['bearish_pct']}٪\n"
+        f"⚪ رنج: {data['range']} ارز | {data['range_pct']}٪\n\n"
+        f"نتیجه کلی: بازار {data['bias_text']} است.\n"
+        f"قدرت وضعیت: {data['power']}\n\n"
+        "این گزارش فقط وضعیت کلی بازار را نشان می‌دهد و به تنهایی سیگنال ورود نیست."
     )
 
     MARKET_STATUS_CACHE["time"] = now
     MARKET_STATUS_CACHE["text"] = text
-
     return text
