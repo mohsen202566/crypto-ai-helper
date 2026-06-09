@@ -4,12 +4,13 @@ import telebot
 import threading
 import time
 
-from config import BOT_TOKEN, AUTO_SCAN_INTERVAL_MINUTES, TRACKER_CHECK_INTERVAL_SECONDS
+from config import BOT_TOKEN, AUTO_SCAN_INTERVAL_MINUTES, TRACKER_CHECK_INTERVAL_SECONDS, AUTO_TRACK_AUTO_SIGNALS
 from coins_fa import COINS_FA
 from analysis import analyze_symbol
 from scanner import get_best_signals, SCAN_SYMBOLS, should_send_auto_signal
 from market_scanner import get_market_status_text
 from users import is_user_allowed, is_owner, add_user, remove_user, list_users
+from diagnostics import format_error_report, log_exception
 from signal_tracker import (
     add_signal_to_tracking,
     check_active_signals,
@@ -39,54 +40,6 @@ def safe(value, default="\u0646\u0627\u0645\u0634\u062e\u0635"):
     return value
 
 
-def send_long_message(chat_id, text, reply_to_message_id=None, limit=3800):
-    """
-    ارسال امن پیام‌های بلند تلگرام.
-    اگر گزارش آمار بلند باشد، به چند پیام کوچک‌تر تقسیم می‌شود
-    تا ربات به خاطر محدودیت تلگرام ساکت نماند.
-    """
-    if text is None:
-        text = "گزارش خالی است."
-
-    text = str(text)
-
-    if not text.strip():
-        text = "گزارش خالی است."
-
-    chunks = []
-    current = ""
-
-    for line in text.split("\n"):
-        while len(line) > limit:
-            part = line[:limit]
-            line = line[limit:]
-            if current:
-                chunks.append(current)
-                current = ""
-            chunks.append(part)
-
-        candidate = current + ("\n" if current else "") + line
-
-        if len(candidate) > limit:
-            if current:
-                chunks.append(current)
-            current = line
-        else:
-            current = candidate
-
-    if current:
-        chunks.append(current)
-
-    if not chunks:
-        chunks = ["گزارش خالی است."]
-
-    for i, chunk in enumerate(chunks):
-        if i == 0 and reply_to_message_id:
-            bot.send_message(chat_id, chunk, reply_to_message_id=reply_to_message_id)
-        else:
-            bot.send_message(chat_id, chunk)
-
-
 def remember_signal_result(sent_message, result):
     try:
         if result and result.get("direction") != "NO TRADE":
@@ -114,23 +67,8 @@ def is_track_command(text):
 
 
 def is_stats_command(text):
-    """
-    دستور آمار را کمی منعطف‌تر تشخیص می‌دهد.
-    آمار، آمار 7، آمار 7 روز، آمار کل و حتی تایپ اشتباهی آمارا را می‌پذیرد.
-    """
-    clean = (text or "").strip()
-    clean = clean.replace("ي", "ی").replace("ك", "ک")
-    clean = " ".join(clean.split())
-
-    if clean in ["آمار", "آمارا", "امار", "امارا"]:
-        return True
-
-    return (
-        clean.startswith("آمار ")
-        or clean.startswith("آمارا ")
-        or clean.startswith("امار ")
-        or clean.startswith("امارا ")
-    )
+    clean = text.strip()
+    return clean == "\u0622\u0645\u0627\u0631" or clean.startswith("\u0622\u0645\u0627\u0631 ")
 
 
 def is_reset_stats_command(text):
@@ -233,64 +171,6 @@ def fa_general(value):
     return data.get(value, value)
 
 
-
-def signal_risk_badge(result):
-    """
-    فقط برچسب نمایشی سیگنال را می‌سازد.
-    این تابع روی تحلیل، ورود، اسکن، آمار یا مانیتورینگ هیچ اثری ندارد.
-    """
-    try:
-        if not result or result.get("direction") == "NO TRADE":
-            return ""
-
-        risky_reasons = []
-
-        risk_level = result.get("risk_level")
-        if risk_level and risk_level != "پایین":
-            risky_reasons.append("ریسک پایین نیست")
-
-        try:
-            rr = float(result.get("risk_reward", 0) or 0)
-            if rr < 0.70:
-                risky_reasons.append("ریسک به ریوارد ضعیف است")
-        except Exception:
-            pass
-
-        try:
-            confirmations = int(result.get("predictive_confirmations", 0) or 0)
-            if confirmations <= 4:
-                risky_reasons.append("تاییدیه‌های ورود حداقلی است")
-        except Exception:
-            pass
-
-        freshness = result.get("freshness")
-        if freshness == "LOW":
-            risky_reasons.append("تازگی حرکت پایین است")
-
-        if result.get("late_entry"):
-            risky_reasons.append("ورود دیرهنگام است")
-
-        if result.get("tp_space_ok") is False:
-            risky_reasons.append("فضای TP ضعیف است")
-
-        if result.get("trap_risk"):
-            risky_reasons.append("نزدیک حمایت/مقاومت مهم است")
-
-        try:
-            spread = float(result.get("spread_percent", 0) or 0)
-            if spread > 0.08:
-                risky_reasons.append("اسپرد بالاست")
-        except Exception:
-            pass
-
-        if risky_reasons:
-            return "⚠️ سیگنال پرریسک"
-
-        return "✅ سیگنال عادی"
-
-    except Exception:
-        return "✅ سیگنال عادی"
-
 def build_trade_levels(result):
     if result.get("stop_loss") is None:
         return f"""
@@ -328,10 +208,9 @@ def build_analysis_text(result):
     trade_levels = build_trade_levels(result)
 
     return f"""
-{signal_risk_badge(result)}
-
 📊 تحلیل فیوچرز {result['symbol']}
 
+وضعیت ورود: {"✅ فعال" if result.get("entry_confirmed") else "👀 منتظر فعال‌سازی" if result.get("setup_waiting_activation") else "غیرفعال"}
 قیمت فعلی: {result['price']}
 
 جهت نهایی: {fa_direction(result['direction'])}
@@ -409,7 +288,6 @@ def send_best_signals(message, very_safe_only=False):
 
         msg += f"""
 {medals[i]} {r['symbol']}
-{signal_risk_badge(r)}
 جهت: {direction_fa}
 حالت ورود: {safe(r.get('entry_mode'))}
 تازگی حرکت: {safe(r.get('freshness'))}
@@ -433,11 +311,13 @@ ADX: {safe(r.get('adx'))}
 def send_auto_signal_to_all_users(result):
     direction_fa = "لانگ" if result["direction"] == "LONG" else "شورت"
 
+    title = "🚨 سیگنال آماده" if result.get("setup_waiting_activation") else "🚨 سیگنال خودکار"
+    entry_status_text = "👀 منتظر فعال‌سازی ورود" if result.get("setup_waiting_activation") else "✅ ورود فعال"
+
     text = f"""
-{signal_risk_badge(result)}
+{title}
 
-🚨 سیگنال خودکار
-
+وضعیت: {entry_status_text}
 ارز: {result['symbol']}
 جهت: {direction_fa}
 حالت ورود: {safe(result.get('entry_mode'))}
@@ -466,8 +346,13 @@ ADX: {safe(result.get('adx'))}
         try:
             sent = bot.send_message(user_id, text)
             remember_signal_result(sent, result)
+            if AUTO_TRACK_AUTO_SIGNALS:
+                try:
+                    add_signal_to_tracking(user_id=user_id, chat_id=user_id, message_id=sent.message_id, result=result)
+                except Exception as e:
+                    log_exception("ثبت خودکار مانیتورینگ", e, "bot.py", "send_auto_signal_to_all_users", result.get("symbol"))
         except Exception as e:
-            print("SEND AUTO SIGNAL ERROR:", user_id, str(e))
+            log_exception("ارسال سیگنال خودکار", e, "bot.py", "send_auto_signal_to_all_users", result.get("symbol"))
 
 def auto_signal_loop():
     time.sleep(60)
@@ -506,7 +391,7 @@ def signal_tracking_loop():
 
             for item in messages:
                 try:
-                    bot.send_message(item["chat_id"], item["message"])
+                    bot.send_message(item["chat_id"], item["message"], reply_to_message_id=item.get("reply_to_message_id"))
                 except Exception as e:
                     print("SEND TRACK RESULT ERROR:", str(e))
 
@@ -627,25 +512,6 @@ def handle_message(message):
             bot.reply_to(message, "❌ خطا در پاک کردن آمار.")
         return
 
-    if is_stats_command(text):
-        try:
-            days = parse_days_from_text(text)
-            report = get_stats_report(days)
-
-            if not report or not str(report).strip():
-                report = "📊 آمار خالی است یا هنوز سیگنال بسته‌شده‌ای ثبت نشده."
-
-            send_long_message(
-                message.chat.id,
-                report,
-                reply_to_message_id=message.message_id
-            )
-
-        except Exception as e:
-            print("STATS REPORT ERROR:", str(e))
-            bot.reply_to(message, f"❌ خطا در دریافت آمار:\n{e}")
-
-        return
 
     profit_calc = parse_profit_calc_text(text)
     if profit_calc:
@@ -685,6 +551,12 @@ def handle_message(message):
         )
 
         bot.reply_to(message, msg)
+        return
+
+    if is_stats_command(text):
+        days = parse_days_from_text(text)
+        report = get_stats_report(days)
+        bot.reply_to(message, report)
         return
 
     if "\u062e\u06cc\u0644\u06cc \u0627\u0645\u0646" in text or "very safe" in text.lower():
