@@ -665,11 +665,11 @@ def score_entry(df_15m, df_5m):
 
     # 15M فقط تایید نرم جهت است، نه ترمز سنگین ورود.
     if last_15["close"] > last_15["ema20"]:
-        long_score += 14
+        long_score += 20
         reasons_long.append("15M: جهت ورود لانگ را تایید نرم می‌کند")
 
     if last_15["close"] < last_15["ema20"]:
-        short_score += 14
+        short_score += 20
         reasons_short.append("15M: جهت ورود شورت را تایید نرم می‌کند")
 
     # 5M موتور اصلی ورود است.
