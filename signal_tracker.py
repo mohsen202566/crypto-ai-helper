@@ -233,6 +233,7 @@ def activate_pending_signal(signal, price):
     signal["activated_at_text"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     signal["activated_price"] = float(price)
     signal["last_checked_at"] = now_ts()
+    record_stat_event(signal, "ACTIVATED")
     return signal
 
 def close_pending_setup(signal, reason):
@@ -350,6 +351,7 @@ def add_signal_to_tracking(user_id, chat_id, message_id, result):
 
     active.append(signal)
     save_active_signals(active)
+    record_stat_event(signal, 'SETUP_CREATED')
 
     if initial_status == "PENDING_ACTIVATION":
         return True, f"👀 ستاپ {signal['symbol']} ذخیره شد و منتظر فعال‌سازی ورود است."
@@ -976,6 +978,21 @@ def parse_days_from_text(text):
     return 7
 
 
+
+def record_stat_event(signal, status):
+    stats = get_signal_stats()
+    item = {
+        "symbol": signal.get("symbol"),
+        "direction": signal.get("direction"),
+        "status": status,
+        "created_at": now_ts(),
+        "closed_at": now_ts()
+    }
+    stats.append(item)
+    save_signal_stats(stats)
+
+
+
 def get_stats_report(days=None):
     stats = get_signal_stats()
 
@@ -983,115 +1000,43 @@ def get_stats_report(days=None):
         start_ts = now_ts() - (days * 24 * 60 * 60)
         stats = [s for s in stats if s.get("closed_at", 0) >= start_ts]
 
-    total = len(stats)
+    setups = len([s for s in stats if s.get("status") == "SETUP_CREATED"])
+    activated = len([s for s in stats if s.get("status") == "ACTIVATED"])
+    cancelled = len([s for s in stats if s.get("status") == "CANCELLED"])
+    tp1 = len([s for s in stats if s.get("status") == "TP1"])
+    tp2 = len([s for s in stats if s.get("status") == "TP2"])
+    sl = len([s for s in stats if s.get("status") == "SL"])
 
-    if total == 0:
-        if days is None:
-            return "📊 هنوز هیچ سیگنال بسته‌شده‌ای در آمار کل وجود ندارد."
-        return f"📊 در {days} روز اخیر هیچ سیگنال بسته‌شده‌ای وجود ندارد."
-
-    wins_list = [s for s in stats if s.get("status") == "TP1"]
-    losses_list = [s for s in stats if s.get("status") == "SL"]
-
-    tp1_count = len(wins_list)
-    sl_count = len(losses_list)
-
-    win_rate = round((tp1_count / total) * 100, 1)
-
-    long_stats = [s for s in stats if s.get("direction") == "LONG"]
-    short_stats = [s for s in stats if s.get("direction") == "SHORT"]
-
-    def direction_report(items):
-        if not items:
-            return "0 سیگنال | برد: 0 | باخت: 0 | Win Rate: 0٪"
-
-        wins = len([x for x in items if x.get("status") == "TP1"])
-        losses = len([x for x in items if x.get("status") == "SL"])
-        wr = round((wins / len(items)) * 100, 1)
-
-        return f"{len(items)} سیگنال | برد: {wins} | باخت: {losses} | Win Rate: {wr}٪"
-
-    symbols = {}
-
-    for s in stats:
-        sym = s.get("symbol")
-        if sym not in symbols:
-            symbols[sym] = {"total": 0, "wins": 0, "losses": 0}
-
-        symbols[sym]["total"] += 1
-
-        if s.get("status") == "TP1":
-            symbols[sym]["wins"] += 1
-        elif s.get("status") == "SL":
-            symbols[sym]["losses"] += 1
-
-    sorted_symbols = sorted(
-        symbols.items(),
-        key=lambda x: (x[1]["wins"], x[1]["total"]),
-        reverse=True
-    )
-
-    top_symbols_text = ""
-
-    for sym, data in sorted_symbols[:7]:
-        wr = round((data["wins"] / data["total"]) * 100, 1)
-        top_symbols_text += f"\n{sym}: {data['wins']}/{data['total']} برد | {wr}٪"
-
-    avg_win = 0
-    avg_loss = 0
-
-    if wins_list:
-        avg_win = round(sum([abs(float(s.get("result_percent", 0))) for s in wins_list]) / len(wins_list), 3)
-
-    if losses_list:
-        avg_loss = round(sum([abs(float(s.get("result_percent", 0))) for s in losses_list]) / len(losses_list), 3)
+    activation_rate = round((activated / setups) * 100, 1) if setups else 0
+    activated_wr = round((tp1 / (tp1 + sl)) * 100, 1) if (tp1 + sl) else 0
 
     title = "آمار کل" if days is None else f"آمار {days} روز اخیر"
 
-    report = f"""
+    return f"""
 📊 {title}
 
-کل سیگنال‌های زیرنظرگرفته‌شده:
-{total}
+Setup ساخته شده:
+{setups}
 
-✅ TP1:
-{tp1_count}
+✅ Activated:
+{activated}
 
-❌ SL:
-{sl_count}
+🚫 Cancelled:
+{cancelled}
 
-Win Rate:
-{win_rate}٪
+Activation Rate:
+{activation_rate}٪
 
-میانگین برد:
-{avg_win}٪
+TP1:
+{tp1}
 
-میانگین باخت:
-{avg_loss}٪
+TP2:
+{tp2}
 
-لانگ:
-{direction_report(long_stats)}
+SL:
+{sl}
 
-شورت:
-{direction_report(short_stats)}
-
-عملکرد ارزها:
-{top_symbols_text}
+Activated Win Rate:
+{activated_wr}٪
 """
-
-    report += format_signal_details(
-        wins_list,
-        f"✅ لیست بردها ({len(wins_list)}):",
-        limit=12,
-        include_reasons=False
-    )
-
-    report += format_signal_details(
-        losses_list,
-        f"❌ لیست استاپ‌ها ({len(losses_list)}):",
-        limit=12,
-        include_reasons=True
-    )
-
-    return report
 
