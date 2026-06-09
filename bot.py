@@ -38,44 +38,6 @@ def safe(value, default="\u0646\u0627\u0645\u0634\u062e\u0635"):
         return default
     return value
 
-def signal_risk_badge(result):
-    """
-    برچسب نمایشی سیگنال؛ هیچ سیگنالی را حذف نمی‌کند.
-    فقط برای تصمیم‌گیری سریع‌تر کاربر است.
-    """
-    try:
-        rr = float(result.get("risk_reward") or 0)
-    except Exception:
-        rr = 0
-
-    try:
-        confirmations = int(result.get("predictive_confirmations") or 0)
-    except Exception:
-        confirmations = 0
-
-    risk_level = result.get("risk_level")
-    freshness = result.get("freshness")
-
-    risky = False
-
-    if risk_level in ["متوسط", "بالا"]:
-        risky = True
-    if rr and rr < 0.85:
-        risky = True
-    if confirmations and confirmations <= 4:
-        risky = True
-    if freshness == "LOW":
-        risky = True
-    if result.get("late_entry"):
-        risky = True
-    if result.get("tp_space_ok") is False:
-        risky = True
-    if result.get("trap_risk"):
-        risky = True
-
-    return "⚠️ سیگنال پرریسک" if risky else "✅ سیگنال عادی"
-
-
 
 def remember_signal_result(sent_message, result):
     try:
@@ -104,8 +66,23 @@ def is_track_command(text):
 
 
 def is_stats_command(text):
-    clean = text.strip()
-    return clean == "\u0622\u0645\u0627\u0631" or clean.startswith("\u0622\u0645\u0627\u0631 ")
+    """
+    دستور آمار را کمی منعطف‌تر تشخیص می‌دهد.
+    آمار، آمار 7، آمار 7 روز، آمار کل و حتی تایپ اشتباهی آمارا را می‌پذیرد.
+    """
+    clean = (text or "").strip()
+    clean = clean.replace("ي", "ی").replace("ك", "ک")
+    clean = " ".join(clean.split())
+
+    if clean in ["آمار", "آمارا", "امار", "امارا"]:
+        return True
+
+    return (
+        clean.startswith("آمار ")
+        or clean.startswith("آمارا ")
+        or clean.startswith("امار ")
+        or clean.startswith("امارا ")
+    )
 
 
 def is_reset_stats_command(text):
@@ -244,11 +221,7 @@ def build_analysis_text(result):
     reasons_text = chr(10).join([f"✅ {r}" for r in reasons])
     trade_levels = build_trade_levels(result)
 
-    badge = signal_risk_badge(result)
-
     return f"""
-{badge}
-
 📊 تحلیل فیوچرز {result['symbol']}
 
 قیمت فعلی: {result['price']}
@@ -326,11 +299,8 @@ def send_best_signals(message, very_safe_only=False):
     for i, r in enumerate(results):
         direction_fa = "\u0644\u0627\u0646\u06af" if r["direction"] == "LONG" else "\u0634\u0648\u0631\u062a"
 
-        badge = signal_risk_badge(r)
-
         msg += f"""
 {medals[i]} {r['symbol']}
-{badge}
 جهت: {direction_fa}
 حالت ورود: {safe(r.get('entry_mode'))}
 تازگی حرکت: {safe(r.get('freshness'))}
@@ -353,11 +323,8 @@ ADX: {safe(r.get('adx'))}
 
 def send_auto_signal_to_all_users(result):
     direction_fa = "لانگ" if result["direction"] == "LONG" else "شورت"
-    badge = signal_risk_badge(result)
 
     text = f"""
-{badge}
-
 🚨 سیگنال خودکار
 
 ارز: {result['symbol']}
@@ -549,6 +516,11 @@ def handle_message(message):
             bot.reply_to(message, "❌ خطا در پاک کردن آمار.")
         return
 
+    if is_stats_command(text):
+        days = parse_days_from_text(text)
+        report = get_stats_report(days)
+        bot.reply_to(message, report)
+        return
 
     profit_calc = parse_profit_calc_text(text)
     if profit_calc:
@@ -588,12 +560,6 @@ def handle_message(message):
         )
 
         bot.reply_to(message, msg)
-        return
-
-    if is_stats_command(text):
-        days = parse_days_from_text(text)
-        report = get_stats_report(days)
-        bot.reply_to(message, report)
         return
 
     if "\u062e\u06cc\u0644\u06cc \u0627\u0645\u0646" in text or "very safe" in text.lower():
