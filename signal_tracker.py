@@ -7,6 +7,12 @@ from datetime import datetime, timedelta
 
 import ccxt
 from analysis import analyze_symbol
+from config import PENDING_SETUP_TIMEOUT_MINUTES, ENTRY_ACTIVATION_PRICE_TOLERANCE_ATR
+try:
+    from diagnostics import log_exception
+except Exception:
+    def log_exception(section, exc, file_name=None, function_name=None, symbol=None):
+        print(section, str(exc)); return str(exc)
 
 
 ACTIVE_SIGNALS_FILE = "active_signals.json"
@@ -197,6 +203,49 @@ def reset_stats():
         return False
 
 
+
+def has_active_or_pending_symbol(active, user_id, symbol):
+    for item in active:
+        if int(item.get("user_id", 0)) == int(user_id) and item.get("symbol") == symbol:
+            if item.get("status") in ["ACTIVE", "PENDING_ACTIVATION"]:
+                return True
+    return False
+
+def price_in_entry_zone(signal, price):
+    try:
+        price = float(price)
+        atr = float(signal.get("atr") or 0)
+        entry = float(signal.get("entry") or 0)
+        zone_low = signal.get("entry_zone_low")
+        zone_high = signal.get("entry_zone_high")
+        if zone_low is not None and zone_high is not None:
+            return float(zone_low) <= price <= float(zone_high)
+        tolerance = abs(atr) * float(ENTRY_ACTIVATION_PRICE_TOLERANCE_ATR or 0.30)
+        if tolerance <= 0:
+            tolerance = abs(entry) * 0.002
+        return abs(price - entry) <= tolerance
+    except Exception:
+        return False
+
+def activate_pending_signal(signal, price):
+    signal["status"] = "ACTIVE"
+    signal["activated_at"] = now_ts()
+    signal["activated_at_text"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    signal["activated_price"] = float(price)
+    signal["last_checked_at"] = now_ts()
+    return signal
+
+def close_pending_setup(signal, reason):
+    stats = get_signal_stats()
+    closed = dict(signal)
+    closed["status"] = "CANCELLED"
+    closed["cancel_reason"] = reason
+    closed["closed_at"] = now_ts()
+    closed["closed_at_text"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    stats.append(closed)
+    save_signal_stats(stats)
+    return f"🚫 ستاپ {signal.get('symbol')} لغو شد\n\nجهت: {fa_direction(signal.get('direction'))}\nعلت: {reason}"
+
 def add_signal_to_tracking(user_id, chat_id, message_id, result):
     if result.get("direction") == "NO TRADE":
         return False, "این تحلیل سیگنال قابل پیگیری ندارد."
@@ -205,6 +254,12 @@ def add_signal_to_tracking(user_id, chat_id, message_id, result):
         return False, "برای این سیگنال TP1 یا SL وجود ندارد."
 
     active = get_active_signals()
+
+    if has_active_or_pending_symbol(active, user_id, result.get("symbol")):
+        return False, f"⚠️ {result.get('symbol')} از قبل زیر نظر یا در انتظار فعال‌سازی است."
+
+    entry_confirmed = bool(result.get("entry_confirmed"))
+    initial_status = "ACTIVE" if entry_confirmed else "PENDING_ACTIVATION"
 
     signal = {
         "id": f"{result['symbol']}_{message_id}_{now_ts()}",
@@ -219,6 +274,15 @@ def add_signal_to_tracking(user_id, chat_id, message_id, result):
         "stop_loss": float(result["stop_loss"]),
         "tp1": float(result["tp1"]),
         "tp2": None if result.get("tp2") is None else float(result["tp2"]),
+        "atr": result.get("atr"),
+        "entry_confirmed": entry_confirmed,
+        "entry_status": result.get("entry_status"),
+        "entry_zone_low": result.get("entry_zone_low"),
+        "entry_zone_high": result.get("entry_zone_high"),
+        "setup_score": result.get("setup_score"),
+        "setup_reasons": result.get("setup_reasons", []),
+        "compression_active": result.get("compression_active"),
+        "compression_label": result.get("compression_label"),
 
         "score": result.get("score"),
         "win_probability": result.get("win_probability"),
@@ -277,13 +341,18 @@ def add_signal_to_tracking(user_id, chat_id, message_id, result):
         "hit_source": None,
         "hit_candle_time": None,
 
-        "status": "ACTIVE",
-        "warning_sent": False
+        "status": initial_status,
+        "warning_sent": False,
+        "activated_at": now_ts() if entry_confirmed else None,
+        "activated_at_text": datetime.now().strftime("%Y-%m-%d %H:%M:%S") if entry_confirmed else None,
+        "activated_price": float(result.get("price")) if entry_confirmed else None
     }
 
     active.append(signal)
     save_active_signals(active)
 
+    if initial_status == "PENDING_ACTIVATION":
+        return True, f"👀 ستاپ {signal['symbol']} ذخیره شد و منتظر فعال‌سازی ورود است."
     return True, f"✅ سیگنال {signal['symbol']} زیر نظر گرفته شد."
 
 
@@ -312,72 +381,19 @@ def price_hit_sl(signal, price):
 
 
 def calculate_result_percent(signal, exit_price):
-    """
-    درصد حرکت را همیشه عددی برمی‌گرداند تا در پیام‌ها None٪ نمایش داده نشود.
-    برای LONG: خروج بالاتر از ورود مثبت است.
-    برای SHORT: خروج پایین‌تر از ورود مثبت است.
-    """
-    try:
-        entry = float(signal.get("entry", 0))
-        exit_price = float(exit_price)
-        direction = signal.get("direction")
-    except Exception:
-        return 0
+    entry = float(signal["entry"])
+    direction = signal["direction"]
 
     if entry == 0:
         return 0
 
     if direction == "LONG":
         percent = ((exit_price - entry) / entry) * 100
-    elif direction == "SHORT":
-        percent = ((entry - exit_price) / entry) * 100
     else:
-        return 0
+        percent = ((entry - exit_price) / entry) * 100
 
     return round(percent, 3)
 
-
-def calculate_tp2_percent(signal, exit_price):
-    return calculate_result_percent(signal, exit_price)
-
-
-def update_tp2_stat(signal, exit_price):
-    """
-    TP2 را روی رکورد TP1 همان سیگنال ثبت می‌کند.
-    رکورد جدیدی به آمار اضافه نمی‌شود تا Win Rate تغییر نکند.
-    """
-    stats = get_signal_stats()
-    updated = False
-
-    for item in reversed(stats):
-        if item.get("id") == signal.get("id") and item.get("status") == "TP1":
-            item["tp2_hit"] = True
-            item["tp2_exit_price"] = float(exit_price)
-            item["tp2_result_percent"] = calculate_tp2_percent(signal, exit_price)
-            item["tp2_hit_at"] = now_ts()
-            item["tp2_hit_at_text"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            item["tp2_hit_source"] = signal.get("hit_source")
-            item["tp2_hit_candle_time"] = signal.get("hit_candle_time")
-            updated = True
-            break
-
-    if updated:
-        save_signal_stats(stats)
-
-    return updated
-
-
-def format_tp2_message(signal, exit_price):
-    tp2_percent = calculate_tp2_percent(signal, exit_price)
-    return (
-        f"🎯 TP2 سیگنال {signal['symbol']} خورد\n\n"
-        f"جهت: {'لانگ' if signal['direction'] == 'LONG' else 'شورت'}\n"
-        f"ورود: {signal['entry']}\n"
-        f"TP2: {signal.get('tp2')}\n"
-        f"قیمت خروج TP2: {exit_price}\n"
-        f"درصد حرکت تا TP2: {tp2_percent}٪\n\n"
-        f"این مورد فقط در آمار TP2 ثبت شد و روی Win Rate اثر ندارد."
-    )
 
 def close_signal(signal, result_type, exit_price):
     stats = get_signal_stats()
@@ -439,15 +455,6 @@ def format_signed_percent(value):
 
     sign = "+" if value > 0 else ""
     return f"{sign}{value}٪"
-
-
-def safe_float(value, default=0):
-    try:
-        if value is None:
-            return default
-        return float(value)
-    except Exception:
-        return default
 
 
 def compact_signal_line(signal):
@@ -661,6 +668,35 @@ def check_active_signals():
 
     for signal in active:
         try:
+            if signal.get("status") == "PENDING_ACTIVATION":
+                age = now_ts() - int(signal.get("created_at") or now_ts())
+                if age > int(PENDING_SETUP_TIMEOUT_MINUTES) * 60:
+                    msg = close_pending_setup(signal, "زمان انتظار فعال‌سازی تمام شد")
+                    messages.append({"chat_id": signal["chat_id"], "message": msg, "reply_to_message_id": signal.get("message_id")})
+                    continue
+                price = get_last_close_from_1m_or_ticker(signal["symbol"], signal)
+                if price_in_entry_zone(signal, price):
+                    try:
+                        live = analyze_symbol(signal["symbol"])
+                        if live.get("direction") == signal.get("direction") and live.get("entry_confirmed"):
+                            signal = activate_pending_signal(signal, price)
+                            activation_msg = (
+                                "✅ ورود فعال شد\n\n"
+                                f"ارز: {signal['symbol']}\n"
+                                f"جهت: {fa_direction(signal['direction'])}\n"
+                                f"قیمت فعال‌سازی: {round(float(price), 8)}\n"
+                                "تحلیل لحظه‌ای 5M با پیش‌بینی اولیه همسو شد."
+                            )
+                            messages.append({
+                                "chat_id": signal["chat_id"],
+                                "reply_to_message_id": signal.get("message_id"),
+                                "message": activation_msg
+                            })
+                    except Exception as e:
+                        log_exception("فعال‌سازی ورود", e, "signal_tracker.py", "check_active_signals", signal.get("symbol"))
+                remaining.append(signal)
+                continue
+
             result_type, exit_price = detect_signal_hit_from_candles(signal)
 
             if result_type:
@@ -1005,10 +1041,10 @@ def get_stats_report(days=None):
     avg_loss = 0
 
     if wins_list:
-        avg_win = round(sum([abs(safe_float(s.get("result_percent"), 0)) for s in wins_list]) / len(wins_list), 3)
+        avg_win = round(sum([abs(float(s.get("result_percent", 0))) for s in wins_list]) / len(wins_list), 3)
 
     if losses_list:
-        avg_loss = round(sum([abs(safe_float(s.get("result_percent"), 0)) for s in losses_list]) / len(losses_list), 3)
+        avg_loss = round(sum([abs(float(s.get("result_percent", 0))) for s in losses_list]) / len(losses_list), 3)
 
     title = "آمار کل" if days is None else f"آمار {days} روز اخیر"
 
@@ -1050,13 +1086,11 @@ Win Rate:
         include_reasons=False
     )
 
-    # دلایل استاپ از گزارش آمار حذف شد تا پیام آمار کوتاه‌تر و سبک‌تر بماند.
-    # خود دلایل احتمالی استاپ همچنان در پیام نتیجه SL نمایش داده می‌شوند.
     report += format_signal_details(
         losses_list,
         f"❌ لیست استاپ‌ها ({len(losses_list)}):",
         limit=12,
-        include_reasons=False
+        include_reasons=True
     )
 
     return report
