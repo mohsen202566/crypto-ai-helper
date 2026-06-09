@@ -210,17 +210,20 @@ def is_high_quality_signal(result):
     if result.get("direction") == "NO TRADE":
         return False
 
-    if not result.get("entry_confirmed"):
+    if not result.get("entry_confirmed") and not result.get("setup_waiting_activation"):
         return False
 
-    if result.get("entry_mode") != "PREDICTIVE_TRIGGER":
+    if result.get("entry_mode") not in ["PREDICTIVE_TRIGGER", "PREDICTIVE_SETUP"]:
         return False
 
-    if result.get("freshness") not in ["HIGH", "MEDIUM"]:
-        return False
-
-    if int(result.get("predictive_confirmations") or 0) < 4:
-        return False
+    if result.get("entry_confirmed"):
+        if result.get("freshness") not in ["HIGH", "MEDIUM"]:
+            return False
+        if int(result.get("predictive_confirmations") or 0) < 4:
+            return False
+    else:
+        if int(result.get("setup_score") or 0) < 4:
+            return False
 
     if result.get("late_entry"):
         return False
@@ -296,8 +299,9 @@ def get_best_signals(limit=5, very_safe_only=False):
     results = sorted(
         results,
         key=lambda x: (
+            1 if x.get("entry_confirmed") else 0,
             freshness_rank.get(x.get("freshness"), 0),
-            int(x.get("predictive_confirmations") or 0),
+            int(x.get("predictive_confirmations") or 0) + int(x.get("setup_score") or 0),
             x.get("risk_reward", 0),
         ),
         reverse=True,
