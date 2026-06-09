@@ -1018,14 +1018,14 @@ def normalize_score_by_quality(score, rr, raw_direction, pattern, multi_candle, 
 def calculate_trade_levels(raw_direction, price, atr, support=None, resistance=None):
     """
     TP/SL اسکالپی:
-    TP1 نزدیک‌تر است تا حرکت‌های 5 تا 15 دقیقه‌ای از دست نروند؛ SL بیش از حد تنگ نمی‌شود.
+    TP1 کمی دورتر شده تا R/R بهتر شود؛ SL برای جلوگیری از استاپ‌های نویزی تنگ‌تر نشده است.
     """
     buffer = atr * 0.18
 
     if raw_direction == "LONG":
         stop_loss = price - (atr * 1.20)
-        tp1 = price + (atr * 0.85)
-        tp2 = price + (atr * 1.45)
+        tp1 = price + (atr * 1.05)
+        tp2 = price + (atr * 1.80)
 
         if support is not None and support < price:
             structural_sl = float(support) - buffer
@@ -1044,8 +1044,8 @@ def calculate_trade_levels(raw_direction, price, atr, support=None, resistance=N
 
     if raw_direction == "SHORT":
         stop_loss = price + (atr * 1.20)
-        tp1 = price - (atr * 0.85)
-        tp2 = price - (atr * 1.45)
+        tp1 = price - (atr * 1.05)
+        tp2 = price - (atr * 1.80)
 
         if resistance is not None and resistance > price:
             structural_sl = float(resistance) + buffer
