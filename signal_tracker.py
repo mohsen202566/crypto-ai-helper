@@ -1041,11 +1041,13 @@ Win Rate:
         include_reasons=False
     )
 
+    # دلایل استاپ از گزارش آمار حذف شد تا پیام آمار کوتاه‌تر و سبک‌تر بماند.
+    # خود دلایل احتمالی استاپ همچنان در پیام نتیجه SL نمایش داده می‌شوند.
     report += format_signal_details(
         losses_list,
         f"❌ لیست استاپ‌ها ({len(losses_list)}):",
         limit=12,
-        include_reasons=True
+        include_reasons=False
     )
 
     return report
