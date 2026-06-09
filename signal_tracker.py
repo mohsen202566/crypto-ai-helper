@@ -22,10 +22,6 @@ TRACKER_MAX_OHLCV_LIMIT = 180
 # حالت محافظه‌کارانه: SL اولویت دارد تا آمار بیش از حد خوش‌بینانه نشود.
 SAME_CANDLE_HIT_POLICY = "SL_FIRST"
 
-# بعد از TP1، فقط برای آمار TP2 سیگنال مدت محدودی زیرنظر می‌ماند.
-# این مورد روی Win Rate اثر ندارد و برای جلوگیری از فشار اضافی روی VPS زمان‌دار است.
-TP2_MONITOR_MAX_SECONDS = 6 * 60 * 60
-
 exchange = ccxt.okx({
     "enableRateLimit": True,
     "timeout": 20000,
@@ -108,65 +104,36 @@ def get_recent_1m_candles_since(symbol, since_ts):
 
 def candle_path_hit(signal, candle):
     """
-    با high/low کندل 1m بررسی می‌کند که TP1، TP2 یا SL لمس شده یا نه.
-    TP2 فقط بعد از TP1 برای آمار بررسی می‌شود و روی Win Rate اثر ندارد.
-    اگر داخل یک کندل هم TP1 و هم SL لمس شده باشد، طبق SAME_CANDLE_HIT_POLICY تصمیم می‌گیرد.
+    با high/low کندل 1m بررسی می‌کند که TP1 یا SL لمس شده یا نه.
+    اگر هر دو داخل یک کندل لمس شده باشند، طبق SAME_CANDLE_HIT_POLICY تصمیم می‌گیرد.
     """
     direction = signal.get("direction")
     high = float(candle[2])
     low = float(candle[3])
 
-    tp1 = signal.get("tp1")
-    tp2 = signal.get("tp2")
-    stop_loss = signal.get("stop_loss")
-
-    if direction not in ["LONG", "SHORT"]:
-        return None, None, None
-
-    # مرحله بعد از TP1: فقط TP2 را چک می‌کنیم.
-    if signal.get("tp1_hit"):
-        if tp2 is None:
-            return None, None, None
-
-        if direction == "LONG" and high >= float(tp2):
-            return "TP2", float(tp2), "candle_path"
-
-        if direction == "SHORT" and low <= float(tp2):
-            return "TP2", float(tp2), "candle_path"
-
-        return None, None, None
-
-    tp1_hit = False
-    tp2_hit = False
+    tp_hit = False
     sl_hit = False
 
     if direction == "LONG":
-        tp1_hit = tp1 is not None and high >= float(tp1)
-        tp2_hit = tp2 is not None and high >= float(tp2)
-        sl_hit = stop_loss is not None and low <= float(stop_loss)
-
+        tp_hit = high >= float(signal["tp1"])
+        sl_hit = low <= float(signal["stop_loss"])
     elif direction == "SHORT":
-        tp1_hit = tp1 is not None and low <= float(tp1)
-        tp2_hit = tp2 is not None and low <= float(tp2)
-        sl_hit = stop_loss is not None and high >= float(stop_loss)
+        tp_hit = low <= float(signal["tp1"])
+        sl_hit = high >= float(signal["stop_loss"])
 
-    if tp1_hit and sl_hit:
+    if tp_hit and sl_hit:
         if SAME_CANDLE_HIT_POLICY == "TP_FIRST":
-            if tp2_hit:
-                return "TP1_TP2", float(tp2), "same_candle"
-            return "TP1", float(tp1), "same_candle"
-        return "SL", float(stop_loss), "same_candle"
+            return "TP1", float(signal["tp1"]), "same_candle"
+        return "SL", float(signal["stop_loss"]), "same_candle"
 
-    if tp1_hit and tp2_hit:
-        return "TP1_TP2", float(tp2), "candle_path"
-
-    if tp1_hit:
-        return "TP1", float(tp1), "candle_path"
+    if tp_hit:
+        return "TP1", float(signal["tp1"]), "candle_path"
 
     if sl_hit:
-        return "SL", float(stop_loss), "candle_path"
+        return "SL", float(signal["stop_loss"]), "candle_path"
 
     return None, None, None
+
 
 def detect_signal_hit_from_candles(signal):
     last_checked_at = signal.get("last_checked_at") or signal.get("created_at") or now_ts() - 5 * 60
@@ -345,8 +312,29 @@ def price_hit_sl(signal, price):
 
 
 def calculate_result_percent(signal, exit_price):
-    entry = float(signal["entry"])
-    direction = signal["direction"]
+    """
+    درصد حرکت را همیشه عددی برمی‌گرداند تا در پیام‌ها None٪ نمایش داده نشود.
+    برای LONG: خروج بالاتر از ورود مثبت است.
+    برای SHORT: خروج پایین‌تر از ورود مثبت است.
+    """
+    try:
+        entry = float(signal.get("entry", 0))
+        exit_price = float(exit_price)
+        direction = signal.get("direction")
+    except Exception:
+        return 0
+
+    if entry == 0:
+        return 0
+
+    if direction == "LONG":
+        percent = ((exit_price - entry) / entry) * 100
+    elif direction == "SHORT":
+        percent = ((entry - exit_price) / entry) * 100
+    else:
+        return 0
+
+    return round(percent, 3)
 
 
 def calculate_tp2_percent(signal, exit_price):
@@ -391,66 +379,30 @@ def format_tp2_message(signal, exit_price):
         f"این مورد فقط در آمار TP2 ثبت شد و روی Win Rate اثر ندارد."
     )
 
-    if entry == 0:
-        return 0
-
-    if direction == "LONG":
-        percent = ((exit_price - entry) / entry) * 100
-    else:
-        percent = ((entry - exit_price) / entry) * 100
-
-    return round(percent, 3)
-
-
 def close_signal(signal, result_type, exit_price):
     stats = get_signal_stats()
 
     closed = dict(signal)
-    stat_status = "TP1" if result_type == "TP1_TP2" else result_type
-
-    closed["status"] = stat_status
-    closed["exit_price"] = float(signal.get("tp1") if result_type == "TP1_TP2" else exit_price)
+    closed["status"] = result_type
+    closed["exit_price"] = float(exit_price)
     closed["closed_at"] = now_ts()
     closed["closed_at_text"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    closed["result_percent"] = calculate_result_percent(closed, closed["exit_price"])
+    closed["result_percent"] = calculate_result_percent(signal, exit_price)
     closed["hit_source"] = signal.get("hit_source")
     closed["hit_candle_time"] = signal.get("hit_candle_time")
-
-    if stat_status == "TP1":
-        closed["tp2_hit"] = result_type == "TP1_TP2"
-        if result_type == "TP1_TP2":
-            closed["tp2_exit_price"] = float(exit_price)
-            closed["tp2_result_percent"] = calculate_tp2_percent(signal, exit_price)
-            closed["tp2_hit_at"] = now_ts()
-            closed["tp2_hit_at_text"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            closed["tp2_hit_source"] = signal.get("hit_source")
-            closed["tp2_hit_candle_time"] = signal.get("hit_candle_time")
-    else:
-        closed["tp2_hit"] = False
 
     stats.append(closed)
     save_signal_stats(stats)
 
-    if stat_status == "TP1":
-        extra_tp2 = ""
-        if result_type == "TP1_TP2":
-            extra_tp2 = (
-                f"\nTP2: {signal.get('tp2')}\n"
-                f"نتیجه TP2: خورده شد 🎯\n"
-                f"درصد حرکت تا TP2: {closed.get('tp2_result_percent')}٪"
-            )
-        elif signal.get("tp2") is not None:
-            extra_tp2 = "\nTP2: هنوز برای آمار جداگانه زیرنظر می‌ماند"
-
+    if result_type == "TP1":
         return (
             f"✅ نتیجه سیگنال {signal['symbol']}\n\n"
             f"جهت: {'لانگ' if signal['direction'] == 'LONG' else 'شورت'}\n"
             f"ورود: {signal['entry']}\n"
             f"TP1: {signal['tp1']}\n"
-            f"قیمت خروج: {closed['exit_price']}\n"
+            f"قیمت خروج: {exit_price}\n"
             f"نتیجه: موفق ✅\n"
             f"درصد حرکت: {closed['result_percent']}٪"
-            f"{extra_tp2}"
         )
 
     sl_reasons = guess_sl_reasons(closed)
@@ -467,6 +419,9 @@ def close_signal(signal, result_type, exit_price):
         f"دلایل احتمالی استاپ:\n"
         f"{reasons_text}"
     )
+
+
+
 
 def fa_direction(direction):
     if direction == "LONG":
@@ -487,17 +442,13 @@ def format_signed_percent(value):
 
 
 def compact_signal_line(signal):
-    tp2_text = ""
-    if signal.get("status") == "TP1" and signal.get("tp2") is not None:
-        tp2_text = " | TP2 ✅" if signal.get("tp2_hit") else " | TP2 ❌"
-
     return (
         f"{signal.get('symbol', 'نامشخص')} | "
         f"{fa_direction(signal.get('direction'))} | "
         f"{format_signed_percent(signal.get('result_percent', 0))} | "
         f"ورود: {signal.get('entry')} | خروج: {signal.get('exit_price')}"
-        f"{tp2_text}"
     )
+
 
 def guess_sl_reasons(signal):
     reasons = []
@@ -701,45 +652,14 @@ def check_active_signals():
 
     for signal in active:
         try:
-            # اگر بعد از TP1 مدت زیادی گذشت و TP2 نخورد، از لیست فعال حذف شود.
-            # رکورد TP1 در آمار باقی می‌ماند و tp2_hit همان False می‌ماند.
-            if signal.get("tp1_hit"):
-                tp1_time = int(signal.get("tp1_hit_at") or signal.get("closed_at") or signal.get("created_at") or now_ts())
-                if now_ts() - tp1_time > TP2_MONITOR_MAX_SECONDS:
-                    continue
-
             result_type, exit_price = detect_signal_hit_from_candles(signal)
 
             if result_type:
-                if result_type == "TP2":
-                    update_tp2_stat(signal, exit_price)
-                    messages.append({
-                        "chat_id": signal["chat_id"],
-                        "message": format_tp2_message(signal, exit_price)
-                    })
-                    continue
-
                 msg = close_signal(signal, result_type, exit_price)
                 messages.append({
                     "chat_id": signal["chat_id"],
                     "message": msg
                 })
-
-                # اگر فقط TP1 خورده و TP2 وجود دارد، برای آمار TP2 سیگنال را فعال نگه می‌داریم.
-                if result_type == "TP1" and signal.get("tp2") is not None:
-                    signal["tp1_hit"] = True
-                    signal["tp1_hit_at"] = now_ts()
-                    signal["tp1_hit_at_text"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    signal["status"] = "WAITING_TP2"
-                    signal["last_checked_at"] = now_ts()
-                    signal["last_checked_at_text"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    remaining.append(signal)
-
-                continue
-
-            # بعد از TP1 دیگر هشدار ضعف لازم نیست؛ فقط TP2 برای آمار چک می‌شود.
-            if signal.get("tp1_hit"):
-                remaining.append(signal)
                 continue
 
             # برای هشدار ضعف، قیمت فعلی فقط جهت نمایش استفاده می‌شود؛
@@ -773,6 +693,8 @@ def check_active_signals():
 
     save_active_signals(remaining)
     return messages
+
+
 
 def normalize_number_text_for_calc(text):
     mapping = {
@@ -1079,26 +1001,6 @@ def get_stats_report(days=None):
     if losses_list:
         avg_loss = round(sum([abs(float(s.get("result_percent", 0))) for s in losses_list]) / len(losses_list), 3)
 
-    tp2_list = [s for s in wins_list if s.get("tp2_hit")]
-    tp2_count = len(tp2_list)
-    tp2_rate = round((tp2_count / tp1_count) * 100, 1) if tp1_count else 0
-
-    tp2_symbols = {}
-    for s in tp2_list:
-        sym = s.get("symbol")
-        if sym not in tp2_symbols:
-            tp2_symbols[sym] = 0
-        tp2_symbols[sym] += 1
-
-    sorted_tp2_symbols = sorted(tp2_symbols.items(), key=lambda x: x[1], reverse=True)
-
-    tp2_symbols_text = ""
-    if sorted_tp2_symbols:
-        for sym, count in sorted_tp2_symbols[:10]:
-            tp2_symbols_text += f"\n{sym}: {count} بار TP2"
-    else:
-        tp2_symbols_text = "\nندارد"
-
     title = "آمار کل" if days is None else f"آمار {days} روز اخیر"
 
     report = f"""
@@ -1121,15 +1023,6 @@ Win Rate:
 
 میانگین باخت:
 {avg_loss}٪
-
-🎯 TP2:
-{tp2_count} از {tp1_count} برد
-
-نرخ رسیدن به TP2 بعد از TP1:
-{tp2_rate}٪
-
-ارزهای TP2 خورده:
-{tp2_symbols_text}
 
 لانگ:
 {direction_report(long_stats)}
