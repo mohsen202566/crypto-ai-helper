@@ -441,6 +441,15 @@ def format_signed_percent(value):
     return f"{sign}{value}٪"
 
 
+def safe_float(value, default=0):
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
 def compact_signal_line(signal):
     return (
         f"{signal.get('symbol', 'نامشخص')} | "
@@ -996,10 +1005,10 @@ def get_stats_report(days=None):
     avg_loss = 0
 
     if wins_list:
-        avg_win = round(sum([abs(float(s.get("result_percent", 0))) for s in wins_list]) / len(wins_list), 3)
+        avg_win = round(sum([abs(safe_float(s.get("result_percent"), 0)) for s in wins_list]) / len(wins_list), 3)
 
     if losses_list:
-        avg_loss = round(sum([abs(float(s.get("result_percent", 0))) for s in losses_list]) / len(losses_list), 3)
+        avg_loss = round(sum([abs(safe_float(s.get("result_percent"), 0)) for s in losses_list]) / len(losses_list), 3)
 
     title = "آمار کل" if days is None else f"آمار {days} روز اخیر"
 
