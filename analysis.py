@@ -665,11 +665,11 @@ def score_entry(df_15m, df_5m):
 
     # 15M فقط تایید نرم جهت است، نه ترمز سنگین ورود.
     if last_15["close"] > last_15["ema20"]:
-        long_score += 20
+        long_score += 14
         reasons_long.append("15M: جهت ورود لانگ را تایید نرم می‌کند")
 
     if last_15["close"] < last_15["ema20"]:
-        short_score += 20
+        short_score += 14
         reasons_short.append("15M: جهت ورود شورت را تایید نرم می‌کند")
 
     # 5M موتور اصلی ورود است.
@@ -1018,14 +1018,14 @@ def normalize_score_by_quality(score, rr, raw_direction, pattern, multi_candle, 
 def calculate_trade_levels(raw_direction, price, atr, support=None, resistance=None):
     """
     TP/SL اسکالپی:
-    TP1 کمی دورتر شده تا R/R بهتر شود؛ SL برای جلوگیری از استاپ‌های نویزی تنگ‌تر نشده است.
+    TP1 نزدیک‌تر است تا حرکت‌های 5 تا 15 دقیقه‌ای از دست نروند؛ SL بیش از حد تنگ نمی‌شود.
     """
     buffer = atr * 0.18
 
     if raw_direction == "LONG":
         stop_loss = price - (atr * 1.20)
-        tp1 = price + (atr * 0.75)
-        tp2 = price + (atr * 1.50)
+        tp1 = price + (atr * 0.85)
+        tp2 = price + (atr * 1.45)
 
         if support is not None and support < price:
             structural_sl = float(support) - buffer
@@ -1044,8 +1044,8 @@ def calculate_trade_levels(raw_direction, price, atr, support=None, resistance=N
 
     if raw_direction == "SHORT":
         stop_loss = price + (atr * 1.20)
-        tp1 = price - (atr * 0.75)
-        tp2 = price - (atr * 1.50)
+        tp1 = price - (atr * 0.85)
+        tp2 = price - (atr * 1.45)
 
         if resistance is not None and resistance > price:
             structural_sl = float(resistance) + buffer
@@ -1403,6 +1403,87 @@ def _power_snapshot(df_5m):
     }
 
 
+
+def detect_compression_context(df_30m, df_15m, df_5m):
+    """تشخیص فشردگی/رنج قبل از شکست؛ فقط برای Setup استفاده می‌شود."""
+    context = {"compression_active": False, "compression_score": 0, "compression_label": "غیرفعال", "compression_reasons": []}
+    try:
+        last15 = df_15m.iloc[-1]
+        recent15 = df_15m.tail(24)
+        recent5 = df_5m.tail(24)
+        atr_now = float(last15.get("atr", 0) or 0)
+        atr_ma = float(df_15m["atr"].tail(60).mean())
+        if atr_now <= 0:
+            return context
+        range15 = float(recent15["high"].max() - recent15["low"].min())
+        range5 = float(recent5["high"].max() - recent5["low"].min())
+        atr_contracting = atr_ma > 0 and atr_now <= atr_ma * 0.82
+        range_tight = range15 <= atr_now * 4.2 or range5 <= atr_now * 2.6
+        vwap_flat = abs(float(df_5m.iloc[-1]["vwap"]) - float(df_5m.iloc[-6]["vwap"])) <= atr_now * 0.35
+        score = 0
+        if atr_contracting:
+            score += 1; context["compression_reasons"].append("ATR نسبت به میانگین کاهش یافته")
+        if range_tight:
+            score += 1; context["compression_reasons"].append("قیمت در محدوده فشرده حرکت می‌کند")
+        if vwap_flat:
+            score += 1; context["compression_reasons"].append("VWAP تقریباً صاف و رنج است")
+        context["compression_score"] = score
+        context["compression_active"] = score >= 2
+        context["compression_label"] = "فعال" if score >= 2 else "ضعیف"
+    except Exception:
+        pass
+    return context
+
+
+def predictive_setup_decision(df_4h, df_1h, df_30m, df_15m, df_5m, price, atr, long_score, short_score, trends, market_regime="neutral"):
+    """مرحله اول: سیگنال کامل آماده می‌شود اما ورود منتظر فعال‌سازی 5M می‌ماند."""
+    reasons_long, reasons_short = [], []
+    last15 = df_15m.iloc[-1]
+    last5 = df_5m.iloc[-1]
+    prev5 = df_5m.iloc[-2]
+    p = _power_snapshot(df_5m)
+    compression = detect_compression_context(df_30m, df_15m, df_5m)
+    trend30 = trend_direction(df_30m)
+    trend15 = trend_direction(df_15m)
+    trend1h = trend_direction(df_1h)
+    trend4h = trend_direction(df_4h)
+    long_setup_score = 0
+    short_setup_score = 0
+    if trend30 in ["bullish", "weak_bullish"]:
+        long_setup_score += 2; reasons_long.append("30M به نفع لانگ است")
+    if trend30 in ["bearish", "weak_bearish"]:
+        short_setup_score += 2; reasons_short.append("30M به نفع شورت است")
+    if trend15 in ["bullish", "weak_bullish"] or float(last15["close"]) >= float(last15["ema20"]):
+        long_setup_score += 2; reasons_long.append("15M آماده لانگ است")
+    if trend15 in ["bearish", "weak_bearish"] or float(last15["close"]) <= float(last15["ema20"]):
+        short_setup_score += 2; reasons_short.append("15M آماده شورت است")
+    if p["buy2"] >= 58 or p["buy3"] >= 55:
+        long_setup_score += 1; reasons_long.append("قدرت خرید کوتاه‌مدت دیده می‌شود")
+    if p["sell2"] >= 58 or p["sell3"] >= 55:
+        short_setup_score += 1; reasons_short.append("قدرت فروش کوتاه‌مدت دیده می‌شود")
+    if float(last5["macd_hist"]) >= float(prev5["macd_hist"]):
+        long_setup_score += 1; reasons_long.append("Fresh Momentum برای لانگ بهتر شده")
+    if float(last5["macd_hist"]) <= float(prev5["macd_hist"]):
+        short_setup_score += 1; reasons_short.append("Fresh Momentum برای شورت بهتر شده")
+    if market_regime == "bullish":
+        long_setup_score += 1; reasons_long.append("رژیم کلی بازار کمی صعودی است")
+    elif market_regime == "bearish":
+        short_setup_score += 1; reasons_short.append("رژیم کلی بازار کمی نزولی است")
+    if compression.get("compression_active"):
+        if long_setup_score >= short_setup_score:
+            long_setup_score += 1; reasons_long.append("فشردگی/رنج فعال است و احتمال شکست صعودی بررسی می‌شود")
+        else:
+            short_setup_score += 1; reasons_short.append("فشردگی/رنج فعال است و احتمال شکست نزولی بررسی می‌شود")
+    long_block = trend1h == "bearish" and trend4h in ["bearish", "weak_bearish"]
+    short_block = trend1h == "bullish" and trend4h in ["bullish", "weak_bullish"]
+    direction = "NO TRADE"; reasons = []
+    setup_score = max(long_setup_score, short_setup_score)
+    if long_setup_score >= 4 and long_setup_score >= short_setup_score + 1 and not long_block:
+        direction = "LONG"; reasons = reasons_long
+    elif short_setup_score >= 4 and short_setup_score >= long_setup_score + 1 and not short_block:
+        direction = "SHORT"; reasons = reasons_short
+    return {"direction": direction, "setup_ok": direction in ["LONG", "SHORT"], "setup_score": setup_score, "setup_reasons": reasons[:10], "compression": compression, "entry_status": "WAITING_ACTIVATION" if direction in ["LONG", "SHORT"] else "NO_SETUP"}
+
 def predictive_entry_decision(df_4h, df_1h, df_30m, df_15m, df_5m, price, atr, spread_percent=None):
     """
     موتور اصلی نسخه پیش‌بینی‌محور.
@@ -1686,7 +1767,14 @@ def analyze_symbol(symbol):
         df_4h, df_1h, df_30m, df_15m, df_5m, price, atr, spread_percent
     )
 
+    setup_context = predictive_setup_decision(
+        df_4h, df_1h, df_30m, df_15m, df_5m,
+        price, atr, long_score, short_score, trends, market_regime
+    )
+
     pre_direction = predictive_context.get("direction", "NO TRADE")
+    if pre_direction == "NO TRADE" and setup_context.get("setup_ok"):
+        pre_direction = setup_context.get("direction", "NO TRADE")
 
     tq_l, tq_s, tq_rl, tq_rs, technical_context = technical_quality_context(
         pre_direction, price, atr, support, resistance, df_15m, df_5m, df_30m, df_1h
@@ -1708,11 +1796,15 @@ def analyze_symbol(symbol):
     candle_forecast_reason = technical_context.get("candle_forecast_reason")
 
     raw_direction = predictive_context.get("direction", "NO TRADE")
+    entry_confirmed_now = bool(predictive_context.get("ok")) and raw_direction in ["LONG", "SHORT"]
+    if raw_direction == "NO TRADE" and setup_context.get("setup_ok"):
+        raw_direction = setup_context.get("direction", "NO TRADE")
+
     score = max(long_score, short_score)  # فقط برای سازگاری داخلی/آمار قدیمی؛ تصمیم‌گیر نیست.
-    if raw_direction == "LONG":
+    if entry_confirmed_now and raw_direction in ["LONG", "SHORT"]:
         reasons = predictive_context.get("reasons", []) + risk_notes
-    elif raw_direction == "SHORT":
-        reasons = predictive_context.get("reasons", []) + risk_notes
+    elif raw_direction in ["LONG", "SHORT"]:
+        reasons = setup_context.get("setup_reasons", []) + ["وضعیت: منتظر فعال‌سازی ورود با تایید 5M"] + risk_notes
     else:
         reasons = predictive_context.get("reasons", ["تریگر پیش‌بینی ورود کامل نیست"])
 
@@ -1732,9 +1824,9 @@ def analyze_symbol(symbol):
 
     rr = risk_reward(raw_direction, price, stop_loss_raw, tp1_raw)
 
-    # در نسخه پیش‌بینی‌محور، امتیاز فقط برای سازگاری داخلی باقی می‌ماند و تصمیم ورود نمی‌گیرد.
-    # ورود فقط وقتی فعال است که predictive_entry_decision تریگر تازه را تایید کند.
-    entry_ok = bool(predictive_context.get("ok")) and raw_direction in ["LONG", "SHORT"]
+    # معماری دو مرحله‌ای: Setup کامل صادر می‌شود، اما ورود فقط بعد از Activation فعال است.
+    entry_ok = entry_confirmed_now
+    setup_waiting = (not entry_ok) and raw_direction in ["LONG", "SHORT"] and setup_context.get("setup_ok")
     block_reasons = predictive_context.get("block_reasons", [])
     liquidity_risk = "پایین" if entry_ok else "متوسط"
     fake_breakout = "none"
@@ -1754,13 +1846,19 @@ def analyze_symbol(symbol):
         rr=rr
     )
 
-    if raw_direction == "NO TRADE" or not entry_ok:
+    if raw_direction == "NO TRADE":
         final_direction = "NO TRADE"
         reasons = reasons + block_reasons
         stop_loss = None
         tp1 = None
         tp2 = None
         grade = "NO_ENTRY"
+    elif setup_waiting:
+        final_direction = raw_direction
+        stop_loss = stop_loss_raw
+        tp1 = tp1_raw
+        tp2 = tp2_raw
+        grade = "WAITING_ACTIVATION"
     else:
         final_direction = raw_direction
         stop_loss = stop_loss_raw
@@ -1839,8 +1937,16 @@ def analyze_symbol(symbol):
         "power_acceleration": predictive_context.get("power_accel"),
         "predictive_confirmations": predictive_context.get("confirmations"),
         "freshness": predictive_context.get("freshness"),
-        "entry_mode": predictive_context.get("entry_mode"),
-        "entry_confirmed": bool(predictive_context.get("ok")),
+        "entry_mode": "PREDICTIVE_SETUP" if setup_waiting else predictive_context.get("entry_mode"),
+        "entry_status": "WAITING_ACTIVATION" if setup_waiting else ("ACTIVE" if entry_ok else "NO_ENTRY"),
+        "entry_confirmed": bool(entry_ok),
+        "setup_waiting_activation": bool(setup_waiting),
+        "setup_score": setup_context.get("setup_score"),
+        "setup_reasons": setup_context.get("setup_reasons", []),
+        "compression_active": setup_context.get("compression", {}).get("compression_active"),
+        "compression_score": setup_context.get("compression", {}).get("compression_score"),
+        "compression_label": setup_context.get("compression", {}).get("compression_label"),
+        "compression_reasons": setup_context.get("compression", {}).get("compression_reasons", []),
         "ema_distance_atr": predictive_context.get("ema_distance_atr"),
         "vwap_distance_atr": predictive_context.get("vwap_distance_atr"),
 
