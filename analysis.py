@@ -1463,10 +1463,7 @@ def predictive_entry_decision(df_4h, df_1h, df_30m, df_15m, df_5m, price, atr, s
         confirmations_long += 1; reasons_long.append("شیب MACD Histogram به نفع لانگ است")
     if rsi_rising and float(last["rsi"]) < 72:
         confirmations_long += 1; reasons_long.append("RSI slope صعودی است و هنوز بیش‌ازحد دیر نشده")
-    if close_above_ema and (
-        close_above_vwap
-        or ((not close_above_vwap) and p["buy2"] >= 70)
-    ):
+    if close_above_ema and (close_above_vwap or vwap_reclaim_long):
         confirmations_long += 1; reasons_long.append("قیمت EMA20/VWAP را برای لانگ تایید کرده")
     if float(last15["close"]) >= float(last15["ema20"]):
         confirmations_long += 1; reasons_long.append("15M تایید نرم لانگ می‌دهد")
@@ -1479,10 +1476,7 @@ def predictive_entry_decision(df_4h, df_1h, df_30m, df_15m, df_5m, price, atr, s
         confirmations_short += 1; reasons_short.append("شیب MACD Histogram به نفع شورت است")
     if rsi_falling and float(last["rsi"]) > 28:
         confirmations_short += 1; reasons_short.append("RSI slope نزولی است و هنوز بیش‌ازحد دیر نشده")
-    if close_below_ema and (
-        close_below_vwap
-        or ((not close_below_vwap) and p["sell2"] >= 70)
-    ):
+    if close_below_ema and (close_below_vwap or vwap_reclaim_short):
         confirmations_short += 1; reasons_short.append("قیمت EMA20/VWAP را برای شورت تایید کرده")
     if float(last15["close"]) <= float(last15["ema20"]):
         confirmations_short += 1; reasons_short.append("15M تایید نرم شورت می‌دهد")
