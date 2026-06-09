@@ -1023,8 +1023,8 @@ def calculate_trade_levels(raw_direction, price, atr, support=None, resistance=N
     buffer = atr * 0.18
 
     if raw_direction == "LONG":
-        stop_loss = price - (atr * 1.20)
-        tp1 = price + (atr * 0.80)
+        stop_loss = price - (atr * 1.00)
+        tp1 = price + (atr * 0.75)
         tp2 = price + (atr * 1.80)
 
         if support is not None and support < price:
@@ -1043,8 +1043,8 @@ def calculate_trade_levels(raw_direction, price, atr, support=None, resistance=N
         return stop_loss, tp1, tp2
 
     if raw_direction == "SHORT":
-        stop_loss = price + (atr * 1.20)
-        tp1 = price - (atr * 0.80)
+        stop_loss = price + (atr * 1.00)
+        tp1 = price - (atr * 0.75)
         tp2 = price - (atr * 1.80)
 
         if resistance is not None and resistance > price:
