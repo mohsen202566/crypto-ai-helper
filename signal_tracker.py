@@ -110,12 +110,23 @@ def get_recent_1m_candles_since(symbol, since_ts):
 
 def candle_path_hit(signal, candle):
     """
-    با high/low کندل 1m بررسی می‌کند که TP1 یا SL لمس شده یا نه.
-    اگر هر دو داخل یک کندل لمس شده باشند، طبق SAME_CANDLE_HIT_POLICY تصمیم می‌گیرد.
+    قبل از TP1: مسیر کندل برای TP1 یا SL بررسی می‌شود.
+    بعد از TP1: فقط TP2 بررسی می‌شود تا Win Rate با TP2 قاطی نشود.
     """
     direction = signal.get("direction")
     high = float(candle[2])
     low = float(candle[3])
+
+    if signal.get("tp1_hit"):
+        tp2 = signal.get("tp2")
+        if tp2 is None:
+            return None, None, None
+        tp2 = float(tp2)
+        if direction == "LONG" and high >= tp2:
+            return "TP2", tp2, "candle_path"
+        if direction == "SHORT" and low <= tp2:
+            return "TP2", tp2, "candle_path"
+        return None, None, None
 
     tp_hit = False
     sl_hit = False
@@ -139,7 +150,6 @@ def candle_path_hit(signal, candle):
         return "SL", float(signal["stop_loss"]), "candle_path"
 
     return None, None, None
-
 
 def detect_signal_hit_from_candles(signal):
     last_checked_at = signal.get("last_checked_at") or signal.get("created_at") or now_ts() - 5 * 60
@@ -237,14 +247,10 @@ def activate_pending_signal(signal, price):
     return signal
 
 def close_pending_setup(signal, reason):
-    stats = get_signal_stats()
-    closed = dict(signal)
-    closed["status"] = "CANCELLED"
-    closed["cancel_reason"] = reason
-    closed["closed_at"] = now_ts()
-    closed["closed_at_text"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    stats.append(closed)
-    save_signal_stats(stats)
+    signal["cancel_reason"] = reason
+    signal["closed_at"] = now_ts()
+    signal["closed_at_text"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    record_stat_event(signal, "CANCELLED", extra={"cancel_reason": reason})
     return f"🚫 ستاپ {signal.get('symbol')} لغو شد\n\nجهت: {fa_direction(signal.get('direction'))}\nعلت: {reason}"
 
 def add_signal_to_tracking(user_id, chat_id, message_id, result):
@@ -290,6 +296,14 @@ def add_signal_to_tracking(user_id, chat_id, message_id, result):
         "entry_grade": result.get("entry_grade"),
         "risk_level": result.get("risk_level"),
         "risk_reward": result.get("risk_reward"),
+        "freshness": result.get("freshness"),
+        "entry_mode": result.get("entry_mode"),
+        "predictive_confirmations": result.get("predictive_confirmations"),
+        "power2_buy": result.get("power2_buy"),
+        "power2_sell": result.get("power2_sell"),
+        "power3_buy": result.get("power3_buy"),
+        "power3_sell": result.get("power3_sell"),
+        "power_acceleration": result.get("power_acceleration"),
 
         "market_regime": result.get("market_regime"),
         "market_regime_text": result.get("market_regime_text"),
@@ -351,7 +365,9 @@ def add_signal_to_tracking(user_id, chat_id, message_id, result):
 
     active.append(signal)
     save_active_signals(active)
-    record_stat_event(signal, 'SETUP_CREATED')
+    record_stat_event(signal, "SETUP_CREATED")
+    if initial_status == "ACTIVE":
+        record_stat_event(signal, "ACTIVATED")
 
     if initial_status == "PENDING_ACTIVATION":
         return True, f"👀 ستاپ {signal['symbol']} ذخیره شد و منتظر فعال‌سازی ورود است."
@@ -398,8 +414,6 @@ def calculate_result_percent(signal, exit_price):
 
 
 def close_signal(signal, result_type, exit_price):
-    stats = get_signal_stats()
-
     closed = dict(signal)
     closed["status"] = result_type
     closed["exit_price"] = float(exit_price)
@@ -409,8 +423,12 @@ def close_signal(signal, result_type, exit_price):
     closed["hit_source"] = signal.get("hit_source")
     closed["hit_candle_time"] = signal.get("hit_candle_time")
 
-    stats.append(closed)
-    save_signal_stats(stats)
+    record_stat_event(closed, result_type, extra={
+        "exit_price": float(exit_price),
+        "result_percent": closed.get("result_percent"),
+        "hit_source": closed.get("hit_source"),
+        "hit_candle_time": closed.get("hit_candle_time"),
+    })
 
     if result_type == "TP1":
         return (
@@ -420,6 +438,17 @@ def close_signal(signal, result_type, exit_price):
             f"TP1: {signal['tp1']}\n"
             f"قیمت خروج: {exit_price}\n"
             f"نتیجه: موفق ✅\n"
+            f"درصد حرکت: {closed['result_percent']}٪"
+        )
+
+    if result_type == "TP2":
+        return (
+            f"🎯 نتیجه TP2 سیگنال {signal['symbol']}\n\n"
+            f"جهت: {'لانگ' if signal['direction'] == 'LONG' else 'شورت'}\n"
+            f"ورود: {signal['entry']}\n"
+            f"TP2: {signal['tp2']}\n"
+            f"قیمت خروج: {exit_price}\n"
+            f"نتیجه: تارگت دوم ✅\n"
             f"درصد حرکت: {closed['result_percent']}٪"
         )
 
@@ -437,9 +466,6 @@ def close_signal(signal, result_type, exit_price):
         f"دلایل احتمالی استاپ:\n"
         f"{reasons_text}"
     )
-
-
-
 
 def fa_direction(direction):
     if direction == "LONG":
@@ -705,8 +731,18 @@ def check_active_signals():
                 msg = close_signal(signal, result_type, exit_price)
                 messages.append({
                     "chat_id": signal["chat_id"],
-                    "message": msg
+                    "message": msg,
+                    "reply_to_message_id": signal.get("message_id")
                 })
+
+                if result_type == "TP1" and signal.get("tp2") is not None:
+                    signal["tp1_hit"] = True
+                    signal["tp1_hit_at"] = now_ts()
+                    signal["tp1_hit_at_text"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    signal["last_checked_at"] = now_ts()
+                    remaining.append(signal)
+                    continue
+
                 continue
 
             # برای هشدار ضعف، قیمت فعلی فقط جهت نمایش استفاده می‌شود؛
@@ -979,64 +1015,306 @@ def parse_days_from_text(text):
 
 
 
-def record_stat_event(signal, status):
-    stats = get_signal_stats()
-    item = {
+def get_signal_identity(signal):
+    return signal.get("signal_id") or signal.get("id")
+
+
+def stat_event_exists(stats, signal_id, status):
+    if not signal_id:
+        return False
+    for item in stats:
+        if item.get("signal_id") == signal_id and item.get("status") == status:
+            return True
+    return False
+
+
+def build_stat_event(signal, status, extra=None):
+    current = now_ts()
+    signal_id = get_signal_identity(signal)
+    event = {
+        "schema": "v2_event_stats",
+        "signal_id": signal_id,
+        "id": signal_id,
+        "status": status,
+        "event_type": status,
+        "event_at": current,
+        "closed_at": current,
+        "event_time_text": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "symbol": signal.get("symbol"),
         "direction": signal.get("direction"),
-        "status": status,
-        "created_at": now_ts(),
-        "closed_at": now_ts()
+        "user_id": signal.get("user_id"),
+        "chat_id": signal.get("chat_id"),
+        "message_id": signal.get("message_id"),
+        "entry": signal.get("entry"),
+        "stop_loss": signal.get("stop_loss"),
+        "tp1": signal.get("tp1"),
+        "tp2": signal.get("tp2"),
+        "activated_price": signal.get("activated_price"),
+        "exit_price": signal.get("exit_price"),
+        "result_percent": signal.get("result_percent"),
+        "created_at": signal.get("created_at"),
+        "created_at_text": signal.get("created_at_text"),
+        "activated_at": signal.get("activated_at"),
+        "activated_at_text": signal.get("activated_at_text"),
+        "entry_mode": signal.get("entry_mode"),
+        "entry_status": signal.get("entry_status"),
+        "entry_confirmed": signal.get("entry_confirmed"),
+        "entry_grade": signal.get("entry_grade"),
+        "risk_level": signal.get("risk_level"),
+        "risk_reward": signal.get("risk_reward"),
+        "freshness": signal.get("freshness"),
+        "predictive_confirmations": signal.get("predictive_confirmations"),
+        "setup_score": signal.get("setup_score"),
+        "adx": signal.get("adx"),
+        "rsi": signal.get("rsi"),
+        "macd_hist": signal.get("macd_hist"),
+        "vwap_status": signal.get("vwap_status"),
+        "market_regime": signal.get("market_regime"),
+        "market_regime_label": signal.get("market_regime_label"),
+        "market_breadth_status": signal.get("market_breadth_status"),
+        "market_breadth_label": signal.get("market_breadth_label"),
+        "market_breadth_bullish_pct": signal.get("market_breadth_bullish_pct"),
+        "market_breadth_bearish_pct": signal.get("market_breadth_bearish_pct"),
+        "compression_active": signal.get("compression_active"),
+        "compression_label": signal.get("compression_label"),
+        "power2_buy": signal.get("power2_buy"),
+        "power2_sell": signal.get("power2_sell"),
+        "power3_buy": signal.get("power3_buy"),
+        "power3_sell": signal.get("power3_sell"),
+        "power_acceleration": signal.get("power_acceleration"),
+        "buy_power": signal.get("buy_power"),
+        "sell_power": signal.get("sell_power"),
+        "cancel_reason": signal.get("cancel_reason"),
+        "hit_source": signal.get("hit_source"),
+        "hit_candle_time": signal.get("hit_candle_time"),
+        "warning_sent": signal.get("warning_sent"),
+        "warning_reasons": signal.get("warning_reasons", []),
     }
-    stats.append(item)
-    save_signal_stats(stats)
+    if extra:
+        event.update(extra)
+    return event
 
 
+def record_stat_event(signal, status, extra=None, unique=True):
+    try:
+        stats = get_signal_stats()
+        signal_id = get_signal_identity(signal)
+        if unique and stat_event_exists(stats, signal_id, status):
+            return False
+        stats.append(build_stat_event(signal, status, extra=extra))
+        save_signal_stats(stats)
+        return True
+    except Exception as e:
+        print("STAT EVENT ERROR:", status, str(e))
+        return False
 
 def get_stats_report(days=None):
     stats = get_signal_stats()
+    active = get_active_signals()
 
+    start_ts = None
     if days is not None:
         start_ts = now_ts() - (days * 24 * 60 * 60)
-        stats = [s for s in stats if s.get("closed_at", 0) >= start_ts]
 
-    setups = len([s for s in stats if s.get("status") == "SETUP_CREATED"])
-    activated = len([s for s in stats if s.get("status") == "ACTIVATED"])
-    cancelled = len([s for s in stats if s.get("status") == "CANCELLED"])
-    tp1 = len([s for s in stats if s.get("status") == "TP1"])
-    tp2 = len([s for s in stats if s.get("status") == "TP2"])
-    sl = len([s for s in stats if s.get("status") == "SL"])
+    def event_time(item):
+        return int(item.get("event_at") or item.get("closed_at") or item.get("created_at") or 0)
+
+    if start_ts is not None:
+        stats = [s for s in stats if event_time(s) >= start_ts]
+        active = [s for s in active if int(s.get("created_at") or 0) >= start_ts]
+
+    v2 = [s for s in stats if s.get("signal_id")]
+    legacy = [s for s in stats if not s.get("signal_id") and s.get("status") in ["TP1", "SL"]]
+
+    def ids(status):
+        return set(s.get("signal_id") for s in v2 if s.get("status") == status and s.get("signal_id"))
+
+    setup_ids = ids("SETUP_CREATED")
+    activated_ids = ids("ACTIVATED")
+    cancelled_ids = ids("CANCELLED")
+    tp1_ids = ids("TP1")
+    tp2_ids = ids("TP2")
+    sl_ids = ids("SL")
+
+    pending_active_ids = set(get_signal_identity(s) for s in active if s.get("status") == "PENDING_ACTIVATION" and get_signal_identity(s))
+    active_trade_ids = set(get_signal_identity(s) for s in active if s.get("status") == "ACTIVE" and get_signal_identity(s))
+
+    setups = len(setup_ids)
+    activated = len(activated_ids)
+    cancelled = len(cancelled_ids)
+    pending = len(pending_active_ids)
+    active_trades = len(active_trade_ids)
+    tp1_count = len(tp1_ids)
+    tp2_count = len(tp2_ids)
+    sl_count = len(sl_ids)
 
     activation_rate = round((activated / setups) * 100, 1) if setups else 0
-    activated_wr = round((tp1 / (tp1 + sl)) * 100, 1) if (tp1 + sl) else 0
+    closed_activated = tp1_count + sl_count
+    activated_win_rate = round((tp1_count / closed_activated) * 100, 1) if closed_activated else 0
+    tp2_rate = round((tp2_count / tp1_count) * 100, 1) if tp1_count else 0
+
+    def latest_events(status):
+        by_id = {}
+        for s in v2:
+            if s.get("status") == status and s.get("signal_id"):
+                by_id[s.get("signal_id")] = s
+        return list(by_id.values())
+
+    activated_events = latest_events("ACTIVATED")
+    tp1_events = latest_events("TP1")
+    tp2_events = latest_events("TP2")
+    sl_events = latest_events("SL")
+    cancelled_events = latest_events("CANCELLED")
+    outcome_events = tp1_events + sl_events
+
+    def avg_minutes(items, start_key, end_key):
+        vals = []
+        for item in items:
+            try:
+                a = int(item.get(start_key) or 0)
+                b = int(item.get(end_key) or item.get("event_at") or item.get("closed_at") or 0)
+                if a > 0 and b > 0 and b >= a:
+                    vals.append((b - a) / 60)
+            except Exception:
+                pass
+        return round(sum(vals) / len(vals), 1) if vals else 0
+
+    avg_activation_min = avg_minutes(activated_events, "created_at", "activated_at")
+    avg_tp1_min = avg_minutes(tp1_events, "activated_at", "closed_at")
+    avg_sl_min = avg_minutes(sl_events, "activated_at", "closed_at")
+
+    def direction_report(direction):
+        items = [x for x in outcome_events if x.get("direction") == direction]
+        wins = len([x for x in items if x.get("status") == "TP1"])
+        losses = len([x for x in items if x.get("status") == "SL"])
+        total = wins + losses
+        wr = round((wins / total) * 100, 1) if total else 0
+        return f"{total} معامله | TP1: {wins} | SL: {losses} | Win Rate: {wr}٪"
+
+    def group_report(field, title, limit=8):
+        groups = {}
+        for item in outcome_events:
+            key = item.get(field)
+            if key in [None, "", "نامشخص"]:
+                key = "نامشخص"
+            groups.setdefault(str(key), {"tp1": 0, "sl": 0})
+            if item.get("status") == "TP1":
+                groups[str(key)]["tp1"] += 1
+            elif item.get("status") == "SL":
+                groups[str(key)]["sl"] += 1
+        if not groups:
+            return f"\n{title}:\nندارد\n"
+        rows = []
+        for key, data in groups.items():
+            total = data["tp1"] + data["sl"]
+            wr = round((data["tp1"] / total) * 100, 1) if total else 0
+            rows.append((total, wr, key, data))
+        rows.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        out = f"\n{title}:"
+        for total, wr, key, data in rows[:limit]:
+            out += f"\n{key}: {data['tp1']}/{total} TP1 | {wr}٪"
+        return out + "\n"
+
+    def adx_bucket(value):
+        try:
+            v = float(value)
+        except Exception:
+            return "ADX نامشخص"
+        if v < 15:
+            return "ADX زیر 15"
+        if v < 20:
+            return "ADX 15 تا 20"
+        if v < 25:
+            return "ADX 20 تا 25"
+        return "ADX بالای 25"
+
+    for item in outcome_events:
+        item["adx_bucket"] = adx_bucket(item.get("adx"))
+
+    avg_win = round(sum(abs(float(s.get("result_percent", 0) or 0)) for s in tp1_events) / len(tp1_events), 3) if tp1_events else 0
+    avg_loss = round(sum(abs(float(s.get("result_percent", 0) or 0)) for s in sl_events) / len(sl_events), 3) if sl_events else 0
 
     title = "آمار کل" if days is None else f"آمار {days} روز اخیر"
 
-    return f"""
+    if not v2 and not active:
+        if days is None:
+            return "📊 هنوز آمار دقیق جدیدی وجود ندارد."
+        return f"📊 در {days} روز اخیر آمار دقیق جدیدی وجود ندارد."
+
+    report = f"""
 📊 {title}
 
-Setup ساخته شده:
+ستاپ ساخته‌شده:
 {setups}
 
-✅ Activated:
+✅ ورود فعال‌شده:
 {activated}
 
-🚫 Cancelled:
+👀 هنوز منتظر فعال‌سازی:
+{pending}
+
+🚫 لغوشده:
 {cancelled}
 
 Activation Rate:
 {activation_rate}٪
 
+معاملات فعال باز:
+{active_trades}
+
+--------------------
+
 TP1:
-{tp1}
+{tp1_count}
 
 TP2:
-{tp2}
+{tp2_count}
 
 SL:
-{sl}
+{sl_count}
 
 Activated Win Rate:
-{activated_wr}٪
+{activated_win_rate}٪
+
+TP2 Rate از TP1:
+{tp2_rate}٪
+
+میانگین برد:
+{avg_win}٪
+
+میانگین باخت:
+{avg_loss}٪
+
+--------------------
+
+میانگین زمان تا فعال‌سازی:
+{avg_activation_min} دقیقه
+
+میانگین زمان تا TP1 بعد از فعال‌سازی:
+{avg_tp1_min} دقیقه
+
+میانگین زمان تا SL بعد از فعال‌سازی:
+{avg_sl_min} دقیقه
+
+--------------------
+
+لانگ:
+{direction_report('LONG')}
+
+شورت:
+{direction_report('SHORT')}
 """
+    report += group_report("symbol", "عملکرد ارزها")
+    report += group_report("entry_mode", "عملکرد بر اساس حالت ورود")
+    report += group_report("freshness", "عملکرد بر اساس تازگی حرکت")
+    report += group_report("risk_level", "عملکرد بر اساس ریسک")
+    report += group_report("adx_bucket", "عملکرد بر اساس ADX")
+    report += group_report("market_regime", "عملکرد بر اساس روند کلی بازار")
+    report += format_signal_details(tp1_events, f"✅ لیست TP1 ({len(tp1_events)}):", limit=10, include_reasons=False)
+    report += format_signal_details(tp2_events, f"🎯 لیست TP2 ({len(tp2_events)}):", limit=10, include_reasons=False)
+    report += format_signal_details(sl_events, f"❌ لیست SL ({len(sl_events)}):", limit=10, include_reasons=True)
+    report += format_signal_details(cancelled_events, f"🚫 لیست لغوشده‌ها ({len(cancelled_events)}):", limit=10, include_reasons=False)
+    if legacy:
+        report += f"\n\nرکوردهای قدیمی بدون signal_id: {len(legacy)} مورد\nاین رکوردها در آمار دقیق جدید حساب نشده‌اند."
+    return report
 
