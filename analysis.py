@@ -1898,16 +1898,38 @@ def analyze_symbol(symbol):
     rr = risk_reward(raw_direction, price, stop_loss_raw, tp1_raw)
 
     # معماری دو مرحله‌ای: Setup کامل صادر می‌شود، اما ورود فقط بعد از Activation فعال است.
+    # نکته مهم: TP Space / Trap Risk نباید Setup را حذف کند؛ اما نباید اجازه Entry فعال بدهد.
+    # این کار باعث می‌شود ارز همچنان زیر نظر بماند، ولی ورود فقط وقتی تمیز و دور از حمایت/مقاومت خطرناک باشد صادر شود.
     entry_ok = entry_confirmed_now
+    block_reasons = list(predictive_context.get("block_reasons", []))
+
+    if raw_direction in ["LONG", "SHORT"]:
+        if tp_space_ok is False:
+            clean_reason = tp_space_reason or "فضای TP نسبت به حمایت/مقاومت برای ورود فعال کافی نیست"
+            reasons.append(clean_reason)
+            block_reasons.append(clean_reason)
+            entry_ok = False
+
+        if trap_risk:
+            clean_reason = trap_reason or "ورود نزدیک حمایت/مقاومت مهم ریسک تله دارد"
+            reasons.append(clean_reason)
+            block_reasons.append(clean_reason)
+            entry_ok = False
+
+    # اگر RR خیلی ضعیف باشد، Setup می‌تواند باقی بماند اما Entry فعال صادر نمی‌شود.
+    # مقدار 0.55 خشک نیست، فقط ورودهایی مثل RR بسیار پایین را نگه می‌دارد تا شرایط بهتر شود.
+    preliminary_stop, preliminary_tp1, _ = calculate_trade_levels(raw_direction, price, atr, support, resistance)
+    preliminary_rr = risk_reward(raw_direction, price, preliminary_stop, preliminary_tp1)
+    if entry_ok and raw_direction in ["LONG", "SHORT"] and preliminary_rr < 0.55:
+        clean_reason = "ریسک به ریوارد برای ورود فعال تمیز نیست؛ ستاپ فقط زیر نظر می‌ماند"
+        reasons.append(clean_reason)
+        block_reasons.append(clean_reason)
+        entry_ok = False
+
     setup_waiting = (not entry_ok) and raw_direction in ["LONG", "SHORT"] and setup_context.get("setup_ok")
-    block_reasons = predictive_context.get("block_reasons", [])
     liquidity_risk = "پایین" if entry_ok else "متوسط"
     fake_breakout = "none"
     trend_exhaustion = "none"
-
-    if raw_direction != "NO TRADE" and tp_space_ok is False:
-        # TP Space دیگر سیگنال را حذف نمی‌کند؛ فقط به عنوان هشدار ذخیره/نمایش داده می‌شود.
-        reasons.append(tp_space_reason or "فضای TP نسبت به حمایت/مقاومت ضعیف است")
 
     risk_level = calculate_risk_level(
         raw_direction=raw_direction,
