@@ -21,7 +21,6 @@ from signal_tracker import (
     get_profit_for_signal_text,
     get_profit_simulation_report,
     reset_stats,
-    can_add_automatic_signal,
 )
 
 if not BOT_TOKEN:
@@ -352,10 +351,6 @@ ADX: {safe(result.get('adx'))}
 
     for user_id in list_users():
         try:
-            can_add, reason = can_add_automatic_signal(user_id, result.get("symbol"))
-            if not can_add:
-                continue
-
             sent = bot.send_message(user_id, text)
             remember_signal_result(sent, result)
             if AUTO_TRACK_AUTO_SIGNALS:
@@ -374,11 +369,7 @@ def auto_signal_loop():
             try:
                 result = analyze_symbol(symbol)
 
-                # فقط سیگنال‌هایی ارسال شوند که از دروازه اصلی scanner عبور کرده‌اند.
-                # قبلاً یک شرط OR باعث می‌شد هر Setup لانگ/شورت ارسال شود و سقف Watchlist دور زده شود.
-                should_auto = should_send_auto_signal(result)
-
-                if should_auto:
+                if should_send_auto_signal(result):
                     send_auto_signal_to_all_users(result)
 
             except Exception as e:
@@ -407,9 +398,19 @@ def signal_tracking_loop():
 
             for item in messages:
                 try:
-                    bot.send_message(item["chat_id"], item["message"], reply_to_message_id=item.get("reply_to_message_id"))
+                    reply_to_id = item.get("reply_to_message_id")
+                    try:
+                        bot.send_message(
+                            item["chat_id"],
+                            item["message"],
+                            reply_to_message_id=reply_to_id if reply_to_id else None
+                        )
+                    except Exception as reply_error:
+                        # اگر ریپلای به پیام اصلی به هر دلیل خطا داد، پیام نتیجه از دست نرود.
+                        print("SEND TRACK RESULT REPLY ERROR:", str(reply_error))
+                        bot.send_message(item["chat_id"], item["message"])
                 except Exception as e:
-                    print("SEND TRACK RESULT ERROR:", str(e))
+                    log_exception("ارسال نتیجه مانیتورینگ", e, "bot.py", "signal_tracking_loop")
 
         except Exception as e:
             print("SIGNAL TRACKING LOOP ERROR:", str(e))
