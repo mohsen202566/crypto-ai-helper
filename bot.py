@@ -4,13 +4,12 @@ import telebot
 import threading
 import time
 
-from config import BOT_TOKEN, AUTO_SCAN_INTERVAL_MINUTES, TRACKER_CHECK_INTERVAL_SECONDS, AUTO_TRACK_AUTO_SIGNALS
+from config import BOT_TOKEN, AUTO_SCAN_INTERVAL_MINUTES, TRACKER_CHECK_INTERVAL_SECONDS
 from coins_fa import COINS_FA
 from analysis import analyze_symbol
 from scanner import get_best_signals, SCAN_SYMBOLS, should_send_auto_signal
 from market_scanner import get_market_status_text
 from users import is_user_allowed, is_owner, add_user, remove_user, list_users
-from diagnostics import format_error_report, log_exception
 from signal_tracker import (
     add_signal_to_tracking,
     check_active_signals,
@@ -210,7 +209,6 @@ def build_analysis_text(result):
     return f"""
 📊 تحلیل فیوچرز {result['symbol']}
 
-وضعیت ورود: {"✅ فعال" if result.get("entry_confirmed") else "👀 منتظر فعال‌سازی" if result.get("setup_waiting_activation") else "غیرفعال"}
 قیمت فعلی: {result['price']}
 
 جهت نهایی: {fa_direction(result['direction'])}
@@ -311,13 +309,9 @@ ADX: {safe(r.get('adx'))}
 def send_auto_signal_to_all_users(result):
     direction_fa = "لانگ" if result["direction"] == "LONG" else "شورت"
 
-    title = "🚨 سیگنال آماده" if result.get("setup_waiting_activation") else "🚨 سیگنال خودکار"
-    entry_status_text = "👀 منتظر فعال‌سازی ورود" if result.get("setup_waiting_activation") else "✅ ورود فعال"
-
     text = f"""
-{title}
+🚨 سیگنال خودکار
 
-وضعیت: {entry_status_text}
 ارز: {result['symbol']}
 جهت: {direction_fa}
 حالت ورود: {safe(result.get('entry_mode'))}
@@ -346,13 +340,8 @@ ADX: {safe(result.get('adx'))}
         try:
             sent = bot.send_message(user_id, text)
             remember_signal_result(sent, result)
-            if AUTO_TRACK_AUTO_SIGNALS:
-                try:
-                    add_signal_to_tracking(user_id=user_id, chat_id=user_id, message_id=sent.message_id, result=result)
-                except Exception as e:
-                    log_exception("ثبت خودکار مانیتورینگ", e, "bot.py", "send_auto_signal_to_all_users", result.get("symbol"))
         except Exception as e:
-            log_exception("ارسال سیگنال خودکار", e, "bot.py", "send_auto_signal_to_all_users", result.get("symbol"))
+            print("SEND AUTO SIGNAL ERROR:", user_id, str(e))
 
 def auto_signal_loop():
     time.sleep(60)
@@ -391,7 +380,7 @@ def signal_tracking_loop():
 
             for item in messages:
                 try:
-                    bot.send_message(item["chat_id"], item["message"], reply_to_message_id=item.get("reply_to_message_id"))
+                    bot.send_message(item["chat_id"], item["message"])
                 except Exception as e:
                     print("SEND TRACK RESULT ERROR:", str(e))
 
