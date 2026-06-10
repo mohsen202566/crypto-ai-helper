@@ -385,12 +385,12 @@ def apply_market_regime_to_scores(long_score, short_score, market_regime, reason
     روند کلی بازار فقط اثر بسیار نرم دارد.
     """
     if market_regime == "bearish":
-        short_score += 2
-        long_score -= 2
+        short_score += 5
+        long_score -= 5
         reasons_short.append("روند کلی بازار کمی به نفع شورت است")
     elif market_regime == "bullish":
-        long_score += 2
-        short_score -= 2
+        long_score += 5
+        short_score -= 5
         reasons_long.append("روند کلی بازار کمی به نفع لانگ است")
 
     return max(0, long_score), max(0, short_score)
@@ -552,202 +552,6 @@ def technical_quality_context(raw_direction, price, atr, support, resistance, df
     context["technical_quality_long_adj"] = long_adj
     context["technical_quality_short_adj"] = short_adj
     return long_adj, short_adj, reasons_long, reasons_short, context
-
-def _btc_lead_bias_from_data(btc_15m, btc_5m):
-    """
-    BTC Lead Indicator برای اسکالپ آلت‌ها.
-    خروجی فقط بایاس نرم می‌دهد و هیچ سیگنالی را مستقیم حذف نمی‌کند.
-    """
-    try:
-        last_15 = btc_15m.iloc[-1]
-        last_5 = btc_5m.iloc[-1]
-        prev_5 = btc_5m.iloc[-2]
-        prev2_5 = btc_5m.iloc[-3]
-
-        p = _power_snapshot(btc_5m)
-
-        trend_15 = trend_direction(btc_15m)
-        trend_5 = trend_direction(btc_5m)
-
-        macd_rising = float(last_5["macd_hist"]) > float(prev_5["macd_hist"])
-        macd_falling = float(last_5["macd_hist"]) < float(prev_5["macd_hist"])
-        macd_turn_up = macd_rising and float(prev_5["macd_hist"]) <= float(prev2_5["macd_hist"])
-        macd_turn_down = macd_falling and float(prev_5["macd_hist"]) >= float(prev2_5["macd_hist"])
-
-        rsi_rising = float(last_5["rsi"]) > float(prev_5["rsi"])
-        rsi_falling = float(last_5["rsi"]) < float(prev_5["rsi"])
-
-        close_above_ema = float(last_5["close"]) >= float(last_5["ema20"])
-        close_below_ema = float(last_5["close"]) <= float(last_5["ema20"])
-        close_above_vwap = float(last_5["close"]) >= float(last_5["vwap"])
-        close_below_vwap = float(last_5["close"]) <= float(last_5["vwap"])
-
-        bullish_points = 0
-        bearish_points = 0
-        reasons = []
-
-        if trend_15 in ["bullish", "weak_bullish"]:
-            bullish_points += 1
-        if trend_15 in ["bearish", "weak_bearish"]:
-            bearish_points += 1
-
-        if trend_5 in ["bullish", "weak_bullish"]:
-            bullish_points += 1
-        if trend_5 in ["bearish", "weak_bearish"]:
-            bearish_points += 1
-
-        if close_above_ema and close_above_vwap:
-            bullish_points += 1
-            reasons.append("BTC بالای EMA20/VWAP در 5M است")
-        if close_below_ema and close_below_vwap:
-            bearish_points += 1
-            reasons.append("BTC پایین EMA20/VWAP در 5M است")
-
-        if macd_turn_up or macd_rising:
-            bullish_points += 1
-            reasons.append("BTC MACD Histogram به سمت بالا می‌چرخد")
-        if macd_turn_down or macd_falling:
-            bearish_points += 1
-            reasons.append("BTC MACD Histogram به سمت پایین می‌چرخد")
-
-        if rsi_rising and float(last_5["rsi"]) < 72:
-            bullish_points += 1
-            reasons.append("BTC RSI slope صعودی دارد")
-        if rsi_falling and float(last_5["rsi"]) > 28:
-            bearish_points += 1
-            reasons.append("BTC RSI slope نزولی دارد")
-
-        if p["buy2"] >= 66 or (p["buy2"] >= 58 and p["buy3"] >= 55):
-            bullish_points += 1
-            reasons.append("BTC قدرت خرید 2/3 کندلی دارد")
-        if p["sell2"] >= 66 or (p["sell2"] >= 58 and p["sell3"] >= 55):
-            bearish_points += 1
-            reasons.append("BTC قدرت فروش 2/3 کندلی دارد")
-
-        if p["buy_accel"] >= 6:
-            bullish_points += 1
-            reasons.append("BTC شتاب خرید تازه دارد")
-        if p["sell_accel"] >= 6:
-            bearish_points += 1
-            reasons.append("BTC شتاب فروش تازه دارد")
-
-        diff = bullish_points - bearish_points
-
-        if diff >= 4:
-            bias = "STRONG_BULLISH"
-            long_adj, short_adj = 4, -4
-        elif diff >= 2:
-            bias = "BULLISH"
-            long_adj, short_adj = 2, -2
-        elif diff <= -4:
-            bias = "STRONG_BEARISH"
-            long_adj, short_adj = -4, 4
-        elif diff <= -2:
-            bias = "BEARISH"
-            long_adj, short_adj = -2, 2
-        else:
-            bias = "NEUTRAL"
-            long_adj, short_adj = 0, 0
-
-        return {
-            "btc_bias": bias,
-            "btc_lead_long_adj": long_adj,
-            "btc_lead_short_adj": short_adj,
-            "btc_bullish_points": bullish_points,
-            "btc_bearish_points": bearish_points,
-            "btc_bias_diff": diff,
-            "btc_power2_buy": p["buy2"],
-            "btc_power2_sell": p["sell2"],
-            "btc_power3_buy": p["buy3"],
-            "btc_power3_sell": p["sell3"],
-            "btc_power_acceleration": p["buy_accel"] if diff >= 0 else p["sell_accel"],
-            "btc_reasons": reasons[:8],
-        }
-
-    except Exception:
-        return {
-            "btc_bias": "UNKNOWN",
-            "btc_lead_long_adj": 0,
-            "btc_lead_short_adj": 0,
-            "btc_bullish_points": 0,
-            "btc_bearish_points": 0,
-            "btc_bias_diff": 0,
-            "btc_power2_buy": None,
-            "btc_power2_sell": None,
-            "btc_power3_buy": None,
-            "btc_power3_sell": None,
-            "btc_power_acceleration": None,
-            "btc_reasons": [],
-        }
-
-
-def get_btc_lead_context(symbol, df_15m=None, df_5m=None):
-    """
-    برای BTC خودش از همان دیتای نماد استفاده می‌شود.
-    برای آلت‌ها BTC جدا خوانده می‌شود.
-    """
-    try:
-        if symbol == "BTCUSDT" and df_15m is not None and df_5m is not None:
-            return _btc_lead_bias_from_data(df_15m, df_5m)
-
-        btc_15m = add_indicators(get_klines("BTCUSDT", "15m"))
-        btc_5m = add_indicators(get_klines("BTCUSDT", "5m"))
-        return _btc_lead_bias_from_data(btc_15m, btc_5m)
-
-    except Exception:
-        return {
-            "btc_bias": "UNKNOWN",
-            "btc_lead_long_adj": 0,
-            "btc_lead_short_adj": 0,
-            "btc_bullish_points": 0,
-            "btc_bearish_points": 0,
-            "btc_bias_diff": 0,
-            "btc_power2_buy": None,
-            "btc_power2_sell": None,
-            "btc_power3_buy": None,
-            "btc_power3_sell": None,
-            "btc_power_acceleration": None,
-            "btc_reasons": [],
-        }
-
-
-def btc_filter(symbol):
-    """
-    BTC Lead نرم:
-    Strong = ±4
-    Normal = ±2
-    بدون هارد فیلتر، برای جلوگیری از خشک شدن سیگنال‌ها.
-    """
-    try:
-        ctx = get_btc_lead_context(symbol)
-
-        long_score = int(ctx.get("btc_lead_long_adj", 0) or 0)
-        short_score = int(ctx.get("btc_lead_short_adj", 0) or 0)
-        bias = ctx.get("btc_bias", "NEUTRAL")
-
-        reasons_long = []
-        reasons_short = []
-
-        if bias == "STRONG_BULLISH":
-            reasons_long.append("BTC Lead قوی به نفع لانگ است")
-            reasons_short.append("BTC Lead قوی خلاف شورت است")
-        elif bias == "BULLISH":
-            reasons_long.append("BTC Lead کمی به نفع لانگ است")
-            reasons_short.append("BTC Lead کمی خلاف شورت است")
-        elif bias == "STRONG_BEARISH":
-            reasons_short.append("BTC Lead قوی به نفع شورت است")
-            reasons_long.append("BTC Lead قوی خلاف لانگ است")
-        elif bias == "BEARISH":
-            reasons_short.append("BTC Lead کمی به نفع شورت است")
-            reasons_long.append("BTC Lead کمی خلاف لانگ است")
-        elif bias == "NEUTRAL":
-            reasons_long.append("BTC Lead خنثی است")
-            reasons_short.append("BTC Lead خنثی است")
-
-        return bias, long_score, short_score, reasons_long, reasons_short
-
-    except Exception:
-        return "UNKNOWN", 0, 0, [], []
 
 
 def signal_validity(score, direction):
@@ -1599,7 +1403,7 @@ def detect_compression_context(df_30m, df_15m, df_5m):
     return context
 
 
-def predictive_setup_decision(df_4h, df_1h, df_30m, df_15m, df_5m, price, atr, long_score, short_score, trends, market_regime="neutral", btc_bias="NEUTRAL"):
+def predictive_setup_decision(df_4h, df_1h, df_30m, df_15m, df_5m, price, atr, long_score, short_score, trends, market_regime="neutral"):
     """مرحله اول: سیگنال کامل آماده می‌شود اما ورود منتظر فعال‌سازی 5M می‌ماند."""
     reasons_long, reasons_short = [], []
     last15 = df_15m.iloc[-1]
@@ -1633,19 +1437,6 @@ def predictive_setup_decision(df_4h, df_1h, df_30m, df_15m, df_5m, price, atr, l
         long_setup_score += 1; reasons_long.append("رژیم کلی بازار کمی صعودی است")
     elif market_regime == "bearish":
         short_setup_score += 1; reasons_short.append("رژیم کلی بازار کمی نزولی است")
-
-    # BTC Lead فقط بایاس نرم برای Setup می‌دهد؛ سیگنال را مستقیم حذف نمی‌کند.
-    if btc_bias == "STRONG_BULLISH":
-        long_setup_score += 2; short_setup_score -= 1; reasons_long.append("BTC Lead قوی به نفع ستاپ لانگ است")
-    elif btc_bias == "BULLISH":
-        long_setup_score += 1; reasons_long.append("BTC Lead کمی به نفع ستاپ لانگ است")
-    elif btc_bias == "STRONG_BEARISH":
-        short_setup_score += 2; long_setup_score -= 1; reasons_short.append("BTC Lead قوی به نفع ستاپ شورت است")
-    elif btc_bias == "BEARISH":
-        short_setup_score += 1; reasons_short.append("BTC Lead کمی به نفع ستاپ شورت است")
-
-    long_setup_score = max(0, long_setup_score)
-    short_setup_score = max(0, short_setup_score)
     if compression.get("compression_active"):
         if long_setup_score >= short_setup_score:
             long_setup_score += 1; reasons_long.append("فشردگی/رنج فعال است و احتمال شکست صعودی بررسی می‌شود")
@@ -1661,7 +1452,7 @@ def predictive_setup_decision(df_4h, df_1h, df_30m, df_15m, df_5m, price, atr, l
         direction = "SHORT"; reasons = reasons_short
     return {"direction": direction, "setup_ok": direction in ["LONG", "SHORT"], "setup_score": setup_score, "setup_reasons": reasons[:10], "compression": compression, "entry_status": "WAITING_ACTIVATION" if direction in ["LONG", "SHORT"] else "NO_SETUP"}
 
-def predictive_entry_decision(df_4h, df_1h, df_30m, df_15m, df_5m, price, atr, spread_percent=None, btc_bias="NEUTRAL"):
+def predictive_entry_decision(df_4h, df_1h, df_30m, df_15m, df_5m, price, atr, spread_percent=None):
     """
     موتور اصلی نسخه پیش‌بینی‌محور.
     تصمیم نهایی دیگر با امتیاز 0 تا 100 نیست؛ فقط تریگر ورود تازه / عدم ورود.
@@ -1738,29 +1529,6 @@ def predictive_entry_decision(df_4h, df_1h, df_30m, df_15m, df_5m, price, atr, s
         confirmations_short += 1; reasons_short.append("قیمت EMA20/VWAP را برای شورت تایید کرده")
     if float(last15["close"]) <= float(last15["ema20"]):
         confirmations_short += 1; reasons_short.append("15M تایید نرم شورت می‌دهد")
-
-    # BTC Lead به عنوان تایید نرم ورود؛ نه فیلتر سخت.
-    # در حالت Strong هم‌جهت یک تایید اضافه می‌دهد و خلاف‌جهت را فقط کمی سخت‌تر می‌کند.
-    if btc_bias == "STRONG_BULLISH":
-        confirmations_long += 1
-        reasons_long.append("BTC Lead قوی ورود لانگ را تایید می‌کند")
-        if confirmations_short >= 4:
-            confirmations_short -= 1
-            reasons_short.append("BTC Lead قوی خلاف شورت است")
-    elif btc_bias == "BULLISH":
-        if confirmations_long >= 3:
-            confirmations_long += 1
-            reasons_long.append("BTC Lead کمی ورود لانگ را تایید می‌کند")
-    elif btc_bias == "STRONG_BEARISH":
-        confirmations_short += 1
-        reasons_short.append("BTC Lead قوی ورود شورت را تایید می‌کند")
-        if confirmations_long >= 4:
-            confirmations_long -= 1
-            reasons_long.append("BTC Lead قوی خلاف لانگ است")
-    elif btc_bias == "BEARISH":
-        if confirmations_short >= 3:
-            confirmations_short += 1
-            reasons_short.append("BTC Lead کمی ورود شورت را تایید می‌کند")
 
     late_long = (
         ema_distance_atr > 0.95
@@ -1904,22 +1672,8 @@ def analyze_symbol(symbol):
         reasons_short
     )
 
-    btc_lead_context = get_btc_lead_context(symbol, df_15m, df_5m)
-    btc_status = btc_lead_context.get("btc_bias", "NEUTRAL")
-    l = int(btc_lead_context.get("btc_lead_long_adj", 0) or 0)
-    s = int(btc_lead_context.get("btc_lead_short_adj", 0) or 0)
-    long_score += l
-    short_score += s
-
-    if btc_status in ["STRONG_BULLISH", "BULLISH"]:
-        reasons_long.append("BTC Lead به نفع لانگ است")
-        reasons_short.append("BTC Lead خلاف شورت است")
-    elif btc_status in ["STRONG_BEARISH", "BEARISH"]:
-        reasons_short.append("BTC Lead به نفع شورت است")
-        reasons_long.append("BTC Lead خلاف لانگ است")
-    else:
-        reasons_long.append("BTC Lead خنثی است")
-        reasons_short.append("BTC Lead خنثی است")
+    # BTC filter/lead removed: keep Market Regime only.
+    btc_status = "disabled"
 
     # موارد حذف‌شده از نسخه ساده؛ نه امتیاز دارند، نه نمایش داده می‌شوند.
     trendline = "none"
@@ -1975,12 +1729,12 @@ def analyze_symbol(symbol):
     spread_percent = get_spread_percent(symbol)
 
     predictive_context = predictive_entry_decision(
-        df_4h, df_1h, df_30m, df_15m, df_5m, price, atr, spread_percent, btc_status
+        df_4h, df_1h, df_30m, df_15m, df_5m, price, atr, spread_percent
     )
 
     setup_context = predictive_setup_decision(
         df_4h, df_1h, df_30m, df_15m, df_5m,
-        price, atr, long_score, short_score, trends, market_regime, btc_status
+        price, atr, long_score, short_score, trends, market_regime
     )
 
     pre_direction = predictive_context.get("direction", "NO TRADE")
@@ -2166,18 +1920,6 @@ def analyze_symbol(symbol):
         "market_structure": structure,
         "trends": trends,
         "btc_filter": btc_status,
-        "btc_bias": btc_status,
-        "btc_lead_long_adj": btc_lead_context.get("btc_lead_long_adj"),
-        "btc_lead_short_adj": btc_lead_context.get("btc_lead_short_adj"),
-        "btc_bullish_points": btc_lead_context.get("btc_bullish_points"),
-        "btc_bearish_points": btc_lead_context.get("btc_bearish_points"),
-        "btc_bias_diff": btc_lead_context.get("btc_bias_diff"),
-        "btc_power2_buy": btc_lead_context.get("btc_power2_buy"),
-        "btc_power2_sell": btc_lead_context.get("btc_power2_sell"),
-        "btc_power3_buy": btc_lead_context.get("btc_power3_buy"),
-        "btc_power3_sell": btc_lead_context.get("btc_power3_sell"),
-        "btc_power_acceleration": btc_lead_context.get("btc_power_acceleration"),
-        "btc_reasons": btc_lead_context.get("btc_reasons", []),
 
         "candle_pattern": pattern,
         "multi_candle": multi_candle,
