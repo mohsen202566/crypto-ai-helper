@@ -1300,14 +1300,7 @@ TP2 Rate از TP1:{tp2_rate}٪
 عملکرد بر اساس ADX:
 {_group_performance(closed_for_wr, lambda s: _adx_bucket(s.get('adx')))}
 عملکرد بر اساس روند کلی بازار:
-{_group_performance(closed_for_wr, lambda s: s.get('market_regime') or s.get('market_regime_label'))}
-{format_signal_details(tp1_records, f'✅ لیست TP1 ({tp1}):', include_reasons=False)}
-{format_signal_details(tp2_records, f'🎯 لیست TP2 ({tp2}):', include_reasons=False)}
-{format_signal_details(sl_records, f'❌ لیست SL ({sl}):', include_reasons=True)}
-{format_signal_details(cancelled_events, f'🚫 لیست لغوشده‌ها ({cancelled}):', include_reasons=False)}"""
-
-    if legacy_count:
-        report += f"\nرکوردهای قدیمی بدون signal_id: {legacy_count} مورد\nاین رکوردها در آمار دقیق جدید حساب نشده‌اند."
+{_group_performance(closed_for_wr, lambda s: s.get('market_regime') or s.get('market_regime_label'))}"""
 
     return report
 
