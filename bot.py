@@ -21,6 +21,7 @@ from signal_tracker import (
     get_profit_for_signal_text,
     get_profit_simulation_report,
     reset_stats,
+    can_add_automatic_signal,
 )
 
 if not BOT_TOKEN:
@@ -351,6 +352,10 @@ ADX: {safe(result.get('adx'))}
 
     for user_id in list_users():
         try:
+            can_add, reason = can_add_automatic_signal(user_id, result.get("symbol"))
+            if not can_add:
+                continue
+
             sent = bot.send_message(user_id, text)
             remember_signal_result(sent, result)
             if AUTO_TRACK_AUTO_SIGNALS:
@@ -369,7 +374,12 @@ def auto_signal_loop():
             try:
                 result = analyze_symbol(symbol)
 
-                if should_send_auto_signal(result):
+                should_auto = should_send_auto_signal(result) or (
+                    result.get("direction") in ["LONG", "SHORT"]
+                    and (result.get("setup_waiting_activation") or result.get("entry_confirmed"))
+                )
+
+                if should_auto:
                     send_auto_signal_to_all_users(result)
 
             except Exception as e:
