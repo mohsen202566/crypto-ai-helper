@@ -18,6 +18,14 @@ except Exception:
 ACTIVE_SIGNALS_FILE = "active_signals.json"
 SIGNAL_STATS_FILE = "signal_stats.json"
 
+# تعداد Setup/Signal هایی که ربات باید همزمان زیر نظر بگیرد.
+# اگر config مقدار نداشت، پیش‌فرض 20 است.
+try:
+    from config import WATCHLIST_TARGET_SIZE
+except Exception:
+    WATCHLIST_TARGET_SIZE = int(os.getenv("WATCHLIST_TARGET_SIZE", "20"))
+
+
 # Tracker برای اسکالپ نباید فقط Last Price را ببیند.
 # با کندل 1m مسیر قیمت از آخرین چک بررسی می‌شود تا لمس سریع TP/SL جا نیفتد.
 TRACKER_OHLCV_TIMEFRAME = "1m"
@@ -211,6 +219,30 @@ def has_active_or_pending_symbol(active, user_id, symbol):
                 return True
     return False
 
+
+def get_watchlist_count(user_id):
+    active = get_active_signals()
+    return sum(
+        1 for item in active
+        if int(item.get("user_id", 0)) == int(user_id)
+        and item.get("status") in ["ACTIVE", "PENDING_ACTIVATION"]
+    )
+
+
+def can_add_automatic_signal(user_id, symbol):
+    """برای حفظ Watchlist حدود 15 تا 20 تایی و جلوگیری از سیگنال تکراری."""
+    active = get_active_signals()
+    if has_active_or_pending_symbol(active, user_id, symbol):
+        return False, "duplicate"
+    count = sum(
+        1 for item in active
+        if int(item.get("user_id", 0)) == int(user_id)
+        and item.get("status") in ["ACTIVE", "PENDING_ACTIVATION"]
+    )
+    if count >= int(WATCHLIST_TARGET_SIZE):
+        return False, "watchlist_full"
+    return True, "ok"
+
 def price_in_entry_zone(signal, price):
     try:
         price = float(price)
@@ -227,12 +259,32 @@ def price_in_entry_zone(signal, price):
     except Exception:
         return False
 
-def activate_pending_signal(signal, price):
+def activate_pending_signal(signal, price, live_result=None):
+    """ستاپ را با تحلیل لحظه‌ای فعال می‌کند.
+    اگر live_result موجود باشد، Entry/SL/TP با آخرین تحلیل جایگزین می‌شود تا سطوح کهنه نشوند.
+    """
     signal["status"] = "ACTIVE"
     signal["activated_at"] = now_ts()
     signal["activated_at_text"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     signal["activated_price"] = float(price)
+    signal["entry"] = float(price)
+
+    if live_result:
+        for key in [
+            "stop_loss", "tp1", "tp2", "risk_level", "risk_reward", "entry_mode",
+            "freshness", "predictive_confirmations", "power2_buy", "power2_sell",
+            "power3_buy", "power3_sell", "power_acceleration", "rsi", "adx",
+            "vwap_status", "reasons", "late_entry", "late_entry_reason",
+            "tp_space_ok", "tp_space_reason", "trap_risk", "trap_reason",
+            "candle_forecast", "candle_forecast_reason"
+        ]:
+            if key in live_result and live_result.get(key) is not None:
+                signal[key] = live_result.get(key)
+        signal["entry_confirmed"] = True
+        signal["entry_status"] = "ACTIVE"
+
     signal["last_checked_at"] = now_ts()
+    signal["last_checked_at_text"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     record_stat_event(signal, "ACTIVATED")
     return signal
 
@@ -707,26 +759,38 @@ def check_active_signals():
                     msg = close_pending_setup(signal, "زمان انتظار فعال‌سازی تمام شد")
                     messages.append({"chat_id": signal["chat_id"], "message": msg, "reply_to_message_id": signal.get("message_id")})
                     continue
-                price = get_last_close_from_1m_or_ticker(signal["symbol"], signal)
-                if price_in_entry_zone(signal, price):
-                    try:
-                        live = analyze_symbol(signal["symbol"])
-                        if live.get("direction") == signal.get("direction") and live.get("entry_confirmed"):
-                            signal = activate_pending_signal(signal, price)
-                            activation_msg = (
-                                "✅ ورود فعال شد\n\n"
-                                f"ارز: {signal['symbol']}\n"
-                                f"جهت: {fa_direction(signal['direction'])}\n"
-                                f"قیمت فعال‌سازی: {round(float(price), 8)}\n"
-                                "تحلیل لحظه‌ای 5M با پیش‌بینی اولیه همسو شد."
-                            )
-                            messages.append({
-                                "chat_id": signal["chat_id"],
-                                "reply_to_message_id": signal.get("message_id"),
-                                "message": activation_msg
-                            })
-                    except Exception as e:
-                        log_exception("فعال‌سازی ورود", e, "signal_tracker.py", "check_active_signals", signal.get("symbol"))
+
+                # مزیت اصلی نسخه جدید: ستاپ‌های آماده مرتب با تحلیل لحظه‌ای چک می‌شوند.
+                # Entry فقط وقتی صادر می‌شود که Power دو کندلی، RSI، MACD و EMA/VWAP همسو شوند.
+                try:
+                    live = analyze_symbol(signal["symbol"])
+                    live_price = float(live.get("price") or get_last_close_from_1m_or_ticker(signal["symbol"], signal))
+                    same_direction = live.get("direction") == signal.get("direction")
+                    activated_now = bool(live.get("entry_confirmed")) and live.get("entry_mode") == "PREDICTIVE_TRIGGER"
+
+                    if same_direction and activated_now:
+                        signal = activate_pending_signal(signal, live_price, live)
+                        activation_msg = (
+                            "✅ ورود فعال شد\n\n"
+                            f"ارز: {signal['symbol']}\n"
+                            f"جهت: {fa_direction(signal['direction'])}\n"
+                            f"قیمت فعال‌سازی: {round(float(live_price), 8)}\n"
+                            f"تاییدیه‌ها: {signal.get('predictive_confirmations')}\n"
+                            f"Power 2 کندلی: خرید {signal.get('power2_buy')}٪ / فروش {signal.get('power2_sell')}٪\n"
+                            "کندل دوم، RSI، MACD و EMA/VWAP همسو شدند."
+                        )
+                        messages.append({
+                            "chat_id": signal["chat_id"],
+                            "reply_to_message_id": signal.get("message_id"),
+                            "message": activation_msg
+                        })
+                    else:
+                        signal["last_checked_at"] = now_ts()
+                        signal["last_checked_at_text"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                except Exception as e:
+                    log_exception("فعال‌سازی ورود", e, "signal_tracker.py", "check_active_signals", signal.get("symbol"))
+
                 remaining.append(signal)
                 continue
 
