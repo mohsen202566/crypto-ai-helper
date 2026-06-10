@@ -374,10 +374,9 @@ def auto_signal_loop():
             try:
                 result = analyze_symbol(symbol)
 
-                should_auto = should_send_auto_signal(result) or (
-                    result.get("direction") in ["LONG", "SHORT"]
-                    and (result.get("setup_waiting_activation") or result.get("entry_confirmed"))
-                )
+                # فقط سیگنال‌هایی ارسال شوند که از دروازه اصلی scanner عبور کرده‌اند.
+                # قبلاً یک شرط OR باعث می‌شد هر Setup لانگ/شورت ارسال شود و سقف Watchlist دور زده شود.
+                should_auto = should_send_auto_signal(result)
 
                 if should_auto:
                     send_auto_signal_to_all_users(result)
