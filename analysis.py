@@ -1,43 +1,20 @@
 # -*- coding: utf-8 -*-
-import json
-import os
-import re
 import time
-from datetime import datetime, timedelta
-
+import os
 import ccxt
-from analysis import analyze_symbol
-from config import PENDING_SETUP_TIMEOUT_MINUTES, ENTRY_ACTIVATION_PRICE_TOLERANCE_ATR
-try:
-    from diagnostics import log_exception
-except Exception:
-    def log_exception(section, exc, file_name=None, function_name=None, symbol=None):
-        print(section, str(exc)); return str(exc)
+import pandas as pd
+import ta
+
+from market_sentiment import get_market_sentiment
 
 
-ACTIVE_SIGNALS_FILE = "active_signals.json"
-SIGNAL_STATS_FILE = "signal_stats.json"
-
-# تعداد Setup/Signal هایی که ربات باید همزمان زیر نظر بگیرد.
-# اگر config مقدار نداشت، پیش‌فرض 20 است.
-try:
-    from config import WATCHLIST_TARGET_SIZE
-except Exception:
-    WATCHLIST_TARGET_SIZE = int(os.getenv("WATCHLIST_TARGET_SIZE", "20"))
-
-# Tracker برای اسکالپ نباید فقط Last Price را ببیند.
-# با کندل 1m مسیر قیمت از آخرین چک بررسی می‌شود تا لمس سریع TP/SL جا نیفتد.
-TRACKER_OHLCV_TIMEFRAME = "1m"
-TRACKER_LOOKBACK_BUFFER_SECONDS = 90
-TRACKER_MAX_OHLCV_LIMIT = 180
-
-# اگر داخل یک کندل هم TP و هم SL لمس شده باشد، ترتیب واقعی مشخص نیست.
-# حالت محافظه‌کارانه: SL اولویت دارد تا آمار بیش از حد خوش‌بینانه نشود.
-SAME_CANDLE_HIT_POLICY = "SL_FIRST"
+TECHNICAL_QUALITY_LATE_ENTRY_ATR = 1.65
+TECHNICAL_QUALITY_MIN_TP_SPACE_ATR = 0.95
+TECHNICAL_QUALITY_LOW_ATR_PCT = 0.08
+TECHNICAL_QUALITY_EXTREME_ATR_PCT = 3.5
 
 exchange = ccxt.okx({
     "enableRateLimit": True,
-    "timeout": 20000,
     "options": {"defaultType": "swap"}
 })
 
@@ -47,1355 +24,1993 @@ def to_okx_symbol(symbol):
     return f"{coin}/USDT:USDT"
 
 
-def now_ts():
-    return int(time.time())
+def cap_score(value):
+    return max(0, min(int(value), 100))
 
 
-def load_json(path, default):
-    if not os.path.exists(path):
-        return default
-
+def safe_round(value, digits=8):
+    if value is None:
+        return None
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+        return round(float(value), digits)
     except Exception:
-        return default
+        return None
 
 
-def save_json(path, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+def get_klines(symbol, interval="15m", limit=320):
+    ohlcv = exchange.fetch_ohlcv(to_okx_symbol(symbol), timeframe=interval, limit=limit)
 
+    if not ohlcv or len(ohlcv) < 220:
+        raise Exception(f"داده کافی برای {symbol} در تایم {interval} دریافت نشد")
 
-def get_current_price(symbol):
-    ticker = exchange.fetch_ticker(to_okx_symbol(symbol))
-    price = ticker.get("last") or ticker.get("close")
-
-    if price is None:
-        raise Exception(f"قیمت {symbol} دریافت نشد")
-
-    return float(price)
-
-
-def get_recent_1m_candles_since(symbol, since_ts):
-    """
-    کندل‌های 1 دقیقه‌ای از آخرین زمان بررسی تا الان را می‌گیرد.
-    خروجی ccxt: [timestamp_ms, open, high, low, close, volume]
-    """
-    now = now_ts()
-
-    try:
-        since_ts = int(since_ts or 0)
-    except Exception:
-        since_ts = 0
-
-    if since_ts <= 0:
-        since_ts = now - 5 * 60
-
-    since_ms = max(0, (since_ts - TRACKER_LOOKBACK_BUFFER_SECONDS) * 1000)
-    minutes = max(5, int((now - since_ts) / 60) + 4)
-    limit = min(TRACKER_MAX_OHLCV_LIMIT, max(10, minutes))
-
-    candles = exchange.fetch_ohlcv(
-        to_okx_symbol(symbol),
-        timeframe=TRACKER_OHLCV_TIMEFRAME,
-        since=since_ms,
-        limit=limit
+    df = pd.DataFrame(
+        ohlcv,
+        columns=["time", "open", "high", "low", "close", "volume"]
     )
 
-    clean = []
-    min_allowed_ms = max(0, (since_ts - TRACKER_LOOKBACK_BUFFER_SECONDS) * 1000)
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    for c in candles or []:
-        if not c or len(c) < 5:
-            continue
-        if int(c[0]) >= min_allowed_ms:
-            clean.append(c)
+    df = df.dropna()
+    df = df.iloc[:-1]
 
-    return clean
+    return df
 
 
-def candle_path_hit(signal, candle):
-    """
-    با high/low کندل 1m بررسی می‌کند که TP1 یا SL لمس شده یا نه.
-    اگر هر دو داخل یک کندل لمس شده باشند، طبق SAME_CANDLE_HIT_POLICY تصمیم می‌گیرد.
-    """
-    direction = signal.get("direction")
-    high = float(candle[2])
-    low = float(candle[3])
+def add_indicators(df):
+    df = df.copy()
 
-    tp_hit = False
-    sl_hit = False
+    df["ema20"] = ta.trend.ema_indicator(df["close"], window=20)
+    df["ema50"] = ta.trend.ema_indicator(df["close"], window=50)
+    df["ema200"] = ta.trend.ema_indicator(df["close"], window=200)
 
-    if direction == "LONG":
-        tp_hit = high >= float(signal["tp1"])
-        sl_hit = low <= float(signal["stop_loss"])
-    elif direction == "SHORT":
-        tp_hit = low <= float(signal["tp1"])
-        sl_hit = high >= float(signal["stop_loss"])
+    df["rsi"] = ta.momentum.rsi(df["close"], window=14)
 
-    if tp_hit and sl_hit:
-        if SAME_CANDLE_HIT_POLICY == "TP_FIRST":
-            return "TP1", float(signal["tp1"]), "same_candle"
-        return "SL", float(signal["stop_loss"]), "same_candle"
+    macd = ta.trend.MACD(df["close"])
+    df["macd"] = macd.macd()
+    df["macd_signal"] = macd.macd_signal()
+    df["macd_hist"] = macd.macd_diff()
 
-    if tp_hit:
-        return "TP1", float(signal["tp1"]), "candle_path"
+    df["atr"] = ta.volatility.average_true_range(
+        df["high"], df["low"], df["close"], window=14
+    )
 
-    if sl_hit:
-        return "SL", float(signal["stop_loss"]), "candle_path"
+    adx = ta.trend.ADXIndicator(
+        high=df["high"],
+        low=df["low"],
+        close=df["close"],
+        window=14
+    )
+    df["adx"] = adx.adx()
 
-    return None, None, None
+    df["volume_ma20"] = df["volume"].rolling(20).mean()
+    df["atr_ma50"] = df["atr"].rolling(50).mean()
 
+    typical_price = (df["high"] + df["low"] + df["close"]) / 3
+    df["vwap"] = (typical_price * df["volume"]).cumsum() / df["volume"].cumsum()
 
-def detect_signal_hit_from_candles(signal):
-    last_checked_at = signal.get("last_checked_at") or signal.get("created_at") or now_ts() - 5 * 60
-    candles = get_recent_1m_candles_since(signal["symbol"], last_checked_at)
+    df = df.dropna()
 
-    last_candle_ts = None
+    if len(df) < 80:
+        raise Exception("اندیکاتورها کامل محاسبه نشدند")
 
-    for candle in candles:
-        last_candle_ts = int(candle[0] / 1000)
-        result_type, exit_price, hit_source = candle_path_hit(signal, candle)
-        if result_type:
-            signal["last_checked_at"] = now_ts()
-            signal["last_checked_at_text"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            signal["hit_source"] = hit_source
-            signal["hit_candle_time"] = datetime.fromtimestamp(last_candle_ts).strftime("%Y-%m-%d %H:%M:%S")
-            return result_type, exit_price
-
-    # حتی اگر کندل جدیدی نبود، زمان چک آپدیت شود تا loop گیر نکند.
-    signal["last_checked_at"] = now_ts()
-    signal["last_checked_at_text"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    return None, None
+    return df
 
 
-def get_last_close_from_1m_or_ticker(symbol, signal=None):
+def get_funding_rate(symbol):
     try:
-        last_checked_at = None
-        if signal:
-            last_checked_at = signal.get("last_checked_at") or signal.get("created_at")
-        candles = get_recent_1m_candles_since(symbol, last_checked_at or now_ts() - 3 * 60)
-        if candles:
-            return float(candles[-1][4])
+        data = exchange.fetch_funding_rate(to_okx_symbol(symbol))
+        rate = data.get("fundingRate")
+        if rate is None:
+            return None
+        return round(float(rate) * 100, 5)
+    except Exception:
+        return None
+
+
+def get_open_interest(symbol):
+    try:
+        data = exchange.fetch_open_interest(to_okx_symbol(symbol))
+        value = data.get("openInterestAmount") or data.get("openInterestValue")
+        if value is None:
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def get_spread_percent(symbol):
+    try:
+        orderbook = exchange.fetch_order_book(to_okx_symbol(symbol), limit=5)
+
+        if not orderbook.get("bids") or not orderbook.get("asks"):
+            return None
+
+        bid = orderbook["bids"][0][0]
+        ask = orderbook["asks"][0][0]
+
+        if not bid or not ask:
+            return None
+
+        mid = (bid + ask) / 2
+        return round(((ask - bid) / mid) * 100, 4)
+
+    except Exception:
+        return None
+
+
+def trend_direction(df):
+    last = df.iloc[-1]
+
+    if last["close"] > last["ema20"] > last["ema50"] > last["ema200"]:
+        return "bullish"
+
+    if last["close"] < last["ema20"] < last["ema50"] < last["ema200"]:
+        return "bearish"
+
+    if last["close"] > last["ema200"]:
+        return "weak_bullish"
+
+    if last["close"] < last["ema200"]:
+        return "weak_bearish"
+
+    return "range"
+
+
+def buy_sell_power(df, candles=20):
+    recent = df.tail(candles)
+
+    green_volume = recent[recent["close"] > recent["open"]]["volume"].sum()
+    red_volume = recent[recent["close"] < recent["open"]]["volume"].sum()
+    total = green_volume + red_volume
+
+    if total == 0:
+        return 50, 50
+
+    buy_power = round((green_volume / total) * 100, 1)
+    sell_power = round((red_volume / total) * 100, 1)
+
+    return buy_power, sell_power
+
+def support_resistance(df):
+    return support_resistance_swing(df)
+
+
+
+
+
+def candle_pattern(df):
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    body = abs(last["close"] - last["open"])
+    candle_range = last["high"] - last["low"]
+
+    if candle_range == 0:
+        return "weak"
+
+    upper_wick = last["high"] - max(last["close"], last["open"])
+    lower_wick = min(last["close"], last["open"]) - last["low"]
+
+    if last["close"] > last["open"] and prev["close"] < prev["open"]:
+        if last["close"] > prev["open"] and last["open"] < prev["close"]:
+            return "bullish_engulfing"
+
+    if last["close"] < last["open"] and prev["close"] > prev["open"]:
+        if last["close"] < prev["open"] and last["open"] > prev["close"]:
+            return "bearish_engulfing"
+
+    if lower_wick > body * 2.2 and upper_wick < body * 1.2:
+        return "bullish_pinbar"
+
+    if upper_wick > body * 2.2 and lower_wick < body * 1.2:
+        return "bearish_pinbar"
+
+    if body / candle_range >= 0.6:
+        if last["close"] > last["open"]:
+            return "bullish_strong"
+        return "bearish_strong"
+
+    return "weak"
+
+
+
+def volume_spike(df):
+    last = df.iloc[-1]
+
+    if last["volume_ma20"] == 0:
+        return False
+
+    return last["volume"] > last["volume_ma20"] * 1.5
+
+
+
+
+
+
+
+def detect_fvg(df):
+    if len(df) < 5:
+        return "none"
+
+    c1 = df.iloc[-3]
+    c3 = df.iloc[-1]
+
+    if c1["high"] < c3["low"]:
+        return "bullish_fvg"
+
+    if c1["low"] > c3["high"]:
+        return "bearish_fvg"
+
+    return "none"
+
+
+def detect_order_block(df):
+    recent = df.tail(16)
+
+    for i in range(len(recent) - 3, 2, -1):
+        candle = recent.iloc[i]
+        next_candle = recent.iloc[i + 1]
+
+        if candle["close"] < candle["open"] and next_candle["close"] > next_candle["open"]:
+            if next_candle["close"] > candle["high"]:
+                return "bullish_order_block"
+
+        if candle["close"] > candle["open"] and next_candle["close"] < next_candle["open"]:
+            if next_candle["close"] < candle["low"]:
+                return "bearish_order_block"
+
+    return "none"
+
+
+def detect_rsi_divergence(df):
+    recent = df.tail(35)
+
+    lows = recent.nsmallest(2, "low").sort_index()
+    highs = recent.nlargest(2, "high").sort_index()
+
+    if len(lows) == 2:
+        first = lows.iloc[0]
+        second = lows.iloc[1]
+
+        if second["low"] < first["low"] and second["rsi"] > first["rsi"]:
+            return "bullish_rsi_divergence"
+
+    if len(highs) == 2:
+        first = highs.iloc[0]
+        second = highs.iloc[1]
+
+        if second["high"] > first["high"] and second["rsi"] < first["rsi"]:
+            return "bearish_rsi_divergence"
+
+    return "none"
+
+
+def detect_macd_divergence(df):
+    recent = df.tail(35)
+
+    lows = recent.nsmallest(2, "low").sort_index()
+    highs = recent.nlargest(2, "high").sort_index()
+
+    if len(lows) == 2:
+        first = lows.iloc[0]
+        second = lows.iloc[1]
+
+        if second["low"] < first["low"] and second["macd_hist"] > first["macd_hist"]:
+            return "bullish_macd_divergence"
+
+    if len(highs) == 2:
+        first = highs.iloc[0]
+        second = highs.iloc[1]
+
+        if second["high"] > first["high"] and second["macd_hist"] < first["macd_hist"]:
+            return "bearish_macd_divergence"
+
+    return "none"
+
+
+
+
+def calculate_vwap_status(df):
+    last = df.iloc[-1]
+
+    if last["close"] > last["vwap"]:
+        return "above_vwap"
+
+    if last["close"] < last["vwap"]:
+        return "below_vwap"
+
+    return "near_vwap"
+
+
+def calculate_volume_profile(df):
+    recent = df.tail(120).copy()
+
+    try:
+        recent["price_bin"] = pd.cut(recent["close"], bins=24)
+        grouped = recent.groupby("price_bin", observed=False)["volume"].sum()
+
+        if grouped.empty:
+            return None, "unknown"
+
+        poc_bin = grouped.idxmax()
+        poc_price = (poc_bin.left + poc_bin.right) / 2
+
+        last_price = float(recent.iloc[-1]["close"])
+
+        if last_price > poc_price:
+            status = "above_poc"
+        elif last_price < poc_price:
+            status = "below_poc"
+        else:
+            status = "near_poc"
+
+        return float(poc_price), status
+
+    except Exception:
+        return None, "unknown"
+
+
+
+def detect_market_regime(symbol, df_4h, df_1h, df_30m, df_15m, market=None):
+    """
+    روند کلی بازار در نسخه ساده فقط بایاس خیلی نرم می‌دهد.
+    """
+    try:
+        if symbol == "BTCUSDT":
+            btc_1h = df_1h
+            btc_30m = df_30m
+        else:
+            btc_1h = add_indicators(get_klines("BTCUSDT", "1h"))
+            btc_30m = add_indicators(get_klines("BTCUSDT", "30m"))
+
+        t1 = trend_direction(btc_1h)
+        t30 = trend_direction(btc_30m)
+
+        bearish = sum(1 for t in [t1, t30] if t in ["bearish", "weak_bearish"])
+        bullish = sum(1 for t in [t1, t30] if t in ["bullish", "weak_bullish"])
+
+        if bearish >= 2:
+            return "bearish", "نزولی", -2, ["BTC در تایم‌های اصلی نزولی است"]
+        if bullish >= 2:
+            return "bullish", "صعودی", 2, ["BTC در تایم‌های اصلی صعودی است"]
+
+        return "neutral", "خنثی", 0, ["BTC جهت واضحی ندارد"]
+
+    except Exception:
+        return "neutral", "نامشخص", 0, []
+
+def apply_market_regime_to_scores(long_score, short_score, market_regime, reasons_long, reasons_short):
+    """
+    روند کلی بازار فقط اثر بسیار نرم دارد.
+    """
+    if market_regime == "bearish":
+        short_score += 5
+        long_score -= 5
+        reasons_short.append("روند کلی بازار کمی به نفع شورت است")
+    elif market_regime == "bullish":
+        long_score += 5
+        short_score -= 5
+        reasons_long.append("روند کلی بازار کمی به نفع لانگ است")
+
+    return max(0, long_score), max(0, short_score)
+
+def find_swing_levels(df, lookback=140, window=3):
+    try:
+        recent = df.tail(lookback).copy()
+        lows, highs = [], []
+        for i in range(window, len(recent) - window):
+            row = recent.iloc[i]
+            left = recent.iloc[i - window:i]
+            right = recent.iloc[i + 1:i + 1 + window]
+            if row["low"] <= left["low"].min() and row["low"] <= right["low"].min():
+                lows.append(float(row["low"]))
+            if row["high"] >= left["high"].max() and row["high"] >= right["high"].max():
+                highs.append(float(row["high"]))
+        return lows[-8:], highs[-8:]
+    except Exception:
+        return [], []
+
+
+def support_resistance_basic(df):
+    recent = df.tail(80)
+    return recent["low"].min(), recent["high"].max()
+
+
+def support_resistance_swing(df):
+    lows, highs = find_swing_levels(df)
+    support, resistance = support_resistance_basic(df)
+    try:
+        price = float(df.iloc[-1]["close"])
+        below = [x for x in lows if x < price]
+        above = [x for x in highs if x > price]
+        if below:
+            support = max(below)
+        if above:
+            resistance = min(above)
+    except Exception:
+        pass
+    return support, resistance
+
+
+
+
+
+
+
+
+def technical_quality_context(raw_direction, price, atr, support, resistance, df_15m, df_5m, df_30m, df_1h):
+    """
+    لایه حرفه‌ای اما نرم برای فیوچرز.
+    بیشتر موارد فقط امتیاز را کم می‌کنند و برای آمار/دلایل SL ذخیره می‌شوند؛
+    ربات را خشک نمی‌کند، اما ورودهای خیلی دیر یا TP بدون فضا را مشخص می‌کند.
+    """
+    long_adj = 0
+    short_adj = 0
+    reasons_long = []
+    reasons_short = []
+
+    context = {
+        "technical_quality_long_adj": 0,
+        "technical_quality_short_adj": 0,
+        "sr_entry_status": "soft",
+        "sr_entry_label": None,
+        "sr_entry_confirmed": False,
+        "tp_space_ok": True,
+        "tp_space_reason": None,
+        "tp_space_atr": None,
+        "late_entry": False,
+        "late_entry_reason": None,
+        "trap_risk": False,
+        "trap_reason": None,
+        "distance_from_vwap_atr": None,
+        "distance_from_ema20_atr": None,
+        "candle_forecast": "neutral",
+        "candle_forecast_reason": None,
+    }
+
+    try:
+        last_15 = df_15m.iloc[-1]
+        last_5 = df_5m.iloc[-1]
+        prev_5 = df_5m.iloc[-2]
+        atr_value = float(atr) if atr and atr > 0 else float(last_15.get("atr", 0))
+        if atr_value <= 0:
+            return 0, 0, [], [], context
+
+        vwap_distance = abs(float(price) - float(last_5["vwap"])) / atr_value
+        ema_distance = abs(float(price) - float(last_5["ema20"])) / atr_value
+        context["distance_from_vwap_atr"] = round(vwap_distance, 2)
+        context["distance_from_ema20_atr"] = round(ema_distance, 2)
+
+        candle_body = abs(float(last_5["close"]) - float(last_5["open"]))
+        candle_range = max(float(last_5["high"]) - float(last_5["low"]), 0)
+        large_candle = candle_range >= atr_value * 0.85 or candle_body >= atr_value * 0.55
+
+        # Anti Late Entry: فقط اگر فاصله خیلی زیاد یا کندل جهشی باشد، جریمه نرم می‌دهد.
+        if raw_direction == "LONG" and price > last_5["ema20"] and (vwap_distance > 1.35 or ema_distance > 1.20 or large_candle):
+            long_adj -= 7
+            context["late_entry"] = True
+            context["late_entry_reason"] = "فاصله قیمت از EMA/VWAP یا اندازه کندل برای لانگ زیاد بود"
+            reasons_long.append("ورود لانگ کمی دیر است؛ امتیاز کاهش یافت")
+        elif raw_direction == "SHORT" and price < last_5["ema20"] and (vwap_distance > 1.35 or ema_distance > 1.20 or large_candle):
+            short_adj -= 7
+            context["late_entry"] = True
+            context["late_entry_reason"] = "فاصله قیمت از EMA/VWAP یا اندازه کندل برای شورت زیاد بود"
+            reasons_short.append("ورود شورت کمی دیر است؛ امتیاز کاهش یافت")
+
+        # TP Space / Trap: TP نباید روی حمایت/مقاومت بیفتد. اینجا نرم است؛ فقط اگر خیلی نزدیک باشد امتیاز کم می‌کند.
+        if raw_direction == "LONG" and resistance is not None and resistance > price:
+            space_atr = (float(resistance) - float(price)) / atr_value
+            context["tp_space_atr"] = round(space_atr, 2)
+            if space_atr < 0.70:
+                long_adj -= 10
+                context["tp_space_ok"] = False
+                context["tp_space_reason"] = "مقاومت خیلی نزدیک است و فضای TP برای لانگ کم است"
+                context["trap_risk"] = True
+                context["trap_reason"] = "لانگ نزدیک مقاومت مهم ثبت شده بود"
+                reasons_long.append("مقاومت نزدیک است؛ TP Space برای لانگ ضعیف است")
+            elif space_atr < 1.00:
+                long_adj -= 5
+                context["tp_space_reason"] = "مقاومت نسبتاً نزدیک است"
+                reasons_long.append("مقاومت نسبتاً نزدیک است؛ امتیاز لانگ کمی کاهش یافت")
+
+        if raw_direction == "SHORT" and support is not None and support < price:
+            space_atr = (float(price) - float(support)) / atr_value
+            context["tp_space_atr"] = round(space_atr, 2)
+            if space_atr < 0.70:
+                short_adj -= 10
+                context["tp_space_ok"] = False
+                context["tp_space_reason"] = "حمایت خیلی نزدیک است و فضای TP برای شورت کم است"
+                context["trap_risk"] = True
+                context["trap_reason"] = "شورت نزدیک حمایت مهم ثبت شده بود"
+                reasons_short.append("حمایت نزدیک است؛ TP Space برای شورت ضعیف است")
+            elif space_atr < 1.00:
+                short_adj -= 5
+                context["tp_space_reason"] = "حمایت نسبتاً نزدیک است"
+                reasons_short.append("حمایت نسبتاً نزدیک است؛ امتیاز شورت کمی کاهش یافت")
+
+        # Candle Forecast ساده و سبک: فقط برای تصمیم داخلی و دلایل SL ذخیره می‌شود.
+        if last_5["close"] > last_5["ema20"] and last_5["macd_hist"] > prev_5["macd_hist"] and last_5["close"] > last_5["vwap"]:
+            context["candle_forecast"] = "bullish_continuation"
+            context["candle_forecast_reason"] = "کندل، EMA، VWAP و شیب MACD به نفع ادامه صعود بودند"
+            if raw_direction == "SHORT":
+                short_adj -= 6
+                reasons_short.append("پیش‌بینی کندلی کوتاه‌مدت خلاف شورت است")
+        elif last_5["close"] < last_5["ema20"] and last_5["macd_hist"] < prev_5["macd_hist"] and last_5["close"] < last_5["vwap"]:
+            context["candle_forecast"] = "bearish_continuation"
+            context["candle_forecast_reason"] = "کندل، EMA، VWAP و شیب MACD به نفع ادامه نزول بودند"
+            if raw_direction == "LONG":
+                long_adj -= 6
+                reasons_long.append("پیش‌بینی کندلی کوتاه‌مدت خلاف لانگ است")
+        else:
+            context["candle_forecast"] = "neutral_or_pullback"
+            context["candle_forecast_reason"] = "کندل بعدی قطعیت کافی ندارد یا احتمال پولبک وجود دارد"
+
+    except Exception:
+        return 0, 0, [], [], context
+
+    context["technical_quality_long_adj"] = long_adj
+    context["technical_quality_short_adj"] = short_adj
+    return long_adj, short_adj, reasons_long, reasons_short, context
+
+def btc_filter(symbol):
+    if symbol == "BTCUSDT":
+        return "neutral", 0, 0, [], []
+
+    try:
+        btc_15m = add_indicators(get_klines("BTCUSDT", "15m"))
+        btc_5m = add_indicators(get_klines("BTCUSDT", "5m"))
+
+        btc_15_trend = trend_direction(btc_15m)
+        btc_5_trend = trend_direction(btc_5m)
+
+        long_score = 0
+        short_score = 0
+        reasons_long = []
+        reasons_short = []
+
+        if btc_15_trend in ["bullish", "weak_bullish"] and btc_5_trend in ["bullish", "weak_bullish"]:
+            long_score += 8
+            reasons_long.append("BTC در تایم ورود صعودی است")
+
+        elif btc_15_trend in ["bearish", "weak_bearish"] and btc_5_trend in ["bearish", "weak_bearish"]:
+            short_score += 8
+            reasons_short.append("BTC در تایم ورود نزولی است")
+        else:
+            reasons_long.append("BTC جهت واضحی ندارد")
+            reasons_short.append("BTC جهت واضحی ندارد")
+
+        return "ok", long_score, short_score, reasons_long, reasons_short
+
+    except Exception:
+        return "unknown", 0, 0, [], []
+
+
+def signal_validity(score, direction):
+    if direction == "NO TRADE":
+        return "سیگنال معتبر نیست"
+
+    if score >= 90:
+        return "5 تا 15 دقیقه"
+
+    if score >= 80:
+        return "5 تا 15 دقیقه"
+
+    if score >= 70:
+        return "5 تا 10 دقیقه"
+
+    return "اعتبار پایین"
+
+
+def signal_timeframe(score, direction):
+    if direction == "NO TRADE":
+        return "بدون تایم‌فریم ورود"
+
+    return "5M تا 15M"
+
+
+def score_macro_trend(df_1d, df_4h, df_1h, df_30m):
+    long_score = 0
+    short_score = 0
+    reasons_long = []
+    reasons_short = []
+
+    trends = {
+        "1D": trend_direction(df_1d),
+        "4H": trend_direction(df_4h),
+        "1H": trend_direction(df_1h),
+        "30M": trend_direction(df_30m),
+    }
+
+    # Fast Pump/Dump Scalp Mode:
+    # 1H و 4H فقط جهت کلی هستند؛ 30M کیفیت ستاپ است و 5M داخل score_entry موتور اصلی ورود است.
+    weights = {
+        "1D": 1,
+        "4H": 3,
+        "1H": 6,
+        "30M": 11,
+    }
+
+    for tf, trend in trends.items():
+        weight = weights[tf]
+
+        if trend == "bullish":
+            long_score += weight
+            reasons_long.append(f"{tf}: روند صعودی")
+        elif trend == "weak_bullish":
+            long_score += int(weight * 0.5)
+            reasons_long.append(f"{tf}: تمایل صعودی")
+        elif trend == "bearish":
+            short_score += weight
+            reasons_short.append(f"{tf}: روند نزولی")
+        elif trend == "weak_bearish":
+            short_score += int(weight * 0.5)
+            reasons_short.append(f"{tf}: تمایل نزولی")
+
+    return long_score, short_score, reasons_long, reasons_short, trends
+
+def score_entry(df_15m, df_5m):
+    long_score = 0
+    short_score = 0
+    reasons_long = []
+    reasons_short = []
+
+    last_15 = df_15m.iloc[-1]
+    last_5 = df_5m.iloc[-1]
+
+    buy_power, sell_power = buy_sell_power(df_5m, candles=20)
+    fast_buy_power, fast_sell_power = buy_sell_power(df_5m, candles=6)
+    ultra_buy_power, ultra_sell_power = buy_sell_power(df_5m, candles=3)
+    instant_buy_power, instant_sell_power = buy_sell_power(df_5m, candles=2)
+
+    # 15M فقط تایید نرم جهت است، نه ترمز سنگین ورود.
+    if last_15["close"] > last_15["ema20"]:
+        long_score += 14
+        reasons_long.append("15M: جهت ورود لانگ را تایید نرم می‌کند")
+
+    if last_15["close"] < last_15["ema20"]:
+        short_score += 14
+        reasons_short.append("15M: جهت ورود شورت را تایید نرم می‌کند")
+
+    # 5M موتور اصلی ورود است.
+    if last_5["close"] > last_5["ema20"] and last_5["macd"] > last_5["macd_signal"]:
+        long_score += 45
+        reasons_long.append("5M: تایید ورود لانگ با EMA و MACD")
+
+    if last_5["close"] < last_5["ema20"] and last_5["macd"] < last_5["macd_signal"]:
+        short_score += 45
+        reasons_short.append("5M: تایید ورود شورت با EMA و MACD")
+
+    # RSI عددی فقط اثر ملایم دارد؛ ورود سریع با RSI slope پایین‌تر انجام می‌شود.
+    if 45 <= last_5["rsi"] <= 68:
+        long_score += 8
+        reasons_long.append("RSI مناسب برای لانگ در 5M")
+
+    if 32 <= last_5["rsi"] <= 55:
+        short_score += 8
+        reasons_short.append("RSI مناسب برای شورت در 5M")
+
+    # Power کوتاه‌مدت برای پامپ/دامپ بیشترین اهمیت را دارد.
+    if buy_power >= 62:
+        long_score += 6
+        reasons_long.append("قدرت خرید کلی بالا در تایم ورود")
+
+    if fast_buy_power >= 62:
+        long_score += 10
+        reasons_long.append("قدرت خرید سریع در 5M بالا است")
+
+    if ultra_buy_power >= 66:
+        long_score += 14
+        reasons_long.append("قدرت خرید خیلی سریع 3 کندلی بالا است")
+
+    if instant_buy_power >= 68:
+        long_score += 18
+        reasons_long.append("قدرت خرید لحظه‌ای 2 کندلی بالا است")
+
+    if sell_power >= 62:
+        short_score += 6
+        reasons_short.append("قدرت فروش کلی بالا در تایم ورود")
+
+    if fast_sell_power >= 62:
+        short_score += 10
+        reasons_short.append("قدرت فروش سریع در 5M بالا است")
+
+    if ultra_sell_power >= 66:
+        short_score += 14
+        reasons_short.append("قدرت فروش خیلی سریع 3 کندلی بالا است")
+
+    if instant_sell_power >= 68:
+        short_score += 18
+        reasons_short.append("قدرت فروش لحظه‌ای 2 کندلی بالا است")
+
+    pattern = candle_pattern(df_5m)
+    multi_candle = "disabled"
+
+    if pattern in ["bullish_engulfing", "bullish_pinbar", "bullish_strong"]:
+        long_score += 10
+        reasons_long.append(f"کندل تاییدی لانگ: {pattern}")
+
+    if pattern in ["bearish_engulfing", "bearish_pinbar", "bearish_strong"]:
+        short_score += 10
+        reasons_short.append(f"کندل تاییدی شورت: {pattern}")
+
+    if volume_spike(df_5m):
+        long_score += 6
+        short_score += 6
+        reasons_long.append("افزایش حجم واقعی")
+        reasons_short.append("افزایش حجم واقعی")
+
+    if last_15["adx"] >= 18:
+        long_score += 4
+        short_score += 4
+        reasons_long.append("ADX قابل قبول در 15M")
+        reasons_short.append("ADX قابل قبول در 15M")
+
+    # تریگر خیلی سریع پامپ/دامپ:
+    # Histogram دو کندلی + RSI slope دو کندلی + Power دو کندلی + EMA20.
+    try:
+        prev_5 = df_5m.iloc[-2]
+
+        macd_hist_rising = last_5["macd_hist"] > prev_5["macd_hist"]
+        macd_hist_falling = last_5["macd_hist"] < prev_5["macd_hist"]
+        rsi_rising = last_5["rsi"] > prev_5["rsi"]
+        rsi_falling = last_5["rsi"] < prev_5["rsi"]
+
+        if (
+            last_5["close"] > last_5["ema20"]
+            and macd_hist_rising
+            and rsi_rising
+            and instant_buy_power >= 64
+        ):
+            long_score += 28
+            reasons_long.append("تریگر سریع پامپ: EMA، Histogram، RSI و Power دو کندلی همسو هستند")
+
+        if (
+            last_5["close"] < last_5["ema20"]
+            and macd_hist_falling
+            and rsi_falling
+            and instant_sell_power >= 64
+        ):
+            short_score += 28
+            reasons_short.append("تریگر سریع دامپ: EMA، Histogram، RSI و Power دو کندلی همسو هستند")
     except Exception:
         pass
 
-    return get_current_price(symbol)
+    return long_score, short_score, reasons_long, reasons_short, buy_power, sell_power, pattern, multi_candle
+
+def score_smart_money(df_15m, df_5m):
+    """
+    FVG و Order Block فقط اثر سبک دارند و هیچ سیگنالی را رد نمی‌کنند.
+    """
+    long_score = 0
+    short_score = 0
+    reasons_long = []
+    reasons_short = []
+
+    fvg = detect_fvg(df_5m)
+    order_block = detect_order_block(df_15m)
+
+    if fvg == "bullish_fvg":
+        long_score += 2
+        reasons_long.append("FVG صعودی، اثر سبک")
+
+    if fvg == "bearish_fvg":
+        short_score += 2
+        reasons_short.append("FVG نزولی، اثر سبک")
+
+    if order_block == "bullish_order_block":
+        long_score += 3
+        reasons_long.append("Order Block صعودی هم‌جهت، اثر سبک")
+
+    if order_block == "bearish_order_block":
+        short_score += 3
+        reasons_short.append("Order Block نزولی هم‌جهت، اثر سبک")
+
+    return long_score, short_score, reasons_long, reasons_short, "none", "none", fvg, order_block
+
+def score_divergence(df_5m):
+    long_score = 0
+    short_score = 0
+    reasons_long = []
+    reasons_short = []
+
+    rsi_divergence = detect_rsi_divergence(df_5m)
+    macd_divergence = detect_macd_divergence(df_5m)
+
+    if rsi_divergence == "bullish_rsi_divergence":
+        long_score += 10
+        reasons_long.append("واگرایی مثبت RSI")
+
+    if rsi_divergence == "bearish_rsi_divergence":
+        short_score += 10
+        reasons_short.append("واگرایی منفی RSI")
+
+    if macd_divergence == "bullish_macd_divergence":
+        long_score += 10
+        reasons_long.append("واگرایی مثبت MACD")
+
+    if macd_divergence == "bearish_macd_divergence":
+        short_score += 10
+        reasons_short.append("واگرایی منفی MACD")
+
+    return long_score, short_score, reasons_long, reasons_short, rsi_divergence, macd_divergence
 
 
-def get_active_signals():
-    return load_json(ACTIVE_SIGNALS_FILE, [])
+def score_futures_data(symbol):
+    funding_rate = get_funding_rate(symbol)
+    open_interest = get_open_interest(symbol)
+
+    long_score = 0
+    short_score = 0
+    risk_notes = []
+
+    if funding_rate is not None:
+        if funding_rate > 0.05:
+            short_score += 4
+            risk_notes.append("Funding مثبت و نسبتاً بالا")
+        elif funding_rate < -0.05:
+            long_score += 4
+            risk_notes.append("Funding منفی و نسبتاً بالا")
+
+    if open_interest is not None and open_interest > 0:
+        long_score += 2
+        short_score += 2
+
+    return long_score, short_score, funding_rate, open_interest, risk_notes
 
 
-def save_active_signals(signals):
-    save_json(ACTIVE_SIGNALS_FILE, signals)
+def score_market_sentiment(symbol):
+    """
+    Fear & Greed و Altseason فقط 1 امتیاز اثر ناچیز دارند.
+    """
+    market = get_market_sentiment()
+
+    long_score = 0
+    short_score = 0
+    reasons_long = []
+    reasons_short = []
+
+    fear_value = market.get("fear_value")
+    altseason = market.get("altseason_status")
+
+    if fear_value is not None:
+        if fear_value <= 25:
+            long_score += 1
+            reasons_long.append("Fear & Greed در ترس شدید، اثر ناچیز")
+        elif fear_value >= 80:
+            short_score += 1
+            reasons_short.append("Fear & Greed در طمع شدید، اثر ناچیز")
+
+    if symbol != "BTCUSDT":
+        if altseason == "قوی":
+            long_score += 1
+            reasons_long.append("آلت‌سیزن قوی، اثر ناچیز")
+        elif altseason == "ضعیف":
+            short_score += 1
+            reasons_short.append("آلت‌سیزن ضعیف، اثر ناچیز")
+
+    return long_score, short_score, reasons_long, reasons_short, market
+
+def score_vwap_volume_profile(df_15m, df_5m):
+    long_score = 0
+    short_score = 0
+    reasons_long = []
+    reasons_short = []
+
+    vwap_status = calculate_vwap_status(df_5m)
+    poc_price, volume_profile_status = calculate_volume_profile(df_15m)
+
+    if vwap_status == "above_vwap":
+        long_score += 6
+        reasons_long.append("قیمت بالای VWAP است")
+
+    if vwap_status == "below_vwap":
+        short_score += 6
+        reasons_short.append("قیمت پایین VWAP است")
+
+    if volume_profile_status == "above_poc":
+        long_score += 5
+        reasons_long.append("قیمت بالای POC حجمی است")
+
+    if volume_profile_status == "below_poc":
+        short_score += 5
+        reasons_short.append("قیمت پایین POC حجمی است")
+
+    return long_score, short_score, reasons_long, reasons_short, vwap_status, poc_price, volume_profile_status
 
 
-def get_signal_stats():
-    return load_json(SIGNAL_STATS_FILE, [])
 
+def apply_direction_conflict_penalties(
+    long_score,
+    short_score,
+    pattern,
+    multi_candle,
+    order_block,
+    fvg,
+    vwap_status,
+    buy_power,
+    sell_power,
+    reasons_long,
+    reasons_short
+):
+    """
+    تناقض‌ها فقط جریمه نرم دارند؛ هیچ موردی در این لایه سیگنال را حذف نمی‌کند.
+    """
+    bullish_candle = pattern in ["bullish_engulfing", "bullish_pinbar", "bullish_strong"]
+    bearish_candle = pattern in ["bearish_engulfing", "bearish_pinbar", "bearish_strong"]
 
-def save_signal_stats(stats):
-    save_json(SIGNAL_STATS_FILE, stats)
+    if bullish_candle:
+        short_score -= 4
+        reasons_short.append("کندل صعودی خلاف شورت است")
 
+    if bearish_candle:
+        long_score -= 4
+        reasons_long.append("کندل نزولی خلاف لانگ است")
 
-def reset_stats():
+    if vwap_status == "above_vwap":
+        short_score -= 4
+        reasons_short.append("قیمت بالای VWAP است و برای شورت ریسک دارد")
+
+    if vwap_status == "below_vwap":
+        long_score -= 4
+        reasons_long.append("قیمت پایین VWAP است و برای لانگ ریسک دارد")
+
     try:
-        save_signal_stats([])
-        return True
-    except Exception as e:
-        print("RESET STATS ERROR:", str(e))
-        return False
-
-
-
-def has_active_or_pending_symbol(active, user_id, symbol):
-    for item in active:
-        if int(item.get("user_id", 0)) == int(user_id) and item.get("symbol") == symbol:
-            if item.get("status") in ["ACTIVE", "PENDING_ACTIVATION"]:
-                return True
-    return False
-
-
-def get_watchlist_count(user_id):
-    active = get_active_signals()
-    return sum(
-        1 for item in active
-        if int(item.get("user_id", 0)) == int(user_id)
-        and item.get("status") in ["ACTIVE", "PENDING_ACTIVATION"]
-    )
-
-
-def can_add_automatic_signal(user_id, symbol):
-    """برای حفظ Watchlist حدود 20 تایی و جلوگیری از سیگنال تکراری."""
-    active = get_active_signals()
-    if has_active_or_pending_symbol(active, user_id, symbol):
-        return False, "duplicate"
-
-    count = sum(
-        1 for item in active
-        if int(item.get("user_id", 0)) == int(user_id)
-        and item.get("status") in ["ACTIVE", "PENDING_ACTIVATION"]
-    )
-
-    if count >= int(WATCHLIST_TARGET_SIZE):
-        return False, "watchlist_full"
-
-    return True, "ok"
-
-def price_in_entry_zone(signal, price):
-    try:
-        price = float(price)
-        atr = float(signal.get("atr") or 0)
-        entry = float(signal.get("entry") or 0)
-        zone_low = signal.get("entry_zone_low")
-        zone_high = signal.get("entry_zone_high")
-        if zone_low is not None and zone_high is not None:
-            return float(zone_low) <= price <= float(zone_high)
-        tolerance = abs(atr) * float(ENTRY_ACTIVATION_PRICE_TOLERANCE_ATR or 0.30)
-        if tolerance <= 0:
-            tolerance = abs(entry) * 0.002
-        return abs(price - entry) <= tolerance
+        power_gap = float(buy_power) - float(sell_power)
     except Exception:
-        return False
+        power_gap = 0
 
-def activate_pending_signal(signal, price):
-    signal["status"] = "ACTIVE"
-    signal["activated_at"] = now_ts()
-    signal["activated_at_text"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    signal["activated_price"] = float(price)
-    signal["last_checked_at"] = now_ts()
-    record_stat_event(signal, "ACTIVATED")
-    return signal
+    if power_gap > 0:
+        if power_gap >= 12:
+            short_score -= 9
+            reasons_short.append("قدرت خرید به‌طور واضح از فروش بالاتر است")
+        elif power_gap >= 5:
+            short_score -= 5
+            reasons_short.append("قدرت خرید نسبت به فروش کمی بالاتر است")
+        else:
+            short_score -= 2
+            reasons_short.append("قدرت خرید اندکی از فروش بالاتر است")
 
-def close_pending_setup(signal, reason):
-    stats = get_signal_stats()
-    closed = dict(signal)
-    closed["status"] = "CANCELLED"
-    closed["cancel_reason"] = reason
-    closed["closed_at"] = now_ts()
-    closed["closed_at_text"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    closed["signal_id"] = _signal_id(closed)
-    closed["event_type"] = "CANCELLED"
-    closed["event_at"] = closed["closed_at"]
+    elif power_gap < 0:
+        sell_gap = abs(power_gap)
+        if sell_gap >= 12:
+            long_score -= 9
+            reasons_long.append("قدرت فروش به‌طور واضح از خرید بالاتر است")
+        elif sell_gap >= 5:
+            long_score -= 5
+            reasons_long.append("قدرت فروش نسبت به خرید کمی بالاتر است")
+        else:
+            long_score -= 2
+            reasons_long.append("قدرت فروش اندکی از خرید بالاتر است")
 
-    # جلوگیری از ثبت چندباره لغو برای یک ستاپ
-    exists = any(
-        item.get("signal_id") == closed["signal_id"] and item.get("event_type", item.get("status")) == "CANCELLED"
-        for item in stats
-    )
-    if not exists:
-        stats.append(closed)
-        save_signal_stats(stats)
+    if order_block == "bullish_order_block":
+        short_score -= 3
+        reasons_short.append("Order Block صعودی خلاف شورت است؛ جریمه خیلی سبک اعمال شد")
+    elif order_block == "bearish_order_block":
+        long_score -= 3
+        reasons_long.append("Order Block نزولی خلاف لانگ است؛ جریمه خیلی سبک اعمال شد")
 
-    return f"🚫 ستاپ {signal.get('symbol')} لغو شد\n\nجهت: {fa_direction(signal.get('direction'))}\nعلت: {reason}"
+    if fvg == "bullish_fvg":
+        short_score -= 3
+        reasons_short.append("FVG صعودی کمی خلاف شورت است")
+    elif fvg == "bearish_fvg":
+        long_score -= 3
+        reasons_long.append("FVG نزولی کمی خلاف لانگ است")
 
-def add_signal_to_tracking(user_id, chat_id, message_id, result):
-    if result.get("direction") == "NO TRADE":
-        return False, "این تحلیل سیگنال قابل پیگیری ندارد."
+    return max(0, long_score), max(0, short_score)
 
-    if result.get("stop_loss") is None or result.get("tp1") is None:
-        return False, "برای این سیگنال TP1 یا SL وجود ندارد."
+def normalize_score_by_quality(score, rr, raw_direction, pattern, multi_candle, order_block, vwap_status, fvg="none"):
+    """
+    برای اسکالپ، RR پایین‌تر قابل قبول است؛ فقط RR خیلی بد امتیاز را محدود می‌کند.
+    """
+    if raw_direction == "NO TRADE":
+        return score
 
-    active = get_active_signals()
+    if rr < 0.55:
+        score = min(score, 74)
+    elif rr < 0.65:
+        score = min(score, 82)
+    elif rr < 0.80:
+        score = min(score, 90)
 
-    if has_active_or_pending_symbol(active, user_id, result.get("symbol")):
-        return False, f"⚠️ {result.get('symbol')} از قبل زیر نظر یا در انتظار فعال‌سازی است."
+    return cap_score(score)
 
-    entry_confirmed = bool(result.get("entry_confirmed"))
-    initial_status = "ACTIVE" if entry_confirmed else "PENDING_ACTIVATION"
-    signal_uid = f"{result['symbol']}_{message_id}_{now_ts()}"
+def calculate_trade_levels(raw_direction, price, atr, support=None, resistance=None):
+    """
+    TP/SL اسکالپی:
+    TP1 نزدیک‌تر است تا حرکت‌های 5 تا 15 دقیقه‌ای از دست نروند؛ SL بیش از حد تنگ نمی‌شود.
+    """
+    buffer = atr * 0.18
 
-    signal = {
-        "id": signal_uid,
-        "signal_id": signal_uid,
-        "user_id": int(user_id),
-        "chat_id": int(chat_id),
-        "message_id": int(message_id),
+    if raw_direction == "LONG":
+        stop_loss = price - (atr * 1.20)
+        tp1 = price + (atr * 0.85)
+        tp2 = price + (atr * 1.45)
 
-        "symbol": result["symbol"],
-        "direction": result["direction"],
+        if support is not None and support < price:
+            structural_sl = float(support) - buffer
+            if abs(price - structural_sl) <= atr * 1.75:
+                stop_loss = min(stop_loss, structural_sl)
 
-        "entry": float(result["price"]),
-        "stop_loss": float(result["stop_loss"]),
-        "tp1": float(result["tp1"]),
-        "tp2": None if result.get("tp2") is None else float(result["tp2"]),
-        "atr": result.get("atr"),
-        "entry_confirmed": entry_confirmed,
-        "entry_status": result.get("entry_status"),
-        "entry_zone_low": result.get("entry_zone_low"),
-        "entry_zone_high": result.get("entry_zone_high"),
-        "setup_score": result.get("setup_score"),
-        "setup_reasons": result.get("setup_reasons", []),
-        "compression_active": result.get("compression_active"),
-        "compression_label": result.get("compression_label"),
+        if resistance is not None and resistance > price:
+            adjusted_tp1 = float(resistance) - buffer
+            if adjusted_tp1 > price:
+                tp1 = min(tp1, adjusted_tp1)
+            adjusted_tp2 = float(resistance) + (atr * 0.22)
+            if adjusted_tp2 > price:
+                tp2 = min(tp2, adjusted_tp2)
 
-        "score": result.get("score"),
-        "win_probability": result.get("win_probability"),
-        "entry_grade": result.get("entry_grade"),
-        "risk_level": result.get("risk_level"),
-        "risk_reward": result.get("risk_reward"),
-        "entry_mode": result.get("entry_mode"),
-        "freshness": result.get("freshness"),
-        "predictive_confirmations": result.get("predictive_confirmations"),
-        "power2_buy": result.get("power2_buy"),
-        "power2_sell": result.get("power2_sell"),
-        "power3_buy": result.get("power3_buy"),
-        "power3_sell": result.get("power3_sell"),
-        "power_acceleration": result.get("power_acceleration"),
+        return stop_loss, tp1, tp2
 
-        "market_regime": result.get("market_regime"),
-        "market_regime_text": result.get("market_regime_text"),
-        "buy_power": result.get("buy_power"),
-        "sell_power": result.get("sell_power"),
-        "adx": result.get("adx"),
-        "rsi": result.get("rsi"),
-        "vwap_status": result.get("vwap_status"),
-        "order_block": result.get("order_block"),
-        "fvg": result.get("fvg"),
-        "candle_pattern": result.get("candle_pattern"),
-        "multi_candle": result.get("multi_candle"),
-        "market_structure": result.get("market_structure"),
-        "trendline": result.get("trendline"),
-        "breakout": result.get("breakout"),
-        "rsi_divergence": result.get("rsi_divergence"),
-        "macd_divergence": result.get("macd_divergence"),
-        "macd_hist": result.get("macd_hist"),
-        "market_regime": result.get("market_regime"),
-        "market_regime_label": result.get("market_regime_label"),
-        "market_breadth_status": result.get("market_breadth_status"),
-        "market_breadth_label": result.get("market_breadth_label"),
-        "market_breadth_bullish_pct": result.get("market_breadth_bullish_pct"),
-        "market_breadth_bearish_pct": result.get("market_breadth_bearish_pct"),
-        "fake_breakout": result.get("fake_breakout"),
-        "trend_exhaustion": result.get("trend_exhaustion"),
+    if raw_direction == "SHORT":
+        stop_loss = price + (atr * 1.20)
+        tp1 = price - (atr * 0.85)
+        tp2 = price - (atr * 1.45)
 
-        # Hidden professional diagnostics from analysis.py.
-        # These are NOT shown in signal text, but are saved for SL analysis/statistics.
-        "late_entry": result.get("late_entry"),
-        "late_entry_reason": result.get("late_entry_reason"),
-        "tp_space_ok": result.get("tp_space_ok"),
-        "tp_space_reason": result.get("tp_space_reason"),
-        "tp_space_atr": result.get("tp_space_atr"),
-        "trap_risk": result.get("trap_risk"),
-        "trap_reason": result.get("trap_reason"),
-        "candle_forecast": result.get("candle_forecast"),
-        "candle_forecast_reason": result.get("candle_forecast_reason"),
+        if resistance is not None and resistance > price:
+            structural_sl = float(resistance) + buffer
+            if abs(structural_sl - price) <= atr * 1.75:
+                stop_loss = max(stop_loss, structural_sl)
 
-        "reasons": result.get("reasons", []),
+        if support is not None and support < price:
+            adjusted_tp1 = float(support) + buffer
+            if adjusted_tp1 < price:
+                tp1 = max(tp1, adjusted_tp1)
+            adjusted_tp2 = float(support) - (atr * 0.22)
+            if adjusted_tp2 < price:
+                tp2 = max(tp2, adjusted_tp2)
 
-        "warning_reasons": [],
-        "warning_time": None,
-        "warning_time_text": None,
+        return stop_loss, tp1, tp2
 
-        "created_at": now_ts(),
-        "created_at_text": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "last_checked_at": now_ts(),
-        "last_checked_at_text": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "hit_source": None,
-        "hit_candle_time": None,
+    return None, None, None
 
-        "status": initial_status,
-        "warning_sent": False,
-        "activated_at": now_ts() if entry_confirmed else None,
-        "activated_at_text": datetime.now().strftime("%Y-%m-%d %H:%M:%S") if entry_confirmed else None,
-        "activated_price": float(result.get("price")) if entry_confirmed else None
-    }
-
-    active.append(signal)
-    save_active_signals(active)
-    record_stat_event(signal, 'SETUP_CREATED')
-
-    if initial_status == "PENDING_ACTIVATION":
-        return True, f"👀 ستاپ {signal['symbol']} ذخیره شد و منتظر فعال‌سازی ورود است."
-    return True, f"✅ سیگنال {signal['symbol']} زیر نظر گرفته شد."
-
-
-def price_hit_tp1(signal, price):
-    direction = signal["direction"]
-
-    if direction == "LONG":
-        return price >= signal["tp1"]
-
-    if direction == "SHORT":
-        return price <= signal["tp1"]
-
-    return False
-
-
-def price_hit_sl(signal, price):
-    direction = signal["direction"]
-
-    if direction == "LONG":
-        return price <= signal["stop_loss"]
-
-    if direction == "SHORT":
-        return price >= signal["stop_loss"]
-
-    return False
-
-
-def calculate_result_percent(signal, exit_price):
-    entry = float(signal["entry"])
-    direction = signal["direction"]
-
-    if entry == 0:
+def risk_reward(raw_direction, price, stop_loss, tp1):
+    if raw_direction == "NO TRADE" or stop_loss is None or tp1 is None:
         return 0
 
-    if direction == "LONG":
-        percent = ((exit_price - entry) / entry) * 100
+    risk = abs(price - stop_loss)
+    reward = abs(tp1 - price)
+
+    if risk <= 0:
+        return 0
+
+    return round(reward / risk, 2)
+
+
+def calculate_risk_level(raw_direction, score, liquidity_risk, funding_rate, adx, spread_percent, rr):
+    if raw_direction == "NO TRADE":
+        return "بالا"
+
+    risk = 0
+
+    if score < 72:
+        risk += 2
+
+    if adx < 13:
+        risk += 2
+    elif adx < 16:
+        risk += 1
+
+    if liquidity_risk == "بالا":
+        risk += 2
+    elif liquidity_risk == "متوسط":
+        risk += 1
+
+    if funding_rate is not None and abs(funding_rate) > 0.07:
+        risk += 1
+
+    if spread_percent is not None and spread_percent > 0.08:
+        risk += 2
+
+    if rr < 0.60:
+        risk += 2
+    elif rr < 0.75:
+        risk += 1
+
+    if risk >= 4:
+        return "بالا"
+
+    if risk >= 2:
+        return "متوسط"
+
+    return "پایین"
+
+def entry_grade(score, risk_level, rr, final_direction):
+    if final_direction == "NO TRADE":
+        return "Reject"
+
+    if score >= 90 and rr >= 0.80 and risk_level != "بالا":
+        return "A+"
+
+    if score >= 81 and rr >= 0.62 and risk_level != "بالا":
+        return "A"
+
+    return "Reject"
+
+def win_probability(score, risk_level, rr, adx, grade):
+    """
+    احتمال موفقیت متناسب با اسکالپ؛ ADX پایین به اندازه نسخه‌های قبلی تنبیه نمی‌شود.
+    """
+    p = 40 + int(score * 0.28)
+    p += 6 if risk_level == "پایین" else 2 if risk_level == "متوسط" else -4
+    p += 5 if rr >= 1.0 else 2 if rr >= 0.70 else -4
+    p += 3 if adx >= 20 else -3 if adx < 13 else -1 if adx < 16 else 0
+    p += 4 if grade == "A+" else 2 if grade == "A" else -5
+    return max(0, min(p, 92))
+
+def news_filter_status():
+    """اخبار از تصمیم‌گیری حذف شده است."""
+    return False, "غیرفعال"
+
+def news_filter_active():
+    return False
+
+
+
+
+def calculate_setup_zone(raw_direction, price, atr):
+    """
+    ناحیه ورود پیشنهادی برای اسکالپ سریع.
+    """
+    if raw_direction == "LONG":
+        zone_low = price - (atr * 0.25)
+        zone_high = price + (atr * 0.08)
+        trigger = "ورود لانگ بعد از حفظ EMA20 و ادامه قدرت خرید در 5M/15M"
+
+    elif raw_direction == "SHORT":
+        zone_low = price - (atr * 0.08)
+        zone_high = price + (atr * 0.25)
+        trigger = "ورود شورت بعد از حفظ EMA20 و ادامه قدرت فروش در 5M/15M"
+
     else:
-        percent = ((entry - exit_price) / entry) * 100
+        return "inactive", None, None, "ستاپ فعالی وجود ندارد"
 
-    return round(percent, 3)
+    return "ready", zone_low, zone_high, trigger
 
-
-def close_signal(signal, result_type, exit_price):
-    stats = get_signal_stats()
-
-    closed = dict(signal)
-    closed["status"] = result_type
-    closed["exit_price"] = float(exit_price)
-    closed["closed_at"] = now_ts()
-    closed["closed_at_text"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    closed["result_percent"] = calculate_result_percent(signal, exit_price)
-    closed["hit_source"] = signal.get("hit_source")
-    closed["hit_candle_time"] = signal.get("hit_candle_time")
-
-    closed["signal_id"] = _signal_id(closed)
-    closed["event_type"] = result_type
-    closed["event_at"] = closed["closed_at"]
-
-    # جلوگیری از دوباره‌شماری TP/SL برای یک سیگنال
-    exists = any(
-        item.get("signal_id") == closed["signal_id"] and item.get("event_type", item.get("status")) == result_type
-        for item in stats
-    )
-    if not exists:
-        stats.append(closed)
-        save_signal_stats(stats)
-
-    if result_type == "TP1":
-        return (
-            f"✅ نتیجه سیگنال {signal['symbol']}\n\n"
-            f"جهت: {'لانگ' if signal['direction'] == 'LONG' else 'شورت'}\n"
-            f"ورود: {signal['entry']}\n"
-            f"TP1: {signal['tp1']}\n"
-            f"قیمت خروج: {exit_price}\n"
-            f"نتیجه: موفق ✅\n"
-            f"درصد حرکت: {closed['result_percent']}٪"
-        )
-
-    sl_reasons = guess_sl_reasons(closed)
-    reasons_text = "\n".join([f"- {r}" for r in sl_reasons[:4]])
-
-    return (
-        f"❌ نتیجه سیگنال {signal['symbol']}\n\n"
-        f"جهت: {'لانگ' if signal['direction'] == 'LONG' else 'شورت'}\n"
-        f"ورود: {signal['entry']}\n"
-        f"SL: {signal['stop_loss']}\n"
-        f"قیمت خروج: {exit_price}\n"
-        f"نتیجه: حد ضرر ❌\n"
-        f"درصد حرکت: {closed['result_percent']}٪\n\n"
-        f"دلایل احتمالی استاپ:\n"
-        f"{reasons_text}"
-    )
-
-
-
-
-def fa_direction(direction):
-    if direction == "LONG":
-        return "لانگ"
-    if direction == "SHORT":
-        return "شورت"
-    return "نامشخص"
-
-
-def format_signed_percent(value):
-    try:
-        value = float(value)
-    except Exception:
-        return "0٪"
-
-    sign = "+" if value > 0 else ""
-    return f"{sign}{value}٪"
-
-
-def compact_signal_line(signal):
-    return (
-        f"{signal.get('symbol', 'نامشخص')} | "
-        f"{fa_direction(signal.get('direction'))} | "
-        f"{format_signed_percent(signal.get('result_percent', 0))} | "
-        f"ورود: {signal.get('entry')} | خروج: {signal.get('exit_price')}"
-    )
-
-
-def guess_sl_reasons(signal):
+def very_safe_status(raw_direction, score, win_probability_value, risk_level, rr, trends,
+                     vwap_status, buy_power, sell_power, adx_value,
+                     pattern=None, multi_candle=None, order_block=None, fvg=None,
+                     market_regime="neutral"):
+    """
+    حالت خیلی امن فقط نمایشی است و روی سیگنال عادی اثر ندارد.
+    """
     reasons = []
 
-    warning_reasons = signal.get("warning_reasons") or []
-    if warning_reasons:
-        reasons.append("قبل از SL هشدار ضعف صادر شده بود")
-        for item in warning_reasons[:3]:
-            reasons.append(item)
+    if raw_direction not in ["LONG", "SHORT"]:
+        return False, ["جهت مشخص نیست"]
 
-    direction = signal.get("direction")
+    if score < 88:
+        reasons.append("امتیاز کمتر از حد Very Safe است")
 
-    buy_power = signal.get("buy_power")
-    sell_power = signal.get("sell_power")
+    if win_probability_value is not None and win_probability_value < 68:
+        reasons.append("احتمال موفقیت کمتر از حد Very Safe است")
+
+    if rr < 1.0:
+        reasons.append("ریسک به ریوارد برای Very Safe کافی نیست")
+
+    if adx_value < 25:
+        reasons.append("ADX برای Very Safe قوی نیست")
+
+    if raw_direction == "LONG" and buy_power < 60:
+        reasons.append("قدرت خرید برای Very Safe کافی نیست")
+
+    if raw_direction == "SHORT" and sell_power < 60:
+        reasons.append("قدرت فروش برای Very Safe کافی نیست")
+
+    return len(reasons) == 0, reasons
+
+def apply_final_momentum_balance(score, raw_direction, adx_value, buy_power, sell_power, rsi_value, reasons):
+    """
+    بالانس نهایی سریع‌تر برای Fast Pump/Dump Mode.
+    ADX و RSI دیگر شروع حرکت را خفه نمی‌کنند؛ فقط خلاف‌جهت‌های واضح امتیاز را کم می‌کنند.
+    """
+    if raw_direction == "NO TRADE":
+        return cap_score(score)
+
+    try:
+        adx_value = float(adx_value)
+    except Exception:
+        adx_value = 18.0
 
     try:
         buy_power = float(buy_power)
         sell_power = float(sell_power)
-
-        if direction == "LONG" and sell_power >= buy_power + 10:
-            reasons.append("قدرت فروش هنگام ورود از خرید بیشتر بود")
-
-        if direction == "SHORT" and buy_power >= sell_power + 10:
-            reasons.append("قدرت خرید هنگام ورود از فروش بیشتر بود")
     except Exception:
-        pass
+        buy_power = 50.0
+        sell_power = 50.0
 
-    if direction == "LONG":
-        if signal.get("vwap_status") == "below_vwap":
-            reasons.append("لانگ زیر VWAP ثبت شده بود")
-        if signal.get("order_block") == "bearish_order_block":
-            reasons.append("اوردر بلاک مخالف لانگ بود")
-        if signal.get("fvg") == "bearish_fvg":
-            reasons.append("FVG مخالف لانگ بود")
-        if signal.get("multi_candle") == "bearish":
-            reasons.append("تایید چندکندلی مخالف لانگ بود")
-        if signal.get("market_regime") == "bearish":
-            reasons.append("لانگ خلاف روند کلی نزولی بازار بود")
-
-    if direction == "SHORT":
-        if signal.get("vwap_status") == "above_vwap":
-            reasons.append("شورت بالای VWAP ثبت شده بود")
-        if signal.get("order_block") == "bullish_order_block":
-            reasons.append("اوردر بلاک مخالف شورت بود")
-        if signal.get("fvg") == "bullish_fvg":
-            reasons.append("FVG مخالف شورت بود")
-        if signal.get("multi_candle") == "bullish":
-            reasons.append("تایید چندکندلی مخالف شورت بود")
-        if signal.get("market_regime") == "bullish":
-            reasons.append("شورت خلاف روند کلی صعودی بازار بود")
-
-    if signal.get("fake_breakout") not in [None, "none"]:
-        reasons.append("احتمال فیک بریک‌اوت در تحلیل ثبت شده بود")
-
-    if signal.get("trend_exhaustion") not in [None, "none"]:
-        reasons.append("نشانه خستگی روند وجود داشت")
-    if signal.get("late_entry"):
-        reasons.append(signal.get("late_entry_reason") or "ورود دیرهنگام در تحلیل اولیه دیده شده بود")
-    if signal.get("tp_space_ok") is False:
-        reasons.append(signal.get("tp_space_reason") or "فضای کافی تا TP وجود نداشت")
-    if signal.get("trap_risk"):
-        reasons.append(signal.get("trap_reason") or "ورود نزدیک حمایت/مقاومت مهم انجام شده بود")
-    candle_forecast = signal.get("candle_forecast")
-    direction = signal.get("direction")
-    if direction == "LONG" and candle_forecast == "bearish_continuation":
-        reasons.append(signal.get("candle_forecast_reason") or "پیش‌بینی کندلی خلاف لانگ بود")
-    if direction == "SHORT" and candle_forecast == "bullish_continuation":
-        reasons.append(signal.get("candle_forecast_reason") or "پیش‌بینی کندلی خلاف شورت بود")
-    if signal.get("noise_status") in ["high_noise", "medium_noise"]:
-        reasons.append("بازار هنگام ورود نویزی/رنج بوده است")
-    if signal.get("volatility_status") in ["too_low", "too_high"]:
-        reasons.append(signal.get("volatility_label") or "وضعیت نوسان مناسب نبود")
-    if signal.get("liquidity_pool_status") not in [None, "none", "unknown"]:
-        reasons.append(signal.get("liquidity_pool_label") or "Liquidity Pool مهم نزدیک قیمت بود")
-
-    if not reasons:
-        reasons.append("دلیل مشخصی در داده‌های ذخیره‌شده دیده نشد")
-
-    clean = []
-    for item in reasons:
-        if item and item not in clean:
-            clean.append(item)
-
-    return clean[:5]
-
-
-def format_signal_details(items, title, limit=10, include_reasons=False):
-    if not items:
-        return f"\n{title}\nندارد\n"
-
-    out = f"\n{title}\n"
-
-    for signal in items[:limit]:
-        out += f"\n{compact_signal_line(signal)}"
-
-        if include_reasons:
-            reasons = guess_sl_reasons(signal)
-            out += "\nدلیل احتمالی:"
-            for reason in reasons[:4]:
-                out += f"\n- {reason}"
-
-        out += "\n"
-
-    if len(items) > limit:
-        out += f"\n... و {len(items) - limit} مورد دیگر\n"
-
-    return out
-
-
-def weakness_warning_for_signal(signal, result, price):
-    direction = signal.get("direction")
-    warnings = []
-
-    if direction == "LONG":
-        if result.get("raw_direction") == "SHORT" or result.get("direction") == "SHORT":
-            warnings.append("جهت تحلیل جدید به شورت تغییر کرده است")
-        if result.get("vwap_status") == "below_vwap":
-            warnings.append("قیمت زیر VWAP رفته است")
-        if result.get("sell_power", 0) >= result.get("buy_power", 0) + 12:
-            warnings.append("قدرت فروش نسبت به خرید بیشتر شده است")
-        if result.get("market_structure") == "bearish_structure":
-            warnings.append("ساختار کوتاه‌مدت نزولی شده است")
-        if result.get("rsi_divergence") == "bearish_rsi_divergence":
-            warnings.append("واگرایی منفی RSI دیده شده است")
-        if result.get("macd_divergence") == "bearish_macd_divergence":
-            warnings.append("واگرایی منفی MACD دیده شده است")
-        try:
-            macd_hist_now = float(result.get("macd_hist", 0))
-            # MACD Histogram به‌تنهایی هشدار ندهد؛ فقط وقتی با VWAP یا قدرت فروش همراه شود.
-            if macd_hist_now < 0 and (
-                result.get("vwap_status") == "below_vwap"
-                or result.get("sell_power", 0) >= result.get("buy_power", 0) + 8
-            ):
-                warnings.append("MACD هیستوگرام برای لانگ با تایید VWAP/قدرت فروش ضعیف شده است")
-        except Exception:
-            pass
-        if result.get("fake_breakout") == "fake_bullish_breakout":
-            warnings.append("احتمال فیک بریک‌اوت صعودی وجود دارد")
-
-    elif direction == "SHORT":
-        if result.get("raw_direction") == "LONG" or result.get("direction") == "LONG":
-            warnings.append("جهت تحلیل جدید به لانگ تغییر کرده است")
-        if result.get("vwap_status") == "above_vwap":
-            warnings.append("قیمت بالای VWAP رفته است")
-        if result.get("buy_power", 0) >= result.get("sell_power", 0) + 12:
-            warnings.append("قدرت خرید نسبت به فروش بیشتر شده است")
-        if result.get("market_structure") == "bullish_structure":
-            warnings.append("ساختار کوتاه‌مدت صعودی شده است")
-        if result.get("rsi_divergence") == "bullish_rsi_divergence":
-            warnings.append("واگرایی مثبت RSI دیده شده است")
-        if result.get("macd_divergence") == "bullish_macd_divergence":
-            warnings.append("واگرایی مثبت MACD دیده شده است")
-        try:
-            macd_hist_now = float(result.get("macd_hist", 0))
-            # MACD Histogram به‌تنهایی هشدار ندهد؛ فقط وقتی با VWAP یا قدرت خرید همراه شود.
-            if macd_hist_now > 0 and (
-                result.get("vwap_status") == "above_vwap"
-                or result.get("buy_power", 0) >= result.get("sell_power", 0) + 8
-            ):
-                warnings.append("MACD هیستوگرام برای شورت با تایید VWAP/قدرت خرید ضعیف شده است")
-        except Exception:
-            pass
-        if result.get("fake_breakout") == "fake_bearish_breakout":
-            warnings.append("احتمال فیک بریک‌اوت نزولی وجود دارد")
-
-    if result.get("late_entry"):
-        warnings.append("ورود از نظر Late Entry پرریسک شده است")
-    if result.get("tp_space_ok") is False:
-        warnings.append("فضای TP ضعیف شده یا حمایت/مقاومت نزدیک است")
-    if result.get("trap_risk"):
-        warnings.append(result.get("trap_reason") or "قیمت نزدیک حمایت/مقاومت مهم است")
-    if direction == "LONG" and result.get("candle_forecast") == "bearish_continuation":
-        warnings.append("پیش‌بینی کندلی کوتاه‌مدت خلاف لانگ شده است")
-    if direction == "SHORT" and result.get("candle_forecast") == "bullish_continuation":
-        warnings.append("پیش‌بینی کندلی کوتاه‌مدت خلاف شورت شده است")
-    if result.get("noise_status") == "high_noise":
-        warnings.append("بازار نویزی/رنج شده است")
-    if result.get("volatility_status") in ["too_low", "too_high"]:
-        warnings.append(result.get("volatility_label") or "وضعیت نوسان مناسب نیست")
-
-    if len(warnings) >= 2:
-        text = "\n".join([f"⚠️ {w}" for w in warnings[:5]])
-        message = (
-            f"⚠️ هشدار ضعف سیگنال {signal['symbol']}\n\n"
-            f"جهت سیگنال: {'لانگ' if direction == 'LONG' else 'شورت'}\n"
-            f"ورود: {signal['entry']}\n"
-            f"قیمت فعلی: {price}\n\n"
-            f"{text}\n\n"
-            f"ریسک معامله بالا رفته؛ بستن معامله یا کاهش ریسک را بررسی کن."
-        )
-
-        return message, warnings[:5]
-
-    return None, []
-
-
-
-def evaluate_pending_setup_state(signal, live):
-    """
-    بررسی می‌کند آیا یک Pending Setup هنوز ارزش نگهداری دارد یا نه.
-    هدف: اگر ستاپ قبلی جهتش عوض شد یا بازار رنج/بی‌جهت شد، قبل از فعال‌سازی لغو شود.
-    این تابع ستاپ جدید نمی‌سازد؛ Scanner در چرخه بعدی فرصت جدید را پیدا می‌کند.
-    """
-    signal_direction = signal.get("direction")
-    live_direction = (live or {}).get("direction")
-    live_raw_direction = (live or {}).get("raw_direction")
-    live_entry_mode = (live or {}).get("entry_mode")
-
-    if live_direction not in ["LONG", "SHORT"]:
-        return "CANCEL", "بازار وارد حالت رنج/بی‌جهت شد و ستاپ دیگر معتبر نیست"
-
-    if live_direction != signal_direction:
-        if live_direction in ["LONG", "SHORT"]:
-            return "CANCEL", f"جهت تحلیل از {fa_direction(signal_direction)} به {fa_direction(live_direction)} تغییر کرد"
-        return "CANCEL", "جهت تحلیل از ستاپ قبلی خارج شد"
-
-    # اگر جهت اصلی هنوز همان است، باید حداقل یکی از حالت‌های معتبر Setup/Trigger وجود داشته باشد.
     try:
-        setup_score = int((live or {}).get("setup_score") or 0)
+        rsi_value = float(rsi_value)
     except Exception:
-        setup_score = 0
+        rsi_value = 50.0
 
-    still_setup = bool((live or {}).get("setup_waiting_activation")) or live_entry_mode == "PREDICTIVE_SETUP"
-    still_trigger = bool((live or {}).get("entry_confirmed")) or live_entry_mode == "PREDICTIVE_TRIGGER"
+    power_gap = buy_power - sell_power
 
-    if not still_setup and not still_trigger and setup_score < 4:
-        return "CANCEL", "ستاپ از نظر تکنیکال ضعیف/رنج شده و تایید کافی برای ادامه مانیتور ندارد"
+    if raw_direction == "SHORT":
+        aligned_power = power_gap <= -4
+        opposite_power = power_gap >= 6
+    elif raw_direction == "LONG":
+        aligned_power = power_gap >= 4
+        opposite_power = power_gap <= -6
+    else:
+        aligned_power = False
+        opposite_power = False
 
-    # اگر raw_direction به هر دلیل خلاف جهت ذخیره‌شده باشد، محتاطانه لغو می‌کنیم.
-    if live_raw_direction in ["LONG", "SHORT"] and live_raw_direction != signal_direction:
-        return "CANCEL", f"جهت خام تحلیل با ستاپ قبلی همسو نیست و به {fa_direction(live_raw_direction)} تغییر کرده"
+    if adx_value < 13:
+        if opposite_power:
+            score -= 10
+            score = min(score, 82)
+            reasons.append("ADX بسیار پایین و قدرت خلاف جهت است؛ امتیاز محدود شد")
+        elif not aligned_power:
+            score -= 6
+            score = min(score, 86)
+            reasons.append("ADX بسیار پایین است و قدرت تایید کامل ندارد")
+        else:
+            score -= 2
+            score = min(score, 94)
+            reasons.append("ADX پایین است اما قدرت هم‌جهت دیده می‌شود")
+    elif adx_value < 16:
+        if opposite_power:
+            score -= 7
+            score = min(score, 86)
+            reasons.append("ADX ضعیف و قدرت خلاف جهت است")
+        elif aligned_power:
+            score -= 1
+            score = min(score, 96)
+            reasons.append("ADX ضعیف است اما قدرت هم‌جهت اجازه عبور می‌دهد")
+        else:
+            score -= 4
+            score = min(score, 90)
+            reasons.append("ADX ضعیف و قدرت خنثی است")
 
-    return "KEEP", None
+    if raw_direction == "SHORT":
+        if power_gap >= 12:
+            score -= 9
+            reasons.append("قدرت خرید به‌وضوح خلاف شورت است")
+        elif power_gap >= 6:
+            score -= 5
+            reasons.append("قدرت خرید خلاف شورت است")
+        if rsi_value > 58:
+            score -= 4
+            reasons.append("RSI برای شورت کمی بالاست")
+    elif raw_direction == "LONG":
+        sell_gap = -power_gap
+        if sell_gap >= 12:
+            score -= 9
+            reasons.append("قدرت فروش به‌وضوح خلاف لانگ است")
+        elif sell_gap >= 6:
+            score -= 5
+            reasons.append("قدرت فروش خلاف لانگ است")
+        if rsi_value < 42:
+            score -= 4
+            reasons.append("RSI برای لانگ کمی پایین است")
+
+    return cap_score(score)
+
+def entry_filter(raw_direction, score, long_score, short_score, df_15m, df_5m, spread_percent, market_regime="neutral", order_block="none", fvg="none", buy_power=50, sell_power=50, rsi_divergence="none", macd_divergence="none"):
+    """
+    فیلتر ورود برای Fast Pump/Dump Mode:
+    فقط شرایط واقعاً ضعیف را رد می‌کند و اجازه می‌دهد 5M قوی زودتر وارد شود.
+    """
+    reasons_block = []
+    liquidity_risk = "پایین"
+
+    if raw_direction == "NO TRADE":
+        return False, reasons_block, "بالا", "none", "none"
+
+    if score < 76:
+        reasons_block.append("امتیاز سیگنال برای ورود کافی نیست")
+        return False, reasons_block, "متوسط", "none", "none"
+
+    try:
+        adx_15m = float(df_15m.iloc[-1].get("adx", 0))
+    except Exception:
+        adx_15m = 0
+
+    try:
+        buy_power_value = float(buy_power)
+        sell_power_value = float(sell_power)
+    except Exception:
+        buy_power_value = 50
+        sell_power_value = 50
+
+    power_gap = buy_power_value - sell_power_value
+
+    if adx_15m < 13:
+        reasons_block.append("ADX در 15M خیلی پایین است")
+        return False, reasons_block, "متوسط", "none", "none"
+
+    if adx_15m < 15:
+        if raw_direction == "LONG" and not (score >= 82 and power_gap >= 7):
+            reasons_block.append("ADX پایین است و تایید قدرت خرید کافی نیست")
+            return False, reasons_block, "متوسط", "none", "none"
+        if raw_direction == "SHORT" and not (score >= 82 and power_gap <= -7):
+            reasons_block.append("ADX پایین است و تایید قدرت فروش کافی نیست")
+            return False, reasons_block, "متوسط", "none", "none"
+
+    if raw_direction == "LONG":
+        if power_gap < 4:
+            reasons_block.append("اختلاف قدرت خرید نسبت به فروش برای لانگ کافی نیست")
+            return False, reasons_block, "متوسط", "none", "none"
+        if fvg == "bearish_fvg" and score < 84:
+            reasons_block.append("FVG نزولی خلاف لانگ است و امتیاز برای عبور کافی نیست")
+            return False, reasons_block, "متوسط", "none", "none"
+
+    if raw_direction == "SHORT":
+        if power_gap > -4:
+            reasons_block.append("اختلاف قدرت فروش نسبت به خرید برای شورت کافی نیست")
+            return False, reasons_block, "متوسط", "none", "none"
+        if fvg == "bullish_fvg" and score < 84:
+            reasons_block.append("FVG صعودی خلاف شورت است و امتیاز برای عبور کافی نیست")
+            return False, reasons_block, "متوسط", "none", "none"
+
+    if spread_percent is not None and spread_percent > 0.12:
+        reasons_block.append("اسپرد برای معامله زیاد است")
+        return False, reasons_block, "بالا", "none", "none"
+
+    return True, reasons_block, liquidity_risk, "none", "none"
+
+def apply_conflict_penalties(
+    long_score,
+    short_score,
+    trendline,
+    structure,
+    reasons_long,
+    reasons_short
+):
+    if trendline == "uptrend":
+        long_score += 12
+        short_score -= 15
+        reasons_long.append("تقویت: خط روند صعودی است")
+        reasons_short.append("جریمه: شورت خلاف خط روند صعودی است")
+
+    elif trendline == "downtrend":
+        short_score += 12
+        long_score -= 15
+        reasons_short.append("تقویت: خط روند نزولی است")
+        reasons_long.append("جریمه: لانگ خلاف خط روند نزولی است")
+
+    if structure == "bullish_structure":
+        long_score += 15
+        short_score -= 18
+        reasons_long.append("تقویت: ساختار بازار صعودی است")
+        reasons_short.append("جریمه: شورت خلاف ساختار صعودی بازار است")
+
+    elif structure == "bearish_structure":
+        short_score += 15
+        long_score -= 18
+        reasons_short.append("تقویت: ساختار بازار نزولی است")
+        reasons_long.append("جریمه: لانگ خلاف ساختار نزولی بازار است")
+
+    return max(0, long_score), max(0, short_score)
 
 
-def check_active_signals():
-    active = get_active_signals()
-    remaining = []
-    messages = []
 
-    for signal in active:
-        try:
-            if signal.get("status") == "PENDING_ACTIVATION":
-                age = now_ts() - int(signal.get("created_at") or now_ts())
-                if age > int(PENDING_SETUP_TIMEOUT_MINUTES) * 60:
-                    msg = close_pending_setup(signal, "زمان انتظار فعال‌سازی تمام شد")
-                    messages.append({"chat_id": signal["chat_id"], "message": msg, "reply_to_message_id": signal.get("message_id")})
-                    continue
-
-                price = get_last_close_from_1m_or_ticker(signal["symbol"], signal)
-
-                try:
-                    live = analyze_symbol(signal["symbol"])
-                    action, cancel_reason = evaluate_pending_setup_state(signal, live)
-
-                    if action == "CANCEL":
-                        msg = close_pending_setup(signal, cancel_reason)
-                        messages.append({
-                            "chat_id": signal["chat_id"],
-                            "reply_to_message_id": signal.get("message_id"),
-                            "message": msg
-                        })
-                        continue
-
-                    same_direction = live.get("direction") == signal.get("direction")
-                    activated_now = bool(live.get("entry_confirmed")) and live.get("entry_mode") == "PREDICTIVE_TRIGGER"
-
-                    if same_direction and activated_now and price_in_entry_zone(signal, price):
-                        signal = activate_pending_signal(signal, price)
-                        activation_msg = (
-                            "✅ ورود فعال شد\n\n"
-                            f"ارز: {signal['symbol']}\n"
-                            f"جهت: {fa_direction(signal['direction'])}\n"
-                            f"قیمت فعال‌سازی: {round(float(price), 8)}\n"
-                            "تحلیل لحظه‌ای با ستاپ اولیه همسو ماند و شرایط ورود تکمیل شد."
-                        )
-                        messages.append({
-                            "chat_id": signal["chat_id"],
-                            "reply_to_message_id": signal.get("message_id"),
-                            "message": activation_msg
-                        })
-                    else:
-                        signal["last_checked_at"] = now_ts()
-                        signal["last_checked_at_text"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-                except Exception as e:
-                    log_exception("فعال‌سازی/اعتبارسنجی ستاپ", e, "signal_tracker.py", "check_active_signals", signal.get("symbol"))
-                    signal["last_checked_at"] = now_ts()
-                    signal["last_checked_at_text"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-                remaining.append(signal)
-                continue
-
-            result_type, exit_price = detect_signal_hit_from_candles(signal)
-
-            if result_type:
-                msg = close_signal(signal, result_type, exit_price)
-                messages.append({
-                    "chat_id": signal["chat_id"],
-                    "message": msg
-                })
-                continue
-
-            # برای هشدار ضعف، قیمت فعلی فقط جهت نمایش استفاده می‌شود؛
-            # تشخیص TP/SL با مسیر کندل‌های 1m انجام شده است.
-            price = get_last_close_from_1m_or_ticker(signal["symbol"], signal)
-
-            if not signal.get("warning_sent", False):
-                try:
-                    result = analyze_symbol(signal["symbol"])
-                    warning_msg, warning_reasons = weakness_warning_for_signal(signal, result, price)
-
-                    if warning_msg:
-                        signal["warning_sent"] = True
-                        signal["warning_reasons"] = warning_reasons
-                        signal["warning_time"] = now_ts()
-                        signal["warning_time_text"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-                        messages.append({
-                            "chat_id": signal["chat_id"],
-                            "message": warning_msg
-                        })
-
-                except Exception as e:
-                    print("WARNING CHECK ERROR:", signal.get("symbol"), str(e))
-
-            remaining.append(signal)
-
-        except Exception as e:
-            print("TRACK SIGNAL ERROR:", signal.get("symbol"), str(e))
-            remaining.append(signal)
-
-    save_active_signals(remaining)
-    return messages
-
-
-
-def normalize_number_text_for_calc(text):
-    mapping = {
-        "۰": "0", "۱": "1", "۲": "2", "۳": "3", "۴": "4",
-        "۵": "5", "۶": "6", "۷": "7", "۸": "8", "۹": "9",
-        "٠": "0", "١": "1", "٢": "2", "٣": "3", "٤": "4",
-        "٥": "5", "٦": "6", "٧": "7", "٨": "8", "٩": "9",
-        "٫": ".", ",": "."
+def _power_snapshot(df_5m):
+    """قدرت خرید/فروش سریع برای موتور پیش‌بینی؛ تصمیم اصلی با 2 و 3 کندل است."""
+    buy2, sell2 = buy_sell_power(df_5m, candles=2)
+    buy3, sell3 = buy_sell_power(df_5m, candles=3)
+    buy6, sell6 = buy_sell_power(df_5m, candles=6)
+    prev3 = df_5m.iloc[:-1]
+    prev_buy3, prev_sell3 = buy_sell_power(prev3, candles=3)
+    return {
+        "buy2": float(buy2), "sell2": float(sell2),
+        "buy3": float(buy3), "sell3": float(sell3),
+        "buy6": float(buy6), "sell6": float(sell6),
+        "prev_buy3": float(prev_buy3), "prev_sell3": float(prev_sell3),
+        "buy_accel": round(float(buy3) - float(prev_buy3), 1),
+        "sell_accel": round(float(sell3) - float(prev_sell3), 1),
     }
 
-    for src, dst in mapping.items():
-        text = text.replace(src, dst)
-
-    return text
 
 
-def parse_profit_calc_text(text):
-    if not text:
-        return None
-
-    normalized = normalize_number_text_for_calc(text.strip().lower())
-
-    has_calc_word = (
-        "لوریج" in normalized
-        or "leverage" in normalized
-        or "اهرم" in normalized
-        or "دلار" in normalized
-        or "$" in normalized
-        or "سرمایه" in normalized
-        or "محاسبه" in normalized
-        or "سود" in normalized
-        or "ضرر" in normalized
-    )
-
-    numbers = re.findall(r"\d+(?:\.\d+)?", normalized)
-
-    if len(numbers) < 2 or not has_calc_word:
-        return None
-
-    margin = None
-    leverage = None
-
-    lev_match = re.search(r"(?:لوریج|leverage|اهرم)\s*(\d+(?:\.\d+)?)", normalized)
-
-    if lev_match:
-        leverage = float(lev_match.group(1))
-        before_lev = normalized[:lev_match.start()]
-        before_numbers = re.findall(r"\d+(?:\.\d+)?", before_lev)
-
-        if before_numbers:
-            margin = float(before_numbers[-1])
-
-    if margin is None or leverage is None:
-        margin = float(numbers[0])
-        leverage = float(numbers[1])
-
-    if margin <= 0 or leverage <= 0:
-        return None
-
-    return margin, leverage
-
-
-def calculate_pnl_usdt(result_percent, margin, leverage):
+def detect_compression_context(df_30m, df_15m, df_5m):
+    """تشخیص فشردگی/رنج قبل از شکست؛ فقط برای Setup استفاده می‌شود."""
+    context = {"compression_active": False, "compression_score": 0, "compression_label": "غیرفعال", "compression_reasons": []}
     try:
-        result_percent = float(result_percent)
-        margin = float(margin)
-        leverage = float(leverage)
+        last15 = df_15m.iloc[-1]
+        recent15 = df_15m.tail(24)
+        recent5 = df_5m.tail(24)
+        atr_now = float(last15.get("atr", 0) or 0)
+        atr_ma = float(df_15m["atr"].tail(60).mean())
+        if atr_now <= 0:
+            return context
+        range15 = float(recent15["high"].max() - recent15["low"].min())
+        range5 = float(recent5["high"].max() - recent5["low"].min())
+        atr_contracting = atr_ma > 0 and atr_now <= atr_ma * 0.82
+        range_tight = range15 <= atr_now * 4.2 or range5 <= atr_now * 2.6
+        vwap_flat = abs(float(df_5m.iloc[-1]["vwap"]) - float(df_5m.iloc[-6]["vwap"])) <= atr_now * 0.35
+        score = 0
+        if atr_contracting:
+            score += 1; context["compression_reasons"].append("ATR نسبت به میانگین کاهش یافته")
+        if range_tight:
+            score += 1; context["compression_reasons"].append("قیمت در محدوده فشرده حرکت می‌کند")
+        if vwap_flat:
+            score += 1; context["compression_reasons"].append("VWAP تقریباً صاف و رنج است")
+        context["compression_score"] = score
+        context["compression_active"] = score >= 2
+        context["compression_label"] = "فعال" if score >= 2 else "ضعیف"
     except Exception:
-        return 0
-
-    return round((margin * leverage * result_percent) / 100, 4)
-
-
-def format_money(value):
-    try:
-        value = float(value)
-    except Exception:
-        value = 0
-
-    sign = "+" if value > 0 else ""
-    return f"{sign}{round(value, 4)}$"
+        pass
+    return context
 
 
-def parse_days_from_report_text(text):
-    if not text:
-        return 7
-
-    normalized = normalize_number_text_for_calc(text)
-
-    if "آمار کل" in normalized:
-        return None
-
-    match = re.search(r"آمار\s+(\d+)\s+روز", normalized)
-    if match:
-        return int(match.group(1))
-
-    return 7
-
-
-def get_profit_for_signal_text(reply_text, margin, leverage):
-    if not reply_text:
-        return None
-
-    normalized = normalize_number_text_for_calc(reply_text)
-
-    percent_match = re.search(r"درصد حرکت\s*:\s*([+-]?\d+(?:\.\d+)?)\s*٪", normalized)
-    if not percent_match:
-        percent_match = re.search(r"([+-]?\d+(?:\.\d+)?)\s*٪", normalized)
-
-    if not percent_match:
-        return None
-
-    result_percent = float(percent_match.group(1))
-    pnl = calculate_pnl_usdt(result_percent, margin, leverage)
-
-    symbol = "نامشخص"
-    symbol_match = re.search(r"([A-Z0-9]+USDT)", normalized)
-    if symbol_match:
-        symbol = symbol_match.group(1)
-
-    result_text = "سود" if pnl > 0 else "ضرر" if pnl < 0 else "بدون سود/ضرر"
-
-    return (
-        f"💰 محاسبه معامله\n\n"
-        f"ارز: {symbol}\n"
-        f"سرمایه: {margin}$\n"
-        f"لوریج: {leverage}x\n\n"
-        f"درصد حرکت:\n"
-        f"{result_percent}٪\n\n"
-        f"{result_text} تقریبی:\n"
-        f"{format_money(pnl)}"
-    )
-
-
-def get_profit_simulation_report(margin, leverage, days=None):
-    stats = get_signal_stats()
-
-    if days is not None:
-        start_ts = now_ts() - (days * 24 * 60 * 60)
-        stats = [s for s in stats if s.get("closed_at", 0) >= start_ts]
-
-    total = len(stats)
-
-    if total == 0:
-        title = "آمار کل" if days is None else f"{days} روز اخیر"
-        return f"📊 برای {title} معامله بسته‌شده‌ای جهت محاسبه وجود ندارد."
-
-    wins = [s for s in stats if s.get("status") == "TP1"]
-    losses = [s for s in stats if s.get("status") == "SL"]
-
-    gross_profit = 0
-    gross_loss = 0
-    best_trade = None
-    worst_trade = None
-
-    for s in stats:
-        pnl = calculate_pnl_usdt(s.get("result_percent", 0), margin, leverage)
-        s["_calc_pnl"] = pnl
-
-        if pnl >= 0:
-            gross_profit += pnl
+def predictive_setup_decision(df_4h, df_1h, df_30m, df_15m, df_5m, price, atr, long_score, short_score, trends, market_regime="neutral"):
+    """مرحله اول: سیگنال کامل آماده می‌شود اما ورود منتظر فعال‌سازی 5M می‌ماند."""
+    reasons_long, reasons_short = [], []
+    last15 = df_15m.iloc[-1]
+    last5 = df_5m.iloc[-1]
+    prev5 = df_5m.iloc[-2]
+    p = _power_snapshot(df_5m)
+    compression = detect_compression_context(df_30m, df_15m, df_5m)
+    trend30 = trend_direction(df_30m)
+    trend15 = trend_direction(df_15m)
+    trend1h = trend_direction(df_1h)
+    trend4h = trend_direction(df_4h)
+    long_setup_score = 0
+    short_setup_score = 0
+    if trend30 in ["bullish", "weak_bullish"]:
+        long_setup_score += 2; reasons_long.append("30M به نفع لانگ است")
+    if trend30 in ["bearish", "weak_bearish"]:
+        short_setup_score += 2; reasons_short.append("30M به نفع شورت است")
+    if trend15 in ["bullish", "weak_bullish"] or float(last15["close"]) >= float(last15["ema20"]):
+        long_setup_score += 2; reasons_long.append("15M آماده لانگ است")
+    if trend15 in ["bearish", "weak_bearish"] or float(last15["close"]) <= float(last15["ema20"]):
+        short_setup_score += 2; reasons_short.append("15M آماده شورت است")
+    if p["buy2"] >= 58 or p["buy3"] >= 55:
+        long_setup_score += 1; reasons_long.append("قدرت خرید کوتاه‌مدت دیده می‌شود")
+    if p["sell2"] >= 58 or p["sell3"] >= 55:
+        short_setup_score += 1; reasons_short.append("قدرت فروش کوتاه‌مدت دیده می‌شود")
+    if float(last5["macd_hist"]) >= float(prev5["macd_hist"]):
+        long_setup_score += 1; reasons_long.append("Fresh Momentum برای لانگ بهتر شده")
+    if float(last5["macd_hist"]) <= float(prev5["macd_hist"]):
+        short_setup_score += 1; reasons_short.append("Fresh Momentum برای شورت بهتر شده")
+    if market_regime == "bullish":
+        long_setup_score += 1; reasons_long.append("رژیم کلی بازار کمی صعودی است")
+    elif market_regime == "bearish":
+        short_setup_score += 1; reasons_short.append("رژیم کلی بازار کمی نزولی است")
+    if compression.get("compression_active"):
+        if long_setup_score >= short_setup_score:
+            long_setup_score += 1; reasons_long.append("فشردگی/رنج فعال است و احتمال شکست صعودی بررسی می‌شود")
         else:
-            gross_loss += pnl
+            short_setup_score += 1; reasons_short.append("فشردگی/رنج فعال است و احتمال شکست نزولی بررسی می‌شود")
+    long_block = trend1h == "bearish" and trend4h in ["bearish", "weak_bearish"]
+    short_block = trend1h == "bullish" and trend4h in ["bullish", "weak_bullish"]
+    direction = "NO TRADE"; reasons = []
+    setup_score = max(long_setup_score, short_setup_score)
+    if long_setup_score >= 4 and long_setup_score >= short_setup_score + 1 and not long_block:
+        direction = "LONG"; reasons = reasons_long
+    elif short_setup_score >= 4 and short_setup_score >= long_setup_score + 1 and not short_block:
+        direction = "SHORT"; reasons = reasons_short
+    return {"direction": direction, "setup_ok": direction in ["LONG", "SHORT"], "setup_score": setup_score, "setup_reasons": reasons[:10], "compression": compression, "entry_status": "WAITING_ACTIVATION" if direction in ["LONG", "SHORT"] else "NO_SETUP"}
 
-        if best_trade is None or pnl > best_trade.get("_calc_pnl", 0):
-            best_trade = s
+def predictive_entry_decision(df_4h, df_1h, df_30m, df_15m, df_5m, price, atr, spread_percent=None):
+    """
+    موتور اصلی نسخه پیش‌بینی‌محور.
+    تصمیم نهایی دیگر با امتیاز 0 تا 100 نیست؛ فقط تریگر ورود تازه / عدم ورود.
+    """
+    reasons_long = []
+    reasons_short = []
+    block_reasons = []
+    confirmations_long = 0
+    confirmations_short = 0
 
-        if worst_trade is None or pnl < worst_trade.get("_calc_pnl", 0):
-            worst_trade = s
+    last = df_5m.iloc[-1]
+    prev = df_5m.iloc[-2]
+    prev2 = df_5m.iloc[-3]
+    last15 = df_15m.iloc[-1]
 
-    gross_profit = round(gross_profit, 4)
-    gross_loss = round(gross_loss, 4)
-    net = round(gross_profit + gross_loss, 4)
+    atr_value = float(atr) if atr and atr > 0 else float(last.get("atr", 0) or 0)
+    if atr_value <= 0:
+        return {"direction": "NO TRADE", "ok": False, "reasons": ["ATR معتبر نیست"], "block_reasons": ["ATR معتبر نیست"], "confirmations": 0, "freshness": "LOW"}
 
-    total_margin_used = margin * total
-    roi = round((net / total_margin_used) * 100, 2) if total_margin_used > 0 else 0
+    p = _power_snapshot(df_5m)
 
-    title = "آمار کل" if days is None else f"آمار {days} روز اخیر"
+    macd_rising = float(last["macd_hist"]) > float(prev["macd_hist"])
+    macd_falling = float(last["macd_hist"]) < float(prev["macd_hist"])
+    macd_turn_up = macd_rising and float(prev["macd_hist"]) <= float(prev2["macd_hist"])
+    macd_turn_down = macd_falling and float(prev["macd_hist"]) >= float(prev2["macd_hist"])
 
-    best_text = "نامشخص"
-    if best_trade:
-        best_text = (
-            f"{best_trade.get('symbol')} | "
-            f"{fa_direction(best_trade.get('direction'))} | "
-            f"{format_money(best_trade.get('_calc_pnl', 0))}"
-        )
+    rsi_rising = float(last["rsi"]) > float(prev["rsi"])
+    rsi_falling = float(last["rsi"]) < float(prev["rsi"])
 
-    worst_text = "نامشخص"
-    if worst_trade:
-        worst_text = (
-            f"{worst_trade.get('symbol')} | "
-            f"{fa_direction(worst_trade.get('direction'))} | "
-            f"{format_money(worst_trade.get('_calc_pnl', 0))}"
-        )
+    close_above_ema = float(last["close"]) >= float(last["ema20"])
+    close_below_ema = float(last["close"]) <= float(last["ema20"])
+    close_above_vwap = float(last["close"]) >= float(last["vwap"])
+    close_below_vwap = float(last["close"]) <= float(last["vwap"])
+    vwap_reclaim_long = float(prev["close"]) <= float(prev["vwap"]) and close_above_vwap
+    vwap_reclaim_short = float(prev["close"]) >= float(prev["vwap"]) and close_below_vwap
 
-    return (
-        f"💰 شبیه‌سازی سود و ضرر\n\n"
-        f"{title}\n\n"
-        f"سرمایه هر معامله: {margin}$\n"
-        f"لوریج: {leverage}x\n\n"
-        f"تعداد معاملات: {total}\n"
-        f"بردها: {len(wins)}\n"
-        f"استاپ‌ها: {len(losses)}\n\n"
-        f"سود کل TPها:\n"
-        f"{format_money(gross_profit)}\n\n"
-        f"ضرر کل SLها:\n"
-        f"{format_money(gross_loss)}\n\n"
-        f"سود/ضرر خالص:\n"
-        f"{format_money(net)}\n\n"
-        f"بازده نسبت به مجموع سرمایه‌های واردشده:\n"
-        f"{roi}٪\n\n"
-        f"بهترین معامله:\n"
-        f"{best_text}\n\n"
-        f"بدترین معامله:\n"
-        f"{worst_text}\n\n"
-        f"محاسبه بدون کارمزد و اسلیپیج است."
+    ema_distance_atr = abs(float(price) - float(last["ema20"])) / atr_value
+    vwap_distance_atr = abs(float(price) - float(last["vwap"])) / atr_value
+    recent = df_5m.tail(10)
+    recent_high = float(recent["high"].max())
+    recent_low = float(recent["low"].min())
+    move_from_low_atr = (float(price) - recent_low) / atr_value
+    move_from_high_atr = (recent_high - float(price)) / atr_value
+    near_recent_high = recent_high - float(price) <= atr_value * 0.18
+    near_recent_low = float(price) - recent_low <= atr_value * 0.18
+
+    trend_1h = trend_direction(df_1h)
+    trend_4h = trend_direction(df_4h)
+    strong_context_long_block = trend_1h in ["bearish"] and trend_4h in ["bearish", "weak_bearish"]
+    strong_context_short_block = trend_1h in ["bullish"] and trend_4h in ["bullish", "weak_bullish"]
+
+    if p["buy2"] >= 58 and p["buy3"] >= 55:
+        confirmations_long += 1; reasons_long.append("قدرت خرید 2 تا 3 کندلی فعال است")
+    if p["buy_accel"] >= 5 or p["buy2"] >= 66:
+        confirmations_long += 1; reasons_long.append("شتاب قدرت خرید تازه دیده شد")
+    if macd_rising or macd_turn_up:
+        confirmations_long += 1; reasons_long.append("شیب MACD Histogram به نفع لانگ است")
+    if rsi_rising and float(last["rsi"]) < 72:
+        confirmations_long += 1; reasons_long.append("RSI slope صعودی است و هنوز بیش‌ازحد دیر نشده")
+    if close_above_ema and (close_above_vwap or vwap_reclaim_long):
+        confirmations_long += 1; reasons_long.append("قیمت EMA20/VWAP را برای لانگ تایید کرده")
+    if float(last15["close"]) >= float(last15["ema20"]):
+        confirmations_long += 1; reasons_long.append("15M تایید نرم لانگ می‌دهد")
+
+    if p["sell2"] >= 58 and p["sell3"] >= 55:
+        confirmations_short += 1; reasons_short.append("قدرت فروش 2 تا 3 کندلی فعال است")
+    if p["sell_accel"] >= 5 or p["sell2"] >= 66:
+        confirmations_short += 1; reasons_short.append("شتاب قدرت فروش تازه دیده شد")
+    if macd_falling or macd_turn_down:
+        confirmations_short += 1; reasons_short.append("شیب MACD Histogram به نفع شورت است")
+    if rsi_falling and float(last["rsi"]) > 28:
+        confirmations_short += 1; reasons_short.append("RSI slope نزولی است و هنوز بیش‌ازحد دیر نشده")
+    if close_below_ema and (close_below_vwap or vwap_reclaim_short):
+        confirmations_short += 1; reasons_short.append("قیمت EMA20/VWAP را برای شورت تایید کرده")
+    if float(last15["close"]) <= float(last15["ema20"]):
+        confirmations_short += 1; reasons_short.append("15M تایید نرم شورت می‌دهد")
+
+    late_long = (
+        ema_distance_atr > 0.95
+        or vwap_distance_atr > 1.10
+        or (near_recent_high and move_from_low_atr > 1.20)
+        or float(last["rsi"]) >= 73
+    )
+    late_short = (
+        ema_distance_atr > 0.95
+        or vwap_distance_atr > 1.10
+        or (near_recent_low and move_from_high_atr > 1.20)
+        or float(last["rsi"]) <= 27
     )
 
+    if late_long:
+        reasons_long.append("رد لانگ: حرکت دیر شده یا قیمت از EMA/VWAP زیاد فاصله گرفته")
+    if late_short:
+        reasons_short.append("رد شورت: حرکت دیر شده یا قیمت از EMA/VWAP زیاد فاصله گرفته")
 
-def parse_days_from_text(text):
-    text = text.strip()
+    if spread_percent is not None and spread_percent > 0.12:
+        block_reasons.append("اسپرد برای ورود سریع زیاد است")
 
-    if "کل" in text:
-        return None
+    long_ok = confirmations_long >= 4 and not late_long and not strong_context_long_block
+    short_ok = confirmations_short >= 4 and not late_short and not strong_context_short_block
 
-    digits = ""
-    for ch in text:
-        if ch.isdigit():
-            digits += ch
+    if long_ok and short_ok:
+        if confirmations_long > confirmations_short:
+            short_ok = False
+        elif confirmations_short > confirmations_long:
+            long_ok = False
+        else:
+            long_ok = short_ok = False
+            block_reasons.append("تریگر لانگ و شورت همزمان و مبهم است")
 
-    if digits:
-        return int(digits)
+    if block_reasons:
+        long_ok = False
+        short_ok = False
 
-    return 7
+    if long_ok:
+        freshness = "HIGH" if (p["buy_accel"] >= 8 or macd_turn_up or vwap_reclaim_long) and ema_distance_atr <= 0.70 else "MEDIUM"
+        return {
+            "direction": "LONG", "ok": True, "reasons": reasons_long[:10], "block_reasons": [],
+            "confirmations": confirmations_long, "freshness": freshness,
+            "power2_buy": p["buy2"], "power2_sell": p["sell2"],
+            "power3_buy": p["buy3"], "power3_sell": p["sell3"],
+            "power_accel": p["buy_accel"], "late_entry": False,
+            "ema_distance_atr": round(ema_distance_atr, 2), "vwap_distance_atr": round(vwap_distance_atr, 2),
+            "entry_mode": "PREDICTIVE_TRIGGER"
+        }
 
+    if short_ok:
+        freshness = "HIGH" if (p["sell_accel"] >= 8 or macd_turn_down or vwap_reclaim_short) and ema_distance_atr <= 0.70 else "MEDIUM"
+        return {
+            "direction": "SHORT", "ok": True, "reasons": reasons_short[:10], "block_reasons": [],
+            "confirmations": confirmations_short, "freshness": freshness,
+            "power2_buy": p["buy2"], "power2_sell": p["sell2"],
+            "power3_buy": p["buy3"], "power3_sell": p["sell3"],
+            "power_accel": p["sell_accel"], "late_entry": False,
+            "ema_distance_atr": round(ema_distance_atr, 2), "vwap_distance_atr": round(vwap_distance_atr, 2),
+            "entry_mode": "PREDICTIVE_TRIGGER"
+        }
 
+    no_trade_reasons = block_reasons[:]
+    if confirmations_long < 4 and confirmations_short < 4:
+        no_trade_reasons.append("تریگر پیش‌بینی ورود هنوز کامل نیست")
+    if confirmations_long >= 4 and late_long:
+        no_trade_reasons.append("لانگ از نظر قدرت خوب بود ولی دیر شده بود")
+    if confirmations_short >= 4 and late_short:
+        no_trade_reasons.append("شورت از نظر قدرت خوب بود ولی دیر شده بود")
+    if strong_context_long_block and confirmations_long >= confirmations_short:
+        no_trade_reasons.append("1H/4H به‌طور قوی خلاف لانگ است")
+    if strong_context_short_block and confirmations_short >= confirmations_long:
+        no_trade_reasons.append("1H/4H به‌طور قوی خلاف شورت است")
 
+    best_reasons = reasons_long if confirmations_long >= confirmations_short else reasons_short
+    return {
+        "direction": "NO TRADE", "ok": False, "reasons": (no_trade_reasons + best_reasons)[:10],
+        "block_reasons": no_trade_reasons[:8], "confirmations": max(confirmations_long, confirmations_short),
+        "freshness": "LOW", "power2_buy": p["buy2"], "power2_sell": p["sell2"],
+        "power3_buy": p["buy3"], "power3_sell": p["sell3"],
+        "power_accel": p["buy_accel"] if confirmations_long >= confirmations_short else p["sell_accel"],
+        "late_entry": late_long if confirmations_long >= confirmations_short else late_short,
+        "ema_distance_atr": round(ema_distance_atr, 2), "vwap_distance_atr": round(vwap_distance_atr, 2),
+        "entry_mode": "PREDICTIVE_TRIGGER"
+    }
 
-def _signal_id(signal):
-    """شناسه پایدار برای جلوگیری از دوباره‌شماری یک سیگنال در آمار."""
-    sid = signal.get("signal_id") or signal.get("id")
-    if sid:
-        return str(sid)
+def analyze_symbol(symbol):
+    df_1d = add_indicators(get_klines(symbol, "1d"))
+    df_4h = add_indicators(get_klines(symbol, "4h"))
+    df_1h = add_indicators(get_klines(symbol, "1h"))
+    df_30m = add_indicators(get_klines(symbol, "30m"))
+    df_15m = add_indicators(get_klines(symbol, "15m"))
+    df_5m = add_indicators(get_klines(symbol, "5m"))
 
-    symbol = signal.get("symbol", "UNKNOWN")
-    message_id = signal.get("message_id", "no_msg")
-    created_at = signal.get("created_at", "no_time")
-    return f"{symbol}_{message_id}_{created_at}"
+    long_score = 0
+    short_score = 0
+    reasons_long = []
+    reasons_short = []
 
+    l, s, rl, rs, trends = score_macro_trend(df_1d, df_4h, df_1h, df_30m)
+    long_score += l
+    short_score += s
+    reasons_long += rl
+    reasons_short += rs
 
-def _event_time_for_status(signal, status):
-    if status == "SETUP_CREATED":
-        return int(signal.get("created_at") or now_ts())
-    if status == "ACTIVATED":
-        return int(signal.get("activated_at") or now_ts())
-    return int(signal.get("closed_at") or now_ts())
+    l, s, rl, rs, buy_power, sell_power, pattern, multi_candle = score_entry(df_15m, df_5m)
+    long_score += l
+    short_score += s
+    reasons_long += rl
+    reasons_short += rs
 
+    l, s, rl, rs, liquidity_grab, stop_hunt, fvg, order_block = score_smart_money(df_15m, df_5m)
+    long_score += l
+    short_score += s
+    reasons_long += rl
+    reasons_short += rs
 
-def _copy_stat_snapshot(signal, status):
-    event_ts = _event_time_for_status(signal, status)
-    item = dict(signal)
-    item["signal_id"] = _signal_id(signal)
-    item["event_type"] = status
-    item["status"] = status
-    item["event_at"] = event_ts
+    l, s, rl, rs, rsi_divergence, macd_divergence = score_divergence(df_5m)
+    long_score += l
+    short_score += s
+    reasons_long += rl
+    reasons_short += rs
 
-    if status == "SETUP_CREATED":
-        item["created_at"] = int(signal.get("created_at") or event_ts)
-        item["closed_at"] = None
-    elif status == "ACTIVATED":
-        item["created_at"] = int(signal.get("created_at") or event_ts)
-        item["activated_at"] = int(signal.get("activated_at") or event_ts)
-        item["closed_at"] = None
+    l, s, rl, rs, vwap_status, poc_price, volume_profile_status = score_vwap_volume_profile(df_15m, df_5m)
+    long_score += l
+    short_score += s
+    reasons_long += rl
+    reasons_short += rs
+
+    long_score, short_score = apply_direction_conflict_penalties(
+        long_score,
+        short_score,
+        pattern,
+        multi_candle,
+        order_block,
+        fvg,
+        vwap_status,
+        buy_power,
+        sell_power,
+        reasons_long,
+        reasons_short
+    )
+
+    btc_status, l, s, rl, rs = btc_filter(symbol)
+    long_score += l
+    short_score += s
+    reasons_long += rl
+    reasons_short += rs
+
+    # موارد حذف‌شده از نسخه ساده؛ نه امتیاز دارند، نه نمایش داده می‌شوند.
+    trendline = "none"
+    breakout = "none"
+    structure = "none"
+
+    l, s, rl, rs, market = score_market_sentiment(symbol)
+    long_score += l
+    short_score += s
+    reasons_long += rl
+    reasons_short += rs
+
+    market_regime, market_regime_text, market_regime_score, market_regime_reasons = detect_market_regime(
+        symbol,
+        df_4h,
+        df_1h,
+        df_30m,
+        df_15m,
+        market
+    )
+
+    long_score, short_score = apply_market_regime_to_scores(
+        long_score,
+        short_score,
+        market_regime,
+        reasons_long,
+        reasons_short
+    )
+
+    l, s, funding_rate, open_interest, risk_notes = score_futures_data(symbol)
+    long_score += l
+    short_score += s
+
+    long_score = cap_score(long_score)
+    short_score = cap_score(short_score)
+
+    last = df_5m.iloc[-1]
+    last_15 = df_15m.iloc[-1]
+    price = float(last["close"])
+
+    # برای معاملات 30 تا 60 دقیقه، ATR و ADX تایم 15M مناسب‌تر از 5M است.
+    atr = float(last_15["atr"])
+    adx_value = float(last_15["adx"])
+
+    support, resistance = support_resistance(df_15m)
+
+    setup_status, entry_zone_low, entry_zone_high, entry_trigger = calculate_setup_zone(
+        "NO TRADE",
+        price,
+        atr
+    )
+
+    spread_percent = get_spread_percent(symbol)
+
+    predictive_context = predictive_entry_decision(
+        df_4h, df_1h, df_30m, df_15m, df_5m, price, atr, spread_percent
+    )
+
+    setup_context = predictive_setup_decision(
+        df_4h, df_1h, df_30m, df_15m, df_5m,
+        price, atr, long_score, short_score, trends, market_regime
+    )
+
+    pre_direction = predictive_context.get("direction", "NO TRADE")
+    if pre_direction == "NO TRADE" and setup_context.get("setup_ok"):
+        pre_direction = setup_context.get("direction", "NO TRADE")
+
+    tq_l, tq_s, tq_rl, tq_rs, technical_context = technical_quality_context(
+        pre_direction, price, atr, support, resistance, df_15m, df_5m, df_30m, df_1h
+    )
+    # در نسخه پیش‌بینی‌محور، کیفیت تکنیکال فقط برای تشخیص دیر بودن/ریسک ذخیره می‌شود؛
+    # تصمیم نهایی با امتیاز کم و زیاد نمی‌شود.
+    reasons_long += tq_rl
+    reasons_short += tq_rs
+
+    # داده‌های حرفه‌ای پنهان برای ثبت در Tracker و تحلیل علت SL؛ در نمایش سیگنال نشان داده نمی‌شوند.
+    late_entry = technical_context.get("late_entry", False)
+    late_entry_reason = technical_context.get("late_entry_reason")
+    tp_space_ok = technical_context.get("tp_space_ok", True)
+    tp_space_reason = technical_context.get("tp_space_reason")
+    tp_space_atr = technical_context.get("tp_space_atr")
+    trap_risk = technical_context.get("trap_risk", False)
+    trap_reason = technical_context.get("trap_reason")
+    candle_forecast = technical_context.get("candle_forecast")
+    candle_forecast_reason = technical_context.get("candle_forecast_reason")
+
+    raw_direction = predictive_context.get("direction", "NO TRADE")
+    entry_confirmed_now = bool(predictive_context.get("ok")) and raw_direction in ["LONG", "SHORT"]
+    if raw_direction == "NO TRADE" and setup_context.get("setup_ok"):
+        raw_direction = setup_context.get("direction", "NO TRADE")
+
+    score = max(long_score, short_score)  # فقط برای سازگاری داخلی/آمار قدیمی؛ تصمیم‌گیر نیست.
+    if entry_confirmed_now and raw_direction in ["LONG", "SHORT"]:
+        reasons = predictive_context.get("reasons", []) + risk_notes
+    elif raw_direction in ["LONG", "SHORT"]:
+        reasons = setup_context.get("setup_reasons", []) + ["وضعیت: منتظر فعال‌سازی ورود با تایید 5M"] + risk_notes
     else:
-        item["closed_at"] = int(signal.get("closed_at") or event_ts)
+        reasons = predictive_context.get("reasons", ["تریگر پیش‌بینی ورود کامل نیست"])
 
-    return item
+    setup_status, entry_zone_low, entry_zone_high, entry_trigger = calculate_setup_zone(
+        raw_direction,
+        price,
+        atr
+    )
 
+    stop_loss_raw, tp1_raw, tp2_raw = calculate_trade_levels(
+        raw_direction,
+        price,
+        atr,
+        support,
+        resistance
+    )
 
-def record_stat_event(signal, status):
-    """
-    ثبت رویداد آماری بدون تغییر دادن رفتار سیگنال/ترکر.
-    برای هر signal_id هر event فقط یک بار ثبت می‌شود تا آمار تکراری نشود.
-    """
-    try:
-        stats = get_signal_stats()
-        signal_id = _signal_id(signal)
+    rr = risk_reward(raw_direction, price, stop_loss_raw, tp1_raw)
 
-        for item in stats:
-            if item.get("signal_id") == signal_id and item.get("event_type", item.get("status")) == status:
-                return
+    # معماری دو مرحله‌ای: Setup کامل صادر می‌شود، اما ورود فقط بعد از Activation فعال است.
+    entry_ok = entry_confirmed_now
+    setup_waiting = (not entry_ok) and raw_direction in ["LONG", "SHORT"] and setup_context.get("setup_ok")
+    block_reasons = predictive_context.get("block_reasons", [])
+    liquidity_risk = "پایین" if entry_ok else "متوسط"
+    fake_breakout = "none"
+    trend_exhaustion = "none"
 
-        stats.append(_copy_stat_snapshot(signal, status))
-        save_signal_stats(stats)
-    except Exception as e:
-        print("RECORD STAT EVENT ERROR:", str(e))
+    if raw_direction != "NO TRADE" and tp_space_ok is False:
+        # TP Space دیگر سیگنال را حذف نمی‌کند؛ فقط به عنوان هشدار ذخیره/نمایش داده می‌شود.
+        reasons.append(tp_space_reason or "فضای TP نسبت به حمایت/مقاومت ضعیف است")
 
+    risk_level = calculate_risk_level(
+        raw_direction=raw_direction,
+        score=score,
+        liquidity_risk=liquidity_risk,
+        funding_rate=funding_rate,
+        adx=adx_value,
+        spread_percent=spread_percent,
+        rr=rr
+    )
 
-def _finalize_stat_record(signal, final_status, exit_price=None):
-    item = _copy_stat_snapshot(signal, final_status)
-    item["status"] = final_status
-    item["event_type"] = final_status
-    if exit_price is not None:
-        item["exit_price"] = float(exit_price)
-    if final_status in ["TP1", "SL"] and exit_price is not None:
-        item["result_percent"] = calculate_result_percent(signal, exit_price)
-    return item
+    if raw_direction == "NO TRADE":
+        final_direction = "NO TRADE"
+        reasons = reasons + block_reasons
+        stop_loss = None
+        tp1 = None
+        tp2 = None
+        grade = "NO_ENTRY"
+    elif setup_waiting:
+        final_direction = raw_direction
+        stop_loss = stop_loss_raw
+        tp1 = tp1_raw
+        tp2 = tp2_raw
+        grade = "WAITING_ACTIVATION"
+    else:
+        final_direction = raw_direction
+        stop_loss = stop_loss_raw
+        tp1 = tp1_raw
+        tp2 = tp2_raw
+        grade = "ENTRY"
 
+    # احتمال موفقیت هم دیگر در تصمیم ورود دخالت ندارد؛ فقط مقدار نمایشی/سازگاری است.
+    win_prob = win_probability(score, risk_level, rr, adx_value, "A" if grade == "ENTRY" else "Reject")
+    win_prob = max(0, min(int(win_prob), 92))
 
-def _filter_stats_by_days(stats, days):
-    if days is None:
-        return stats
-    start_ts = now_ts() - (days * 24 * 60 * 60)
-    out = []
-    for s in stats:
-        ts = s.get("event_at") or s.get("closed_at") or s.get("activated_at") or s.get("created_at") or 0
-        try:
-            if int(ts or 0) >= start_ts:
-                out.append(s)
-        except Exception:
-            pass
-    return out
+    very_safe_ok, very_safe_reasons = very_safe_status(
+        final_direction,
+        score,
+        win_prob,
+        risk_level,
+        rr,
+        trends,
+        vwap_status,
+        buy_power,
+        sell_power,
+        adx_value,
+        pattern,
+        multi_candle,
+        order_block,
+        fvg,
+        market_regime
+    )
 
+    display_buy_power = predictive_context.get("power2_buy", buy_power)
+    display_sell_power = predictive_context.get("power2_sell", sell_power)
 
-def _latest_active_by_signal_id(active):
-    data = {}
-    for s in active:
-        data[_signal_id(s)] = s
-    return data
+    return {
+        "symbol": symbol,
+        "price": safe_round(price, 8),
+        "direction": final_direction,
+        "raw_direction": raw_direction,
+        "score": cap_score(score),
 
+        "entry_grade": grade,
+        "risk_level": risk_level,
+        "risk_reward": rr,
+        "win_probability": win_prob,
 
-def _unique_events(stats, event_type):
-    seen = set()
-    out = []
-    for s in stats:
-        et = s.get("event_type") or s.get("status")
-        if et != event_type:
-            continue
-        sid = s.get("signal_id") or s.get("id")
-        if not sid:
-            continue
-        key = (sid, event_type)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(s)
-    return out
+        "validity": signal_validity(score, final_direction),
+        "signal_timeframe": signal_timeframe(score, final_direction),
 
+        "rsi": safe_round(last["rsi"], 2),
+        "macd": safe_round(last["macd"], 6),
+        "macd_signal": safe_round(last["macd_signal"], 6),
+        "macd_hist": safe_round(last["macd_hist"], 6),
+        "ema20": safe_round(last["ema20"], 8),
+        "ema50": safe_round(last["ema50"], 8),
+        "ema200": safe_round(last["ema200"], 8),
+        "atr": safe_round(atr, 8),
+        "adx": safe_round(adx_value, 2),
+        "vwap": safe_round(last["vwap"], 8),
 
-def _legacy_without_signal_id(stats):
-    return [s for s in stats if not s.get("signal_id") and not s.get("id")]
+        "stop_loss": None if stop_loss is None else safe_round(stop_loss, 8),
+        "tp1": None if tp1 is None else safe_round(tp1, 8),
+        "tp2": None if tp2 is None else safe_round(tp2, 8),
 
+        "candidate_stop_loss": None if stop_loss_raw is None else safe_round(stop_loss_raw, 8),
+        "candidate_tp1": None if tp1_raw is None else safe_round(tp1_raw, 8),
+        "candidate_tp2": None if tp2_raw is None else safe_round(tp2_raw, 8),
 
-def _closed_records(stats, status):
-    seen = set()
-    out = []
-    for s in stats:
-        if s.get("status") != status:
-            continue
-        sid = s.get("signal_id") or s.get("id")
-        if sid:
-            key = (sid, status)
-            if key in seen:
-                continue
-            seen.add(key)
-        out.append(s)
-    return out
+        "support": safe_round(support, 8),
+        "resistance": safe_round(resistance, 8),
 
+        "buy_power": display_buy_power,
+        "sell_power": display_sell_power,
+        "power2_buy": predictive_context.get("power2_buy"),
+        "power2_sell": predictive_context.get("power2_sell"),
+        "power3_buy": predictive_context.get("power3_buy"),
+        "power3_sell": predictive_context.get("power3_sell"),
+        "power_acceleration": predictive_context.get("power_accel"),
+        "predictive_confirmations": predictive_context.get("confirmations"),
+        "freshness": predictive_context.get("freshness"),
+        "entry_mode": "PREDICTIVE_SETUP" if setup_waiting else predictive_context.get("entry_mode"),
+        "entry_status": "WAITING_ACTIVATION" if setup_waiting else ("ACTIVE" if entry_ok else "NO_ENTRY"),
+        "entry_confirmed": bool(entry_ok),
+        "setup_waiting_activation": bool(setup_waiting),
+        "setup_score": setup_context.get("setup_score"),
+        "setup_reasons": setup_context.get("setup_reasons", []),
+        "compression_active": setup_context.get("compression", {}).get("compression_active"),
+        "compression_score": setup_context.get("compression", {}).get("compression_score"),
+        "compression_label": setup_context.get("compression", {}).get("compression_label"),
+        "compression_reasons": setup_context.get("compression", {}).get("compression_reasons", []),
+        "ema_distance_atr": predictive_context.get("ema_distance_atr"),
+        "vwap_distance_atr": predictive_context.get("vwap_distance_atr"),
 
-def _pct(part, total):
-    return round((part / total) * 100, 1) if total else 0
+        "trendline": trendline,
+        "breakout": breakout,
+        "market_structure": structure,
+        "trends": trends,
+        "btc_filter": btc_status,
 
+        "candle_pattern": pattern,
+        "multi_candle": multi_candle,
+        "liquidity_grab": liquidity_grab,
+        "stop_hunt": stop_hunt,
+        "fvg": fvg,
+        "order_block": order_block,
+        "rsi_divergence": rsi_divergence,
+        "macd_divergence": macd_divergence,
+        "fake_breakout": fake_breakout,
+        "trend_exhaustion": trend_exhaustion,
 
-def _avg(values):
-    clean = []
-    for v in values:
-        try:
-            clean.append(float(v))
-        except Exception:
-            pass
-    return round(sum(clean) / len(clean), 2) if clean else 0
+        "vwap_status": vwap_status,
+        "poc_price": safe_round(poc_price, 8),
+        "volume_profile_status": volume_profile_status,
 
+        "funding_rate": funding_rate,
+        "open_interest": open_interest,
+        "spread_percent": spread_percent,
+        "liquidity_risk": liquidity_risk,
 
-def _minutes_between(start, end):
-    try:
-        start = int(start or 0)
-        end = int(end or 0)
-        if start <= 0 or end <= 0 or end < start:
-            return None
-        return round((end - start) / 60, 1)
-    except Exception:
-        return None
+        "fear_value": market.get("fear_value"),
+        "fear_text": market.get("fear_text"),
+        "btc_dominance": market.get("btc_dominance"),
+        "dominance_status": market.get("dominance_status"),
+        "altseason_status": market.get("altseason_status"),
 
+        "market_regime": market_regime,
+        "market_regime_text": market_regime_text,
+        "market_regime_score": market_regime_score,
+        "market_regime_reasons": market_regime_reasons,
 
-def _adx_bucket(value):
-    try:
-        v = float(value)
-    except Exception:
-        return "ADX نامشخص"
-    if v < 15:
-        return "ADX زیر 15"
-    if v < 22:
-        return "ADX 15 تا 22"
-    if v < 30:
-        return "ADX 22 تا 30"
-    return "ADX بالای 30"
+        "long_score": long_score,
+        "short_score": short_score,
 
+        "setup_status": setup_status,
+        "entry_zone_low": None if entry_zone_low is None else safe_round(entry_zone_low, 8),
+        "entry_zone_high": None if entry_zone_high is None else safe_round(entry_zone_high, 8),
+        "entry_trigger": entry_trigger,
 
-def _group_performance(records, key_func):
-    groups = {}
-    for r in records:
-        key = key_func(r) or "نامشخص"
-        if key not in groups:
-            groups[key] = {"total": 0, "tp1": 0, "sl": 0}
-        groups[key]["total"] += 1
-        if r.get("status") == "TP1":
-            groups[key]["tp1"] += 1
-        if r.get("status") == "SL":
-            groups[key]["sl"] += 1
+        "very_safe": very_safe_ok,
+        "very_safe_reasons": very_safe_reasons[:8],
 
-    if not groups:
-        return "ندارد"
+        # Hidden professional diagnostics: bot.py does not display these in signal text,
+        # but signal_tracker stores them for SL reasons and statistics.
+        "late_entry": late_entry,
+        "late_entry_reason": late_entry_reason,
+        "tp_space_ok": tp_space_ok,
+        "tp_space_reason": tp_space_reason,
+        "tp_space_atr": tp_space_atr,
+        "trap_risk": trap_risk,
+        "trap_reason": trap_reason,
+        "candle_forecast": candle_forecast,
+        "candle_forecast_reason": candle_forecast_reason,
 
-    lines = []
-    for key, g in sorted(groups.items(), key=lambda x: x[1]["total"], reverse=True):
-        wr = _pct(g["tp1"], g["tp1"] + g["sl"])
-        lines.append(f"{key}: {g['tp1']}/{g['total']} TP1 | {wr}٪")
-    return "\n".join(lines[:12])
+        "news_filter_active": news_filter_active(),
 
-
-def get_stats_report(days=None):
-    raw_stats = get_signal_stats()
-    stats = _filter_stats_by_days(raw_stats, days)
-    active_now = get_active_signals()
-
-    setup_events = _unique_events(stats, "SETUP_CREATED")
-    activated_events = _unique_events(stats, "ACTIVATED")
-    cancelled_events = _closed_records(stats, "CANCELLED")
-    tp1_records = _closed_records(stats, "TP1")
-    tp2_records = _closed_records(stats, "TP2")
-    sl_records = _closed_records(stats, "SL")
-
-    active_pending = [s for s in active_now if s.get("status") == "PENDING_ACTIVATION"]
-    active_trades = [s for s in active_now if s.get("status") == "ACTIVE"]
-
-    setups = len(setup_events)
-    activated = len(activated_events)
-    pending = len(active_pending)
-    cancelled = len(cancelled_events)
-    tp1 = len(tp1_records)
-    tp2 = len(tp2_records)
-    sl = len(sl_records)
-    open_active = len(active_trades)
-
-    activation_rate = _pct(activated, setups)
-    activated_wr = _pct(tp1, tp1 + sl)
-    tp2_rate = _pct(tp2, tp1)
-
-    win_percents = [s.get("result_percent") for s in tp1_records]
-    loss_percents = [abs(float(s.get("result_percent", 0))) for s in sl_records if s.get("result_percent") is not None]
-
-    activation_times = []
-    setup_by_id = {s.get("signal_id") or s.get("id"): s for s in setup_events}
-    activated_by_id = {s.get("signal_id") or s.get("id"): s for s in activated_events}
-    for sid, a in activated_by_id.items():
-        setup = setup_by_id.get(sid, a)
-        m = _minutes_between(setup.get("created_at"), a.get("activated_at") or a.get("event_at"))
-        if m is not None:
-            activation_times.append(m)
-
-    tp1_times = []
-    sl_times = []
-    for s in tp1_records:
-        m = _minutes_between(s.get("activated_at") or s.get("created_at"), s.get("closed_at") or s.get("event_at"))
-        if m is not None:
-            tp1_times.append(m)
-    for s in sl_records:
-        m = _minutes_between(s.get("activated_at") or s.get("created_at"), s.get("closed_at") or s.get("event_at"))
-        if m is not None:
-            sl_times.append(m)
-
-    closed_for_wr = tp1_records + sl_records
-    long_records = [s for s in closed_for_wr if s.get("direction") == "LONG"]
-    short_records = [s for s in closed_for_wr if s.get("direction") == "SHORT"]
-
-    def dir_line(name, records):
-        w = len([s for s in records if s.get("status") == "TP1"])
-        l = len([s for s in records if s.get("status") == "SL"])
-        return f"{name}:{len(records)} معامله | TP1: {w} | SL: {l} | Win Rate: {_pct(w, w + l)}٪"
-
-    title = "آمار کل" if days is None else f"آمار {days} روز اخیر"
-    legacy_count = len(_legacy_without_signal_id(raw_stats))
-
-    report = f"""📊 {title}
-
-ستاپ ساخته‌شده:{setups}
-✅ ورود فعال‌شده:{activated}
-👀 هنوز منتظر فعال‌سازی:{pending}
-🚫 لغوشده:{cancelled}
-Activation Rate:{activation_rate}٪
-معاملات فعال باز:{open_active}
---------------------
-TP1:{tp1}
-TP2:{tp2}
-SL:{sl}
-Activated Win Rate:{activated_wr}٪
-TP2 Rate از TP1:{tp2_rate}٪
-میانگین برد:{_avg(win_percents)}٪
-میانگین باخت:{_avg(loss_percents)}٪
---------------------
-میانگین زمان تا فعال‌سازی:{_avg(activation_times)} دقیقه
-میانگین زمان تا TP1 بعد از فعال‌سازی:{_avg(tp1_times)} دقیقه
-میانگین زمان تا SL بعد از فعال‌سازی:{_avg(sl_times)} دقیقه
---------------------
-{dir_line('لانگ', long_records)}
-{dir_line('شورت', short_records)}
-عملکرد ارزها:
-{_group_performance(closed_for_wr, lambda s: s.get('symbol'))}
-عملکرد بر اساس حالت ورود:
-{_group_performance(closed_for_wr, lambda s: s.get('entry_mode'))}
-عملکرد بر اساس تازگی حرکت:
-{_group_performance(closed_for_wr, lambda s: s.get('freshness'))}
-عملکرد بر اساس ریسک:
-{_group_performance(closed_for_wr, lambda s: s.get('risk_level'))}
-عملکرد بر اساس ADX:
-{_group_performance(closed_for_wr, lambda s: _adx_bucket(s.get('adx')))}
-عملکرد بر اساس روند کلی بازار:
-{_group_performance(closed_for_wr, lambda s: s.get('market_regime') or s.get('market_regime_label'))}"""
-
-    return report
-
+        "reasons": reasons[:18],
+    }
