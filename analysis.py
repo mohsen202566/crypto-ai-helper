@@ -13,6 +13,19 @@ TECHNICAL_QUALITY_MIN_TP_SPACE_ATR = 0.95
 TECHNICAL_QUALITY_LOW_ATR_PCT = 0.08
 TECHNICAL_QUALITY_EXTREME_ATR_PCT = 3.5
 
+# تنظیمات معماری جدید: Setup تکنیکال، سپس فعال‌سازی سریع با Power دو کندلی.
+# اعداد عمداً متعادل‌اند تا ربات خشک نشود، اما ورودهای ضعیف مثل شورت با Sell2 پایین را رد کند.
+SETUP_MIN_SCORE = 7
+SETUP_MIN_EDGE = 2
+ENTRY_MIN_CONFIRMATIONS = 4
+ENTRY_POWER2_MIN = 60.0
+ENTRY_POWER2_STRONG = 64.0
+ENTRY_OPPOSITE_POWER2_MAX = 42.0
+ENTRY_POWER_ACCEL_MIN = 2.0
+ENTRY_MAX_EMA_DISTANCE_ATR = 0.90
+ENTRY_MAX_VWAP_DISTANCE_ATR = 1.05
+
+
 exchange = ccxt.okx({
     "enableRateLimit": True,
     "options": {"defaultType": "swap"}
@@ -37,7 +50,7 @@ def safe_round(value, digits=8):
         return None
 
 
-def get_klines(symbol, interval="15m", limit=320):
+def get_klines(symbol, interval="15m", limit=320, include_current=False):
     ohlcv = exchange.fetch_ohlcv(to_okx_symbol(symbol), timeframe=interval, limit=limit)
 
     if not ohlcv or len(ohlcv) < 220:
@@ -52,7 +65,8 @@ def get_klines(symbol, interval="15m", limit=320):
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     df = df.dropna()
-    df = df.iloc[:-1]
+    if not include_current:
+        df = df.iloc[:-1]
 
     return df
 
@@ -552,38 +566,6 @@ def technical_quality_context(raw_direction, price, atr, support, resistance, df
     context["technical_quality_long_adj"] = long_adj
     context["technical_quality_short_adj"] = short_adj
     return long_adj, short_adj, reasons_long, reasons_short, context
-
-def btc_filter(symbol):
-    if symbol == "BTCUSDT":
-        return "neutral", 0, 0, [], []
-
-    try:
-        btc_15m = add_indicators(get_klines("BTCUSDT", "15m"))
-        btc_5m = add_indicators(get_klines("BTCUSDT", "5m"))
-
-        btc_15_trend = trend_direction(btc_15m)
-        btc_5_trend = trend_direction(btc_5m)
-
-        long_score = 0
-        short_score = 0
-        reasons_long = []
-        reasons_short = []
-
-        if btc_15_trend in ["bullish", "weak_bullish"] and btc_5_trend in ["bullish", "weak_bullish"]:
-            long_score += 8
-            reasons_long.append("BTC در تایم ورود صعودی است")
-
-        elif btc_15_trend in ["bearish", "weak_bearish"] and btc_5_trend in ["bearish", "weak_bearish"]:
-            short_score += 8
-            reasons_short.append("BTC در تایم ورود نزولی است")
-        else:
-            reasons_long.append("BTC جهت واضحی ندارد")
-            reasons_short.append("BTC جهت واضحی ندارد")
-
-        return "ok", long_score, short_score, reasons_long, reasons_short
-
-    except Exception:
-        return "unknown", 0, 0, [], []
 
 
 def signal_validity(score, direction):
@@ -1387,19 +1369,34 @@ def apply_conflict_penalties(
 
 
 def _power_snapshot(df_5m):
-    """قدرت خرید/فروش سریع برای موتور پیش‌بینی؛ تصمیم اصلی با 2 و 3 کندل است."""
+    """قدرت خرید/فروش سریع.
+    Power سه و شش کندلی برای تشخیص Setup استفاده می‌شود؛
+    Power دو کندلی و شتاب آن تریگر اصلی فعال‌سازی ورود است.
+    """
     buy2, sell2 = buy_sell_power(df_5m, candles=2)
     buy3, sell3 = buy_sell_power(df_5m, candles=3)
     buy6, sell6 = buy_sell_power(df_5m, candles=6)
-    prev3 = df_5m.iloc[:-1]
-    prev_buy3, prev_sell3 = buy_sell_power(prev3, candles=3)
+
+    prev = df_5m.iloc[:-1]
+    prev_buy2, prev_sell2 = buy_sell_power(prev, candles=2)
+    prev_buy3, prev_sell3 = buy_sell_power(prev, candles=3)
+
+    buy2 = float(buy2); sell2 = float(sell2)
+    buy3 = float(buy3); sell3 = float(sell3)
+    buy6 = float(buy6); sell6 = float(sell6)
+    prev_buy2 = float(prev_buy2); prev_sell2 = float(prev_sell2)
+    prev_buy3 = float(prev_buy3); prev_sell3 = float(prev_sell3)
+
     return {
-        "buy2": float(buy2), "sell2": float(sell2),
-        "buy3": float(buy3), "sell3": float(sell3),
-        "buy6": float(buy6), "sell6": float(sell6),
-        "prev_buy3": float(prev_buy3), "prev_sell3": float(prev_sell3),
-        "buy_accel": round(float(buy3) - float(prev_buy3), 1),
-        "sell_accel": round(float(sell3) - float(prev_sell3), 1),
+        "buy2": buy2, "sell2": sell2,
+        "buy3": buy3, "sell3": sell3,
+        "buy6": buy6, "sell6": sell6,
+        "prev_buy2": prev_buy2, "prev_sell2": prev_sell2,
+        "prev_buy3": prev_buy3, "prev_sell3": prev_sell3,
+        "buy_accel": round(buy2 - prev_buy2, 1),
+        "sell_accel": round(sell2 - prev_sell2, 1),
+        "buy3_accel": round(buy3 - prev_buy3, 1),
+        "sell3_accel": round(sell3 - prev_sell3, 1),
     }
 
 
@@ -1436,58 +1433,102 @@ def detect_compression_context(df_30m, df_15m, df_5m):
 
 
 def predictive_setup_decision(df_4h, df_1h, df_30m, df_15m, df_5m, price, atr, long_score, short_score, trends, market_regime="neutral"):
-    """مرحله اول: سیگنال کامل آماده می‌شود اما ورود منتظر فعال‌سازی 5M می‌ماند."""
+    """مرحله اول: انتخاب ارزهای آماده برای Watchlist.
+    اینجا نقطه ورود لحظه‌ای صادر نمی‌شود؛ فقط ارزهایی پذیرفته می‌شوند که از نظر تکنیکال
+    احتمال پامپ/دامپ دارند و ارزش مانیتور ثانیه‌ای را دارند.
+    """
     reasons_long, reasons_short = [], []
     last15 = df_15m.iloc[-1]
     last5 = df_5m.iloc[-1]
     prev5 = df_5m.iloc[-2]
     p = _power_snapshot(df_5m)
     compression = detect_compression_context(df_30m, df_15m, df_5m)
+
     trend30 = trend_direction(df_30m)
     trend15 = trend_direction(df_15m)
     trend1h = trend_direction(df_1h)
     trend4h = trend_direction(df_4h)
+
     long_setup_score = 0
     short_setup_score = 0
+
+    # 30M و 15M جهت آماده شدن حرکت را می‌دهند؛ 1H/4H فقط کانتکست هستند.
     if trend30 in ["bullish", "weak_bullish"]:
         long_setup_score += 2; reasons_long.append("30M به نفع لانگ است")
     if trend30 in ["bearish", "weak_bearish"]:
         short_setup_score += 2; reasons_short.append("30M به نفع شورت است")
+
     if trend15 in ["bullish", "weak_bullish"] or float(last15["close"]) >= float(last15["ema20"]):
-        long_setup_score += 2; reasons_long.append("15M آماده لانگ است")
+        long_setup_score += 2; reasons_long.append("15M برای لانگ آماده است")
     if trend15 in ["bearish", "weak_bearish"] or float(last15["close"]) <= float(last15["ema20"]):
-        short_setup_score += 2; reasons_short.append("15M آماده شورت است")
-    if p["buy2"] >= 58 or p["buy3"] >= 55:
-        long_setup_score += 1; reasons_long.append("قدرت خرید کوتاه‌مدت دیده می‌شود")
-    if p["sell2"] >= 58 or p["sell3"] >= 55:
-        short_setup_score += 1; reasons_short.append("قدرت فروش کوتاه‌مدت دیده می‌شود")
-    if float(last5["macd_hist"]) >= float(prev5["macd_hist"]):
-        long_setup_score += 1; reasons_long.append("Fresh Momentum برای لانگ بهتر شده")
-    if float(last5["macd_hist"]) <= float(prev5["macd_hist"]):
-        short_setup_score += 1; reasons_short.append("Fresh Momentum برای شورت بهتر شده")
+        short_setup_score += 2; reasons_short.append("15M برای شورت آماده است")
+
+    # Setup با 3 و 6 کندل ساخته می‌شود؛ Power 2 فقط نقش کمکی دارد تا خیلی دیر نشویم.
+    if p["buy3"] >= 56 or p["buy6"] >= 54:
+        long_setup_score += 2; reasons_long.append("قدرت خرید 3/6 کندلی در حال شکل‌گیری است")
+    if p["sell3"] >= 56 or p["sell6"] >= 54:
+        short_setup_score += 2; reasons_short.append("قدرت فروش 3/6 کندلی در حال شکل‌گیری است")
+
+    if p["buy3_accel"] >= 2 or p["buy2"] >= 58:
+        long_setup_score += 1; reasons_long.append("شتاب اولیه خرید دیده می‌شود")
+    if p["sell3_accel"] >= 2 or p["sell2"] >= 58:
+        short_setup_score += 1; reasons_short.append("شتاب اولیه فروش دیده می‌شود")
+
+    if float(last5["macd_hist"]) > float(prev5["macd_hist"]):
+        long_setup_score += 1; reasons_long.append("هیستوگرام MACD برای لانگ بهتر شده")
+    if float(last5["macd_hist"]) < float(prev5["macd_hist"]):
+        short_setup_score += 1; reasons_short.append("هیستوگرام MACD برای شورت ضعیف‌تر شده")
+
+    if float(last5["rsi"]) > float(prev5["rsi"]) and float(last5["rsi"]) < 72:
+        long_setup_score += 1; reasons_long.append("RSI برای لانگ در حال تقویت است")
+    if float(last5["rsi"]) < float(prev5["rsi"]) and float(last5["rsi"]) > 28:
+        short_setup_score += 1; reasons_short.append("RSI برای شورت در حال تضعیف است")
+
+    if float(last5["close"]) >= float(last5["ema20"]):
+        long_setup_score += 1; reasons_long.append("قیمت بالای EMA20 پنج دقیقه است")
+    if float(last5["close"]) <= float(last5["ema20"]):
+        short_setup_score += 1; reasons_short.append("قیمت زیر EMA20 پنج دقیقه است")
+
     if market_regime == "bullish":
-        long_setup_score += 1; reasons_long.append("رژیم کلی بازار کمی صعودی است")
+        long_setup_score += 1; reasons_long.append("رژیم کلی بازار کمی به نفع لانگ است")
     elif market_regime == "bearish":
-        short_setup_score += 1; reasons_short.append("رژیم کلی بازار کمی نزولی است")
+        short_setup_score += 1; reasons_short.append("رژیم کلی بازار کمی به نفع شورت است")
+
     if compression.get("compression_active"):
         if long_setup_score >= short_setup_score:
-            long_setup_score += 1; reasons_long.append("فشردگی/رنج فعال است و احتمال شکست صعودی بررسی می‌شود")
+            long_setup_score += 1; reasons_long.append("فشردگی فعال است و احتمال شکست صعودی بررسی می‌شود")
         else:
-            short_setup_score += 1; reasons_short.append("فشردگی/رنج فعال است و احتمال شکست نزولی بررسی می‌شود")
+            short_setup_score += 1; reasons_short.append("فشردگی فعال است و احتمال شکست نزولی بررسی می‌شود")
+
+    # جلوگیری از ورود Watchlist به ارزهایی که خلاف کانتکست قوی هستند.
     long_block = trend1h == "bearish" and trend4h in ["bearish", "weak_bearish"]
     short_block = trend1h == "bullish" and trend4h in ["bullish", "weak_bullish"]
-    direction = "NO TRADE"; reasons = []
+
+    direction = "NO TRADE"
+    reasons = []
     setup_score = max(long_setup_score, short_setup_score)
-    if long_setup_score >= 4 and long_setup_score >= short_setup_score + 1 and not long_block:
+
+    if long_setup_score >= SETUP_MIN_SCORE and long_setup_score >= short_setup_score + SETUP_MIN_EDGE and not long_block:
         direction = "LONG"; reasons = reasons_long
-    elif short_setup_score >= 4 and short_setup_score >= long_setup_score + 1 and not short_block:
+    elif short_setup_score >= SETUP_MIN_SCORE and short_setup_score >= long_setup_score + SETUP_MIN_EDGE and not short_block:
         direction = "SHORT"; reasons = reasons_short
-    return {"direction": direction, "setup_ok": direction in ["LONG", "SHORT"], "setup_score": setup_score, "setup_reasons": reasons[:10], "compression": compression, "entry_status": "WAITING_ACTIVATION" if direction in ["LONG", "SHORT"] else "NO_SETUP"}
+
+    return {
+        "direction": direction,
+        "setup_ok": direction in ["LONG", "SHORT"],
+        "setup_score": setup_score,
+        "setup_long_score": long_setup_score,
+        "setup_short_score": short_setup_score,
+        "setup_reasons": reasons[:10],
+        "compression": compression,
+        "entry_status": "WAITING_ACTIVATION" if direction in ["LONG", "SHORT"] else "NO_SETUP"
+    }
+
 
 def predictive_entry_decision(df_4h, df_1h, df_30m, df_15m, df_5m, price, atr, spread_percent=None):
-    """
-    موتور اصلی نسخه پیش‌بینی‌محور.
-    تصمیم نهایی دیگر با امتیاز 0 تا 100 نیست؛ فقط تریگر ورود تازه / عدم ورود.
+    """مرحله دوم: فعال‌سازی ورود.
+    تریگر اصلی Power دو کندلی است؛ اما برای جلوگیری از SLهای ضعیف، MACD، RSI، EMA/VWAP،
+    فاصله قیمت و کانتکست بالاتر هم باید همسو باشند.
     """
     reasons_long = []
     reasons_short = []
@@ -1533,44 +1574,65 @@ def predictive_entry_decision(df_4h, df_1h, df_30m, df_15m, df_5m, price, atr, s
 
     trend_1h = trend_direction(df_1h)
     trend_4h = trend_direction(df_4h)
-    strong_context_long_block = trend_1h in ["bearish"] and trend_4h in ["bearish", "weak_bearish"]
-    strong_context_short_block = trend_1h in ["bullish"] and trend_4h in ["bullish", "weak_bullish"]
+    strong_context_long_block = trend_1h == "bearish" and trend_4h in ["bearish", "weak_bearish"]
+    strong_context_short_block = trend_1h == "bullish" and trend_4h in ["bullish", "weak_bullish"]
 
-    if p["buy2"] >= 58 and p["buy3"] >= 55:
-        confirmations_long += 1; reasons_long.append("قدرت خرید 2 تا 3 کندلی فعال است")
-    if p["buy_accel"] >= 5 or p["buy2"] >= 66:
-        confirmations_long += 1; reasons_long.append("شتاب قدرت خرید تازه دیده شد")
+    # Power دو کندلی: شرط اصلی فعال‌سازی. اگر کندل دوم واقعاً در حال اوج گرفتن نباشد، ورود صادر نمی‌شود.
+    long_power2_ok = (
+        p["buy2"] >= ENTRY_POWER2_MIN
+        and p["sell2"] <= ENTRY_OPPOSITE_POWER2_MAX
+        and (p["buy_accel"] >= ENTRY_POWER_ACCEL_MIN or p["buy2"] >= ENTRY_POWER2_STRONG or p["buy2"] >= p["buy3"] - 2)
+    )
+    short_power2_ok = (
+        p["sell2"] >= ENTRY_POWER2_MIN
+        and p["buy2"] <= ENTRY_OPPOSITE_POWER2_MAX
+        and (p["sell_accel"] >= ENTRY_POWER_ACCEL_MIN or p["sell2"] >= ENTRY_POWER2_STRONG or p["sell2"] >= p["sell3"] - 2)
+    )
+
+    if long_power2_ok:
+        confirmations_long += 2; reasons_long.append("Power دو کندلی خرید به نقطه فعال‌سازی رسیده")
+    else:
+        reasons_long.append("Power دو کندلی خرید هنوز برای ورود کافی نیست")
+
+    if short_power2_ok:
+        confirmations_short += 2; reasons_short.append("Power دو کندلی فروش به نقطه فعال‌سازی رسیده")
+    else:
+        reasons_short.append("Power دو کندلی فروش هنوز برای ورود کافی نیست")
+
+    if p["buy3"] >= 55:
+        confirmations_long += 1; reasons_long.append("Power سه کندلی خرید Setup را تایید می‌کند")
+    if p["sell3"] >= 55:
+        confirmations_short += 1; reasons_short.append("Power سه کندلی فروش Setup را تایید می‌کند")
+
     if macd_rising or macd_turn_up:
-        confirmations_long += 1; reasons_long.append("شیب MACD Histogram به نفع لانگ است")
+        confirmations_long += 1; reasons_long.append("هیستوگرام MACD به نفع لانگ تقویت شده")
+    if macd_falling or macd_turn_down:
+        confirmations_short += 1; reasons_short.append("هیستوگرام MACD به نفع شورت ضعیف‌تر شده")
+
     if rsi_rising and float(last["rsi"]) < 72:
-        confirmations_long += 1; reasons_long.append("RSI slope صعودی است و هنوز بیش‌ازحد دیر نشده")
+        confirmations_long += 1; reasons_long.append("RSI در کندل دوم به نفع لانگ رشد کرده")
+    if rsi_falling and float(last["rsi"]) > 28:
+        confirmations_short += 1; reasons_short.append("RSI در کندل دوم به نفع شورت افت کرده")
+
     if close_above_ema and (close_above_vwap or vwap_reclaim_long):
-        confirmations_long += 1; reasons_long.append("قیمت EMA20/VWAP را برای لانگ تایید کرده")
+        confirmations_long += 1; reasons_long.append("EMA20/VWAP برای لانگ همسو است")
+    if close_below_ema and (close_below_vwap or vwap_reclaim_short):
+        confirmations_short += 1; reasons_short.append("EMA20/VWAP برای شورت همسو است")
+
     if float(last15["close"]) >= float(last15["ema20"]):
         confirmations_long += 1; reasons_long.append("15M تایید نرم لانگ می‌دهد")
-
-    if p["sell2"] >= 58 and p["sell3"] >= 55:
-        confirmations_short += 1; reasons_short.append("قدرت فروش 2 تا 3 کندلی فعال است")
-    if p["sell_accel"] >= 5 or p["sell2"] >= 66:
-        confirmations_short += 1; reasons_short.append("شتاب قدرت فروش تازه دیده شد")
-    if macd_falling or macd_turn_down:
-        confirmations_short += 1; reasons_short.append("شیب MACD Histogram به نفع شورت است")
-    if rsi_falling and float(last["rsi"]) > 28:
-        confirmations_short += 1; reasons_short.append("RSI slope نزولی است و هنوز بیش‌ازحد دیر نشده")
-    if close_below_ema and (close_below_vwap or vwap_reclaim_short):
-        confirmations_short += 1; reasons_short.append("قیمت EMA20/VWAP را برای شورت تایید کرده")
     if float(last15["close"]) <= float(last15["ema20"]):
         confirmations_short += 1; reasons_short.append("15M تایید نرم شورت می‌دهد")
 
     late_long = (
-        ema_distance_atr > 0.95
-        or vwap_distance_atr > 1.10
+        ema_distance_atr > ENTRY_MAX_EMA_DISTANCE_ATR
+        or vwap_distance_atr > ENTRY_MAX_VWAP_DISTANCE_ATR
         or (near_recent_high and move_from_low_atr > 1.20)
         or float(last["rsi"]) >= 73
     )
     late_short = (
-        ema_distance_atr > 0.95
-        or vwap_distance_atr > 1.10
+        ema_distance_atr > ENTRY_MAX_EMA_DISTANCE_ATR
+        or vwap_distance_atr > ENTRY_MAX_VWAP_DISTANCE_ATR
         or (near_recent_low and move_from_high_atr > 1.20)
         or float(last["rsi"]) <= 27
     )
@@ -1581,10 +1643,27 @@ def predictive_entry_decision(df_4h, df_1h, df_30m, df_15m, df_5m, price, atr, s
         reasons_short.append("رد شورت: حرکت دیر شده یا قیمت از EMA/VWAP زیاد فاصله گرفته")
 
     if spread_percent is not None and spread_percent > 0.12:
-        block_reasons.append("اسپرد برای ورود سریع زیاد است")
+        # Classic mode: اسپرد فقط هشدار است و سیگنال تکنیکال را حذف نمی‌کند.
+        reasons_long.append("هشدار: اسپرد برای ورود سریع کمی زیاد است")
+        reasons_short.append("هشدار: اسپرد برای ورود سریع کمی زیاد است")
 
-    long_ok = confirmations_long >= 4 and not late_long and not strong_context_long_block
-    short_ok = confirmations_short >= 4 and not late_short and not strong_context_short_block
+    # Classic technical activation:
+    # تصمیم ورود فقط با موتور 5M گرفته می‌شود: Power دو کندلی + MACD slope + RSI slope + EMA20.
+    # VWAP، Late Entry و کانتکست 1H/4H فقط در دلایل/ریسک ذخیره می‌شوند و ورود را خشک نمی‌کنند.
+    long_ok = (
+        confirmations_long >= ENTRY_MIN_CONFIRMATIONS
+        and long_power2_ok
+        and macd_rising
+        and rsi_rising
+        and close_above_ema
+    )
+    short_ok = (
+        confirmations_short >= ENTRY_MIN_CONFIRMATIONS
+        and short_power2_ok
+        and macd_falling
+        and rsi_falling
+        and close_below_ema
+    )
 
     if long_ok and short_ok:
         if confirmations_long > confirmations_short:
@@ -1599,36 +1678,34 @@ def predictive_entry_decision(df_4h, df_1h, df_30m, df_15m, df_5m, price, atr, s
         long_ok = False
         short_ok = False
 
+    base = {
+        "power2_buy": p["buy2"], "power2_sell": p["sell2"],
+        "power3_buy": p["buy3"], "power3_sell": p["sell3"],
+        "power_accel": p["buy_accel"] if confirmations_long >= confirmations_short else p["sell_accel"],
+        "buy_accel": p["buy_accel"], "sell_accel": p["sell_accel"],
+        "ema_distance_atr": round(ema_distance_atr, 2),
+        "vwap_distance_atr": round(vwap_distance_atr, 2),
+        "entry_mode": "PREDICTIVE_TRIGGER"
+    }
+
     if long_ok:
-        freshness = "HIGH" if (p["buy_accel"] >= 8 or macd_turn_up or vwap_reclaim_long) and ema_distance_atr <= 0.70 else "MEDIUM"
-        return {
-            "direction": "LONG", "ok": True, "reasons": reasons_long[:10], "block_reasons": [],
-            "confirmations": confirmations_long, "freshness": freshness,
-            "power2_buy": p["buy2"], "power2_sell": p["sell2"],
-            "power3_buy": p["buy3"], "power3_sell": p["sell3"],
-            "power_accel": p["buy_accel"], "late_entry": False,
-            "ema_distance_atr": round(ema_distance_atr, 2), "vwap_distance_atr": round(vwap_distance_atr, 2),
-            "entry_mode": "PREDICTIVE_TRIGGER"
-        }
+        freshness = "HIGH" if (p["buy_accel"] >= 6 or macd_turn_up or vwap_reclaim_long) and ema_distance_atr <= 0.70 else "MEDIUM"
+        return {**base, "direction": "LONG", "ok": True, "reasons": reasons_long[:10], "block_reasons": [], "confirmations": confirmations_long, "freshness": freshness, "late_entry": False}
 
     if short_ok:
-        freshness = "HIGH" if (p["sell_accel"] >= 8 or macd_turn_down or vwap_reclaim_short) and ema_distance_atr <= 0.70 else "MEDIUM"
-        return {
-            "direction": "SHORT", "ok": True, "reasons": reasons_short[:10], "block_reasons": [],
-            "confirmations": confirmations_short, "freshness": freshness,
-            "power2_buy": p["buy2"], "power2_sell": p["sell2"],
-            "power3_buy": p["buy3"], "power3_sell": p["sell3"],
-            "power_accel": p["sell_accel"], "late_entry": False,
-            "ema_distance_atr": round(ema_distance_atr, 2), "vwap_distance_atr": round(vwap_distance_atr, 2),
-            "entry_mode": "PREDICTIVE_TRIGGER"
-        }
+        freshness = "HIGH" if (p["sell_accel"] >= 6 or macd_turn_down or vwap_reclaim_short) and ema_distance_atr <= 0.70 else "MEDIUM"
+        return {**base, "direction": "SHORT", "ok": True, "reasons": reasons_short[:10], "block_reasons": [], "confirmations": confirmations_short, "freshness": freshness, "late_entry": False}
 
     no_trade_reasons = block_reasons[:]
-    if confirmations_long < 4 and confirmations_short < 4:
-        no_trade_reasons.append("تریگر پیش‌بینی ورود هنوز کامل نیست")
-    if confirmations_long >= 4 and late_long:
+    if confirmations_long < ENTRY_MIN_CONFIRMATIONS and confirmations_short < ENTRY_MIN_CONFIRMATIONS:
+        no_trade_reasons.append("تریگر ورود هنوز کامل نیست")
+    if confirmations_long >= ENTRY_MIN_CONFIRMATIONS and not long_power2_ok:
+        no_trade_reasons.append("لانگ از نظر تکنیکال نزدیک بود اما Power دو کندلی کافی نبود")
+    if confirmations_short >= ENTRY_MIN_CONFIRMATIONS and not short_power2_ok:
+        no_trade_reasons.append("شورت از نظر تکنیکال نزدیک بود اما Power دو کندلی کافی نبود")
+    if confirmations_long >= ENTRY_MIN_CONFIRMATIONS and late_long:
         no_trade_reasons.append("لانگ از نظر قدرت خوب بود ولی دیر شده بود")
-    if confirmations_short >= 4 and late_short:
+    if confirmations_short >= ENTRY_MIN_CONFIRMATIONS and late_short:
         no_trade_reasons.append("شورت از نظر قدرت خوب بود ولی دیر شده بود")
     if strong_context_long_block and confirmations_long >= confirmations_short:
         no_trade_reasons.append("1H/4H به‌طور قوی خلاف لانگ است")
@@ -1637,14 +1714,13 @@ def predictive_entry_decision(df_4h, df_1h, df_30m, df_15m, df_5m, price, atr, s
 
     best_reasons = reasons_long if confirmations_long >= confirmations_short else reasons_short
     return {
-        "direction": "NO TRADE", "ok": False, "reasons": (no_trade_reasons + best_reasons)[:10],
-        "block_reasons": no_trade_reasons[:8], "confirmations": max(confirmations_long, confirmations_short),
-        "freshness": "LOW", "power2_buy": p["buy2"], "power2_sell": p["sell2"],
-        "power3_buy": p["buy3"], "power3_sell": p["sell3"],
-        "power_accel": p["buy_accel"] if confirmations_long >= confirmations_short else p["sell_accel"],
+        **base,
+        "direction": "NO TRADE", "ok": False,
+        "reasons": (no_trade_reasons + best_reasons)[:10],
+        "block_reasons": no_trade_reasons[:8],
+        "confirmations": max(confirmations_long, confirmations_short),
+        "freshness": "LOW",
         "late_entry": late_long if confirmations_long >= confirmations_short else late_short,
-        "ema_distance_atr": round(ema_distance_atr, 2), "vwap_distance_atr": round(vwap_distance_atr, 2),
-        "entry_mode": "PREDICTIVE_TRIGGER"
     }
 
 def analyze_symbol(symbol):
@@ -1653,7 +1729,7 @@ def analyze_symbol(symbol):
     df_1h = add_indicators(get_klines(symbol, "1h"))
     df_30m = add_indicators(get_klines(symbol, "30m"))
     df_15m = add_indicators(get_klines(symbol, "15m"))
-    df_5m = add_indicators(get_klines(symbol, "5m"))
+    df_5m = add_indicators(get_klines(symbol, "5m", include_current=True))
 
     long_score = 0
     short_score = 0
@@ -1704,7 +1780,7 @@ def analyze_symbol(symbol):
         reasons_short
     )
 
-    # BTC Filter/Lead مستقیم حذف شده است؛ Market Regime پایین‌تر همچنان باقی می‌ماند.
+    # BTC filter/lead disabled: اثر مستقیم بیت‌کوین حذف شده و فقط Market Regime باقی می‌ماند.
     btc_status = "disabled"
 
     # موارد حذف‌شده از نسخه ساده؛ نه امتیاز دارند، نه نمایش داده می‌شوند.
@@ -1821,31 +1897,21 @@ def analyze_symbol(symbol):
 
     rr = risk_reward(raw_direction, price, stop_loss_raw, tp1_raw)
 
-    # تریگر مخفی برای Tracker: اگر شرایط ورود تمیز نباشد، حتی در Tracker هم فعال نشود.
-    activation_block_reasons = list(predictive_context.get("block_reasons", []) or [])
-    if raw_direction != "NO TRADE":
-        if tp_space_ok is False:
-            activation_block_reasons.append(tp_space_reason or "فضای TP برای فعال‌سازی ورود کافی نیست")
-        if trap_risk:
-            activation_block_reasons.append(trap_reason or "Trap Risk نزدیک حمایت/مقاومت مهم فعال است")
-        if rr < 0.55:
-            activation_block_reasons.append("ریسک به ریوارد برای فعال‌سازی ورود کافی نیست")
-    activation_ready_clean = bool(entry_confirmed_now) and raw_direction in ["LONG", "SHORT"] and not activation_block_reasons
+    # معماری دو مرحله‌ای: Setup کامل صادر می‌شود، اما ورود فقط بعد از Activation فعال است.
+    # نکته مهم: TP Space / Trap Risk نباید Setup را حذف کند؛ اما نباید اجازه Entry فعال بدهد.
+    # این کار باعث می‌شود ارز همچنان زیر نظر بماند، ولی ورود فقط وقتی تمیز و دور از حمایت/مقاومت خطرناک باشد صادر شود.
+    entry_ok = entry_confirmed_now
+    block_reasons = list(predictive_context.get("block_reasons", []))
 
-    # معماری نهایی: هیچ سیگنال جدیدی مستقیم ACTIVE نمی‌شود.
-    # حتی اگر تریگر ورود کامل باشد، خروجی تحلیل فقط Setup می‌سازد.
-    # فعال‌سازی واقعی فقط توسط signal_tracker و بعد از چک دوباره انجام می‌شود.
-    activation_ready_now = bool(activation_ready_clean)
-    entry_ok = False
-    setup_waiting = raw_direction in ["LONG", "SHORT"] and setup_context.get("setup_ok")
-    block_reasons = predictive_context.get("block_reasons", [])
-    liquidity_risk = "متوسط"
+    # Classic mode: TP Space / Trap / RR فقط برای آمار و تحلیل علت SL ذخیره می‌شوند.
+    # این موارد دیگر جلوی سیگنال فعال را نمی‌گیرند؛ تصمیم فعال‌سازی فقط با موتور تکنیکال 5M است.
+    preliminary_stop, preliminary_tp1, _ = calculate_trade_levels(raw_direction, price, atr, support, resistance)
+    preliminary_rr = risk_reward(raw_direction, price, preliminary_stop, preliminary_tp1)
+
+    setup_waiting = (not entry_ok) and raw_direction in ["LONG", "SHORT"] and setup_context.get("setup_ok")
+    liquidity_risk = "پایین" if entry_ok else "متوسط"
     fake_breakout = "none"
     trend_exhaustion = "none"
-
-    if raw_direction != "NO TRADE" and tp_space_ok is False:
-        # TP Space دیگر سیگنال را حذف نمی‌کند؛ فقط به عنوان هشدار ذخیره/نمایش داده می‌شود.
-        reasons.append(tp_space_reason or "فضای TP نسبت به حمایت/مقاومت ضعیف است")
 
     risk_level = calculate_risk_level(
         raw_direction=raw_direction,
@@ -1871,12 +1937,11 @@ def analyze_symbol(symbol):
         tp2 = tp2_raw
         grade = "WAITING_ACTIVATION"
     else:
-        final_direction = "NO TRADE"
-        reasons = reasons + block_reasons
-        stop_loss = None
-        tp1 = None
-        tp2 = None
-        grade = "NO_ENTRY"
+        final_direction = raw_direction
+        stop_loss = stop_loss_raw
+        tp1 = tp1_raw
+        tp2 = tp2_raw
+        grade = "ENTRY"
 
     # احتمال موفقیت هم دیگر در تصمیم ورود دخالت ندارد؛ فقط مقدار نمایشی/سازگاری است.
     win_prob = win_probability(score, risk_level, rr, adx_value, "A" if grade == "ENTRY" else "Reject")
@@ -1949,19 +2014,13 @@ def analyze_symbol(symbol):
         "power_acceleration": predictive_context.get("power_accel"),
         "predictive_confirmations": predictive_context.get("confirmations"),
         "freshness": predictive_context.get("freshness"),
-        # خروجی بیرونی همیشه اول Setup است؛ فعال‌سازی فقط در signal_tracker انجام می‌شود.
-        "entry_mode": "PREDICTIVE_SETUP" if setup_waiting else "NO_ENTRY",
-        "entry_status": "WAITING_ACTIVATION" if setup_waiting else "NO_ENTRY",
-        "entry_confirmed": False,
+        "entry_mode": "PREDICTIVE_SETUP" if setup_waiting else predictive_context.get("entry_mode"),
+        "entry_status": "WAITING_ACTIVATION" if setup_waiting else ("ACTIVE" if entry_ok else "NO_ENTRY"),
+        "entry_confirmed": bool(entry_ok),
         "setup_waiting_activation": bool(setup_waiting),
-
-        # فیلدهای داخلی برای Tracker؛ Bot از این‌ها به عنوان سیگنال ورود مستقیم استفاده نمی‌کند.
-        "activation_ready": bool(activation_ready_now),
-        "activation_entry_mode": predictive_context.get("entry_mode"),
-        "activation_direction": predictive_context.get("direction"),
-        "activation_reasons": predictive_context.get("reasons", []),
-        "activation_block_reasons": activation_block_reasons,
         "setup_score": setup_context.get("setup_score"),
+        "setup_long_score": setup_context.get("setup_long_score"),
+        "setup_short_score": setup_context.get("setup_short_score"),
         "setup_reasons": setup_context.get("setup_reasons", []),
         "compression_active": setup_context.get("compression", {}).get("compression_active"),
         "compression_score": setup_context.get("compression", {}).get("compression_score"),
