@@ -922,19 +922,19 @@ def apply_direction_conflict_penalties(
     bearish_candle = pattern in ["bearish_engulfing", "bearish_pinbar", "bearish_strong"]
 
     if bullish_candle:
-        short_score -= 4
+        short_score -= 6
         reasons_short.append("کندل صعودی خلاف شورت است")
 
     if bearish_candle:
-        long_score -= 4
+        long_score -= 6
         reasons_long.append("کندل نزولی خلاف لانگ است")
 
     if vwap_status == "above_vwap":
-        short_score -= 4
+        short_score -= 6
         reasons_short.append("قیمت بالای VWAP است و برای شورت ریسک دارد")
 
     if vwap_status == "below_vwap":
-        long_score -= 4
+        long_score -= 6
         reasons_long.append("قیمت پایین VWAP است و برای لانگ ریسک دارد")
 
     try:
