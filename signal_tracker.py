@@ -18,6 +18,13 @@ except Exception:
 ACTIVE_SIGNALS_FILE = "active_signals.json"
 SIGNAL_STATS_FILE = "signal_stats.json"
 
+# تعداد Setup/Signal هایی که ربات باید همزمان زیر نظر بگیرد.
+# اگر config مقدار نداشت، پیش‌فرض 20 است.
+try:
+    from config import WATCHLIST_TARGET_SIZE
+except Exception:
+    WATCHLIST_TARGET_SIZE = int(os.getenv("WATCHLIST_TARGET_SIZE", "20"))
+
 # Tracker برای اسکالپ نباید فقط Last Price را ببیند.
 # با کندل 1m مسیر قیمت از آخرین چک بررسی می‌شود تا لمس سریع TP/SL جا نیفتد.
 TRACKER_OHLCV_TIMEFRAME = "1m"
@@ -210,6 +217,33 @@ def has_active_or_pending_symbol(active, user_id, symbol):
             if item.get("status") in ["ACTIVE", "PENDING_ACTIVATION"]:
                 return True
     return False
+
+
+def get_watchlist_count(user_id):
+    active = get_active_signals()
+    return sum(
+        1 for item in active
+        if int(item.get("user_id", 0)) == int(user_id)
+        and item.get("status") in ["ACTIVE", "PENDING_ACTIVATION"]
+    )
+
+
+def can_add_automatic_signal(user_id, symbol):
+    """برای حفظ Watchlist حدود 20 تایی و جلوگیری از سیگنال تکراری."""
+    active = get_active_signals()
+    if has_active_or_pending_symbol(active, user_id, symbol):
+        return False, "duplicate"
+
+    count = sum(
+        1 for item in active
+        if int(item.get("user_id", 0)) == int(user_id)
+        and item.get("status") in ["ACTIVE", "PENDING_ACTIVATION"]
+    )
+
+    if count >= int(WATCHLIST_TARGET_SIZE):
+        return False, "watchlist_full"
+
+    return True, "ok"
 
 def price_in_entry_zone(signal, price):
     try:
@@ -446,7 +480,6 @@ def close_signal(signal, result_type, exit_price):
     if result_type == "TP1":
         return (
             f"✅ نتیجه سیگنال {signal['symbol']}\n\n"
-            f"این نتیجه مربوط به سیگنال ریپلای‌شده است.\n"
             f"جهت: {'لانگ' if signal['direction'] == 'LONG' else 'شورت'}\n"
             f"ورود: {signal['entry']}\n"
             f"TP1: {signal['tp1']}\n"
@@ -460,7 +493,6 @@ def close_signal(signal, result_type, exit_price):
 
     return (
         f"❌ نتیجه سیگنال {signal['symbol']}\n\n"
-        f"این نتیجه مربوط به سیگنال ریپلای‌شده است.\n"
         f"جهت: {'لانگ' if signal['direction'] == 'LONG' else 'شورت'}\n"
         f"ورود: {signal['entry']}\n"
         f"SL: {signal['stop_loss']}\n"
@@ -696,6 +728,45 @@ def weakness_warning_for_signal(signal, result, price):
     return None, []
 
 
+
+def evaluate_pending_setup_state(signal, live):
+    """
+    بررسی می‌کند آیا یک Pending Setup هنوز ارزش نگهداری دارد یا نه.
+    هدف: اگر ستاپ قبلی جهتش عوض شد یا بازار رنج/بی‌جهت شد، قبل از فعال‌سازی لغو شود.
+    این تابع ستاپ جدید نمی‌سازد؛ Scanner در چرخه بعدی فرصت جدید را پیدا می‌کند.
+    """
+    signal_direction = signal.get("direction")
+    live_direction = (live or {}).get("direction")
+    live_raw_direction = (live or {}).get("raw_direction")
+    live_entry_mode = (live or {}).get("entry_mode")
+
+    if live_direction not in ["LONG", "SHORT"]:
+        return "CANCEL", "بازار وارد حالت رنج/بی‌جهت شد و ستاپ دیگر معتبر نیست"
+
+    if live_direction != signal_direction:
+        if live_direction in ["LONG", "SHORT"]:
+            return "CANCEL", f"جهت تحلیل از {fa_direction(signal_direction)} به {fa_direction(live_direction)} تغییر کرد"
+        return "CANCEL", "جهت تحلیل از ستاپ قبلی خارج شد"
+
+    # اگر جهت اصلی هنوز همان است، باید حداقل یکی از حالت‌های معتبر Setup/Trigger وجود داشته باشد.
+    try:
+        setup_score = int((live or {}).get("setup_score") or 0)
+    except Exception:
+        setup_score = 0
+
+    still_setup = bool((live or {}).get("setup_waiting_activation")) or live_entry_mode == "PREDICTIVE_SETUP"
+    still_trigger = bool((live or {}).get("entry_confirmed")) or live_entry_mode == "PREDICTIVE_TRIGGER"
+
+    if not still_setup and not still_trigger and setup_score < 4:
+        return "CANCEL", "ستاپ از نظر تکنیکال ضعیف/رنج شده و تایید کافی برای ادامه مانیتور ندارد"
+
+    # اگر raw_direction به هر دلیل خلاف جهت ذخیره‌شده باشد، محتاطانه لغو می‌کنیم.
+    if live_raw_direction in ["LONG", "SHORT"] and live_raw_direction != signal_direction:
+        return "CANCEL", f"جهت خام تحلیل با ستاپ قبلی همسو نیست و به {fa_direction(live_raw_direction)} تغییر کرده"
+
+    return "KEEP", None
+
+
 def check_active_signals():
     active = get_active_signals()
     remaining = []
@@ -709,26 +780,48 @@ def check_active_signals():
                     msg = close_pending_setup(signal, "زمان انتظار فعال‌سازی تمام شد")
                     messages.append({"chat_id": signal["chat_id"], "message": msg, "reply_to_message_id": signal.get("message_id")})
                     continue
+
                 price = get_last_close_from_1m_or_ticker(signal["symbol"], signal)
-                if price_in_entry_zone(signal, price):
-                    try:
-                        live = analyze_symbol(signal["symbol"])
-                        if live.get("direction") == signal.get("direction") and live.get("entry_confirmed"):
-                            signal = activate_pending_signal(signal, price)
-                            activation_msg = (
-                                "✅ ورود فعال شد\n\n"
-                                f"ارز: {signal['symbol']}\n"
-                                f"جهت: {fa_direction(signal['direction'])}\n"
-                                f"قیمت فعال‌سازی: {round(float(price), 8)}\n"
-                                "تحلیل لحظه‌ای 5M با پیش‌بینی اولیه همسو شد."
-                            )
-                            messages.append({
-                                "chat_id": signal["chat_id"],
-                                "reply_to_message_id": signal.get("message_id"),
-                                "message": activation_msg
-                            })
-                    except Exception as e:
-                        log_exception("فعال‌سازی ورود", e, "signal_tracker.py", "check_active_signals", signal.get("symbol"))
+
+                try:
+                    live = analyze_symbol(signal["symbol"])
+                    action, cancel_reason = evaluate_pending_setup_state(signal, live)
+
+                    if action == "CANCEL":
+                        msg = close_pending_setup(signal, cancel_reason)
+                        messages.append({
+                            "chat_id": signal["chat_id"],
+                            "reply_to_message_id": signal.get("message_id"),
+                            "message": msg
+                        })
+                        continue
+
+                    same_direction = live.get("direction") == signal.get("direction")
+                    activated_now = bool(live.get("entry_confirmed")) and live.get("entry_mode") == "PREDICTIVE_TRIGGER"
+
+                    if same_direction and activated_now and price_in_entry_zone(signal, price):
+                        signal = activate_pending_signal(signal, price)
+                        activation_msg = (
+                            "✅ ورود فعال شد\n\n"
+                            f"ارز: {signal['symbol']}\n"
+                            f"جهت: {fa_direction(signal['direction'])}\n"
+                            f"قیمت فعال‌سازی: {round(float(price), 8)}\n"
+                            "تحلیل لحظه‌ای با ستاپ اولیه همسو ماند و شرایط ورود تکمیل شد."
+                        )
+                        messages.append({
+                            "chat_id": signal["chat_id"],
+                            "reply_to_message_id": signal.get("message_id"),
+                            "message": activation_msg
+                        })
+                    else:
+                        signal["last_checked_at"] = now_ts()
+                        signal["last_checked_at_text"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                except Exception as e:
+                    log_exception("فعال‌سازی/اعتبارسنجی ستاپ", e, "signal_tracker.py", "check_active_signals", signal.get("symbol"))
+                    signal["last_checked_at"] = now_ts()
+                    signal["last_checked_at_text"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
                 remaining.append(signal)
                 continue
 
@@ -738,7 +831,6 @@ def check_active_signals():
                 msg = close_signal(signal, result_type, exit_price)
                 messages.append({
                     "chat_id": signal["chat_id"],
-                    "reply_to_message_id": signal.get("message_id"),
                     "message": msg
                 })
                 continue
@@ -760,7 +852,6 @@ def check_active_signals():
 
                         messages.append({
                             "chat_id": signal["chat_id"],
-                            "reply_to_message_id": signal.get("message_id"),
                             "message": warning_msg
                         })
 
