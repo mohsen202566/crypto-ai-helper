@@ -399,12 +399,12 @@ def apply_market_regime_to_scores(long_score, short_score, market_regime, reason
     روند کلی بازار فقط اثر بسیار نرم دارد.
     """
     if market_regime == "bearish":
-        short_score += 5
-        long_score -= 5
+        short_score += 7
+        long_score -= 7
         reasons_short.append("روند کلی بازار کمی به نفع شورت است")
     elif market_regime == "bullish":
-        long_score += 5
-        short_score -= 5
+        long_score += 7
+        short_score -= 7
         reasons_long.append("روند کلی بازار کمی به نفع لانگ است")
 
     return max(0, long_score), max(0, short_score)
