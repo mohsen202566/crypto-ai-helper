@@ -24,6 +24,38 @@ from signal_tracker import (
     can_add_automatic_signal,
 )
 
+try:
+    from paper_trader import (
+        set_trade_enabled,
+        emergency_stop,
+        set_trade_margin,
+        set_leverage,
+        set_max_open_positions,
+        format_trade_status,
+        format_trade_stats,
+        format_open_positions,
+        format_trade_settings,
+        format_empty_slots,
+    )
+    PAPER_TRADER_AVAILABLE = True
+except Exception as e:
+    PAPER_TRADER_AVAILABLE = False
+    PAPER_TRADER_IMPORT_ERROR = str(e)
+
+    def _paper_unavailable(*args, **kwargs):
+        return "❌ ماژول Paper Trader لود نشد. فایل‌های auto_trade_config.py و paper_trader.py را چک کن.\nجزئیات: " + PAPER_TRADER_IMPORT_ERROR
+
+    def set_trade_enabled(enabled): return _paper_unavailable()
+    def emergency_stop(): return _paper_unavailable()
+    def format_trade_status(): return _paper_unavailable()
+    def format_trade_stats(): return _paper_unavailable()
+    def format_open_positions(): return _paper_unavailable()
+    def format_trade_settings(): return _paper_unavailable()
+    def format_empty_slots(): return _paper_unavailable()
+    def set_trade_margin(value): return False, _paper_unavailable()
+    def set_leverage(value): return False, _paper_unavailable()
+    def set_max_open_positions(value): return False, _paper_unavailable()
+
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN تنظیم نشده است. اول روی VPS دستور export BOT_TOKEN را بزن.")
 
@@ -33,6 +65,8 @@ bot = telebot.TeleBot(BOT_TOKEN)
 MESSAGE_RESULTS = {}
 
 TRACK_COMMANDS = ["\u0632\u06cc\u0631 \u0646\u0638\u0631", "\u0632\u06cc\u0631\u0646\u0638\u0631", "\u0632\u06cc\u0631 \u0646\u0638\u0631 \u0628\u06af\u06cc\u0631", "\u0646\u0638\u0631"]
+
+TRADE_WAITING_ACTION = {}
 
 
 def safe(value, default="\u0646\u0627\u0645\u0634\u062e\u0635"):
@@ -421,6 +455,110 @@ def signal_tracking_loop():
         time.sleep(TRACKER_CHECK_INTERVAL_SECONDS)
 
 
+
+def handle_trade_waiting_input(message, text):
+    user_id = int(message.from_user.id)
+
+    if user_id not in TRADE_WAITING_ACTION:
+        return False
+
+    action = TRADE_WAITING_ACTION.pop(user_id)
+
+    if not is_owner(user_id):
+        bot.reply_to(message, "⛔ فقط مالک ربات می‌تواند تنظیمات ترید را تغییر دهد.")
+        return True
+
+    try:
+        if action == "trade_margin":
+            ok, reply = set_trade_margin(text)
+            bot.reply_to(message, reply)
+            return True
+
+        if action == "leverage":
+            ok, reply = set_leverage(text)
+            bot.reply_to(message, reply)
+            return True
+
+        if action == "max_positions":
+            ok, reply = set_max_open_positions(text)
+            bot.reply_to(message, reply)
+            return True
+
+        bot.reply_to(message, "❌ دستور تنظیم نامشخص بود.")
+        return True
+
+    except Exception as e:
+        bot.reply_to(message, f"❌ خطا در ثبت تنظیم:\n{e}")
+        return True
+
+
+def handle_trade_command(message, text):
+    clean = text.strip().lower()
+    user_id = int(message.from_user.id)
+
+    trade_owner_commands = [
+        "ترید فعال",
+        "ترید غیرفعال",
+        "توقف اضطراری",
+        "ترید دلار",
+        "ترید لوریج",
+        "حداکثر پوزیشن",
+    ]
+
+    if clean in trade_owner_commands and not is_owner(user_id):
+        bot.reply_to(message, "⛔ فقط مالک ربات می‌تواند دستورهای ترید را اجرا کند.")
+        return True
+
+    if clean == "ترید فعال":
+        bot.reply_to(message, set_trade_enabled(True))
+        return True
+
+    if clean == "ترید غیرفعال":
+        bot.reply_to(message, set_trade_enabled(False))
+        return True
+
+    if clean == "توقف اضطراری":
+        bot.reply_to(message, emergency_stop())
+        return True
+
+    if clean in ["وضعیت ترید", "داشبورد"]:
+        bot.reply_to(message, format_trade_status())
+        return True
+
+    if clean in ["آمار ترید", "امار ترید"]:
+        bot.reply_to(message, format_trade_stats())
+        return True
+
+    if clean in ["پوزیشن ها", "پوزیشن‌ها", "پوزیشنهای باز", "پوزیشن های باز"]:
+        bot.reply_to(message, format_open_positions())
+        return True
+
+    if clean in ["تنظیمات ترید", "تنظیم ترید"]:
+        bot.reply_to(message, format_trade_settings())
+        return True
+
+    if clean == "اسلات خالی":
+        bot.reply_to(message, format_empty_slots())
+        return True
+
+    if clean == "ترید دلار":
+        TRADE_WAITING_ACTION[user_id] = "trade_margin"
+        bot.reply_to(message, "مقدار دلاری هر پوزیشن را وارد کن:\nمثلاً: 5")
+        return True
+
+    if clean == "ترید لوریج":
+        TRADE_WAITING_ACTION[user_id] = "leverage"
+        bot.reply_to(message, "لوریج معاملات بعدی را وارد کن:\nمثلاً: 10")
+        return True
+
+    if clean == "حداکثر پوزیشن":
+        TRADE_WAITING_ACTION[user_id] = "max_positions"
+        bot.reply_to(message, "حداکثر تعداد پوزیشن همزمان را وارد کن:\nمثلاً: 5")
+        return True
+
+    return False
+
+
 @bot.message_handler(commands=["start"])
 def start(message):
     if not is_user_allowed(message.from_user.id):
@@ -512,6 +650,12 @@ def handle_message(message):
         return
 
     text = message.text.strip()
+
+    if handle_trade_waiting_input(message, text):
+        return
+
+    if handle_trade_command(message, text):
+        return
 
     if is_market_status_command(text):
         bot.reply_to(message, "⏳ در حال محاسبه وضعیت بازار...")
