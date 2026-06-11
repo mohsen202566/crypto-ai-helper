@@ -1704,11 +1704,8 @@ def analyze_symbol(symbol):
         reasons_short
     )
 
-    btc_status, l, s, rl, rs = btc_filter(symbol)
-    long_score += l
-    short_score += s
-    reasons_long += rl
-    reasons_short += rs
+    # BTC Filter/Lead مستقیم حذف شده است؛ Market Regime پایین‌تر همچنان باقی می‌ماند.
+    btc_status = "disabled"
 
     # موارد حذف‌شده از نسخه ساده؛ نه امتیاز دارند، نه نمایش داده می‌شوند.
     trendline = "none"
@@ -1824,11 +1821,25 @@ def analyze_symbol(symbol):
 
     rr = risk_reward(raw_direction, price, stop_loss_raw, tp1_raw)
 
-    # معماری دو مرحله‌ای: Setup کامل صادر می‌شود، اما ورود فقط بعد از Activation فعال است.
-    entry_ok = entry_confirmed_now
-    setup_waiting = (not entry_ok) and raw_direction in ["LONG", "SHORT"] and setup_context.get("setup_ok")
+    # تریگر مخفی برای Tracker: اگر شرایط ورود تمیز نباشد، حتی در Tracker هم فعال نشود.
+    activation_block_reasons = list(predictive_context.get("block_reasons", []) or [])
+    if raw_direction != "NO TRADE":
+        if tp_space_ok is False:
+            activation_block_reasons.append(tp_space_reason or "فضای TP برای فعال‌سازی ورود کافی نیست")
+        if trap_risk:
+            activation_block_reasons.append(trap_reason or "Trap Risk نزدیک حمایت/مقاومت مهم فعال است")
+        if rr < 0.55:
+            activation_block_reasons.append("ریسک به ریوارد برای فعال‌سازی ورود کافی نیست")
+    activation_ready_clean = bool(entry_confirmed_now) and raw_direction in ["LONG", "SHORT"] and not activation_block_reasons
+
+    # معماری نهایی: هیچ سیگنال جدیدی مستقیم ACTIVE نمی‌شود.
+    # حتی اگر تریگر ورود کامل باشد، خروجی تحلیل فقط Setup می‌سازد.
+    # فعال‌سازی واقعی فقط توسط signal_tracker و بعد از چک دوباره انجام می‌شود.
+    activation_ready_now = bool(activation_ready_clean)
+    entry_ok = False
+    setup_waiting = raw_direction in ["LONG", "SHORT"] and setup_context.get("setup_ok")
     block_reasons = predictive_context.get("block_reasons", [])
-    liquidity_risk = "پایین" if entry_ok else "متوسط"
+    liquidity_risk = "متوسط"
     fake_breakout = "none"
     trend_exhaustion = "none"
 
@@ -1860,11 +1871,12 @@ def analyze_symbol(symbol):
         tp2 = tp2_raw
         grade = "WAITING_ACTIVATION"
     else:
-        final_direction = raw_direction
-        stop_loss = stop_loss_raw
-        tp1 = tp1_raw
-        tp2 = tp2_raw
-        grade = "ENTRY"
+        final_direction = "NO TRADE"
+        reasons = reasons + block_reasons
+        stop_loss = None
+        tp1 = None
+        tp2 = None
+        grade = "NO_ENTRY"
 
     # احتمال موفقیت هم دیگر در تصمیم ورود دخالت ندارد؛ فقط مقدار نمایشی/سازگاری است.
     win_prob = win_probability(score, risk_level, rr, adx_value, "A" if grade == "ENTRY" else "Reject")
@@ -1937,10 +1949,18 @@ def analyze_symbol(symbol):
         "power_acceleration": predictive_context.get("power_accel"),
         "predictive_confirmations": predictive_context.get("confirmations"),
         "freshness": predictive_context.get("freshness"),
-        "entry_mode": "PREDICTIVE_SETUP" if setup_waiting else predictive_context.get("entry_mode"),
-        "entry_status": "WAITING_ACTIVATION" if setup_waiting else ("ACTIVE" if entry_ok else "NO_ENTRY"),
-        "entry_confirmed": bool(entry_ok),
+        # خروجی بیرونی همیشه اول Setup است؛ فعال‌سازی فقط در signal_tracker انجام می‌شود.
+        "entry_mode": "PREDICTIVE_SETUP" if setup_waiting else "NO_ENTRY",
+        "entry_status": "WAITING_ACTIVATION" if setup_waiting else "NO_ENTRY",
+        "entry_confirmed": False,
         "setup_waiting_activation": bool(setup_waiting),
+
+        # فیلدهای داخلی برای Tracker؛ Bot از این‌ها به عنوان سیگنال ورود مستقیم استفاده نمی‌کند.
+        "activation_ready": bool(activation_ready_now),
+        "activation_entry_mode": predictive_context.get("entry_mode"),
+        "activation_direction": predictive_context.get("direction"),
+        "activation_reasons": predictive_context.get("reasons", []),
+        "activation_block_reasons": activation_block_reasons,
         "setup_score": setup_context.get("setup_score"),
         "setup_reasons": setup_context.get("setup_reasons", []),
         "compression_active": setup_context.get("compression", {}).get("compression_active"),
