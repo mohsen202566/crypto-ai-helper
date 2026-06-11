@@ -201,56 +201,42 @@ def soft_confirmation_bonus(result):
 
 def is_high_quality_signal(result):
     """
-    دروازه اتوسیگنال نسخه Predictive Trigger.
-    امتیاز 0 تا 100 دیگر شرط صدور سیگنال نیست؛ فقط تاییدیه ورود تازه مهم است.
+    Classic technical gate:
+    اتوسیگنال یا ستاپ فقط با خروجی موتور تکنیکال/پیش‌بینی پذیرفته می‌شود.
+    late_entry، RR، ADX و فیلترهای اضافه دیگر اینجا سیگنال را حذف نمی‌کنند.
     """
     if not result:
         return False
 
-    if result.get("direction") == "NO TRADE":
-        return False
-
-    if not result.get("entry_confirmed") and not result.get("setup_waiting_activation"):
+    direction = result.get("direction")
+    if direction not in ["LONG", "SHORT"]:
         return False
 
     if result.get("entry_mode") not in ["PREDICTIVE_TRIGGER", "PREDICTIVE_SETUP"]:
         return False
 
     if result.get("entry_confirmed"):
-        if result.get("freshness") not in ["HIGH", "MEDIUM"]:
+        try:
+            confirmations = int(result.get("predictive_confirmations") or 0)
+        except Exception:
+            confirmations = 0
+        if confirmations < 4:
             return False
-        if int(result.get("predictive_confirmations") or 0) < 4:
-            return False
-    else:
-        if int(result.get("setup_score") or 0) < 4:
-            return False
-
-    if result.get("late_entry"):
-        return False
-
-    if result.get("risk_reward", 0) < 0.50:
-        return False
-
-    if result.get("adx", 0) < 10:
-        return False
-
-    spread = result.get("spread_percent")
-    if spread is not None and spread > 0.12:
+    elif not result.get("setup_waiting_activation"):
         return False
 
     try:
-        buy2 = float(result.get("power2_buy", 50))
-        sell2 = float(result.get("power2_sell", 50))
-        buy3 = float(result.get("power3_buy", 50))
-        sell3 = float(result.get("power3_sell", 50))
+        buy2 = float(result.get("power2_buy", 50) or 50)
+        sell2 = float(result.get("power2_sell", 50) or 50)
     except Exception:
-        buy2 = sell2 = buy3 = sell3 = 50
+        buy2 = sell2 = 50
 
-    direction = result.get("direction")
-    if direction == "LONG" and not (buy2 >= 58 and buy3 >= 55):
-        return False
-    if direction == "SHORT" and not (sell2 >= 58 and sell3 >= 55):
-        return False
+    # برای ستاپ سخت‌گیری Power نداریم؛ برای ورود فعال Power دو کندلی باید همسو باشد.
+    if result.get("entry_confirmed"):
+        if direction == "LONG" and buy2 < 58:
+            return False
+        if direction == "SHORT" and sell2 < 58:
+            return False
 
     return True
 
