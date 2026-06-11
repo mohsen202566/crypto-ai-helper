@@ -130,34 +130,6 @@ def get_today_pnl(state=None):
     return round(sum(safe_float(p.get("pnl_usdt")) for p in get_today_closed_positions(state)), 4)
 
 
-def format_signed_money(value):
-    value = safe_float(value)
-    sign = "+" if value > 0 else ""
-    return f"{sign}{round(value, 4)}$"
-
-
-def pnl_label(value):
-    value = safe_float(value)
-    if value > 0:
-        return "سود"
-    if value < 0:
-        return "ضرر"
-    return "سود/ضرر"
-
-
-def get_total_pnl(state=None):
-    state = state or get_state()
-    return round(sum(safe_float(p.get("pnl_usdt")) for p in state.get("closed_positions", [])), 4)
-
-
-def get_gross_profit_loss(state=None):
-    state = state or get_state()
-    closed = state.get("closed_positions", [])
-    gross_profit = round(sum(safe_float(p.get("pnl_usdt")) for p in closed if safe_float(p.get("pnl_usdt")) > 0), 4)
-    gross_loss = round(sum(safe_float(p.get("pnl_usdt")) for p in closed if safe_float(p.get("pnl_usdt")) < 0), 4)
-    return gross_profit, gross_loss
-
-
 def check_daily_loss_lock(state):
     today_pnl = get_today_pnl(state)
     max_loss = abs(safe_float(state.get("daily_max_loss_usdt"), DEFAULT_DAILY_MAX_LOSS_USDT))
@@ -241,6 +213,14 @@ def can_open_new_trade(signal):
 
     if signal.get("direction") not in ["LONG", "SHORT"]:
         return False, "جهت سیگنال معتبر نیست."
+
+    risk_raw = signal.get("risk_level")
+    risk = str(risk_raw or "").strip().upper()
+    low_risk_values = ["LOW", "LOW_RISK", "پایین", "ریسک پایین", "کم", "LOW ✅"]
+
+    if risk not in [str(x).strip().upper() for x in low_risk_values]:
+        shown_risk = risk_raw if risk_raw not in [None, ""] else "نامشخص"
+        return False, f"فقط سیگنال‌های ریسک پایین معامله می‌شوند. ریسک این سیگنال: {shown_risk}"
 
     if signal.get("tp1") is None or signal.get("stop_loss") is None:
         return False, "TP1 یا SL در سیگنال وجود ندارد."
@@ -419,8 +399,6 @@ def format_trade_status():
     state = get_state()
     open_count = len(state.get("open_positions", []))
     max_pos = safe_int(state.get("max_open_positions"), DEFAULT_MAX_OPEN_POSITIONS)
-    today_pnl = get_today_pnl(state)
-    total_pnl = get_total_pnl(state)
 
     return f"""🤖 وضعیت ترید
 
@@ -435,8 +413,7 @@ def format_trade_status():
 پوزیشن باز: {open_count}/{max_pos}
 اسلات خالی: {open_slots_count(state)}
 
-{pnl_label(today_pnl)} امروز: {format_signed_money(today_pnl)}
-سود/ضرر کل: {format_signed_money(total_pnl)}
+ضرر امروز: {get_today_pnl(state)}$
 حد ضرر روزانه: {state.get('daily_max_loss_usdt')}$
 قفل ضرر روزانه: {cooldown_text(state)}
 """
@@ -472,9 +449,8 @@ def format_trade_stats():
     total = tp1 + sl
     win_rate = round((tp1 / total) * 100, 1) if total else 0
 
-    total_pnl = get_total_pnl(state)
+    total_pnl = round(sum(safe_float(p.get("pnl_usdt")) for p in closed), 4)
     today_pnl = get_today_pnl(state)
-    gross_profit, gross_loss = get_gross_profit_loss(state)
 
     return f"""📊 آمار ترید Paper
 
@@ -490,10 +466,8 @@ TP1: {tp1}
 SL: {sl}
 Win Rate: {win_rate}٪
 
-{pnl_label(today_pnl)} امروز: {format_signed_money(today_pnl)}
-سود کل TPها: {format_signed_money(gross_profit)}
-ضرر کل SLها: {format_signed_money(gross_loss)}
-خالص کل: {format_signed_money(total_pnl)}
+سود/ضرر امروز: {today_pnl}$
+سود/ضرر کل: {total_pnl}$
 
 حجم هر پوزیشن: {state.get('trade_margin_usdt')}$
 لوریج: {state.get('leverage')}x
