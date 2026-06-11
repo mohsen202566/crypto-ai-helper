@@ -34,6 +34,42 @@ TRACKER_MAX_OHLCV_LIMIT = 180
 # حالت محافظه‌کارانه: SL اولویت دارد تا آمار بیش از حد خوش‌بینانه نشود.
 SAME_CANDLE_HIT_POLICY = "SL_FIRST"
 
+
+QUIET_TRACKER_ERRORS = [
+    "not supported between instances of 'NoneType' and 'str'",
+    "does not have market symbol",
+    "symbol",
+    "market",
+    "fetch_ohlcv",
+    "fetch_ticker",
+    "timeout",
+    "timed out",
+    "Too Many Requests",
+    "429",
+    "NetworkError",
+    "ExchangeNotAvailable",
+    "داده کافی",
+    "اندیکاتورها کامل محاسبه نشدند",
+]
+
+
+def is_quiet_tracker_error(exc):
+    msg = str(exc)
+    lower = msg.lower()
+    return any(item.lower() in lower for item in QUIET_TRACKER_ERRORS)
+
+
+def mark_tracker_data_error(signal, exc):
+    """خطاهای دیتای صرافی را بدون کرش و بدون اسپم لاگ مدیریت می‌کند."""
+    try:
+        signal["last_checked_at"] = now_ts()
+        signal["last_checked_at_text"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        signal["last_tracker_error"] = str(exc)[:300]
+        signal["tracker_error_count"] = int(signal.get("tracker_error_count") or 0) + 1
+    except Exception:
+        pass
+    return signal
+
 exchange = ccxt.okx({
     "enableRateLimit": True,
     "timeout": 20000,
@@ -903,9 +939,13 @@ def check_active_signals():
                         signal["last_checked_at_text"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
                 except Exception as e:
-                    log_exception("فعال‌سازی/اعتبارسنجی ستاپ", e, "signal_tracker.py", "check_active_signals", signal.get("symbol"))
-                    signal["last_checked_at"] = now_ts()
-                    signal["last_checked_at_text"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    if is_quiet_tracker_error(e):
+                        signal = mark_tracker_data_error(signal, e)
+                        print("TRACK DATA SKIP:", signal.get("symbol"), str(e)[:160])
+                    else:
+                        log_exception("فعال‌سازی/اعتبارسنجی ستاپ", e, "signal_tracker.py", "check_active_signals", signal.get("symbol"))
+                        signal["last_checked_at"] = now_ts()
+                        signal["last_checked_at_text"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
                 remaining.append(signal)
                 continue
@@ -950,12 +990,19 @@ def check_active_signals():
                         })
 
                 except Exception as e:
-                    print("WARNING CHECK ERROR:", signal.get("symbol"), str(e))
+                    if is_quiet_tracker_error(e):
+                        signal = mark_tracker_data_error(signal, e)
+                    else:
+                        print("WARNING CHECK ERROR:", signal.get("symbol"), str(e))
 
             remaining.append(signal)
 
         except Exception as e:
-            print("TRACK SIGNAL ERROR:", signal.get("symbol"), str(e))
+            if is_quiet_tracker_error(e):
+                signal = mark_tracker_data_error(signal, e)
+                print("TRACK DATA SKIP:", signal.get("symbol"), str(e)[:160])
+            else:
+                log_exception("بررسی سیگنال فعال", e, "signal_tracker.py", "check_active_signals", signal.get("symbol"))
             remaining.append(signal)
 
     save_active_signals(remaining)
