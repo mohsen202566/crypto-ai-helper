@@ -332,9 +332,13 @@ def add_signal_to_tracking(user_id, chat_id, message_id, result):
     if has_active_or_pending_symbol(active, user_id, result.get("symbol")):
         return False, f"⚠️ {result.get('symbol')} از قبل زیر نظر یا در انتظار فعال‌سازی است."
 
-    # معماری نهایی: همه سیگنال‌ها ابتدا Setup هستند؛ هیچ سیگنال تازه‌ای مستقیم ACTIVE نمی‌شود.
-    entry_confirmed = False
-    initial_status = "PENDING_ACTIVATION"
+    # اگر سیگنال واقعاً با ورود فعال صادر شده باشد، باید از همان ابتدا ACTIVE ذخیره شود
+    # تا Tracker بتواند بعد از آن TP1/SL را بررسی و نتیجه را ارسال کند.
+    # ستاپ‌های عادی همچنان PENDING_ACTIVATION می‌مانند.
+    result_entry_mode = result.get("entry_mode")
+    result_entry_status = result.get("entry_status")
+    entry_confirmed = bool(result.get("entry_confirmed")) or result_entry_status == "ACTIVE" or result_entry_mode == "PREDICTIVE_TRIGGER"
+    initial_status = "ACTIVE" if entry_confirmed else "PENDING_ACTIVATION"
     signal_uid = f"{result['symbol']}_{message_id}_{now_ts()}"
 
     signal = {
@@ -428,14 +432,17 @@ def add_signal_to_tracking(user_id, chat_id, message_id, result):
 
         "status": initial_status,
         "warning_sent": False,
-        "activated_at": None,
-        "activated_at_text": None,
-        "activated_price": None
+        "activated_at": now_ts() if initial_status == "ACTIVE" else None,
+        "activated_at_text": datetime.now().strftime("%Y-%m-%d %H:%M:%S") if initial_status == "ACTIVE" else None,
+        "activated_price": float(result["price"]) if initial_status == "ACTIVE" else None
     }
 
     active.append(signal)
     save_active_signals(active)
     record_stat_event(signal, 'SETUP_CREATED')
+    if initial_status == "ACTIVE":
+        record_stat_event(signal, 'ACTIVATED')
+        return True, f"✅ سیگنال {signal['symbol']} فعال ذخیره شد و تا TP1/SL زیر نظر است."
 
     return True, f"👀 ستاپ {signal['symbol']} ذخیره شد و منتظر فعال‌سازی ورود است."
 
