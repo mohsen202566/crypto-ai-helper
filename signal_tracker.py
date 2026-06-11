@@ -211,6 +211,41 @@ def has_active_or_pending_symbol(active, user_id, symbol):
                 return True
     return False
 
+
+def get_watchlist_count(user_id):
+    active = get_active_signals()
+    return sum(
+        1 for item in active
+        if int(item.get("user_id", 0)) == int(user_id)
+        and item.get("status") in ["ACTIVE", "PENDING_ACTIVATION"]
+    )
+
+
+def can_add_automatic_signal(user_id, symbol):
+    """برای حفظ سقف Watchlist و جلوگیری از سیگنال تکراری."""
+    active = get_active_signals()
+
+    if has_active_or_pending_symbol(active, user_id, symbol):
+        return False, "duplicate"
+
+    try:
+        from config import WATCHLIST_TARGET_SIZE
+        target_size = int(WATCHLIST_TARGET_SIZE)
+    except Exception:
+        target_size = int(os.getenv("WATCHLIST_TARGET_SIZE", "20"))
+
+    count = sum(
+        1 for item in active
+        if int(item.get("user_id", 0)) == int(user_id)
+        and item.get("status") in ["ACTIVE", "PENDING_ACTIVATION"]
+    )
+
+    if count >= target_size:
+        return False, "watchlist_full"
+
+    return True, "ok"
+
+
 def price_in_entry_zone(signal, price):
     try:
         price = float(price)
