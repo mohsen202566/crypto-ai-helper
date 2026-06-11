@@ -274,7 +274,7 @@ def can_add_automatic_signal(user_id, symbol):
         from config import WATCHLIST_TARGET_SIZE
         target_size = int(WATCHLIST_TARGET_SIZE)
     except Exception:
-        target_size = int(os.getenv("WATCHLIST_TARGET_SIZE", "20"))
+        target_size = int(os.getenv("WATCHLIST_TARGET_SIZE", "30"))
 
     count = sum(
         1 for item in active
