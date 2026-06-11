@@ -831,6 +831,7 @@ def check_active_signals():
                 msg = close_signal(signal, result_type, exit_price)
                 messages.append({
                     "chat_id": signal["chat_id"],
+                    "reply_to_message_id": signal.get("message_id"),
                     "message": msg
                 })
                 continue
@@ -852,6 +853,7 @@ def check_active_signals():
 
                         messages.append({
                             "chat_id": signal["chat_id"],
+                            "reply_to_message_id": signal.get("message_id"),
                             "message": warning_msg
                         })
 
