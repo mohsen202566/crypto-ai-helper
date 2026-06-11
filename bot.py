@@ -21,6 +21,7 @@ from signal_tracker import (
     get_profit_for_signal_text,
     get_profit_simulation_report,
     reset_stats,
+    can_add_automatic_signal,
 )
 
 if not BOT_TOKEN:
@@ -351,6 +352,10 @@ ADX: {safe(result.get('adx'))}
 
     for user_id in list_users():
         try:
+            can_add, reason = can_add_automatic_signal(user_id, result.get("symbol"))
+            if not can_add:
+                continue
+
             sent = bot.send_message(user_id, text)
             remember_signal_result(sent, result)
             if AUTO_TRACK_AUTO_SIGNALS:
@@ -398,19 +403,17 @@ def signal_tracking_loop():
 
             for item in messages:
                 try:
-                    reply_to_id = item.get("reply_to_message_id")
-                    try:
-                        bot.send_message(
-                            item["chat_id"],
-                            item["message"],
-                            reply_to_message_id=reply_to_id if reply_to_id else None
-                        )
-                    except Exception as reply_error:
-                        # اگر ریپلای به پیام اصلی به هر دلیل خطا داد، پیام نتیجه از دست نرود.
-                        print("SEND TRACK RESULT REPLY ERROR:", str(reply_error))
-                        bot.send_message(item["chat_id"], item["message"])
+                    bot.send_message(
+                        item["chat_id"],
+                        item["message"],
+                        reply_to_message_id=item.get("reply_to_message_id")
+                    )
                 except Exception as e:
-                    log_exception("ارسال نتیجه مانیتورینگ", e, "bot.py", "signal_tracking_loop")
+                    print("SEND TRACK RESULT REPLY ERROR:", str(e))
+                    try:
+                        bot.send_message(item["chat_id"], item["message"])
+                    except Exception as e2:
+                        print("SEND TRACK RESULT FALLBACK ERROR:", str(e2))
 
         except Exception as e:
             print("SIGNAL TRACKING LOOP ERROR:", str(e))
