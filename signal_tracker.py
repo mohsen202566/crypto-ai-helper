@@ -14,6 +14,12 @@ except Exception:
     def log_exception(section, exc, file_name=None, function_name=None, symbol=None):
         print(section, str(exc)); return str(exc)
 
+try:
+    from paper_trader import open_paper_trade, close_paper_trade_by_signal
+except Exception:
+    open_paper_trade = None
+    close_paper_trade_by_signal = None
+
 
 ACTIVE_SIGNALS_FILE = "active_signals.json"
 SIGNAL_STATS_FILE = "signal_stats.json"
@@ -320,6 +326,33 @@ def close_pending_setup(signal, reason):
 
     return f"🚫 ستاپ {signal.get('symbol')} لغو شد\n\nجهت: {fa_direction(signal.get('direction'))}\nعلت: {reason}"
 
+
+
+def try_open_paper_trade(signal):
+    """Paper Trade را امن باز می‌کند؛ اگر ماژول لود نشده باشد یا خطا دهد، Tracker کرش نمی‌کند."""
+    if not open_paper_trade:
+        return None
+
+    try:
+        ok, paper_msg = open_paper_trade(signal)
+        return paper_msg
+    except Exception as e:
+        print("PAPER TRADE OPEN ERROR:", str(e))
+        return f"⚠️ خطا در باز کردن Paper Trade برای {signal.get('symbol')}\nعلت: {str(e)[:300]}"
+
+
+def try_close_paper_trade(signal, result_type, exit_price):
+    """Paper Trade را امن می‌بندد؛ اگر پوزیشن متناظر نبود، فقط پیام خطا/هشدار می‌دهد و Tracker ادامه می‌دهد."""
+    if not close_paper_trade_by_signal:
+        return None
+
+    try:
+        ok, paper_msg = close_paper_trade_by_signal(signal, result_type, exit_price)
+        return paper_msg
+    except Exception as e:
+        print("PAPER TRADE CLOSE ERROR:", str(e))
+        return f"⚠️ خطا در بستن Paper Trade برای {signal.get('symbol')}\nعلت: {str(e)[:300]}"
+
 def add_signal_to_tracking(user_id, chat_id, message_id, result):
     if result.get("direction") == "NO TRADE":
         return False, "این تحلیل سیگنال قابل پیگیری ندارد."
@@ -442,7 +475,11 @@ def add_signal_to_tracking(user_id, chat_id, message_id, result):
     record_stat_event(signal, 'SETUP_CREATED')
     if initial_status == "ACTIVE":
         record_stat_event(signal, 'ACTIVATED')
-        return True, f"✅ سیگنال {signal['symbol']} فعال ذخیره شد و تا TP1/SL زیر نظر است."
+        msg = f"✅ سیگنال {signal['symbol']} فعال ذخیره شد و تا TP1/SL زیر نظر است."
+        paper_msg = try_open_paper_trade(signal)
+        if paper_msg:
+            msg += f"\n\n{paper_msg}"
+        return True, msg
 
     return True, f"👀 ستاپ {signal['symbol']} ذخیره شد و منتظر فعال‌سازی ورود است."
 
@@ -840,6 +877,7 @@ def check_active_signals():
 
                     if same_direction and activated_now and price_in_entry_zone(signal, price):
                         signal = activate_pending_signal(signal, price, live)
+                        paper_open_msg = try_open_paper_trade(signal)
                         activation_msg = (
                             "✅ ورود فعال شد\n\n"
                             f"ارز: {signal['symbol']}\n"
@@ -854,6 +892,12 @@ def check_active_signals():
                             "reply_to_message_id": signal.get("message_id"),
                             "message": activation_msg
                         })
+                        if paper_open_msg:
+                            messages.append({
+                                "chat_id": signal["chat_id"],
+                                "reply_to_message_id": signal.get("message_id"),
+                                "message": paper_open_msg
+                            })
                     else:
                         signal["last_checked_at"] = now_ts()
                         signal["last_checked_at_text"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -869,12 +913,19 @@ def check_active_signals():
             result_type, exit_price = detect_signal_hit_from_candles(signal)
 
             if result_type:
+                paper_close_msg = try_close_paper_trade(signal, result_type, exit_price)
                 msg = close_signal(signal, result_type, exit_price)
                 messages.append({
                     "chat_id": signal["chat_id"],
                     "reply_to_message_id": signal.get("message_id"),
                     "message": msg
                 })
+                if paper_close_msg:
+                    messages.append({
+                        "chat_id": signal["chat_id"],
+                        "reply_to_message_id": signal.get("message_id"),
+                        "message": paper_close_msg
+                    })
                 continue
 
             # برای هشدار ضعف، قیمت فعلی فقط جهت نمایش استفاده می‌شود؛
