@@ -32,6 +32,8 @@ try:
         set_trade_margin,
         set_leverage,
         set_max_open_positions,
+        reset_trade_stats,
+        set_trade_balance,
         format_trade_status,
         format_open_positions,
         format_trade_stats,
@@ -79,6 +81,12 @@ except Exception as e:
         return False, _paper_unavailable()
 
     def set_max_open_positions(value):
+        return False, _paper_unavailable()
+
+    def reset_trade_stats():
+        return _paper_unavailable()
+
+    def set_trade_balance(value):
         return False, _paper_unavailable()
 
 if not BOT_TOKEN:
@@ -233,6 +241,7 @@ def handle_trade_command(message, text):
         "ترید دلار", "دلار ترید", "حجم ترید", "مارجین ترید",
         "ترید لوریج", "لوریج ترید", "اهرم ترید",
         "حداکثر پوزیشن", "حد اکثر پوزیشن", "حداکثر معاملات",
+        "ریست ترید", "حذف آمار ترید", "حذف امار ترید", "ریست آمار ترید", "ریست امار ترید",
     ]
 
     if clean in owner_commands and not is_owner(user_id):
@@ -249,6 +258,22 @@ def handle_trade_command(message, text):
 
     if clean in ["توقف اضطراری", "استاپ ترید", "توقف ترید"]:
         bot.reply_to(message, emergency_stop())
+        return True
+
+    if clean in ["ریست ترید", "حذف آمار ترید", "حذف امار ترید", "ریست آمار ترید", "ریست امار ترید"]:
+        bot.reply_to(message, reset_trade_stats())
+        return True
+
+    if clean.startswith("سرمایه ترید "):
+        if not is_owner(user_id):
+            bot.reply_to(message, "⛔ فقط مالک ربات می‌تواند سرمایه ترید را تغییر دهد.")
+            return True
+        try:
+            value = clean.split()[-1]
+            ok, reply = set_trade_balance(value)
+            bot.reply_to(message, reply)
+        except Exception:
+            bot.reply_to(message, "فرمت درست: سرمایه ترید 50")
         return True
 
     if clean in ["ترید دلار", "دلار ترید", "حجم ترید", "مارجین ترید"]:
