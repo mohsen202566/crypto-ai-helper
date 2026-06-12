@@ -24,6 +24,10 @@ from auto_trade_config import (
 )
 
 
+MIN_START_BALANCE_USDT = 5
+MAX_START_BALANCE_USDT = 1000
+
+
 def now_ts():
     return int(time.time())
 
@@ -357,6 +361,61 @@ def close_paper_trade_by_signal(signal, result_type, exit_price):
         f"سود/ضرر: {closed['pnl_usdt']}$\n"
         f"درصد حرکت: {closed['move_percent']}٪\n"
         f"بالانس Paper: {state['paper_balance_usdt']}$"
+    )
+
+
+def reset_trade_stats():
+    """Reset Paper Trading history while preserving current trade settings."""
+    state = get_state()
+    start_balance = safe_float(state.get("start_balance_usdt"), DEFAULT_START_BALANCE_USDT)
+
+    state["paper_balance_usdt"] = round(start_balance, 4)
+    state["open_positions"] = []
+    state["closed_positions"] = []
+    state["cooldown_until"] = 0
+    state["emergency_stop"] = False
+    state["stats_reset_at"] = now_ts()
+    state["stats_reset_at_text"] = now_text()
+
+    save_state(state)
+    return (
+        "✅ آمار Paper Trading ریست شد.\n"
+        f"💰 سرمایه اولیه: {state['start_balance_usdt']}$\n"
+        f"💰 بالانس فعلی Paper: {state['paper_balance_usdt']}$"
+    )
+
+
+def set_trade_balance(value):
+    """Set Paper Trading starting balance and reset Paper Trading stats."""
+    raw_value = safe_float(value, -1)
+
+    # سرمایه باید عدد صحیح باشد تا خطای تایپی مثل 50.5 وارد آمار نشود.
+    try:
+        text_value = str(value).strip()
+        if not text_value.isdigit():
+            return False, "❌ فرمت درست: سرمایه ترید 50"
+    except Exception:
+        return False, "❌ فرمت درست: سرمایه ترید 50"
+
+    balance = int(raw_value)
+    if balance < MIN_START_BALANCE_USDT or balance > MAX_START_BALANCE_USDT:
+        return False, f"❌ سرمایه ترید باید بین {MIN_START_BALANCE_USDT} تا {MAX_START_BALANCE_USDT} دلار باشد."
+
+    state = get_state()
+    state["start_balance_usdt"] = float(balance)
+    state["paper_balance_usdt"] = float(balance)
+    state["open_positions"] = []
+    state["closed_positions"] = []
+    state["cooldown_until"] = 0
+    state["emergency_stop"] = False
+    state["stats_reset_at"] = now_ts()
+    state["stats_reset_at_text"] = now_text()
+
+    save_state(state)
+    return True, (
+        f"✅ سرمایه Paper Trading روی {balance}$ تنظیم شد.\n"
+        "📊 آمار ترید ریست شد و از نو شروع شد.\n"
+        f"💰 بالانس فعلی Paper: {balance}$"
     )
 
 
