@@ -130,11 +130,26 @@ def get_today_pnl(state=None):
     return round(sum(safe_float(p.get("pnl_usdt")) for p in get_today_closed_positions(state)), 4)
 
 
+def get_account_base_loss(state=None):
+    """
+    ضرر واقعی از اصل سرمایه را حساب می‌کند، نه مجموع SLها.
+    اگر حساب هنوز بالاتر از بالانس شروع باشد، ضرر = 0 است.
+    مثال: شروع 50، بالانس 53.5 => ضرر 0
+    مثال: شروع 50، بالانس 43 => ضرر 7
+    """
+    state = state or get_state()
+    start_balance = safe_float(state.get("start_balance_usdt"), DEFAULT_START_BALANCE_USDT)
+    current_balance = safe_float(state.get("paper_balance_usdt"), start_balance)
+    return round(max(0.0, start_balance - current_balance), 4)
+
+
 def check_daily_loss_lock(state):
-    today_pnl = get_today_pnl(state)
+    # قفل ضرر باید فقط وقتی فعال شود که ضرر از اصل سرمایه به حد مجاز برسد،
+    # نه وقتی چند SL از سودهای قبلی کم شده‌اند.
+    account_base_loss = get_account_base_loss(state)
     max_loss = abs(safe_float(state.get("daily_max_loss_usdt"), DEFAULT_DAILY_MAX_LOSS_USDT))
 
-    if today_pnl <= -max_loss:
+    if account_base_loss >= max_loss:
         hours = safe_int(state.get("cooldown_after_daily_loss_hours"), DEFAULT_COOLDOWN_AFTER_DAILY_LOSS_HOURS)
         state["enabled"] = False
         state["cooldown_until"] = now_ts() + hours * 3600
@@ -413,8 +428,9 @@ def format_trade_status():
 پوزیشن باز: {open_count}/{max_pos}
 اسلات خالی: {open_slots_count(state)}
 
-ضرر امروز: {get_today_pnl(state)}$
-حد ضرر روزانه: {state.get('daily_max_loss_usdt')}$
+سود/ضرر امروز: {get_today_pnl(state)}$
+ضرر از اصل سرمایه: {get_account_base_loss(state)}$
+حد ضرر از اصل سرمایه: {state.get('daily_max_loss_usdt')}$
 قفل ضرر روزانه: {cooldown_text(state)}
 """
 
@@ -468,6 +484,7 @@ Win Rate: {win_rate}٪
 
 سود/ضرر امروز: {today_pnl}$
 سود/ضرر کل: {total_pnl}$
+ضرر از اصل سرمایه: {get_account_base_loss(state)}$
 
 حجم هر پوزیشن: {state.get('trade_margin_usdt')}$
 لوریج: {state.get('leverage')}x
