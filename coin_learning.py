@@ -42,30 +42,47 @@ def _ensure_coin_stats(data, symbol, direction):
         data["coins"][key] = {
             "symbol": symbol,
             "direction": direction,
+
             "total": 0,
             "tp1": 0,
             "tp2": 0,
             "sl": 0,
+
             "ghost_total": 0,
             "ghost_tp1": 0,
             "ghost_tp2": 0,
             "ghost_sl": 0,
+
             "moves": [],
+            "rsi_values": [],
+            "adx_values": [],
+            "power2_buy_values": [],
+            "power2_sell_values": [],
+
             "last_updated": None
         }
 
     return data["coins"][key]
 
 
+def _get_signal_id(result):
+    return (
+        result.get("signal_id")
+        or result.get("id")
+        or f"{result.get('symbol')}_{result.get('direction')}_{int(datetime.utcnow().timestamp())}"
+    )
+
+
 def create_signal_snapshot(result, signal_type="REAL"):
     return {
-        "id": result.get("signal_id") or f"{result.get('symbol')}_{int(datetime.utcnow().timestamp())}",
+        "id": _get_signal_id(result),
         "signal_type": signal_type,
 
         "symbol": result.get("symbol"),
         "direction": result.get("direction"),
 
-        "entry": result.get("entry"),
+        "entry": result.get("entry") or result.get("price"),
+        "price": result.get("price") or result.get("entry"),
         "tp1": result.get("tp1"),
         "tp2": result.get("tp2"),
         "stop_loss": result.get("stop_loss"),
@@ -73,6 +90,9 @@ def create_signal_snapshot(result, signal_type="REAL"):
         "score": result.get("score"),
         "confirmations": result.get("confirmations"),
         "risk_level": result.get("risk_level"),
+        "risk_reward": result.get("risk_reward"),
+        "entry_mode": result.get("entry_mode"),
+        "freshness": result.get("freshness"),
 
         "rsi": result.get("rsi"),
         "adx": result.get("adx"),
@@ -82,15 +102,22 @@ def create_signal_snapshot(result, signal_type="REAL"):
 
         "buy_power": result.get("buy_power"),
         "sell_power": result.get("sell_power"),
-        "buy_power_2": result.get("buy_power_2"),
-        "sell_power_2": result.get("sell_power_2"),
-        "buy_power_3": result.get("buy_power_3"),
-        "sell_power_3": result.get("sell_power_3"),
+
+        "power2_buy": result.get("power2_buy") or result.get("buy_power_2"),
+        "power2_sell": result.get("power2_sell") or result.get("sell_power_2"),
+        "power3_buy": result.get("power3_buy") or result.get("buy_power_3"),
+        "power3_sell": result.get("power3_sell") or result.get("sell_power_3"),
 
         "atr": result.get("atr"),
-        "market_mode": result.get("market_mode"),
+        "market_mode": result.get("market_mode") or result.get("market_regime"),
         "coin_behavior": result.get("coin_behavior"),
         "btc_bias": result.get("btc_bias"),
+
+        "support": result.get("support"),
+        "resistance": result.get("resistance"),
+        "sr_timeframe": result.get("sr_timeframe"),
+
+        "reasons": result.get("reasons", []),
 
         "created_at": _now(),
         "closed_at": None,
@@ -111,17 +138,42 @@ def record_signal(result, signal_type="REAL"):
     data = load_learning()
     snapshot = create_signal_snapshot(result, signal_type=signal_type)
 
+    existing_ids = {str(x.get("id")) for x in data["signals"]}
+    if str(snapshot["id"]) in existing_ids:
+        return snapshot["id"]
+
     data["signals"].append(snapshot)
+    data["signals"] = data["signals"][-10000:]
 
     stats = _ensure_coin_stats(data, snapshot["symbol"], snapshot["direction"])
+
     if signal_type == "GHOST":
         stats["ghost_total"] += 1
     else:
         stats["total"] += 1
 
+    _append_indicator_values(stats, snapshot)
     stats["last_updated"] = _now()
+
     save_learning(data)
     return snapshot["id"]
+
+
+def _append_float(target_list, value, max_len=300):
+    try:
+        if value is None:
+            return
+        target_list.append(float(value))
+        del target_list[:-max_len]
+    except Exception:
+        return
+
+
+def _append_indicator_values(stats, snapshot):
+    _append_float(stats.setdefault("rsi_values", []), snapshot.get("rsi"))
+    _append_float(stats.setdefault("adx_values", []), snapshot.get("adx"))
+    _append_float(stats.setdefault("power2_buy_values", []), snapshot.get("power2_buy"))
+    _append_float(stats.setdefault("power2_sell_values", []), snapshot.get("power2_sell"))
 
 
 def update_signal_result(signal_id, result, exit_price=None, move_percent=None, holding_minutes=None):
@@ -174,11 +226,7 @@ def update_signal_result(signal_id, result, exit_price=None, move_percent=None, 
             stats["sl"] += 1
 
     if move_percent is not None:
-        try:
-            stats["moves"].append(float(move_percent))
-            stats["moves"] = stats["moves"][-200:]
-        except Exception:
-            pass
+        _append_float(stats.setdefault("moves", []), move_percent, max_len=500)
 
     stats["last_updated"] = _now()
     save_learning(data)
@@ -187,16 +235,16 @@ def update_signal_result(signal_id, result, exit_price=None, move_percent=None, 
 
 def get_coin_stats(symbol, direction=None):
     data = load_learning()
-    results = []
+    rows = []
 
-    for key, stats in data.get("coins", {}).items():
+    for stats in data.get("coins", {}).values():
         if stats.get("symbol") != symbol:
             continue
         if direction and stats.get("direction") != direction:
             continue
-        results.append(stats)
+        rows.append(stats)
 
-    return results
+    return rows
 
 
 def calculate_win_rate(stats):
@@ -208,11 +256,17 @@ def calculate_win_rate(stats):
     return round((wins / total_closed) * 100, 2)
 
 
-def average_move(stats):
-    moves = stats.get("moves") or []
-    if not moves:
+def average_list(values):
+    if not values:
         return 0.0
-    return round(sum(moves) / len(moves), 4)
+    try:
+        return round(sum(float(x) for x in values) / len(values), 4)
+    except Exception:
+        return 0.0
+
+
+def average_move(stats):
+    return average_list(stats.get("moves") or [])
 
 
 def format_coin_behavior(symbol):
@@ -227,13 +281,17 @@ def format_coin_behavior(symbol):
         direction = stats.get("direction")
         wr = calculate_win_rate(stats)
         avg_move = average_move(stats)
+        avg_rsi = average_list(stats.get("rsi_values") or [])
+        avg_adx = average_list(stats.get("adx_values") or [])
 
         text += (
             f"{direction}\n"
             f"معاملات: {stats.get('total', 0)}\n"
             f"TP1: {stats.get('tp1', 0)} | TP2: {stats.get('tp2', 0)} | SL: {stats.get('sl', 0)}\n"
             f"Win Rate: {wr}%\n"
-            f"میانگین حرکت: {avg_move}%\n\n"
+            f"میانگین حرکت: {avg_move}%\n"
+            f"میانگین RSI: {avg_rsi}\n"
+            f"میانگین ADX: {avg_adx}\n\n"
         )
 
     return text.strip()
@@ -250,11 +308,60 @@ def format_learning_summary():
     total_tp2 = sum(int(x.get("tp2", 0)) for x in coins.values())
     total_sl = sum(int(x.get("sl", 0)) for x in coins.values())
 
+    ghost_total = sum(int(x.get("ghost_total", 0)) for x in coins.values())
+    ghost_tp1 = sum(int(x.get("ghost_tp1", 0)) for x in coins.values())
+    ghost_tp2 = sum(int(x.get("ghost_tp2", 0)) for x in coins.values())
+    ghost_sl = sum(int(x.get("ghost_sl", 0)) for x in coins.values())
+
     return (
         "🧠 حافظه یادگیری ربات\n\n"
         f"کل رکوردها: {total_signals}\n"
-        f"کوین/جهت‌های ثبت‌شده: {total_coins}\n"
+        f"کوین/جهت‌های ثبت‌شده: {total_coins}\n\n"
+        f"واقعی:\n"
         f"TP1: {total_tp1}\n"
         f"TP2: {total_tp2}\n"
-        f"SL: {total_sl}"
+        f"SL: {total_sl}\n\n"
+        f"مخفی:\n"
+        f"Ghost Total: {ghost_total}\n"
+        f"Ghost TP1: {ghost_tp1}\n"
+        f"Ghost TP2: {ghost_tp2}\n"
+        f"Ghost SL: {ghost_sl}"
     )
+
+
+def format_smart_stats():
+    data = load_learning()
+    coins = list(data.get("coins", {}).values())
+
+    if not coins:
+        return "هنوز داده‌ای برای آمار هوشمند ثبت نشده."
+
+    rows = []
+    for stats in coins:
+        closed = int(stats.get("tp1", 0)) + int(stats.get("tp2", 0)) + int(stats.get("sl", 0))
+        if closed <= 0:
+            continue
+        rows.append({
+            "symbol": stats.get("symbol"),
+            "direction": stats.get("direction"),
+            "closed": closed,
+            "wr": calculate_win_rate(stats),
+            "sl": int(stats.get("sl", 0)),
+            "avg_move": average_move(stats)
+        })
+
+    if not rows:
+        return "هنوز نتیجه TP/SL کافی برای آمار هوشمند ثبت نشده."
+
+    best = sorted(rows, key=lambda x: (x["wr"], x["closed"]), reverse=True)[:5]
+    worst = sorted(rows, key=lambda x: (x["sl"], -x["wr"]), reverse=True)[:5]
+
+    text = "📊 آمار هوشمند\n\n🏆 بهترین‌ها:\n"
+    for x in best:
+        text += f"{x['symbol']} {x['direction']} | WR: {x['wr']}% | معاملات: {x['closed']} | حرکت: {x['avg_move']}%\n"
+
+    text += "\n⚠️ ضعیف‌ترین‌ها:\n"
+    for x in worst:
+        text += f"{x['symbol']} {x['direction']} | SL: {x['sl']} | WR: {x['wr']}% | معاملات: {x['closed']}\n"
+
+    return text.strip()
