@@ -35,37 +35,62 @@ def _coin_key(symbol, direction):
     return f"{symbol}_{direction}"
 
 
+def _safe_float(value):
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def _avg(values):
+    clean = []
+    for v in values or []:
+        x = _safe_float(v)
+        if x is not None:
+            clean.append(x)
+    if not clean:
+        return 0.0
+    return round(sum(clean) / len(clean), 4)
+
+
+def _append_limited(lst, value, limit=500):
+    x = _safe_float(value)
+    if x is None:
+        return
+    lst.append(x)
+    del lst[:-limit]
+
+
 def _ensure_coin_stats(data, symbol, direction):
     key = _coin_key(symbol, direction)
-
     if key not in data["coins"]:
         data["coins"][key] = {
             "symbol": symbol,
             "direction": direction,
-
             "total": 0,
             "tp1": 0,
             "tp2": 0,
             "sl": 0,
-
             "ghost_total": 0,
             "ghost_tp1": 0,
             "ghost_tp2": 0,
             "ghost_sl": 0,
-
             "moves": [],
             "rsi_values": [],
             "adx_values": [],
+            "macd_hist_values": [],
             "power2_buy_values": [],
             "power2_sell_values": [],
-
+            "power3_buy_values": [],
+            "power3_sell_values": [],
             "last_updated": None
         }
-
     return data["coins"][key]
 
 
-def _get_signal_id(result):
+def _signal_id(result):
     return (
         result.get("signal_id")
         or result.get("id")
@@ -75,9 +100,8 @@ def _get_signal_id(result):
 
 def create_signal_snapshot(result, signal_type="REAL"):
     return {
-        "id": _get_signal_id(result),
+        "id": _signal_id(result),
         "signal_type": signal_type,
-
         "symbol": result.get("symbol"),
         "direction": result.get("direction"),
 
@@ -100,13 +124,13 @@ def create_signal_snapshot(result, signal_type="REAL"):
         "macd_signal": result.get("macd_signal"),
         "macd_hist": result.get("macd_hist"),
 
-        "buy_power": result.get("buy_power"),
-        "sell_power": result.get("sell_power"),
-
         "power2_buy": result.get("power2_buy") or result.get("buy_power_2"),
         "power2_sell": result.get("power2_sell") or result.get("sell_power_2"),
         "power3_buy": result.get("power3_buy") or result.get("buy_power_3"),
         "power3_sell": result.get("power3_sell") or result.get("sell_power_3"),
+
+        "buy_power": result.get("buy_power"),
+        "sell_power": result.get("sell_power"),
 
         "atr": result.get("atr"),
         "market_mode": result.get("market_mode") or result.get("market_regime"),
@@ -131,19 +155,18 @@ def create_signal_snapshot(result, signal_type="REAL"):
 def record_signal(result, signal_type="REAL"):
     if not is_learning_enabled():
         return False
-
     if not result or result.get("direction") not in ["LONG", "SHORT"]:
         return False
 
     data = load_learning()
-    snapshot = create_signal_snapshot(result, signal_type=signal_type)
+    snapshot = create_signal_snapshot(result, signal_type)
 
-    existing_ids = {str(x.get("id")) for x in data["signals"]}
-    if str(snapshot["id"]) in existing_ids:
+    existing = {str(x.get("id")) for x in data["signals"]}
+    if str(snapshot["id"]) in existing:
         return snapshot["id"]
 
     data["signals"].append(snapshot)
-    data["signals"] = data["signals"][-10000:]
+    data["signals"] = data["signals"][-20000:]
 
     stats = _ensure_coin_stats(data, snapshot["symbol"], snapshot["direction"])
 
@@ -152,28 +175,17 @@ def record_signal(result, signal_type="REAL"):
     else:
         stats["total"] += 1
 
-    _append_indicator_values(stats, snapshot)
-    stats["last_updated"] = _now()
+    _append_limited(stats["rsi_values"], snapshot.get("rsi"))
+    _append_limited(stats["adx_values"], snapshot.get("adx"))
+    _append_limited(stats["macd_hist_values"], snapshot.get("macd_hist"))
+    _append_limited(stats["power2_buy_values"], snapshot.get("power2_buy"))
+    _append_limited(stats["power2_sell_values"], snapshot.get("power2_sell"))
+    _append_limited(stats["power3_buy_values"], snapshot.get("power3_buy"))
+    _append_limited(stats["power3_sell_values"], snapshot.get("power3_sell"))
 
+    stats["last_updated"] = _now()
     save_learning(data)
     return snapshot["id"]
-
-
-def _append_float(target_list, value, max_len=300):
-    try:
-        if value is None:
-            return
-        target_list.append(float(value))
-        del target_list[:-max_len]
-    except Exception:
-        return
-
-
-def _append_indicator_values(stats, snapshot):
-    _append_float(stats.setdefault("rsi_values", []), snapshot.get("rsi"))
-    _append_float(stats.setdefault("adx_values", []), snapshot.get("adx"))
-    _append_float(stats.setdefault("power2_buy_values", []), snapshot.get("power2_buy"))
-    _append_float(stats.setdefault("power2_sell_values", []), snapshot.get("power2_sell"))
 
 
 def update_signal_result(signal_id, result, exit_price=None, move_percent=None, holding_minutes=None):
@@ -188,10 +200,7 @@ def update_signal_result(signal_id, result, exit_price=None, move_percent=None, 
             found = item
             break
 
-    if not found:
-        return False
-
-    if found.get("result"):
+    if not found or found.get("result"):
         return False
 
     result = str(result).upper()
@@ -204,11 +213,8 @@ def update_signal_result(signal_id, result, exit_price=None, move_percent=None, 
     found["holding_minutes"] = holding_minutes
     found["closed_at"] = _now()
 
-    symbol = found.get("symbol")
-    direction = found.get("direction")
+    stats = _ensure_coin_stats(data, found.get("symbol"), found.get("direction"))
     signal_type = found.get("signal_type", "REAL")
-
-    stats = _ensure_coin_stats(data, symbol, direction)
 
     if signal_type == "GHOST":
         if result == "TP1":
@@ -226,47 +232,35 @@ def update_signal_result(signal_id, result, exit_price=None, move_percent=None, 
             stats["sl"] += 1
 
     if move_percent is not None:
-        _append_float(stats.setdefault("moves", []), move_percent, max_len=500)
+        _append_limited(stats["moves"], move_percent)
 
     stats["last_updated"] = _now()
     save_learning(data)
     return True
 
 
+def calculate_win_rate(stats):
+    closed = int(stats.get("tp1", 0)) + int(stats.get("tp2", 0)) + int(stats.get("sl", 0))
+    if closed <= 0:
+        return 0.0
+    wins = int(stats.get("tp1", 0)) + int(stats.get("tp2", 0))
+    return round((wins / closed) * 100, 2)
+
+
+def average_move(stats):
+    return _avg(stats.get("moves") or [])
+
+
 def get_coin_stats(symbol, direction=None):
     data = load_learning()
     rows = []
-
     for stats in data.get("coins", {}).values():
         if stats.get("symbol") != symbol:
             continue
         if direction and stats.get("direction") != direction:
             continue
         rows.append(stats)
-
     return rows
-
-
-def calculate_win_rate(stats):
-    total_closed = int(stats.get("tp1", 0)) + int(stats.get("tp2", 0)) + int(stats.get("sl", 0))
-    if total_closed <= 0:
-        return 0.0
-
-    wins = int(stats.get("tp1", 0)) + int(stats.get("tp2", 0))
-    return round((wins / total_closed) * 100, 2)
-
-
-def average_list(values):
-    if not values:
-        return 0.0
-    try:
-        return round(sum(float(x) for x in values) / len(values), 4)
-    except Exception:
-        return 0.0
-
-
-def average_move(stats):
-    return average_list(stats.get("moves") or [])
 
 
 def format_coin_behavior(symbol):
@@ -278,20 +272,15 @@ def format_coin_behavior(symbol):
     text = f"🧠 رفتار کوین {symbol}\n\n"
 
     for stats in rows:
-        direction = stats.get("direction")
-        wr = calculate_win_rate(stats)
-        avg_move = average_move(stats)
-        avg_rsi = average_list(stats.get("rsi_values") or [])
-        avg_adx = average_list(stats.get("adx_values") or [])
-
         text += (
-            f"{direction}\n"
+            f"{stats.get('direction')}\n"
             f"معاملات: {stats.get('total', 0)}\n"
             f"TP1: {stats.get('tp1', 0)} | TP2: {stats.get('tp2', 0)} | SL: {stats.get('sl', 0)}\n"
-            f"Win Rate: {wr}%\n"
-            f"میانگین حرکت: {avg_move}%\n"
-            f"میانگین RSI: {avg_rsi}\n"
-            f"میانگین ADX: {avg_adx}\n\n"
+            f"Win Rate: {calculate_win_rate(stats)}%\n"
+            f"میانگین حرکت: {average_move(stats)}%\n"
+            f"میانگین RSI: {_avg(stats.get('rsi_values'))}\n"
+            f"میانگین ADX: {_avg(stats.get('adx_values'))}\n"
+            f"میانگین MACD Hist: {_avg(stats.get('macd_hist_values'))}\n\n"
         )
 
     return text.strip()
@@ -331,13 +320,9 @@ def format_learning_summary():
 
 def format_smart_stats():
     data = load_learning()
-    coins = list(data.get("coins", {}).values())
-
-    if not coins:
-        return "هنوز داده‌ای برای آمار هوشمند ثبت نشده."
-
     rows = []
-    for stats in coins:
+
+    for stats in data.get("coins", {}).values():
         closed = int(stats.get("tp1", 0)) + int(stats.get("tp2", 0)) + int(stats.get("sl", 0))
         if closed <= 0:
             continue
@@ -345,20 +330,21 @@ def format_smart_stats():
             "symbol": stats.get("symbol"),
             "direction": stats.get("direction"),
             "closed": closed,
-            "wr": calculate_win_rate(stats),
+            "tp": int(stats.get("tp1", 0)) + int(stats.get("tp2", 0)),
             "sl": int(stats.get("sl", 0)),
-            "avg_move": average_move(stats)
+            "wr": calculate_win_rate(stats),
+            "move": average_move(stats)
         })
 
     if not rows:
-        return "هنوز نتیجه TP/SL کافی برای آمار هوشمند ثبت نشده."
+        return "هنوز نتیجه کافی برای آمار هوشمند ثبت نشده."
 
     best = sorted(rows, key=lambda x: (x["wr"], x["closed"]), reverse=True)[:5]
     worst = sorted(rows, key=lambda x: (x["sl"], -x["wr"]), reverse=True)[:5]
 
     text = "📊 آمار هوشمند\n\n🏆 بهترین‌ها:\n"
     for x in best:
-        text += f"{x['symbol']} {x['direction']} | WR: {x['wr']}% | معاملات: {x['closed']} | حرکت: {x['avg_move']}%\n"
+        text += f"{x['symbol']} {x['direction']} | WR: {x['wr']}% | معاملات: {x['closed']} | حرکت: {x['move']}%\n"
 
     text += "\n⚠️ ضعیف‌ترین‌ها:\n"
     for x in worst:
