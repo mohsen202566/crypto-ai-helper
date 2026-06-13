@@ -1,60 +1,167 @@
 # -*- coding: utf-8 -*-
+
 import os
 
 
-def get_env_str(name, default=None):
-    value = os.getenv(name)
-    if value is None:
-        return default
-    value = str(value).strip()
-    return value if value else default
+# ============================================================
+# Telegram
+# ============================================================
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+
+OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
+
+ALLOWED_USER_IDS = [
+    int(x.strip())
+    for x in os.getenv("ALLOWED_USER_IDS", "").split(",")
+    if x.strip().isdigit()
+]
+
+if OWNER_ID and OWNER_ID not in ALLOWED_USER_IDS:
+    ALLOWED_USER_IDS.append(OWNER_ID)
 
 
-def get_env_int(name, default):
-    try:
-        return int(get_env_str(name, default))
-    except Exception:
-        return int(default)
+# ============================================================
+# Auto Signal
+# ============================================================
+
+AUTO_SIGNAL_ENABLED = os.getenv(
+    "AUTO_SIGNAL_ENABLED",
+    "true",
+).lower() == "true"
+
+AUTO_SCAN_INTERVAL_MINUTES = int(
+    os.getenv("AUTO_SCAN_INTERVAL_MINUTES", "5")
+)
+
+AUTO_DIRECT_SCORE_MIN = int(
+    os.getenv("AUTO_DIRECT_SCORE_MIN", "82")
+)
 
 
-def get_env_float(name, default):
-    try:
-        return float(get_env_str(name, default))
-    except Exception:
-        return float(default)
+# ============================================================
+# Analysis Thresholds
+# ============================================================
+
+MIN_DIRECT_SCORE = int(
+    os.getenv("MIN_DIRECT_SCORE", "82")
+)
+
+MIN_MANUAL_CONFIRMATIONS = int(
+    os.getenv("MIN_MANUAL_CONFIRMATIONS", "4")
+)
+
+MIN_ADX_FOR_TREND = float(
+    os.getenv("MIN_ADX_FOR_TREND", "20")
+)
 
 
-def get_env_bool(name, default=True):
-    value = get_env_str(name)
-    if value is None:
-        return bool(default)
-    return value.lower() in ["1", "true", "yes", "on", "enable", "enabled"]
+# ============================================================
+# Slot / Position Limits
+# ============================================================
+
+MAX_ACTIVE_POSITIONS = int(
+    os.getenv("MAX_ACTIVE_POSITIONS", "5")
+)
+
+MAX_POSITIONS_PER_SYMBOL = int(
+    os.getenv("MAX_POSITIONS_PER_SYMBOL", "1")
+)
 
 
-BOT_TOKEN = get_env_str("BOT_TOKEN")
-OWNER_ID = get_env_int("OWNER_ID", 1055122209)
-ALLOWED_USERS = [OWNER_ID]
-
-# Auto signal: standard technical direct signals only
-AUTO_SIGNAL_ENABLED = get_env_bool("AUTO_SIGNAL_ENABLED", True)
-AUTO_SIGNAL_SCORE = get_env_int("AUTO_SIGNAL_SCORE", 75)
-AUTO_SIGNAL_COOLDOWN_MINUTES = get_env_int("AUTO_SIGNAL_COOLDOWN_MINUTES", 120)
-AUTO_SCAN_INTERVAL_MINUTES = get_env_int("AUTO_SCAN_INTERVAL_MINUTES", 3)
-AUTO_SCAN_MAX_SYMBOLS = get_env_int("AUTO_SCAN_MAX_SYMBOLS", 70)
-AUTO_TRACK_AUTO_SIGNALS = get_env_bool("AUTO_TRACK_AUTO_SIGNALS", True)
-
+# ============================================================
 # Tracker
-TRACKER_CHECK_INTERVAL_SECONDS = get_env_int("TRACKER_CHECK_INTERVAL_SECONDS", 30)
+# ============================================================
 
-# Technical engine tuning: balanced, not too dry and not too loose
-MIN_DIRECT_SCORE = get_env_int("MIN_DIRECT_SCORE", 70)
-MIN_AUTO_CONFIRMATIONS = get_env_int("MIN_AUTO_CONFIRMATIONS", 4)
-MIN_MANUAL_CONFIRMATIONS = get_env_int("MIN_MANUAL_CONFIRMATIONS", 3)
-MIN_ADX_FOR_TREND = get_env_float("MIN_ADX_FOR_TREND", 14)
+TRACKER_CHECK_INTERVAL_SECONDS = int(
+    os.getenv("TRACKER_CHECK_INTERVAL_SECONDS", "20")
+)
 
-# Risk display
-MAX_LEVERAGE_SUGGESTION = get_env_int("MAX_LEVERAGE_SUGGESTION", 5)
-RISK_PER_TRADE_PERCENT = get_env_int("RISK_PER_TRADE_PERCENT", 1)
 
-# Market data cache used by market_sentiment.py if present
-MARKET_SENTIMENT_CACHE_SECONDS = get_env_int("MARKET_SENTIMENT_CACHE_SECONDS", 1800)
+# ============================================================
+# Paper Trading
+# ============================================================
+
+PAPER_TRADING_ENABLED = os.getenv(
+    "PAPER_TRADING_ENABLED",
+    "true",
+).lower() == "true"
+
+
+# ============================================================
+# AI / Learning
+# ============================================================
+
+AI_ENABLED = os.getenv(
+    "AI_ENABLED",
+    "true",
+).lower() == "true"
+
+AI_LEARNING_ENABLED = os.getenv(
+    "AI_LEARNING_ENABLED",
+    "true",
+).lower() == "true"
+
+GHOST_LEARNING_ENABLED = os.getenv(
+    "GHOST_LEARNING_ENABLED",
+    "true",
+).lower() == "true"
+
+MAX_GHOST_SIGNALS = int(
+    os.getenv("MAX_GHOST_SIGNALS", "500")
+)
+
+
+# ============================================================
+# Coin Risk
+# ============================================================
+
+DAILY_SL_STRICTNESS_START = int(
+    os.getenv("DAILY_SL_STRICTNESS_START", "3")
+)
+
+MAX_DAILY_STRICTNESS_LEVEL = int(
+    os.getenv("MAX_DAILY_STRICTNESS_LEVEL", "5")
+)
+
+
+# ============================================================
+# Scan Symbols
+# ============================================================
+
+SCAN_SYMBOLS = [
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT",
+    "BNBUSDT",
+    "XRPUSDT",
+    "DOGEUSDT",
+    "ADAUSDT",
+    "AVAXUSDT",
+    "LINKUSDT",
+    "TONUSDT",
+    "TRXUSDT",
+    "DOTUSDT",
+    "LTCUSDT",
+    "BCHUSDT",
+    "UNIUSDT",
+    "APTUSDT",
+    "ARBUSDT",
+    "OPUSDT",
+    "NEARUSDT",
+    "FILUSDT",
+    "INJUSDT",
+    "ATOMUSDT",
+    "SUIUSDT",
+    "SEIUSDT",
+    "ETCUSDT",
+    "AAVEUSDT",
+    "ICPUSDT",
+    "TIAUSDT",
+    "ORDIUSDT",
+    "WIFUSDT",
+    "PEPEUSDT",
+    "SHIBUSDT",
+    "FLOKIUSDT",
+    "BONKUSDT",
+]
