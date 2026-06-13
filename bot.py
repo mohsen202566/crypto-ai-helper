@@ -22,6 +22,7 @@ from signal_tracker import (
     get_profit_simulation_report,
     reset_stats,
     can_add_automatic_signal,
+    get_symbol_stats_report,
 )
 
 # Paper Trade / Trade commands
@@ -153,6 +154,31 @@ def is_market_status_command(text):
         "محاسبه وضعیت بازار",
         "بررسی",
     ]
+
+
+def is_symbol_stats_command(text):
+    clean = _normalize_trade_text(text)
+    commands = [
+        "آمار کلی ارزها", "امار کلی ارزها",
+        "آمار ارزها", "امار ارزها",
+        "بهترین ارزها",
+        "بدترین ارزها", "ضعیف ترین ارزها", "ضعیف‌ترین ارزها",
+    ]
+    if clean in commands:
+        return True
+    for prefix in commands:
+        if clean.startswith(prefix + " "):
+            return True
+    return False
+
+
+def get_symbol_stats_mode(text):
+    clean = _normalize_trade_text(text)
+    if clean.startswith("بهترین ارزها"):
+        return "best"
+    if clean.startswith("بدترین ارزها") or clean.startswith("ضعیف ترین ارزها") or clean.startswith("ضعیف‌ترین ارزها"):
+        return "worst"
+    return "all"
 
 
 
@@ -830,6 +856,13 @@ def handle_message(message):
         )
 
         bot.reply_to(message, msg)
+        return
+
+    if is_symbol_stats_command(text):
+        days = parse_days_from_text(text)
+        mode = get_symbol_stats_mode(text)
+        report = get_symbol_stats_report(days, mode=mode)
+        bot.reply_to(message, report)
         return
 
     if is_stats_command(text):
