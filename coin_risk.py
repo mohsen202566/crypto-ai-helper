@@ -50,14 +50,64 @@ def _ensure_coin(day_data, symbol, direction):
         day_data[key] = {
             "symbol": symbol,
             "direction": direction,
+
             "sl_count": 0,
             "tp_count": 0,
+
             "risk_level": "NORMAL",
             "strictness": 0,
+
+            "risk_score": 0,
+            "priority_score": 100,
+
+            "bad_day": False,
+            "recommend_reduce": False,
+
             "updated_at": None
         }
 
     return day_data[key]
+
+
+def _recalculate_risk(item):
+    sl = int(item.get("sl_count", 0))
+    tp = int(item.get("tp_count", 0))
+
+    if sl <= 2:
+        item["risk_level"] = "NORMAL"
+        item["strictness"] = 0
+        item["risk_score"] = sl * 10
+
+    elif sl == 3:
+        item["risk_level"] = "CAUTION"
+        item["strictness"] = 1
+        item["risk_score"] = 40
+
+    elif sl == 4:
+        item["risk_level"] = "HIGH"
+        item["strictness"] = 2
+        item["risk_score"] = 60
+
+    elif sl == 5:
+        item["risk_level"] = "VERY_HIGH"
+        item["strictness"] = 3
+        item["risk_score"] = 80
+
+    else:
+        item["risk_level"] = "EXTREME"
+        item["strictness"] = 4
+        item["risk_score"] = 100
+
+    item["priority_score"] = max(
+        0,
+        100 + (tp * 3) - (sl * 10)
+    )
+
+    item["bad_day"] = sl >= 5
+    item["recommend_reduce"] = sl >= 6
+    item["updated_at"] = _now()
+
+    return item
 
 
 def register_result(symbol, direction, result):
@@ -71,26 +121,12 @@ def register_result(symbol, direction, result):
     result = str(result).upper()
 
     if result == "SL":
-        item["sl_count"] += 1
+        item["sl_count"] = int(item.get("sl_count", 0)) + 1
+
     elif result in ["TP1", "TP2"]:
-        item["tp_count"] += 1
+        item["tp_count"] = int(item.get("tp_count", 0)) + 1
 
-    sl = item["sl_count"]
-
-    if sl <= 2:
-        item["risk_level"] = "NORMAL"
-        item["strictness"] = 0
-    elif sl == 3:
-        item["risk_level"] = "CAUTION"
-        item["strictness"] = 1
-    elif sl == 4:
-        item["risk_level"] = "HIGH"
-        item["strictness"] = 2
-    else:
-        item["risk_level"] = "EXTREME"
-        item["strictness"] = 3
-
-    item["updated_at"] = _now()
+    _recalculate_risk(item)
     save_risk(data)
     return item
 
@@ -98,14 +134,21 @@ def register_result(symbol, direction, result):
 def get_risk(symbol, direction):
     data = load_risk()
     day_data = data.get("daily", {}).get(_today(), {})
-    return day_data.get(_key(symbol, direction), {
+
+    default = {
         "symbol": symbol,
         "direction": direction,
         "sl_count": 0,
         "tp_count": 0,
         "risk_level": "NORMAL",
-        "strictness": 0
-    })
+        "strictness": 0,
+        "risk_score": 0,
+        "priority_score": 100,
+        "bad_day": False,
+        "recommend_reduce": False
+    }
+
+    return day_data.get(_key(symbol, direction), default)
 
 
 def get_strictness(symbol, direction):
@@ -118,6 +161,64 @@ def get_strictness(symbol, direction):
 
 def should_be_extra_strict(symbol, direction):
     return get_strictness(symbol, direction) > 0
+
+
+def get_risk_score(symbol, direction):
+    if not is_ai_enabled():
+        return 0
+
+    risk = get_risk(symbol, direction)
+    return int(risk.get("risk_score", 0))
+
+
+def get_priority_score(symbol, direction):
+    if not is_ai_enabled():
+        return 100
+
+    risk = get_risk(symbol, direction)
+    return int(risk.get("priority_score", 100))
+
+
+def should_reduce_symbol(symbol, direction):
+    if not is_ai_enabled():
+        return False
+
+    risk = get_risk(symbol, direction)
+    return bool(risk.get("recommend_reduce", False))
+
+
+def get_risky_coins(limit=20):
+    data = load_risk()
+    day_data = data.get("daily", {}).get(_today(), {})
+
+    rows = list(day_data.values())
+
+    rows.sort(
+        key=lambda x: (
+            int(x.get("risk_score", 0)),
+            int(x.get("sl_count", 0))
+        ),
+        reverse=True
+    )
+
+    return rows[:limit]
+
+
+def get_best_priority_coins(limit=20):
+    data = load_risk()
+    day_data = data.get("daily", {}).get(_today(), {})
+
+    rows = list(day_data.values())
+
+    rows.sort(
+        key=lambda x: (
+            int(x.get("priority_score", 0)),
+            -int(x.get("risk_score", 0))
+        ),
+        reverse=True
+    )
+
+    return rows[:limit]
 
 
 def format_risk_report():
@@ -135,7 +236,13 @@ def format_risk_report():
     if not risky:
         return "✅ امروز هنوز هیچ کوین/جهتی وارد حالت ریسک بالا نشده."
 
-    risky.sort(key=lambda x: int(x.get("sl_count", 0)), reverse=True)
+    risky.sort(
+        key=lambda x: (
+            int(x.get("risk_score", 0)),
+            int(x.get("sl_count", 0))
+        ),
+        reverse=True
+    )
 
     text = "⚠️ ریسک کوین‌ها امروز\n\n"
 
@@ -143,7 +250,33 @@ def format_risk_report():
         text += (
             f"{item.get('symbol')} {item.get('direction')}\n"
             f"SL: {item.get('sl_count', 0)} | TP: {item.get('tp_count', 0)}\n"
-            f"Risk: {item.get('risk_level')} | Strictness: {item.get('strictness')}\n\n"
+            f"Risk: {item.get('risk_level')} | Strictness: {item.get('strictness')}\n"
+            f"Risk Score: {item.get('risk_score', 0)} | Priority: {item.get('priority_score', 0)}\n"
+        )
+
+        if item.get("recommend_reduce"):
+            text += "پیشنهاد: کاهش اولویت امروز\n"
+
+        text += "\n"
+
+    return text.strip()
+
+
+def format_priority_report():
+    rows = get_best_priority_coins(limit=15)
+
+    if not rows:
+        return "هنوز داده‌ای برای اولویت‌بندی کوین‌ها وجود ندارد."
+
+    text = "🏆 اولویت کوین‌ها امروز\n\n"
+
+    for item in rows:
+        text += (
+            f"{item.get('symbol')} {item.get('direction')}\n"
+            f"Priority: {item.get('priority_score', 100)} | "
+            f"Risk: {item.get('risk_score', 0)} | "
+            f"TP: {item.get('tp_count', 0)} | "
+            f"SL: {item.get('sl_count', 0)}\n\n"
         )
 
     return text.strip()
