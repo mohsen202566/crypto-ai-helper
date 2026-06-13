@@ -1,263 +1,54 @@
 # -*- coding: utf-8 -*-
-
-from datetime import datetime
-
+import time, uuid
+from typing import Dict, Any, List
 from data_store import load_json, save_json
+from config import MAX_GHOST_SIGNALS, GHOST_LEARNING_ENABLED
+try:
+    from coin_learning import record_signal, update_signal_result
+    from ai_memory import update_ai_summary
+except Exception:
+    record_signal = None; update_signal_result = None; update_ai_summary = None
 
-from ai_memory import is_learning_enabled
+GHOST_FILE = 'ghost_signals.json'
 
-from coin_learning import (
-    record_signal,
-    update_signal_result,
-)
+def _state():
+    s = load_json(GHOST_FILE, {'open': {}, 'closed': []})
+    if not isinstance(s, dict): s = {'open': {}, 'closed': []}
+    s.setdefault('open', {}); s.setdefault('closed', [])
+    return s
 
-GHOST_FILE = "ghost_signals.json"
+def create_ghost_signal(symbol: str, direction: str, entry: float, stop_loss: float, tp1: float, tp2=None, score=None, snapshot=None, source='scanner', reason='SLOT_FULL') -> Dict[str, Any]:
+    if not GHOST_LEARNING_ENABLED: return {}
+    s = _state(); gid = f"ghost_{symbol}_{direction}_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+    g = {'signal_id': gid, 'id': gid, 'symbol': str(symbol).upper(), 'direction': str(direction).upper(), 'entry': float(entry), 'price': float(entry), 'stop_loss': float(stop_loss), 'tp1': float(tp1), 'tp2': tp2, 'score': score, 'snapshot': snapshot or {}, 'source': source, 'reason': reason, 'created_at': int(time.time()), 'status': 'OPEN'}
+    s['open'][gid] = g
+    while len(s['open']) > MAX_GHOST_SIGNALS:
+        first = sorted(s['open'].keys())[0]; del s['open'][first]
+    save_json(GHOST_FILE, s)
+    if record_signal: 
+        try: record_signal(g, signal_type='GHOST')
+        except Exception: pass
+    if update_ai_summary:
+        try: update_ai_summary(total_ghost_signals=1)
+        except Exception: pass
+    return g
 
-MAX_GHOSTS = 5000
-
-
-def _now():
-    return datetime.utcnow().isoformat()
-
-
-def _empty_data():
-    return {
-        "version": 2,
-
-        "ghost_signals": [],
-
-        "stats": {
-            "created": 0,
-            "closed": 0,
-            "tp1": 0,
-            "tp2": 0,
-            "sl": 0
-        },
-
-        "updated_at": None
-    }
-
-
-def load_ghosts():
-    data = load_json(
-        GHOST_FILE,
-        _empty_data()
-    )
-
-    data.setdefault(
-        "ghost_signals",
-        []
-    )
-
-    data.setdefault(
-        "stats",
-        {}
-    )
-
-    return data
-
-
-def save_ghosts(data):
-    data["updated_at"] = _now()
-
-    return save_json(
-        GHOST_FILE,
-        data
-    )
-
-
-def create_ghost_signal(result):
-
-    if not is_learning_enabled():
-        return False
-
-    if not result:
-        return False
-
-    if result.get("direction") not in [
-        "LONG",
-        "SHORT"
-    ]:
-        return False
-
-    learning_id = record_signal(
-        result,
-        signal_type="GHOST"
-    )
-
-    if not learning_id:
-        return False
-
-    data = load_ghosts()
-
-    ghost = {
-        "learning_id": learning_id,
-
-        "symbol": result.get("symbol"),
-        "direction": result.get("direction"),
-
-        "entry": result.get("entry"),
-        "tp1": result.get("tp1"),
-        "tp2": result.get("tp2"),
-        "stop_loss": result.get("stop_loss"),
-
-        "score": result.get("score"),
-        "confirmations": result.get("confirmations"),
-
-        "status": "ACTIVE",
-
-        "created_at": _now(),
-
-        "closed_at": None,
-
-        "result": None
-    }
-
-    data["ghost_signals"].append(
-        ghost
-    )
-
-    data["ghost_signals"] = (
-        data["ghost_signals"][-MAX_GHOSTS:]
-    )
-
-    data["stats"]["created"] = (
-        int(data["stats"].get("created", 0))
-        + 1
-    )
-
-    save_ghosts(data)
-
-    return learning_id
-
-def close_ghost_signal(
-    learning_id,
-    result,
-    exit_price=None,
-    move_percent=None,
-    holding_minutes=None
-):
-
-    data = load_ghosts()
-
-    found = None
-
-    for item in data["ghost_signals"]:
-        if str(item.get("learning_id")) == str(learning_id):
-            found = item
-            break
-
-    if not found:
-        return False
-
-    if found.get("status") != "ACTIVE":
-        return False
-
-    result = str(result).upper()
-
-    if result not in ["TP1", "TP2", "SL"]:
-        return False
-
-    found["status"] = "CLOSED"
-    found["result"] = result
-    found["closed_at"] = _now()
-    found["exit_price"] = exit_price
-    found["move_percent"] = move_percent
-    found["holding_minutes"] = holding_minutes
-
-    update_signal_result(
-        learning_id,
-        result,
-        exit_price=exit_price,
-        move_percent=move_percent,
-        holding_minutes=holding_minutes
-    )
-
-    data["stats"]["closed"] = (
-        int(data["stats"].get("closed", 0))
-        + 1
-    )
-
-    if result == "TP1":
-        data["stats"]["tp1"] = int(data["stats"].get("tp1", 0)) + 1
-    elif result == "TP2":
-        data["stats"]["tp2"] = int(data["stats"].get("tp2", 0)) + 1
-    elif result == "SL":
-        data["stats"]["sl"] = int(data["stats"].get("sl", 0)) + 1
-
-    save_ghosts(data)
-
+def close_ghost_signal(signal_id: str, result: str, exit_price: float, move_percent: float = 0.0) -> bool:
+    s = _state(); g = s['open'].pop(signal_id, None)
+    if not g: return False
+    g.update({'status': 'CLOSED', 'result': result, 'exit_price': exit_price, 'move_percent': move_percent, 'closed_at': int(time.time())})
+    s['closed'].append(g); s['closed'] = s['closed'][-MAX_GHOST_SIGNALS:]
+    save_json(GHOST_FILE, s)
+    if update_signal_result:
+        try: update_signal_result(signal_id, result, exit_price=exit_price, move_percent=move_percent)
+        except Exception: pass
     return True
 
+def get_ghost_stats() -> Dict[str, Any]:
+    s = _state(); closed = s.get('closed', [])
+    tp = len([x for x in closed if str(x.get('result')).upper() in ['TP1','TP2','TP']]); sl = len([x for x in closed if str(x.get('result')).upper() == 'SL'])
+    return {'open': len(s.get('open', {})), 'closed': len(closed), 'tp': tp, 'sl': sl}
 
-def get_active_ghosts():
-    data = load_ghosts()
-
-    return [
-        x for x in data.get("ghost_signals", [])
-        if x.get("status") == "ACTIVE"
-    ]
-
-
-def get_closed_ghosts():
-    data = load_ghosts()
-
-    return [
-        x for x in data.get("ghost_signals", [])
-        if x.get("status") == "CLOSED"
-    ]
-
-
-def get_ghost_by_learning_id(learning_id):
-    data = load_ghosts()
-
-    for item in data.get("ghost_signals", []):
-        if str(item.get("learning_id")) == str(learning_id):
-            return item
-
-    return None
-
-
-def count_active_ghosts():
-    return len(get_active_ghosts())
-
-
-def format_ghost_report():
-    data = load_ghosts()
-
-    ghosts = data.get("ghost_signals", [])
-    stats = data.get("stats", {})
-
-    total = len(ghosts)
-    active = len([
-        x for x in ghosts
-        if x.get("status") == "ACTIVE"
-    ])
-
-    closed = len([
-        x for x in ghosts
-        if x.get("status") == "CLOSED"
-    ])
-
-    tp1 = int(stats.get("tp1", 0))
-    tp2 = int(stats.get("tp2", 0))
-    sl = int(stats.get("sl", 0))
-
-    closed_results = tp1 + tp2 + sl
-
-    wr = (
-        round(((tp1 + tp2) / closed_results) * 100, 2)
-        if closed_results
-        else 0.0
-    )
-
-    return (
-        "👻 سیگنال‌های مخفی\n\n"
-        f"کل رکوردها: {total}\n"
-        f"فعال: {active}\n"
-        f"بسته‌شده: {closed}\n\n"
-        f"TP1: {tp1}\n"
-        f"TP2: {tp2}\n"
-        f"SL: {sl}\n"
-        f"Ghost WR: {wr}%"
-    )
+def format_ghost_report() -> str:
+    st = get_ghost_stats()
+    return f"👻 Ghost Signals\nباز: {st['open']}\nبسته: {st['closed']}\nTP: {st['tp']} | SL: {st['sl']}"
