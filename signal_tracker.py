@@ -16,10 +16,14 @@ except Exception:
 try:
     from coin_learning import record_signal, update_signal_result
     from coin_risk import register_result
-except Exception:
+    from slot_manager import add_position, close_position
+except Exception as e:
     record_signal = None
     update_signal_result = None
     register_result = None
+    add_position = None
+    close_position = None
+    print("AI TRACKER IMPORT ERROR:", str(e))
 
 
 ACTIVE_SIGNALS_FILE = "active_signals.json"
@@ -53,18 +57,26 @@ def now_text():
 def load_json(path, default):
     if not os.path.exists(path):
         return default
+
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return data if isinstance(data, type(default)) else default
+
+        if not isinstance(data, type(default)):
+            return default
+
+        return data
+
     except Exception:
         return default
 
 
 def save_json(path, data):
     tmp = path + ".tmp"
+
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
     os.replace(tmp, path)
 
 
@@ -95,27 +107,11 @@ def reset_stats():
 def fa_direction(direction):
     if direction == "LONG":
         return "لانگ"
+
     if direction == "SHORT":
         return "شورت"
+
     return str(direction)
-
-
-def has_active_symbol(active, user_id, symbol):
-    for item in active:
-        if (
-            int(item.get("user_id", 0)) == int(user_id)
-            and item.get("symbol") == symbol
-            and item.get("status") == "ACTIVE"
-        ):
-            return True
-    return False
-
-
-def can_add_automatic_signal(user_id, symbol):
-    active = get_active_signals()
-    if has_active_symbol(active, user_id, symbol):
-        return False, "duplicate"
-    return True, "ok"
 
 
 def _signal_id(signal):
@@ -126,9 +122,32 @@ def _signal_id(signal):
     )
 
 
+def has_active_symbol(active, user_id, symbol):
+    for item in active:
+        if (
+            int(item.get("user_id", 0)) == int(user_id)
+            and item.get("symbol") == symbol
+            and item.get("status") == "ACTIVE"
+        ):
+            return True
+
+    return False
+
+
+def can_add_automatic_signal(user_id, symbol):
+    active = get_active_signals()
+
+    if has_active_symbol(active, user_id, symbol):
+        return False, "duplicate"
+
+    return True, "ok"
+
+
 def record_stat_event(signal, event_type, exit_price=None, move_percent=None):
     stats = get_signal_stats()
+
     item = dict(signal)
+
     item["signal_id"] = _signal_id(signal)
     item["event_type"] = event_type
     item["status"] = event_type
@@ -137,6 +156,7 @@ def record_stat_event(signal, event_type, exit_price=None, move_percent=None):
 
     if exit_price is not None:
         item["exit_price"] = exit_price
+
     if move_percent is not None:
         item["move_percent"] = move_percent
 
@@ -144,38 +164,20 @@ def record_stat_event(signal, event_type, exit_price=None, move_percent=None):
     save_signal_stats(stats)
 
 
-def try_open_paper_trade(signal):
-    if not open_paper_trade:
-        return None
-    try:
-        ok, msg = open_paper_trade(signal)
-        return msg
-    except Exception as e:
-        return f"⚠️ خطا در باز کردن Paper Trade برای {signal.get('symbol')}\nعلت: {str(e)[:250]}"
-
-
-def try_close_paper_trade(signal, result_type, exit_price):
-    if not close_paper_trade_by_signal:
-        return None
-    try:
-        ok, msg = close_paper_trade_by_signal(signal, result_type, exit_price)
-        return msg
-    except Exception as e:
-        return f"⚠️ خطا در بستن Paper Trade برای {signal.get('symbol')}\nعلت: {str(e)[:250]}"
-
 def ai_record_signal(signal):
     if not record_signal:
         return
+
     try:
         record_signal(signal, signal_type="REAL")
     except Exception as e:
-        print("AI LEARNING RECORD ERROR:", str(e))
+        print("AI RECORD SIGNAL ERROR:", str(e))
 
 
 def ai_record_result(signal, hit_type, exit_price, pct):
     signal_id = signal.get("signal_id") or signal.get("id")
 
-    if update_signal_result:
+if update_signal_result:
         try:
             update_signal_result(
                 signal_id,
@@ -184,73 +186,195 @@ def ai_record_result(signal, hit_type, exit_price, pct):
                 move_percent=pct
             )
         except Exception as e:
-            print("AI LEARNING RESULT ERROR:", str(e))
+            print("AI UPDATE RESULT ERROR:", str(e))
 
     if register_result:
         try:
-            register_result(signal.get("symbol"), signal.get("direction"), hit_type)
+            register_result(
+                signal.get("symbol"),
+                signal.get("direction"),
+                hit_type
+            )
         except Exception as e:
-            print("AI RISK RESULT ERROR:", str(e))
+            print("AI RISK REGISTER ERROR:", str(e))
 
 
-def add_signal_to_tracking(user_id, chat_id, message_id, result):
+def ai_open_slot(signal):
+    if not add_position:
+        return
+
+    try:
+        add_position(
+            signal.get("signal_id") or signal.get("id"),
+            signal.get("symbol"),
+            signal.get("direction"),
+            score=signal.get("score")
+        )
+    except Exception as e:
+        print("AI SLOT OPEN ERROR:", str(e))
+
+
+def ai_close_slot(signal):
+    if not close_position:
+        return
+
+    try:
+        close_position(
+            signal.get("signal_id") or signal.get("id")
+        )
+    except Exception as e:
+        print("AI SLOT CLOSE ERROR:", str(e))
+
+
+def try_open_paper_trade(signal):
+    if not open_paper_trade:
+        return None
+
+    try:
+        ok, msg = open_paper_trade(signal)
+        return msg
+    except Exception as e:
+        return (
+            f"⚠️ خطا در باز کردن Paper Trade برای {signal.get('symbol')}\n"
+            f"علت: {str(e)[:250]}"
+        )
+
+
+def try_close_paper_trade(signal, result_type, exit_price):
+    if not close_paper_trade_by_signal:
+        return None
+
+    try:
+        ok, msg = close_paper_trade_by_signal(
+            signal,
+            result_type,
+            exit_price
+        )
+        return msg
+    except Exception as e:
+        return (
+            f"⚠️ خطا در بستن Paper Trade برای {signal.get('symbol')}\n"
+            f"علت: {str(e)[:250]}"
+        )
+
+def add_signal_to_tracking(
+    user_id,
+    chat_id,
+    message_id,
+    result
+):
     if result.get("direction") not in ["LONG", "SHORT"]:
         return False, "این تحلیل سیگنال قابل پیگیری ندارد."
 
-    if result.get("stop_loss") is None or result.get("tp1") is None:
-        return False, "برای این سیگنال TP1 یا SL وجود ندارد."
+    if result.get("stop_loss") is None:
+        return False, "برای این سیگنال حد ضرر وجود ندارد."
+
+    if result.get("tp1") is None:
+        return False, "برای این سیگنال TP1 وجود ندارد."
 
     active = get_active_signals()
 
-    if has_active_symbol(active, user_id, result.get("symbol")):
-        return False, f"⚠️ {result.get('symbol')} از قبل زیر نظر است."
+    if has_active_symbol(
+        active,
+        user_id,
+        result.get("symbol")
+    ):
+        return (
+            False,
+            f"⚠️ {result.get('symbol')} از قبل زیر نظر است."
+        )
 
-    signal_uid = f"{result['symbol']}_{message_id}_{now_ts()}"
+    signal_uid = (
+        f"{result['symbol']}_"
+        f"{message_id}_"
+        f"{now_ts()}"
+    )
 
     signal = {
         "id": signal_uid,
         "signal_id": signal_uid,
+
         "user_id": int(user_id),
         "chat_id": int(chat_id),
         "message_id": int(message_id),
+
         "symbol": result["symbol"],
         "direction": result["direction"],
+
         "status": "ACTIVE",
 
-        "entry": float(result.get("entry") or result.get("price")),
-        "price": float(result.get("price") or result.get("entry")),
-        "stop_loss": float(result["stop_loss"]),
-        "tp1": float(result["tp1"]),
-        "tp2": None if result.get("tp2") is None else float(result["tp2"]),
+        "entry": float(
+            result.get("entry")
+            or result.get("price")
+        ),
 
+        "price": float(
+            result.get("price")
+            or result.get("entry")
+        ),
+
+        "stop_loss": float(
+            result["stop_loss"]
+        ),
+
+        "tp1": float(
+            result["tp1"]
+        ),
+
+        "tp2": (
+            None
+            if result.get("tp2") is None
+            else float(result["tp2"])
+        ),
+
+        # ---------- AI Memory ----------
         "score": result.get("score"),
         "risk_level": result.get("risk_level"),
         "risk_reward": result.get("risk_reward"),
-        "entry_mode": result.get("entry_mode") or "CLASSIC_TECHNICAL",
+
+        "entry_mode": (
+            result.get("entry_mode")
+            or "CLASSIC_TECHNICAL"
+        ),
+
         "confirmations": result.get("confirmations"),
         "freshness": result.get("freshness"),
 
         "rsi": result.get("rsi"),
         "adx": result.get("adx"),
+
         "macd": result.get("macd"),
         "macd_signal": result.get("macd_signal"),
         "macd_hist": result.get("macd_hist"),
 
         "power2_buy": result.get("power2_buy"),
         "power2_sell": result.get("power2_sell"),
+
         "power3_buy": result.get("power3_buy"),
         "power3_sell": result.get("power3_sell"),
 
-        "support": result.get("support"),
-        "resistance": result.get("resistance"),
-        "sr_timeframe": result.get("sr_timeframe"),
+        "buy_power": result.get("buy_power"),
+        "sell_power": result.get("sell_power"),
 
-        "market_mode": result.get("market_mode") or result.get("market_regime"),
+        "atr": result.get("atr"),
+
+        "market_mode": (
+            result.get("market_mode")
+            or result.get("market_regime")
+        ),
+
         "coin_behavior": result.get("coin_behavior"),
         "btc_bias": result.get("btc_bias"),
 
-        "reasons": result.get("reasons", []),
+        "support": result.get("support"),
+        "resistance": result.get("resistance"),
 
+        "reasons": result.get(
+            "reasons",
+            []
+        ),
+
+        # ---------- timestamps ----------
         "created_at": now_ts(),
         "created_at_text": now_text(),
         "last_checked_at": now_ts(),
@@ -259,10 +383,22 @@ def add_signal_to_tracking(user_id, chat_id, message_id, result):
     active.append(signal)
     save_active_signals(active)
 
-    record_stat_event(signal, "SIGNAL_CREATED")
+    # ---------- Stats ----------
+    record_stat_event(
+        signal,
+        "SIGNAL_CREATED"
+    )
+
+    # ---------- AI Learning ----------
     ai_record_signal(signal)
 
-    paper_msg = try_open_paper_trade(signal)
+    # ---------- Slot Manager ----------
+    ai_open_slot(signal)
+
+    # ---------- Paper Trade ----------
+    paper_msg = try_open_paper_trade(
+        signal
+    )
 
     msg = (
         f"✅ سیگنال زیر نظر گرفته شد\n\n"
@@ -273,39 +409,86 @@ def add_signal_to_tracking(user_id, chat_id, message_id, result):
         f"SL: {signal['stop_loss']}"
     )
 
+    if signal.get("score") is not None:
+        msg += (
+            f"\nامتیاز: "
+            f"{signal.get('score')}"
+        )
+
     if paper_msg:
         msg += "\n\n" + paper_msg
 
     return True, msg
 
-def get_recent_1m_candles_since(symbol, since_ts):
-    since_ts = int(since_ts or now_ts() - 5 * 60)
-    since_ms = max(0, (since_ts - TRACKER_LOOKBACK_BUFFER_SECONDS) * 1000)
-    minutes = max(5, int((now_ts() - since_ts) / 60) + 4)
-    limit = min(TRACKER_MAX_OHLCV_LIMIT, max(10, minutes))
 
-    return exchange.fetch_ohlcv(
-        to_okx_symbol(symbol),
-        timeframe=TRACKER_OHLCV_TIMEFRAME,
-        since=since_ms,
-        limit=limit
-    ) or []
+def get_recent_1m_candles_since(
+    symbol,
+    since_ts
+):
+    since_ts = int(
+        since_ts
+        or now_ts() - 5 * 60
+    )
+
+    since_ms = max(
+        0,
+        (
+            since_ts
+            - TRACKER_LOOKBACK_BUFFER_SECONDS
+        )
+        * 1000
+    )
+
+minutes = max(
+        5,
+        int(
+            (
+                now_ts()
+                - since_ts
+            )
+            / 60
+        )
+        + 4
+    )
+
+    limit = min(
+        TRACKER_MAX_OHLCV_LIMIT,
+        max(10, minutes)
+    )
+
+    return (
+        exchange.fetch_ohlcv(
+            to_okx_symbol(symbol),
+            timeframe=TRACKER_OHLCV_TIMEFRAME,
+            since=since_ms,
+            limit=limit
+        )
+        or []
+    )
 
 
-def candle_path_hit(signal, candle):
+def candle_path_hit(
+    signal,
+    candle
+):
     high = float(candle[2])
     low = float(candle[3])
 
-    direction = signal.get("direction")
+    direction = signal.get(
+        "direction"
+    )
+
     tp1 = float(signal["tp1"])
     sl = float(signal["stop_loss"])
 
     if direction == "LONG":
         tp_hit = high >= tp1
         sl_hit = low <= sl
+
     elif direction == "SHORT":
         tp_hit = low <= tp1
         sl_hit = high >= sl
+
     else:
         return None, None
 
@@ -323,17 +506,42 @@ def candle_path_hit(signal, candle):
     return None, None
 
 
-def move_percent(signal, exit_price):
-    entry = float(signal.get("entry") or 0)
+def move_percent(
+    signal,
+    exit_price
+):
+    entry = float(
+        signal.get("entry")
+        or 0
+    )
 
     if entry <= 0:
         return 0.0
 
     if signal.get("direction") == "LONG":
-        return round(((float(exit_price) - entry) / entry) * 100, 4)
+        return round(
+            (
+                (
+                    float(exit_price)
+                    - entry
+                )
+                / entry
+            )
+            * 100,
+            4
+        )
 
-    return round(((entry - float(exit_price)) / entry) * 100, 4)
-
+    return round(
+        (
+            (
+                entry
+                - float(exit_price)
+            )
+            / entry
+        )
+        * 100,
+        4
+    )
 
 def check_active_signals():
     active = get_active_signals()
@@ -350,26 +558,64 @@ def check_active_signals():
 
             candles = get_recent_1m_candles_since(
                 signal["symbol"],
-                signal.get("last_checked_at") or signal.get("created_at")
+                signal.get("last_checked_at")
+                or signal.get("created_at")
             )
 
             for candle in candles:
-                hit_type, exit_price = candle_path_hit(signal, candle)
+                hit_type, exit_price = candle_path_hit(
+                    signal,
+                    candle
+                )
+
                 if hit_type:
                     break
 
             signal["last_checked_at"] = now_ts()
 
             if hit_type:
-                pct = move_percent(signal, exit_price)
+                pct = move_percent(
+                    signal,
+                    exit_price
+                )
 
-                record_stat_event(signal, hit_type, exit_price, pct)
-                ai_record_result(signal, hit_type, exit_price, pct)
+                # ---------- Tracker Stats ----------
+                record_stat_event(
+                    signal,
+                    hit_type,
+                    exit_price,
+                    pct
+                )
 
-                paper_msg = try_close_paper_trade(signal, hit_type, exit_price)
+                # ---------- AI Learning + Coin Risk ----------
+                ai_record_result(
+                    signal,
+                    hit_type,
+                    exit_price,
+                    pct
+                )
 
-                icon = "✅" if hit_type == "TP1" else "❌"
-                result_fa = "حد سود 1" if hit_type == "TP1" else "حد ضرر"
+                # ---------- Slot Manager ----------
+                ai_close_slot(signal)
+
+                # ---------- Paper Trade ----------
+                paper_msg = try_close_paper_trade(
+                    signal,
+                    hit_type,
+                    exit_price
+                )
+
+                icon = (
+                    "✅"
+                    if hit_type == "TP1"
+                    else "❌"
+                )
+
+                result_fa = (
+                    "حد سود 1"
+                    if hit_type == "TP1"
+                    else "حد ضرر"
+                )
 
                 text = (
                     f"{icon} نتیجه سیگنال {signal.get('symbol')}\n"
@@ -398,13 +644,20 @@ def check_active_signals():
             remaining.append(signal)
 
     save_active_signals(remaining)
+
     return messages
 
 
 def parse_days_from_text(text):
-    m = re.search(r"(\d+)", text or "")
+    m = re.search(
+        r"(\d+)",
+        text or ""
+    )
+
     if m:
-        return int(m.group(1))
+        return int(
+            m.group(1)
+        )
 
     if text and "کل" in text:
         return 3650
@@ -413,37 +666,75 @@ def parse_days_from_text(text):
 
 
 def parse_days_from_report_text(text):
-    return parse_days_from_text(text or "")
+    return parse_days_from_text(
+        text or ""
+    )
 
 
 def parse_profit_calc_text(text):
     if not text:
         return None
 
-    nums = re.findall(r"\d+(?:\.\d+)?", text)
+    nums = re.findall(
+        r"\d+(?:\.\d+)?",
+        text
+    )
 
-    if "سود" in text or "محاسبه" in text or "درآمد" in text:
+    if (
+        "سود" in text
+        or "محاسبه" in text
+        or "درآمد" in text
+    ):
         if len(nums) >= 2:
-            return float(nums[0]), float(nums[1])
+            return (
+                float(nums[0]),
+                float(nums[1])
+            )
 
     return None
 
 
-def get_profit_for_signal_text(reply_text, margin, leverage):
+def get_profit_for_signal_text(
+    reply_text,
+    margin,
+    leverage
+):
     return None
 
-def get_profit_simulation_report(margin, leverage, days=7):
+
+def get_profit_simulation_report(
+    margin,
+    leverage,
+    days=7
+):
     stats = get_signal_stats()
-    since = now_ts() - int(days) * 86400
+
+    since = (
+        now_ts()
+        - int(days) * 86400
+    )
 
     closed = [
         s for s in stats
-        if int(s.get("event_at", 0)) >= since
-        and s.get("event_type") in ["TP1", "SL"]
+        if int(
+            s.get(
+                "event_at",
+                0
+            )
+        ) >= since
+        and s.get("event_type")
+        in ["TP1", "SL"]
     ]
 
-    wins = len([s for s in closed if s.get("event_type") == "TP1"])
-    losses = len([s for s in closed if s.get("event_type") == "SL"])
+wins = len([
+        s for s in closed
+        if s.get("event_type") == "TP1"
+    ])
+
+    losses = len([
+        s for s in closed
+        if s.get("event_type") == "SL"
+    ])
 
     return (
         f"📊 شبیه‌سازی سود {days} روز\n"
@@ -456,27 +747,82 @@ def get_profit_simulation_report(margin, leverage, days=7):
 
 def get_stats_report(days=7):
     stats = get_signal_stats()
-    since = now_ts() - int(days) * 86400
+
+    since = (
+        now_ts()
+        - int(days) * 86400
+    )
 
     data = [
         s for s in stats
-        if int(s.get("event_at", s.get("created_at", 0)) or 0) >= since
+        if int(
+            s.get(
+                "event_at",
+                s.get(
+                    "created_at",
+                    0
+                )
+            )
+            or 0
+        ) >= since
     ]
 
-    created = [s for s in data if s.get("event_type") == "SIGNAL_CREATED"]
-    tp1 = [s for s in data if s.get("event_type") == "TP1"]
-    sl = [s for s in data if s.get("event_type") == "SL"]
+    created = [
+        s for s in data
+        if s.get("event_type")
+        == "SIGNAL_CREATED"
+    ]
+
+    tp1 = [
+        s for s in data
+        if s.get("event_type")
+        == "TP1"
+    ]
+
+    sl = [
+        s for s in data
+        if s.get("event_type")
+        == "SL"
+    ]
 
     total = len(tp1) + len(sl)
-    win_rate = round((len(tp1) / total) * 100, 1) if total else 0
 
-    active_count = len(get_active_signals())
+    win_rate = (
+        round(
+            (
+                len(tp1)
+                / total
+            )
+            * 100,
+            1
+        )
+        if total
+        else 0
+    )
 
-    longs = [s for s in tp1 + sl if s.get("direction") == "LONG"]
-    shorts = [s for s in tp1 + sl if s.get("direction") == "SHORT"]
+    active_count = len(
+        get_active_signals()
+    )
 
-    long_tp = len([s for s in longs if s.get("event_type") == "TP1"])
-    short_tp = len([s for s in shorts if s.get("event_type") == "TP1"])
+    longs = [
+        s for s in tp1 + sl
+        if s.get("direction") == "LONG"
+    ]
+
+    shorts = [
+        s for s in tp1 + sl
+        if s.get("direction") == "SHORT"
+    ]
+
+    long_tp = len([
+        s for s in longs
+        if s.get("event_type") == "TP1"
+    ])
+
+    short_tp = len([
+        s for s in shorts
+        if s.get("event_type") == "TP1"
+    ])
 
     return (
         f"📊 آمار {days} روز اخیر\n\n"
@@ -492,7 +838,6 @@ def get_stats_report(days=7):
         f"\nمعماری: CLASSIC_TECHNICAL + AI_LEARNING"
     )
 
-
 def _format_days_label(days):
     try:
         d = int(days)
@@ -504,7 +849,13 @@ def _format_days_label(days):
 
 def _event_ts(item):
     try:
-        return int(item.get("event_at", item.get("created_at", 0)) or 0)
+        return int(
+            item.get(
+                "event_at",
+                item.get("created_at", 0)
+            )
+            or 0
+        )
     except Exception:
         return 0
 
@@ -525,15 +876,26 @@ def _safe_int(value, default=0):
 
 def _infer_sl_reason(item):
     reasons = item.get("reasons") or []
-    reason_text = " ".join([str(x) for x in reasons])
+    reason_text = " ".join(
+        [str(x) for x in reasons]
+    )
 
-    if "فاصله از EMA20 خیلی زیاد" in reason_text or "فاصله از EMA20 زیاد" in reason_text:
+    if (
+        "فاصله از EMA20 خیلی زیاد" in reason_text
+        or "فاصله از EMA20 زیاد" in reason_text
+    ):
         return "ورود دیر / فاصله زیاد از EMA20"
 
-    if "حجم 15M ضعیف" in reason_text or "حجم ضعیف" in reason_text:
+    if (
+        "حجم 15M ضعیف" in reason_text
+        or "حجم ضعیف" in reason_text
+    ):
         return "حجم ضعیف هنگام سیگنال"
 
-    risk = str(item.get("risk_level") or "").upper()
+    risk = str(
+        item.get("risk_level")
+        or ""
+    ).upper()
 
     if risk in ["HIGH", "ریسک بالا", "بالا"]:
         return "ریسک سیگنال بالا بوده"
@@ -541,22 +903,34 @@ def _infer_sl_reason(item):
     if risk in ["MEDIUM", "متوسط"]:
         return "ریسک سیگنال متوسط بوده"
 
-    adx = _safe_float(item.get("adx"), 0)
+    adx = _safe_float(
+        item.get("adx"),
+        0
+    )
 
     if 0 < adx < 25:
         return "ADX پایین / قدرت روند کم"
 
-    confirmations = _safe_int(item.get("confirmations"), 0)
+    confirmations = _safe_int(
+        item.get("confirmations"),
+        0
+    )
 
     if confirmations and confirmations < 5:
         return "تاییدیه‌های کم"
 
-    freshness = str(item.get("freshness") or "").upper()
+    freshness = str(
+        item.get("freshness")
+        or ""
+    ).upper()
 
     if freshness == "LOW":
         return "تازگی حرکت ضعیف"
 
-    rr = _safe_float(item.get("risk_reward"), 0)
+    rr = _safe_float(
+        item.get("risk_reward"),
+        0
+    )
 
     if 0 < rr < 0.5:
         return "ریسک به ریوارد ضعیف"
@@ -564,43 +938,68 @@ def _infer_sl_reason(item):
     return "نامشخص / نیاز به داده بیشتر"
 
 
-def get_symbol_stats_report(days=3650, mode="all"):
+def get_symbol_stats_report(
+    days=3650,
+    mode="all"
+):
     try:
         days = int(days)
     except Exception:
         days = 3650
 
-    since = 0 if days >= 3650 else now_ts() - days * 86400
+    since = (
+        0
+        if days >= 3650
+        else now_ts() - days * 86400
+    )
 
     stats = get_signal_stats()
 
-    data = [s for s in stats if _event_ts(s) >= since]
-    created = [s for s in data if s.get("event_type") == "SIGNAL_CREATED"]
+    data = [
+        s for s in stats
+        if _event_ts(s) >= since
+    ]
+
+    created = [
+        s for s in data
+        if s.get("event_type")
+        == "SIGNAL_CREATED"
+    ]
 
     closed = [
         s for s in data
-        if s.get("event_type") in ["TP1", "SL"]
+        if s.get("event_type")
+        in ["TP1", "SL"]
         and s.get("symbol")
     ]
 
-if not closed:
-        return f"📊 آمار ارزها ({_format_days_label(days)})\n\nهنوز نتیجه TP1/SL ثبت نشده است."
+    if not closed:
+        return (
+            f"📊 آمار ارزها ({_format_days_label(days)})\n\n"
+            f"هنوز نتیجه TP1/SL ثبت نشده است."
+        )
 
     by_symbol = {}
     sl_reason_counts = {}
 
     for item in closed:
-        symbol = str(item.get("symbol") or "UNKNOWN")
+        symbol = str(
+            item.get("symbol")
+            or "UNKNOWN"
+        )
 
-        row = by_symbol.setdefault(symbol, {
-            "symbol": symbol,
-            "tp1": 0,
-            "sl": 0,
-            "total": 0,
-            "move_sum": 0.0,
-            "long": 0,
-            "short": 0,
-        })
+        row = by_symbol.setdefault(
+            symbol,
+            {
+                "symbol": symbol,
+                "tp1": 0,
+                "sl": 0,
+                "total": 0,
+                "move_sum": 0.0,
+                "long": 0,
+                "short": 0,
+            }
+        )
 
         event = item.get("event_type")
 
@@ -608,60 +1007,134 @@ if not closed:
 
         if event == "TP1":
             row["tp1"] += 1
+
         elif event == "SL":
             row["sl"] += 1
+
             reason = _infer_sl_reason(item)
-            sl_reason_counts[reason] = sl_reason_counts.get(reason, 0) + 1
+
+            sl_reason_counts[reason] = (
+                sl_reason_counts.get(reason, 0)
+                + 1
+            )
 
         if item.get("direction") == "LONG":
             row["long"] += 1
+
         elif item.get("direction") == "SHORT":
             row["short"] += 1
 
-        row["move_sum"] += _safe_float(item.get("move_percent"), 0)
+        row["move_sum"] += _safe_float(
+            item.get("move_percent"),
+            0
+        )
 
     rows = []
 
     for row in by_symbol.values():
-        row["win_rate"] = round((row["tp1"] / row["total"]) * 100, 1) if row["total"] else 0
-        row["move_sum"] = round(row["move_sum"], 4)
-        rows.append(row)
+        row["win_rate"] = (
+            round(
+                (
+                    row["tp1"]
+                    / row["total"]
+                )
+                * 100,
+                1
+            )
+            if row["total"]
+            else 0
+        )
+
+        row["move_sum"] = round(
+            row["move_sum"],
+            4
+        )
+
+rows.append(row)
 
     rows_by_best = sorted(
         rows,
-        key=lambda x: (x["win_rate"], x["move_sum"], x["total"]),
+        key=lambda x: (
+            x["win_rate"],
+            x["move_sum"],
+            x["total"]
+        ),
         reverse=True
     )
 
     rows_by_worst = sorted(
         rows,
-        key=lambda x: (x["win_rate"], x["move_sum"], -x["total"])
+        key=lambda x: (
+            x["win_rate"],
+            x["move_sum"],
+            -x["total"]
+        )
     )
 
     rows_all = sorted(
         rows,
-        key=lambda x: (x["total"], x["win_rate"], x["move_sum"]),
+        key=lambda x: (
+            x["total"],
+            x["win_rate"],
+            x["move_sum"]
+        ),
         reverse=True
     )
 
     if mode == "best":
         selected = rows_by_best[:15]
-        title = f"🏆 بهترین ارزها ({_format_days_label(days)})"
+        title = (
+            f"🏆 بهترین ارزها "
+            f"({_format_days_label(days)})"
+        )
+
     elif mode == "worst":
         selected = rows_by_worst[:15]
-        title = f"⚠️ ضعیف‌ترین ارزها ({_format_days_label(days)})"
+        title = (
+            f"⚠️ ضعیف‌ترین ارزها "
+            f"({_format_days_label(days)})"
+        )
+
     else:
         selected = rows_all
-        title = f"📊 آمار کلی ارزها ({_format_days_label(days)})"
+        title = (
+            f"📊 آمار کلی ارزها "
+            f"({_format_days_label(days)})"
+        )
 
-    total_tp1 = len([x for x in closed if x.get("event_type") == "TP1"])
-    total_sl = len([x for x in closed if x.get("event_type") == "SL"])
+    total_tp1 = len([
+        x for x in closed
+        if x.get("event_type") == "TP1"
+    ])
+
+    total_sl = len([
+        x for x in closed
+        if x.get("event_type") == "SL"
+    ])
 
     total_closed = total_tp1 + total_sl
-    total_wr = round((total_tp1 / total_closed) * 100, 1) if total_closed else 0
+
+    total_wr = (
+        round(
+            (
+                total_tp1
+                / total_closed
+            )
+            * 100,
+            1
+        )
+        if total_closed
+        else 0
+    )
 
     total_move = round(
-        sum(_safe_float(x.get("move_percent"), 0) for x in closed),
+        sum(
+            _safe_float(
+                x.get("move_percent"),
+                0
+            )
+            for x in closed
+        ),
         4
     )
 
@@ -675,54 +1148,103 @@ if not closed:
         "--------------------",
     ]
 
-    max_rows = 35 if mode == "all" else 15
+    max_rows = (
+        35
+        if mode == "all"
+        else 15
+    )
 
-    for i, row in enumerate(selected[:max_rows], start=1):
-        sign = "+" if row["move_sum"] > 0 else ""
+    for i, row in enumerate(
+        selected[:max_rows],
+        start=1
+    ):
+        sign = (
+            "+"
+            if row["move_sum"] > 0
+            else ""
+        )
+
         lines.append(
-            f"{i}) {row['symbol']} | معاملات: {row['total']} | TP1: {row['tp1']} | SL: {row['sl']} | "
-            f"WR: {row['win_rate']}% | حرکت: {sign}{row['move_sum']}% | L/S: {row['long']}/{row['short']}"
+            f"{i}) {row['symbol']} | "
+            f"معاملات: {row['total']} | "
+            f"TP1: {row['tp1']} | "
+            f"SL: {row['sl']} | "
+            f"WR: {row['win_rate']}% | "
+            f"حرکت: {sign}{row['move_sum']}% | "
+            f"L/S: {row['long']}/{row['short']}"
         )
 
     if len(selected) > max_rows:
-        lines.append(f"... و {len(selected) - max_rows} ارز دیگر")
+        lines.append(
+            f"... و {len(selected) - max_rows} ارز دیگر"
+        )
 
     if mode == "all":
         lines.append("--------------------")
         lines.append("🏆 بهترین‌ها:")
 
         for row in rows_by_best[:5]:
-            sign = "+" if row["move_sum"] > 0 else ""
-            lines.append(f"{row['symbol']} → WR {row['win_rate']}% | {sign}{row['move_sum']}%")
+            sign = (
+                "+"
+                if row["move_sum"] > 0
+                else ""
+            )
+
+            lines.append(
+                f"{row['symbol']} → "
+                f"WR {row['win_rate']}% | "
+                f"{sign}{row['move_sum']}%"
+            )
 
         lines.append("⚠️ ضعیف‌ترین‌ها:")
 
         for row in rows_by_worst[:5]:
-            sign = "+" if row["move_sum"] > 0 else ""
-            lines.append(f"{row['symbol']} → WR {row['win_rate']}% | {sign}{row['move_sum']}%")
+            sign = (
+                "+"
+                if row["move_sum"] > 0
+                else ""
+            )
+
+            lines.append(
+                f"{row['symbol']} → "
+                f"WR {row['win_rate']}% | "
+                f"{sign}{row['move_sum']}%"
+            )
 
         if sl_reason_counts:
             lines.append("--------------------")
             lines.append("❌ علت‌های احتمالی SL:")
 
-            for reason, count in sorted(sl_reason_counts.items(), key=lambda x: x[1], reverse=True)[:6]:
-                lines.append(f"{reason}: {count}")
+            for reason, count in sorted(
+                sl_reason_counts.items(),
+                key=lambda x: x[1],
+                reverse=True
+            )[:6]:
+                lines.append(
+                    f"{reason}: {count}"
+                )
 
-            lines.append("یادداشت: علت SL از داده‌های ذخیره‌شده همان سیگنال تخمین زده می‌شود، نه تحلیل دوباره بازار.")
+            lines.append(
+                "یادداشت: علت SL از داده‌های ذخیره‌شده همان سیگنال تخمین زده می‌شود، نه تحلیل دوباره بازار."
+            )
 
     text = "\n".join(lines)
 
-if len(text) > 3900:
+    if len(text) > 3900:
         trimmed = []
         total_len = 0
 
-        for line in lines:
+for line in lines:
             if total_len + len(line) + 1 > 3800:
                 break
+
             trimmed.append(line)
             total_len += len(line) + 1
 
-        trimmed.append("\nگزارش طولانی بود؛ بخشی از ارزهای کم‌تعداد حذف شد.")
+        trimmed.append(
+            "\nگزارش طولانی بود؛ بخشی از ارزهای کم‌تعداد حذف شد."
+        )
+
         text = "\n".join(trimmed)
 
     return text
