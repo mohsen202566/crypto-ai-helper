@@ -298,7 +298,7 @@ def simple_classic_score(symbol: str, df_4h: pd.DataFrame, df_1h: pd.DataFrame, 
     rsi_5 = float(last_5["rsi"])
     rsi_5_prev = float(prev_5["rsi"])
 
-    if 50 <= rsi_15 <= 68:
+    if 52 <= rsi_15 <= 66:
         long_score += 12
         confirmations_long += 1
         long_reasons.append("15M: RSI در محدوده سالم لانگ است")
@@ -436,17 +436,17 @@ def simple_classic_score(symbol: str, df_4h: pd.DataFrame, df_1h: pd.DataFrame, 
 
     # Balanced validity for both LONG and SHORT:
     # both sides need ADX >= 20 and at least one of 1H/15M trend alignment plus 15M MACD agreement.
-    long_direction_ok = trends["1H"] == "bullish" or trends["15M"] == "bullish"
+    long_direction_ok = trends["1H"] == "bullish" and trends["15M"] == "bullish"
     short_direction_ok = trends["1H"] == "bearish" or trends["15M"] == "bearish"
-    long_macd_ok = last_15["macd"] >= last_15["macd_signal"]
+    long_macd_ok = last_15["macd"] > last_15["macd_signal"] and last_15["macd_hist"] > 0
     short_macd_ok = last_15["macd"] <= last_15["macd_signal"]
 
     if not long_direction_ok:
-        long_reasons.append("رد لانگ: 1H یا 15M جهت لانگ را تایید نمی‌کند")
+        long_reasons.append("رد لانگ: 1H و 15M باید همزمان جهت لانگ را تایید کنند")
     if not short_direction_ok:
         short_reasons.append("رد شورت: 1H یا 15M جهت شورت را تایید نمی‌کند")
     if not long_macd_ok:
-        long_reasons.append("رد لانگ: MACD 15M با لانگ هم‌جهت نیست")
+        long_reasons.append("رد لانگ: MACD 15M و Histogram برای لانگ کافی نیست")
     if not short_macd_ok:
         short_reasons.append("رد شورت: MACD 15M با شورت هم‌جهت نیست")
 
