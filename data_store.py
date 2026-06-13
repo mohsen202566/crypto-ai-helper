@@ -13,16 +13,37 @@ def ensure_data_dirs():
     os.makedirs(BACKUP_DIR, exist_ok=True)
 
 
-def _full_path(filename):
+def data_path(filename):
     ensure_data_dirs()
     return os.path.join(DATA_DIR, filename)
 
 
-def load_json(filename, default=None):
-    path = _full_path(filename)
+def utc_now():
+    return datetime.utcnow().isoformat()
 
+
+def backup_file(filename):
+    ensure_data_dirs()
+
+    path = data_path(filename)
+    if not os.path.exists(path):
+        return False
+
+    try:
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        backup_name = f"{filename}.{timestamp}.bak"
+        backup_path = os.path.join(BACKUP_DIR, backup_name)
+        shutil.copy2(path, backup_path)
+        return True
+    except Exception:
+        return False
+
+
+def load_json(filename, default=None):
     if default is None:
         default = {}
+
+    path = data_path(filename)
 
     if not os.path.exists(path):
         save_json(filename, default)
@@ -30,7 +51,15 @@ def load_json(filename, default=None):
 
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+
+        if not isinstance(data, type(default)):
+            backup_file(filename)
+            save_json(filename, default)
+            return default
+
+        return data
+
     except Exception:
         backup_file(filename)
         save_json(filename, default)
@@ -38,32 +67,16 @@ def load_json(filename, default=None):
 
 
 def save_json(filename, data):
-    path = _full_path(filename)
-    temp_path = path + ".tmp"
+    path = data_path(filename)
+    tmp_path = path + ".tmp"
 
-    with open(temp_path, "w", encoding="utf-8") as f:
+    ensure_data_dirs()
+
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-    os.replace(temp_path, path)
+    os.replace(tmp_path, path)
     return True
-
-
-def backup_file(filename):
-    ensure_data_dirs()
-    path = _full_path(filename)
-
-    if not os.path.exists(path):
-        return False
-
-    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    backup_name = f"{filename}.{timestamp}.bak"
-    backup_path = os.path.join(BACKUP_DIR, backup_name)
-
-    try:
-        shutil.copy2(path, backup_path)
-        return True
-    except Exception:
-        return False
 
 
 def append_event(filename, event):
@@ -73,7 +86,9 @@ def append_event(filename, event):
         backup_file(filename)
         data = []
 
-    event["created_at"] = datetime.utcnow().isoformat()
+    if isinstance(event, dict):
+        event.setdefault("created_at", utc_now())
+
     data.append(event)
     save_json(filename, data)
     return True
