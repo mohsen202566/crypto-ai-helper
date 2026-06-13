@@ -1,6 +1,7 @@
-pyTelegramBotAPI
-requests
+python-telegram-bot==20.7
+ccxt
 pandas
 numpy
 ta
-ccxt
+requests
+python-dotenv
