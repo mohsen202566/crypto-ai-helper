@@ -338,3 +338,201 @@ def get_stats_report(days=7):
         f"شورت: {len(shorts)} | TP1: {short_tp}\n"
         f"\nمعماری: CLASSIC_TECHNICAL"
     )
+
+
+def _format_days_label(days):
+    try:
+        d = int(days)
+    except Exception:
+        d = 7
+    return "کل" if d >= 3650 else f"{d} روز اخیر"
+
+
+def _event_ts(item):
+    try:
+        return int(item.get("event_at", item.get("created_at", 0)) or 0)
+    except Exception:
+        return 0
+
+
+def _safe_float(value, default=0.0):
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _safe_int(value, default=0):
+    try:
+        return int(float(value))
+    except Exception:
+        return int(default)
+
+
+def _infer_sl_reason(item):
+    """Best-effort SL reason from the data already stored with each tracked signal.
+    This does not re-analyze the market; it summarizes the conditions saved at signal creation.
+    """
+    reasons = item.get("reasons") or []
+    reason_text = " ".join([str(x) for x in reasons])
+
+    if "فاصله از EMA20 خیلی زیاد" in reason_text or "فاصله از EMA20 زیاد" in reason_text:
+        return "ورود دیر / فاصله زیاد از EMA20"
+    if "حجم 15M ضعیف" in reason_text or "حجم ضعیف" in reason_text:
+        return "حجم ضعیف هنگام سیگنال"
+
+    risk = str(item.get("risk_level") or "").upper()
+    if risk in ["HIGH", "ریسک بالا", "بالا"]:
+        return "ریسک سیگنال بالا بوده"
+    if risk in ["MEDIUM", "متوسط"]:
+        return "ریسک سیگنال متوسط بوده"
+
+    adx = _safe_float(item.get("adx"), 0)
+    if 0 < adx < 25:
+        return "ADX پایین / قدرت روند کم"
+
+    confirmations = _safe_int(item.get("confirmations"), 0)
+    if confirmations and confirmations < 5:
+        return "تاییدیه‌های کم"
+
+    freshness = str(item.get("freshness") or "").upper()
+    if freshness == "LOW":
+        return "تازگی حرکت ضعیف"
+
+    rr = _safe_float(item.get("risk_reward"), 0)
+    if 0 < rr < 0.5:
+        return "ریسک به ریوارد ضعیف"
+
+    return "نامشخص / نیاز به داده بیشتر"
+
+
+def get_symbol_stats_report(days=3650, mode="all"):
+    """Return per-symbol statistics from signal tracker results, not Paper Trading.
+
+    Commands can use mode:
+    - all: all symbols in one message
+    - best: best symbols by win rate, then total move percent
+    - worst: weakest symbols by win rate, then total move percent
+    """
+    try:
+        days = int(days)
+    except Exception:
+        days = 3650
+
+    since = 0 if days >= 3650 else now_ts() - days * 86400
+    stats = get_signal_stats()
+    data = [s for s in stats if _event_ts(s) >= since]
+    created = [s for s in data if s.get("event_type") == "SIGNAL_CREATED"]
+    closed = [s for s in data if s.get("event_type") in ["TP1", "SL"] and s.get("symbol")]
+
+    if not closed:
+        return f"📊 آمار ارزها ({_format_days_label(days)})\n\nهنوز نتیجه TP1/SL ثبت نشده است."
+
+    by_symbol = {}
+    sl_reason_counts = {}
+    for item in closed:
+        symbol = str(item.get("symbol") or "UNKNOWN")
+        row = by_symbol.setdefault(symbol, {
+            "symbol": symbol,
+            "tp1": 0,
+            "sl": 0,
+            "total": 0,
+            "move_sum": 0.0,
+            "long": 0,
+            "short": 0,
+        })
+        event = item.get("event_type")
+        row["total"] += 1
+        if event == "TP1":
+            row["tp1"] += 1
+        elif event == "SL":
+            row["sl"] += 1
+            reason = _infer_sl_reason(item)
+            sl_reason_counts[reason] = sl_reason_counts.get(reason, 0) + 1
+
+        if item.get("direction") == "LONG":
+            row["long"] += 1
+        elif item.get("direction") == "SHORT":
+            row["short"] += 1
+        row["move_sum"] += _safe_float(item.get("move_percent"), 0)
+
+    rows = []
+    for row in by_symbol.values():
+        row["win_rate"] = round((row["tp1"] / row["total"]) * 100, 1) if row["total"] else 0
+        row["move_sum"] = round(row["move_sum"], 4)
+        rows.append(row)
+
+    rows_by_best = sorted(rows, key=lambda x: (x["win_rate"], x["move_sum"], x["total"]), reverse=True)
+    rows_by_worst = sorted(rows, key=lambda x: (x["win_rate"], x["move_sum"], -x["total"]))
+    rows_all = sorted(rows, key=lambda x: (x["total"], x["win_rate"], x["move_sum"]), reverse=True)
+
+    if mode == "best":
+        selected = rows_by_best[:15]
+        title = f"🏆 بهترین ارزها ({_format_days_label(days)})"
+    elif mode == "worst":
+        selected = rows_by_worst[:15]
+        title = f"⚠️ ضعیف‌ترین ارزها ({_format_days_label(days)})"
+    else:
+        selected = rows_all
+        title = f"📊 آمار کلی ارزها ({_format_days_label(days)})"
+
+    total_tp1 = len([x for x in closed if x.get("event_type") == "TP1"])
+    total_sl = len([x for x in closed if x.get("event_type") == "SL"])
+    total_closed = total_tp1 + total_sl
+    total_wr = round((total_tp1 / total_closed) * 100, 1) if total_closed else 0
+    total_move = round(sum(_safe_float(x.get("move_percent"), 0) for x in closed), 4)
+
+    lines = [
+        title,
+        "",
+        f"سیگنال‌های ثبت‌شده: {len(created)}",
+        f"نتایج بسته‌شده: {total_closed} | TP1: {total_tp1} | SL: {total_sl}",
+        f"Win Rate کلی: {total_wr}%",
+        f"جمع درصد حرکت: {total_move}%",
+        "--------------------",
+    ]
+
+    max_rows = 35 if mode == "all" else 15
+    for i, row in enumerate(selected[:max_rows], start=1):
+        sign = "+" if row["move_sum"] > 0 else ""
+        lines.append(
+            f"{i}) {row['symbol']} | معاملات: {row['total']} | TP1: {row['tp1']} | SL: {row['sl']} | "
+            f"WR: {row['win_rate']}% | حرکت: {sign}{row['move_sum']}% | L/S: {row['long']}/{row['short']}"
+        )
+
+    if len(selected) > max_rows:
+        lines.append(f"... و {len(selected) - max_rows} ارز دیگر")
+
+    if mode == "all":
+        lines.append("--------------------")
+        lines.append("🏆 بهترین‌ها:")
+        for row in rows_by_best[:5]:
+            sign = "+" if row["move_sum"] > 0 else ""
+            lines.append(f"{row['symbol']} → WR {row['win_rate']}% | {sign}{row['move_sum']}%")
+
+        lines.append("⚠️ ضعیف‌ترین‌ها:")
+        for row in rows_by_worst[:5]:
+            sign = "+" if row["move_sum"] > 0 else ""
+            lines.append(f"{row['symbol']} → WR {row['win_rate']}% | {sign}{row['move_sum']}%")
+
+        if sl_reason_counts:
+            lines.append("--------------------")
+            lines.append("❌ علت‌های احتمالی SL:")
+            for reason, count in sorted(sl_reason_counts.items(), key=lambda x: x[1], reverse=True)[:6]:
+                lines.append(f"{reason}: {count}")
+            lines.append("یادداشت: علت SL از داده‌های ذخیره‌شده همان سیگنال تخمین زده می‌شود، نه تحلیل دوباره بازار.")
+
+    text = "\n".join(lines)
+    if len(text) > 3900:
+        # Telegram safe trim while keeping the report usable.
+        trimmed = []
+        total_len = 0
+        for line in lines:
+            if total_len + len(line) + 1 > 3800:
+                break
+            trimmed.append(line)
+            total_len += len(line) + 1
+        trimmed.append("\nگزارش طولانی بود؛ بخشی از ارزهای کم‌تعداد حذف شد.")
+        text = "\n".join(trimmed)
+    return text
+
