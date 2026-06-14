@@ -293,6 +293,15 @@ def has_open_position(symbol: str, direction: Optional[str] = None) -> bool:
     return False
 
 
+
+def get_max_positions_setting() -> int:
+    """Shared max-position setting used by Paper Trade and Slot Manager."""
+    cfg = _read_trade_settings()
+    try:
+        return max(MIN_MAX_OPEN_POSITIONS, min(int(cfg.get("max_positions", DEFAULT_MAX_OPEN_POSITIONS)), MAX_MAX_OPEN_POSITIONS))
+    except Exception:
+        return int(DEFAULT_MAX_OPEN_POSITIONS)
+
 def can_open_paper_position(signal: Optional[Dict[str, Any]] = None) -> Tuple[bool, str]:
     if is_daily_locked():
         remaining = round(get_lock_remaining_seconds() / 3600, 2)
@@ -300,7 +309,7 @@ def can_open_paper_position(signal: Optional[Dict[str, Any]] = None) -> Tuple[bo
 
     cfg = _read_trade_settings()
     s = _state()
-    max_pos = max(MIN_MAX_OPEN_POSITIONS, min(int(cfg["max_positions"]), MAX_MAX_OPEN_POSITIONS))
+    max_pos = get_max_positions_setting()
     if len(s.get("open_positions", {})) >= max_pos:
         return False, "ظرفیت پوزیشن‌های Paper پر است."
 
@@ -410,6 +419,7 @@ def close_paper_position(symbol: str, direction: str, exit_price: float, result:
 
     acc = s.setdefault("account", {})
     acc["balance"] = round(float(acc.get("balance", acc.get("start_balance", 0)) or 0) + pnl_usdt, 6)
+    closed["balance_after"] = acc["balance"]
 
     stats = s.setdefault("stats", {"total": 0, "tp1": 0, "tp2": 0, "sl": 0, "manual_closed": 0})
     stats["total"] = int(stats.get("total", 0)) + 1
