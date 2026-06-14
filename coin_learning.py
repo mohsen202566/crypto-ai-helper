@@ -83,7 +83,7 @@ def format_learning_summary() -> str:
     total = sum(int(r.get('real_total', 0)) for r in rows); ghost = sum(int(r.get('ghost_total', 0)) for r in rows)
     sl = sum(int(r.get('sl', 0)) for r in rows); tp = sum(int(r.get('tp1', 0)) + int(r.get('tp2', 0)) for r in rows)
     wr = round(tp / max(tp + sl, 1) * 100, 1) if (tp + sl) else 0
-    return f"🧠 خلاصه یادگیری\nReal تجمعی: {total}\nGhost تجمعی: {ghost}\nنتایج بسته‌شده: TP={tp} | SL={sl}\nWinRate بسته‌شده: {wr}%"
+    return f"🧠 خلاصه یادگیری\nReal: {total}\nGhost: {ghost}\nTP: {tp} | SL: {sl}\nWinRate: {wr}%"
 
 def format_coin_behavior(symbol: str = None) -> str:
     s = _state(); rows = list(s.get('by_coin_direction', {}).values())
