@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import time
 from typing import Dict, List, Optional, Any
-from analysis import analyze_symbol
+from analysis import analyze_symbol, add_indicators, get_klines, ema_direction
 try:
     from config import SCAN_SYMBOLS, AUTO_DIRECT_SCORE_MIN
 except Exception:
@@ -18,11 +18,7 @@ try:
     from coin_rotation import sort_symbols_by_rotation
 except Exception:
     sort_symbols_by_rotation=None
-try:
-    from paper_trader import is_daily_locked
-except Exception:
-    is_daily_locked=None
-SCAN_DELAY_SECONDS=0.20; MAX_SCAN_RESULTS=10; MIN_SCANNER_SCORE=AUTO_DIRECT_SCORE_MIN
+SCAN_DELAY_SECONDS=0.05; MAX_SCAN_RESULTS=10; MIN_SCANNER_SCORE=82
 
 def normalize_symbol(symbol):
     s=str(symbol).upper().strip(); return s if s.endswith('USDT') else f'{s}USDT'
@@ -71,17 +67,9 @@ def save_as_ghost(r, reason='SLOT_FULL'):
     except Exception: return False
 
 def scan_for_auto_signals(symbols: Optional[List[str]]=None, max_results:int=MAX_SCAN_RESULTS, allow_ghost:bool=True):
-    if is_daily_locked:
-        try:
-            if is_daily_locked():
-                return {'signals': [], 'all_valid_signals': [], 'scanned': 0, 'no_trade_count': 0, 'error_count': 0, 'ghost_count': 0, 'mode': 'DAILY_LOCK', 'free_slots': 0, 'timestamp': int(time.time())}
-        except Exception:
-            pass
-
     sr=scan_market(symbols,max_results,allow_ghost); valid=sr.get('all_valid_signals',[])
+    if not valid: sr['signals']=[]; sr['mode']='NO_SIGNAL'; return sr
     free=get_available_slots(); sr['free_slots']=free
-    if not valid:
-        sr['signals']=[]; sr['mode']='NO_SIGNAL'; return sr
     if free<=0:
         gc=0
         if allow_ghost:
@@ -102,16 +90,47 @@ def get_best_signal(symbols=None):
 
 def get_top_signals(symbols=None, limit=5): return scan_for_auto_signals(symbols,limit,False).get('signals',[])[:limit]
 
+def quick_market_bias(symbol):
+    """Fast overview helper: only 1H + 15M, no full signal analysis.
+    This keeps Telegram market overview from timing out.
+    """
+    df_1h = add_indicators(get_klines(normalize_symbol(symbol), '1h', limit=260))
+    df_15m = add_indicators(get_klines(normalize_symbol(symbol), '15m', limit=260))
+    t1 = ema_direction(df_1h)
+    t15 = ema_direction(df_15m)
+    l15 = df_15m.iloc[-1]
+    score = 50
+    if t1 == 'bullish': score += 15
+    if t15 == 'bullish': score += 15
+    if t1 == 'bearish': score -= 15
+    if t15 == 'bearish': score -= 15
+    if l15['close'] > l15['vwap']: score += 5
+    else: score -= 5
+    if l15['macd'] > l15['macd_signal']: score += 5
+    else: score -= 5
+    if l15['rsi'] >= 52: score += 5
+    elif l15['rsi'] <= 48: score -= 5
+    if t1 == 'bullish' and t15 == 'bullish':
+        bias = 'bullish'
+    elif t1 == 'bearish' and t15 == 'bearish':
+        bias = 'bearish'
+    else:
+        bias = 'neutral'
+    return {'symbol': normalize_symbol(symbol), 'bias': bias, 'direction': 'OVERVIEW', 'score': max(0, min(100, int(score))), 'trend_1h': t1, 'trend_15m': t15}
+
 def scan_market_overview(symbols=None, limit=40):
-    symbols=(symbols or get_scan_symbols())[:limit]; bullish=bearish=neutral=errors=0; details=[]
+    symbols=(symbols or get_scan_symbols())[:limit]; bullish= bearish= neutral= errors=0; details=[]; error_details=[]
     for sym in symbols:
         try:
-            r=analyze_symbol(normalize_symbol(sym)); t=r.get('trends',{}); one=t.get('1H'); fifteen=t.get('15M')
-            if one=='bullish' and fifteen=='bullish': bullish+=1; bias='bullish'
-            elif one=='bearish' and fifteen=='bearish': bearish+=1; bias='bearish'
-            else: neutral+=1; bias='neutral'
-            details.append({'symbol':sym,'bias':bias,'direction':r.get('direction'),'score':r.get('score')})
-        except Exception: errors+=1
+            r=quick_market_bias(sym); bias=r.get('bias')
+            if bias=='bullish': bullish+=1
+            elif bias=='bearish': bearish+=1
+            else: neutral+=1
+            details.append(r)
+        except Exception as e:
+            errors+=1
+            if len(error_details) < 5:
+                error_details.append({'symbol': normalize_symbol(sym), 'error': str(e)[:160]})
         time.sleep(SCAN_DELAY_SECONDS)
     total=max(bullish+bearish+neutral,1); bp=round(bullish/total*100,1); sp=round(bearish/total*100,1); np=round(neutral/total*100,1)
     if bp>=50: mb='bullish'; summary='بازار بیشتر صعودی است'
@@ -120,7 +139,7 @@ def scan_market_overview(symbols=None, limit=40):
     elif bp>sp: mb='slightly_bullish'; summary='بازار کمی تمایل صعودی دارد'
     elif sp>bp: mb='slightly_bearish'; summary='بازار کمی تمایل نزولی دارد'
     else: mb='neutral'; summary='بازار جهت مشخصی ندارد'
-    return {'market_bias':mb,'summary':summary,'bullish':bullish,'bearish':bearish,'neutral':neutral,'errors':errors,'bullish_pct':bp,'bearish_pct':sp,'neutral_pct':np,'details':details,'scanned':len(symbols),'timestamp':int(time.time())}
+    return {'market_bias':mb,'summary':summary,'bullish':bullish,'bearish':bearish,'neutral':neutral,'errors':errors,'error_details':error_details,'bullish_pct':bp,'bearish_pct':sp,'neutral_pct':np,'details':details,'scanned':len(symbols),'timestamp':int(time.time())}
 
 def scan_symbols_for_signals(symbols=None,max_results=MAX_SCAN_RESULTS): return scan_for_auto_signals(symbols,max_results,True).get('signals',[])
 def find_best_signal(symbols=None): return get_best_signal(symbols)
