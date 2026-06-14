@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """AI Classic Direct Analysis Engine - complete integrated version."""
 import math
+import time
 from typing import Dict, List, Optional, Tuple, Any
 import ccxt
 import pandas as pd
@@ -27,6 +28,8 @@ except Exception:
     update_ai_summary = None
 
 exchange = ccxt.okx({'enableRateLimit': True, 'timeout': 20000, 'options': {'defaultType': 'swap'}})
+_SOFT_MARKET_CONTEXT_CACHE = {'ts': 0, 'data': None}
+SOFT_MARKET_CONTEXT_TTL_SECONDS = 120
 AUTO_DIRECT_SCORE_MIN = 82
 ADX_HARD_MIN = max(float(MIN_ADX_FOR_TREND), 20.0)
 LONG_DIRECT_SCORE_BONUS_REQUIREMENT = 0
@@ -313,13 +316,28 @@ def build_trade_levels(direction, price, atr, df_5m, df_15m, df_30m, snapshot=No
     return safe_round(sl), safe_round(tp1), safe_round(tp2), rr, {'volatility_factor':round(vf,3),'ai_tp_used':bool(ai_tp),'ai_tp':ai_tp,'nearest_support':levels.get('nearest_support'),'nearest_resistance':levels.get('nearest_resistance')}
 
 def get_soft_market_context():
+    now = time.time() if 'time' in globals() else 0
+    try:
+        cached = _SOFT_MARKET_CONTEXT_CACHE.get('data')
+        cached_ts = float(_SOFT_MARKET_CONTEXT_CACHE.get('ts') or 0)
+        if cached and now and (now - cached_ts) <= SOFT_MARKET_CONTEXT_TTL_SECONDS:
+            return dict(cached)
+    except Exception:
+        pass
     try:
         b4=add_indicators(get_klines('BTCUSDT','4h')); b1=add_indicators(get_klines('BTCUSDT','1h')); b15=add_indicators(get_klines('BTCUSDT','15m'))
         t4=ema_direction(b4); t1=ema_direction(b1); t15=ema_direction(b15); last=b15.iloc[-1]
         regime='bullish' if t4=='bullish' and t1=='bullish' else 'bearish' if t4=='bearish' and t1=='bearish' else 'neutral'
         btc_bias='bullish' if regime=='bullish' and last['macd']>=last['macd_signal'] else 'bearish' if regime=='bearish' and last['macd']<=last['macd_signal'] else 'neutral'
-        return {'market_regime':regime,'btc_bias':btc_bias,'btc_4h':t4,'btc_1h':t1,'btc_15m':t15}
-    except Exception: return {'market_regime':'neutral','btc_bias':'neutral'}
+        data={'market_regime':regime,'btc_bias':btc_bias,'btc_4h':t4,'btc_1h':t1,'btc_15m':t15}
+        try:
+            _SOFT_MARKET_CONTEXT_CACHE['data'] = dict(data)
+            _SOFT_MARKET_CONTEXT_CACHE['ts'] = now or 0
+        except Exception:
+            pass
+        return data
+    except Exception:
+        return {'market_regime':'neutral','btc_bias':'neutral'}
 
 def analyze_symbol(symbol: str) -> Dict:
     symbol=str(symbol).upper().strip()
