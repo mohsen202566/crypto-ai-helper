@@ -303,9 +303,51 @@ PERSIAN_SYMBOLS = {
 }
 
 
+COMMAND_ONLY_PHRASES = {
+    "ترید", "ترید فعال", "فعال ترید", "وضعیت ترید", "تریدها",
+    "آمار ترید", "امار ترید", "ریست ترید", "حجم پوزیشن",
+    "حداکثر پوزیشن", "پوزیشن‌ها", "پوزیشن ها", "positions",
+    "بهترین سیگنال", "بهترین", "بررسی", "بررسی بازار", "بازار", "وضعیت بازار",
+    "آمار", "امار", "حذف آمار", "حذف امار", "ریست آمار",
+    "هوش مصنوعی", "ai", "وضعیت ai", "وضعیت هوش مصنوعی",
+    "حافظه ربات", "حافظه ai", "یادگیری", "learning",
+    "ریسک کوین‌ها", "ریسک کوین ها", "چرخش کوین",
+    "سیگنال‌های مخفی", "سیگنال های مخفی", "ghost", "ghost signals",
+    "اسلات‌ها", "اسلات ها", "slots", "slot",
+}
+
+COMMAND_WORDS = {
+    "ترید", "فعال", "وضعیت", "آمار", "امار", "ریست", "حذف", "حجم", "پوزیشن",
+    "پوزیشن‌ها", "پوزیشنها", "حداکثر", "بهترین", "بدترین", "سیگنال", "سیگنال‌ها",
+    "سیگنالهای", "بررسی", "بازار", "ربات", "هوش", "مصنوعی", "حافظه", "یادگیری",
+    "ریسک", "چرخش", "اسلات", "اسلات‌ها", "مخفی", "دلار", "لوریج",
+}
+
+def _normalize_command_text(text: str) -> str:
+    return (
+        str(text or "")
+        .lower()
+        .replace("ي", "ی")
+        .replace("ك", "ک")
+        .replace("‌", " ")
+        .strip()
+    )
+
+def is_command_only_text(text: str) -> bool:
+    t = _normalize_command_text(text)
+    compact = t.replace(" ", "")
+    if t in COMMAND_ONLY_PHRASES or compact in {x.replace(" ", "") for x in COMMAND_ONLY_PHRASES}:
+        return True
+    words = [w for w in re.split(r"\s+", t) if w]
+    return bool(words) and all(w in COMMAND_WORDS or w.isdigit() for w in words)
+
 def normalize_symbol_text(text: str) -> Optional[str]:
     raw_text = str(text or "").strip()
-    t = raw_text.lower()
+    t = _normalize_command_text(raw_text)
+
+    # Safety gate: pure bot/trade/stat commands must never become fake symbols like USDT.
+    if is_command_only_text(t):
+        return None
 
     cleaned = (
         t.replace("تحلیل", "")
@@ -320,14 +362,21 @@ def normalize_symbol_text(text: str) -> Optional[str]:
         .strip()
     )
 
+    # After removing analysis words, check again; empty/command text is not a symbol.
+    if not cleaned or is_command_only_text(cleaned):
+        return None
+
     for key, symbol in PERSIAN_SYMBOLS.items():
         if key in cleaned:
             return symbol
 
     raw = cleaned.upper().replace(" ", "")
-    if raw.endswith("USDT") and len(raw) >= 6:
+    blocked_raw = {"USDT", "تریدفعال", "وضعیتترید", "آمارترید", "امارترید", "حجمپوزیشن"}
+    if raw in blocked_raw:
+        return None
+    if raw.endswith("USDT") and len(raw) >= 6 and raw != "USDT":
         return raw
-    if raw.isalpha() and 2 <= len(raw) <= 10:
+    if raw.isascii() and raw.isalpha() and 2 <= len(raw) <= 10:
         return raw + "USDT"
     return None
 
@@ -1111,7 +1160,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     # Trade commands
-    if low in ["ترید", "وضعیت ترید"]:
+    if low in ["ترید", "وضعیت ترید", "ترید فعال", "فعال ترید", "تریدها"]:
         await trade_status_command(update, context)
         return
 
