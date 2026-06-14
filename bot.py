@@ -235,6 +235,98 @@ def format_bot_settings_status() -> str:
     )
 
 
+def _safe_len_from_json(path: str, keys: List[str]) -> int:
+    try:
+        data = load_json(path, {})
+        cur = data
+        for key in keys:
+            if isinstance(cur, dict):
+                cur = cur.get(key, {})
+            else:
+                return 0
+        if isinstance(cur, dict):
+            return len(cur)
+        if isinstance(cur, list):
+            return len(cur)
+        return 0
+    except Exception:
+        return 0
+
+
+def estimate_ai_watched_symbols() -> int:
+    """Best-effort count of coins/symbols with AI memory/learning/tracking data."""
+    candidates = [
+        (os.path.join(DATA_DIR, "coin_learning.json"), []),
+        (os.path.join(DATA_DIR, "learning.json"), []),
+        (os.path.join(DATA_DIR, "ai_memory.json"), ["symbols"]),
+        (os.path.join(DATA_DIR, "active_signals.json"), []),
+        (os.path.join(DATA_DIR, "ghost_signals.json"), []),
+    ]
+    best = 0
+    for path, keys in candidates:
+        best = max(best, _safe_len_from_json(path, keys))
+    return best
+
+
+def format_custom_ai_status() -> str:
+    st = load_bot_settings()
+    watched = estimate_ai_watched_symbols()
+    parts = [
+        "🧠 وضعیت هوش مصنوعی",
+        "",
+        f"وضعیت AI: {'✅ روشن' if st.get('ai_enabled') else '❌ خاموش'}",
+        f"یادگیری: {'✅ روشن' if st.get('learning_enabled') else '❌ خاموش'}",
+        f"گزارش روزانه: {'✅ روشن' if st.get('daily_report_enabled') else '❌ خاموش'}",
+        f"حالت: {'محافظه‌کار' if st.get('mode') == 'conservative' else 'عادی'}",
+        f"تعداد ارزهای زیر نظر/دارای داده: {watched}",
+    ]
+    extra = []
+    for fn in [format_ai_status, format_learning_summary, format_rotation_report, format_ghost_report, format_slot_report]:
+        if not fn:
+            continue
+        try:
+            value = fn()
+            if value:
+                extra.append(str(value))
+        except Exception:
+            pass
+    if extra:
+        parts.append("")
+        parts.append("📊 جزئیات یادگیری و حافظه:")
+        parts.append("\n\n".join(extra))
+    else:
+        parts.append("")
+        parts.append("جزئیات یادگیری هنوز داده کافی ندارد یا ماژول گزارش در دسترس نیست.")
+    return "\n".join(parts)
+
+
+def reset_ai_runtime_stats_only() -> List[str]:
+    """
+    Reset only temporary/report AI stats.
+    Important: learning memory files are intentionally NOT deleted.
+    """
+    reset_files = [
+        "ai_daily_stats.json",
+        "ai_report_stats.json",
+        "daily_ai_report.json",
+        "coin_daily_stats.json",
+        "coin_report_stats.json",
+        "rotation_daily_stats.json",
+        "ghost_daily_stats.json",
+    ]
+    done = []
+    for name in reset_files:
+        path = os.path.join(DATA_DIR, name)
+        try:
+            if os.path.exists(path):
+                save_json(path, {})
+                done.append(name)
+        except Exception:
+            pass
+    return done
+
+
+
 async def set_bot_setting_command(update: Update, key: str, value: Any, message: str) -> None:
     st = load_bot_settings()
     st[key] = value
@@ -544,6 +636,23 @@ async def position_size_command(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
 
+async def trade_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    parts = ["📈 آمار ترید", "", format_trade_status()]
+    if format_paper_stats:
+        try:
+            parts.append("\n📊 Paper Trade:")
+            parts.append(str(format_paper_stats()))
+        except Exception:
+            pass
+    if format_open_positions:
+        try:
+            parts.append("\n📌 پوزیشن‌های باز:")
+            parts.append(str(format_open_positions()))
+        except Exception:
+            pass
+    await send_long_text(update, "\n".join(parts))
+
+
 async def reset_trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     save_trade_settings(DEFAULT_TRADE_SETTINGS.copy())
     await update.message.reply_text("✅ تنظیمات ترید ریست شد.\n\n" + format_trade_status())
@@ -648,45 +757,28 @@ def attach_signal_metadata(signal: Dict[str, Any], message_id: int, chat_id: int
 def format_commands_help() -> str:
     return (
         "📚 دستورات ربات\n\n"
-        "📊 تحلیل و سیگنال:\n"
-        "تحلیل بیتکوین\n"
-        "سیگنال سولانا\n"
-        "BTC / ETH / SOL\n"
+        "🤖 خود ربات:\n"
         "بهترین سیگنال\n"
-        "بررسی / بررسی بازار\n\n"
-        "💰 ترید و مدیریت سرمایه:\n"
-        "وضعیت ترید / وضعیت / ترید\n"
-        "سرمایه ترید / سرمایه ترید 1000\n"
-        "ترید دلار / ترید دلار 20\n"
-        "ترید لوریج / ترید لوریج 5\n"
-        "حداکثر پوزیشن / حداکثر پوزیشن 10\n"
-        "حجم پوزیشن\n"
-        "ریست ترید\n"
-        "ترید فعال / ترید غیرفعال\n"
-        "اتوسیگنال فعال / اتوسیگنال غیرفعال\n\n"
-        "📈 آمار و پوزیشن‌ها:\n"
-        "آمار / آمار 7 روز / آمار کل\n"
-        "آمار ارزها\n"
-        "بهترین ارزها / بدترین ارزها\n"
-        "پوزیشن‌ها\n"
-        "سیگنال‌های فعال\n"
-        "حذف آمار\n\n"
+        "وضعیت بازار\n"
+        "آمار / امار\n\n"
+        "💰 ترید:\n"
+        "ترید\n"
+        "وضعیت ترید\n"
+        "ترید دلار\n"
+        "ترید لوریج\n"
+        "حداکثر پوزیشن\n"
+        "آمار ترید / امار ترید\n"
+        "ریست ترید\n\n"
         "🧠 هوش مصنوعی:\n"
-        "هوش مصنوعی / AI / وضعیت AI\n"
-        "آمار هوشمند\n"
-        "حافظه ربات\n"
-        "رفتار کوین BTC\n"
-        "ریسک کوین‌ها\n"
-        "بهترین کوین‌ها\n"
-        "بدترین کوین‌ها\n"
-        "سیگنال‌های مخفی\n"
-        "اسلات‌ها\n\n"
-        "⚙️ تنظیمات AI و ربات:\n"
-        "تنظیمات ربات\n"
-        "AI روشن / AI خاموش\n"
-        "یادگیری روشن / یادگیری خاموش\n"
-        "گزارش روزانه روشن / گزارش روزانه خاموش\n"
-        "حالت محافظه‌کار / حالت عادی\n"
+        "هوش مصنوعی\n"
+        "وضعیت هوش مصنوعی\n"
+        "هوش مصنوعی روشن\n"
+        "هوش مصنوعی خاموش\n"
+        "ریست آمار هوش مصنوعی\n\n"
+        "📊 تحلیل:\n"
+        "تحلیل بیتکوین\n"
+        "تحلیل BTC\n"
+        "سیگنال سولانا\n"
     )
 
 # ============================================================
@@ -845,16 +937,7 @@ async def ai_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await reject_unauthorized(update)
         return
 
-    parts = []
-    for fn in [format_ai_status, format_learning_summary, format_rotation_report, format_ghost_report, format_slot_report]:
-        if not fn:
-            continue
-        try:
-            parts.append(fn())
-        except Exception:
-            pass
-
-    await send_long_text(update, "\n\n".join(parts) if parts else "AI Status در دسترس نیست.")
+    await send_long_text(update, format_custom_ai_status())
 
 
 async def learning_memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -874,6 +957,19 @@ async def learning_memory_command(update: Update, context: ContextTypes.DEFAULT_
         except Exception:
             pass
     await send_long_text(update, "\n\n".join(parts) if parts else "حافظه ربات در دسترس نیست.")
+
+
+async def reset_ai_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if get_user_id(update) != OWNER_ID:
+        await reject_unauthorized(update)
+        return
+
+    reset_files = reset_ai_runtime_stats_only()
+    await update.message.reply_text(
+        "✅ آمار روزانه/گزارشی هوش مصنوعی ریست شد.\n"
+        "حافظه یادگیری و تجربه‌های ذخیره‌شده پاک نشد.\n\n"
+        f"فایل‌های ریست‌شده: {', '.join(reset_files) if reset_files else 'فایل موقت خاصی پیدا نشد'}"
+    )
 
 
 async def coin_behavior_command(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol: Optional[str] = None) -> None:
@@ -1097,6 +1193,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     low = text.lower().strip()
+    compact = low.replace(" ", "").replace("\u200c", "")
     uid = get_user_id(update)
 
     # Follow-up answers for trade settings
@@ -1153,6 +1250,23 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await send_long_text(update, format_commands_help())
         return
 
+    # AI commands requested by user
+    if compact in ["هوشمصنوعیروشن", "aiروشن"]:
+        await set_bot_setting_command(update, "ai_enabled", True, "هوش مصنوعی روشن شد.")
+        return
+
+    if compact in ["هوشمصنوعیخاموش", "aiخاموش"]:
+        await set_bot_setting_command(update, "ai_enabled", False, "هوش مصنوعی خاموش شد.")
+        return
+
+    if compact in ["ریستامارهوشمصنوعی", "ریستآمارهوشمصنوعی", "ریستهوشمصنوعی"]:
+        await reset_ai_stats_command(update, context)
+        return
+
+    if compact in ["هوشمصنوعی", "وضعیتهوشمصنوعی", "ai", "وضعیتai"]:
+        await ai_status_command(update, context)
+        return
+
     # Bot / AI / trading switches
     if low in ["وضعیت ربات", "تنظیمات ربات", "تنظیمات", "تنظیمات ai", "تنظیمات هوش مصنوعی"]:
         await update.message.reply_text(format_bot_settings_status())
@@ -1207,6 +1321,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     # Trade commands
+    if compact in ["امتارترید", "آمارترید"]:
+        await trade_stats_command(update, context)
+        return
+
     if low in ["وضعیت ترید", "وضعیت", "ترید"]:
         await trade_status_command(update, context)
         return
@@ -1223,7 +1341,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await set_leverage_command(update, context)
         return
 
-    if low.startswith("حداکثر پوزیشن") or low.startswith("حد اکثر پوزیشن") or low.startswith("حداکثر معاملات") or low.startswith("حداکثر معامله"):
+    if compact.startswith("حداکثرپوزیشن") or compact.startswith("حداکثرمعاملات") or compact.startswith("حداکثرمعامله") or low.startswith("حد اکثر پوزیشن"):
         await set_max_positions_command(update, context)
         return
 
