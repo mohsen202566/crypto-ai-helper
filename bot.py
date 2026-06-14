@@ -462,7 +462,9 @@ def format_trade_status() -> str:
         "سرمایه ترید 1000\n"
         "ترید دلار / ترید دلار 20\n"
         "ترید لوریج / ترید لوریج 5\n"
+        "حداکثر پوزیشن / حداکثر پوزیشن 10\n"
         "حجم پوزیشن\n"
+        "ترید فعال / ترید غیرفعال\n"
         "ریست ترید"
     )
 
@@ -641,6 +643,52 @@ def attach_signal_metadata(signal: Dict[str, Any], message_id: int, chat_id: int
     return s
 
 
+
+
+def format_commands_help() -> str:
+    return (
+        "📚 دستورات ربات\n\n"
+        "📊 تحلیل و سیگنال:\n"
+        "تحلیل بیتکوین\n"
+        "سیگنال سولانا\n"
+        "BTC / ETH / SOL\n"
+        "بهترین سیگنال\n"
+        "بررسی / بررسی بازار\n\n"
+        "💰 ترید و مدیریت سرمایه:\n"
+        "وضعیت ترید / وضعیت / ترید\n"
+        "سرمایه ترید / سرمایه ترید 1000\n"
+        "ترید دلار / ترید دلار 20\n"
+        "ترید لوریج / ترید لوریج 5\n"
+        "حداکثر پوزیشن / حداکثر پوزیشن 10\n"
+        "حجم پوزیشن\n"
+        "ریست ترید\n"
+        "ترید فعال / ترید غیرفعال\n"
+        "اتوسیگنال فعال / اتوسیگنال غیرفعال\n\n"
+        "📈 آمار و پوزیشن‌ها:\n"
+        "آمار / آمار 7 روز / آمار کل\n"
+        "آمار ارزها\n"
+        "بهترین ارزها / بدترین ارزها\n"
+        "پوزیشن‌ها\n"
+        "سیگنال‌های فعال\n"
+        "حذف آمار\n\n"
+        "🧠 هوش مصنوعی:\n"
+        "هوش مصنوعی / AI / وضعیت AI\n"
+        "آمار هوشمند\n"
+        "حافظه ربات\n"
+        "رفتار کوین BTC\n"
+        "ریسک کوین‌ها\n"
+        "بهترین کوین‌ها\n"
+        "بدترین کوین‌ها\n"
+        "سیگنال‌های مخفی\n"
+        "اسلات‌ها\n\n"
+        "⚙️ تنظیمات AI و ربات:\n"
+        "تنظیمات ربات\n"
+        "AI روشن / AI خاموش\n"
+        "یادگیری روشن / یادگیری خاموش\n"
+        "گزارش روزانه روشن / گزارش روزانه خاموش\n"
+        "حالت محافظه‌کار / حالت عادی\n"
+    )
+
 # ============================================================
 # Core commands
 # ============================================================
@@ -650,35 +698,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await reject_unauthorized(update)
         return
 
-    text = (
-        "🤖 Crypto AI Bot\n\n"
-        "دستورهای اصلی:\n"
-        "تحلیل بیتکوین\n"
-        "سیگنال سولانا\n"
-        "بهترین سیگنال\n"
-        "بررسی / بررسی بازار\n"
-        "آمار / آمار 7 روز / آمار کل\n"
-        "حذف آمار\n\n"
-        "دستورهای ترید:\n"
-        "وضعیت ترید\n"
-        "سرمایه ترید 1000\n"
-        "ترید دلار / ترید دلار 20\n"
-        "ترید لوریج / ترید لوریج 5\n"
-        "حجم پوزیشن\n"
-        "ریست ترید\n\n"
-        "AI و مدیریت:\n"
-        "هوش مصنوعی\n"
-        "حافظه ربات\n"
-        "ریسک کوین‌ها\n"
-        "بهترین کوین‌ها\n"
-        "بدترین کوین‌ها\n"
-        "سیگنال‌های مخفی\n"
-        "اسلات‌ها\n"
-        "پوزیشن‌ها\n"
-        "سیگنال‌های فعال\n\n"
-        "یادداشت: دستور «زیر نظر» حذف شده؛ همه سیگنال‌ها خودکار Track می‌شوند."
-    )
-    await update.message.reply_text(text)
+    await send_long_text(update, format_commands_help())
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1129,8 +1149,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("نیازی به دستور زیر نظر نیست؛ همه سیگنال‌های معتبر خودکار Track می‌شوند.")
         return
 
+    if low in ["دستورات", "راهنما", "help", "/help"]:
+        await send_long_text(update, format_commands_help())
+        return
+
     # Bot / AI / trading switches
-    if low in ["وضعیت ربات", "تنظیمات ربات", "تنظیمات", "وضعیت ai", "وضعیت هوش مصنوعی"]:
+    if low in ["وضعیت ربات", "تنظیمات ربات", "تنظیمات", "تنظیمات ai", "تنظیمات هوش مصنوعی"]:
         await update.message.reply_text(format_bot_settings_status())
         return
 
@@ -1311,6 +1335,7 @@ def build_application() -> Application:
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("commands", help_command))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("positions", positions_command))
     app.add_handler(CommandHandler("active", active_signals_command))
