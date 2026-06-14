@@ -290,6 +290,17 @@ def normalize_symbol_text(text: str) -> Optional[str]:
         .strip()
     )
 
+    # Do not treat bot commands/settings words as coin symbols
+    command_words = {
+        "وضعیت", "وضعیت ترید", "ترید", "دلار لوریج", "لوریج دلار", "لوریج",
+        "حجم پوزیشن", "ریست ترید", "سرمایه ترید", "ترید دلار",
+        "آمار", "امار", "بررسی", "بررسی بازار", "بازار", "بهترین سیگنال",
+        "هوش مصنوعی", "حافظه ربات", "سیگنال‌های مخفی", "سیگنال های مخفی",
+        "اسلات‌ها", "اسلات ها", "پوزیشن‌ها", "پوزیشن ها",
+    }
+    if t in command_words or cleaned in command_words:
+        return None
+
     for key, symbol in PERSIAN_SYMBOLS.items():
         if key in cleaned:
             return symbol
@@ -297,7 +308,7 @@ def normalize_symbol_text(text: str) -> Optional[str]:
     raw = cleaned.upper().replace(" ", "")
     if raw.endswith("USDT") and len(raw) >= 6:
         return raw
-    if raw.isalpha() and 2 <= len(raw) <= 10:
+    if raw.isascii() and raw.isalpha() and 2 <= len(raw) <= 10:
         return raw + "USDT"
     return None
 
@@ -1002,7 +1013,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     # Trade commands
-    if low == "وضعیت ترید":
+    if low in ["وضعیت ترید", "وضعیت", "ترید"]:
         await trade_status_command(update, context)
         return
 
@@ -1014,7 +1025,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await set_trade_margin_command(update, context)
         return
 
-    if low.startswith("لوریج دلار") or low.startswith("لوریج"):
+    if low.startswith("لوریج دلار") or low.startswith("دلار لوریج") or low.startswith("لوریج"):
         await set_leverage_command(update, context)
         return
 
