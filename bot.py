@@ -290,17 +290,6 @@ def normalize_symbol_text(text: str) -> Optional[str]:
         .strip()
     )
 
-    # Do not treat bot commands/settings words as coin symbols
-    command_words = {
-        "وضعیت", "وضعیت ترید", "ترید", "دلار لوریج", "لوریج دلار", "لوریج",
-        "حجم پوزیشن", "ریست ترید", "سرمایه ترید", "ترید دلار",
-        "آمار", "امار", "بررسی", "بررسی بازار", "بازار", "بهترین سیگنال",
-        "هوش مصنوعی", "حافظه ربات", "سیگنال‌های مخفی", "سیگنال های مخفی",
-        "اسلات‌ها", "اسلات ها", "پوزیشن‌ها", "پوزیشن ها",
-    }
-    if t in command_words or cleaned in command_words:
-        return None
-
     for key, symbol in PERSIAN_SYMBOLS.items():
         if key in cleaned:
             return symbol
