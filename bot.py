@@ -26,7 +26,7 @@ from telegram.ext import (
 )
 
 from analysis import analyze_symbol
-from scanner import scan_for_auto_signals, get_top_signals, scan_market_overview, get_scan_symbols
+from scanner import scan_for_auto_signals, get_top_signals, scan_market_overview
 
 
 # ============================================================
@@ -67,12 +67,20 @@ try:
         format_paper_stats,
         format_open_positions,
         reset_paper_trades,
+        format_paper_trade_status,
+        configure_paper_account,
+        can_open_paper_position,
+        is_daily_locked,
     )
 except Exception:
     open_paper_position = None
     format_paper_stats = None
     format_open_positions = None
     reset_paper_trades = None
+    format_paper_trade_status = None
+    configure_paper_account = None
+    can_open_paper_position = None
+    is_daily_locked = None
 
 
 try:
@@ -159,13 +167,11 @@ logger = logging.getLogger("crypto-ai-bot")
 # ============================================================
 
 LAST_AUTO_SIGNAL_TIME: Dict[str, int] = {}
-USER_PENDING_ACTION: Dict[int, str] = {}
 AUTO_SIGNAL_COOLDOWN_SECONDS = int(AUTO_SIGNAL_COOLDOWN_MINUTES) * 60
 
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 TRADE_SETTINGS_FILE = os.path.join(DATA_DIR, "trade_settings.json")
-BOT_SETTINGS_FILE = os.path.join(DATA_DIR, "bot_settings.json")
 
 
 # ============================================================
@@ -191,147 +197,6 @@ def save_json(path: str, data: Any) -> None:
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
-
-
-# ============================================================
-# Bot / AI settings helpers
-# ============================================================
-
-DEFAULT_BOT_SETTINGS = {
-    "trading_enabled": True,
-    "ai_enabled": True,
-    "learning_enabled": True,
-    "daily_report_enabled": False,
-    "mode": "normal",
-    "auto_signal_enabled": bool(AUTO_SIGNAL_ENABLED),
-    "updated_at": None,
-}
-
-
-def load_bot_settings() -> Dict[str, Any]:
-    state = load_json(BOT_SETTINGS_FILE, DEFAULT_BOT_SETTINGS.copy())
-    merged = DEFAULT_BOT_SETTINGS.copy()
-    if isinstance(state, dict):
-        merged.update(state)
-    return merged
-
-
-def save_bot_settings(state: Dict[str, Any]) -> Dict[str, Any]:
-    state["updated_at"] = int(time.time())
-    save_json(BOT_SETTINGS_FILE, state)
-    return state
-
-
-def format_bot_settings_status() -> str:
-    st = load_bot_settings()
-    return (
-        "⚙️ وضعیت تنظیمات ربات\n\n"
-        f"ترید: {'✅ فعال' if st.get('trading_enabled') else '❌ غیرفعال'}\n"
-        f"اتوسیگنال: {'✅ فعال' if st.get('auto_signal_enabled') else '❌ غیرفعال'}\n"
-        f"AI: {'✅ روشن' if st.get('ai_enabled') else '❌ خاموش'}\n"
-        f"یادگیری: {'✅ روشن' if st.get('learning_enabled') else '❌ خاموش'}\n"
-        f"گزارش روزانه: {'✅ روشن' if st.get('daily_report_enabled') else '❌ خاموش'}\n"
-        f"حالت: {'محافظه‌کار' if st.get('mode') == 'conservative' else 'عادی'}"
-    )
-
-
-def _safe_len_from_json(path: str, keys: List[str]) -> int:
-    try:
-        data = load_json(path, {})
-        cur = data
-        for key in keys:
-            if isinstance(cur, dict):
-                cur = cur.get(key, {})
-            else:
-                return 0
-        if isinstance(cur, dict):
-            return len(cur)
-        if isinstance(cur, list):
-            return len(cur)
-        return 0
-    except Exception:
-        return 0
-
-
-def estimate_ai_watched_symbols() -> int:
-    """Best-effort count of coins/symbols with AI memory/learning/tracking data."""
-    candidates = [
-        (os.path.join(DATA_DIR, "coin_learning.json"), []),
-        (os.path.join(DATA_DIR, "learning.json"), []),
-        (os.path.join(DATA_DIR, "ai_memory.json"), ["symbols"]),
-        (os.path.join(DATA_DIR, "active_signals.json"), []),
-        (os.path.join(DATA_DIR, "ghost_signals.json"), []),
-    ]
-    best = 0
-    for path, keys in candidates:
-        best = max(best, _safe_len_from_json(path, keys))
-    return best
-
-
-def format_custom_ai_status() -> str:
-    st = load_bot_settings()
-    watched = estimate_ai_watched_symbols()
-    parts = [
-        "🧠 وضعیت هوش مصنوعی",
-        "",
-        f"وضعیت AI: {'✅ روشن' if st.get('ai_enabled') else '❌ خاموش'}",
-        f"یادگیری: {'✅ روشن' if st.get('learning_enabled') else '❌ خاموش'}",
-        f"گزارش روزانه: {'✅ روشن' if st.get('daily_report_enabled') else '❌ خاموش'}",
-        f"حالت: {'محافظه‌کار' if st.get('mode') == 'conservative' else 'عادی'}",
-        f"تعداد ارزهای زیر نظر/دارای داده: {watched}",
-    ]
-    extra = []
-    for fn in [format_ai_status, format_learning_summary, format_rotation_report, format_ghost_report, format_slot_report]:
-        if not fn:
-            continue
-        try:
-            value = fn()
-            if value:
-                extra.append(str(value))
-        except Exception:
-            pass
-    if extra:
-        parts.append("")
-        parts.append("📊 جزئیات یادگیری و حافظه:")
-        parts.append("\n\n".join(extra))
-    else:
-        parts.append("")
-        parts.append("جزئیات یادگیری هنوز داده کافی ندارد یا ماژول گزارش در دسترس نیست.")
-    return "\n".join(parts)
-
-
-def reset_ai_runtime_stats_only() -> List[str]:
-    """
-    Reset only temporary/report AI stats.
-    Important: learning memory files are intentionally NOT deleted.
-    """
-    reset_files = [
-        "ai_daily_stats.json",
-        "ai_report_stats.json",
-        "daily_ai_report.json",
-        "coin_daily_stats.json",
-        "coin_report_stats.json",
-        "rotation_daily_stats.json",
-        "ghost_daily_stats.json",
-    ]
-    done = []
-    for name in reset_files:
-        path = os.path.join(DATA_DIR, name)
-        try:
-            if os.path.exists(path):
-                save_json(path, {})
-                done.append(name)
-        except Exception:
-            pass
-    return done
-
-
-
-async def set_bot_setting_command(update: Update, key: str, value: Any, message: str) -> None:
-    st = load_bot_settings()
-    st[key] = value
-    save_bot_settings(st)
-    await update.message.reply_text(f"✅ {message}\n\n{format_bot_settings_status()}")
 
 
 # ============================================================
@@ -440,7 +305,7 @@ def normalize_symbol_text(text: str) -> Optional[str]:
     raw = cleaned.upper().replace(" ", "")
     if raw.endswith("USDT") and len(raw) >= 6:
         return raw
-    if raw.isascii() and raw.isalpha() and 2 <= len(raw) <= 10:
+    if raw.isalpha() and 2 <= len(raw) <= 10:
         return raw + "USDT"
     return None
 
@@ -505,9 +370,9 @@ async def send_long_text(update: Update, text: str, max_len: int = 3900) -> None
 # ============================================================
 
 DEFAULT_TRADE_SETTINGS = {
-    "capital_usd": 1000.0,
-    "trade_margin_usd": 20.0,
-    "leverage": 5.0,
+    "capital_usd": 50.0,
+    "trade_margin_usd": 5.0,
+    "leverage": 10.0,
     "max_positions": 5,
     "updated_at": None,
 }
@@ -534,6 +399,24 @@ def calc_position_size(settings: Dict[str, Any]) -> float:
 
 
 def format_trade_status() -> str:
+    # Prefer the real Paper Trade status when the module is available.
+    if format_paper_trade_status:
+        try:
+            paper_text = format_paper_trade_status()
+            return (
+                paper_text
+                + "\n\nدستورها:\n"
+                "سرمایه ترید 1000\n"
+                "ترید دلار / ترید دلار 20\n"
+                "ترید لوریج / ترید لوریج 5\n"
+                "حداکثر پوزیشن / حداکثر پوزیشن 10\n"
+                "حجم پوزیشن\n"
+                "آمار ترید\n"
+                "ریست ترید"
+            )
+        except Exception:
+            pass
+
     s = load_trade_settings()
     position_size = calc_position_size(s)
     capital = safe_num(s.get("capital_usd"), 0.0)
@@ -556,10 +439,9 @@ def format_trade_status() -> str:
         "ترید لوریج / ترید لوریج 5\n"
         "حداکثر پوزیشن / حداکثر پوزیشن 10\n"
         "حجم پوزیشن\n"
-        "ترید فعال / ترید غیرفعال\n"
+        "آمار ترید\n"
         "ریست ترید"
     )
-
 
 async def trade_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(format_trade_status())
@@ -567,63 +449,41 @@ async def trade_status_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def set_capital_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     value = extract_first_number(update.message.text)
-    if value is None:
-        USER_PENDING_ACTION[get_user_id(update)] = "set_capital"
-        await update.message.reply_text("کل سرمایه ترید چند دلار است؟\nعدد بزرگ‌تر از 1 بفرست.")
-        return
-    if value < 1:
-        await update.message.reply_text("سرمایه باید عددی بزرگ‌تر از 1 دلار باشد.")
+    if value is None or value <= 0:
+        await update.message.reply_text("مثال درست: سرمایه ترید 1000")
         return
     s = load_trade_settings()
     s["capital_usd"] = float(value)
     save_trade_settings(s)
+    if configure_paper_account:
+        try:
+            configure_paper_account(capital_usd=float(value), reset_balance=True)
+        except Exception:
+            pass
     await update.message.reply_text(f"✅ سرمایه ترید روی {value}$ تنظیم شد.\n\n{format_trade_status()}")
 
 
 async def set_trade_margin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     value = extract_first_number(update.message.text)
-    if value is None:
-        USER_PENDING_ACTION[get_user_id(update)] = "set_trade_margin"
-        await update.message.reply_text("مبلغ هر پوزیشن چند دلار باشد؟\nعدد بین 1 تا 1,000,000 بفرست.")
-        return
-    if value < 1 or value > 1_000_000:
-        await update.message.reply_text("عدد باید بین 1 تا 1,000,000 دلار باشد.")
+    if value is None or value <= 0:
+        await update.message.reply_text("مثال درست: ترید دلار 20")
         return
     s = load_trade_settings()
     s["trade_margin_usd"] = float(value)
     save_trade_settings(s)
-    await update.message.reply_text(f"✅ مبلغ هر پوزیشن روی {value}$ تنظیم شد.\n\n{format_trade_status()}")
+    await update.message.reply_text(f"✅ مبلغ هر ترید روی {value}$ تنظیم شد.\n\n{format_trade_status()}")
 
 
 async def set_leverage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     value = extract_first_number(update.message.text)
-    if value is None:
-        USER_PENDING_ACTION[get_user_id(update)] = "set_leverage"
-        await update.message.reply_text("لوریج چند باشد؟\nعدد بین 1 تا 50 بفرست.")
+    if value is None or value <= 0:
+        await update.message.reply_text("مثال درست: لوریج دلار 5")
         return
-    if value < 1 or value > 50:
-        await update.message.reply_text("لوریج باید بین 1 تا 50 باشد.")
-        return
-    value = float(value)
+    value = min(float(value), 50.0)
     s = load_trade_settings()
     s["leverage"] = value
     save_trade_settings(s)
     await update.message.reply_text(f"✅ لوریج روی {value}x تنظیم شد.\n\n{format_trade_status()}")
-
-
-async def set_max_positions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    value = extract_first_number(update.message.text)
-    if value is None:
-        USER_PENDING_ACTION[get_user_id(update)] = "set_max_positions"
-        await update.message.reply_text("حداکثر چند پوزیشن همزمان باشد؟\nعدد بین 1 تا 50 بفرست.")
-        return
-    if value < 1 or value > 50:
-        await update.message.reply_text("حداکثر پوزیشن باید بین 1 تا 50 باشد.")
-        return
-    st = load_trade_settings()
-    st["max_positions"] = int(value)
-    save_trade_settings(st)
-    await update.message.reply_text(f"✅ حداکثر پوزیشن همزمان روی {int(value)} تنظیم شد.\n\n{format_trade_status()}")
 
 
 async def position_size_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -636,26 +496,19 @@ async def position_size_command(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
 
-async def trade_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    parts = ["📈 آمار ترید", "", format_trade_status()]
-    if format_paper_stats:
-        try:
-            parts.append("\n📊 Paper Trade:")
-            parts.append(str(format_paper_stats()))
-        except Exception:
-            pass
-    if format_open_positions:
-        try:
-            parts.append("\n📌 پوزیشن‌های باز:")
-            parts.append(str(format_open_positions()))
-        except Exception:
-            pass
-    await send_long_text(update, "\n".join(parts))
-
-
 async def reset_trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     save_trade_settings(DEFAULT_TRADE_SETTINGS.copy())
-    await update.message.reply_text("✅ تنظیمات ترید ریست شد.\n\n" + format_trade_status())
+    if reset_paper_trades:
+        try:
+            reset_paper_trades(capital_usd=DEFAULT_TRADE_SETTINGS.get("capital_usd"))
+        except TypeError:
+            try:
+                reset_paper_trades()
+            except Exception:
+                pass
+        except Exception:
+            pass
+    await update.message.reply_text("✅ تنظیمات و آمار Paper Trade ریست شد.\n\n" + format_trade_status())
 
 
 # ============================================================
@@ -752,35 +605,6 @@ def attach_signal_metadata(signal: Dict[str, Any], message_id: int, chat_id: int
     return s
 
 
-
-
-def format_commands_help() -> str:
-    return (
-        "📚 دستورات ربات\n\n"
-        "🤖 خود ربات:\n"
-        "بهترین سیگنال\n"
-        "وضعیت بازار\n"
-        "آمار / امار\n\n"
-        "💰 ترید:\n"
-        "ترید\n"
-        "وضعیت ترید\n"
-        "ترید دلار\n"
-        "ترید لوریج\n"
-        "حداکثر پوزیشن\n"
-        "آمار ترید / امار ترید\n"
-        "ریست ترید\n\n"
-        "🧠 هوش مصنوعی:\n"
-        "هوش مصنوعی\n"
-        "وضعیت هوش مصنوعی\n"
-        "هوش مصنوعی روشن\n"
-        "هوش مصنوعی خاموش\n"
-        "ریست آمار هوش مصنوعی\n\n"
-        "📊 تحلیل:\n"
-        "تحلیل بیتکوین\n"
-        "تحلیل BTC\n"
-        "سیگنال سولانا\n"
-    )
-
 # ============================================================
 # Core commands
 # ============================================================
@@ -790,7 +614,35 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await reject_unauthorized(update)
         return
 
-    await send_long_text(update, format_commands_help())
+    text = (
+        "🤖 Crypto AI Bot\n\n"
+        "دستورهای اصلی:\n"
+        "تحلیل بیتکوین\n"
+        "سیگنال سولانا\n"
+        "بهترین سیگنال\n"
+        "بررسی / بررسی بازار\n"
+        "آمار / آمار 7 روز / آمار کل\n"
+        "حذف آمار\n\n"
+        "دستورهای ترید:\n"
+        "وضعیت ترید\n"
+        "سرمایه ترید 1000\n"
+        "ترید دلار 20\n"
+        "لوریج دلار 5\n"
+        "حجم پوزیشن\n"
+        "ریست ترید\n\n"
+        "AI و مدیریت:\n"
+        "هوش مصنوعی\n"
+        "حافظه ربات\n"
+        "ریسک کوین‌ها\n"
+        "بهترین کوین‌ها\n"
+        "بدترین کوین‌ها\n"
+        "سیگنال‌های مخفی\n"
+        "اسلات‌ها\n"
+        "پوزیشن‌ها\n"
+        "سیگنال‌های فعال\n\n"
+        "یادداشت: دستور «زیر نظر» حذف شده؛ همه سیگنال‌ها خودکار Track می‌شوند."
+    )
+    await update.message.reply_text(text)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -819,69 +671,17 @@ async def best_signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await waiting.edit_text(f"❌ خطا:\n{str(e)[:300]}")
 
 
-def merge_market_overviews(parts: List[Dict[str, Any]]) -> Dict[str, Any]:
-    bullish = sum(int(p.get('bullish', 0) or 0) for p in parts)
-    bearish = sum(int(p.get('bearish', 0) or 0) for p in parts)
-    neutral = sum(int(p.get('neutral', 0) or 0) for p in parts)
-    errors = sum(int(p.get('errors', 0) or 0) for p in parts)
-    scanned = sum(int(p.get('scanned', 0) or 0) for p in parts)
-    total = max(bullish + bearish + neutral, 1)
-    bp = round(bullish / total * 100, 1)
-    sp = round(bearish / total * 100, 1)
-    np = round(neutral / total * 100, 1)
-    if bp >= 50:
-        mb, summary = 'bullish', 'بازار بیشتر صعودی است'
-    elif sp >= 50:
-        mb, summary = 'bearish', 'بازار بیشتر نزولی است'
-    elif np >= 45:
-        mb, summary = 'neutral', 'بازار بیشتر رنج یا نامشخص است'
-    elif bp > sp:
-        mb, summary = 'slightly_bullish', 'بازار کمی تمایل صعودی دارد'
-    elif sp > bp:
-        mb, summary = 'slightly_bearish', 'بازار کمی تمایل نزولی دارد'
-    else:
-        mb, summary = 'neutral', 'بازار جهت مشخصی ندارد'
-    details = []
-    for p in parts:
-        details.extend(p.get('details', []) or [])
-    return {'market_bias': mb, 'summary': summary, 'bullish': bullish, 'bearish': bearish, 'neutral': neutral, 'errors': errors, 'bullish_pct': bp, 'bearish_pct': sp, 'neutral_pct': np, 'details': details, 'scanned': scanned, 'timestamp': int(time.time())}
-
-def format_market_part(result: Dict[str, Any], part_no: int, total_parts: int) -> str:
-    return (
-        f"📊 وضعیت بازار - بخش {part_no}/{total_parts}\n\n"
-        f"بررسی‌شده: {result.get('scanned')} ارز\n"
-        f"صعودی: {result.get('bullish')} | نزولی: {result.get('bearish')} | رنج: {result.get('neutral')}\n"
-        f"خطا: {result.get('errors', 0)}"
-    )
-
 async def market_overview_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         await reject_unauthorized(update)
         return
 
-    waiting = await update.message.reply_text("⏳ وضعیت بازار: بخش 1 در حال اسکن...")
+    waiting = await update.message.reply_text("⏳ در حال بررسی بازار...")
     try:
-        symbols = get_scan_symbols()[:40]
-        chunks = [symbols[:15], symbols[15:30], symbols[30:40]]
-        parts = []
-        for idx, chunk in enumerate(chunks, 1):
-            if not chunk:
-                continue
-            if idx == 1:
-                try:
-                    await waiting.edit_text(f"⏳ وضعیت بازار: بخش {idx}/3 در حال اسکن...")
-                except Exception:
-                    pass
-            else:
-                await update.message.reply_text(f"⏳ وضعیت بازار: بخش {idx}/3 در حال اسکن...")
-            part = scan_market_overview(symbols=chunk, limit=len(chunk))
-            parts.append(part)
-            await update.message.reply_text(format_market_part(part, idx, 3))
-            await asyncio.sleep(0.2)
-        overview = merge_market_overviews(parts)
-        await update.message.reply_text(format_market_overview_text(overview))
+        overview = scan_market_overview()
+        await waiting.edit_text(format_market_overview_text(overview))
     except Exception as e:
-        await update.message.reply_text(f"❌ خطا:\n{str(e)[:300]}")
+        await waiting.edit_text(f"❌ خطا:\n{str(e)[:300]}")
 
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -989,7 +789,16 @@ async def ai_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await reject_unauthorized(update)
         return
 
-    await send_long_text(update, format_custom_ai_status())
+    parts = []
+    for fn in [format_ai_status, format_learning_summary, format_rotation_report, format_ghost_report, format_slot_report]:
+        if not fn:
+            continue
+        try:
+            parts.append(fn())
+        except Exception:
+            pass
+
+    await send_long_text(update, "\n\n".join(parts) if parts else "AI Status در دسترس نیست.")
 
 
 async def learning_memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1009,19 +818,6 @@ async def learning_memory_command(update: Update, context: ContextTypes.DEFAULT_
         except Exception:
             pass
     await send_long_text(update, "\n\n".join(parts) if parts else "حافظه ربات در دسترس نیست.")
-
-
-async def reset_ai_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if get_user_id(update) != OWNER_ID:
-        await reject_unauthorized(update)
-        return
-
-    reset_files = reset_ai_runtime_stats_only()
-    await update.message.reply_text(
-        "✅ آمار روزانه/گزارشی هوش مصنوعی ریست شد.\n"
-        "حافظه یادگیری و تجربه‌های ذخیره‌شده پاک نشد.\n\n"
-        f"فایل‌های ریست‌شده: {', '.join(reset_files) if reset_files else 'فایل موقت خاصی پیدا نشد'}"
-    )
 
 
 async def coin_behavior_command(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol: Optional[str] = None) -> None:
@@ -1136,12 +932,30 @@ def auto_signal_key(signal: Dict[str, Any]) -> str:
 
 def can_send_auto_signal(signal: Dict[str, Any]) -> bool:
     try:
+        st = load_bot_settings()
+        if not st.get("trading_enabled", True):
+            return False
+        if not st.get("auto_signal_enabled", bool(AUTO_SIGNAL_ENABLED)):
+            return False
+        if is_daily_locked:
+            try:
+                if is_daily_locked():
+                    return False
+            except Exception:
+                pass
         if signal.get("status") != "ACTIVE":
             return False
         if not signal.get("entry_confirmed", False):
             return False
         if int(signal.get("score", 0) or 0) < int(AUTO_DIRECT_SCORE_MIN):
             return False
+        if can_open_paper_position:
+            try:
+                ok, _reason = can_open_paper_position(signal)
+                if not ok:
+                    return False
+            except Exception:
+                pass
 
         key = auto_signal_key(signal)
         now = int(time.time())
@@ -1156,7 +970,7 @@ def mark_auto_signal_sent(signal: Dict[str, Any]) -> None:
 
 
 async def auto_signal_loop(app: Application) -> None:
-    if not OWNER_ID:
+    if not AUTO_SIGNAL_ENABLED or not OWNER_ID:
         logger.info("Auto signal disabled or OWNER_ID missing")
         return
 
@@ -1164,10 +978,6 @@ async def auto_signal_loop(app: Application) -> None:
 
     while True:
         try:
-            bot_settings = load_bot_settings()
-            if not bot_settings.get("auto_signal_enabled", True) or not bot_settings.get("trading_enabled", True):
-                await asyncio.sleep(max(60, int(AUTO_SCAN_INTERVAL_MINUTES) * 60))
-                continue
             result = scan_for_auto_signals(max_results=3, allow_ghost=True)
             signals = result.get("signals", [])
 
@@ -1245,140 +1055,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     low = text.lower().strip()
-    compact = low.replace(" ", "").replace("\u200c", "")
-    uid = get_user_id(update)
-
-    # Follow-up answers for trade settings
-    if uid in USER_PENDING_ACTION:
-        action = USER_PENDING_ACTION.pop(uid)
-        value = extract_first_number(text)
-
-        if action == "set_trade_margin":
-            if value is None or value < 1 or value > 1_000_000:
-                await update.message.reply_text("عدد باید بین 1 تا 1,000,000 دلار باشد. دوباره دستور «ترید دلار» را بفرست.")
-                return
-            s = load_trade_settings()
-            s["trade_margin_usd"] = float(value)
-            save_trade_settings(s)
-            await update.message.reply_text(f"✅ مبلغ هر پوزیشن روی {value}$ تنظیم شد.\n\n{format_trade_status()}")
-            return
-
-        if action == "set_leverage":
-            if value is None or value < 1 or value > 50:
-                await update.message.reply_text("لوریج باید بین 1 تا 50 باشد. دوباره دستور «ترید لوریج» را بفرست.")
-                return
-            s = load_trade_settings()
-            s["leverage"] = float(value)
-            save_trade_settings(s)
-            await update.message.reply_text(f"✅ لوریج روی {value}x تنظیم شد.\n\n{format_trade_status()}")
-            return
-
-        if action == "set_capital":
-            if value is None or value < 1 or value > 1_000_000_000:
-                await update.message.reply_text("سرمایه باید عددی بزرگ‌تر از 1 دلار باشد. دوباره دستور «سرمایه ترید» را بفرست.")
-                return
-            s = load_trade_settings()
-            s["capital_usd"] = float(value)
-            save_trade_settings(s)
-            await update.message.reply_text(f"✅ سرمایه ترید روی {value}$ تنظیم شد.\n\n{format_trade_status()}")
-            return
-
-        if action == "set_max_positions":
-            if value is None or value < 1 or value > 50:
-                await update.message.reply_text("حداکثر پوزیشن باید بین 1 تا 50 باشد. دوباره دستور «حداکثر پوزیشن» را بفرست.")
-                return
-            s = load_trade_settings()
-            s["max_positions"] = int(value)
-            save_trade_settings(s)
-            await update.message.reply_text(f"✅ حداکثر پوزیشن همزمان روی {int(value)} تنظیم شد.\n\n{format_trade_status()}")
-            return
 
     # Removed manual tracking commands
     if low in ["زیر نظر", "زیرنظر", "زیر نظر بگیر", "نظر"]:
         await update.message.reply_text("نیازی به دستور زیر نظر نیست؛ همه سیگنال‌های معتبر خودکار Track می‌شوند.")
         return
 
-    if low in ["دستورات", "راهنما", "help", "/help"]:
-        await send_long_text(update, format_commands_help())
-        return
-
-    # AI commands requested by user
-    if compact in ["هوشمصنوعیروشن", "aiروشن"]:
-        await set_bot_setting_command(update, "ai_enabled", True, "هوش مصنوعی روشن شد.")
-        return
-
-    if compact in ["هوشمصنوعیخاموش", "aiخاموش"]:
-        await set_bot_setting_command(update, "ai_enabled", False, "هوش مصنوعی خاموش شد.")
-        return
-
-    if compact in ["ریستامارهوشمصنوعی", "ریستآمارهوشمصنوعی", "ریستهوشمصنوعی"]:
-        await reset_ai_stats_command(update, context)
-        return
-
-    if compact in ["هوشمصنوعی", "وضعیتهوشمصنوعی", "ai", "وضعیتai"]:
-        await ai_status_command(update, context)
-        return
-
-    # Bot / AI / trading switches
-    if low in ["وضعیت ربات", "تنظیمات ربات", "تنظیمات", "تنظیمات ai", "تنظیمات هوش مصنوعی"]:
-        await update.message.reply_text(format_bot_settings_status())
-        return
-
-    if low in ["ترید فعال", "فعال ترید"]:
-        await set_bot_setting_command(update, "trading_enabled", True, "ترید فعال شد.")
-        return
-
-    if low in ["ترید غیرفعال", "ترید غیر فعال", "غیرفعال ترید", "غیر فعال ترید"]:
-        await set_bot_setting_command(update, "trading_enabled", False, "ترید غیرفعال شد.")
-        return
-
-    if low in ["اتوسیگنال فعال", "اتو سیگنال فعال", "سیگنال خودکار فعال"]:
-        await set_bot_setting_command(update, "auto_signal_enabled", True, "اتوسیگنال فعال شد.")
-        return
-
-    if low in ["اتوسیگنال غیرفعال", "اتوسیگنال غیر فعال", "اتو سیگنال غیرفعال", "اتو سیگنال غیر فعال", "سیگنال خودکار غیرفعال"]:
-        await set_bot_setting_command(update, "auto_signal_enabled", False, "اتوسیگنال غیرفعال شد.")
-        return
-
-    if low in ["ai روشن", "هوش مصنوعی روشن"]:
-        await set_bot_setting_command(update, "ai_enabled", True, "AI روشن شد.")
-        return
-
-    if low in ["ai خاموش", "هوش مصنوعی خاموش"]:
-        await set_bot_setting_command(update, "ai_enabled", False, "AI خاموش شد.")
-        return
-
-    if low in ["یادگیری روشن", "learning on"]:
-        await set_bot_setting_command(update, "learning_enabled", True, "یادگیری روشن شد.")
-        return
-
-    if low in ["یادگیری خاموش", "learning off"]:
-        await set_bot_setting_command(update, "learning_enabled", False, "یادگیری خاموش شد.")
-        return
-
-    if low in ["گزارش روزانه روشن", "گزارش روزانه فعال"]:
-        await set_bot_setting_command(update, "daily_report_enabled", True, "گزارش روزانه روشن شد.")
-        return
-
-    if low in ["گزارش روزانه خاموش", "گزارش روزانه غیرفعال", "گزارش روزانه غیر فعال"]:
-        await set_bot_setting_command(update, "daily_report_enabled", False, "گزارش روزانه خاموش شد.")
-        return
-
-    if low in ["حالت محافظه‌کار", "حالت محافظه کار", "محافظه‌کار", "محافظه کار"]:
-        await set_bot_setting_command(update, "mode", "conservative", "حالت محافظه‌کار فعال شد.")
-        return
-
-    if low in ["حالت عادی", "عادی"]:
-        await set_bot_setting_command(update, "mode", "normal", "حالت عادی فعال شد.")
-        return
-
     # Trade commands
-    if compact in ["امتارترید", "آمارترید"]:
-        await trade_stats_command(update, context)
+    if low in ["ترید", "وضعیت ترید"]:
+        await trade_status_command(update, context)
         return
 
-    if low in ["وضعیت ترید", "وضعیت", "ترید"]:
-        await trade_status_command(update, context)
+    if low in ["آمار ترید", "امار ترید"]:
+        await trade_stats_command(update, context)
         return
 
     if low.startswith("سرمایه ترید"):
@@ -1389,11 +1078,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await set_trade_margin_command(update, context)
         return
 
-    if low.startswith("ترید لوریج") or low.startswith("لوریج ترید") or low.startswith("لوریج دلار") or low.startswith("دلار لوریج") or low.startswith("لوریج"):
+    if low.startswith("ترید لوریج") or low.startswith("لوریج دلار") or low.startswith("لوریج"):
         await set_leverage_command(update, context)
         return
 
-    if compact.startswith("حداکثرپوزیشن") or compact.startswith("حداکثرمعاملات") or compact.startswith("حداکثرمعامله") or low.startswith("حد اکثر پوزیشن"):
+    if low.startswith("حداکثر پوزیشن"):
         await set_max_positions_command(update, context)
         return
 
@@ -1446,7 +1135,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await ai_status_command(update, context)
         return
 
-    if low in ["حافظه ربات", "حافظه ai", "یادگیری", "learning", "آمار هوشمند", "امار هوشمند"]:
+    if low in ["حافظه ربات", "حافظه ai", "یادگیری", "learning"]:
         await learning_memory_command(update, context)
         return
 
@@ -1476,11 +1165,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "تحلیل بیتکوین\n"
         "بهترین سیگنال\n"
         "بررسی\n"
-        "وضعیت ترید\n"
-        "ترید دلار\n"
-        "ترید لوریج\n"
-        "حداکثر پوزیشن\n"
-        "هوش مصنوعی"
+        "وضعیت ترید"
     )
 
 
@@ -1505,7 +1190,6 @@ def build_application() -> Application:
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("commands", help_command))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("positions", positions_command))
     app.add_handler(CommandHandler("active", active_signals_command))
