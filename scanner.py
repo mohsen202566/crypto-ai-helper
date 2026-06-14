@@ -94,8 +94,8 @@ def quick_market_bias(symbol):
     """Fast overview helper: only 1H + 15M, no full signal analysis.
     This keeps Telegram market overview from timing out.
     """
-    df_1h = add_indicators(get_klines(normalize_symbol(symbol), '1h', limit=230))
-    df_15m = add_indicators(get_klines(normalize_symbol(symbol), '15m', limit=230))
+    df_1h = add_indicators(get_klines(normalize_symbol(symbol), '1h', limit=260))
+    df_15m = add_indicators(get_klines(normalize_symbol(symbol), '15m', limit=260))
     t1 = ema_direction(df_1h)
     t15 = ema_direction(df_15m)
     l15 = df_15m.iloc[-1]
@@ -119,7 +119,7 @@ def quick_market_bias(symbol):
     return {'symbol': normalize_symbol(symbol), 'bias': bias, 'direction': 'OVERVIEW', 'score': max(0, min(100, int(score))), 'trend_1h': t1, 'trend_15m': t15}
 
 def scan_market_overview(symbols=None, limit=40):
-    symbols=(symbols or get_scan_symbols())[:limit]; bullish= bearish= neutral= errors=0; details=[]
+    symbols=(symbols or get_scan_symbols())[:limit]; bullish= bearish= neutral= errors=0; details=[]; error_details=[]
     for sym in symbols:
         try:
             r=quick_market_bias(sym); bias=r.get('bias')
@@ -127,8 +127,10 @@ def scan_market_overview(symbols=None, limit=40):
             elif bias=='bearish': bearish+=1
             else: neutral+=1
             details.append(r)
-        except Exception:
+        except Exception as e:
             errors+=1
+            if len(error_details) < 5:
+                error_details.append({'symbol': normalize_symbol(sym), 'error': str(e)[:160]})
         time.sleep(SCAN_DELAY_SECONDS)
     total=max(bullish+bearish+neutral,1); bp=round(bullish/total*100,1); sp=round(bearish/total*100,1); np=round(neutral/total*100,1)
     if bp>=50: mb='bullish'; summary='بازار بیشتر صعودی است'
@@ -137,7 +139,7 @@ def scan_market_overview(symbols=None, limit=40):
     elif bp>sp: mb='slightly_bullish'; summary='بازار کمی تمایل صعودی دارد'
     elif sp>bp: mb='slightly_bearish'; summary='بازار کمی تمایل نزولی دارد'
     else: mb='neutral'; summary='بازار جهت مشخصی ندارد'
-    return {'market_bias':mb,'summary':summary,'bullish':bullish,'bearish':bearish,'neutral':neutral,'errors':errors,'bullish_pct':bp,'bearish_pct':sp,'neutral_pct':np,'details':details,'scanned':len(symbols),'timestamp':int(time.time())}
+    return {'market_bias':mb,'summary':summary,'bullish':bullish,'bearish':bearish,'neutral':neutral,'errors':errors,'error_details':error_details,'bullish_pct':bp,'bearish_pct':sp,'neutral_pct':np,'details':details,'scanned':len(symbols),'timestamp':int(time.time())}
 
 def scan_symbols_for_signals(symbols=None,max_results=MAX_SCAN_RESULTS): return scan_for_auto_signals(symbols,max_results,True).get('signals',[])
 def find_best_signal(symbols=None): return get_best_signal(symbols)
