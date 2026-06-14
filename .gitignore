@@ -1,0 +1,12 @@
+.env
+__pycache__/
+*.pyc
+*.log
+data/
+active_signals.json
+signal_stats.json
+paper_trade_state.json
+paper_trades.json
+market_sentiment_cache.json
+users.json
+bot.log
