@@ -305,7 +305,7 @@ def normalize_symbol_text(text: str) -> Optional[str]:
     raw = cleaned.upper().replace(" ", "")
     if raw.endswith("USDT") and len(raw) >= 6:
         return raw
-    if raw.isalpha() and 2 <= len(raw) <= 10:
+    if raw.isascii() and raw.isalpha() and 2 <= len(raw) <= 10:
         return raw + "USDT"
     return None
 
@@ -370,9 +370,9 @@ async def send_long_text(update: Update, text: str, max_len: int = 3900) -> None
 # ============================================================
 
 DEFAULT_TRADE_SETTINGS = {
-    "capital_usd": 50.0,
-    "trade_margin_usd": 5.0,
-    "leverage": 10.0,
+    "capital_usd": 1000.0,
+    "trade_margin_usd": 20.0,
+    "leverage": 5.0,
     "max_positions": 5,
     "updated_at": None,
 }
@@ -399,12 +399,10 @@ def calc_position_size(settings: Dict[str, Any]) -> float:
 
 
 def format_trade_status() -> str:
-    # Prefer the real Paper Trade status when the module is available.
     if format_paper_trade_status:
         try:
-            paper_text = format_paper_trade_status()
             return (
-                paper_text
+                format_paper_trade_status()
                 + "\n\nدستورها:\n"
                 "سرمایه ترید 1000\n"
                 "ترید دلار / ترید دلار 20\n"
@@ -477,13 +475,42 @@ async def set_trade_margin_command(update: Update, context: ContextTypes.DEFAULT
 async def set_leverage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     value = extract_first_number(update.message.text)
     if value is None or value <= 0:
-        await update.message.reply_text("مثال درست: لوریج دلار 5")
+        await update.message.reply_text("مثال درست: ترید لوریج 5")
         return
     value = min(float(value), 50.0)
     s = load_trade_settings()
     s["leverage"] = value
     save_trade_settings(s)
     await update.message.reply_text(f"✅ لوریج روی {value}x تنظیم شد.\n\n{format_trade_status()}")
+
+
+async def set_max_positions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    value = extract_first_number(update.message.text)
+    if value is None or value <= 0:
+        await update.message.reply_text("مثال درست: حداکثر پوزیشن 10")
+        return
+    value = max(1, min(int(value), 50))
+    s = load_trade_settings()
+    s["max_positions"] = value
+    save_trade_settings(s)
+    await update.message.reply_text(f"✅ حداکثر پوزیشن همزمان روی {value} تنظیم شد.\n\n{format_trade_status()}")
+
+
+async def trade_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    parts = ["📈 آمار ترید"]
+    if format_paper_stats:
+        try:
+            parts.append(str(format_paper_stats()))
+        except Exception:
+            pass
+    if format_open_positions:
+        try:
+            parts.append(str(format_open_positions()))
+        except Exception:
+            pass
+    if len(parts) == 1:
+        parts.append(format_trade_status())
+    await send_long_text(update, "\n\n".join(parts))
 
 
 async def position_size_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -502,10 +529,7 @@ async def reset_trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             reset_paper_trades(capital_usd=DEFAULT_TRADE_SETTINGS.get("capital_usd"))
         except TypeError:
-            try:
-                reset_paper_trades()
-            except Exception:
-                pass
+            reset_paper_trades()
         except Exception:
             pass
     await update.message.reply_text("✅ تنظیمات و آمار Paper Trade ریست شد.\n\n" + format_trade_status())
@@ -628,7 +652,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "سرمایه ترید 1000\n"
         "ترید دلار 20\n"
         "لوریج دلار 5\n"
+        "حداکثر پوزیشن 10\n"
         "حجم پوزیشن\n"
+        "آمار ترید\n"
         "ریست ترید\n\n"
         "AI و مدیریت:\n"
         "هوش مصنوعی\n"
@@ -932,14 +958,16 @@ def auto_signal_key(signal: Dict[str, Any]) -> str:
 
 def can_send_auto_signal(signal: Dict[str, Any]) -> bool:
     try:
-        st = load_bot_settings()
-        if not st.get("trading_enabled", True):
-            return False
-        if not st.get("auto_signal_enabled", bool(AUTO_SIGNAL_ENABLED)):
-            return False
         if is_daily_locked:
             try:
                 if is_daily_locked():
+                    return False
+            except Exception:
+                pass
+        if can_open_paper_position:
+            try:
+                ok, _reason = can_open_paper_position(signal)
+                if not ok:
                     return False
             except Exception:
                 pass
@@ -949,13 +977,6 @@ def can_send_auto_signal(signal: Dict[str, Any]) -> bool:
             return False
         if int(signal.get("score", 0) or 0) < int(AUTO_DIRECT_SCORE_MIN):
             return False
-        if can_open_paper_position:
-            try:
-                ok, _reason = can_open_paper_position(signal)
-                if not ok:
-                    return False
-            except Exception:
-                pass
 
         key = auto_signal_key(signal)
         now = int(time.time())
@@ -963,7 +984,6 @@ def can_send_auto_signal(signal: Dict[str, Any]) -> bool:
         return now - last >= AUTO_SIGNAL_COOLDOWN_SECONDS
     except Exception:
         return False
-
 
 def mark_auto_signal_sent(signal: Dict[str, Any]) -> None:
     LAST_AUTO_SIGNAL_TIME[auto_signal_key(signal)] = int(time.time())
@@ -1062,12 +1082,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     # Trade commands
-    if low in ["ترید", "وضعیت ترید"]:
+    if low in ["وضعیت ترید", "ترید"]:
         await trade_status_command(update, context)
-        return
-
-    if low in ["آمار ترید", "امار ترید"]:
-        await trade_stats_command(update, context)
         return
 
     if low.startswith("سرمایه ترید"):
@@ -1078,12 +1094,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await set_trade_margin_command(update, context)
         return
 
-    if low.startswith("ترید لوریج") or low.startswith("لوریج دلار") or low.startswith("لوریج"):
+    if low.startswith("ترید لوریج") or low.startswith("لوریج دلار") or low.startswith("دلار لوریج") or low.startswith("لوریج"):
         await set_leverage_command(update, context)
         return
 
-    if low.startswith("حداکثر پوزیشن"):
+    if low.startswith("حداکثر پوزیشن") or low.startswith("حد اکثر پوزیشن") or low.startswith("حداکثر معاملات"):
         await set_max_positions_command(update, context)
+        return
+
+    if low in ["آمار ترید", "امار ترید"]:
+        await trade_stats_command(update, context)
         return
 
     if low == "حجم پوزیشن":
