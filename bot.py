@@ -26,7 +26,7 @@ from telegram.ext import (
 )
 
 from analysis import analyze_symbol
-from scanner import scan_for_auto_signals, get_top_signals, scan_market_overview
+from scanner import scan_for_auto_signals, get_top_signals, scan_market_overview, get_scan_symbols
 
 
 # ============================================================
@@ -819,17 +819,69 @@ async def best_signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await waiting.edit_text(f"❌ خطا:\n{str(e)[:300]}")
 
 
+def merge_market_overviews(parts: List[Dict[str, Any]]) -> Dict[str, Any]:
+    bullish = sum(int(p.get('bullish', 0) or 0) for p in parts)
+    bearish = sum(int(p.get('bearish', 0) or 0) for p in parts)
+    neutral = sum(int(p.get('neutral', 0) or 0) for p in parts)
+    errors = sum(int(p.get('errors', 0) or 0) for p in parts)
+    scanned = sum(int(p.get('scanned', 0) or 0) for p in parts)
+    total = max(bullish + bearish + neutral, 1)
+    bp = round(bullish / total * 100, 1)
+    sp = round(bearish / total * 100, 1)
+    np = round(neutral / total * 100, 1)
+    if bp >= 50:
+        mb, summary = 'bullish', 'بازار بیشتر صعودی است'
+    elif sp >= 50:
+        mb, summary = 'bearish', 'بازار بیشتر نزولی است'
+    elif np >= 45:
+        mb, summary = 'neutral', 'بازار بیشتر رنج یا نامشخص است'
+    elif bp > sp:
+        mb, summary = 'slightly_bullish', 'بازار کمی تمایل صعودی دارد'
+    elif sp > bp:
+        mb, summary = 'slightly_bearish', 'بازار کمی تمایل نزولی دارد'
+    else:
+        mb, summary = 'neutral', 'بازار جهت مشخصی ندارد'
+    details = []
+    for p in parts:
+        details.extend(p.get('details', []) or [])
+    return {'market_bias': mb, 'summary': summary, 'bullish': bullish, 'bearish': bearish, 'neutral': neutral, 'errors': errors, 'bullish_pct': bp, 'bearish_pct': sp, 'neutral_pct': np, 'details': details, 'scanned': scanned, 'timestamp': int(time.time())}
+
+def format_market_part(result: Dict[str, Any], part_no: int, total_parts: int) -> str:
+    return (
+        f"📊 وضعیت بازار - بخش {part_no}/{total_parts}\n\n"
+        f"بررسی‌شده: {result.get('scanned')} ارز\n"
+        f"صعودی: {result.get('bullish')} | نزولی: {result.get('bearish')} | رنج: {result.get('neutral')}\n"
+        f"خطا: {result.get('errors', 0)}"
+    )
+
 async def market_overview_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         await reject_unauthorized(update)
         return
 
-    waiting = await update.message.reply_text("⏳ در حال بررسی بازار...")
+    waiting = await update.message.reply_text("⏳ وضعیت بازار: بخش 1 در حال اسکن...")
     try:
-        overview = scan_market_overview()
-        await waiting.edit_text(format_market_overview_text(overview))
+        symbols = get_scan_symbols()[:40]
+        chunks = [symbols[:15], symbols[15:30], symbols[30:40]]
+        parts = []
+        for idx, chunk in enumerate(chunks, 1):
+            if not chunk:
+                continue
+            if idx == 1:
+                try:
+                    await waiting.edit_text(f"⏳ وضعیت بازار: بخش {idx}/3 در حال اسکن...")
+                except Exception:
+                    pass
+            else:
+                await update.message.reply_text(f"⏳ وضعیت بازار: بخش {idx}/3 در حال اسکن...")
+            part = scan_market_overview(symbols=chunk, limit=len(chunk))
+            parts.append(part)
+            await update.message.reply_text(format_market_part(part, idx, 3))
+            await asyncio.sleep(0.2)
+        overview = merge_market_overviews(parts)
+        await update.message.reply_text(format_market_overview_text(overview))
     except Exception as e:
-        await waiting.edit_text(f"❌ خطا:\n{str(e)[:300]}")
+        await update.message.reply_text(f"❌ خطا:\n{str(e)[:300]}")
 
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
