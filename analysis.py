@@ -213,11 +213,20 @@ def simple_classic_score(symbol, df_4h, df_1h, df_30m, df_15m, df_5m, market_con
     buy2,sell2=buy_sell_power(df_5m,2); buy3,sell3=buy_sell_power(df_5m,3); buy20,sell20=buy_sell_power(df_5m,20)
     if buy3>=62: long_score+=3
     if sell3>=62: short_score+=3
-    # Balanced auto-signal rules: not too strict at start; AI/risk modules can tighten later.
+    # Balanced auto-signal rules: normal classic gates + soft escape for very strong technical signals.
+    # The bot should stay technical and medium-soft; AI/risk modules can tighten later.
     long_direction_ok=(trends['15M']=='bullish') or (trends['1H']=='bullish' and trends['5M']=='bullish') or (trends['30M']=='bullish' and safe_float(l15['rsi'])>=50)
     short_direction_ok=(trends['15M']=='bearish') or (trends['1H']=='bearish' and trends['5M']=='bearish') or (trends['30M']=='bearish' and safe_float(l15['rsi'])<=50)
     long_macd_ok=(l15['macd']>l15['macd_signal']) or (l5['macd']>l5['macd_signal'] and l15['macd_hist']>=safe_float(p15['macd_hist']))
     short_macd_ok=(l15['macd']<=l15['macd_signal']) or (l5['macd']<=l5['macd_signal'] and l15['macd_hist']<=safe_float(p15['macd_hist']))
+
+    # Soft direction rescue: do not kill a very strong signal only because one timeframe gate is mixed.
+    # Still requires strong score, trend strength, momentum, RSI side, and power/volume pressure.
+    if (not long_direction_ok) and long_score>=92 and adx>=25 and long_macd_ok and safe_float(l15['rsi'])>=48 and (buy3>=52 or buy20>=55) and (trends['5M']=='bullish' or trends['4H']=='bullish' or l15['close']>l15['vwap']):
+        long_direction_ok=True
+    if (not short_direction_ok) and short_score>=92 and adx>=25 and short_macd_ok and safe_float(l15['rsi'])<=52 and (sell3>=52 or sell20>=55) and (trends['5M']=='bearish' or trends['4H']=='bearish' or l15['close']<l15['vwap']):
+        short_direction_ok=True
+
     long_1h_ok=(trends['1H']=='bullish' and l1['close']>l1['ema20'] and l1['macd']>=l1['macd_signal']) if LONG_MIN_1H_STRICT else True
     long_vwap_ok=(l15['close']>=l15['vwap']) if LONG_BLOCK_IF_AGAINST_VWAP else True
     if not long_direction_ok: long_reasons.append('رد لانگ: 1H و 15M صعودی نیستند')
