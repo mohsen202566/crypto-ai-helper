@@ -8,7 +8,7 @@ import ta
 try:
     from config import MIN_DIRECT_SCORE, MIN_ADX_FOR_TREND, MIN_MANUAL_CONFIRMATIONS
 except Exception:
-    MIN_DIRECT_SCORE = 82; MIN_ADX_FOR_TREND = 20; MIN_MANUAL_CONFIRMATIONS = 4
+    MIN_DIRECT_SCORE = 82; MIN_ADX_FOR_TREND = 20; MIN_MANUAL_CONFIRMATIONS = 3
 try:
     from coin_learning import build_signal_snapshot, get_smart_tp_suggestion, should_require_extra_strength
 except Exception:
@@ -29,9 +29,9 @@ except Exception:
 exchange = ccxt.okx({'enableRateLimit': True, 'timeout': 20000, 'options': {'defaultType': 'swap'}})
 AUTO_DIRECT_SCORE_MIN = 82
 ADX_HARD_MIN = max(float(MIN_ADX_FOR_TREND), 20.0)
-LONG_DIRECT_SCORE_BONUS_REQUIREMENT = 3
-LONG_MIN_1H_STRICT = True
-LONG_BLOCK_IF_AGAINST_VWAP = True
+LONG_DIRECT_SCORE_BONUS_REQUIREMENT = 0
+LONG_MIN_1H_STRICT = False
+LONG_BLOCK_IF_AGAINST_VWAP = False
 MIN_SL_ATR_MULTIPLIER = 1.30
 TP1_FALLBACK_ATR = 0.75
 TP2_FALLBACK_ATR = 1.40
@@ -210,10 +210,11 @@ def simple_classic_score(symbol, df_4h, df_1h, df_30m, df_15m, df_5m, market_con
     buy2,sell2=buy_sell_power(df_5m,2); buy3,sell3=buy_sell_power(df_5m,3); buy20,sell20=buy_sell_power(df_5m,20)
     if buy3>=62: long_score+=3
     if sell3>=62: short_score+=3
-    long_direction_ok=trends['1H']=='bullish' and trends['15M']=='bullish'
-    short_direction_ok=trends['1H']=='bearish' or trends['15M']=='bearish'
-    long_macd_ok=l15['macd']>l15['macd_signal'] and l15['macd_hist']>0
-    short_macd_ok=l15['macd']<=l15['macd_signal']
+    # Balanced auto-signal rules: not too strict at start; AI/risk modules can tighten later.
+    long_direction_ok=(trends['15M']=='bullish') or (trends['1H']=='bullish' and trends['5M']=='bullish') or (trends['30M']=='bullish' and safe_float(l15['rsi'])>=50)
+    short_direction_ok=(trends['15M']=='bearish') or (trends['1H']=='bearish' and trends['5M']=='bearish') or (trends['30M']=='bearish' and safe_float(l15['rsi'])<=50)
+    long_macd_ok=(l15['macd']>l15['macd_signal']) or (l5['macd']>l5['macd_signal'] and l15['macd_hist']>=safe_float(p15['macd_hist']))
+    short_macd_ok=(l15['macd']<=l15['macd_signal']) or (l5['macd']<=l5['macd_signal'] and l15['macd_hist']<=safe_float(p15['macd_hist']))
     long_1h_ok=(trends['1H']=='bullish' and l1['close']>l1['ema20'] and l1['macd']>=l1['macd_signal']) if LONG_MIN_1H_STRICT else True
     long_vwap_ok=(l15['close']>=l15['vwap']) if LONG_BLOCK_IF_AGAINST_VWAP else True
     if not long_direction_ok: long_reasons.append('رد لانگ: 1H و 15M صعودی نیستند')
@@ -333,13 +334,15 @@ def analyze_symbol(symbol: str) -> Dict:
         rotation=get_rotation_context(symbol); rs=safe_float(rotation.get('rotation_score',50),50)
         if rs>=75: final_score+=2
         elif rs<=25: final_score-=2
-        extra=ai_extra_strength_required(symbol,direction,snapshot); min_score=max(int(MIN_DIRECT_SCORE),AUTO_DIRECT_SCORE_MIN)+(LONG_DIRECT_SCORE_BONUS_REQUIREMENT if direction=='LONG' else 0)+int(extra.get('extra_score',0) or 0); req_conf=int(MIN_MANUAL_CONFIRMATIONS)+int(extra.get('extra_confirmations',0) or 0)
+        extra=ai_extra_strength_required(symbol,direction,snapshot); min_score=82+int(extra.get('extra_score',0) or 0); base_conf=min(3, int(MIN_MANUAL_CONFIRMATIONS)); req_conf=base_conf+int(extra.get('extra_confirmations',0) or 0)
         if extra.get('required'): reasons.append(extra.get('reason') or 'AI تایید بیشتر می‌خواهد')
         level_pack=get_strong_levels(df_5m,df_15m,df_30m,price,atr); support=level_pack.get('nearest_support'); resistance=level_pack.get('nearest_resistance')
-        entry_confirmed=valid and final_score>=min_score and confirmations>=req_conf
-        common={'symbol':symbol,'score':cap_score(final_score),'long_score':long_score,'short_score':short_score,'price':safe_round(price),'atr':safe_round(atr),'market_regime':market_context.get('market_regime','neutral'),'btc_bias':market_context.get('btc_bias','neutral'),'confirmations':confirmations,'required_confirmations':req_conf,'rsi':safe_round(df_15m.iloc[-1]['rsi'],2),'macd':safe_round(df_15m.iloc[-1]['macd'],6),'macd_signal':safe_round(df_15m.iloc[-1]['macd_signal'],6),'macd_hist':safe_round(df_15m.iloc[-1]['macd_hist'],6),'adx':safe_round(df_15m.iloc[-1]['adx'],2),'vwap_status':vwap_status(df_15m),'support':safe_round(support),'resistance':safe_round(resistance),'trends':sp.get('trends',{}),'distance_ema20_atr':sp.get('distance_ema20_atr'),'volume_status':sp.get('volume_status'),'volume_ratio':sp.get('volume_ratio'),'buy_power':sp.get('buy_power'),'sell_power':sp.get('sell_power'),'power2_buy':sp.get('power2_buy'),'power2_sell':sp.get('power2_sell'),'power3_buy':sp.get('power3_buy'),'power3_sell':sp.get('power3_sell'),'snapshot':snapshot,'coin_risk':risk_state,'rotation':rotation,'reasons':reasons[:20],'signal_timeframe':'AI Classic Direct'}
+        # If score is strong, allow one fewer confirmation so the bot does not miss early moves.
+        effective_req_conf = max(2, req_conf - 1) if final_score >= 88 else req_conf
+        entry_confirmed=valid and final_score>=min_score and confirmations>=effective_req_conf
+        common={'symbol':symbol,'score':cap_score(final_score),'long_score':long_score,'short_score':short_score,'price':safe_round(price),'atr':safe_round(atr),'market_regime':market_context.get('market_regime','neutral'),'btc_bias':market_context.get('btc_bias','neutral'),'confirmations':confirmations,'required_confirmations':effective_req_conf,'rsi':safe_round(df_15m.iloc[-1]['rsi'],2),'macd':safe_round(df_15m.iloc[-1]['macd'],6),'macd_signal':safe_round(df_15m.iloc[-1]['macd_signal'],6),'macd_hist':safe_round(df_15m.iloc[-1]['macd_hist'],6),'adx':safe_round(df_15m.iloc[-1]['adx'],2),'vwap_status':vwap_status(df_15m),'support':safe_round(support),'resistance':safe_round(resistance),'trends':sp.get('trends',{}),'distance_ema20_atr':sp.get('distance_ema20_atr'),'volume_status':sp.get('volume_status'),'volume_ratio':sp.get('volume_ratio'),'buy_power':sp.get('buy_power'),'sell_power':sp.get('sell_power'),'power2_buy':sp.get('power2_buy'),'power2_sell':sp.get('power2_sell'),'power3_buy':sp.get('power3_buy'),'power3_sell':sp.get('power3_sell'),'snapshot':snapshot,'coin_risk':risk_state,'rotation':rotation,'reasons':reasons[:20],'signal_timeframe':'AI Classic Direct'}
         if not entry_confirmed:
-            return {**common,'direction':'NO TRADE','status':'NO_TRADE','entry_confirmed':False,'entry_mode':'NO_ENTRY','entry':None,'stop_loss':None,'tp1':None,'tp2':None,'risk_reward':0,'risk_level':'UNKNOWN','freshness':'LOW','tp_meta':{},'validity':'سیگنال معتبر نیست'}
+            return {**common,'direction':'NO TRADE','status':'NO_TRADE','entry_confirmed':False,'entry_mode':'NO_ENTRY','entry':None,'stop_loss':None,'tp1':None,'tp2':None,'risk_reward':0,'risk_level':'UNKNOWN','freshness':'LOW','tp_meta':{},'validity':'سیگنال معتبر نیست','valid_gate':valid,'min_score':min_score}
         sl,tp1,tp2,rr,tp_meta=build_trade_levels(direction,price,atr,df_5m,df_15m,df_30m,snapshot,symbol); risk_level='LOW' if final_score>=92 and confirmations>=6 else 'MEDIUM' if final_score>=86 and confirmations>=5 else 'HIGH'; freshness='HIGH' if confirmations>=6 else 'MEDIUM' if confirmations>=5 else 'LOW'
         if update_ai_summary:
             try: update_ai_summary(total_signals=1)
