@@ -159,6 +159,7 @@ logger = logging.getLogger("crypto-ai-bot")
 # ============================================================
 
 LAST_AUTO_SIGNAL_TIME: Dict[str, int] = {}
+USER_PENDING_ACTION: Dict[int, str] = {}
 AUTO_SIGNAL_COOLDOWN_SECONDS = int(AUTO_SIGNAL_COOLDOWN_MINUTES) * 60
 
 DATA_DIR = "data"
@@ -409,8 +410,8 @@ def format_trade_status() -> str:
         f"حداکثر پوزیشن همزمان: {max_positions}\n\n"
         "دستورها:\n"
         "سرمایه ترید 1000\n"
-        "ترید دلار 20\n"
-        "لوریج دلار 5\n"
+        "ترید دلار / ترید دلار 20\n"
+        "ترید لوریج / ترید لوریج 5\n"
         "حجم پوزیشن\n"
         "ریست ترید"
     )
@@ -433,21 +434,29 @@ async def set_capital_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def set_trade_margin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     value = extract_first_number(update.message.text)
-    if value is None or value <= 0:
-        await update.message.reply_text("مثال درست: ترید دلار 20")
+    if value is None:
+        USER_PENDING_ACTION[get_user_id(update)] = "set_trade_margin"
+        await update.message.reply_text("مبلغ هر پوزیشن چند دلار باشد؟\nعدد بین 1 تا 1,000,000 بفرست.")
+        return
+    if value < 1 or value > 1_000_000:
+        await update.message.reply_text("عدد باید بین 1 تا 1,000,000 دلار باشد.")
         return
     s = load_trade_settings()
     s["trade_margin_usd"] = float(value)
     save_trade_settings(s)
-    await update.message.reply_text(f"✅ مبلغ هر ترید روی {value}$ تنظیم شد.\n\n{format_trade_status()}")
+    await update.message.reply_text(f"✅ مبلغ هر پوزیشن روی {value}$ تنظیم شد.\n\n{format_trade_status()}")
 
 
 async def set_leverage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     value = extract_first_number(update.message.text)
-    if value is None or value <= 0:
-        await update.message.reply_text("مثال درست: لوریج دلار 5")
+    if value is None:
+        USER_PENDING_ACTION[get_user_id(update)] = "set_leverage"
+        await update.message.reply_text("لوریج چند باشد؟\nعدد بین 1 تا 50 بفرست.")
         return
-    value = min(float(value), 50.0)
+    if value < 1 or value > 50:
+        await update.message.reply_text("لوریج باید بین 1 تا 50 باشد.")
+        return
+    value = float(value)
     s = load_trade_settings()
     s["leverage"] = value
     save_trade_settings(s)
@@ -584,8 +593,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "دستورهای ترید:\n"
         "وضعیت ترید\n"
         "سرمایه ترید 1000\n"
-        "ترید دلار 20\n"
-        "لوریج دلار 5\n"
+        "ترید دلار / ترید دلار 20\n"
+        "ترید لوریج / ترید لوریج 5\n"
         "حجم پوزیشن\n"
         "ریست ترید\n\n"
         "AI و مدیریت:\n"
@@ -995,6 +1004,32 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     low = text.lower().strip()
+    uid = get_user_id(update)
+
+    # Follow-up answers for trade settings
+    if uid in USER_PENDING_ACTION:
+        action = USER_PENDING_ACTION.pop(uid)
+        value = extract_first_number(text)
+
+        if action == "set_trade_margin":
+            if value is None or value < 1 or value > 1_000_000:
+                await update.message.reply_text("عدد باید بین 1 تا 1,000,000 دلار باشد. دوباره دستور «ترید دلار» را بفرست.")
+                return
+            s = load_trade_settings()
+            s["trade_margin_usd"] = float(value)
+            save_trade_settings(s)
+            await update.message.reply_text(f"✅ مبلغ هر پوزیشن روی {value}$ تنظیم شد.\n\n{format_trade_status()}")
+            return
+
+        if action == "set_leverage":
+            if value is None or value < 1 or value > 50:
+                await update.message.reply_text("لوریج باید بین 1 تا 50 باشد. دوباره دستور «ترید لوریج» را بفرست.")
+                return
+            s = load_trade_settings()
+            s["leverage"] = float(value)
+            save_trade_settings(s)
+            await update.message.reply_text(f"✅ لوریج روی {value}x تنظیم شد.\n\n{format_trade_status()}")
+            return
 
     # Removed manual tracking commands
     if low in ["زیر نظر", "زیرنظر", "زیر نظر بگیر", "نظر"]:
@@ -1014,7 +1049,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await set_trade_margin_command(update, context)
         return
 
-    if low.startswith("لوریج دلار") or low.startswith("دلار لوریج") or low.startswith("لوریج"):
+    if low.startswith("ترید لوریج") or low.startswith("لوریج ترید") or low.startswith("لوریج دلار") or low.startswith("دلار لوریج") or low.startswith("لوریج"):
         await set_leverage_command(update, context)
         return
 
