@@ -114,6 +114,33 @@ try:
 except Exception:
     format_slot_report = None
 
+try:
+    from real_trade_manager import (
+        get_real_trade_status_text,
+        get_toobit_balance_text,
+        set_real_initial_capital,
+        set_real_position_size,
+        set_real_leverage,
+        set_real_max_positions,
+        enable_real_trading,
+        disable_real_trading,
+        activate_real_emergency_stop,
+        reset_real_trade_state,
+        open_real_position_from_signal,
+    )
+except Exception:
+    get_real_trade_status_text = None
+    get_toobit_balance_text = None
+    set_real_initial_capital = None
+    set_real_position_size = None
+    set_real_leverage = None
+    set_real_max_positions = None
+    enable_real_trading = None
+    disable_real_trading = None
+    activate_real_emergency_stop = None
+    reset_real_trade_state = None
+    open_real_position_from_signal = None
+
 
 # ============================================================
 # Config
@@ -610,6 +637,113 @@ async def set_max_positions_command(update: Update, context: ContextTypes.DEFAUL
 
 
 # ============================================================
+# Real Toobit trade commands
+# ============================================================
+
+def real_trade_module_available() -> bool:
+    return all([
+        get_real_trade_status_text,
+        set_real_initial_capital,
+        set_real_position_size,
+        set_real_leverage,
+        set_real_max_positions,
+        enable_real_trading,
+        disable_real_trading,
+        activate_real_emergency_stop,
+        reset_real_trade_state,
+    ])
+
+
+async def real_trade_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not real_trade_module_available() or not get_real_trade_status_text:
+        await update.message.reply_text("ماژول ترید واقعی توبیت فعال نیست یا فایل real_trade_manager.py پیدا نشد.")
+        return
+    await update.message.reply_text(get_real_trade_status_text())
+
+
+async def toobit_balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not get_toobit_balance_text:
+        await update.message.reply_text("ماژول اتصال توبیت فعال نیست یا فایل tobit_client.py پیدا نشد.")
+        return
+    await send_long_text(update, get_toobit_balance_text())
+
+
+async def set_real_capital_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not set_real_initial_capital:
+        await update.message.reply_text("ماژول ترید واقعی فعال نیست.")
+        return
+    value = extract_first_number(update.message.text)
+    if value is None or value <= 0:
+        await update.message.reply_text("مثال درست: سرمایه واقعی 50")
+        return
+    await update.message.reply_text(set_real_initial_capital(float(value)) + "\n\n" + get_real_trade_status_text())
+
+
+async def set_real_position_size_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not set_real_position_size:
+        await update.message.reply_text("ماژول ترید واقعی فعال نیست.")
+        return
+    value = extract_first_number(update.message.text)
+    if value is None or value <= 0:
+        await update.message.reply_text("مثال درست: ترید واقعی دلار 2")
+        return
+    await update.message.reply_text(set_real_position_size(float(value)) + "\n\n" + get_real_trade_status_text())
+
+
+async def set_real_leverage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not set_real_leverage:
+        await update.message.reply_text("ماژول ترید واقعی فعال نیست.")
+        return
+    value = extract_first_number(update.message.text)
+    if value is None or value <= 0:
+        await update.message.reply_text("مثال درست: لوریج واقعی 5")
+        return
+    await update.message.reply_text(set_real_leverage(float(value)) + "\n\n" + get_real_trade_status_text())
+
+
+async def set_real_max_positions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not set_real_max_positions:
+        await update.message.reply_text("ماژول ترید واقعی فعال نیست.")
+        return
+    value = extract_first_number(update.message.text)
+    if value is None or value <= 0:
+        await update.message.reply_text("مثال درست: حداکثر پوزیشن واقعی 3")
+        return
+    await update.message.reply_text(set_real_max_positions(int(value)) + "\n\n" + get_real_trade_status_text())
+
+
+async def enable_real_trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not enable_real_trading:
+        await update.message.reply_text("ماژول ترید واقعی فعال نیست.")
+        return
+    await update.message.reply_text(enable_real_trading() + "\n\n" + get_real_trade_status_text())
+
+
+async def disable_real_trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not disable_real_trading:
+        await update.message.reply_text("ماژول ترید واقعی فعال نیست.")
+        return
+    await update.message.reply_text(disable_real_trading() + "\n\n" + get_real_trade_status_text())
+
+
+async def real_emergency_stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not activate_real_emergency_stop:
+        await update.message.reply_text("ماژول ترید واقعی فعال نیست.")
+        return
+    await update.message.reply_text(activate_real_emergency_stop() + "\n\n" + get_real_trade_status_text())
+
+
+async def reset_real_trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if get_user_id(update) != OWNER_ID:
+        await reject_unauthorized(update)
+        return
+    if not reset_real_trade_state:
+        await update.message.reply_text("ماژول ترید واقعی فعال نیست.")
+        return
+    await update.message.reply_text(reset_real_trade_state() + "\n\n" + get_real_trade_status_text())
+
+
+# ============================================================
 # Formatting analysis output
 # ============================================================
 
@@ -728,6 +862,17 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "لوریج دلار 5\n"
         "حجم پوزیشن\n"
         "ریست ترید\n\n"
+        "دستورهای ترید واقعی توبیت:\n"
+        "وضعیت ترید واقعی\n"
+        "بالانس توبیت\n"
+        "سرمایه واقعی 50\n"
+        "ترید واقعی دلار 2\n"
+        "لوریج واقعی 5\n"
+        "حداکثر پوزیشن واقعی 3\n"
+        "ترید واقعی فعال\n"
+        "ترید واقعی خاموش\n"
+        "توقف اضطراری واقعی\n"
+        "ریست ترید واقعی\n\n"
         "AI و مدیریت:\n"
         "هوش مصنوعی\n"
         "حافظه ربات\n"
@@ -1016,6 +1161,16 @@ async def register_sent_signal(signal: Dict[str, Any], sent_message: Any, source
             except Exception as e:
                 logger.error(f"open_paper_position error: {e}")
 
+        if open_real_position_from_signal:
+            try:
+                real_result = open_real_position_from_signal(meta)
+                if real_result.get("ok"):
+                    logger.info(f"real Toobit position opened: {real_result}")
+                elif not real_result.get("blocked"):
+                    logger.error(f"real Toobit position error: {real_result}")
+            except Exception as e:
+                logger.error(f"open_real_position_from_signal error: {e}")
+
     except Exception as e:
         logger.error(f"register_sent_signal error: {e}")
 
@@ -1157,6 +1312,47 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # Removed manual tracking commands
     if low in ["زیر نظر", "زیرنظر", "زیر نظر بگیر", "نظر"]:
         await update.message.reply_text("نیازی به دستور زیر نظر نیست؛ همه سیگنال‌های معتبر خودکار Track می‌شوند.")
+        return
+
+    # Real Toobit trade commands - must be checked before generic Paper Trade commands.
+    if low in ["ترید واقعی", "وضعیت ترید واقعی", "ترید توبیت", "وضعیت ترید توبیت"]:
+        await real_trade_status_command(update, context)
+        return
+
+    if low in ["بالانس توبیت", "موجودی توبیت"]:
+        await toobit_balance_command(update, context)
+        return
+
+    if low.startswith("سرمایه واقعی") or low.startswith("سرمایه ترید واقعی"):
+        await set_real_capital_command(update, context)
+        return
+
+    if low.startswith("ترید واقعی دلار") or low.startswith("حجم واقعی") or low.startswith("حجم ترید واقعی"):
+        await set_real_position_size_command(update, context)
+        return
+
+    if low.startswith("لوریج واقعی") or low.startswith("لوریج ترید واقعی"):
+        await set_real_leverage_command(update, context)
+        return
+
+    if low.startswith("حداکثر پوزیشن واقعی") or low.startswith("حداکثر پوزیشن توبیت"):
+        await set_real_max_positions_command(update, context)
+        return
+
+    if low in ["ترید واقعی فعال", "فعال ترید واقعی", "فعال سازی ترید واقعی", "فعال‌سازی ترید واقعی"]:
+        await enable_real_trade_command(update, context)
+        return
+
+    if low in ["ترید واقعی خاموش", "خاموش ترید واقعی", "غیرفعال ترید واقعی", "ترید واقعی غیرفعال"]:
+        await disable_real_trade_command(update, context)
+        return
+
+    if low in ["توقف اضطراری واقعی", "استاپ اضطراری واقعی", "خاموش اضطراری واقعی"]:
+        await real_emergency_stop_command(update, context)
+        return
+
+    if low == "ریست ترید واقعی":
+        await reset_real_trade_command(update, context)
         return
 
     # Trade commands
