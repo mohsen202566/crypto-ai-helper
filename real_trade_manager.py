@@ -1,0 +1,331 @@
+# real_trade_manager.py
+# Safe real trading manager for Toobit Futures
+# Default state: OFF / zero values / no real order
+
+import os
+import time
+from typing import Dict, Any, Optional
+
+from data_store import load_json, save_json
+from tobit_client import toobit_client
+
+
+REAL_TRADE_FILE = "data/real_trade_state.json"
+
+
+DEFAULT_REAL_TRADE_STATE = {
+    "enabled": False,
+    "exchange": "TOOBIT",
+    "mode": "REAL",
+    "emergency_stop": False,
+
+    "initial_capital": 0.0,
+    "position_size_usd": 0.0,
+    "leverage": 0.0,
+    "max_positions": 0,
+
+    "open_positions": {},
+    "total_realized_pnl": 0.0,
+    "today_realized_pnl": 0.0,
+    "daily_loss_limit_usd": 0.0,
+    "daily_loss_locked_until": 0,
+
+    "created_at": 0,
+    "updated_at": 0,
+}
+
+
+def _now() -> int:
+    return int(time.time())
+
+
+def load_real_trade_state() -> Dict[str, Any]:
+    state = load_json(REAL_TRADE_FILE, DEFAULT_REAL_TRADE_STATE.copy())
+
+    changed = False
+    for k, v in DEFAULT_REAL_TRADE_STATE.items():
+        if k not in state:
+            state[k] = v
+            changed = True
+
+    if changed:
+        save_real_trade_state(state)
+
+    return state
+
+
+def save_real_trade_state(state: Dict[str, Any]) -> None:
+    state["updated_at"] = _now()
+    if not state.get("created_at"):
+        state["created_at"] = _now()
+    save_json(REAL_TRADE_FILE, state)
+
+
+def is_real_trade_ready() -> tuple[bool, str]:
+    state = load_real_trade_state()
+
+    if not state.get("enabled"):
+        return False, "ترید واقعی خاموش است"
+
+    if state.get("emergency_stop"):
+        return False, "توقف اضطراری فعال است"
+
+    if state.get("daily_loss_locked_until", 0) > _now():
+        return False, "قفل ضرر روزانه فعال است"
+
+    if float(state.get("initial_capital", 0)) <= 0:
+        return False, "سرمایه ترید تنظیم نشده است"
+
+    if float(state.get("position_size_usd", 0)) <= 0:
+        return False, "حجم هر پوزیشن تنظیم نشده است"
+
+    if float(state.get("leverage", 0)) <= 0:
+        return False, "لوریج تنظیم نشده است"
+
+    if int(state.get("max_positions", 0)) <= 0:
+        return False, "حداکثر پوزیشن تنظیم نشده است"
+
+    if len(state.get("open_positions", {})) >= int(state.get("max_positions", 0)):
+        return False, "ظرفیت پوزیشن‌ها پر است"
+
+    return True, "آماده ترید واقعی"
+
+
+def set_real_initial_capital(amount: float) -> str:
+    state = load_real_trade_state()
+    amount = float(amount)
+
+    if amount <= 0:
+        return "❌ سرمایه باید بیشتر از صفر باشد."
+
+    state["initial_capital"] = amount
+
+    if float(state.get("daily_loss_limit_usd", 0)) <= 0:
+        state["daily_loss_limit_usd"] = round(amount * 0.14, 4)
+
+    save_real_trade_state(state)
+    return f"✅ سرمایه ترید واقعی تنظیم شد: {amount}$"
+
+
+def set_real_position_size(amount: float) -> str:
+    state = load_real_trade_state()
+    amount = float(amount)
+
+    if amount <= 0:
+        return "❌ حجم پوزیشن باید بیشتر از صفر باشد."
+
+    state["position_size_usd"] = amount
+    save_real_trade_state(state)
+    return f"✅ حجم هر پوزیشن واقعی تنظیم شد: {amount}$"
+
+
+def set_real_leverage(leverage: float) -> str:
+    state = load_real_trade_state()
+    leverage = float(leverage)
+
+    if leverage < 1 or leverage > 50:
+        return "❌ لوریج باید بین 1 تا 50 باشد."
+
+    state["leverage"] = leverage
+    save_real_trade_state(state)
+    return f"✅ لوریج ترید واقعی تنظیم شد: {leverage}x"
+
+
+def set_real_max_positions(count: int) -> str:
+    state = load_real_trade_state()
+    count = int(count)
+
+    if count < 1 or count > 20:
+        return "❌ حداکثر پوزیشن باید بین 1 تا 20 باشد."
+
+    state["max_positions"] = count
+    save_real_trade_state(state)
+    return f"✅ حداکثر پوزیشن واقعی تنظیم شد: {count}"
+
+
+def enable_real_trading() -> str:
+    state = load_real_trade_state()
+
+    checks = [
+        ("initial_capital", "سرمایه ترید"),
+        ("position_size_usd", "حجم هر پوزیشن"),
+        ("leverage", "لوریج"),
+        ("max_positions", "حداکثر پوزیشن"),
+    ]
+
+    missing = []
+    for key, label in checks:
+        if float(state.get(key, 0)) <= 0:
+            missing.append(label)
+
+    if missing:
+        return "❌ ترید واقعی فعال نشد.\nاول این موارد را تنظیم کن:\n" + "\n".join(f"• {x}" for x in missing)
+
+    state["enabled"] = True
+    state["emergency_stop"] = False
+    save_real_trade_state(state)
+
+    return "✅ ترید واقعی فعال شد.\n⚠️ از این لحظه فقط سیگنال‌های واجد شرایط می‌توانند سفارش واقعی ثبت کنند."
+
+
+def disable_real_trading() -> str:
+    state = load_real_trade_state()
+    state["enabled"] = False
+    save_real_trade_state(state)
+    return "⛔ ترید واقعی خاموش شد."
+
+
+def activate_real_emergency_stop() -> str:
+    state = load_real_trade_state()
+    state["enabled"] = False
+    state["emergency_stop"] = True
+    save_real_trade_state(state)
+    return "🚨 توقف اضطراری فعال شد و ترید واقعی خاموش شد."
+
+
+def reset_real_trade_state() -> str:
+    state = DEFAULT_REAL_TRADE_STATE.copy()
+    state["created_at"] = _now()
+    state["updated_at"] = _now()
+    save_real_trade_state(state)
+    return "✅ تنظیمات ترید واقعی ریست شد. همه مقدارها صفر و ترید خاموش است."
+
+
+def get_real_trade_status_text() -> str:
+    state = load_real_trade_state()
+    open_count = len(state.get("open_positions", {}))
+    max_positions = int(state.get("max_positions", 0))
+    free_slots = max(max_positions - open_count, 0)
+
+    approx_position = float(state.get("position_size_usd", 0)) * float(state.get("leverage", 0))
+
+    status = "✅ فعال" if state.get("enabled") else "⛔ غیرفعال"
+    emergency = "فعال" if state.get("emergency_stop") else "غیرفعال"
+
+    return (
+        "🤖 وضعیت ترید واقعی توبیت\n"
+        f"وضعیت: {status}\n"
+        f"حالت: REAL\n"
+        f"صرافی: TOOBIT\n"
+        f"توقف اضطراری: {emergency}\n\n"
+        f"سرمایه اولیه: {state.get('initial_capital', 0)}$\n"
+        f"حجم هر پوزیشن: {state.get('position_size_usd', 0)}$\n"
+        f"لوریج: {state.get('leverage', 0)}x\n"
+        f"حجم تقریبی پوزیشن: {round(approx_position, 4)}$\n\n"
+        f"پوزیشن باز: {open_count}/{max_positions}\n"
+        f"اسلات خالی: {free_slots}\n\n"
+        f"سود/ضرر امروز: {round(float(state.get('today_realized_pnl', 0)), 4)}$\n"
+        f"سود/ضرر کل: {round(float(state.get('total_realized_pnl', 0)), 4)}$\n"
+        f"حد ضرر روزانه: {state.get('daily_loss_limit_usd', 0)}$"
+    )
+
+
+def get_toobit_balance_text() -> str:
+    result = toobit_client.get_account_balance()
+
+    if not result.get("ok"):
+        return f"❌ دریافت بالانس توبیت ناموفق بود:\n{result.get('error') or result.get('data')}"
+
+    return f"✅ پاسخ بالانس توبیت:\n{result.get('data')}"
+
+
+def calculate_order_quantity(entry_price: float) -> float:
+    state = load_real_trade_state()
+    position_usd = float(state.get("position_size_usd", 0))
+    leverage = float(state.get("leverage", 0))
+
+    if entry_price <= 0 or position_usd <= 0 or leverage <= 0:
+        return 0.0
+
+    notional = position_usd * leverage
+    quantity = notional / float(entry_price)
+    return round(quantity, 6)
+
+
+def open_real_position_from_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
+    ready, reason = is_real_trade_ready()
+    if not ready:
+        return {"ok": False, "blocked": True, "error": reason}
+
+    symbol = signal.get("symbol")
+    direction = signal.get("direction")
+    entry = float(signal.get("entry", 0))
+    tp1 = signal.get("tp1")
+    sl = signal.get("sl")
+    signal_id = signal.get("signal_id") or f"{symbol}_{direction}_{_now()}"
+
+    if not symbol or not direction or entry <= 0:
+        return {"ok": False, "error": "اطلاعات سیگنال ناقص است"}
+
+    state = load_real_trade_state()
+
+    if signal_id in state.get("open_positions", {}):
+        return {"ok": False, "blocked": True, "error": "این سیگنال قبلاً پوزیشن باز دارد"}
+
+    quantity = calculate_order_quantity(entry)
+    if quantity <= 0:
+        return {"ok": False, "error": "محاسبه حجم سفارش نامعتبر است"}
+
+    order_result = toobit_client.place_market_order(
+        symbol=symbol,
+        direction=direction,
+        quantity=quantity,
+        take_profit=tp1,
+        stop_loss=sl,
+    )
+
+    if not order_result.get("ok"):
+        return order_result
+
+    state["open_positions"][signal_id] = {
+        "signal_id": signal_id,
+        "symbol": symbol,
+        "direction": direction,
+        "entry": entry,
+        "tp1": tp1,
+        "tp2": signal.get("tp2"),
+        "sl": sl,
+        "quantity": quantity,
+        "position_size_usd": state.get("position_size_usd", 0),
+        "leverage": state.get("leverage", 0),
+        "opened_at": _now(),
+        "exchange_order": order_result.get("data"),
+    }
+
+    save_real_trade_state(state)
+
+    return {
+        "ok": True,
+        "signal_id": signal_id,
+        "symbol": symbol,
+        "direction": direction,
+        "quantity": quantity,
+        "order": order_result.get("data"),
+    }
+
+
+def close_real_position(signal_id: str) -> Dict[str, Any]:
+    state = load_real_trade_state()
+    pos = state.get("open_positions", {}).get(signal_id)
+
+    if not pos:
+        return {"ok": False, "error": "پوزیشن پیدا نشد"}
+
+    result = toobit_client.close_market_position(
+        symbol=pos["symbol"],
+        direction=pos["direction"],
+        quantity=float(pos["quantity"]),
+    )
+
+    if not result.get("ok"):
+        return result
+
+    state["open_positions"].pop(signal_id, None)
+    save_real_trade_state(state)
+
+    return {
+        "ok": True,
+        "closed": True,
+        "signal_id": signal_id,
+        "exchange_result": result.get("data"),
+    }
