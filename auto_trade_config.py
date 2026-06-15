@@ -39,9 +39,12 @@ def get_env_bool(name, default=False):
 
 AUTO_TRADE_STATE_FILE = get_env_str("AUTO_TRADE_STATE_FILE", "paper_trade_state.json")
 
+# Main trade state defaults
+# Keep trade disabled by default. Real trading must never start automatically.
 DEFAULT_TRADE_ENABLED = get_env_bool("DEFAULT_TRADE_ENABLED", False)
 DEFAULT_TRADE_MODE = get_env_str("DEFAULT_TRADE_MODE", "PAPER")
 
+# Paper/default settings kept compatible with current bot behavior.
 DEFAULT_START_BALANCE_USDT = get_env_float("DEFAULT_START_BALANCE_USDT", 50.0)
 DEFAULT_TRADE_MARGIN_USDT = get_env_float("DEFAULT_TRADE_MARGIN_USDT", 5.0)
 DEFAULT_LEVERAGE = get_env_int("DEFAULT_LEVERAGE", 10)
@@ -50,11 +53,25 @@ DEFAULT_MAX_OPEN_POSITIONS = get_env_int("DEFAULT_MAX_OPEN_POSITIONS", 5)
 DEFAULT_DAILY_MAX_LOSS_USDT = get_env_float("DEFAULT_DAILY_MAX_LOSS_USDT", 7.0)
 DEFAULT_COOLDOWN_AFTER_DAILY_LOSS_HOURS = get_env_int("DEFAULT_COOLDOWN_AFTER_DAILY_LOSS_HOURS", 12)
 
+# Real trading safety defaults.
+# Initial real values stay zero/off until the user explicitly configures them.
+DEFAULT_REAL_TRADING_ENABLED = get_env_bool("DEFAULT_REAL_TRADING_ENABLED", False)
+DEFAULT_REAL_EMERGENCY_STOP = get_env_bool("DEFAULT_REAL_EMERGENCY_STOP", True)
+DEFAULT_REAL_START_BALANCE_USDT = get_env_float("DEFAULT_REAL_START_BALANCE_USDT", 0.0)
+DEFAULT_REAL_TRADE_MARGIN_USDT = get_env_float("DEFAULT_REAL_TRADE_MARGIN_USDT", 0.0)
+DEFAULT_REAL_LEVERAGE = get_env_int("DEFAULT_REAL_LEVERAGE", 0)
+DEFAULT_REAL_MAX_OPEN_POSITIONS = get_env_int("DEFAULT_REAL_MAX_OPEN_POSITIONS", 0)
+DEFAULT_REAL_DAILY_MAX_LOSS_USDT = get_env_float("DEFAULT_REAL_DAILY_MAX_LOSS_USDT", 0.0)
+
+# User command limits
 MIN_TRADE_MARGIN_USDT = get_env_float("MIN_TRADE_MARGIN_USDT", 1.0)
 MAX_TRADE_MARGIN_USDT = get_env_float("MAX_TRADE_MARGIN_USDT", 1000000.0)
 
 MIN_LEVERAGE = get_env_int("MIN_LEVERAGE", 1)
-MAX_LEVERAGE = get_env_int("MAX_LEVERAGE", 50)
+MAX_LEVERAGE = get_env_int("MAX_LEVERAGE", 100)
 
 MIN_MAX_OPEN_POSITIONS = get_env_int("MIN_MAX_OPEN_POSITIONS", 1)
-MAX_MAX_OPEN_POSITIONS = get_env_int("MAX_MAX_OPEN_POSITIONS", 50)
+MAX_MAX_OPEN_POSITIONS = get_env_int("MAX_MAX_OPEN_POSITIONS", 200)
+
+MIN_DAILY_MAX_LOSS_USDT = get_env_float("MIN_DAILY_MAX_LOSS_USDT", 1.0)
+MAX_DAILY_MAX_LOSS_USDT = get_env_float("MAX_DAILY_MAX_LOSS_USDT", 1000000.0)
