@@ -14,7 +14,7 @@ except Exception:
 
 
 SLOT_FILE = 'slot_state.json'
-TRADE_SETTINGS_FILE = 'data/trade_settings.json'
+TRADE_SETTINGS_FILE = 'trade_settings.json'
 
 def _state():
     s = load_json(SLOT_FILE, {'positions': {}})
