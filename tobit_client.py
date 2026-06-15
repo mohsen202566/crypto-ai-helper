@@ -83,30 +83,34 @@ class ToobitClient:
             return {"ok": False, "error": str(e)}
 
     def normalize_futures_symbol(self, symbol: str) -> str:
-        s = symbol.upper().replace("/", "").replace("-", "")
+        raw = str(symbol or "").upper().strip()
+
+        if "-SWAP-USDT" in raw:
+            return raw
+
+        s = raw.replace("/", "").replace("-", "").replace("_", "")
 
         if s.endswith("USDT"):
             base = s[:-4]
             return f"{base}-SWAP-USDT"
 
-        if "-SWAP-USDT" in symbol.upper():
-            return symbol.upper()
-
-        return symbol.upper()
+        return raw
 
     def safe_decimal(self, value, precision: int = 6) -> str:
         q = Decimal("1." + ("0" * precision))
         return str(Decimal(str(value)).quantize(q, rounding=ROUND_DOWN))
 
     def get_account_balance(self):
-        return self._signed_request("GET", "/api/v1/futures/account")
+        return self._signed_request("GET", "/api/v1/futures/balance")
 
-    def get_position(self, symbol: str):
-        symbol = self.normalize_futures_symbol(symbol)
+    def get_position(self, symbol: str | None = None):
+        params = {}
+        if symbol:
+            params["symbol"] = self.normalize_futures_symbol(symbol)
         return self._signed_request(
             "GET",
-            "/api/v1/futures/position",
-            {"symbol": symbol},
+            "/api/v1/futures/positions",
+            params,
         )
 
     def place_market_order(
