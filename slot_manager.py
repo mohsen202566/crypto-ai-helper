@@ -14,6 +14,7 @@ except Exception:
 
 
 SLOT_FILE = 'slot_state.json'
+TRADE_SETTINGS_FILE = 'data/trade_settings.json'
 
 def _state():
     s = load_json(SLOT_FILE, {'positions': {}})
@@ -24,8 +25,22 @@ def _state():
 def get_active_positions() -> List[Dict[str, Any]]:
     return list(_state().get('positions', {}).values())
 
+def get_max_active_positions() -> int:
+    """Use live trade settings first, then fall back to config default."""
+    try:
+        settings = load_json(TRADE_SETTINGS_FILE, {})
+        if isinstance(settings, dict):
+            value = int(settings.get('max_positions') or MAX_ACTIVE_POSITIONS)
+            return max(1, value)
+    except Exception:
+        pass
+    try:
+        return max(1, int(MAX_ACTIVE_POSITIONS))
+    except Exception:
+        return 1
+
 def get_free_slots() -> int:
-    return max(0, int(MAX_ACTIVE_POSITIONS) - len(get_active_positions()))
+    return max(0, get_max_active_positions() - len(get_active_positions()))
 
 def is_symbol_direction_active(symbol: str, direction: str = None) -> bool:
     for p in get_active_positions():
@@ -142,6 +157,6 @@ def select_best_candidates(candidates: List[Dict], limit: int = 1) -> List[Dict]
 
 def format_slot_report() -> str:
     ps = get_active_positions()
-    lines = [f"📌 Slot ها: {len(ps)}/{MAX_ACTIVE_POSITIONS}"]
+    lines = [f"📌 Slot ها: {len(ps)}/{get_max_active_positions()}"]
     for p in ps: lines.append(f"{p.get('symbol')} {p.get('direction')} | {p.get('score')}")
     return '\n'.join(lines)
