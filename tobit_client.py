@@ -138,6 +138,17 @@ class ToobitClient:
                 return {"ok": False, "error": f"Unsupported method: {method}"}
 
             raw_text = response.text
+            
+            print("\n" + "=" * 80)
+print("TOOBIT DEBUG")
+print("URL:", url)
+print("METHOD:", method)
+print("PATH:", path)
+print("STATUS:", response.status_code)
+print("SIGNED PARAMS:", signed_params)
+print("HEADERS:", self._headers(json_body))
+print("RAW RESPONSE:", raw_text)
+print("=" * 80 + "\n")
             try:
                 data = response.json()
             except Exception:
@@ -323,4 +334,12 @@ class ToobitClient:
 ToBitClient = ToobitClient
 
 # Shared singleton used by real_trade_manager.py
+def debug_toobit():
+    client = ToobitClient()
+
+    print("\n===== TOOBIT ENV =====")
+    print(client.debug_env_masked())
+
+    print("\n===== TOOBIT BALANCE TEST =====")
+    print(client.debug_balance())
 toobit_client = ToobitClient()
