@@ -9,13 +9,17 @@ Scope:
 - Calculates PnL as if the trade was real:
     pnl_usdt = margin_usdt * leverage * move_percent / 100
 - Maintains paper balance, daily PnL, open positions, closed history.
-- Applies a 12h trading lock when loss from original capital reaches daily max loss.
+- Protects realized full-dollar profits by moving each complete 1$ profit
+  into protected_balance immediately after a position closes.
+- Applies a trading lock when the paper balance drops by daily_max_loss_usdt
+  from protected_balance. Default lock duration is 1 hour.
 """
 
 import json
 import os
 import time
 import uuid
+import math
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any, Tuple
 
@@ -32,7 +36,6 @@ try:
         DEFAULT_LEVERAGE,
         DEFAULT_MAX_OPEN_POSITIONS,
         DEFAULT_DAILY_MAX_LOSS_USDT,
-        DEFAULT_COOLDOWN_AFTER_DAILY_LOSS_HOURS,
         MIN_TRADE_MARGIN_USDT,
         MAX_TRADE_MARGIN_USDT,
         MIN_LEVERAGE,
@@ -46,13 +49,16 @@ except Exception:
     DEFAULT_LEVERAGE = 5
     DEFAULT_MAX_OPEN_POSITIONS = 5
     DEFAULT_DAILY_MAX_LOSS_USDT = 7.0
-    DEFAULT_COOLDOWN_AFTER_DAILY_LOSS_HOURS = 12
     MIN_TRADE_MARGIN_USDT = 1.0
     MAX_TRADE_MARGIN_USDT = 1_000_000.0
     MIN_LEVERAGE = 1
     MAX_LEVERAGE = 50
     MIN_MAX_OPEN_POSITIONS = 1
     MAX_MAX_OPEN_POSITIONS = 50
+
+# User-preferred default: daily loss lock should last 1 hour, not 12 hours.
+PAPER_DEFAULT_LOCK_HOURS = 1
+PAPER_PROFIT_PROTECTION_UNIT_USDT = 1.0
 
 PAPER_FILE = "paper_trades.json"
 TRADE_SETTINGS_FILE = os.path.join("data", "trade_settings.json")
@@ -120,8 +126,10 @@ def _default_state() -> Dict[str, Any]:
             "mode": "PAPER",
             "start_balance": capital,
             "balance": capital,
+            "protected_balance": capital,
+            "profit_carry_remainder": 0.0,
             "daily_max_loss_usdt": float(DEFAULT_DAILY_MAX_LOSS_USDT),
-            "cooldown_hours": int(DEFAULT_COOLDOWN_AFTER_DAILY_LOSS_HOURS),
+            "cooldown_hours": PAPER_DEFAULT_LOCK_HOURS,
             "daily_lock_until": 0,
             "daily_lock_reason": "",
             "created_at": now_ts(),
@@ -131,6 +139,26 @@ def _default_state() -> Dict[str, Any]:
         "closed_positions": [],
         "stats": {"total": 0, "tp1": 0, "tp2": 0, "sl": 0, "manual_closed": 0},
     }
+
+
+def _migrate_protected_balance(acc: Dict[str, Any]) -> None:
+    """Add protected-balance fields to old paper files without reducing old data."""
+    start = float(acc.get("start_balance", 0) or 0)
+    balance = float(acc.get("balance", start) or start)
+
+    if "protected_balance" not in acc:
+        full_profit_units = math.floor(max(0.0, balance - start) + 1e-9)
+        acc["protected_balance"] = round(start + full_profit_units, 6)
+
+    protected = float(acc.get("protected_balance", start) or start)
+    acc["protected_balance"] = round(max(protected, start), 6)
+
+    if "profit_carry_remainder" not in acc:
+        acc["profit_carry_remainder"] = round(max(0.0, balance - float(acc["protected_balance"])), 6)
+
+    # Any old 12h default should become 1h unless the user later changes it.
+    if int(acc.get("cooldown_hours", 0) or 0) <= 0:
+        acc["cooldown_hours"] = PAPER_DEFAULT_LOCK_HOURS
 
 
 def _state() -> Dict[str, Any]:
@@ -148,12 +176,13 @@ def _state() -> Dict[str, Any]:
         closed = s.get("closed_positions", []) if isinstance(s.get("closed_positions"), list) else []
         realized = sum(float(x.get("pnl_usdt", 0) or 0) for x in closed if isinstance(x, dict))
         start_balance = float(cfg["capital_usd"])
+        balance = round(start_balance + realized, 6)
         s["account"] = {
             "mode": "PAPER",
             "start_balance": start_balance,
-            "balance": round(start_balance + realized, 6),
+            "balance": balance,
             "daily_max_loss_usdt": float(DEFAULT_DAILY_MAX_LOSS_USDT),
-            "cooldown_hours": int(DEFAULT_COOLDOWN_AFTER_DAILY_LOSS_HOURS),
+            "cooldown_hours": PAPER_DEFAULT_LOCK_HOURS,
             "daily_lock_until": 0,
             "daily_lock_reason": "",
             "created_at": now_ts(),
@@ -165,9 +194,10 @@ def _state() -> Dict[str, Any]:
     acc.setdefault("start_balance", float(_read_trade_settings()["capital_usd"]))
     acc.setdefault("balance", float(acc.get("start_balance", 0) or 0))
     acc.setdefault("daily_max_loss_usdt", float(DEFAULT_DAILY_MAX_LOSS_USDT))
-    acc.setdefault("cooldown_hours", int(DEFAULT_COOLDOWN_AFTER_DAILY_LOSS_HOURS))
+    acc.setdefault("cooldown_hours", PAPER_DEFAULT_LOCK_HOURS)
     acc.setdefault("daily_lock_until", 0)
     acc.setdefault("daily_lock_reason", "")
+    _migrate_protected_balance(acc)
     return s
 
 
@@ -230,6 +260,36 @@ def get_loss_from_initial(s: Optional[Dict[str, Any]] = None) -> float:
     return round(max(0.0, start - balance), 6)
 
 
+def get_loss_from_protected(s: Optional[Dict[str, Any]] = None) -> float:
+    s = s or _state()
+    acc = s.get("account", {})
+    protected = float(acc.get("protected_balance", acc.get("start_balance", 0)) or 0)
+    balance = float(acc.get("balance", protected) or protected)
+    return round(max(0.0, protected - balance), 6)
+
+
+def _sync_profit_protection(s: Dict[str, Any]) -> float:
+    """
+    Move every complete 1 USDT of realized balance above protected_balance
+    into protected_balance. Fractional profit remains as profit_carry_remainder.
+    """
+    acc = s.setdefault("account", {})
+    start = float(acc.get("start_balance", 0) or 0)
+    balance = float(acc.get("balance", start) or start)
+    protected = float(acc.get("protected_balance", start) or start)
+
+    if protected < start:
+        protected = start
+
+    full_units = math.floor(max(0.0, balance - protected) / PAPER_PROFIT_PROTECTION_UNIT_USDT + 1e-9)
+    if full_units > 0:
+        protected = round(protected + full_units * PAPER_PROFIT_PROTECTION_UNIT_USDT, 6)
+
+    acc["protected_balance"] = protected
+    acc["profit_carry_remainder"] = round(max(0.0, balance - protected), 6)
+    return protected
+
+
 def is_daily_locked() -> bool:
     s = _state()
     until = int(s.get("account", {}).get("daily_lock_until", 0) or 0)
@@ -247,12 +307,13 @@ def _maybe_apply_daily_lock(s: Dict[str, Any]) -> bool:
         return True
 
     max_loss = float(acc.get("daily_max_loss_usdt", DEFAULT_DAILY_MAX_LOSS_USDT) or DEFAULT_DAILY_MAX_LOSS_USDT)
-    loss_from_initial = get_loss_from_initial(s)
+    loss_from_protected = get_loss_from_protected(s)
 
-    if loss_from_initial >= max_loss > 0:
-        hours = int(acc.get("cooldown_hours", DEFAULT_COOLDOWN_AFTER_DAILY_LOSS_HOURS) or DEFAULT_COOLDOWN_AFTER_DAILY_LOSS_HOURS)
+    if loss_from_protected >= max_loss > 0:
+        hours = int(acc.get("cooldown_hours", PAPER_DEFAULT_LOCK_HOURS) or PAPER_DEFAULT_LOCK_HOURS)
+        hours = max(1, hours)
         acc["daily_lock_until"] = now_ts() + hours * 3600
-        acc["daily_lock_reason"] = f"رسیدن ضرر از اصل سرمایه به {round(loss_from_initial, 4)}$"
+        acc["daily_lock_reason"] = f"رسیدن افت از سرمایه محافظت‌شده به {round(loss_from_protected, 4)}$"
         return True
     return False
 
@@ -277,12 +338,32 @@ def configure_paper_account(
         acc["start_balance"] = capital_usd
         if reset_balance or len(s.get("closed_positions", [])) == 0:
             acc["balance"] = capital_usd
+            acc["protected_balance"] = capital_usd
+            acc["profit_carry_remainder"] = 0.0
+        else:
+            _sync_profit_protection(s)
     if daily_max_loss_usdt is not None:
-        acc["daily_max_loss_usdt"] = float(daily_max_loss_usdt)
+        acc["daily_max_loss_usdt"] = max(0.0, float(daily_max_loss_usdt))
     if cooldown_hours is not None:
-        acc["cooldown_hours"] = int(cooldown_hours)
+        acc["cooldown_hours"] = max(1, int(cooldown_hours))
     _save(s)
     return s
+
+
+def configure_daily_loss_limit(amount_usdt: float) -> str:
+    amount = float(amount_usdt)
+    if amount <= 0:
+        return "❌ حد ضرر روزانه باید بیشتر از صفر باشد. مثال: حد ضرر روزانه 5"
+    configure_paper_account(daily_max_loss_usdt=amount)
+    return f"✅ حد ضرر روزانه روی {round(amount, 4)}$ تنظیم شد."
+
+
+def configure_daily_lock_hours(hours: int) -> str:
+    hours = int(hours)
+    if hours < 1 or hours > 168:
+        return "❌ زمان قفل باید بین 1 تا 168 ساعت باشد. مثال: قفل ضرر 1 ساعت"
+    configure_paper_account(cooldown_hours=hours)
+    return f"✅ زمان قفل ضرر روی {hours} ساعت تنظیم شد."
 
 
 def has_open_position(symbol: str, direction: Optional[str] = None) -> bool:
@@ -410,6 +491,7 @@ def close_paper_position(symbol: str, direction: str, exit_price: float, result:
 
     acc = s.setdefault("account", {})
     acc["balance"] = round(float(acc.get("balance", acc.get("start_balance", 0)) or 0) + pnl_usdt, 6)
+    _sync_profit_protection(s)
 
     stats = s.setdefault("stats", {"total": 0, "tp1": 0, "tp2": 0, "sl": 0, "manual_closed": 0})
     stats["total"] = int(stats.get("total", 0)) + 1
@@ -460,6 +542,7 @@ def get_paper_stats() -> Dict[str, Any]:
     daily_pnl = get_daily_pnl_usdt(s)
     total_pnl = get_total_pnl_usdt(s)
     balance = float(acc.get("balance", acc.get("start_balance", 0)) or 0)
+    protected_balance = float(acc.get("protected_balance", acc.get("start_balance", balance)) or balance)
 
     best = max([float(p.get("pnl_usdt", 0) or 0) for p in closed], default=0.0)
     worst = min([float(p.get("pnl_usdt", 0) or 0) for p in closed], default=0.0)
@@ -474,12 +557,17 @@ def get_paper_stats() -> Dict[str, Any]:
         "open_positions": len(s.get("open_positions", {})),
         "balance": round(balance, 6),
         "start_balance": round(float(acc.get("start_balance", balance) or balance), 6),
+        "protected_balance": round(protected_balance, 6),
+        "profit_carry_remainder": round(float(acc.get("profit_carry_remainder", 0) or 0), 6),
         "daily_pnl": round(daily_pnl, 6),
         "total_pnl": round(total_pnl, 6),
         "loss_from_initial": get_loss_from_initial(s),
+        "loss_from_protected": get_loss_from_protected(s),
         "daily_max_loss": round(float(acc.get("daily_max_loss_usdt", DEFAULT_DAILY_MAX_LOSS_USDT) or DEFAULT_DAILY_MAX_LOSS_USDT), 6),
         "daily_lock": is_daily_locked(),
         "lock_remaining_seconds": get_lock_remaining_seconds(),
+        "cooldown_hours": int(acc.get("cooldown_hours", PAPER_DEFAULT_LOCK_HOURS) or PAPER_DEFAULT_LOCK_HOURS),
+        "daily_lock_reason": str(acc.get("daily_lock_reason", "") or ""),
         "best_trade": round(best, 6),
         "worst_trade": round(worst, 6),
     }
@@ -495,11 +583,13 @@ def _money(v: Any) -> str:
 
 
 def format_closed_trade_line(c: Dict[str, Any]) -> str:
+    st = get_paper_stats()
     return (
         f"Paper Trade بسته شد\n"
         f"PnL: {_money(c.get('pnl_usdt', 0))}\n"
         f"درصد: {c.get('pnl_percent')}٪\n"
-        f"بالانس Paper: {_money(_state().get('account', {}).get('balance', 0)).replace('+','')}"
+        f"بالانس Paper: {_money(st.get('balance', 0)).replace('+','')}\n"
+        f"سرمایه محافظت‌شده: {st.get('protected_balance', 0)}$"
     )
 
 
@@ -512,10 +602,13 @@ def format_paper_stats() -> str:
         f"WinRate: {st['win_rate']}%\n"
         f"باز: {st['open_positions']}\n\n"
         f"بالانس Paper: {st['balance']}$\n"
+        f"سرمایه محافظت‌شده: {st['protected_balance']}$\n"
+        f"سود کامل منتقل‌نشده: {st['profit_carry_remainder']}$\n"
         f"سود/ضرر امروز: {_money(st['daily_pnl'])}\n"
         f"سود/ضرر کل: {_money(st['total_pnl'])}\n"
-        f"ضرر از اصل سرمایه: {st['loss_from_initial']}$\n"
-        f"حد ضرر از اصل سرمایه: {st['daily_max_loss']}$\n"
+        f"ضرر از سرمایه محافظت‌شده: {st['loss_from_protected']}$\n"
+        f"حد ضرر روزانه: {st['daily_max_loss']}$\n"
+        f"زمان قفل: {st['cooldown_hours']} ساعت\n"
         f"قفل ضرر: {'فعال' if st['daily_lock'] else 'غیرفعال'}"
     )
 
@@ -526,12 +619,13 @@ def format_paper_trade_status() -> str:
     max_positions = int(cfg["max_positions"])
     free = max(0, max_positions - int(st["open_positions"]))
     position_size = round(float(cfg["trade_margin_usd"]) * float(cfg["leverage"]), 4)
-    risk_pct = round((float(cfg["trade_margin_usd"]) / max(float(st["start_balance"]), 1e-9)) * 100, 2)
+    risk_pct = round((float(cfg["trade_margin_usd"]) / max(float(st["protected_balance"]), 1e-9)) * 100, 2)
 
     lock_line = "غیرفعال"
     if st["daily_lock"]:
         hours = round(st["lock_remaining_seconds"] / 3600, 2)
-        lock_line = f"فعال، حدود {hours} ساعت باقی مانده"
+        reason = st.get("daily_lock_reason") or "رسیدن به حد ضرر روزانه"
+        lock_line = f"فعال، حدود {hours} ساعت باقی مانده\nدلیل قفل: {reason}"
 
     return (
         "🤖 وضعیت ترید\n\n"
@@ -540,16 +634,20 @@ def format_paper_trade_status() -> str:
         f"توقف اضطراری: {'فعال' if st['daily_lock'] else 'غیرفعال'}\n\n"
         f"سرمایه اولیه: {st['start_balance']}$\n"
         f"بالانس Paper: {st['balance']}$\n"
+        f"سرمایه محافظت‌شده: {st['protected_balance']}$\n"
+        f"سود کامل منتقل‌نشده: {st['profit_carry_remainder']}$\n"
         f"حجم هر پوزیشن: {cfg['trade_margin_usd']}$\n"
         f"لوریج: {cfg['leverage']}x\n"
         f"حجم پوزیشن تقریبی: {position_size}$\n"
-        f"ریسک هر ترید نسبت به سرمایه: {risk_pct}%\n\n"
+        f"ریسک هر ترید نسبت به سرمایه محافظت‌شده: {risk_pct}%\n\n"
         f"پوزیشن باز: {st['open_positions']}/{max_positions}\n"
         f"اسلات خالی: {free}\n\n"
         f"سود/ضرر امروز: {_money(st['daily_pnl'])}\n"
         f"سود/ضرر کل: {_money(st['total_pnl'])}\n"
-        f"ضرر از اصل سرمایه: {st['loss_from_initial']}$\n"
-        f"حد ضرر از اصل سرمایه: {st['daily_max_loss']}$\n"
+        f"ضرر از سرمایه اولیه: {st['loss_from_initial']}$\n"
+        f"ضرر از سرمایه محافظت‌شده: {st['loss_from_protected']}$\n"
+        f"حد ضرر روزانه: {st['daily_max_loss']}$\n"
+        f"زمان قفل ضرر: {st['cooldown_hours']} ساعت\n"
         f"قفل ضرر روزانه: {lock_line}"
     )
 
@@ -574,5 +672,8 @@ def reset_paper_trades(capital_usd: Optional[float] = None) -> bool:
     state = _default_state()
     state["account"]["start_balance"] = capital
     state["account"]["balance"] = capital
+    state["account"]["protected_balance"] = capital
+    state["account"]["profit_carry_remainder"] = 0.0
+    state["account"]["cooldown_hours"] = PAPER_DEFAULT_LOCK_HOURS
     _save(state)
     return True
