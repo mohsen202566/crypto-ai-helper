@@ -186,6 +186,7 @@ logger = logging.getLogger("crypto-ai-bot")
 
 LAST_AUTO_SIGNAL_TIME: Dict[str, int] = {}
 AUTO_SIGNAL_COOLDOWN_SECONDS = int(AUTO_SIGNAL_COOLDOWN_MINUTES) * 60
+REAL_TRACKING_LOOP_INTERVAL_SECONDS = int(os.getenv("REAL_TRACKING_LOOP_INTERVAL_SECONDS", "2") or "2")
 
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -1186,19 +1187,27 @@ async def slot_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # ============================================================
 
 async def register_sent_signal(signal: Dict[str, Any], sent_message: Any, source: str = "auto_signal") -> None:
+    """
+    Register a signal after it is sent to Telegram.
+
+    Real-trading safety architecture:
+    - Auto signals keep the existing AI/scanner/ghost/learning flow untouched.
+    - The real order request is sent through real_trade_manager.
+    - If Toobit accepts the request, the signal enters tracking as PENDING_REAL_CONFIRM.
+    - No false "order not registered / slot not entered" message is sent for delayed Toobit visibility.
+    - If real_trade_manager blocks the order for a true safety reason, the signal is not tracked.
+    """
     try:
         chat_id = sent_message.chat_id
         message_id = sent_message.message_id
 
         meta = attach_signal_metadata(signal, message_id, chat_id, source)
 
-        # In REAL-only mode, an auto signal must not enter tracking/slots
-        # unless the real Toobit order is actually accepted first.
         if source == "auto_signal":
             if not open_real_position_from_signal:
                 logger.error("REAL order module unavailable; auto signal was not tracked.")
                 try:
-                    await sent_message.reply_text("❌ سفارش واقعی ثبت نشد: ماژول توبیت در دسترس نیست.")
+                    await sent_message.reply_text("⛔ سفارش واقعی ارسال نشد: ماژول توبیت در دسترس نیست.")
                 except Exception:
                     pass
                 return
@@ -1208,22 +1217,41 @@ async def register_sent_signal(signal: Dict[str, Any], sent_message: Any, source
             except Exception as e:
                 logger.error(f"open_real_position_from_signal error: {e}")
                 try:
-                    await sent_message.reply_text(f"❌ سفارش واقعی ثبت نشد:\n{str(e)[:250]}")
+                    await sent_message.reply_text(f"⛔ سفارش واقعی به دلیل خطای ایمنی ارسال نشد:\n{str(e)[:250]}")
                 except Exception:
                     pass
                 return
 
-            if real_result.get("ok"):
-                logger.info(f"real Toobit position opened: {real_result}")
-                meta["real_order"] = real_result
-            else:
+            if not isinstance(real_result, dict):
+                logger.error(f"open_real_position_from_signal returned non-dict: {real_result}")
+                return
+
+            if not real_result.get("ok"):
                 reason = real_result.get("error") or real_result.get("message") or real_result.get("data") or "نامشخص"
-                logger.warning(f"real Toobit position not opened; signal will not be tracked: {real_result}")
+                logger.warning(f"real Toobit order blocked/not accepted; signal will not be tracked: {real_result}")
+
+                # This is a true safety/block condition, not the old delayed-position false error.
+                # Never send the old misleading delayed-position error text.
                 try:
-                    await sent_message.reply_text(f"❌ سفارش واقعی ثبت نشد؛ سیگنال وارد اسلات نشد.\nعلت: {str(reason)[:250]}")
+                    await sent_message.reply_text(f"⛔ سفارش واقعی ارسال/تأیید نشد:\n{str(reason)[:250]}")
                 except Exception:
                     pass
                 return
+
+            logger.info(f"real Toobit order accepted/pending confirmation: {real_result}")
+
+            meta["real_order"] = real_result
+            meta["real_status"] = (
+                real_result.get("real_status")
+                or real_result.get("status")
+                or "PENDING_REAL_CONFIRM"
+            )
+            meta["real_signal_id"] = real_result.get("signal_id") or meta.get("signal_id") or meta.get("id")
+            meta["position_size_usd"] = (
+                real_result.get("position_size_usd")
+                or meta.get("position_size_usd")
+            )
+            meta["leverage"] = real_result.get("leverage") or meta.get("leverage")
 
         if add_signal_to_tracking:
             try:
@@ -1419,7 +1447,7 @@ async def signal_tracking_loop(app: Application) -> None:
         except Exception as e:
             logger.error(f"signal_tracking_loop error: {e}")
 
-        await asyncio.sleep(20)
+        await asyncio.sleep(max(2, int(REAL_TRACKING_LOOP_INTERVAL_SECONDS)))
 
 
 # ============================================================
