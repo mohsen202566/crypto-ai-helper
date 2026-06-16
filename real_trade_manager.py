@@ -865,3 +865,467 @@ def close_real_position(
         "exchange_result": result.get("data"),
         "accounting": accounting,
     }
+
+# ---------------------------------------------------------------------------
+# Robust Toobit synchronization layer
+# Added to fix accepted/pending orders that later become real positions and to
+# keep internal slots aligned with actual exchange positions.
+# ---------------------------------------------------------------------------
+
+PENDING_ORDER_POLL_SECONDS = 8.0
+PENDING_ORDER_POLL_INTERVAL = 1.0
+
+
+def _plain_symbol_from_toobit(value: Any) -> str:
+    raw = str(value or "").upper().strip()
+    if not raw:
+        return ""
+    raw = raw.replace("/", "").replace("_", "-")
+    if "-SWAP-USDT" in raw:
+        return raw.replace("-SWAP-USDT", "USDT")
+    if "-SWAP-USDC" in raw:
+        return raw.replace("-SWAP-USDC", "USDC")
+    raw = raw.replace("-", "")
+    return raw
+
+
+def _position_symbol_from_item(item: Dict[str, Any]) -> str:
+    for key in ("symbol", "contractCode", "instrument", "instId", "pair"):
+        if item.get(key):
+            return _plain_symbol_from_toobit(item.get(key))
+    return ""
+
+
+def _position_direction_from_item(item: Dict[str, Any]) -> str:
+    text = " ".join(str(item.get(k, "")) for k in (
+        "side", "positionSide", "direction", "positionType", "holdSide", "tradeSide"
+    )).upper()
+    qty = _safe_float_any(
+        item.get("positionAmt") or item.get("positionSize") or item.get("size") or item.get("qty")
+        or item.get("quantity") or item.get("positionQuantity") or item.get("availablePosition")
+    )
+    if "SHORT" in text or "SELL" in text:
+        return "SHORT"
+    if "LONG" in text or "BUY" in text:
+        return "LONG"
+    if qty < 0:
+        return "SHORT"
+    return "LONG"
+
+
+def _position_entry_from_item(item: Dict[str, Any]) -> float:
+    for key in ("entryPrice", "avgPrice", "openPrice", "positionAvgPrice", "averagePrice"):
+        v = _safe_float_any(item.get(key))
+        if v > 0:
+            return v
+    return 0.0
+
+
+def _position_leverage_from_item(item: Dict[str, Any]) -> float:
+    for key in ("leverage", "lever", "leverageValue"):
+        v = _safe_float_any(item.get(key))
+        if v > 0:
+            return v
+    return 0.0
+
+
+def _position_qty_from_item(item: Dict[str, Any]) -> float:
+    if hasattr(toobit_client, "_position_qty"):
+        try:
+            return float(toobit_client._position_qty(item))
+        except Exception:
+            pass
+    for key in ("positionAmt", "positionSize", "size", "qty", "quantity", "positionQuantity", "availablePosition"):
+        v = _safe_float_any(item.get(key))
+        if v != 0:
+            return abs(v)
+    return 0.0
+
+
+def get_toobit_open_positions_normalized(symbol: Optional[str] = None) -> Dict[str, Any]:
+    """Return normalized open futures positions from Toobit."""
+    try:
+        result = toobit_client.get_positions(symbol=symbol) if symbol else toobit_client.get_positions()
+        if not isinstance(result, dict) or not result.get("ok"):
+            return {"ok": False, "error": str((result or {}).get("error") or (result or {}).get("data") or "position fetch failed"), "positions": []}
+
+        if hasattr(toobit_client, "_flatten_position_items"):
+            items = toobit_client._flatten_position_items(result)
+        else:
+            items = _flatten_dicts(result.get("data"))
+
+        positions = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            qty = _position_qty_from_item(item)
+            if qty <= 0:
+                continue
+            sym = _position_symbol_from_item(item)
+            if not sym:
+                continue
+            direction = _position_direction_from_item(item)
+            positions.append({
+                "symbol": sym,
+                "direction": direction,
+                "quantity": qty,
+                "entry": _position_entry_from_item(item),
+                "leverage": _position_leverage_from_item(item),
+                "raw": item,
+            })
+        return {"ok": True, "positions": positions, "raw": result}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:300], "positions": []}
+
+
+def _internal_position_matches_exchange(pos: Dict[str, Any], ex: Dict[str, Any]) -> bool:
+    return (
+        str(pos.get("symbol") or "").upper() == str(ex.get("symbol") or "").upper()
+        and str(pos.get("direction") or "").upper() == str(ex.get("direction") or "").upper()
+    )
+
+
+def sync_real_positions_with_toobit(state: Optional[Dict[str, Any]] = None, *, save: bool = True) -> Dict[str, Any]:
+    """
+    Reconcile internal open_positions with live Toobit futures positions.
+
+    Safety behavior:
+    - If exchange has a position that the bot missed, create a recovered internal slot.
+    - If internal slot exists but no matching exchange position exists after a grace period,
+      mark/remove it to prevent status saying a fake position is open.
+    - Never closes exchange positions automatically.
+    """
+    state = state or load_json(REAL_TRADE_FILE, DEFAULT_REAL_TRADE_STATE.copy())
+    if not isinstance(state, dict):
+        state = DEFAULT_REAL_TRADE_STATE.copy()
+    state.setdefault("open_positions", {})
+    if not isinstance(state.get("open_positions"), dict):
+        state["open_positions"] = {}
+
+    result = get_toobit_open_positions_normalized()
+    if not result.get("ok"):
+        return {"ok": False, "error": result.get("error"), "state": state, "exchange_positions": []}
+
+    exchange_positions = result.get("positions") or []
+    open_positions = state["open_positions"]
+    now = _now()
+    added = 0
+    removed = 0
+
+    # Add missing exchange positions as recovered slots so status and capacity are truthful.
+    for ex in exchange_positions:
+        exists = any(_internal_position_matches_exchange(pos, ex) for pos in open_positions.values() if isinstance(pos, dict))
+        if exists:
+            continue
+        sid = f"RECOVERED_{ex.get('symbol')}_{ex.get('direction')}_{now}_{added}"
+        open_positions[sid] = {
+            "signal_id": sid,
+            "symbol": ex.get("symbol"),
+            "direction": ex.get("direction"),
+            "entry": ex.get("entry") or 0,
+            "tp1": None,
+            "tp2": None,
+            "sl": None,
+            "quantity": ex.get("quantity") or 0,
+            "position_size_usd": state.get("position_size_usd", 0),
+            "leverage": ex.get("leverage") or state.get("leverage", 0),
+            "opened_at": now,
+            "recovered_from_exchange": True,
+            "exchange_position": ex.get("raw"),
+            "warning": "این پوزیشن در صرافی باز بود ولی داخل اسلات ربات نبود؛ خودکار sync شد.",
+        }
+        added += 1
+
+    # Remove stale internal slots only if exchange confirms no matching live position.
+    for sid, pos in list(open_positions.items()):
+        if not isinstance(pos, dict):
+            open_positions.pop(sid, None)
+            removed += 1
+            continue
+        match = any(_internal_position_matches_exchange(pos, ex) for ex in exchange_positions)
+        if match:
+            continue
+        age = now - int(pos.get("opened_at", 0) or 0)
+        status = str(((pos.get("execution_info") or {}).get("status")) or "").upper()
+        if age >= 15 or status in {"PENDING_NEW", "NEW", "PENDING", "CREATED", "ACCEPTED"}:
+            pos.setdefault("closed_or_missing_at", now)
+            state.setdefault("orphaned_internal_positions", []).append(pos)
+            state["orphaned_internal_positions"] = state["orphaned_internal_positions"][-200:]
+            open_positions.pop(sid, None)
+            removed += 1
+
+    if save and (added or removed):
+        save_real_trade_state(state)
+
+    return {"ok": True, "added": added, "removed": removed, "state": state, "exchange_positions": exchange_positions}
+
+
+def _wait_for_exchange_position(symbol: str, direction: str, quantity: float, timeout: float = PENDING_ORDER_POLL_SECONDS) -> Dict[str, Any]:
+    end = time.time() + float(timeout)
+    last_error = ""
+    while time.time() <= end:
+        try:
+            if hasattr(toobit_client, "_has_open_position"):
+                opened, position_result = toobit_client._has_open_position(symbol, direction, quantity)
+                if opened:
+                    return {"ok": True, "position_result": position_result}
+                last_error = str((position_result or {}).get("error") or "")[:200]
+            else:
+                result = get_toobit_open_positions_normalized(symbol)
+                if result.get("ok"):
+                    for ex in result.get("positions") or []:
+                        if str(ex.get("symbol") or "").upper() == str(symbol or "").upper() and str(ex.get("direction") or "").upper() == str(direction or "").upper():
+                            return {"ok": True, "position_result": result}
+                else:
+                    last_error = str(result.get("error") or "")[:200]
+        except Exception as e:
+            last_error = str(e)[:200]
+        time.sleep(PENDING_ORDER_POLL_INTERVAL)
+    return {"ok": False, "error": last_error or "position not visible after polling"}
+
+
+def _register_real_open_position(state: Dict[str, Any], signal: Dict[str, Any], signal_id: str, quantity: float, order_result: Dict[str, Any], execution_info: Dict[str, Any], recovered_note: str = "") -> Dict[str, Any]:
+    symbol = signal.get("symbol")
+    direction = signal.get("direction")
+    entry = float(signal.get("entry", 0) or 0)
+    tp1 = signal.get("tp1")
+    sl = signal.get("sl") or signal.get("stop_loss")
+    state.setdefault("open_positions", {})
+    state["open_positions"][signal_id] = {
+        "signal_id": signal_id,
+        "symbol": symbol,
+        "direction": direction,
+        "entry": entry,
+        "tp1": tp1,
+        "tp2": signal.get("tp2"),
+        "sl": sl,
+        "quantity": quantity,
+        "position_size_usd": state.get("position_size_usd", 0),
+        "leverage": state.get("leverage", 0),
+        "opened_at": _now(),
+        "exchange_order": order_result.get("data"),
+        "execution_info": execution_info,
+        "recovered_note": recovered_note,
+    }
+    save_real_trade_state(state)
+    return state["open_positions"][signal_id]
+
+
+def is_real_trade_ready() -> tuple[bool, str]:
+    state = load_real_trade_state()
+    sync_result = sync_real_positions_with_toobit(state, save=True)
+    if sync_result.get("ok"):
+        state = sync_result.get("state") or state
+
+    if not state.get("enabled"):
+        return False, "ترید واقعی خاموش است"
+    if state.get("emergency_stop"):
+        return False, "توقف اضطراری فعال است"
+    if state.get("daily_loss_locked_until", 0) > _now():
+        remaining = round((int(state.get("daily_loss_locked_until", 0)) - _now()) / 3600, 2)
+        return False, f"قفل ضرر روزانه فعال است؛ حدود {remaining} ساعت باقی مانده"
+    if float(state.get("initial_capital", 0)) <= 0:
+        return False, "سرمایه ترید تنظیم نشده است"
+    if float(state.get("position_size_usd", 0)) <= 0:
+        return False, "حجم هر پوزیشن تنظیم نشده است"
+    if float(state.get("leverage", 0)) <= 0:
+        return False, "لوریج تنظیم نشده است"
+    if int(state.get("max_positions", 0)) <= 0:
+        return False, "حداکثر پوزیشن تنظیم نشده است"
+    if len(state.get("open_positions", {})) >= int(state.get("max_positions", 0)):
+        return False, "ظرفیت پوزیشن‌ها پر است"
+
+    try:
+        bal_info = _extract_toobit_usdt_balance(toobit_client.get_account_balance())
+        if bal_info.get("ok"):
+            available = float(bal_info.get("available_balance") or 0)
+            needed = float(state.get("position_size_usd", 0) or 0)
+            if available < needed:
+                return False, f"بالانس قابل استفاده توبیت کافی نیست ({available}$ < {needed}$)"
+    except Exception:
+        pass
+
+    _maybe_apply_daily_lock(state)
+    if state.get("daily_loss_locked_until", 0) > _now():
+        save_real_trade_state(state)
+        return False, "قفل ضرر روزانه فعال شد"
+    return True, "آماده ترید واقعی"
+
+
+def open_real_position_from_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
+    ready, reason = is_real_trade_ready()
+    if not ready:
+        return {"ok": False, "blocked": True, "error": reason}
+
+    symbol = str(signal.get("symbol") or "").upper().strip()
+    direction = str(signal.get("direction") or "").upper().strip()
+    entry = float(signal.get("entry", 0) or signal.get("price", 0) or 0)
+    tp1 = signal.get("tp1")
+    sl = signal.get("sl") or signal.get("stop_loss")
+    signal_id = str(signal.get("signal_id") or signal.get("id") or f"{symbol}_{direction}_{_now()}")
+
+    if not symbol or direction not in {"LONG", "SHORT"} or entry <= 0:
+        return {"ok": False, "error": "اطلاعات سیگنال ناقص است"}
+
+    state = load_real_trade_state()
+    sync_result = sync_real_positions_with_toobit(state, save=True)
+    if sync_result.get("ok"):
+        state = sync_result.get("state") or state
+
+    if signal_id in state.get("open_positions", {}):
+        return {"ok": False, "blocked": True, "error": "این سیگنال قبلاً پوزیشن باز دارد"}
+    for pos in state.get("open_positions", {}).values():
+        if isinstance(pos, dict) and str(pos.get("symbol") or "").upper() == symbol and str(pos.get("direction") or "").upper() == direction:
+            return {"ok": False, "blocked": True, "error": f"برای {symbol} {direction} از قبل پوزیشن واقعی باز است"}
+
+    quantity = calculate_order_quantity(entry)
+    if quantity <= 0:
+        return {"ok": False, "error": "محاسبه حجم سفارش نامعتبر است"}
+
+    order_result = toobit_client.place_market_order(
+        symbol=symbol,
+        direction=direction,
+        quantity=quantity,
+        take_profit=tp1,
+        stop_loss=sl,
+    )
+
+    if not order_result.get("ok"):
+        err = str(order_result.get("error") or order_result.get("data") or "")
+        if "quantity too small" in err.lower() or "qty too small" in err.lower():
+            order_result["user_hint"] = "حجم سفارش برای این نماد کم است؛ حجم دلاری یا لوریج را بیشتر کن یا این نماد را از ترید واقعی حذف کن."
+        return order_result
+
+    confirmed_position, execution_info = _order_is_confirmed_position(order_result)
+    recovered_note = ""
+
+    if not confirmed_position:
+        waited = _wait_for_exchange_position(symbol, direction, quantity)
+        if waited.get("ok"):
+            confirmed_position = True
+            execution_info["status"] = execution_info.get("status") or "EXCHANGE_POSITION_FOUND_AFTER_PENDING"
+            execution_info["recovered_by_polling"] = True
+            recovered_note = "سفارش ابتدا Pending بود، سپس با چک پوزیشن توبیت تایید و وارد اسلات شد."
+        else:
+            # Final sync before declaring failure, in case polling response shape differed.
+            sync_after = sync_real_positions_with_toobit(load_real_trade_state(), save=True)
+            if sync_after.get("ok"):
+                for pos in (sync_after.get("state") or {}).get("open_positions", {}).values():
+                    if isinstance(pos, dict) and str(pos.get("symbol") or "").upper() == symbol and str(pos.get("direction") or "").upper() == direction:
+                        return {
+                            "ok": True,
+                            "signal_id": pos.get("signal_id"),
+                            "symbol": symbol,
+                            "direction": direction,
+                            "quantity": pos.get("quantity"),
+                            "order": order_result.get("data"),
+                            "execution_info": execution_info,
+                            "warning": "پوزیشن از طریق sync صرافی پیدا شد.",
+                        }
+            return {
+                "ok": False,
+                "blocked": True,
+                "error": (
+                    "سفارش توسط توبیت پذیرفته شد اما بعد از چند بار چک، پوزیشن واقعی دیده نشد؛ "
+                    "برای جلوگیری از اسلات اشتباه وارد لیست پوزیشن‌های باز نشد."
+                ),
+                "order_status": execution_info.get("status"),
+                "executed_qty": execution_info.get("executed_qty"),
+                "orig_qty": execution_info.get("orig_qty"),
+                "order_id": execution_info.get("order_id"),
+                "client_order_id": execution_info.get("client_order_id"),
+                "exchange_result": order_result.get("data"),
+            }
+
+    state = load_real_trade_state()
+    if signal_id in state.get("open_positions", {}):
+        return {"ok": False, "blocked": True, "error": "این سیگنال قبلاً پوزیشن باز دارد"}
+
+    pos = _register_real_open_position(state, signal, signal_id, quantity, order_result, execution_info, recovered_note)
+    return {
+        "ok": True,
+        "signal_id": signal_id,
+        "symbol": symbol,
+        "direction": direction,
+        "quantity": quantity,
+        "order": order_result.get("data"),
+        "execution_info": execution_info,
+        "position": pos,
+        "warning": recovered_note or order_result.get("warning"),
+    }
+
+
+def get_real_trade_status_text() -> str:
+    state = load_real_trade_state()
+    sync_result = sync_real_positions_with_toobit(state, save=True)
+    sync_line = ""
+    exchange_count = 0
+    if sync_result.get("ok"):
+        state = sync_result.get("state") or state
+        exchange_count = len(sync_result.get("exchange_positions") or [])
+        if sync_result.get("added") or sync_result.get("removed"):
+            sync_line = f"\nهمگام‌سازی صرافی: +{sync_result.get('added', 0)} / -{sync_result.get('removed', 0)}"
+    else:
+        sync_line = f"\n⚠️ همگام‌سازی پوزیشن‌های توبیت ناموفق: {str(sync_result.get('error'))[:120]}"
+
+    open_positions = state.get("open_positions", {}) if isinstance(state.get("open_positions"), dict) else {}
+    open_count = len(open_positions)
+    max_positions = int(float(state.get("max_positions", 0) or 0))
+    free_slots = max(max_positions - open_count, 0)
+
+    position_size = _round_usd(state.get("position_size_usd", 0))
+    leverage = _round_usd(state.get("leverage", 0))
+    approx_position = _round_usd(position_size * leverage, 4)
+    status = "✅ فعال" if state.get("enabled") else "⛔ غیرفعال"
+    emergency = "فعال" if state.get("emergency_stop") else "غیرفعال"
+
+    lock_line = "غیرفعال"
+    if int(state.get("daily_loss_locked_until", 0) or 0) > _now():
+        remaining = round((int(state.get("daily_loss_locked_until", 0)) - _now()) / 3600, 2)
+        lock_line = f"فعال، حدود {remaining} ساعت باقی مانده"
+
+    toobit_balance_line = "بالانس واقعی توبیت: نامشخص"
+    try:
+        toobit_balance_info = _extract_toobit_usdt_balance(toobit_client.get_account_balance())
+        if toobit_balance_info.get("ok"):
+            toobit_balance_line = (
+                f"بالانس واقعی توبیت: {toobit_balance_info.get('balance')}$\n"
+                f"بالانس قابل استفاده توبیت: {toobit_balance_info.get('available_balance')}$"
+            )
+        else:
+            toobit_balance_line = f"بالانس واقعی توبیت: خطا ({str(toobit_balance_info.get('error'))[:120]})"
+    except Exception as e:
+        toobit_balance_line = f"بالانس واقعی توبیت: خطا ({str(e)[:120]})"
+
+    ready, reason = is_real_trade_ready()
+    readiness = "آماده سفارش واقعی" if ready else reason
+
+    leverage_warn = ""
+    try:
+        actual_levs = sorted({float(p.get("leverage") or 0) for p in (sync_result.get("exchange_positions") or []) if float(p.get("leverage") or 0) > 0})
+        if actual_levs and leverage > 0 and any(abs(x - leverage) > 0.01 for x in actual_levs):
+            leverage_warn = f"\n⚠️ لوریج واقعی پوزیشن در توبیت با تنظیم ربات فرق دارد: {actual_levs}"
+    except Exception:
+        pass
+
+    return (
+        "🤖 وضعیت ترید واقعی توبیت\n"
+        f"وضعیت: {status}\n"
+        f"حالت: REAL\n"
+        f"صرافی: TOOBIT\n"
+        f"توقف اضطراری: {emergency}\n"
+        f"آمادگی: {readiness}\n"
+        f"پوزیشن واقعی در توبیت: {exchange_count}\n"
+        f"{sync_line}{leverage_warn}\n\n"
+        f"{toobit_balance_line}\n\n"
+        f"حجم هر پوزیشن: {position_size}$\n"
+        f"لوریج تنظیمی ربات: {leverage}x\n"
+        f"حجم تقریبی پوزیشن: {approx_position}$\n\n"
+        f"پوزیشن باز داخلی/اسلات: {open_count}/{max_positions}\n"
+        f"اسلات خالی: {free_slots}\n\n"
+        f"سود/ضرر امروز: {round(float(state.get('today_realized_pnl', 0)), 4)}$\n"
+        f"سود/ضرر کل: {round(float(state.get('total_realized_pnl', 0)), 4)}$\n"
+        f"حد ضرر روزانه: {state.get('daily_loss_limit_usd', 0)}$\n"
+        f"زمان قفل: {state.get('daily_lock_duration_hours', DEFAULT_REAL_LOCK_DURATION_HOURS)} ساعت\n"
+        f"قفل ضرر روزانه: {lock_line}"
+    )
