@@ -126,6 +126,8 @@ try:
         set_real_position_size,
         set_real_leverage,
         set_real_max_positions,
+        set_real_daily_loss_limit,
+        set_real_lock_duration_hours,
         enable_real_trading,
         disable_real_trading,
         activate_real_emergency_stop,
@@ -139,6 +141,8 @@ except Exception:
     set_real_position_size = None
     set_real_leverage = None
     set_real_max_positions = None
+    set_real_daily_loss_limit = None
+    set_real_lock_duration_hours = None
     enable_real_trading = None
     disable_real_trading = None
     activate_real_emergency_stop = None
@@ -682,6 +686,8 @@ def real_trade_module_available() -> bool:
         set_real_position_size,
         set_real_leverage,
         set_real_max_positions,
+        set_real_daily_loss_limit,
+        set_real_lock_duration_hours,
         enable_real_trading,
         disable_real_trading,
         activate_real_emergency_stop,
@@ -745,6 +751,37 @@ async def set_real_max_positions_command(update: Update, context: ContextTypes.D
         await update.message.reply_text("مثال درست: حداکثر پوزیشن واقعی 3")
         return
     await update.message.reply_text(set_real_max_positions(int(value)) + "\n\n" + get_real_trade_status_text())
+
+
+async def set_real_daily_loss_limit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not set_real_daily_loss_limit:
+        await update.message.reply_text("ماژول تنظیم حد ضرر روزانه واقعی فعال نیست. فایل real_trade_manager.py را به‌روزرسانی کن.")
+        return
+    value = extract_first_number(update.message.text)
+    if value is None or value <= 0:
+        await update.message.reply_text("مثال درست: حد ضرر روزانه واقعی 5")
+        return
+    try:
+        msg = set_real_daily_loss_limit(float(value))
+        await update.message.reply_text(msg + "\n\n" + get_real_trade_status_text())
+    except Exception as e:
+        await update.message.reply_text(f"❌ خطا در تنظیم حد ضرر روزانه واقعی:\n{str(e)[:250]}")
+
+
+async def set_real_lock_hours_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not set_real_lock_duration_hours:
+        await update.message.reply_text("ماژول تنظیم زمان قفل ضرر واقعی فعال نیست. فایل real_trade_manager.py را به‌روزرسانی کن.")
+        return
+    value = extract_first_number(update.message.text)
+    if value is None or value <= 0:
+        await update.message.reply_text("مثال درست: قفل ضرر واقعی 1 ساعت")
+        return
+    try:
+        hours = max(1, min(int(value), 168))
+        msg = set_real_lock_duration_hours(hours)
+        await update.message.reply_text(msg + "\n\n" + get_real_trade_status_text())
+    except Exception as e:
+        await update.message.reply_text(f"❌ خطا در تنظیم زمان قفل ضرر واقعی:\n{str(e)[:250]}")
 
 
 async def enable_real_trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -904,6 +941,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "ترید واقعی دلار 2\n"
         "لوریج واقعی 5\n"
         "حداکثر پوزیشن واقعی 3\n"
+        "حد ضرر روزانه واقعی 5\n"
+        "قفل ضرر واقعی 1 ساعت\n"
         "ترید واقعی فعال\n"
         "ترید واقعی خاموش\n"
         "توقف اضطراری واقعی\n"
@@ -1372,6 +1411,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if low.startswith("حداکثر پوزیشن واقعی") or low.startswith("حداکثر پوزیشن توبیت"):
         await set_real_max_positions_command(update, context)
+        return
+
+    if low.startswith("حد ضرر روزانه واقعی") or low.startswith("حدضرر روزانه واقعی") or low.startswith("حد ضرر توبیت"):
+        await set_real_daily_loss_limit_command(update, context)
+        return
+
+    if low.startswith("قفل ضرر واقعی") or low.startswith("قفل ضرر توبیت"):
+        await set_real_lock_hours_command(update, context)
         return
 
     if low in ["ترید واقعی فعال", "فعال ترید واقعی", "فعال سازی ترید واقعی", "فعال‌سازی ترید واقعی"]:
