@@ -83,9 +83,10 @@ except Exception:
     format_rotation_report = None
 
 try:
-    from ghost_signals import format_ghost_report
+    from ghost_signals import format_ghost_report, create_ghost_signal
 except Exception:
     format_ghost_report = None
+    create_ghost_signal = None
 
 try:
     from slot_manager import format_slot_report
@@ -107,6 +108,7 @@ try:
         activate_real_emergency_stop,
         reset_real_trade_state,
         open_real_position_from_signal,
+        is_real_trade_ready,
     )
 except Exception:
     get_real_trade_status_text = None
@@ -122,6 +124,7 @@ except Exception:
     activate_real_emergency_stop = None
     reset_real_trade_state = None
     open_real_position_from_signal = None
+    is_real_trade_ready = None
 
 
 # ============================================================
@@ -619,6 +622,8 @@ def real_trade_module_available() -> bool:
         disable_real_trading,
         activate_real_emergency_stop,
         reset_real_trade_state,
+        is_real_trade_ready,
+        open_real_position_from_signal,
     ])
 
 async def real_trade_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1121,6 +1126,39 @@ async def register_sent_signal(signal: Dict[str, Any], sent_message: Any, source
 
         meta = attach_signal_metadata(signal, message_id, chat_id, source)
 
+        # In REAL-only mode, an auto signal must not enter tracking/slots
+        # unless the real Toobit order is actually accepted first.
+        if source == "auto_signal":
+            if not open_real_position_from_signal:
+                logger.error("REAL order module unavailable; auto signal was not tracked.")
+                try:
+                    await sent_message.reply_text("❌ سفارش واقعی ثبت نشد: ماژول توبیت در دسترس نیست.")
+                except Exception:
+                    pass
+                return
+
+            try:
+                real_result = open_real_position_from_signal(meta)
+            except Exception as e:
+                logger.error(f"open_real_position_from_signal error: {e}")
+                try:
+                    await sent_message.reply_text(f"❌ سفارش واقعی ثبت نشد:\n{str(e)[:250]}")
+                except Exception:
+                    pass
+                return
+
+            if real_result.get("ok"):
+                logger.info(f"real Toobit position opened: {real_result}")
+                meta["real_order"] = real_result
+            else:
+                reason = real_result.get("error") or real_result.get("message") or real_result.get("data") or "نامشخص"
+                logger.warning(f"real Toobit position not opened; signal will not be tracked: {real_result}")
+                try:
+                    await sent_message.reply_text(f"❌ سفارش واقعی ثبت نشد؛ سیگنال وارد اسلات نشد.\nعلت: {str(reason)[:250]}")
+                except Exception:
+                    pass
+                return
+
         if add_signal_to_tracking:
             try:
                 add_signal_to_tracking(meta)
@@ -1137,16 +1175,6 @@ async def register_sent_signal(signal: Dict[str, Any], sent_message: Any, source
             except Exception as e:
                 logger.error(f"add_signal_to_tracking error: {e}")
 
-        if open_real_position_from_signal:
-            try:
-                real_result = open_real_position_from_signal(meta)
-                if real_result.get("ok"):
-                    logger.info(f"real Toobit position opened: {real_result}")
-                elif not real_result.get("blocked"):
-                    logger.error(f"real Toobit position error: {real_result}")
-            except Exception as e:
-                logger.error(f"open_real_position_from_signal error: {e}")
-
     except Exception as e:
         logger.error(f"register_sent_signal error: {e}")
 
@@ -1159,25 +1187,94 @@ def auto_signal_key(signal: Dict[str, Any]) -> str:
     return f"{signal.get('symbol')}_{signal.get('direction')}"
 
 
-def can_send_auto_signal(signal: Dict[str, Any]) -> bool:
+def auto_signal_gate(signal: Dict[str, Any]) -> tuple[bool, str, bool]:
+    """
+    Returns: (can_send_to_telegram, reason, save_as_ghost)
+
+    REAL-only safety rule:
+    Auto signals are sent only when REAL trading is fully ready.
+    If trading is off, emergency stop is active, daily lock is active,
+    Toobit usable balance is not enough, or slots are full, the signal
+    must stay silent and be stored as Ghost for learning.
+    """
     try:
         st = load_bot_settings()
+
         if not st.get("trading_enabled", True):
-            return False
+            return False, "BOT_TRADING_DISABLED", True
+
         if not st.get("auto_signal_enabled", bool(AUTO_SIGNAL_ENABLED)):
-            return False
+            return False, "AUTO_SIGNAL_DISABLED", False
+
         if signal.get("status") != "ACTIVE":
-            return False
+            return False, "SIGNAL_NOT_ACTIVE", True
+
         if not signal.get("entry_confirmed", False):
-            return False
+            return False, "ENTRY_NOT_CONFIRMED", True
+
         if int(signal.get("score", 0) or 0) < int(AUTO_DIRECT_SCORE_MIN):
-            return False
+            return False, "LOW_SCORE", True
+
         key = auto_signal_key(signal)
         now = int(time.time())
         last = int(LAST_AUTO_SIGNAL_TIME.get(key, 0))
-        return now - last >= AUTO_SIGNAL_COOLDOWN_SECONDS
-    except Exception:
-        return False
+        if now - last < AUTO_SIGNAL_COOLDOWN_SECONDS:
+            return False, "COOLDOWN", False
+
+        if not is_real_trade_ready:
+            return False, "REAL_TRADE_MODULE_UNAVAILABLE", True
+
+        ready, reason = is_real_trade_ready()
+        if not ready:
+            return False, f"REAL_NOT_READY: {reason}", True
+
+        return True, "OK", False
+
+    except Exception as e:
+        return False, f"GATE_ERROR: {str(e)[:120]}", True
+
+
+def can_send_auto_signal(signal: Dict[str, Any]) -> bool:
+    ok, _reason, _ghost = auto_signal_gate(signal)
+    return ok
+
+
+def save_auto_signal_as_ghost(signal: Dict[str, Any], reason: str) -> None:
+    if not create_ghost_signal:
+        return
+
+    try:
+        create_ghost_signal(
+            symbol=signal.get("symbol"),
+            direction=signal.get("direction"),
+            entry=signal.get("entry"),
+            stop_loss=signal.get("stop_loss") or signal.get("sl"),
+            tp1=signal.get("tp1"),
+            tp2=signal.get("tp2"),
+            score=signal.get("score"),
+            snapshot=signal.get("snapshot", {}),
+            source="auto_signal_gate",
+            reason=reason,
+        )
+        logger.info(f"auto signal saved as ghost: {signal.get('symbol')} {signal.get('direction')} | {reason}")
+    except TypeError:
+        try:
+            create_ghost_signal(
+                signal.get("symbol"),
+                signal.get("direction"),
+                signal.get("entry"),
+                signal.get("stop_loss") or signal.get("sl"),
+                signal.get("tp1"),
+                signal.get("tp2"),
+                signal.get("score"),
+                signal.get("snapshot", {}),
+                "auto_signal_gate",
+                reason,
+            )
+        except Exception as e:
+            logger.error(f"save_auto_signal_as_ghost fallback error: {e}")
+    except Exception as e:
+        logger.error(f"save_auto_signal_as_ghost error: {e}")
 
 
 def mark_auto_signal_sent(signal: Dict[str, Any]) -> None:
@@ -1197,7 +1294,10 @@ async def auto_signal_loop(app: Application) -> None:
             signals = result.get("signals", [])
 
             for signal in signals:
-                if not can_send_auto_signal(signal):
+                can_send, reason, should_ghost = auto_signal_gate(signal)
+                if not can_send:
+                    if should_ghost:
+                        save_auto_signal_as_ghost(signal, reason)
                     continue
 
                 sent = await app.bot.send_message(chat_id=OWNER_ID, text=format_signal_message(signal))
