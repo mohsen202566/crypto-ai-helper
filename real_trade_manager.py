@@ -137,6 +137,160 @@ def _extract_toobit_usdt_balance(balance_result: Dict[str, Any]) -> Dict[str, An
 
 
 
+
+def _flatten_dicts(value: Any) -> list:
+    """Best-effort flattening for nested Toobit response dict/list shapes."""
+    out = []
+    if isinstance(value, dict):
+        out.append(value)
+        for v in value.values():
+            if isinstance(v, (dict, list)):
+                out.extend(_flatten_dicts(v))
+    elif isinstance(value, list):
+        for item in value:
+            out.extend(_flatten_dicts(item))
+    return out
+
+
+def _safe_float_any(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or str(value).strip() == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _extract_order_execution_info(order_result: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Extract execution info from Toobit order response.
+
+    Critical safety rule:
+    - PENDING_NEW with executedQty=0 is NOT a real open position.
+    - Only executedQty>0 or avgPrice>0/position recovery should be treated as an open trade.
+    """
+    info = {
+        "status": "",
+        "executed_qty": 0.0,
+        "orig_qty": 0.0,
+        "avg_price": 0.0,
+        "order_id": "",
+        "client_order_id": "",
+        "raw_found": False,
+    }
+
+    if not isinstance(order_result, dict):
+        return info
+
+    for item in _flatten_dicts(order_result.get("data")):
+        if not isinstance(item, dict):
+            continue
+
+        # Prefer rows that look like an order response.
+        if not any(k in item for k in ("status", "executedQty", "origQty", "orderId", "clientOrderId", "avgPrice")):
+            continue
+
+        info["raw_found"] = True
+
+        status = item.get("status") or item.get("orderStatus") or item.get("state") or info["status"]
+        if status is not None:
+            info["status"] = str(status).upper()
+
+        info["executed_qty"] = max(
+            info["executed_qty"],
+            _safe_float_any(item.get("executedQty")),
+            _safe_float_any(item.get("cumQty")),
+            _safe_float_any(item.get("filledQty")),
+            _safe_float_any(item.get("dealQty")),
+        )
+        info["orig_qty"] = max(
+            info["orig_qty"],
+            _safe_float_any(item.get("origQty")),
+            _safe_float_any(item.get("quantity")),
+            _safe_float_any(item.get("qty")),
+        )
+        info["avg_price"] = max(
+            info["avg_price"],
+            _safe_float_any(item.get("avgPrice")),
+            _safe_float_any(item.get("priceAvg")),
+            _safe_float_any(item.get("filledAvgPrice")),
+        )
+
+        if item.get("orderId"):
+            info["order_id"] = str(item.get("orderId"))
+        if item.get("clientOrderId"):
+            info["client_order_id"] = str(item.get("clientOrderId"))
+
+    return info
+
+
+def _order_is_confirmed_position(order_result: Dict[str, Any]) -> tuple[bool, Dict[str, Any]]:
+    """
+    Returns True only when the exchange response/recovery confirms an actual position.
+
+    Some Toobit order responses are accepted but remain PENDING_NEW with executedQty=0.
+    Those must not consume internal slots or be tracked as open positions.
+    """
+    if not isinstance(order_result, dict) or not order_result.get("ok"):
+        return False, _extract_order_execution_info(order_result)
+
+    # tobit_client_position_recovery.py sets this when it verified a real open position after an API error.
+    if order_result.get("recovered_after_error"):
+        info = _extract_order_execution_info(order_result)
+        info["recovered_after_error"] = True
+        return True, info
+
+    info = _extract_order_execution_info(order_result)
+    status = str(info.get("status") or "").upper()
+    executed_qty = _safe_float_any(info.get("executed_qty"))
+    avg_price = _safe_float_any(info.get("avg_price"))
+
+    # Real fills.
+    if executed_qty > 0 or avg_price > 0:
+        return True, info
+
+    # Explicit pending/new/no-fill statuses are not positions.
+    if status in {"PENDING_NEW", "NEW", "PENDING", "CREATED", "ACCEPTED"}:
+        return False, info
+
+    # If Toobit changes shape and no clear execution fields exist, be conservative.
+    return False, info
+
+
+def _cleanup_unfilled_internal_positions(state: Dict[str, Any]) -> int:
+    """
+    Remove stale internal open_positions that are only unfilled Toobit orders.
+
+    This fixes cases where Toobit returned PENDING_NEW/executedQty=0 but the bot
+    incorrectly consumed a slot.
+    """
+    open_positions = state.get("open_positions", {})
+    if not isinstance(open_positions, dict) or not open_positions:
+        return 0
+
+    removed = 0
+    for sid, pos in list(open_positions.items()):
+        if not isinstance(pos, dict):
+            continue
+
+        exchange_order = pos.get("exchange_order")
+        fake_result = {"ok": True, "data": exchange_order}
+        confirmed, info = _order_is_confirmed_position(fake_result)
+
+        opened_at = int(pos.get("opened_at", 0) or 0)
+        age = _now() - opened_at if opened_at else 999999
+
+        # Remove only clearly unfilled/pending records. Keep unknown old data safer.
+        status = str(info.get("status") or "").upper()
+        executed_qty = _safe_float_any(info.get("executed_qty"))
+        if (not confirmed) and status in {"PENDING_NEW", "NEW", "PENDING", "CREATED", "ACCEPTED"} and executed_qty <= 0 and age >= 10:
+            open_positions.pop(sid, None)
+            removed += 1
+
+    return removed
+
+
+
 def _today_key(ts: Optional[int] = None) -> str:
     return time.strftime("%Y-%m-%d", time.localtime(ts or _now()))
 
@@ -185,6 +339,9 @@ def load_real_trade_state() -> Dict[str, Any]:
     state.setdefault("closed_positions", [])
     state.setdefault("daily_lock_reason", "")
     state.setdefault("daily_pnl_day", _today_key())
+
+    if _cleanup_unfilled_internal_positions(state) > 0:
+        changed = True
 
     before_day = state.get("daily_pnl_day")
     _new_day_if_needed(state)
@@ -616,6 +773,27 @@ def open_real_position_from_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
     if not order_result.get("ok"):
         return order_result
 
+    confirmed_position, execution_info = _order_is_confirmed_position(order_result)
+    if not confirmed_position:
+        return {
+            "ok": False,
+            "blocked": True,
+            "error": (
+                "سفارش توسط توبیت پذیرفته شد اما هنوز اجرا نشده است؛ "
+                "برای جلوگیری از اسلات اشتباه، وارد لیست پوزیشن‌های باز نشد."
+            ),
+            "order_status": execution_info.get("status"),
+            "executed_qty": execution_info.get("executed_qty"),
+            "orig_qty": execution_info.get("orig_qty"),
+            "order_id": execution_info.get("order_id"),
+            "client_order_id": execution_info.get("client_order_id"),
+            "exchange_result": order_result.get("data"),
+        }
+
+    state = load_real_trade_state()
+    if signal_id in state.get("open_positions", {}):
+        return {"ok": False, "blocked": True, "error": "این سیگنال قبلاً پوزیشن باز دارد"}
+
     state["open_positions"][signal_id] = {
         "signal_id": signal_id,
         "symbol": symbol,
@@ -629,6 +807,7 @@ def open_real_position_from_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
         "leverage": state.get("leverage", 0),
         "opened_at": _now(),
         "exchange_order": order_result.get("data"),
+        "execution_info": execution_info,
     }
 
     save_real_trade_state(state)
@@ -640,6 +819,7 @@ def open_real_position_from_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
         "direction": direction,
         "quantity": quantity,
         "order": order_result.get("data"),
+        "execution_info": execution_info,
     }
 
 
