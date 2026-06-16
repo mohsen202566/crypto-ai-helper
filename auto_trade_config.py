@@ -37,14 +37,14 @@ def get_env_bool(name, default=False):
     return value.lower() in ["1", "true", "yes", "on", "enable", "enabled"]
 
 
-AUTO_TRADE_STATE_FILE = get_env_str("AUTO_TRADE_STATE_FILE", "paper_trade_state.json")
+AUTO_TRADE_STATE_FILE = get_env_str("AUTO_TRADE_STATE_FILE", "real_trade_state.json")
 
 # Main trade state defaults
 # Keep trade disabled by default. Real trading must never start automatically.
 DEFAULT_TRADE_ENABLED = get_env_bool("DEFAULT_TRADE_ENABLED", False)
-DEFAULT_TRADE_MODE = get_env_str("DEFAULT_TRADE_MODE", "PAPER")
+DEFAULT_TRADE_MODE = "REAL"
 
-# Paper/default settings kept compatible with current bot behavior.
+# Legacy defaults kept for compatibility with older modules; Telegram trading controls use REAL/TOBIT only.
 DEFAULT_START_BALANCE_USDT = get_env_float("DEFAULT_START_BALANCE_USDT", 50.0)
 DEFAULT_TRADE_MARGIN_USDT = get_env_float("DEFAULT_TRADE_MARGIN_USDT", 5.0)
 DEFAULT_LEVERAGE = get_env_int("DEFAULT_LEVERAGE", 10)
@@ -69,10 +69,10 @@ MIN_TRADE_MARGIN_USDT = get_env_float("MIN_TRADE_MARGIN_USDT", 1.0)
 MAX_TRADE_MARGIN_USDT = get_env_float("MAX_TRADE_MARGIN_USDT", 1000000.0)
 
 MIN_LEVERAGE = get_env_int("MIN_LEVERAGE", 1)
-MAX_LEVERAGE = get_env_int("MAX_LEVERAGE", 100)
+MAX_LEVERAGE = get_env_int("MAX_LEVERAGE", 1000000)
 
 MIN_MAX_OPEN_POSITIONS = get_env_int("MIN_MAX_OPEN_POSITIONS", 1)
-MAX_MAX_OPEN_POSITIONS = get_env_int("MAX_MAX_OPEN_POSITIONS", 200)
+MAX_MAX_OPEN_POSITIONS = get_env_int("MAX_MAX_OPEN_POSITIONS", 100)
 
 MIN_DAILY_MAX_LOSS_USDT = get_env_float("MIN_DAILY_MAX_LOSS_USDT", 1.0)
 MAX_DAILY_MAX_LOSS_USDT = get_env_float("MAX_DAILY_MAX_LOSS_USDT", 1000000.0)
