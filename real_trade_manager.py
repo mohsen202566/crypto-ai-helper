@@ -66,6 +66,77 @@ def _round_usd(value: Any, digits: int = 6) -> float:
         return 0.0
 
 
+def _extract_toobit_usdt_balance(balance_result: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Extract USDT futures balance from Toobit balance response.
+    Returns numeric strings so display does not break if Toobit changes precision.
+    """
+    out = {
+        "ok": False,
+        "balance": "0",
+        "available_balance": "0",
+        "error": "",
+    }
+
+    try:
+        if not isinstance(balance_result, dict) or not balance_result.get("ok"):
+            out["error"] = str((balance_result or {}).get("error") or (balance_result or {}).get("data") or "unknown")
+            return out
+
+        data = balance_result.get("data")
+
+        # Common Toobit response from current bot:
+        # [{'balance': '...', 'availableBalance': '...', 'asset': 'USDT', ...}]
+        items = []
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            if isinstance(data.get("data"), list):
+                items = data.get("data")
+            elif isinstance(data.get("result"), list):
+                items = data.get("result")
+            else:
+                items = [data]
+
+        selected = None
+        for item in items:
+            if isinstance(item, dict) and str(item.get("asset") or item.get("coin") or "").upper() == "USDT":
+                selected = item
+                break
+        if selected is None and items and isinstance(items[0], dict):
+            selected = items[0]
+
+        if not isinstance(selected, dict):
+            out["error"] = "USDT balance item not found"
+            return out
+
+        balance = (
+            selected.get("balance")
+            or selected.get("walletBalance")
+            or selected.get("totalBalance")
+            or selected.get("equity")
+            or "0"
+        )
+        available = (
+            selected.get("availableBalance")
+            or selected.get("available")
+            or selected.get("free")
+            or balance
+            or "0"
+        )
+
+        out["ok"] = True
+        out["balance"] = str(balance)
+        out["available_balance"] = str(available)
+        return out
+
+    except Exception as e:
+        out["error"] = str(e)
+        return out
+
+
+
+
 def _today_key(ts: Optional[int] = None) -> str:
     return time.strftime("%Y-%m-%d", time.localtime(ts or _now()))
 
@@ -244,8 +315,8 @@ def set_real_position_size(amount: float) -> str:
     state = load_real_trade_state()
     amount = float(amount)
 
-    if amount <= 0:
-        return "❌ حجم پوزیشن باید بیشتر از صفر باشد."
+    if amount < 1 or amount > 1000000:
+        return "❌ حجم پوزیشن باید بین 1 تا 1000000 دلار باشد."
 
     state["position_size_usd"] = amount
     save_real_trade_state(state)
@@ -256,8 +327,8 @@ def set_real_leverage(leverage: float) -> str:
     state = load_real_trade_state()
     leverage = float(leverage)
 
-    if leverage < 1 or leverage > 50:
-        return "❌ لوریج باید بین 1 تا 50 باشد."
+    if leverage < 1 or leverage > 1000000:
+        return "❌ لوریج باید بین 1 تا 1000000 باشد."
 
     state["leverage"] = leverage
     save_real_trade_state(state)
@@ -268,8 +339,8 @@ def set_real_max_positions(count: int) -> str:
     state = load_real_trade_state()
     count = int(count)
 
-    if count < 1 or count > 20:
-        return "❌ حداکثر پوزیشن باید بین 1 تا 20 باشد."
+    if count < 1 or count > 100:
+        return "❌ حداکثر پوزیشن باید بین 1 تا 100 باشد."
 
     state["max_positions"] = count
     save_real_trade_state(state)
@@ -418,6 +489,19 @@ def get_real_trade_status_text() -> str:
         remaining = round((int(state.get("daily_loss_locked_until", 0)) - _now()) / 3600, 2)
         lock_line = f"فعال، حدود {remaining} ساعت باقی مانده"
 
+    toobit_balance_line = "بالانس واقعی توبیت: نامشخص"
+    try:
+        toobit_balance_info = _extract_toobit_usdt_balance(toobit_client.get_account_balance())
+        if toobit_balance_info.get("ok"):
+            toobit_balance_line = (
+                f"بالانس واقعی توبیت: {toobit_balance_info.get('balance')}$\n"
+                f"بالانس قابل استفاده توبیت: {toobit_balance_info.get('available_balance')}$"
+            )
+        else:
+            toobit_balance_line = f"بالانس واقعی توبیت: خطا ({str(toobit_balance_info.get('error'))[:120]})"
+    except Exception as e:
+        toobit_balance_line = f"بالانس واقعی توبیت: خطا ({str(e)[:120]})"
+
     return (
         "🤖 وضعیت ترید واقعی توبیت\n"
         f"وضعیت: {status}\n"
@@ -425,7 +509,8 @@ def get_real_trade_status_text() -> str:
         f"صرافی: TOOBIT\n"
         f"توقف اضطراری: {emergency}\n\n"
         f"سرمایه اولیه: {state.get('initial_capital', 0)}$\n"
-        f"بالانس داخلی واقعی: {round(float(state.get('balance', 0)), 4)}$\n"
+        f"{toobit_balance_line}\n"
+        f"بالانس حسابداری داخلی: {round(float(state.get('balance', 0)), 4)}$\n"
         f"سرمایه محافظت‌شده: {round(float(state.get('protected_balance', 0)), 4)}$\n"
         f"سود ذخیره زیر 1 دلار: {round(float(state.get('profit_carry_remainder', 0)), 4)}$\n\n"
         f"حجم هر پوزیشن: {state.get('position_size_usd', 0)}$\n"
@@ -447,6 +532,14 @@ def get_toobit_balance_text() -> str:
 
     if not result.get("ok"):
         return f"❌ دریافت بالانس توبیت ناموفق بود:\n{result.get('error') or result.get('data')}"
+
+    info = _extract_toobit_usdt_balance(result)
+    if info.get("ok"):
+        return (
+            "✅ بالانس توبیت\n"
+            f"بالانس کل USDT: {info.get('balance')}$\n"
+            f"بالانس قابل استفاده USDT: {info.get('available_balance')}$"
+        )
 
     return f"✅ پاسخ بالانس توبیت:\n{result.get('data')}"
 
