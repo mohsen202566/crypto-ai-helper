@@ -222,9 +222,9 @@ def simple_classic_score(symbol, df_4h, df_1h, df_30m, df_15m, df_5m, market_con
 
     # Soft direction rescue: do not kill a very strong signal only because one timeframe gate is mixed.
     # Still requires strong score, trend strength, momentum, RSI side, and power/volume pressure.
-    if (not long_direction_ok) and long_score>=92 and adx>=25 and long_macd_ok and safe_float(l15['rsi'])>=48 and (buy3>=52 or buy20>=55) and (trends['5M']=='bullish' or trends['4H']=='bullish' or l15['close']>l15['vwap']):
+    if (not long_direction_ok) and long_score>=95 and adx>=28 and long_macd_ok and safe_float(l15['rsi'])>=50 and (buy3>=58 or buy20>=60) and (trends['5M']=='bullish' or trends['4H']=='bullish') and l15['close']>=l15['vwap']:
         long_direction_ok=True
-    if (not short_direction_ok) and short_score>=92 and adx>=25 and short_macd_ok and safe_float(l15['rsi'])<=52 and (sell3>=52 or sell20>=55) and (trends['5M']=='bearish' or trends['4H']=='bearish' or l15['close']<l15['vwap']):
+    if (not short_direction_ok) and short_score>=95 and adx>=28 and short_macd_ok and safe_float(l15['rsi'])<=50 and (sell3>=58 or sell20>=60) and (trends['5M']=='bearish' or trends['4H']=='bearish') and l15['close']<=l15['vwap']:
         short_direction_ok=True
 
     long_1h_ok=(trends['1H']=='bullish' and l1['close']>l1['ema20'] and l1['macd']>=l1['macd_signal']) if LONG_MIN_1H_STRICT else True
@@ -357,7 +357,10 @@ def analyze_symbol(symbol: str) -> Dict:
         else: direction='SHORT'; final_score=short_score; confirmations=int(sp['confirmations_short']); reasons=list(sp['short_reasons']); valid=bool(sp['short_valid'])
         snapshot=build_local_snapshot(symbol,direction,df_4h,df_1h,df_30m,df_15m,df_5m,sp,market_context)
         risk_state=get_coin_risk(symbol,direction); strict=int(risk_state.get('strictness_level',0) or 0)
-        if strict: final_score-=strict; reasons.append(f'AI Risk: سختگیری سطح {strict}')
+        if strict:
+            risk_penalty = min(12, max(3, strict * 3))
+            final_score -= risk_penalty
+            reasons.append(f'AI Risk: سختگیری سطح {strict} (-{risk_penalty})')
         rotation=get_rotation_context(symbol); rs=safe_float(rotation.get('rotation_score',50),50)
         if rs>=75: final_score+=2
         elif rs<=25: final_score-=2
@@ -365,7 +368,7 @@ def analyze_symbol(symbol: str) -> Dict:
         if extra.get('required'): reasons.append(extra.get('reason') or 'AI تایید بیشتر می‌خواهد')
         level_pack=get_strong_levels(df_5m,df_15m,df_30m,price,atr); support=level_pack.get('nearest_support'); resistance=level_pack.get('nearest_resistance')
         # If score is strong, allow one fewer confirmation so the bot does not miss early moves.
-        effective_req_conf = max(2, req_conf - 1) if final_score >= 88 else req_conf
+        effective_req_conf = max(2, req_conf - 1) if final_score >= 92 else req_conf
         entry_confirmed=valid and final_score>=min_score and confirmations>=effective_req_conf
         common={'symbol':symbol,'score':cap_score(final_score),'long_score':long_score,'short_score':short_score,'price':safe_round(price),'atr':safe_round(atr),'market_regime':market_context.get('market_regime','neutral'),'btc_bias':market_context.get('btc_bias','neutral'),'confirmations':confirmations,'required_confirmations':effective_req_conf,'rsi':safe_round(df_15m.iloc[-1]['rsi'],2),'macd':safe_round(df_15m.iloc[-1]['macd'],6),'macd_signal':safe_round(df_15m.iloc[-1]['macd_signal'],6),'macd_hist':safe_round(df_15m.iloc[-1]['macd_hist'],6),'adx':safe_round(df_15m.iloc[-1]['adx'],2),'vwap_status':vwap_status(df_15m),'support':safe_round(support),'resistance':safe_round(resistance),'trends':sp.get('trends',{}),'distance_ema20_atr':sp.get('distance_ema20_atr'),'volume_status':sp.get('volume_status'),'volume_ratio':sp.get('volume_ratio'),'buy_power':sp.get('buy_power'),'sell_power':sp.get('sell_power'),'power2_buy':sp.get('power2_buy'),'power2_sell':sp.get('power2_sell'),'power3_buy':sp.get('power3_buy'),'power3_sell':sp.get('power3_sell'),'snapshot':snapshot,'coin_risk':risk_state,'rotation':rotation,'reasons':reasons[:20],'signal_timeframe':'AI Classic Direct'}
         if not entry_confirmed:
