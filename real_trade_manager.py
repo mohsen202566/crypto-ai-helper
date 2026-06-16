@@ -281,6 +281,17 @@ def is_real_trade_ready() -> tuple[bool, str]:
     if len(state.get("open_positions", {})) >= int(state.get("max_positions", 0)):
         return False, "ظرفیت پوزیشن‌ها پر است"
 
+    try:
+        bal_info = _extract_toobit_usdt_balance(toobit_client.get_account_balance())
+        if bal_info.get("ok"):
+            available = float(bal_info.get("available_balance") or 0)
+            needed = float(state.get("position_size_usd", 0) or 0)
+            if available < needed:
+                return False, f"بالانس قابل استفاده توبیت کافی نیست ({available}$ < {needed}$)"
+    except Exception:
+        # Do not crash status/commands if Toobit balance check temporarily fails.
+        pass
+
     _maybe_apply_daily_lock(state)
     if state.get("daily_loss_locked_until", 0) > _now():
         save_real_trade_state(state)
@@ -475,11 +486,25 @@ def record_realized_pnl(
 
 def get_real_trade_status_text() -> str:
     state = load_real_trade_state()
-    open_count = len(state.get("open_positions", {}))
-    max_positions = int(state.get("max_positions", 0))
+    open_positions = state.get("open_positions", {})
+    if not isinstance(open_positions, dict):
+        open_positions = {}
+
+    try:
+        open_count = len(open_positions)
+    except Exception:
+        open_count = 0
+
+    try:
+        max_positions = int(float(state.get("max_positions", 0) or 0))
+    except Exception:
+        max_positions = 0
+
     free_slots = max(max_positions - open_count, 0)
 
-    approx_position = float(state.get("position_size_usd", 0)) * float(state.get("leverage", 0))
+    position_size = _round_usd(state.get("position_size_usd", 0))
+    leverage = _round_usd(state.get("leverage", 0))
+    approx_position = _round_usd(position_size * leverage, 4)
 
     status = "✅ فعال" if state.get("enabled") else "⛔ غیرفعال"
     emergency = "فعال" if state.get("emergency_stop") else "غیرفعال"
@@ -502,25 +527,24 @@ def get_real_trade_status_text() -> str:
     except Exception as e:
         toobit_balance_line = f"بالانس واقعی توبیت: خطا ({str(e)[:120]})"
 
+    ready, reason = is_real_trade_ready()
+    readiness = "آماده سفارش واقعی" if ready else reason
+
     return (
         "🤖 وضعیت ترید واقعی توبیت\n"
         f"وضعیت: {status}\n"
         f"حالت: REAL\n"
         f"صرافی: TOOBIT\n"
-        f"توقف اضطراری: {emergency}\n\n"
-        f"سرمایه اولیه: {state.get('initial_capital', 0)}$\n"
-        f"{toobit_balance_line}\n"
-        f"بالانس حسابداری داخلی: {round(float(state.get('balance', 0)), 4)}$\n"
-        f"سرمایه محافظت‌شده: {round(float(state.get('protected_balance', 0)), 4)}$\n"
-        f"سود ذخیره زیر 1 دلار: {round(float(state.get('profit_carry_remainder', 0)), 4)}$\n\n"
-        f"حجم هر پوزیشن: {state.get('position_size_usd', 0)}$\n"
-        f"لوریج: {state.get('leverage', 0)}x\n"
-        f"حجم تقریبی پوزیشن: {round(approx_position, 4)}$\n\n"
+        f"توقف اضطراری: {emergency}\n"
+        f"آمادگی: {readiness}\n\n"
+        f"{toobit_balance_line}\n\n"
+        f"حجم هر پوزیشن: {position_size}$\n"
+        f"لوریج: {leverage}x\n"
+        f"حجم تقریبی پوزیشن: {approx_position}$\n\n"
         f"پوزیشن باز: {open_count}/{max_positions}\n"
         f"اسلات خالی: {free_slots}\n\n"
         f"سود/ضرر امروز: {round(float(state.get('today_realized_pnl', 0)), 4)}$\n"
         f"سود/ضرر کل: {round(float(state.get('total_realized_pnl', 0)), 4)}$\n"
-        f"افت از سرمایه محافظت‌شده: {get_real_loss_from_protected(state)}$\n"
         f"حد ضرر روزانه: {state.get('daily_loss_limit_usd', 0)}$\n"
         f"زمان قفل: {state.get('daily_lock_duration_hours', DEFAULT_REAL_LOCK_DURATION_HOURS)} ساعت\n"
         f"قفل ضرر روزانه: {lock_line}"
