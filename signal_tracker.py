@@ -2,7 +2,7 @@
 """Signal tracker for AI Classic Direct bot.
 
 Tracks ACTIVE signals until TP1 or SL, records stats, updates AI learning/risk,
-closes slot and paper position, and returns Telegram reply events.
+closes slot and returns Telegram reply events.
 """
 
 import json
@@ -13,12 +13,6 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import ccxt
-
-try:
-    from paper_trader import close_paper_position, close_paper_position_by_signal_id
-except Exception:
-    close_paper_position = None
-    close_paper_position_by_signal_id = None
 
 try:
     from coin_learning import record_signal, update_signal_result
@@ -220,40 +214,6 @@ def ai_close_slot(signal: Dict[str, Any]) -> None:
         pass
 
 
-def try_close_paper_trade(signal: Dict[str, Any], result_type: str, exit_price: float) -> Optional[str]:
-    try:
-        closed = None
-        if close_paper_position_by_signal_id and (signal.get("signal_id") or signal.get("id")):
-            closed = close_paper_position_by_signal_id(signal.get("signal_id") or signal.get("id"), exit_price, result_type)
-
-        if not closed and close_paper_position:
-            closed = close_paper_position(
-                signal.get("symbol"),
-                signal.get("direction"),
-                exit_price,
-                result_type,
-                signal_id=signal.get("signal_id") or signal.get("id"),
-            )
-
-        if closed:
-            pnl_pct = closed.get("pnl_percent", 0)
-            pnl_usdt = closed.get("pnl_usdt", 0)
-            balance = None
-            try:
-                from paper_trader import get_paper_stats
-                balance = get_paper_stats().get("balance")
-            except Exception:
-                pass
-
-            sign = "+" if float(pnl_usdt or 0) > 0 else ""
-            msg = f"Paper Trade بسته شد | PnL: {pnl_pct}٪ | {sign}{round(float(pnl_usdt or 0), 4)}$"
-            if balance is not None:
-                msg += f" | بالانس: {balance}$"
-            return msg
-    except Exception as e:
-        return f"⚠️ خطا در بستن Paper Trade: {str(e)[:180]}"
-    return None
-
 def _extract_args_for_tracking(*args, **kwargs) -> Tuple[int, int, int, Dict[str, Any]]:
     """Supports both old and new call styles."""
     if args and isinstance(args[0], dict):
@@ -427,8 +387,6 @@ def check_active_signals() -> List[Dict[str, Any]]:
                 record_stat_event(signal, hit_type, exit_price, pct)
                 ai_record_result(signal, hit_type, exit_price, pct)
                 ai_close_slot(signal)
-                paper_msg = try_close_paper_trade(signal, hit_type, exit_price)
-
                 icon = "✅" if hit_type == "TP1" else "❌"
                 result_fa = "حد سود 1" if hit_type == "TP1" else "حد ضرر"
                 text = (
@@ -439,8 +397,6 @@ def check_active_signals() -> List[Dict[str, Any]]:
                     f"نتیجه: {result_fa}\n"
                     f"درصد حرکت: {pct}٪"
                 )
-                if paper_msg:
-                    text += "\n\n" + paper_msg
                 messages.append({
                     "chat_id": signal.get("chat_id"),
                     "message": text,
