@@ -247,6 +247,57 @@ class ToobitClient:
     def get_positions(self, symbol: str | None = None, category: str | None = None):
         return self.get_position(symbol=symbol, category=category)
 
+    def _flatten_position_items(self, result):
+        """Return a flat list of position dicts from Toobit response shapes."""
+        data = (result or {}).get("data")
+        if isinstance(data, list):
+            return [x for x in data if isinstance(x, dict)]
+        if isinstance(data, dict):
+            for key in ("data", "result", "list", "positions"):
+                v = data.get(key)
+                if isinstance(v, list):
+                    return [x for x in v if isinstance(x, dict)]
+            return [data]
+        return []
+
+    def _position_qty(self, item: dict) -> float:
+        """Best-effort quantity extractor for Toobit futures position rows."""
+        for key in ("positionAmt", "positionSize", "size", "qty", "quantity", "positionQuantity", "availablePosition"):
+            try:
+                v = item.get(key)
+                if v is not None and str(v).strip() != "":
+                    return abs(float(v))
+            except Exception:
+                pass
+        return 0.0
+
+    def _position_side_matches(self, item: dict, direction: str) -> bool:
+        """Best-effort side matcher; if side is absent but qty > 0, accept it."""
+        direction = str(direction or "").upper().strip()
+        raw = " ".join(str(item.get(k, "")) for k in ("side", "positionSide", "direction", "positionType")).upper()
+        if direction == "LONG":
+            return ("LONG" in raw) or ("BUY" in raw) or (raw.strip() == "" and self._position_qty(item) > 0)
+        if direction == "SHORT":
+            return ("SHORT" in raw) or ("SELL" in raw) or (raw.strip() == "" and self._position_qty(item) > 0)
+        return False
+
+    def _has_open_position(self, symbol: str, direction: str, min_qty: float = 0.0):
+        """
+        Verify if an exchange position is actually open.
+        Used as a safety recovery when Toobit returns an error after creating a position.
+        """
+        result = self.get_position(symbol=symbol)
+        if not result.get("ok"):
+            return False, result
+
+        items = self._flatten_position_items(result)
+        for item in items:
+            qty = self._position_qty(item)
+            if qty > max(float(min_qty or 0.0) * 0.25, 0.0) and self._position_side_matches(item, direction):
+                return True, {"ok": True, "position": item, "raw": result}
+
+        return False, result
+
     # ---------- Orders ----------
     def place_market_order(
         self,
@@ -294,7 +345,35 @@ class ToobitClient:
             params["stopLoss"] = str(stop_loss)
             params["slOrderType"] = "MARKET"
 
-        return self._signed_request("POST", "/api/v1/futures/order", params)
+        order_result = self._signed_request("POST", "/api/v1/futures/order", params)
+
+        if order_result.get("ok"):
+            return order_result
+
+        # Critical real-trading safety:
+        # Some Toobit responses may report an error even though the futures
+        # position was opened. Before telling the bot that the order failed,
+        # verify the exchange position so the signal can still enter tracking/slots
+        # and duplicate entries are avoided.
+        try:
+            time.sleep(1.2)
+            opened, position_result = self._has_open_position(symbol, direction, quantity)
+            if opened:
+                return {
+                    "ok": True,
+                    "recovered_after_error": True,
+                    "warning": order_result.get("error"),
+                    "data": {
+                        "order_response": order_result.get("data"),
+                        "position_check": position_result,
+                        "requested_params": params,
+                    },
+                    "path": "/api/v1/futures/order",
+                }
+        except Exception as e:
+            order_result["position_check_error"] = str(e)[:300]
+
+        return order_result
 
     def close_market_position(self, symbol: str, direction: str, quantity: float):
         if not REAL_TRADING_ENABLED:
