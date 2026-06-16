@@ -138,17 +138,6 @@ class ToobitClient:
                 return {"ok": False, "error": f"Unsupported method: {method}"}
 
             raw_text = response.text
-            
-            print("\n" + "=" * 80)
-print("TOOBIT DEBUG")
-print("URL:", url)
-print("METHOD:", method)
-print("PATH:", path)
-print("STATUS:", response.status_code)
-print("SIGNED PARAMS:", signed_params)
-print("HEADERS:", self._headers(json_body))
-print("RAW RESPONSE:", raw_text)
-print("=" * 80 + "\n")
             try:
                 data = response.json()
             except Exception:
@@ -204,6 +193,16 @@ print("=" * 80 + "\n")
             "recv_window": RECV_WINDOW,
             "real_trading_enabled": REAL_TRADING_ENABLED,
         }
+
+
+    def debug_balance(self):
+        result = self.get_balance()
+        print("\n" + "=" * 80)
+        print("TOOBIT BALANCE DEBUG")
+        print("ENV:", self.debug_env_masked())
+        print("RESULT:", result)
+        print("=" * 80 + "\n")
+        return result
 
     def normalize_futures_symbol(self, symbol: str) -> str:
         raw = str(symbol or "").upper().strip()
@@ -333,7 +332,6 @@ print("=" * 80 + "\n")
 # Backward compatibility: both spellings work.
 ToBitClient = ToobitClient
 
-# Shared singleton used by real_trade_manager.py
 def debug_toobit():
     client = ToobitClient()
 
@@ -342,4 +340,6 @@ def debug_toobit():
 
     print("\n===== TOOBIT BALANCE TEST =====")
     print(client.debug_balance())
+
+# Shared singleton used by real_trade_manager.py
 toobit_client = ToobitClient()
