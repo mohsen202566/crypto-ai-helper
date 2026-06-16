@@ -109,6 +109,9 @@ try:
         reset_real_trade_state,
         open_real_position_from_signal,
         is_real_trade_ready,
+        close_real_position_by_symbol,
+        close_all_real_positions,
+        sync_real_positions_text,
     )
 except Exception:
     get_real_trade_status_text = None
@@ -125,6 +128,9 @@ except Exception:
     reset_real_trade_state = None
     open_real_position_from_signal = None
     is_real_trade_ready = None
+    close_real_position_by_symbol = None
+    close_all_real_positions = None
+    sync_real_positions_text = None
 
 
 # ============================================================
@@ -533,7 +539,7 @@ async def set_leverage_command(update: Update, context: ContextTypes.DEFAULT_TYP
     if not set_real_leverage:
         await update.message.reply_text("ماژول ترید واقعی فعال نیست.")
         return
-    value = max(1.0, min(float(value), 1_000_000.0))
+    value = max(1.0, min(float(value), 100.0))
     await update.message.reply_text(set_real_leverage(value) + "\n\n" + format_trade_status())
 
 
@@ -670,7 +676,8 @@ async def set_real_leverage_command(update: Update, context: ContextTypes.DEFAUL
     if value is None or value <= 0:
         await update.message.reply_text("مثال درست: لوریج واقعی 5")
         return
-    await update.message.reply_text(set_real_leverage(float(value)) + "\n\n" + get_real_trade_status_text())
+    value = max(1.0, min(float(value), 100.0))
+    await update.message.reply_text(set_real_leverage(value) + "\n\n" + get_real_trade_status_text())
 
 
 async def set_real_max_positions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -744,6 +751,62 @@ async def reset_real_trade_command(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_text("ماژول ترید واقعی فعال نیست.")
         return
     await update.message.reply_text(reset_real_trade_state() + "\n\n" + get_real_trade_status_text())
+
+
+async def sync_real_positions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        await reject_unauthorized(update)
+        return
+    if not sync_real_positions_text:
+        await update.message.reply_text("ماژول همگام‌سازی توبیت فعال نیست.")
+        return
+    try:
+        await send_long_text(update, sync_real_positions_text())
+    except Exception as e:
+        await update.message.reply_text(f"❌ خطا در همگام‌سازی:\n{str(e)[:250]}")
+
+
+async def close_all_positions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if get_user_id(update) != OWNER_ID:
+        await reject_unauthorized(update)
+        return
+    if not close_all_real_positions:
+        await update.message.reply_text("ماژول بستن پوزیشن‌های واقعی فعال نیست.")
+        return
+    try:
+        res = close_all_real_positions()
+        lines = [f"✅ درخواست بستن همه پوزیشن‌ها ارسال شد. بسته‌شده: {res.get('closed_count', 0)}"]
+        for item in (res.get("results") or [])[:10]:
+            r = item.get("result") or {}
+            ok = "✅" if isinstance(r, dict) and r.get("ok") else "❌"
+            lines.append(f"{ok} {item.get('symbol')} {item.get('direction', '')}: {str(r.get('error') or r.get('message') or 'OK')[:120]}")
+        lines.append("\n" + format_trade_status())
+        await send_long_text(update, "\n".join(lines))
+    except Exception as e:
+        await update.message.reply_text(f"❌ خطا در بستن همه پوزیشن‌ها:\n{str(e)[:250]}")
+
+
+async def close_symbol_position_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if get_user_id(update) != OWNER_ID:
+        await reject_unauthorized(update)
+        return
+    if not close_real_position_by_symbol:
+        await update.message.reply_text("ماژول بستن پوزیشن واقعی فعال نیست.")
+        return
+
+    text = update.message.text or ""
+    symbol = normalize_symbol_text(text.replace("بستن", "").replace("پوزیشن", ""))
+    if not symbol:
+        await update.message.reply_text("مثال درست: بستن OPUSDT")
+        return
+    try:
+        res = close_real_position_by_symbol(symbol)
+        if res.get("ok"):
+            await update.message.reply_text(f"✅ درخواست بستن {symbol} ارسال شد.\n\n" + format_trade_status())
+        else:
+            await update.message.reply_text(f"❌ بسته نشد: {res.get('error') or res.get('data')}\n\n" + format_trade_status())
+    except Exception as e:
+        await update.message.reply_text(f"❌ خطا در بستن {symbol}:\n{str(e)[:250]}")
 
 
 # ============================================================
@@ -870,6 +933,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "ترید فعال\n"
         "ترید خاموش\n"
         "توقف اضطراری\n"
+        "همگام سازی پوزیشن ها\n"
+        "بستن OPUSDT\n"
+        "بستن همه پوزیشن ها\n"
         "ریست ترید\n\n"
         "AI و مدیریت:\n"
         "هوش مصنوعی\n"
@@ -988,15 +1054,15 @@ async def positions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await reject_unauthorized(update)
         return
 
-    if get_toobit_balance_text:
+    if get_real_trade_status_text:
         try:
-            await send_long_text(update, get_toobit_balance_text())
+            await send_long_text(update, get_real_trade_status_text())
             return
         except Exception as e:
-            await update.message.reply_text(f"❌ خطا در دریافت اطلاعات توبیت:\n{str(e)[:250]}")
+            await update.message.reply_text(f"❌ خطا در دریافت پوزیشن‌های توبیت:\n{str(e)[:250]}")
             return
 
-    await update.message.reply_text("ماژول اتصال توبیت فعال نیست.")
+    await update.message.reply_text("ماژول ترید واقعی توبیت فعال نیست.")
 
 
 async def active_signals_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1449,6 +1515,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if low in ["توقف اضطراری", "استاپ اضطراری", "خاموش اضطراری"]:
         await real_emergency_stop_command(update, context)
+        return
+
+    if low in ["همگام سازی", "همگام‌سازی", "همگام سازی پوزیشن ها", "همگام‌سازی پوزیشن‌ها", "sync", "sync positions"]:
+        await sync_real_positions_command(update, context)
+        return
+
+    if low in ["بستن همه", "بستن همه پوزیشن ها", "بستن همه پوزیشن‌ها", "close all", "close all positions"]:
+        await close_all_positions_command(update, context)
+        return
+
+    if low.startswith("بستن ") or low.startswith("close "):
+        await close_symbol_position_command(update, context)
         return
 
     if low in ["آمار ترید", "امار ترید"]:
