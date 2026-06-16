@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Crypto AI Telegram Bot - Full Command Version
+Crypto AI Telegram Bot - Real Trade Command Version
 
 این نسخه برای معماری فعلی ربات نوشته شده:
 - سیگنال‌ها خودکار Track می‌شوند؛ دستور دستی «زیر نظر» حذف شده.
-- دستورهای ترید/سرمایه/لوریج/حجم پوزیشن اضافه شده.
+- دستورهای ترید واقعی/سرمایه/لوریج/حجم پوزیشن اضافه شده.
 - آمار، حذف آمار، بررسی بازار، بهترین سیگنال، وضعیت AI، Ghost/Slot/Coin reports حفظ شده.
 """
 
@@ -59,32 +59,6 @@ except Exception:
         return 7
 
     get_symbol_stats_report = None
-
-
-try:
-    from paper_trader import (
-        open_paper_position,
-        format_paper_stats,
-        format_open_positions,
-        reset_paper_trades,
-        format_paper_trade_status,
-        configure_paper_account,
-        configure_daily_loss_limit,
-        configure_daily_lock_hours,
-        can_open_paper_position,
-        is_daily_locked,
-    )
-except Exception:
-    open_paper_position = None
-    format_paper_stats = None
-    format_open_positions = None
-    reset_paper_trades = None
-    format_paper_trade_status = None
-    configure_paper_account = None
-    configure_daily_loss_limit = None
-    configure_daily_lock_hours = None
-    can_open_paper_position = None
-    is_daily_locked = None
 
 
 try:
@@ -504,53 +478,22 @@ def calc_position_size(settings: Dict[str, Any]) -> float:
     return round(margin * leverage, 4)
 
 
-def format_trade_status() -> str:
-    # Prefer the real Paper Trade status when the module is available.
-    if format_paper_trade_status:
+def _real_status_or_unavailable() -> str:
+    if get_real_trade_status_text:
         try:
-            paper_text = format_paper_trade_status()
-            return (
-                paper_text
-                + "\n\nدستورها:\n"
-                "سرمایه ترید 1000\n"
-                "ترید دلار / ترید دلار 20\n"
-                "ترید لوریج / ترید لوریج 5\n"
-                "حداکثر پوزیشن / حداکثر پوزیشن 10\n"
-                "حجم پوزیشن\n"
-                "آمار ترید\n"
-                "ریست ترید"
-            )
-        except Exception:
-            pass
+            return get_real_trade_status_text()
+        except Exception as e:
+            return f"❌ خطا در دریافت وضعیت ترید واقعی:\n{str(e)[:250]}"
+    return "ماژول ترید واقعی توبیت فعال نیست یا فایل real_trade_manager.py پیدا نشد."
 
-    s = load_trade_settings()
-    position_size = calc_position_size(s)
-    capital = safe_num(s.get("capital_usd"), 0.0)
-    margin = safe_num(s.get("trade_margin_usd"), 0.0)
-    leverage = safe_num(s.get("leverage"), 1.0)
-    max_positions = int(s.get("max_positions", 5) or 5)
-    risk_pct = round((margin / capital) * 100, 2) if capital > 0 else 0
 
-    return (
-        "💰 وضعیت ترید\n\n"
-        f"سرمایه ترید: {capital}$\n"
-        f"مبلغ هر ترید: {margin}$\n"
-        f"لوریج: {leverage}x\n"
-        f"حجم پوزیشن تقریبی: {position_size}$\n"
-        f"ریسک هر ترید نسبت به سرمایه: {risk_pct}٪\n"
-        f"حداکثر پوزیشن همزمان: {max_positions}\n\n"
-        "دستورها:\n"
-        "سرمایه ترید 1000\n"
-        "ترید دلار / ترید دلار 20\n"
-        "ترید لوریج / ترید لوریج 5\n"
-        "حداکثر پوزیشن / حداکثر پوزیشن 10\n"
-        "حجم پوزیشن\n"
-        "آمار ترید\n"
-        "ریست ترید"
-    )
+def format_trade_status() -> str:
+    # Generic trade commands now control REAL / TOBIT trading only.
+    return _real_status_or_unavailable()
 
 async def trade_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(format_trade_status())
+
 
 
 async def set_capital_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -558,15 +501,12 @@ async def set_capital_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     if value is None or value <= 0:
         await update.message.reply_text("مثال درست: سرمایه ترید 1000")
         return
-    s = load_trade_settings()
-    s["capital_usd"] = float(value)
-    save_trade_settings(s)
-    if configure_paper_account:
-        try:
-            configure_paper_account(capital_usd=float(value), reset_balance=True)
-        except Exception:
-            pass
-    await update.message.reply_text(f"✅ سرمایه ترید روی {value}$ تنظیم شد.\n\n{format_trade_status()}")
+    if not set_real_initial_capital:
+        await update.message.reply_text("ماژول ترید واقعی فعال نیست.")
+        return
+    value = max(1.0, min(float(value), 1_000_000.0))
+    await update.message.reply_text(set_real_initial_capital(value) + "\n\n" + format_trade_status())
+
 
 
 async def set_trade_margin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -574,47 +514,40 @@ async def set_trade_margin_command(update: Update, context: ContextTypes.DEFAULT
     if value is None or value <= 0:
         await update.message.reply_text("مثال درست: ترید دلار 20")
         return
-    s = load_trade_settings()
-    s["trade_margin_usd"] = float(value)
-    save_trade_settings(s)
-    await update.message.reply_text(f"✅ مبلغ هر ترید روی {value}$ تنظیم شد.\n\n{format_trade_status()}")
+    if not set_real_position_size:
+        await update.message.reply_text("ماژول ترید واقعی فعال نیست.")
+        return
+    value = max(1.0, min(float(value), 1_000_000.0))
+    await update.message.reply_text(set_real_position_size(value) + "\n\n" + format_trade_status())
+
 
 
 async def set_leverage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     value = extract_first_number(update.message.text)
     if value is None or value <= 0:
-        await update.message.reply_text("مثال درست: لوریج دلار 5")
+        await update.message.reply_text("مثال درست: ترید لوریج 5")
         return
-    value = min(float(value), 50.0)
-    s = load_trade_settings()
-    s["leverage"] = value
-    save_trade_settings(s)
-    await update.message.reply_text(f"✅ لوریج روی {value}x تنظیم شد.\n\n{format_trade_status()}")
+    if not set_real_leverage:
+        await update.message.reply_text("ماژول ترید واقعی فعال نیست.")
+        return
+    value = max(1.0, min(float(value), 1_000_000.0))
+    await update.message.reply_text(set_real_leverage(value) + "\n\n" + format_trade_status())
+
 
 
 async def position_size_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    s = load_trade_settings()
-    await update.message.reply_text(
-        "📌 حجم پوزیشن\n\n"
-        f"مبلغ ترید: {s.get('trade_margin_usd')}$\n"
-        f"لوریج: {s.get('leverage')}x\n"
-        f"حجم پوزیشن تقریبی: {calc_position_size(s)}$"
-    )
+    await update.message.reply_text(format_trade_status())
+
 
 
 async def reset_trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    save_trade_settings(DEFAULT_TRADE_SETTINGS.copy())
-    if reset_paper_trades:
-        try:
-            reset_paper_trades(capital_usd=DEFAULT_TRADE_SETTINGS.get("capital_usd"))
-        except TypeError:
-            try:
-                reset_paper_trades()
-            except Exception:
-                pass
-        except Exception:
-            pass
-    await update.message.reply_text("✅ تنظیمات و آمار Paper Trade ریست شد.\n\n" + format_trade_status())
+    if get_user_id(update) != OWNER_ID:
+        await reject_unauthorized(update)
+        return
+    if not reset_real_trade_state:
+        await update.message.reply_text("ماژول ترید واقعی فعال نیست.")
+        return
+    await update.message.reply_text(reset_real_trade_state() + "\n\n" + format_trade_status())
 
 
 
@@ -622,26 +555,21 @@ async def trade_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not is_allowed(update):
         await reject_unauthorized(update)
         return
-    if format_paper_stats:
-        try:
-            await send_long_text(update, format_paper_stats())
-            return
-        except Exception as e:
-            await update.message.reply_text(f"❌ خطا در آمار ترید:\n{str(e)[:250]}")
-            return
-    await update.message.reply_text("ماژول Paper Trade فعال نیست.")
+    await send_long_text(update, format_trade_status())
+
 
 
 async def set_max_positions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     value = extract_first_number(update.message.text)
     if value is None or value <= 0:
-        await update.message.reply_text("مثال درست: حداکثر پوزیشن 5")
+        await update.message.reply_text("مثال درست: حداکثر پوزیشن 10")
         return
-    value = max(1, min(int(value), 50))
-    s = load_trade_settings()
-    s["max_positions"] = int(value)
-    save_trade_settings(s)
-    await update.message.reply_text(f"✅ حداکثر پوزیشن همزمان روی {value} تنظیم شد.\n\n{format_trade_status()}")
+    if not set_real_max_positions:
+        await update.message.reply_text("ماژول ترید واقعی فعال نیست.")
+        return
+    value = max(1, min(int(value), 100))
+    await update.message.reply_text(set_real_max_positions(value) + "\n\n" + format_trade_status())
+
 
 
 async def set_daily_loss_limit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -649,14 +577,15 @@ async def set_daily_loss_limit_command(update: Update, context: ContextTypes.DEF
     if value is None or value <= 0:
         await update.message.reply_text("مثال درست: حد ضرر روزانه 5")
         return
-    if not configure_daily_loss_limit:
-        await update.message.reply_text("ماژول تنظیم حد ضرر روزانه فعال نیست. فایل paper_trader.py را به‌روزرسانی کن.")
+    if not set_real_daily_loss_limit:
+        await update.message.reply_text("ماژول تنظیم حد ضرر روزانه واقعی فعال نیست. فایل real_trade_manager.py را به‌روزرسانی کن.")
         return
     try:
-        msg = configure_daily_loss_limit(float(value))
+        msg = set_real_daily_loss_limit(float(value))
         await update.message.reply_text(msg + "\n\n" + format_trade_status())
     except Exception as e:
         await update.message.reply_text(f"❌ خطا در تنظیم حد ضرر روزانه:\n{str(e)[:250]}")
+
 
 
 async def set_daily_lock_hours_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -664,24 +593,22 @@ async def set_daily_lock_hours_command(update: Update, context: ContextTypes.DEF
     if value is None or value <= 0:
         await update.message.reply_text("مثال درست: قفل ضرر 1 ساعت")
         return
-    if not configure_daily_lock_hours:
-        await update.message.reply_text("ماژول تنظیم زمان قفل ضرر فعال نیست. فایل paper_trader.py را به‌روزرسانی کن.")
+    if not set_real_lock_duration_hours:
+        await update.message.reply_text("ماژول تنظیم زمان قفل ضرر واقعی فعال نیست. فایل real_trade_manager.py را به‌روزرسانی کن.")
         return
     try:
         hours = max(1, min(int(value), 168))
-        msg = configure_daily_lock_hours(hours)
+        msg = set_real_lock_duration_hours(hours)
         await update.message.reply_text(msg + "\n\n" + format_trade_status())
     except Exception as e:
         await update.message.reply_text(f"❌ خطا در تنظیم زمان قفل ضرر:\n{str(e)[:250]}")
 
 
-# ============================================================
-# Real Toobit trade commands
-# ============================================================
 
 def real_trade_module_available() -> bool:
     return all([
         get_real_trade_status_text,
+        get_toobit_balance_text,
         set_real_initial_capital,
         set_real_position_size,
         set_real_leverage,
@@ -693,7 +620,6 @@ def real_trade_module_available() -> bool:
         activate_real_emergency_stop,
         reset_real_trade_state,
     ])
-
 
 async def real_trade_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not real_trade_module_available() or not get_real_trade_status_text:
@@ -927,26 +853,19 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "بررسی / بررسی بازار\n"
         "آمار / آمار 7 روز / آمار کل\n"
         "حذف آمار\n\n"
-        "دستورهای ترید:\n"
-        "وضعیت ترید\n"
+        "دستورهای ترید واقعی توبیت:\n"
+        "ترید / وضعیت ترید\n"
+        "بالانس توبیت\n"
         "سرمایه ترید 1000\n"
         "ترید دلار 20\n"
-        "لوریج دلار 5\n"
-        "حجم پوزیشن\n"
+        "ترید لوریج 5\n"
+        "حداکثر پوزیشن 10\n"
+        "حد ضرر روزانه 5\n"
+        "قفل ضرر 1 ساعت\n"
+        "ترید فعال\n"
+        "ترید خاموش\n"
+        "توقف اضطراری\n"
         "ریست ترید\n\n"
-        "دستورهای ترید واقعی توبیت:\n"
-        "وضعیت ترید واقعی\n"
-        "بالانس توبیت\n"
-        "سرمایه واقعی 50\n"
-        "ترید واقعی دلار 2\n"
-        "لوریج واقعی 5\n"
-        "حداکثر پوزیشن واقعی 3\n"
-        "حد ضرر روزانه واقعی 5\n"
-        "قفل ضرر واقعی 1 ساعت\n"
-        "ترید واقعی فعال\n"
-        "ترید واقعی خاموش\n"
-        "توقف اضطراری واقعی\n"
-        "ریست ترید واقعی\n\n"
         "AI و مدیریت:\n"
         "هوش مصنوعی\n"
         "حافظه ربات\n"
@@ -957,7 +876,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "اسلات‌ها\n"
         "پوزیشن‌ها\n"
         "سیگنال‌های فعال\n\n"
-        "یادداشت: دستور «زیر نظر» حذف شده؛ همه سیگنال‌ها خودکار Track می‌شوند."
+        "یادداشت: دستورهای ترید مستقیم برای REAL / TOBIT هستند."
     )
     await update.message.reply_text(text)
 
@@ -1019,12 +938,6 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         except Exception as e:
             parts.append(f"خطا در آمار سیگنال: {str(e)[:120]}")
 
-    if format_paper_stats:
-        try:
-            parts.append(format_paper_stats())
-        except Exception:
-            pass
-
     await send_long_text(update, "\n\n".join(parts) if parts else "آماری موجود نیست.")
 
 
@@ -1038,13 +951,6 @@ async def reset_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         if reset_signal_stats:
             reset_signal_stats()
             done.append("آمار سیگنال")
-    except Exception:
-        pass
-
-    try:
-        if reset_paper_trades:
-            reset_paper_trades()
-            done.append("Paper Trade")
     except Exception:
         pass
 
@@ -1071,19 +977,21 @@ async def symbol_stats_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(f"❌ خطا در آمار ارزها:\n{str(e)[:250]}")
 
 
+
 async def positions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         await reject_unauthorized(update)
         return
 
-    if not format_open_positions:
-        await update.message.reply_text("ماژول Paper Trade فعال نیست.")
-        return
+    if get_toobit_balance_text:
+        try:
+            await send_long_text(update, get_toobit_balance_text())
+            return
+        except Exception as e:
+            await update.message.reply_text(f"❌ خطا در دریافت اطلاعات توبیت:\n{str(e)[:250]}")
+            return
 
-    try:
-        await send_long_text(update, format_open_positions())
-    except Exception as e:
-        await update.message.reply_text(str(e)[:250])
+    await update.message.reply_text("ماژول اتصال توبیت فعال نیست.")
 
 
 async def active_signals_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1229,12 +1137,6 @@ async def register_sent_signal(signal: Dict[str, Any], sent_message: Any, source
             except Exception as e:
                 logger.error(f"add_signal_to_tracking error: {e}")
 
-        if open_paper_position:
-            try:
-                open_paper_position(meta, telegram_message_id=message_id, chat_id=chat_id)
-            except Exception as e:
-                logger.error(f"open_paper_position error: {e}")
-
         if open_real_position_from_signal:
             try:
                 real_result = open_real_position_from_signal(meta)
@@ -1264,26 +1166,12 @@ def can_send_auto_signal(signal: Dict[str, Any]) -> bool:
             return False
         if not st.get("auto_signal_enabled", bool(AUTO_SIGNAL_ENABLED)):
             return False
-        if is_daily_locked:
-            try:
-                if is_daily_locked():
-                    return False
-            except Exception:
-                pass
         if signal.get("status") != "ACTIVE":
             return False
         if not signal.get("entry_confirmed", False):
             return False
         if int(signal.get("score", 0) or 0) < int(AUTO_DIRECT_SCORE_MIN):
             return False
-        if can_open_paper_position:
-            try:
-                ok, _reason = can_open_paper_position(signal)
-                if not ok:
-                    return False
-            except Exception:
-                pass
-
         key = auto_signal_key(signal)
         now = int(time.time())
         last = int(LAST_AUTO_SIGNAL_TIME.get(key, 0))
@@ -1388,7 +1276,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("نیازی به دستور زیر نظر نیست؛ همه سیگنال‌های معتبر خودکار Track می‌شوند.")
         return
 
-    # Real Toobit trade commands - must be checked before generic Paper Trade commands.
+    # Real Toobit trade commands - must be checked before generic trade commands.
     if low in ["ترید واقعی", "وضعیت ترید واقعی", "ترید توبیت", "وضعیت ترید توبیت"]:
         await real_trade_status_command(update, context)
         return
@@ -1437,7 +1325,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await reset_real_trade_command(update, context)
         return
 
-    # Paper risk protection commands - must be checked before generic trade commands.
+    # Real risk protection commands.
     if low.startswith("حد ضرر روزانه") or low.startswith("حدضرر روزانه"):
         await set_daily_loss_limit_command(update, context)
         return
@@ -1446,9 +1334,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await set_daily_lock_hours_command(update, context)
         return
 
-    # Trade commands
-    if low in ["ترید", "وضعیت ترید", "ترید فعال", "فعال ترید", "تریدها"]:
+    # Trade commands - generic names now control REAL / TOBIT only.
+    if low in ["ترید", "وضعیت ترید", "تریدها"]:
         await trade_status_command(update, context)
+        return
+
+    if low in ["ترید فعال", "فعال ترید", "فعال سازی ترید", "فعال‌سازی ترید"]:
+        await enable_real_trade_command(update, context)
+        return
+
+    if low in ["ترید خاموش", "خاموش ترید", "غیرفعال ترید", "ترید غیرفعال"]:
+        await disable_real_trade_command(update, context)
+        return
+
+    if low in ["توقف اضطراری", "استاپ اضطراری", "خاموش اضطراری"]:
+        await real_emergency_stop_command(update, context)
         return
 
     if low in ["آمار ترید", "امار ترید"]:
