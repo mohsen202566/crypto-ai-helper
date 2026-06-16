@@ -31,6 +31,13 @@ except Exception:
     add_position = None
     close_position = None
 
+try:
+    from real_trade_manager import load_real_trade_state, save_real_trade_state, record_realized_pnl
+except Exception:
+    load_real_trade_state = None
+    save_real_trade_state = None
+    record_realized_pnl = None
+
 ACTIVE_SIGNALS_FILE = "active_signals.json"
 SIGNAL_STATS_FILE = "signal_stats.json"
 
@@ -276,6 +283,9 @@ def add_signal_to_tracking(*args, **kwargs) -> Tuple[bool, str]:
         "score": result.get("score"),
         "risk_level": result.get("risk_level"),
         "risk_reward": result.get("risk_reward"),
+        "real_order": result.get("real_order"),
+        "position_size_usd": result.get("position_size_usd"),
+        "leverage": result.get("leverage"),
         "entry_mode": result.get("entry_mode") or "AI_CLASSIC_DIRECT",
         "confirmations": result.get("confirmations"),
         "freshness": result.get("freshness"),
@@ -364,6 +374,99 @@ def move_percent(signal: Dict[str, Any], exit_price: float) -> float:
     return round(((entry - float(exit_price)) / entry) * 100, 4)
 
 
+def record_real_trade_result_for_signal(signal: Dict[str, Any], hit_type: str, exit_price: float, pct: float) -> Optional[Dict[str, Any]]:
+    """
+    Update REAL trading accounting when tracker detects TP1/SL.
+
+    PnL formula is leverage-aware:
+        pnl_usd = margin_usdt * leverage * move_percent / 100
+
+    Example:
+        margin=5$, leverage=12x, move=0.5733%
+        pnl = 5 * 12 * 0.5733 / 100 = 0.34398$
+
+    Fees/funding/slippage are not included here because tracker only has signal prices.
+    Toobit balance display remains the source of truth for exact exchange balance.
+    """
+    if not (load_real_trade_state and save_real_trade_state and record_realized_pnl):
+        return None
+
+    try:
+        state = load_real_trade_state()
+        open_positions = state.get("open_positions", {})
+        if not isinstance(open_positions, dict):
+            open_positions = {}
+
+        sid = str(signal.get("signal_id") or signal.get("id") or "")
+        symbol = str(signal.get("symbol") or "").upper()
+        direction = signal.get("direction")
+
+        pos_key = None
+        pos = None
+
+        if sid and sid in open_positions:
+            pos_key = sid
+            pos = open_positions.get(sid)
+
+        if not isinstance(pos, dict):
+            for k, v in open_positions.items():
+                if not isinstance(v, dict):
+                    continue
+                if str(v.get("symbol") or "").upper() == symbol and v.get("direction") == direction:
+                    pos_key = k
+                    pos = v
+                    break
+
+        margin = 0.0
+        leverage = 0.0
+
+        if isinstance(pos, dict):
+            margin = float(pos.get("position_size_usd") or 0)
+            leverage = float(pos.get("leverage") or 0)
+
+        if margin <= 0:
+            margin = float(signal.get("position_size_usd") or state.get("position_size_usd") or 0)
+        if leverage <= 0:
+            leverage = float(signal.get("leverage") or state.get("leverage") or 0)
+
+        if margin <= 0 or leverage <= 0:
+            return {
+                "ok": False,
+                "error": "margin/leverage missing",
+                "margin": margin,
+                "leverage": leverage,
+            }
+
+        pnl_usd = round(float(margin) * float(leverage) * float(pct) / 100.0, 6)
+
+        # Remove from REAL open positions before accounting so status/slots are not stale.
+        if pos_key:
+            state.setdefault("open_positions", {}).pop(pos_key, None)
+            save_real_trade_state(state)
+
+        accounting = record_realized_pnl(
+            pnl_usd=pnl_usd,
+            signal_id=sid or None,
+            symbol=symbol,
+            direction=direction,
+            result=hit_type,
+            exit_price=exit_price,
+        )
+
+        return {
+            "ok": True,
+            "pnl_usd": pnl_usd,
+            "margin": margin,
+            "leverage": leverage,
+            "notional": round(margin * leverage, 6),
+            "accounting": accounting,
+            "removed_position": bool(pos_key),
+        }
+
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:250]}
+
+
 def check_active_signals() -> List[Dict[str, Any]]:
     active = get_active_signals()
     remaining: List[Dict[str, Any]] = []
@@ -386,6 +489,7 @@ def check_active_signals() -> List[Dict[str, Any]]:
                 pct = move_percent(signal, exit_price)
                 record_stat_event(signal, hit_type, exit_price, pct)
                 ai_record_result(signal, hit_type, exit_price, pct)
+                real_trade_accounting = record_real_trade_result_for_signal(signal, hit_type, exit_price, pct)
                 ai_close_slot(signal)
                 icon = "✅" if hit_type == "TP1" else "❌"
                 result_fa = "حد سود 1" if hit_type == "TP1" else "حد ضرر"
@@ -397,6 +501,23 @@ def check_active_signals() -> List[Dict[str, Any]]:
                     f"نتیجه: {result_fa}\n"
                     f"درصد حرکت: {pct}٪"
                 )
+
+                if isinstance(real_trade_accounting, dict) and real_trade_accounting.get("ok"):
+                    acc = real_trade_accounting.get("accounting") or {}
+                    pnl = real_trade_accounting.get("pnl_usd", 0)
+                    sign = "+" if float(pnl or 0) > 0 else ""
+                    text += (
+                        f"\n\nPnL واقعی تقریبی: {sign}{pnl}$"
+                        f"\nمارجین: {real_trade_accounting.get('margin')}$"
+                        f"\nلوریج: {real_trade_accounting.get('leverage')}x"
+                        f"\nحجم تقریبی: {real_trade_accounting.get('notional')}$"
+                        f"\nبالانس داخلی: {acc.get('balance')}$"
+                        f"\nسرمایه محافظت‌شده: {acc.get('protected_balance')}$"
+                    )
+                    if acc.get("daily_locked"):
+                        text += "\n🚨 قفل ضرر روزانه فعال شد."
+                elif isinstance(real_trade_accounting, dict) and real_trade_accounting.get("error"):
+                    text += f"\n\n⚠️ ثبت PnL واقعی انجام نشد: {real_trade_accounting.get('error')}"
                 messages.append({
                     "chat_id": signal.get("chat_id"),
                     "message": text,
