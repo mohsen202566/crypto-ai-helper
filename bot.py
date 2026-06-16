@@ -69,6 +69,8 @@ try:
         reset_paper_trades,
         format_paper_trade_status,
         configure_paper_account,
+        configure_daily_loss_limit,
+        configure_daily_lock_hours,
         can_open_paper_position,
         is_daily_locked,
     )
@@ -79,6 +81,8 @@ except Exception:
     reset_paper_trades = None
     format_paper_trade_status = None
     configure_paper_account = None
+    configure_daily_loss_limit = None
+    configure_daily_lock_hours = None
     can_open_paper_position = None
     is_daily_locked = None
 
@@ -634,6 +638,37 @@ async def set_max_positions_command(update: Update, context: ContextTypes.DEFAUL
     s["max_positions"] = int(value)
     save_trade_settings(s)
     await update.message.reply_text(f"✅ حداکثر پوزیشن همزمان روی {value} تنظیم شد.\n\n{format_trade_status()}")
+
+
+async def set_daily_loss_limit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    value = extract_first_number(update.message.text)
+    if value is None or value <= 0:
+        await update.message.reply_text("مثال درست: حد ضرر روزانه 5")
+        return
+    if not configure_daily_loss_limit:
+        await update.message.reply_text("ماژول تنظیم حد ضرر روزانه فعال نیست. فایل paper_trader.py را به‌روزرسانی کن.")
+        return
+    try:
+        msg = configure_daily_loss_limit(float(value))
+        await update.message.reply_text(msg + "\n\n" + format_trade_status())
+    except Exception as e:
+        await update.message.reply_text(f"❌ خطا در تنظیم حد ضرر روزانه:\n{str(e)[:250]}")
+
+
+async def set_daily_lock_hours_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    value = extract_first_number(update.message.text)
+    if value is None or value <= 0:
+        await update.message.reply_text("مثال درست: قفل ضرر 1 ساعت")
+        return
+    if not configure_daily_lock_hours:
+        await update.message.reply_text("ماژول تنظیم زمان قفل ضرر فعال نیست. فایل paper_trader.py را به‌روزرسانی کن.")
+        return
+    try:
+        hours = max(1, min(int(value), 168))
+        msg = configure_daily_lock_hours(hours)
+        await update.message.reply_text(msg + "\n\n" + format_trade_status())
+    except Exception as e:
+        await update.message.reply_text(f"❌ خطا در تنظیم زمان قفل ضرر:\n{str(e)[:250]}")
 
 
 # ============================================================
@@ -1353,6 +1388,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if low == "ریست ترید واقعی":
         await reset_real_trade_command(update, context)
+        return
+
+    # Paper risk protection commands - must be checked before generic trade commands.
+    if low.startswith("حد ضرر روزانه") or low.startswith("حدضرر روزانه"):
+        await set_daily_loss_limit_command(update, context)
+        return
+
+    if low.startswith("قفل ضرر"):
+        await set_daily_lock_hours_command(update, context)
         return
 
     # Trade commands
