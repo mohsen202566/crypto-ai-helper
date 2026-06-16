@@ -393,6 +393,18 @@ def record_real_trade_result_for_signal(signal: Dict[str, Any], hit_type: str, e
 
     try:
         state = load_real_trade_state()
+        # Keep REAL internal slots aligned with Toobit before calculating PnL.
+        # This covers cases where an order was initially PENDING/ACCEPTED and
+        # became an open position seconds later, or a position was recovered from
+        # the exchange after an API response mismatch.
+        try:
+            from real_trade_manager import sync_real_positions_with_toobit
+            sync_result = sync_real_positions_with_toobit(state, save=True)
+            if isinstance(sync_result, dict) and sync_result.get("ok"):
+                state = sync_result.get("state") or state
+        except Exception:
+            pass
+
         open_positions = state.get("open_positions", {})
         if not isinstance(open_positions, dict):
             open_positions = {}
