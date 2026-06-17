@@ -192,6 +192,7 @@ DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 TRADE_SETTINGS_FILE = os.path.join(DATA_DIR, "trade_settings.json")
 BOT_SETTINGS_FILE = os.path.join(DATA_DIR, "bot_settings.json")
+REAL_TRADE_STATE_FILE = os.path.join(DATA_DIR, "real_trade_state.json")
 
 
 DEFAULT_BOT_SETTINGS = {
@@ -431,6 +432,71 @@ def extract_first_number(text: str) -> Optional[float]:
         return None
 
 
+def is_disable_loss_lock_text(text: str) -> bool:
+    t = _normalize_command_text(text)
+    compact = t.replace(" ", "")
+    if any(x in t for x in ["خاموش", "غیرفعال", "غیر فعال", "لغو", "حذف", "off", "disable"]):
+        return True
+    return bool(re.search(r"(^|\s)0(?:\.0+)?($|\s)", t)) or "صفر" in t or compact in {
+        "قفلضرر0",
+        "قفلضررصفر",
+        "ضررروزانه0",
+        "ضررروزانهصفر",
+        "حدضررروزانه0",
+        "حدضررروزانهصفر",
+    }
+
+
+def disable_real_daily_loss_lock_local() -> str:
+    """
+    Disable daily-loss protection without touching exchange/order logic.
+
+    This only changes data/real_trade_state.json:
+    - daily_loss_limit_usd = 0
+    - clears current lock timer
+    - clears remembered lock loss so re-enabling starts fresh
+    """
+    state = load_json(REAL_TRADE_STATE_FILE, {})
+    if not isinstance(state, dict):
+        state = {}
+
+    state["daily_loss_protection_enabled"] = False
+    state["daily_loss_limit_usd"] = 0.0
+    state["daily_loss_locked_until"] = 0
+    state["daily_lock_reason"] = ""
+    state["daily_lock_loss_value"] = 0.0
+    state["daily_lock_auto_reenable"] = False
+    save_json(REAL_TRADE_STATE_FILE, state)
+    return "✅ قفل/حد ضرر روزانه خاموش شد."
+
+
+def reset_active_daily_lock_from_now(hours: int) -> bool:
+    """
+    If a daily-loss lock is already active, restart its countdown from now.
+    Example: `قفل ضرر 1 ساعت` while locked means 1 hour from this command.
+    """
+    state = load_json(REAL_TRADE_STATE_FILE, {})
+    if not isinstance(state, dict):
+        return False
+
+    locked_until = int(state.get("daily_loss_locked_until", 0) or 0)
+    if locked_until <= int(time.time()):
+        return False
+
+    hours = max(1, min(int(hours), 168))
+    state["daily_loss_locked_until"] = int(time.time()) + hours * 3600
+    save_json(REAL_TRADE_STATE_FILE, state)
+    return True
+
+
+async def disable_daily_loss_lock_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        msg = disable_real_daily_loss_lock_local()
+        await update.message.reply_text(msg + "\n\n" + format_trade_status())
+    except Exception as e:
+        await update.message.reply_text(f"❌ خطا در خاموش کردن قفل ضرر:\n{str(e)[:250]}")
+
+
 async def send_long_text(update: Update, text: str, max_len: int = 3900) -> None:
     if not update.message:
         return
@@ -583,9 +649,14 @@ async def set_max_positions_command(update: Update, context: ContextTypes.DEFAUL
 
 
 async def set_daily_loss_limit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    value = extract_first_number(update.message.text)
+    text = update.message.text or ""
+    if is_disable_loss_lock_text(text):
+        await disable_daily_loss_lock_command(update, context)
+        return
+
+    value = extract_first_number(text)
     if value is None or value <= 0:
-        await update.message.reply_text("مثال درست: حد ضرر روزانه 5")
+        await update.message.reply_text("مثال درست: حد ضرر روزانه 5\nبرای خاموش کردن: قفل ضرر خاموش")
         return
     if not set_real_daily_loss_limit:
         await update.message.reply_text("ماژول تنظیم حد ضرر روزانه واقعی فعال نیست. فایل real_trade_manager.py را به‌روزرسانی کن.")
@@ -599,9 +670,14 @@ async def set_daily_loss_limit_command(update: Update, context: ContextTypes.DEF
 
 
 async def set_daily_lock_hours_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    value = extract_first_number(update.message.text)
+    text = update.message.text or ""
+    if is_disable_loss_lock_text(text):
+        await disable_daily_loss_lock_command(update, context)
+        return
+
+    value = extract_first_number(text)
     if value is None or value <= 0:
-        await update.message.reply_text("مثال درست: قفل ضرر 1 ساعت")
+        await update.message.reply_text("مثال درست: قفل ضرر 1 ساعت\nبرای خاموش کردن: قفل ضرر خاموش")
         return
     if not set_real_lock_duration_hours:
         await update.message.reply_text("ماژول تنظیم زمان قفل ضرر واقعی فعال نیست. فایل real_trade_manager.py را به‌روزرسانی کن.")
@@ -609,6 +685,9 @@ async def set_daily_lock_hours_command(update: Update, context: ContextTypes.DEF
     try:
         hours = max(1, min(int(value), 168))
         msg = set_real_lock_duration_hours(hours)
+        restarted = reset_active_daily_lock_from_now(hours)
+        if restarted:
+            msg += "\n⏱️ شمارش قفل فعال از همین لحظه دوباره محاسبه شد."
         await update.message.reply_text(msg + "\n\n" + format_trade_status())
     except Exception as e:
         await update.message.reply_text(f"❌ خطا در تنظیم زمان قفل ضرر:\n{str(e)[:250]}")
@@ -693,12 +772,17 @@ async def set_real_max_positions_command(update: Update, context: ContextTypes.D
 
 
 async def set_real_daily_loss_limit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = update.message.text or ""
+    if is_disable_loss_lock_text(text):
+        await disable_daily_loss_lock_command(update, context)
+        return
+
     if not set_real_daily_loss_limit:
         await update.message.reply_text("ماژول تنظیم حد ضرر روزانه واقعی فعال نیست. فایل real_trade_manager.py را به‌روزرسانی کن.")
         return
-    value = extract_first_number(update.message.text)
+    value = extract_first_number(text)
     if value is None or value <= 0:
-        await update.message.reply_text("مثال درست: حد ضرر روزانه واقعی 5")
+        await update.message.reply_text("مثال درست: حد ضرر روزانه واقعی 5\nبرای خاموش کردن: قفل ضرر خاموش")
         return
     try:
         msg = set_real_daily_loss_limit(float(value))
@@ -708,16 +792,24 @@ async def set_real_daily_loss_limit_command(update: Update, context: ContextType
 
 
 async def set_real_lock_hours_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = update.message.text or ""
+    if is_disable_loss_lock_text(text):
+        await disable_daily_loss_lock_command(update, context)
+        return
+
     if not set_real_lock_duration_hours:
         await update.message.reply_text("ماژول تنظیم زمان قفل ضرر واقعی فعال نیست. فایل real_trade_manager.py را به‌روزرسانی کن.")
         return
-    value = extract_first_number(update.message.text)
+    value = extract_first_number(text)
     if value is None or value <= 0:
-        await update.message.reply_text("مثال درست: قفل ضرر واقعی 1 ساعت")
+        await update.message.reply_text("مثال درست: قفل ضرر واقعی 1 ساعت\nبرای خاموش کردن: قفل ضرر خاموش")
         return
     try:
         hours = max(1, min(int(value), 168))
         msg = set_real_lock_duration_hours(hours)
+        restarted = reset_active_daily_lock_from_now(hours)
+        if restarted:
+            msg += "\n⏱️ شمارش قفل فعال از همین لحظه دوباره محاسبه شد."
         await update.message.reply_text(msg + "\n\n" + get_real_trade_status_text())
     except Exception as e:
         await update.message.reply_text(f"❌ خطا در تنظیم زمان قفل ضرر واقعی:\n{str(e)[:250]}")
@@ -930,7 +1022,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "ترید لوریج 5\n"
         "حداکثر پوزیشن 10\n"
         "حد ضرر روزانه 5\n"
-        "قفل ضرر 1 ساعت\n"
+        "قفل ضرر 1 ساعت\nقفل ضرر خاموش\n"
         "ترید فعال\n"
         "ترید خاموش\n"
         "توقف اضطراری\n"
@@ -1520,7 +1612,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     # Real risk protection commands.
-    if low.startswith("حد ضرر روزانه") or low.startswith("حدضرر روزانه"):
+    if (
+        low.startswith("حد ضرر روزانه")
+        or low.startswith("حدضرر روزانه")
+        or low.startswith("ضرر روزانه")
+    ):
         await set_daily_loss_limit_command(update, context)
         return
 
