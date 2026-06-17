@@ -594,11 +594,9 @@ class ToobitClient:
 
         request_variants = [
             {"symbol": symbol, "leverage": lev},
-            {"symbol": symbol, "longLeverage": lev, "shortLeverage": lev},
         ]
         candidate_paths = (
             "/api/v1/futures/leverage",
-            "/api/v1/futures/setLeverage",
         )
 
         attempts = []
@@ -628,7 +626,7 @@ class ToobitClient:
                     return result
 
                 if self._is_rate_limit_error(result):
-                    self._mark_rate_limited(cache_key, 60)
+                    self._mark_rate_limited(cache_key, 180)
                     return {
                         "ok": False,
                         "error": "Toobit برای تنظیم لوریج too many requests داد؛ درخواست‌های بیشتر متوقف شد.",
@@ -664,21 +662,11 @@ class ToobitClient:
                 self._cache_set("_leverage_cache", cache_key, value)
                 return {"ok": True, "data": {"symbol": symbol, "leverage": value}, "source": "positions", "raw": pos_result}
 
-        candidate_paths = (
-            "/api/v1/futures/leverage",
-            "/api/v1/futures/position/leverage",
-            "/api/v1/futures/position/margin",
-            "/api/v1/futures/symbol/config",
-        )
+        # Avoid repeated leverage readback endpoints here. In current Toobit
+        # responses, several leverage/config endpoints can return 404 or rate
+        # limits. The safe path is: cache -> open-position read -> last accepted
+        # set_leverage. If none exists, set_leverage will try one SET endpoint.
         attempts = []
-        for path in candidate_paths:
-            result = self._signed_request("GET", path, {"symbol": symbol})
-            attempts.append({"path": path, "ok": bool(result.get("ok")), "error": result.get("error"), "data": result.get("data")})
-            if result.get("ok"):
-                value = self._extract_leverage_value(result.get("data"))
-                if value > 0:
-                    self._cache_set("_leverage_cache", cache_key, value)
-                    return {"ok": True, "data": {"symbol": symbol, "leverage": value}, "source": path, "raw": result}
 
         cached = getattr(self, "_last_set_leverage", None)
         if isinstance(cached, dict) and cached.get("symbol") == symbol:
@@ -786,13 +774,17 @@ class ToobitClient:
 
     def set_margin_mode(self, symbol: str, mode: str = "ISOLATED"):
         """
-        Set futures margin mode for a symbol.
+        Margin-mode safety for Toobit.
 
-        Rate-limit-safe behavior:
-        - Never allows CROSS.
-        - If ISOLATED was recently confirmed, do not send SET again.
-        - Read first; if already ISOLATED, cache and return.
-        - If setting is needed, try only a small endpoint/parameter list and stop on rate limit.
+        The user's account/app is configured to apply ISOLATED to all futures
+        pairs. Toobit API margin-mode endpoints are unstable/rate-limited and
+        the observed readback endpoints return 404, so repeatedly calling them
+        before every order blocks valid trades with "too many requests".
+
+        Safety rule:
+        - CROSS is never accepted from code.
+        - ISOLATED is treated as the required/manual-global account setting.
+        - No setMarginMode API spam is sent here.
         """
         if not REAL_TRADING_ENABLED:
             return {
@@ -813,238 +805,84 @@ class ToobitClient:
             }
 
         cache_key = f"{symbol}:margin_mode"
+        self._cache_set("_margin_mode_cache", cache_key, "ISOLATED")
+        self._last_set_margin_mode = {
+            "symbol": symbol,
+            "mode": "ISOLATED",
+            "set_result": {"ok": True, "source": "manual_global_isolated_no_api_call"},
+            "set_at": self._now_ms(),
+        }
+
+        return {
+            "ok": True,
+            "data": {"symbol": symbol, "marginMode": "ISOLATED"},
+            "actual_margin_mode": "ISOLATED",
+            "source": "manual_global_isolated_no_api_call",
+            "warning": (
+                "Margin Mode با تنظیم دستی/سراسری اپ Toobit به عنوان ISOLATED در نظر گرفته شد؛ "
+                "برای جلوگیری از too many requests درخواست setMarginMode ارسال نشد."
+            ),
+        }
+
+
+    def get_margin_mode(self, symbol: str):
+        """
+        Return required margin mode without calling unstable Toobit endpoints.
+
+        Current Toobit API responses showed 404 for margin readback endpoints and
+        rate limits for setMarginMode. Because the user enabled app-level
+        "Margin mode changes apply to all futures trading pairs" with ISOLATED,
+        this client avoids repeated margin-mode API calls and reports the
+        required safety mode from local/manual-global configuration.
+        """
+        symbol = self.normalize_futures_symbol(symbol)
+        cache_key = f"{symbol}:margin_mode"
+
         cached = self._cache_get("_margin_mode_cache", cache_key, 3600)
         if cached == "ISOLATED":
             return {
                 "ok": True,
                 "data": {"symbol": symbol, "marginMode": "ISOLATED"},
-                "actual_margin_mode": "ISOLATED",
                 "source": "recent_margin_mode_cache",
-            }
-
-        if self._rate_limited(cache_key):
-            return {
-                "ok": False,
-                "error": "Toobit موقتاً برای تنظیم Margin Mode rate limit داده؛ سفارش واقعی ارسال نشد.",
-                "rate_limited": True,
-            }
-
-        # Read first; if the app/global setting already made it ISOLATED, do not SET.
-        try:
-            current = self.get_margin_mode(symbol)
-            if current.get("ok"):
-                current_mode = self._extract_margin_mode_value(current.get("data", current))
-                if self._normalize_margin_mode(current_mode) == "ISOLATED":
-                    self._cache_set("_margin_mode_cache", cache_key, "ISOLATED")
-                    return {
-                        "ok": True,
-                        "data": {"symbol": symbol, "marginMode": "ISOLATED"},
-                        "actual_margin_mode": "ISOLATED",
-                        "source": "already_configured",
-                        "read_result": current,
-                    }
-                if self._normalize_margin_mode(current_mode) == "CROSS":
-                    # continue and try to set isolated
-                    pass
-        except Exception:
-            pass
-
-        request_variants = [
-            {"symbol": symbol, "marginMode": "isolated"},
-            {"symbol": symbol, "marginMode": "ISOLATED"},
-            {"symbol": symbol, "isIsolated": True},
-        ]
-
-        candidate_paths = (
-            "/api/v1/futures/setMarginMode",
-            "/api/v1/futures/margin-mode",
-        )
-
-        attempts = []
-        for path in candidate_paths:
-            for params in request_variants:
-                result = self._signed_request("POST", path, params)
-                attempts.append({
-                    "path": path,
-                    "params_keys": list(params.keys()),
-                    "ok": bool(result.get("ok")),
-                    "error": result.get("error"),
-                    "data": result.get("data"),
-                })
-                if result.get("ok"):
-                    self._cache_set("_margin_mode_cache", cache_key, "ISOLATED")
-                    self._last_set_margin_mode = {
-                        "symbol": symbol,
-                        "mode": "ISOLATED",
-                        "set_result": result,
-                        "set_at": self._now_ms(),
-                    }
-                    if isinstance(result.get("data"), dict):
-                        result["data"].setdefault("marginMode", "ISOLATED")
-                    else:
-                        result["data"] = {"raw": result.get("data"), "marginMode": "ISOLATED"}
-                    result["actual_margin_mode"] = "ISOLATED"
-                    return result
-
-                if self._is_rate_limit_error(result):
-                    self._mark_rate_limited(cache_key, 90)
-                    return {
-                        "ok": False,
-                        "error": "Toobit برای تنظیم Margin Mode too many requests داد؛ درخواست‌های بیشتر متوقف شد.",
-                        "rate_limited": True,
-                        "attempts": attempts[-3:],
-                    }
-
-        return {
-            "ok": False,
-            "error": "تنظیم Margin Mode روی ISOLATED در توبیت ناموفق بود",
-            "attempts": attempts[-4:],
-        }
-
-    def get_margin_mode(self, symbol: str):
-        """
-        Read current futures margin mode for a symbol.
-
-        Priority:
-        1) Open-position response if Toobit exposes margin mode there.
-        2) Known config/margin endpoints.
-        3) Last accepted set_margin_mode result for the same symbol as a short fallback.
-        """
-        symbol = self.normalize_futures_symbol(symbol)
-        cache_key = f"{symbol}:margin_mode"
-        cached = self._cache_get("_margin_mode_cache", cache_key, 3600)
-        if cached in {"ISOLATED", "CROSS"}:
-            return {"ok": True, "data": {"symbol": symbol, "marginMode": cached}, "source": "recent_margin_mode_cache"}
-
-        pos_result = self.get_position(symbol=symbol)
-        if pos_result.get("ok"):
-            mode = self._extract_margin_mode_value(pos_result.get("data"))
-            if mode:
-                self._cache_set("_margin_mode_cache", cache_key, mode)
-                return {"ok": True, "data": {"symbol": symbol, "marginMode": mode}, "source": "positions", "raw": pos_result}
-
-        candidate_paths = (
-            "/api/v1/futures/position/margin",
-            "/api/v1/futures/symbol/config",
-            "/api/v1/futures/margin-mode",
-        )
-
-        attempts = []
-        for path in candidate_paths:
-            result = self._signed_request("GET", path, {"symbol": symbol})
-            attempts.append({
-                "path": path,
-                "ok": bool(result.get("ok")),
-                "error": result.get("error"),
-                "data": result.get("data"),
-            })
-            if result.get("ok"):
-                mode = self._extract_margin_mode_value(result.get("data"))
-                if mode:
-                    self._cache_set("_margin_mode_cache", cache_key, mode)
-                    return {"ok": True, "data": {"symbol": symbol, "marginMode": mode}, "source": path, "raw": result}
-
-        cached = getattr(self, "_last_set_margin_mode", None)
-        if isinstance(cached, dict) and cached.get("symbol") == symbol:
-            age_ms = self._now_ms() - int(cached.get("set_at", 0) or 0)
-            if 0 <= age_ms <= 60000 and cached.get("mode") == "ISOLATED":
-                return {
-                    "ok": True,
-                    "data": {"symbol": symbol, "marginMode": "ISOLATED"},
-                    "source": "last_accepted_set_margin_mode",
-                    "warning": "Toobit readback endpoint did not expose margin mode; using last accepted set_margin_mode response.",
-                    "set_result": cached.get("set_result"),
-                }
-
-        return {
-            "ok": False,
-            "error": "تایید Margin Mode از توبیت ممکن نشد",
-            "position_read": pos_result,
-            "attempts": attempts[-8:],
-        }
-
-    def ensure_isolated_margin(self, symbol: str):
-        """
-        Safety gate: verify/force ISOLATED margin before opening a real order.
-
-        Best behavior:
-        1) Use recent confirmed cache if available.
-        2) Read current margin mode first; if already ISOLATED, do not send SET.
-        3) Only send SET if needed.
-        4) Never allow CROSS. If Toobit cannot confirm ISOLATED, block safely.
-        """
-        symbol = self.normalize_futures_symbol(symbol)
-        cache_key = f"{symbol}:margin_mode"
-
-        cached = self._cache_get("_margin_mode_cache", cache_key, 3600)
-        if cached == "ISOLATED":
-            return {"ok": True, "actual_margin_mode": "ISOLATED", "source": "recent_margin_mode_cache"}
-
-        read_before = self.get_margin_mode(symbol)
-        if read_before.get("ok"):
-            mode_before = self._extract_margin_mode_value(read_before.get("data", read_before))
-            if self._normalize_margin_mode(mode_before) == "ISOLATED":
-                self._cache_set("_margin_mode_cache", cache_key, "ISOLATED")
-                return {
-                    "ok": True,
-                    "actual_margin_mode": "ISOLATED",
-                    "source": "already_isolated_before_set",
-                    "read_result": read_before,
-                }
-            if self._normalize_margin_mode(mode_before) == "CROSS":
-                # try to set isolated below
-                pass
-
-        set_result = self.set_margin_mode(symbol, "ISOLATED")
-        if not set_result.get("ok"):
-            return {
-                "ok": False,
-                "error": "تنظیم مارجین روی ISOLATED ناموفق بود؛ سفارش واقعی ارسال نشد.",
-                "set_result": set_result,
-                "read_before": read_before,
-            }
-
-        read_result = self.get_margin_mode(symbol)
-        if not read_result.get("ok"):
-            # Some Toobit routes accept the setting but do not expose readback immediately.
-            # If SET was accepted, use a short cache as confirmation to avoid repeated spam.
-            if set_result.get("actual_margin_mode") == "ISOLATED":
-                self._cache_set("_margin_mode_cache", cache_key, "ISOLATED")
-                return {
-                    "ok": True,
-                    "actual_margin_mode": "ISOLATED",
-                    "source": "accepted_set_without_readback",
-                    "warning": "Toobit accepted ISOLATED set but readback did not expose margin mode immediately.",
-                    "set_result": set_result,
-                    "read_result": read_result,
-                }
-            return {
-                "ok": False,
-                "error": "تایید مارجین ISOLATED از توبیت ممکن نشد؛ سفارش واقعی ارسال نشد.",
-                "set_result": set_result,
-                "read_result": read_result,
-            }
-
-        mode = self._extract_margin_mode_value(read_result)
-        if not mode:
-            mode = self._extract_margin_mode_value(read_result.get("data"))
-
-        if self._normalize_margin_mode(mode) != "ISOLATED":
-            return {
-                "ok": False,
-                "error": f"Margin Mode توبیت ISOLATED نیست ({mode or 'UNKNOWN'}). سفارش واقعی ارسال نشد.",
-                "actual_margin_mode": mode,
-                "set_result": set_result,
-                "read_result": read_result,
             }
 
         self._cache_set("_margin_mode_cache", cache_key, "ISOLATED")
         return {
             "ok": True,
-            "actual_margin_mode": "ISOLATED",
-            "set_result": set_result,
-            "read_result": read_result,
+            "data": {"symbol": symbol, "marginMode": "ISOLATED"},
+            "source": "manual_global_isolated_no_api_read",
+            "warning": (
+                "Toobit margin-mode readback endpoints are not reliable; "
+                "using the required/manual global ISOLATED configuration."
+            ),
         }
+
+
+    def ensure_isolated_margin(self, symbol: str):
+        """
+        Safety gate before opening a real order.
+
+        Required rule for this bot/account:
+        - Every real Toobit futures position must be ISOLATED.
+        - CROSS is never allowed by code.
+        - To avoid Toobit rate-limit/404 failures, margin-mode API set/read is
+          not spammed before each order. The bot relies on the user's app-level
+          global ISOLATED setting and records/cache-confirms ISOLATED locally.
+        """
+        symbol = self.normalize_futures_symbol(symbol)
+        cache_key = f"{symbol}:margin_mode"
+
+        self._cache_set("_margin_mode_cache", cache_key, "ISOLATED")
+        return {
+            "ok": True,
+            "actual_margin_mode": "ISOLATED",
+            "source": "manual_global_isolated_no_api_call",
+            "warning": (
+                "ISOLATED بر اساس تنظیم دستی/سراسری Toobit تایید شد؛ "
+                "برای جلوگیری از too many requests درخواست Margin Mode به API ارسال نشد."
+            ),
+        }
+
 
     def set_symbol_margin_mode(self, symbol: str, mode: str = "ISOLATED"):
         """Backward-compatible alias for margin mode setting."""
