@@ -28,6 +28,48 @@ REAL_TRADING_ENABLED = os.getenv("REAL_TRADING_ENABLED", "false").strip().lower(
 RECV_WINDOW = int(os.getenv("TOBIT_RECV_WINDOW", "5000") or "5000")
 REQUEST_TIMEOUT = int(os.getenv("TOBIT_REQUEST_TIMEOUT", "15") or "15")
 
+# ---------------------------------------------------------------------------
+# Toobit futures symbol mapping
+# ---------------------------------------------------------------------------
+# The analysis/scanner can keep using standard symbols such as SHIBUSDT,
+# because market data is fetched from OKX. Real Toobit order routes must use
+# Toobit's exact USDT-M futures contract symbols. Some meme coins are listed
+# with a multiplier prefix on Toobit, so normalize them centrally here.
+TOBIT_FUTURES_SYMBOL_MAP = {
+    "SHIBUSDT": "1000SHIBUSDT",
+    "PEPEUSDT": "1000PEPEUSDT",
+    "BONKUSDT": "1000BONKUSDT",
+    "FLOKIUSDT": "1000FLOKIUSDT",
+}
+
+TOBIT_REVERSE_SYMBOL_MAP = {v: k for k, v in TOBIT_FUTURES_SYMBOL_MAP.items()}
+
+
+def normalize_toobit_plain_symbol(symbol: str) -> str:
+    """Return Toobit's plain futures symbol, e.g. SHIBUSDT -> 1000SHIBUSDT."""
+    raw = str(symbol or "").upper().strip()
+    if not raw:
+        return raw
+
+    raw = raw.replace("/", "").replace("_", "-")
+
+    if raw.endswith("-SWAP-USDT"):
+        plain = raw.replace("-SWAP-USDT", "USDT").replace("-", "")
+    elif raw.endswith("-SWAP-USDC"):
+        plain = raw.replace("-SWAP-USDC", "USDC").replace("-", "")
+    else:
+        plain = raw.replace("-", "").replace("SWAP", "")
+
+    return TOBIT_FUTURES_SYMBOL_MAP.get(plain, plain)
+
+
+def normalize_bot_plain_symbol(symbol: str) -> str:
+    """Return the bot/analysis symbol, e.g. 1000SHIBUSDT -> SHIBUSDT."""
+    plain = normalize_toobit_plain_symbol(symbol)
+    return TOBIT_REVERSE_SYMBOL_MAP.get(plain, plain)
+
+
+
 
 class ToobitClient:
     """Minimal, safe Toobit USDT-M futures REST client."""
@@ -249,15 +291,13 @@ class ToobitClient:
         if not raw:
             return raw
 
-        if raw.endswith("-SWAP-USDT") or raw.endswith("-SWAP-USDC"):
-            return raw
+        s = normalize_toobit_plain_symbol(raw)
 
-        s = raw.replace("/", "").replace("_", "").replace("-", "")
         if s.endswith("USDT"):
             return f"{s[:-4]}-SWAP-USDT"
         if s.endswith("USDC"):
             return f"{s[:-4]}-SWAP-USDC"
-        return raw
+        return s
 
     def safe_decimal(self, value, precision: int = 6) -> str:
         try:
@@ -288,33 +328,28 @@ class ToobitClient:
         return self.get_position(symbol=symbol, category=category)
 
     def _plain_symbol(self, symbol: str) -> str:
-        """Convert Toobit/futures symbols to plain symbols like UNIUSDT."""
+        """Convert Toobit/futures symbols to bot plain symbols like SHIBUSDT."""
         raw = str(symbol or "").upper().strip()
         if not raw:
             return ""
-        raw = raw.replace("/", "").replace("_", "-")
-        if "-SWAP-USDT" in raw:
-            return raw.replace("-SWAP-USDT", "USDT")
-        if "-SWAP-USDC" in raw:
-            return raw.replace("-SWAP-USDC", "USDC")
-        raw = raw.replace("-", "")
-        raw = raw.replace("SWAP", "")
-        return raw
+        return normalize_bot_plain_symbol(raw)
 
     def _symbol_candidates(self, symbol: str) -> list[str]:
-        """Return common Toobit symbol formats for a futures symbol."""
+        """Return bot and Toobit symbol formats for a futures symbol."""
         raw = str(symbol or "").upper().strip()
         if not raw:
             return []
 
+        toobit_plain = normalize_toobit_plain_symbol(raw)
+        bot_plain = normalize_bot_plain_symbol(raw)
         normalized = self.normalize_futures_symbol(raw)
-        plain = self._plain_symbol(raw)
 
         candidates = []
         for item in (
             normalized,
-            plain,
-            raw.replace("/", "").replace("_", "").replace("-", ""),
+            toobit_plain,
+            bot_plain,
+            raw.replace("/", "").replace("_", "").replace("-", "").replace("SWAP", ""),
             raw,
         ):
             item = str(item or "").upper().strip()
