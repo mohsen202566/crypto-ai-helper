@@ -410,53 +410,6 @@ def _maybe_apply_daily_lock(state: Dict[str, Any]) -> bool:
     return False
 
 
-def is_real_trade_ready() -> tuple[bool, str]:
-    state = load_real_trade_state()
-
-    if not state.get("enabled"):
-        return False, "ترید واقعی خاموش است"
-
-    if state.get("emergency_stop"):
-        return False, "توقف اضطراری فعال است"
-
-    if state.get("daily_loss_locked_until", 0) > _now():
-        remaining = round((int(state.get("daily_loss_locked_until", 0)) - _now()) / 3600, 2)
-        return False, f"قفل ضرر روزانه فعال است؛ حدود {remaining} ساعت باقی مانده"
-
-    if float(state.get("initial_capital", 0)) <= 0:
-        return False, "سرمایه ترید تنظیم نشده است"
-
-    if float(state.get("position_size_usd", 0)) <= 0:
-        return False, "حجم هر پوزیشن تنظیم نشده است"
-
-    if float(state.get("leverage", 0)) <= 0:
-        return False, "لوریج تنظیم نشده است"
-
-    if int(state.get("max_positions", 0)) <= 0:
-        return False, "حداکثر پوزیشن تنظیم نشده است"
-
-    if len(state.get("open_positions", {})) >= int(state.get("max_positions", 0)):
-        return False, "ظرفیت پوزیشن‌ها پر است"
-
-    try:
-        bal_info = _extract_toobit_usdt_balance(toobit_client.get_account_balance())
-        if bal_info.get("ok"):
-            available = float(bal_info.get("available_balance") or 0)
-            needed = float(state.get("position_size_usd", 0) or 0)
-            if available < needed:
-                return False, f"بالانس قابل استفاده توبیت کافی نیست ({available}$ < {needed}$)"
-    except Exception:
-        # Do not crash status/commands if Toobit balance check temporarily fails.
-        pass
-
-    _maybe_apply_daily_lock(state)
-    if state.get("daily_loss_locked_until", 0) > _now():
-        save_real_trade_state(state)
-        return False, "قفل ضرر روزانه فعال شد"
-
-    return True, "آماده ترید واقعی"
-
-
 def set_real_initial_capital(amount: float) -> str:
     state = load_real_trade_state()
     amount = float(amount)
@@ -641,73 +594,6 @@ def record_realized_pnl(
     }
 
 
-def get_real_trade_status_text() -> str:
-    state = load_real_trade_state()
-    open_positions = state.get("open_positions", {})
-    if not isinstance(open_positions, dict):
-        open_positions = {}
-
-    try:
-        open_count = len(open_positions)
-    except Exception:
-        open_count = 0
-
-    try:
-        max_positions = int(float(state.get("max_positions", 0) or 0))
-    except Exception:
-        max_positions = 0
-
-    free_slots = max(max_positions - open_count, 0)
-
-    position_size = _round_usd(state.get("position_size_usd", 0))
-    leverage = _round_usd(state.get("leverage", 0))
-    approx_position = _round_usd(position_size * leverage, 4)
-
-    status = "✅ فعال" if state.get("enabled") else "⛔ غیرفعال"
-    emergency = "فعال" if state.get("emergency_stop") else "غیرفعال"
-
-    lock_line = "غیرفعال"
-    if int(state.get("daily_loss_locked_until", 0) or 0) > _now():
-        remaining = round((int(state.get("daily_loss_locked_until", 0)) - _now()) / 3600, 2)
-        lock_line = f"فعال، حدود {remaining} ساعت باقی مانده"
-
-    toobit_balance_line = "بالانس واقعی توبیت: نامشخص"
-    try:
-        toobit_balance_info = _extract_toobit_usdt_balance(toobit_client.get_account_balance())
-        if toobit_balance_info.get("ok"):
-            toobit_balance_line = (
-                f"بالانس واقعی توبیت: {toobit_balance_info.get('balance')}$\n"
-                f"بالانس قابل استفاده توبیت: {toobit_balance_info.get('available_balance')}$"
-            )
-        else:
-            toobit_balance_line = f"بالانس واقعی توبیت: خطا ({str(toobit_balance_info.get('error'))[:120]})"
-    except Exception as e:
-        toobit_balance_line = f"بالانس واقعی توبیت: خطا ({str(e)[:120]})"
-
-    ready, reason = is_real_trade_ready()
-    readiness = "آماده سفارش واقعی" if ready else reason
-
-    return (
-        "🤖 وضعیت ترید واقعی توبیت\n"
-        f"وضعیت: {status}\n"
-        f"حالت: REAL\n"
-        f"صرافی: TOOBIT\n"
-        f"توقف اضطراری: {emergency}\n"
-        f"آمادگی: {readiness}\n\n"
-        f"{toobit_balance_line}\n\n"
-        f"حجم هر پوزیشن: {position_size}$\n"
-        f"لوریج: {leverage}x\n"
-        f"حجم تقریبی پوزیشن: {approx_position}$\n\n"
-        f"پوزیشن باز: {open_count}/{max_positions}\n"
-        f"اسلات خالی: {free_slots}\n\n"
-        f"سود/ضرر امروز: {round(float(state.get('today_realized_pnl', 0)), 4)}$\n"
-        f"سود/ضرر کل: {round(float(state.get('total_realized_pnl', 0)), 4)}$\n"
-        f"حد ضرر روزانه: {state.get('daily_loss_limit_usd', 0)}$\n"
-        f"زمان قفل: {state.get('daily_lock_duration_hours', DEFAULT_REAL_LOCK_DURATION_HOURS)} ساعت\n"
-        f"قفل ضرر روزانه: {lock_line}"
-    )
-
-
 def get_toobit_balance_text() -> str:
     result = toobit_client.get_account_balance()
 
@@ -736,91 +622,6 @@ def calculate_order_quantity(entry_price: float) -> float:
     notional = position_usd * leverage
     quantity = notional / float(entry_price)
     return round(quantity, 6)
-
-
-def open_real_position_from_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
-    ready, reason = is_real_trade_ready()
-    if not ready:
-        return {"ok": False, "blocked": True, "error": reason}
-
-    symbol = signal.get("symbol")
-    direction = signal.get("direction")
-    entry = float(signal.get("entry", 0))
-    tp1 = signal.get("tp1")
-    sl = signal.get("sl") or signal.get("stop_loss")
-    signal_id = signal.get("signal_id") or signal.get("id") or f"{symbol}_{direction}_{_now()}"
-
-    if not symbol or not direction or entry <= 0:
-        return {"ok": False, "error": "اطلاعات سیگنال ناقص است"}
-
-    state = load_real_trade_state()
-
-    if signal_id in state.get("open_positions", {}):
-        return {"ok": False, "blocked": True, "error": "این سیگنال قبلاً پوزیشن باز دارد"}
-
-    quantity = calculate_order_quantity(entry)
-    if quantity <= 0:
-        return {"ok": False, "error": "محاسبه حجم سفارش نامعتبر است"}
-
-    order_result = toobit_client.place_market_order(
-        symbol=symbol,
-        direction=direction,
-        quantity=quantity,
-        take_profit=tp1,
-        stop_loss=sl,
-    )
-
-    if not order_result.get("ok"):
-        return order_result
-
-    confirmed_position, execution_info = _order_is_confirmed_position(order_result)
-    if not confirmed_position:
-        return {
-            "ok": False,
-            "blocked": True,
-            "error": (
-                "سفارش توسط توبیت پذیرفته شد اما هنوز اجرا نشده است؛ "
-                "برای جلوگیری از اسلات اشتباه، وارد لیست پوزیشن‌های باز نشد."
-            ),
-            "order_status": execution_info.get("status"),
-            "executed_qty": execution_info.get("executed_qty"),
-            "orig_qty": execution_info.get("orig_qty"),
-            "order_id": execution_info.get("order_id"),
-            "client_order_id": execution_info.get("client_order_id"),
-            "exchange_result": order_result.get("data"),
-        }
-
-    state = load_real_trade_state()
-    if signal_id in state.get("open_positions", {}):
-        return {"ok": False, "blocked": True, "error": "این سیگنال قبلاً پوزیشن باز دارد"}
-
-    state["open_positions"][signal_id] = {
-        "signal_id": signal_id,
-        "symbol": symbol,
-        "direction": direction,
-        "entry": entry,
-        "tp1": tp1,
-        "tp2": signal.get("tp2"),
-        "sl": sl,
-        "quantity": quantity,
-        "position_size_usd": state.get("position_size_usd", 0),
-        "leverage": state.get("leverage", 0),
-        "opened_at": _now(),
-        "exchange_order": order_result.get("data"),
-        "execution_info": execution_info,
-    }
-
-    save_real_trade_state(state)
-
-    return {
-        "ok": True,
-        "signal_id": signal_id,
-        "symbol": symbol,
-        "direction": direction,
-        "quantity": quantity,
-        "order": order_result.get("data"),
-        "execution_info": execution_info,
-    }
 
 
 def close_real_position(
@@ -1152,6 +953,110 @@ def is_real_trade_ready() -> tuple[bool, str]:
     return True, "آماده ترید واقعی"
 
 
+
+
+def _call_client_method(method_names: tuple[str, ...], *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    """Call the first available Toobit client method from a candidate list."""
+    for method_name in method_names:
+        method = getattr(toobit_client, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            result = method(*args, **kwargs)
+            if isinstance(result, dict):
+                return result
+            return {"ok": True, "data": result, "method": method_name}
+        except TypeError:
+            # Try again without keyword arguments for older client versions.
+            try:
+                result = method(*args)
+                if isinstance(result, dict):
+                    return result
+                return {"ok": True, "data": result, "method": method_name}
+            except Exception as e:
+                return {"ok": False, "error": str(e), "method": method_name}
+        except Exception as e:
+            return {"ok": False, "error": str(e), "method": method_name}
+    return {"ok": False, "error": "Toobit client leverage method not found"}
+
+
+def _extract_leverage_from_result(result: Dict[str, Any]) -> float:
+    if not isinstance(result, dict):
+        return 0.0
+    candidates = []
+    for item in _flatten_dicts(result.get("data", result)):
+        if isinstance(item, dict):
+            for key in ("leverage", "lever", "leverageValue"):
+                if key in item:
+                    candidates.append(_safe_float_any(item.get(key)))
+    for value in candidates:
+        if value > 0:
+            return value
+    return 0.0
+
+
+def _ensure_toobit_leverage(symbol: str, desired_leverage: float) -> Dict[str, Any]:
+    """
+    Safety gate before a real order.
+
+    The order is allowed only if the configured leverage can be set/read back
+    through the available Toobit client methods. If the current client does not
+    expose leverage verification, we block instead of opening an unsafe trade.
+    """
+    desired = float(desired_leverage or 0)
+    if desired <= 0:
+        return {"ok": False, "error": "لوریج تنظیمی نامعتبر است"}
+
+    # 1) Try to set/change leverage. Candidate names keep compatibility with
+    # different tobit_client.py versions.
+    set_result = _call_client_method(
+        ("set_leverage", "set_symbol_leverage", "change_leverage", "change_symbol_leverage", "set_futures_leverage"),
+        symbol,
+        desired,
+    )
+    if not set_result.get("ok"):
+        return {
+            "ok": False,
+            "error": "تنظیم لوریج در توبیت ناموفق بود؛ سفارش واقعی ارسال نشد.",
+            "details": set_result.get("error"),
+        }
+
+    # 2) Read/verify leverage. If the client cannot read it back, block safely.
+    read_result = _call_client_method(
+        ("get_symbol_leverage", "get_leverage", "get_futures_leverage", "get_position_mode_leverage"),
+        symbol,
+    )
+    if not read_result.get("ok"):
+        return {
+            "ok": False,
+            "error": "تایید لوریج از توبیت ممکن نشد؛ برای امنیت سفارش واقعی ارسال نشد.",
+            "details": read_result.get("error"),
+            "set_result": set_result,
+        }
+
+    actual = _extract_leverage_from_result(read_result)
+    if actual <= 0:
+        # Some clients return only success on set but no numeric readback. For
+        # real money we keep this conservative.
+        return {
+            "ok": False,
+            "error": "عدد لوریج از پاسخ توبیت قابل تشخیص نبود؛ سفارش واقعی ارسال نشد.",
+            "set_result": set_result,
+            "read_result": read_result,
+        }
+
+    if abs(actual - desired) > 0.01:
+        return {
+            "ok": False,
+            "error": f"لوریج توبیت با تنظیم ربات یکی نیست ({actual}x != {desired}x)؛ سفارش واقعی ارسال نشد.",
+            "actual_leverage": actual,
+            "desired_leverage": desired,
+            "set_result": set_result,
+            "read_result": read_result,
+        }
+
+    return {"ok": True, "actual_leverage": actual, "desired_leverage": desired}
+
 def open_real_position_from_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
     ready, reason = is_real_trade_ready()
     if not ready:
@@ -1181,6 +1086,10 @@ def open_real_position_from_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
     quantity = calculate_order_quantity(entry)
     if quantity <= 0:
         return {"ok": False, "error": "محاسبه حجم سفارش نامعتبر است"}
+
+    leverage_check = _ensure_toobit_leverage(symbol, float(state.get("leverage", 0) or 0))
+    if not leverage_check.get("ok"):
+        return {"ok": False, "blocked": True, "error": leverage_check.get("error"), "leverage_check": leverage_check}
 
     order_result = toobit_client.place_market_order(
         symbol=symbol,
@@ -1329,3 +1238,93 @@ def get_real_trade_status_text() -> str:
         f"زمان قفل: {state.get('daily_lock_duration_hours', DEFAULT_REAL_LOCK_DURATION_HOURS)} ساعت\n"
         f"قفل ضرر روزانه: {lock_line}"
     )
+
+# ---------------------------------------------------------------------------
+# Bot-facing helper functions
+# These three functions are intentionally small/stable so bot.py can import
+# them without duplicating parsing/order-result logic.
+# ---------------------------------------------------------------------------
+
+def handle_real_trade_command(text: str) -> Optional[str]:
+    """Parse Persian real-trade commands and return a Telegram-ready response."""
+    msg = str(text or "").strip()
+    if not msg:
+        return None
+
+    parts = msg.replace("x", " ").replace("X", " ").split()
+    head = parts[0] if parts else ""
+
+    def _num(default: Optional[float] = None) -> Optional[float]:
+        for token in parts[1:]:
+            token = token.replace("$", "").replace(",", "").strip()
+            try:
+                return float(token)
+            except Exception:
+                continue
+        return default
+
+    if msg in {"ترید", "وضعیت ترید", "ترید واقعی", "وضعیت ترید واقعی"}:
+        return get_real_trade_status_text()
+    if msg in {"بالانس توبیت", "موجودی توبیت"}:
+        return get_toobit_balance_text()
+    if msg in {"ترید فعال", "فعال کردن ترید", "ترید روشن", "روشن کردن ترید"}:
+        return enable_real_trading()
+    if msg in {"ترید خاموش", "غیرفعال کردن ترید", "ترید غیرفعال"}:
+        return disable_real_trading()
+    if msg in {"توقف اضطراری", "استاپ اضطراری", "قطع اضطراری"}:
+        return activate_real_emergency_stop()
+    if msg in {"ریست ترید", "ریست ترید واقعی"}:
+        return reset_real_trade_state()
+
+    if msg.startswith("سرمایه ترید"):
+        value = _num()
+        return set_real_initial_capital(value) if value is not None else "❌ مقدار سرمایه را وارد کن. مثال: سرمایه ترید 50"
+    if msg.startswith("ترید دلار") or msg.startswith("حجم پوزیشن"):
+        value = _num()
+        return set_real_position_size(value) if value is not None else "❌ مقدار دلار هر پوزیشن را وارد کن. مثال: ترید دلار 5"
+    if msg.startswith("ترید لوریج") or msg.startswith("لوریج ترید"):
+        value = _num()
+        return set_real_leverage(value) if value is not None else "❌ مقدار لوریج را وارد کن. مثال: ترید لوریج 10"
+    if msg.startswith("حداکثر پوزیشن") or msg.startswith("حداکثر پوزیشن‌ها"):
+        value = _num()
+        return set_real_max_positions(int(value)) if value is not None else "❌ تعداد پوزیشن را وارد کن. مثال: حداکثر پوزیشن 10"
+    if msg.startswith("حد ضرر روزانه") or msg.startswith("ضرر روزانه"):
+        value = _num()
+        return set_real_daily_loss_limit(value) if value is not None else "❌ مقدار حد ضرر روزانه را وارد کن. مثال: حد ضرر روزانه 5"
+    if msg.startswith("زمان قفل") or msg.startswith("مدت قفل"):
+        value = _num()
+        return set_real_lock_duration_hours(int(value)) if value is not None else "❌ مدت قفل را به ساعت وارد کن. مثال: زمان قفل 1"
+
+    return None
+
+
+def format_real_trade_open_result(result: Dict[str, Any]) -> str:
+    """Convert open_real_position_from_signal result into a short Persian message."""
+    if not isinstance(result, dict):
+        return "❌ نتیجه سفارش واقعی نامعتبر بود."
+    if result.get("ok"):
+        warning = result.get("warning")
+        msg = (
+            "✅ سفارش واقعی ثبت و تایید شد.\n"
+            f"نماد: {result.get('symbol')}\n"
+            f"جهت: {result.get('direction')}\n"
+            f"حجم: {result.get('quantity')}"
+        )
+        if warning:
+            msg += f"\n⚠️ {warning}"
+        return msg
+
+    hint = result.get("user_hint")
+    err = result.get("error") or result.get("msg") or result.get("data") or "نامشخص"
+    msg = f"❌ سفارش واقعی ثبت نشد.\nعلت: {err}"
+    if hint:
+        msg += f"\nراهنما: {hint}"
+    return msg
+
+
+def try_open_real_trade_from_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
+    """Bot.py wrapper: open a real trade and include a ready-to-send message."""
+    result = open_real_position_from_signal(signal)
+    result["message"] = format_real_trade_open_result(result)
+    return result
+
