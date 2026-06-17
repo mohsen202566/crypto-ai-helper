@@ -247,57 +247,220 @@ class ToobitClient:
     def get_positions(self, symbol: str | None = None, category: str | None = None):
         return self.get_position(symbol=symbol, category=category)
 
+    def _plain_symbol(self, symbol: str) -> str:
+        """Convert Toobit/futures symbols to plain symbols like UNIUSDT."""
+        raw = str(symbol or "").upper().strip()
+        if not raw:
+            return ""
+        raw = raw.replace("/", "").replace("_", "-")
+        if "-SWAP-USDT" in raw:
+            return raw.replace("-SWAP-USDT", "USDT")
+        if "-SWAP-USDC" in raw:
+            return raw.replace("-SWAP-USDC", "USDC")
+        raw = raw.replace("-", "")
+        raw = raw.replace("SWAP", "")
+        return raw
+
+    def _symbol_candidates(self, symbol: str) -> list[str]:
+        """Return common Toobit symbol formats for a futures symbol."""
+        raw = str(symbol or "").upper().strip()
+        if not raw:
+            return []
+
+        normalized = self.normalize_futures_symbol(raw)
+        plain = self._plain_symbol(raw)
+
+        candidates = []
+        for item in (
+            normalized,
+            plain,
+            raw.replace("/", "").replace("_", "").replace("-", ""),
+            raw,
+        ):
+            item = str(item or "").upper().strip()
+            if item and item not in candidates:
+                candidates.append(item)
+        return candidates
+
+    def _dict_looks_like_position(self, item: dict) -> bool:
+        """Best-effort check for Toobit position rows."""
+        if not isinstance(item, dict):
+            return False
+        position_keys = {
+            "symbol", "contractCode", "instrument", "instId", "pair",
+            "positionAmt", "positionSize", "size", "qty", "quantity",
+            "positionQuantity", "availablePosition", "totalPosition",
+            "holdVol", "holdVolume", "volume", "position",
+            "entryPrice", "avgPrice", "openPrice", "positionAvgPrice",
+            "averagePrice", "leverage", "side", "positionSide", "direction",
+            "positionType", "holdSide", "tradeSide",
+        }
+        return any(k in item for k in position_keys)
+
     def _flatten_position_items(self, result):
-        """Return a flat list of position dicts from Toobit response shapes."""
+        """Return a flat list of likely position dicts from Toobit response shapes."""
         data = (result or {}).get("data")
-        if isinstance(data, list):
-            return [x for x in data if isinstance(x, dict)]
-        if isinstance(data, dict):
-            for key in ("data", "result", "list", "positions"):
-                v = data.get(key)
-                if isinstance(v, list):
-                    return [x for x in v if isinstance(x, dict)]
-            return [data]
-        return []
+        out = []
+
+        def walk(value):
+            if isinstance(value, dict):
+                if self._dict_looks_like_position(value):
+                    out.append(value)
+                for v in value.values():
+                    if isinstance(v, (dict, list)):
+                        walk(v)
+            elif isinstance(value, list):
+                for item in value:
+                    walk(item)
+
+        walk(data)
+        # Fallback: if Toobit returns one raw dict without recognizable keys.
+        if not out and isinstance(data, dict):
+            out.append(data)
+        return out
 
     def _position_qty(self, item: dict) -> float:
         """Best-effort quantity extractor for Toobit futures position rows."""
-        for key in ("positionAmt", "positionSize", "size", "qty", "quantity", "positionQuantity", "availablePosition"):
+        qty_keys = (
+            "positionAmt", "positionSize", "size", "qty", "quantity",
+            "positionQuantity", "availablePosition", "totalPosition",
+            "holdVol", "holdVolume", "volume", "position",
+        )
+        for key in qty_keys:
             try:
                 v = item.get(key)
                 if v is not None and str(v).strip() != "":
                     return abs(float(v))
             except Exception:
                 pass
+
+        # Some APIs return long/short quantities separately.
+        for key in ("longQty", "shortQty", "longSize", "shortSize", "longPosition", "shortPosition"):
+            try:
+                v = item.get(key)
+                if v is not None and str(v).strip() != "":
+                    qty = abs(float(v))
+                    if qty > 0:
+                        return qty
+            except Exception:
+                pass
         return 0.0
+
+    def _position_symbol_matches(self, item: dict, symbol: str) -> bool:
+        """Best-effort symbol matcher for Toobit futures position rows."""
+        wanted = set(self._symbol_candidates(symbol))
+        if not wanted:
+            return False
+
+        symbol_fields = (
+            "symbol", "contractCode", "instrument", "instId", "pair",
+            "symbolName", "contract", "contractName",
+        )
+
+        for key in symbol_fields:
+            value = item.get(key)
+            if value is None or str(value).strip() == "":
+                continue
+            candidates = set(self._symbol_candidates(str(value)))
+            if candidates & wanted:
+                return True
+
+        # If the position endpoint was queried with symbol and Toobit omitted
+        # the symbol field, allow this row to pass symbol matching.
+        return not any(item.get(k) for k in symbol_fields)
 
     def _position_side_matches(self, item: dict, direction: str) -> bool:
         """Best-effort side matcher; if side is absent but qty > 0, accept it."""
         direction = str(direction or "").upper().strip()
-        raw = " ".join(str(item.get(k, "")) for k in ("side", "positionSide", "direction", "positionType")).upper()
+        raw = " ".join(str(item.get(k, "")) for k in (
+            "side", "positionSide", "direction", "positionType", "holdSide",
+            "tradeSide", "sideType", "positionDirection",
+        )).upper()
+
         if direction == "LONG":
-            return ("LONG" in raw) or ("BUY" in raw) or (raw.strip() == "" and self._position_qty(item) > 0)
+            return (
+                "LONG" in raw
+                or "BUY" in raw
+                or "BULL" in raw
+                or "多" in raw
+                or (raw.strip() == "" and self._position_qty(item) > 0)
+            )
         if direction == "SHORT":
-            return ("SHORT" in raw) or ("SELL" in raw) or (raw.strip() == "" and self._position_qty(item) > 0)
+            return (
+                "SHORT" in raw
+                or "SELL" in raw
+                or "BEAR" in raw
+                or "空" in raw
+                or (raw.strip() == "" and self._position_qty(item) > 0)
+            )
         return False
 
     def _has_open_position(self, symbol: str, direction: str, min_qty: float = 0.0):
         """
-        Verify if an exchange position is actually open.
-        Used as a safety recovery when Toobit returns an error after creating a position.
+        Verify if an exchange futures position is actually open.
+
+        Important:
+        - Do not require the exchange quantity to be close to the order quantity.
+          Toobit may expose different quantity fields/precision after market execution.
+        - Check both symbol-specific and all-position endpoints, because some
+          Toobit responses omit/ignore the symbol filter.
         """
-        result = self.get_position(symbol=symbol)
-        if not result.get("ok"):
-            return False, result
+        symbol = str(symbol or "").upper().strip()
+        direction = str(direction or "").upper().strip()
 
-        items = self._flatten_position_items(result)
-        for item in items:
-            qty = self._position_qty(item)
-            if qty > max(float(min_qty or 0.0) * 0.25, 0.0) and self._position_side_matches(item, direction):
-                return True, {"ok": True, "position": item, "raw": result}
+        results = []
+        seen_paths = set()
 
-        return False, result
+        for query_symbol in (symbol, self.normalize_futures_symbol(symbol), None):
+            try:
+                result = self.get_position(symbol=query_symbol)
+            except Exception as e:
+                result = {"ok": False, "error": str(e), "query_symbol": query_symbol}
 
+            key = str((result or {}).get("path")) + "|" + str(query_symbol)
+            if key in seen_paths:
+                continue
+            seen_paths.add(key)
+            results.append({"query_symbol": query_symbol, "result": result})
+
+            if not isinstance(result, dict) or not result.get("ok"):
+                continue
+
+            items = self._flatten_position_items(result)
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                qty = self._position_qty(item)
+
+                # A real open position must have positive quantity. Use any
+                # positive quantity as confirmation; min_qty is only used as a
+                # very small noise floor, not as a strict expected amount.
+                noise_floor = max(float(min_qty or 0.0) * 0.01, 0.0)
+                if qty <= noise_floor:
+                    continue
+
+                if not self._position_symbol_matches(item, symbol):
+                    continue
+
+                if not self._position_side_matches(item, direction):
+                    continue
+
+                return True, {
+                    "ok": True,
+                    "position": item,
+                    "quantity_detected": qty,
+                    "query_symbol": query_symbol,
+                    "raw": result,
+                }
+
+        return False, {
+            "ok": False,
+            "error": "open futures position not found",
+            "symbol": symbol,
+            "direction": direction,
+            "min_qty": min_qty,
+            "checked": results[-3:],
+        }
 
     # ---------- Leverage ----------
     def _extract_leverage_value(self, data) -> float:
