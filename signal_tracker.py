@@ -21,9 +21,11 @@ except Exception:
     update_signal_result = None
 
 try:
-    from coin_risk import register_result
+    from coin_risk import register_result, register_real_result, register_ghost_result
 except Exception:
     register_result = None
+    register_real_result = None
+    register_ghost_result = None
 
 try:
     from slot_manager import add_position, close_position
@@ -179,21 +181,77 @@ def ai_record_signal(signal: Dict[str, Any]) -> None:
         pass
 
 
+def _learning_snapshot(signal: Dict[str, Any], exit_price: Optional[float] = None, move_percent: Optional[float] = None) -> Dict[str, Any]:
+    """Build compact snapshot for AI learning/risk memory.
+
+    The analysis engine already stores a rich `snapshot`; this function keeps it
+    and adds tracker/result context so coin_risk and coin_learning can learn from
+    the exact real signal outcome.
+    """
+    snap = signal.get("snapshot") if isinstance(signal.get("snapshot"), dict) else {}
+    out = dict(snap)
+    for key in [
+        "symbol", "direction", "entry", "price", "score", "risk_level",
+        "risk_reward", "confirmations", "freshness", "rsi", "adx", "macd",
+        "macd_signal", "macd_hist", "power2_buy", "power2_sell",
+        "power3_buy", "power3_sell", "buy_power", "sell_power", "atr",
+        "market_mode", "coin_behavior", "btc_bias", "support", "resistance",
+        "entry_mode",
+    ]:
+        if key not in out and signal.get(key) is not None:
+            out[key] = signal.get(key)
+    if exit_price is not None:
+        out["exit_price"] = exit_price
+    if move_percent is not None:
+        out["move_percent"] = move_percent
+    out["result_source"] = "REAL"
+    out["result_recorded_at"] = now_ts()
+    return out
+
+
 def ai_record_result(signal: Dict[str, Any], hit_type: str, exit_price: float, pct: float) -> None:
+    """Send REAL TP1/SL outcome to AI learning and coin-risk memory.
+
+    TP2 is intentionally not tracked here per current architecture preference;
+    TP1 vs SL remains the main win-rate and risk-learning signal.
+    """
     signal_id = signal.get("signal_id") or signal.get("id")
+    snapshot = _learning_snapshot(signal, exit_price=exit_price, move_percent=pct)
+
     if update_signal_result:
         try:
-            update_signal_result(signal_id, hit_type, exit_price=exit_price, move_percent=pct)
+            update_signal_result(signal_id, hit_type, exit_price=exit_price, move_percent=pct, snapshot=snapshot, source="REAL")
         except TypeError:
             try:
-                update_signal_result(signal_id, hit_type)
+                update_signal_result(signal_id, hit_type, exit_price=exit_price, move_percent=pct)
+            except TypeError:
+                try:
+                    update_signal_result(signal_id, hit_type)
+                except Exception:
+                    pass
             except Exception:
                 pass
         except Exception:
             pass
+
+    # New coin_risk.py supports persistent daily + long-term memory, source,
+    # and snapshot. Prefer the explicit REAL function, then fall back safely for
+    # older deployments.
+    try:
+        if register_real_result:
+            register_real_result(signal.get("symbol"), signal.get("direction"), hit_type, snapshot=snapshot)
+            return
+    except Exception:
+        pass
+
     if register_result:
         try:
-            register_result(signal.get("symbol"), signal.get("direction"), hit_type)
+            register_result(signal.get("symbol"), signal.get("direction"), hit_type, source="REAL", snapshot=snapshot, is_ghost=False)
+        except TypeError:
+            try:
+                register_result(signal.get("symbol"), signal.get("direction"), hit_type)
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -306,6 +364,12 @@ def add_signal_to_tracking(*args, **kwargs) -> Tuple[bool, str]:
         "btc_bias": result.get("btc_bias"),
         "support": result.get("support"),
         "resistance": result.get("resistance"),
+        "vwap_status": result.get("vwap_status"),
+        "min_score": result.get("min_score"),
+        "required_confirmations": result.get("required_confirmations"),
+        "ai_decision": result.get("ai_decision", {}),
+        "coin_risk": result.get("coin_risk", {}),
+        "rotation": result.get("rotation", {}),
         "snapshot": result.get("snapshot", {}),
         "reasons": result.get("reasons", []),
         "created_at": now_ts(),
