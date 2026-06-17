@@ -298,6 +298,182 @@ class ToobitClient:
 
         return False, result
 
+
+    # ---------- Leverage ----------
+    def _extract_leverage_value(self, data) -> float:
+        """Best-effort leverage extractor from Toobit response shapes."""
+        def walk(value):
+            if isinstance(value, dict):
+                yield value
+                for v in value.values():
+                    yield from walk(v)
+            elif isinstance(value, list):
+                for item in value:
+                    yield from walk(item)
+
+        for item in walk(data):
+            if not isinstance(item, dict):
+                continue
+            for key in ("leverage", "lever", "leverageValue", "longLeverage", "shortLeverage"):
+                if key not in item:
+                    continue
+                try:
+                    value = float(item.get(key))
+                    if value > 0:
+                        return value
+                except Exception:
+                    pass
+        return 0.0
+
+    def set_leverage(self, symbol: str, leverage: float):
+        """
+        Set futures leverage for a symbol before opening a real position.
+
+        Toobit API versions can expose slightly different leverage paths, so this
+        method tries a small safe list of signed POST endpoints. The first
+        successful response is returned. If all paths fail, the error includes
+        every attempted path for debugging.
+        """
+        if not REAL_TRADING_ENABLED:
+            return {
+                "ok": False,
+                "blocked": True,
+                "error": "ترید واقعی غیرفعال است. REAL_TRADING_ENABLED=false",
+            }
+
+        symbol = self.normalize_futures_symbol(symbol)
+        try:
+            lev = int(float(leverage))
+        except Exception:
+            return {"ok": False, "error": "leverage نامعتبر است"}
+
+        if lev <= 0:
+            return {"ok": False, "error": "leverage باید بیشتر از صفر باشد"}
+
+        request_variants = [
+            {"symbol": symbol, "leverage": lev},
+            {"symbol": symbol, "leverage": str(lev)},
+            {"symbol": symbol, "longLeverage": lev, "shortLeverage": lev},
+            {"symbol": symbol, "longLeverage": str(lev), "shortLeverage": str(lev)},
+        ]
+        candidate_paths = (
+            "/api/v1/futures/leverage",
+            "/api/v1/futures/position/leverage",
+            "/api/v1/futures/set-leverage",
+            "/api/v1/futures/setLeverage",
+        )
+
+        attempts = []
+        for path in candidate_paths:
+            for params in request_variants:
+                result = self._signed_request("POST", path, params)
+                attempts.append({
+                    "path": path,
+                    "params_keys": list(params.keys()),
+                    "ok": bool(result.get("ok")),
+                    "error": result.get("error"),
+                    "data": result.get("data"),
+                })
+                if result.get("ok"):
+                    self._last_set_leverage = {
+                        "symbol": symbol,
+                        "leverage": float(lev),
+                        "set_result": result,
+                        "set_at": self._now_ms(),
+                    }
+                    if isinstance(result.get("data"), dict):
+                        result["data"].setdefault("leverage", lev)
+                    else:
+                        result["data"] = {"raw": result.get("data"), "leverage": lev}
+                    result["actual_leverage"] = float(lev)
+                    return result
+
+        return {
+            "ok": False,
+            "error": "تنظیم لوریج در توبیت ناموفق بود",
+            "attempts": attempts[-8:],
+        }
+
+    def get_symbol_leverage(self, symbol: str):
+        """
+        Read current futures leverage for a symbol.
+
+        Priority:
+        1) Open-position response if Toobit returns leverage there.
+        2) Known leverage GET endpoints.
+        3) Last accepted set_leverage result for the same symbol as a fallback.
+        """
+        symbol = self.normalize_futures_symbol(symbol)
+
+        pos_result = self.get_position(symbol=symbol)
+        if pos_result.get("ok"):
+            value = self._extract_leverage_value(pos_result.get("data"))
+            if value > 0:
+                return {"ok": True, "data": {"symbol": symbol, "leverage": value}, "source": "positions", "raw": pos_result}
+
+        candidate_paths = (
+            "/api/v1/futures/leverage",
+            "/api/v1/futures/position/leverage",
+            "/api/v1/futures/position/margin",
+            "/api/v1/futures/symbol/config",
+        )
+        attempts = []
+        for path in candidate_paths:
+            result = self._signed_request("GET", path, {"symbol": symbol})
+            attempts.append({"path": path, "ok": bool(result.get("ok")), "error": result.get("error"), "data": result.get("data")})
+            if result.get("ok"):
+                value = self._extract_leverage_value(result.get("data"))
+                if value > 0:
+                    return {"ok": True, "data": {"symbol": symbol, "leverage": value}, "source": path, "raw": result}
+
+        cached = getattr(self, "_last_set_leverage", None)
+        if isinstance(cached, dict) and cached.get("symbol") == symbol:
+            age_ms = self._now_ms() - int(cached.get("set_at", 0) or 0)
+            if 0 <= age_ms <= 60000 and float(cached.get("leverage") or 0) > 0:
+                return {
+                    "ok": True,
+                    "data": {"symbol": symbol, "leverage": float(cached.get("leverage"))},
+                    "source": "last_accepted_set_leverage",
+                    "warning": "Toobit readback endpoint did not expose leverage; using last accepted set_leverage response.",
+                    "set_result": cached.get("set_result"),
+                }
+
+        return {
+            "ok": False,
+            "error": "تایید لوریج از توبیت ممکن نشد",
+            "position_read": pos_result,
+            "attempts": attempts[-6:],
+        }
+
+    def set_symbol_leverage(self, symbol: str, leverage: float):
+        """Backward-compatible alias used by real_trade_manager.py."""
+        return self.set_leverage(symbol, leverage)
+
+    def change_leverage(self, symbol: str, leverage: float):
+        """Backward-compatible alias used by real_trade_manager.py."""
+        return self.set_leverage(symbol, leverage)
+
+    def change_symbol_leverage(self, symbol: str, leverage: float):
+        """Backward-compatible alias used by real_trade_manager.py."""
+        return self.set_leverage(symbol, leverage)
+
+    def set_futures_leverage(self, symbol: str, leverage: float):
+        """Backward-compatible alias used by real_trade_manager.py."""
+        return self.set_leverage(symbol, leverage)
+
+    def get_leverage(self, symbol: str):
+        """Backward-compatible alias used by real_trade_manager.py."""
+        return self.get_symbol_leverage(symbol)
+
+    def get_futures_leverage(self, symbol: str):
+        """Backward-compatible alias used by real_trade_manager.py."""
+        return self.get_symbol_leverage(symbol)
+
+    def get_position_mode_leverage(self, symbol: str):
+        """Backward-compatible alias used by real_trade_manager.py."""
+        return self.get_symbol_leverage(symbol)
+
+
     # ---------- Orders ----------
     def place_market_order(
         self,
