@@ -17,6 +17,24 @@ from typing import Dict, Any, Optional
 from data_store import load_json, save_json
 from tobit_client import toobit_client
 
+try:
+    from tobit_client import normalize_bot_plain_symbol
+except Exception:
+    def normalize_bot_plain_symbol(symbol: str) -> str:
+        raw = str(symbol or "").upper().strip()
+        if not raw:
+            return ""
+        raw = raw.replace("/", "").replace("_", "-")
+        if raw.endswith("-SWAP-USDT"):
+            raw = raw.replace("-SWAP-USDT", "USDT")
+        elif raw.endswith("-SWAP-USDC"):
+            raw = raw.replace("-SWAP-USDC", "USDC")
+        raw = raw.replace("-", "").replace("SWAP", "")
+        for prefix in ("1000000", "10000", "1000"):
+            if raw.startswith(prefix) and raw.endswith("USDT"):
+                return raw[len(prefix):]
+        return raw
+
 
 REAL_TRADE_FILE = "data/real_trade_state.json"
 
@@ -671,6 +689,100 @@ def _estimated_min_quantity(symbol: str, entry_price: float) -> float:
     return 100.0
 
 
+
+def _toobit_normalized_symbol(symbol: str) -> str:
+    """Return the exact Toobit futures symbol used for signed order routes."""
+    try:
+        return str(toobit_client.normalize_futures_symbol(symbol)).upper().strip()
+    except Exception:
+        raw = str(symbol or "").upper().strip().replace("/", "").replace("_", "").replace("-", "")
+        if raw.endswith("USDT"):
+            return f"{raw[:-4]}-SWAP-USDT"
+        if raw.endswith("USDC"):
+            return f"{raw[:-4]}-SWAP-USDC"
+        return raw
+
+
+def _toobit_contract_multiplier(symbol: str) -> float:
+    """
+    Detect Toobit's multiplier contracts such as 1000SHIB-SWAP-USDT.
+
+    The bot/analysis works with normal symbols and normal prices, e.g. SHIBUSDT
+    at 0.000012. Toobit may trade 1000SHIB-SWAP-USDT at 0.012. For those pairs:
+      - Toobit order prices/TP/SL must be multiplied by the multiplier.
+      - Toobit order quantity must be divided by the multiplier.
+    """
+    bot_plain = normalize_bot_plain_symbol(symbol)
+    if not bot_plain.endswith("USDT") and not bot_plain.endswith("USDC"):
+        return 1.0
+
+    bot_base = bot_plain
+    for quote in ("USDT", "USDC"):
+        if bot_base.endswith(quote):
+            bot_base = bot_base[: -len(quote)]
+            break
+
+    normalized = _toobit_normalized_symbol(symbol)
+    contract = normalized.split("-SWAP-")[0].replace("-", "")
+    digits = ""
+    for ch in contract:
+        if ch.isdigit():
+            digits += ch
+        else:
+            break
+
+    if digits and contract[len(digits):] == bot_base:
+        try:
+            mult = float(digits)
+            return mult if mult > 1 else 1.0
+        except Exception:
+            return 1.0
+    return 1.0
+
+
+def _scale_price_for_toobit(symbol: str, price: Optional[float]) -> Optional[float]:
+    if price is None:
+        return None
+    try:
+        value = float(price)
+    except Exception:
+        return None
+    if value <= 0:
+        return None
+    return _round_usd(value * _toobit_contract_multiplier(symbol), 12)
+
+
+def _scale_quantity_for_toobit(symbol: str, quantity: float) -> float:
+    try:
+        qty = float(quantity or 0)
+    except Exception:
+        return 0.0
+    mult = _toobit_contract_multiplier(symbol)
+    if mult <= 1:
+        return qty
+    scaled = qty / mult
+    if scaled >= 1:
+        return round(scaled, 6)
+    return round(scaled, 8)
+
+
+def _prepare_toobit_order_values(symbol: str, entry: float, tp1: Optional[float], sl: Optional[float], quantity: float) -> Dict[str, Any]:
+    """Build exchange-safe values without changing the bot's internal signal values."""
+    mult = _toobit_contract_multiplier(symbol)
+    return {
+        "bot_symbol": normalize_bot_plain_symbol(symbol),
+        "toobit_symbol": _toobit_normalized_symbol(symbol),
+        "toobit_multiplier": mult,
+        "bot_entry": float(entry or 0),
+        "bot_tp1": None if tp1 is None else float(tp1),
+        "bot_sl": None if sl is None else float(sl),
+        "bot_quantity": float(quantity or 0),
+        "toobit_entry": _scale_price_for_toobit(symbol, entry),
+        "toobit_tp1": _scale_price_for_toobit(symbol, tp1),
+        "toobit_sl": _scale_price_for_toobit(symbol, sl),
+        "toobit_quantity": _scale_quantity_for_toobit(symbol, quantity),
+    }
+
 def calculate_order_quantity(entry_price: float, symbol: Optional[str] = None) -> float:
     state = load_real_trade_state()
     position_usd = float(state.get("position_size_usd", 0))
@@ -780,16 +892,23 @@ PENDING_REAL_CONFIRM_STATUS = "PENDING_REAL_CONFIRM"
 
 
 def _plain_symbol_from_toobit(value: Any) -> str:
-    raw = str(value or "").upper().strip()
-    if not raw:
-        return ""
-    raw = raw.replace("/", "").replace("_", "-")
-    if "-SWAP-USDT" in raw:
-        return raw.replace("-SWAP-USDT", "USDT")
-    if "-SWAP-USDC" in raw:
-        return raw.replace("-SWAP-USDC", "USDC")
-    raw = raw.replace("-", "")
-    return raw
+    """Convert Toobit/futures symbols to the bot plain symbol, e.g. 1000SHIB -> SHIBUSDT."""
+    try:
+        return normalize_bot_plain_symbol(str(value or ""))
+    except Exception:
+        raw = str(value or "").upper().strip()
+        if not raw:
+            return ""
+        raw = raw.replace("/", "").replace("_", "-")
+        if "-SWAP-USDT" in raw:
+            raw = raw.replace("-SWAP-USDT", "USDT")
+        elif "-SWAP-USDC" in raw:
+            raw = raw.replace("-SWAP-USDC", "USDC")
+        raw = raw.replace("-", "").replace("SWAP", "")
+        for prefix in ("1000000", "10000", "1000"):
+            if raw.startswith(prefix) and raw.endswith("USDT"):
+                return raw[len(prefix):]
+        return raw
 
 
 def _position_symbol_from_item(item: Dict[str, Any]) -> str:
@@ -882,8 +1001,10 @@ def get_toobit_open_positions_normalized(symbol: Optional[str] = None) -> Dict[s
 
 
 def _internal_position_matches_exchange(pos: Dict[str, Any], ex: Dict[str, Any]) -> bool:
+    pos_symbol = normalize_bot_plain_symbol(str(pos.get("symbol") or ""))
+    ex_symbol = normalize_bot_plain_symbol(str(ex.get("symbol") or ""))
     return (
-        str(pos.get("symbol") or "").upper() == str(ex.get("symbol") or "").upper()
+        pos_symbol == ex_symbol
         and str(pos.get("direction") or "").upper() == str(ex.get("direction") or "").upper()
     )
 
@@ -987,7 +1108,7 @@ def _wait_for_exchange_position(symbol: str, direction: str, quantity: float, ti
                 result = get_toobit_open_positions_normalized(symbol)
                 if result.get("ok"):
                     for ex in result.get("positions") or []:
-                        if str(ex.get("symbol") or "").upper() == str(symbol or "").upper() and str(ex.get("direction") or "").upper() == str(direction or "").upper():
+                        if normalize_bot_plain_symbol(str(ex.get("symbol") or "")) == normalize_bot_plain_symbol(str(symbol or "")) and str(ex.get("direction") or "").upper() == str(direction or "").upper():
                             return {"ok": True, "position_result": result}
                 else:
                     last_error = str(result.get("error") or "")[:200]
@@ -1013,6 +1134,13 @@ def _register_real_open_position(state: Dict[str, Any], signal: Dict[str, Any], 
         "tp2": signal.get("tp2"),
         "sl": sl,
         "quantity": quantity,
+        "bot_quantity": (signal.get("toobit_order") or {}).get("bot_quantity"),
+        "toobit_quantity": quantity,
+        "toobit_symbol": (signal.get("toobit_order") or {}).get("toobit_symbol"),
+        "toobit_multiplier": (signal.get("toobit_order") or {}).get("toobit_multiplier", 1.0),
+        "toobit_entry": (signal.get("toobit_order") or {}).get("toobit_entry"),
+        "toobit_tp1": (signal.get("toobit_order") or {}).get("toobit_tp1"),
+        "toobit_sl": (signal.get("toobit_order") or {}).get("toobit_sl"),
         "position_size_usd": state.get("position_size_usd", 0),
         "leverage": state.get("leverage", 0),
         "margin_mode": "ISOLATED",
@@ -1050,6 +1178,13 @@ def _register_pending_real_position(
         "tp2": signal.get("tp2"),
         "sl": sl,
         "quantity": quantity,
+        "bot_quantity": (signal.get("toobit_order") or {}).get("bot_quantity"),
+        "toobit_quantity": quantity,
+        "toobit_symbol": (signal.get("toobit_order") or {}).get("toobit_symbol"),
+        "toobit_multiplier": (signal.get("toobit_order") or {}).get("toobit_multiplier", 1.0),
+        "toobit_entry": (signal.get("toobit_order") or {}).get("toobit_entry"),
+        "toobit_tp1": (signal.get("toobit_order") or {}).get("toobit_tp1"),
+        "toobit_sl": (signal.get("toobit_order") or {}).get("toobit_sl"),
         "position_size_usd": state.get("position_size_usd", 0),
         "leverage": state.get("leverage", 0),
         "margin_mode": "ISOLATED",
@@ -1396,10 +1531,18 @@ def open_real_position_from_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(pos, dict) and str(pos.get("symbol") or "").upper() == symbol and str(pos.get("direction") or "").upper() == direction:
             return {"ok": False, "blocked": True, "error": f"برای {symbol} {direction} از قبل پوزیشن واقعی باز است"}
 
-    quantity = calculate_order_quantity(entry, symbol=symbol)
-    quantity_check = validate_order_quantity(symbol, entry, quantity)
+    bot_quantity = calculate_order_quantity(entry, symbol=symbol)
+    toobit_order = _prepare_toobit_order_values(symbol, entry, tp1, sl, bot_quantity)
+    toobit_quantity = float(toobit_order.get("toobit_quantity") or 0)
+    toobit_entry = float(toobit_order.get("toobit_entry") or entry)
+
+    quantity_check = validate_order_quantity(symbol, toobit_entry, toobit_quantity)
     if not quantity_check.get("ok"):
+        quantity_check["toobit_order"] = toobit_order
         return quantity_check
+
+    signal = dict(signal)
+    signal["toobit_order"] = toobit_order
 
     leverage_check = _ensure_toobit_leverage(symbol, float(state.get("leverage", 0) or 0))
     if not leverage_check.get("ok"):
@@ -1417,9 +1560,9 @@ def open_real_position_from_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
     order_result = toobit_client.place_market_order(
         symbol=symbol,
         direction=direction,
-        quantity=quantity,
-        take_profit=tp1,
-        stop_loss=sl,
+        quantity=toobit_quantity,
+        take_profit=toobit_order.get("toobit_tp1"),
+        stop_loss=toobit_order.get("toobit_sl"),
     )
 
     if not order_result.get("ok"):
@@ -1437,9 +1580,9 @@ def open_real_position_from_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
         # slot too quickly while the exchange is still making the futures
         # position visible through the API.
         state = load_real_trade_state()
-        pending_pos = _register_pending_real_position(state, signal, signal_id, quantity, order_result, execution_info)
+        pending_pos = _register_pending_real_position(state, signal, signal_id, toobit_quantity, order_result, execution_info)
 
-        waited = _wait_for_exchange_position(symbol, direction, quantity, timeout=PENDING_ORDER_POLL_SECONDS)
+        waited = _wait_for_exchange_position(symbol, direction, toobit_quantity, timeout=PENDING_ORDER_POLL_SECONDS)
         if waited.get("ok"):
             execution_info["status"] = execution_info.get("status") or "EXCHANGE_POSITION_FOUND_AFTER_PENDING"
             execution_info["recovered_by_polling"] = True
@@ -1450,7 +1593,9 @@ def open_real_position_from_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
                 "signal_id": signal_id,
                 "symbol": symbol,
                 "direction": direction,
-                "quantity": quantity,
+                "quantity": toobit_quantity,
+                "bot_quantity": bot_quantity,
+                "toobit_order": toobit_order,
                 "order": order_result.get("data"),
                 "execution_info": execution_info,
                 "position": pos,
@@ -1462,7 +1607,7 @@ def open_real_position_from_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
         sync_after = sync_real_positions_with_toobit(load_real_trade_state(), save=True)
         if sync_after.get("ok"):
             for ex in sync_after.get("exchange_positions") or []:
-                if str(ex.get("symbol") or "").upper() == symbol and str(ex.get("direction") or "").upper() == direction:
+                if normalize_bot_plain_symbol(str(ex.get("symbol") or "")) == normalize_bot_plain_symbol(symbol) and str(ex.get("direction") or "").upper() == direction:
                     pos = _confirm_pending_real_position(signal_id, execution_info, "پوزیشن از طریق sync صرافی پیدا شد.")
                     if pos is None:
                         state_after = load_real_trade_state()
@@ -1472,7 +1617,9 @@ def open_real_position_from_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
                         "signal_id": signal_id,
                         "symbol": symbol,
                         "direction": direction,
-                        "quantity": quantity,
+                        "quantity": toobit_quantity,
+                        "bot_quantity": bot_quantity,
+                        "toobit_order": toobit_order,
                         "order": order_result.get("data"),
                         "execution_info": execution_info,
                         "position": pos,
@@ -1499,7 +1646,7 @@ def open_real_position_from_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
     if signal_id in state.get("open_positions", {}):
         return {"ok": False, "blocked": True, "error": "این سیگنال قبلاً پوزیشن باز دارد"}
 
-    pos = _register_real_open_position(state, signal, signal_id, quantity, order_result, execution_info, recovered_note)
+    pos = _register_real_open_position(state, signal, signal_id, toobit_quantity, order_result, execution_info, recovered_note)
     pos["real_status"] = "ACTIVE_REAL"
     pos["confirmed_at"] = _now()
     save_real_trade_state(state)
@@ -1508,7 +1655,9 @@ def open_real_position_from_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
         "signal_id": signal_id,
         "symbol": symbol,
         "direction": direction,
-        "quantity": quantity,
+        "quantity": toobit_quantity,
+        "bot_quantity": bot_quantity,
+        "toobit_order": toobit_order,
         "order": order_result.get("data"),
         "execution_info": execution_info,
         "position": pos,
