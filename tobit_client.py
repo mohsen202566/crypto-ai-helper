@@ -637,6 +637,272 @@ class ToobitClient:
         return self.get_symbol_leverage(symbol)
 
 
+
+    # ---------- Margin mode / isolated safety ----------
+    def _normalize_margin_mode(self, mode: str) -> str:
+        """Normalize margin mode values to ISOLATED or CROSS."""
+        raw = str(mode or "").upper().strip().replace("-", "_").replace(" ", "_")
+        if raw in {"ISOLATED", "ISOLATE", "FIXED", "SINGLE"}:
+            return "ISOLATED"
+        if raw in {"CROSS", "CROSSED", "CROSS_MARGIN", "FULL"}:
+            return "CROSS"
+        return raw
+
+    def _extract_margin_mode_value(self, data) -> str:
+        """Best-effort margin-mode extractor from Toobit response shapes."""
+        def walk(value):
+            if isinstance(value, dict):
+                yield value
+                for v in value.values():
+                    yield from walk(v)
+            elif isinstance(value, list):
+                for item in value:
+                    yield from walk(item)
+
+        keys = (
+            "marginMode", "margin_mode", "positionMode", "position_mode",
+            "tradeMode", "trade_mode", "marginType", "margin_type",
+            "isolated", "isIsolated", "cross", "isCross",
+        )
+
+        for item in walk(data):
+            if not isinstance(item, dict):
+                continue
+
+            for key in keys:
+                if key not in item:
+                    continue
+
+                value = item.get(key)
+
+                if isinstance(value, bool):
+                    if key.lower() in {"isolated", "isisolated"}:
+                        return "ISOLATED" if value else "CROSS"
+                    if key.lower() in {"cross", "iscross"}:
+                        return "CROSS" if value else "ISOLATED"
+
+                mode = self._normalize_margin_mode(value)
+                if mode in {"ISOLATED", "CROSS"}:
+                    return mode
+
+                text = str(value or "").upper()
+                if "ISOL" in text:
+                    return "ISOLATED"
+                if "CROSS" in text:
+                    return "CROSS"
+
+        return ""
+
+    def set_margin_mode(self, symbol: str, mode: str = "ISOLATED"):
+        """
+        Set futures margin mode for a symbol.
+
+        Real-trading safety rule:
+        - The bot should use ISOLATED only.
+        - This method tries several known Toobit-style endpoint/parameter shapes.
+        - It does not open any order; it only attempts to set margin mode.
+        """
+        if not REAL_TRADING_ENABLED:
+            return {
+                "ok": False,
+                "blocked": True,
+                "error": "ترید واقعی غیرفعال است. REAL_TRADING_ENABLED=false",
+            }
+
+        symbol = self.normalize_futures_symbol(symbol)
+        normalized_mode = self._normalize_margin_mode(mode)
+
+        if normalized_mode != "ISOLATED":
+            return {
+                "ok": False,
+                "blocked": True,
+                "error": "برای امنیت فقط margin mode ایزوله مجاز است.",
+                "requested_mode": mode,
+            }
+
+        request_variants = [
+            {"symbol": symbol, "marginMode": "ISOLATED"},
+            {"symbol": symbol, "marginMode": "isolated"},
+            {"symbol": symbol, "margin_mode": "ISOLATED"},
+            {"symbol": symbol, "marginType": "ISOLATED"},
+            {"symbol": symbol, "marginType": "isolated"},
+            {"symbol": symbol, "positionMode": "ISOLATED"},
+            {"symbol": symbol, "tradeMode": "ISOLATED"},
+            {"symbol": symbol, "isIsolated": True},
+            {"symbol": symbol, "isolated": True},
+        ]
+
+        candidate_paths = (
+            "/api/v1/futures/margin-mode",
+            "/api/v1/futures/marginMode",
+            "/api/v1/futures/position/margin-mode",
+            "/api/v1/futures/position/marginMode",
+            "/api/v1/futures/position/margin",
+            "/api/v1/futures/margin",
+            "/api/v1/futures/set-margin-mode",
+            "/api/v1/futures/setMarginMode",
+        )
+
+        attempts = []
+        for path in candidate_paths:
+            for params in request_variants:
+                result = self._signed_request("POST", path, params)
+                attempts.append({
+                    "path": path,
+                    "params_keys": list(params.keys()),
+                    "ok": bool(result.get("ok")),
+                    "error": result.get("error"),
+                    "data": result.get("data"),
+                })
+                if result.get("ok"):
+                    self._last_set_margin_mode = {
+                        "symbol": symbol,
+                        "mode": "ISOLATED",
+                        "set_result": result,
+                        "set_at": self._now_ms(),
+                    }
+                    if isinstance(result.get("data"), dict):
+                        result["data"].setdefault("marginMode", "ISOLATED")
+                    else:
+                        result["data"] = {"raw": result.get("data"), "marginMode": "ISOLATED"}
+                    result["actual_margin_mode"] = "ISOLATED"
+                    return result
+
+        return {
+            "ok": False,
+            "error": "تنظیم Margin Mode روی ISOLATED در توبیت ناموفق بود",
+            "attempts": attempts[-10:],
+        }
+
+    def get_margin_mode(self, symbol: str):
+        """
+        Read current futures margin mode for a symbol.
+
+        Priority:
+        1) Open-position response if Toobit exposes margin mode there.
+        2) Known config/margin endpoints.
+        3) Last accepted set_margin_mode result for the same symbol as a short fallback.
+        """
+        symbol = self.normalize_futures_symbol(symbol)
+
+        pos_result = self.get_position(symbol=symbol)
+        if pos_result.get("ok"):
+            mode = self._extract_margin_mode_value(pos_result.get("data"))
+            if mode:
+                return {"ok": True, "data": {"symbol": symbol, "marginMode": mode}, "source": "positions", "raw": pos_result}
+
+        candidate_paths = (
+            "/api/v1/futures/margin-mode",
+            "/api/v1/futures/marginMode",
+            "/api/v1/futures/position/margin-mode",
+            "/api/v1/futures/position/marginMode",
+            "/api/v1/futures/position/margin",
+            "/api/v1/futures/symbol/config",
+            "/api/v1/futures/margin",
+        )
+
+        attempts = []
+        for path in candidate_paths:
+            result = self._signed_request("GET", path, {"symbol": symbol})
+            attempts.append({
+                "path": path,
+                "ok": bool(result.get("ok")),
+                "error": result.get("error"),
+                "data": result.get("data"),
+            })
+            if result.get("ok"):
+                mode = self._extract_margin_mode_value(result.get("data"))
+                if mode:
+                    return {"ok": True, "data": {"symbol": symbol, "marginMode": mode}, "source": path, "raw": result}
+
+        cached = getattr(self, "_last_set_margin_mode", None)
+        if isinstance(cached, dict) and cached.get("symbol") == symbol:
+            age_ms = self._now_ms() - int(cached.get("set_at", 0) or 0)
+            if 0 <= age_ms <= 60000 and cached.get("mode") == "ISOLATED":
+                return {
+                    "ok": True,
+                    "data": {"symbol": symbol, "marginMode": "ISOLATED"},
+                    "source": "last_accepted_set_margin_mode",
+                    "warning": "Toobit readback endpoint did not expose margin mode; using last accepted set_margin_mode response.",
+                    "set_result": cached.get("set_result"),
+                }
+
+        return {
+            "ok": False,
+            "error": "تایید Margin Mode از توبیت ممکن نشد",
+            "position_read": pos_result,
+            "attempts": attempts[-8:],
+        }
+
+    def ensure_isolated_margin(self, symbol: str):
+        """
+        Safety gate: force and verify ISOLATED margin before opening a real order.
+
+        If Toobit cannot set/read/confirm ISOLATED, return ok=False so the
+        real trade manager blocks the order.
+        """
+        set_result = self.set_margin_mode(symbol, "ISOLATED")
+        if not set_result.get("ok"):
+            return {
+                "ok": False,
+                "error": "تنظیم مارجین روی ISOLATED ناموفق بود؛ سفارش واقعی ارسال نشد.",
+                "set_result": set_result,
+            }
+
+        read_result = self.get_margin_mode(symbol)
+        if not read_result.get("ok"):
+            return {
+                "ok": False,
+                "error": "تایید مارجین ISOLATED از توبیت ممکن نشد؛ سفارش واقعی ارسال نشد.",
+                "set_result": set_result,
+                "read_result": read_result,
+            }
+
+        mode = self._extract_margin_mode_value(read_result)
+        if not mode:
+            mode = self._extract_margin_mode_value(read_result.get("data"))
+
+        if self._normalize_margin_mode(mode) != "ISOLATED":
+            return {
+                "ok": False,
+                "error": f"Margin Mode توبیت ISOLATED نیست ({mode or 'UNKNOWN'}). سفارش واقعی ارسال نشد.",
+                "actual_margin_mode": mode,
+                "set_result": set_result,
+                "read_result": read_result,
+            }
+
+        return {
+            "ok": True,
+            "actual_margin_mode": "ISOLATED",
+            "set_result": set_result,
+            "read_result": read_result,
+        }
+
+    def set_symbol_margin_mode(self, symbol: str, mode: str = "ISOLATED"):
+        """Backward-compatible alias for margin mode setting."""
+        return self.set_margin_mode(symbol, mode)
+
+    def change_margin_mode(self, symbol: str, mode: str = "ISOLATED"):
+        """Backward-compatible alias for margin mode setting."""
+        return self.set_margin_mode(symbol, mode)
+
+    def change_symbol_margin_mode(self, symbol: str, mode: str = "ISOLATED"):
+        """Backward-compatible alias for margin mode setting."""
+        return self.set_margin_mode(symbol, mode)
+
+    def set_futures_margin_mode(self, symbol: str, mode: str = "ISOLATED"):
+        """Backward-compatible alias for margin mode setting."""
+        return self.set_margin_mode(symbol, mode)
+
+    def get_symbol_margin_mode(self, symbol: str):
+        """Backward-compatible alias for margin mode readback."""
+        return self.get_margin_mode(symbol)
+
+    def get_futures_margin_mode(self, symbol: str):
+        """Backward-compatible alias for margin mode readback."""
+        return self.get_margin_mode(symbol)
+
+
     # ---------- Orders ----------
     def place_market_order(
         self,
