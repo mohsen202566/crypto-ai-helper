@@ -7,9 +7,9 @@ import ccxt
 import pandas as pd
 import ta
 try:
-    from config import MIN_DIRECT_SCORE, MIN_ADX_FOR_TREND, MIN_MANUAL_CONFIRMATIONS
+    from config import MIN_DIRECT_SCORE, MIN_ADX_FOR_TREND, MIN_MANUAL_CONFIRMATIONS, AUTO_DIRECT_SCORE_MIN
 except Exception:
-    MIN_DIRECT_SCORE = 82; MIN_ADX_FOR_TREND = 20; MIN_MANUAL_CONFIRMATIONS = 3
+    MIN_DIRECT_SCORE = 85; MIN_ADX_FOR_TREND = 20; MIN_MANUAL_CONFIRMATIONS = 3; AUTO_DIRECT_SCORE_MIN = 85
 try:
     from coin_learning import build_signal_snapshot, get_smart_tp_suggestion, should_require_extra_strength
 except Exception:
@@ -30,7 +30,7 @@ except Exception:
 exchange = ccxt.okx({'enableRateLimit': True, 'timeout': 20000, 'options': {'defaultType': 'swap'}})
 _SOFT_MARKET_CONTEXT_CACHE = {'ts': 0, 'data': None}
 SOFT_MARKET_CONTEXT_TTL_SECONDS = 120
-AUTO_DIRECT_SCORE_MIN = 82
+AUTO_DIRECT_SCORE_MIN = max(int(MIN_DIRECT_SCORE), int(AUTO_DIRECT_SCORE_MIN))
 ADX_HARD_MIN = max(float(MIN_ADX_FOR_TREND), 20.0)
 LONG_DIRECT_SCORE_BONUS_REQUIREMENT = 0
 LONG_MIN_1H_STRICT = False
@@ -356,21 +356,83 @@ def analyze_symbol(symbol: str) -> Dict:
         if long_score>=short_score: direction='LONG'; final_score=long_score; confirmations=int(sp['confirmations_long']); reasons=list(sp['long_reasons']); valid=bool(sp['long_valid'])
         else: direction='SHORT'; final_score=short_score; confirmations=int(sp['confirmations_short']); reasons=list(sp['short_reasons']); valid=bool(sp['short_valid'])
         snapshot=build_local_snapshot(symbol,direction,df_4h,df_1h,df_30m,df_15m,df_5m,sp,market_context)
-        risk_state=get_coin_risk(symbol,direction); strict=int(risk_state.get('strictness_level',0) or 0)
+        # ------------------------------------------------------------------
+        # AI DECISION LAYER
+        # ------------------------------------------------------------------
+        # Classic analysis only creates a candidate.  The final permission to
+        # issue a signal is controlled here by AI memory/risk/rotation.
+        # This keeps learning directly connected to signal issuance instead of
+        # acting as a small cosmetic score change.
+        risk_state=get_coin_risk(symbol,direction)
+        strict=int(risk_state.get('strictness_level',0) or 0)
+        sl_count=int(risk_state.get('sl_count',0) or 0)
+        risk_score=safe_float(risk_state.get('risk_score',0),0)
+
+        # Base threshold comes from config/env, never hardcoded 82.
+        # Default target is slightly stricter than before, while still allowing
+        # the AI layer to add more strictness per coin+direction after losses.
+        base_min_score=max(int(MIN_DIRECT_SCORE), int(AUTO_DIRECT_SCORE_MIN), 85)
+        base_conf=max(3, int(MIN_MANUAL_CONFIRMATIONS))
+        req_conf=base_conf
+        ai_penalty=0
+        ai_min_score_add=0
+        ai_block=False
+
+        # Per coin + direction risk learning:
+        # - After repeated SLs (real or ghost, depending on coin_risk data),
+        #   require stronger score and more confirmations.
+        # - Keep it gradual so signal frequency does not collapse.
         if strict:
-            risk_penalty = min(12, max(3, strict * 3))
-            final_score -= risk_penalty
-            reasons.append(f'AI Risk: سختگیری سطح {strict} (-{risk_penalty})')
-        rotation=get_rotation_context(symbol); rs=safe_float(rotation.get('rotation_score',50),50)
-        if rs>=75: final_score+=2
-        elif rs<=25: final_score-=2
-        extra=ai_extra_strength_required(symbol,direction,snapshot); min_score=82+int(extra.get('extra_score',0) or 0); base_conf=min(3, int(MIN_MANUAL_CONFIRMATIONS)); req_conf=base_conf+int(extra.get('extra_confirmations',0) or 0)
-        if extra.get('required'): reasons.append(extra.get('reason') or 'AI تایید بیشتر می‌خواهد')
+            ai_penalty += min(14, max(3, strict * 3))
+            ai_min_score_add += min(10, max(2, strict * 2))
+            req_conf += min(3, max(1, strict))
+            reasons.append(f'AI Risk: سختگیری سطح {strict} | SL={sl_count}')
+        elif sl_count >= 2:
+            # Safety fallback if coin_risk stores SL count but strictness_level
+            # is not being calculated correctly yet.
+            fallback_level=min(3, sl_count-1)
+            ai_penalty += min(9, fallback_level * 3)
+            ai_min_score_add += min(6, fallback_level * 2)
+            req_conf += min(2, fallback_level)
+            reasons.append(f'AI Risk fallback: SLهای تکراری {sl_count}')
+
+        # Rotation controls priority and quality gate.
+        rotation=get_rotation_context(symbol)
+        rs=safe_float(rotation.get('rotation_score',50),50)
+        if rs>=80:
+            final_score+=2
+            reasons.append('AI Rotation: اولویت مثبت')
+        elif rs<=20:
+            ai_penalty += 6
+            ai_min_score_add += 4
+            req_conf += 1
+            reasons.append('AI Rotation: کوین کم‌اولویت/پرریسک')
+        elif rs<=35:
+            ai_penalty += 3
+            ai_min_score_add += 2
+            reasons.append('AI Rotation: اولویت ضعیف')
+
+        # Learning engine may request extra strength based on real/ghost history
+        # and similar historical snapshots.
+        extra=ai_extra_strength_required(symbol,direction,snapshot)
+        ai_min_score_add += int(extra.get('extra_score',0) or 0)
+        req_conf += int(extra.get('extra_confirmations',0) or 0)
+        if extra.get('required'):
+            reasons.append(extra.get('reason') or 'AI Learning: تایید بیشتر لازم است')
+
+        # If the coin/direction is extremely risky, AI can block borderline
+        # candidates.  Strong candidates can still pass only with strict gates.
+        if risk_score >= 85 and final_score < 94:
+            ai_block=True
+            reasons.append('AI Block: ریسک کوین/جهت خیلی بالا و امتیاز کافی نیست')
+
+        final_score -= ai_penalty
+        min_score=min(96, base_min_score + ai_min_score_add)
+        effective_req_conf=min(8, max(base_conf, req_conf))
+
         level_pack=get_strong_levels(df_5m,df_15m,df_30m,price,atr); support=level_pack.get('nearest_support'); resistance=level_pack.get('nearest_resistance')
-        # If score is strong, allow one fewer confirmation so the bot does not miss early moves.
-        effective_req_conf = max(2, req_conf - 1) if final_score >= 92 else req_conf
-        entry_confirmed=valid and final_score>=min_score and confirmations>=effective_req_conf
-        common={'symbol':symbol,'score':cap_score(final_score),'long_score':long_score,'short_score':short_score,'price':safe_round(price),'atr':safe_round(atr),'market_regime':market_context.get('market_regime','neutral'),'btc_bias':market_context.get('btc_bias','neutral'),'confirmations':confirmations,'required_confirmations':effective_req_conf,'rsi':safe_round(df_15m.iloc[-1]['rsi'],2),'macd':safe_round(df_15m.iloc[-1]['macd'],6),'macd_signal':safe_round(df_15m.iloc[-1]['macd_signal'],6),'macd_hist':safe_round(df_15m.iloc[-1]['macd_hist'],6),'adx':safe_round(df_15m.iloc[-1]['adx'],2),'vwap_status':vwap_status(df_15m),'support':safe_round(support),'resistance':safe_round(resistance),'trends':sp.get('trends',{}),'distance_ema20_atr':sp.get('distance_ema20_atr'),'volume_status':sp.get('volume_status'),'volume_ratio':sp.get('volume_ratio'),'buy_power':sp.get('buy_power'),'sell_power':sp.get('sell_power'),'power2_buy':sp.get('power2_buy'),'power2_sell':sp.get('power2_sell'),'power3_buy':sp.get('power3_buy'),'power3_sell':sp.get('power3_sell'),'snapshot':snapshot,'coin_risk':risk_state,'rotation':rotation,'reasons':reasons[:20],'signal_timeframe':'AI Classic Direct'}
+        entry_confirmed=(not ai_block) and valid and final_score>=min_score and confirmations>=effective_req_conf
+        common={'symbol':symbol,'score':cap_score(final_score),'long_score':long_score,'short_score':short_score,'price':safe_round(price),'atr':safe_round(atr),'market_regime':market_context.get('market_regime','neutral'),'btc_bias':market_context.get('btc_bias','neutral'),'confirmations':confirmations,'required_confirmations':effective_req_conf,'rsi':safe_round(df_15m.iloc[-1]['rsi'],2),'macd':safe_round(df_15m.iloc[-1]['macd'],6),'macd_signal':safe_round(df_15m.iloc[-1]['macd_signal'],6),'macd_hist':safe_round(df_15m.iloc[-1]['macd_hist'],6),'adx':safe_round(df_15m.iloc[-1]['adx'],2),'vwap_status':vwap_status(df_15m),'support':safe_round(support),'resistance':safe_round(resistance),'trends':sp.get('trends',{}),'distance_ema20_atr':sp.get('distance_ema20_atr'),'volume_status':sp.get('volume_status'),'volume_ratio':sp.get('volume_ratio'),'buy_power':sp.get('buy_power'),'sell_power':sp.get('sell_power'),'power2_buy':sp.get('power2_buy'),'power2_sell':sp.get('power2_sell'),'power3_buy':sp.get('power3_buy'),'power3_sell':sp.get('power3_sell'),'snapshot':snapshot,'coin_risk':risk_state,'rotation':rotation,'ai_decision':{'base_min_score':base_min_score,'min_score':min_score,'ai_penalty':ai_penalty,'ai_min_score_add':ai_min_score_add,'ai_block':ai_block,'strictness_level':strict,'sl_count':sl_count,'risk_score':risk_score,'rotation_score':rs},'reasons':reasons[:20],'signal_timeframe':'AI Classic Direct'}
         if not entry_confirmed:
             return {**common,'direction':'NO TRADE','status':'NO_TRADE','entry_confirmed':False,'entry_mode':'NO_ENTRY','entry':None,'stop_loss':None,'tp1':None,'tp2':None,'risk_reward':0,'risk_level':'UNKNOWN','freshness':'LOW','tp_meta':{},'validity':'سیگنال معتبر نیست','valid_gate':valid,'min_score':min_score}
         sl,tp1,tp2,rr,tp_meta=build_trade_levels(direction,price,atr,df_5m,df_15m,df_30m,snapshot,symbol); risk_level='LOW' if final_score>=92 and confirmations>=6 else 'MEDIUM' if final_score>=86 and confirmations>=5 else 'HIGH'; freshness='HIGH' if confirmations>=6 else 'MEDIUM' if confirmations>=5 else 'LOW'
