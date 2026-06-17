@@ -37,6 +37,14 @@ class ToobitClient:
         self.api_key = (api_key if api_key is not None else TOBIT_API_KEY).strip()
         self.secret_key = (secret_key if secret_key is not None else TOBIT_SECRET_KEY).strip()
 
+        # In-memory safety caches.
+        # Toobit rate-limits repeated leverage/margin-mode changes very fast.
+        # These caches let the bot avoid re-sending SET requests for every signal
+        # when the symbol was already confirmed recently.
+        self._leverage_cache = {}
+        self._margin_mode_cache = {}
+        self._rate_limit_until = {}
+
     def _now_ms(self) -> int:
         return int(time.time() * 1000)
 
@@ -79,6 +87,38 @@ class ToobitClient:
         if text:
             return text[:500]
         return f"HTTP status {status_code}"
+
+    def _is_rate_limit_error(self, result) -> bool:
+        raw = str(result or "").lower()
+        return "too many requests" in raw or "rate limit" in raw or "429" in raw
+
+    def _cache_get(self, cache_name: str, key: str, max_age_sec: int):
+        cache = getattr(self, cache_name, {}) or {}
+        item = cache.get(str(key))
+        if not isinstance(item, dict):
+            return None
+        age = time.time() - float(item.get("ts", 0) or 0)
+        if 0 <= age <= max_age_sec:
+            return item.get("value")
+        return None
+
+    def _cache_set(self, cache_name: str, key: str, value):
+        cache = getattr(self, cache_name, None)
+        if not isinstance(cache, dict):
+            cache = {}
+            setattr(self, cache_name, cache)
+        cache[str(key)] = {"value": value, "ts": time.time()}
+
+    def _rate_limited(self, key: str) -> bool:
+        until = float((getattr(self, "_rate_limit_until", {}) or {}).get(str(key), 0) or 0)
+        return time.time() < until
+
+    def _mark_rate_limited(self, key: str, seconds: int = 60):
+        rl = getattr(self, "_rate_limit_until", None)
+        if not isinstance(rl, dict):
+            rl = {}
+            setattr(self, "_rate_limit_until", rl)
+        rl[str(key)] = time.time() + max(5, int(seconds))
 
     def _signed_request(self, method: str, path: str, params: dict | None = None, *, json_body: bool = False):
         if not self.api_key or not self.secret_key:
@@ -492,10 +532,11 @@ class ToobitClient:
         """
         Set futures leverage for a symbol before opening a real position.
 
-        Toobit API versions can expose slightly different leverage paths, so this
-        method tries a small safe list of signed POST endpoints. The first
-        successful response is returned. If all paths fail, the error includes
-        every attempted path for debugging.
+        Rate-limit-safe behavior:
+        1) If the symbol was recently confirmed at the desired leverage, do not
+           send any SET request again.
+        2) Try to read current leverage first. If it already matches, cache and return.
+        3) Only if needed, try a small endpoint list and stop immediately on rate limit.
         """
         if not REAL_TRADING_ENABLED:
             return {
@@ -513,16 +554,50 @@ class ToobitClient:
         if lev <= 0:
             return {"ok": False, "error": "leverage باید بیشتر از صفر باشد"}
 
+        cache_key = f"{symbol}:leverage"
+        cached = self._cache_get("_leverage_cache", cache_key, 600)
+        if cached is not None:
+            try:
+                if abs(float(cached) - float(lev)) <= 0.01:
+                    return {
+                        "ok": True,
+                        "data": {"symbol": symbol, "leverage": lev},
+                        "actual_leverage": float(lev),
+                        "source": "recent_leverage_cache",
+                    }
+            except Exception:
+                pass
+
+        if self._rate_limited(cache_key):
+            return {
+                "ok": False,
+                "error": "Toobit موقتاً برای تنظیم لوریج rate limit داده؛ برای جلوگیری از اسپم سفارش ارسال نشد.",
+                "rate_limited": True,
+            }
+
+        # Read first; avoid SET if Toobit is already configured.
+        try:
+            current = self.get_symbol_leverage(symbol)
+            if current.get("ok"):
+                cur_lev = self._extract_leverage_value(current.get("data", current))
+                if cur_lev > 0 and abs(cur_lev - float(lev)) <= 0.01:
+                    self._cache_set("_leverage_cache", cache_key, float(lev))
+                    return {
+                        "ok": True,
+                        "data": {"symbol": symbol, "leverage": cur_lev},
+                        "actual_leverage": cur_lev,
+                        "source": "already_configured",
+                        "read_result": current,
+                    }
+        except Exception:
+            pass
+
         request_variants = [
             {"symbol": symbol, "leverage": lev},
-            {"symbol": symbol, "leverage": str(lev)},
             {"symbol": symbol, "longLeverage": lev, "shortLeverage": lev},
-            {"symbol": symbol, "longLeverage": str(lev), "shortLeverage": str(lev)},
         ]
         candidate_paths = (
             "/api/v1/futures/leverage",
-            "/api/v1/futures/position/leverage",
-            "/api/v1/futures/set-leverage",
             "/api/v1/futures/setLeverage",
         )
 
@@ -538,6 +613,7 @@ class ToobitClient:
                     "data": result.get("data"),
                 })
                 if result.get("ok"):
+                    self._cache_set("_leverage_cache", cache_key, float(lev))
                     self._last_set_leverage = {
                         "symbol": symbol,
                         "leverage": float(lev),
@@ -551,10 +627,19 @@ class ToobitClient:
                     result["actual_leverage"] = float(lev)
                     return result
 
+                if self._is_rate_limit_error(result):
+                    self._mark_rate_limited(cache_key, 60)
+                    return {
+                        "ok": False,
+                        "error": "Toobit برای تنظیم لوریج too many requests داد؛ درخواست‌های بیشتر متوقف شد.",
+                        "rate_limited": True,
+                        "attempts": attempts[-3:],
+                    }
+
         return {
             "ok": False,
             "error": "تنظیم لوریج در توبیت ناموفق بود",
-            "attempts": attempts[-8:],
+            "attempts": attempts[-4:],
         }
 
     def get_symbol_leverage(self, symbol: str):
@@ -567,11 +652,16 @@ class ToobitClient:
         3) Last accepted set_leverage result for the same symbol as a fallback.
         """
         symbol = self.normalize_futures_symbol(symbol)
+        cache_key = f"{symbol}:leverage"
+        cached = self._cache_get("_leverage_cache", cache_key, 600)
+        if cached is not None:
+            return {"ok": True, "data": {"symbol": symbol, "leverage": float(cached)}, "source": "recent_leverage_cache"}
 
         pos_result = self.get_position(symbol=symbol)
         if pos_result.get("ok"):
             value = self._extract_leverage_value(pos_result.get("data"))
             if value > 0:
+                self._cache_set("_leverage_cache", cache_key, value)
                 return {"ok": True, "data": {"symbol": symbol, "leverage": value}, "source": "positions", "raw": pos_result}
 
         candidate_paths = (
@@ -587,6 +677,7 @@ class ToobitClient:
             if result.get("ok"):
                 value = self._extract_leverage_value(result.get("data"))
                 if value > 0:
+                    self._cache_set("_leverage_cache", cache_key, value)
                     return {"ok": True, "data": {"symbol": symbol, "leverage": value}, "source": path, "raw": result}
 
         cached = getattr(self, "_last_set_leverage", None)
@@ -697,10 +788,11 @@ class ToobitClient:
         """
         Set futures margin mode for a symbol.
 
-        Real-trading safety rule:
-        - The bot should use ISOLATED only.
-        - This method tries several known Toobit-style endpoint/parameter shapes.
-        - It does not open any order; it only attempts to set margin mode.
+        Rate-limit-safe behavior:
+        - Never allows CROSS.
+        - If ISOLATED was recently confirmed, do not send SET again.
+        - Read first; if already ISOLATED, cache and return.
+        - If setting is needed, try only a small endpoint/parameter list and stop on rate limit.
         """
         if not REAL_TRADING_ENABLED:
             return {
@@ -720,27 +812,52 @@ class ToobitClient:
                 "requested_mode": mode,
             }
 
+        cache_key = f"{symbol}:margin_mode"
+        cached = self._cache_get("_margin_mode_cache", cache_key, 3600)
+        if cached == "ISOLATED":
+            return {
+                "ok": True,
+                "data": {"symbol": symbol, "marginMode": "ISOLATED"},
+                "actual_margin_mode": "ISOLATED",
+                "source": "recent_margin_mode_cache",
+            }
+
+        if self._rate_limited(cache_key):
+            return {
+                "ok": False,
+                "error": "Toobit موقتاً برای تنظیم Margin Mode rate limit داده؛ سفارش واقعی ارسال نشد.",
+                "rate_limited": True,
+            }
+
+        # Read first; if the app/global setting already made it ISOLATED, do not SET.
+        try:
+            current = self.get_margin_mode(symbol)
+            if current.get("ok"):
+                current_mode = self._extract_margin_mode_value(current.get("data", current))
+                if self._normalize_margin_mode(current_mode) == "ISOLATED":
+                    self._cache_set("_margin_mode_cache", cache_key, "ISOLATED")
+                    return {
+                        "ok": True,
+                        "data": {"symbol": symbol, "marginMode": "ISOLATED"},
+                        "actual_margin_mode": "ISOLATED",
+                        "source": "already_configured",
+                        "read_result": current,
+                    }
+                if self._normalize_margin_mode(current_mode) == "CROSS":
+                    # continue and try to set isolated
+                    pass
+        except Exception:
+            pass
+
         request_variants = [
-            {"symbol": symbol, "marginMode": "ISOLATED"},
             {"symbol": symbol, "marginMode": "isolated"},
-            {"symbol": symbol, "margin_mode": "ISOLATED"},
-            {"symbol": symbol, "marginType": "ISOLATED"},
-            {"symbol": symbol, "marginType": "isolated"},
-            {"symbol": symbol, "positionMode": "ISOLATED"},
-            {"symbol": symbol, "tradeMode": "ISOLATED"},
+            {"symbol": symbol, "marginMode": "ISOLATED"},
             {"symbol": symbol, "isIsolated": True},
-            {"symbol": symbol, "isolated": True},
         ]
 
         candidate_paths = (
-            "/api/v1/futures/margin-mode",
-            "/api/v1/futures/marginMode",
-            "/api/v1/futures/position/margin-mode",
-            "/api/v1/futures/position/marginMode",
-            "/api/v1/futures/position/margin",
-            "/api/v1/futures/margin",
-            "/api/v1/futures/set-margin-mode",
             "/api/v1/futures/setMarginMode",
+            "/api/v1/futures/margin-mode",
         )
 
         attempts = []
@@ -755,6 +872,7 @@ class ToobitClient:
                     "data": result.get("data"),
                 })
                 if result.get("ok"):
+                    self._cache_set("_margin_mode_cache", cache_key, "ISOLATED")
                     self._last_set_margin_mode = {
                         "symbol": symbol,
                         "mode": "ISOLATED",
@@ -768,10 +886,19 @@ class ToobitClient:
                     result["actual_margin_mode"] = "ISOLATED"
                     return result
 
+                if self._is_rate_limit_error(result):
+                    self._mark_rate_limited(cache_key, 90)
+                    return {
+                        "ok": False,
+                        "error": "Toobit برای تنظیم Margin Mode too many requests داد؛ درخواست‌های بیشتر متوقف شد.",
+                        "rate_limited": True,
+                        "attempts": attempts[-3:],
+                    }
+
         return {
             "ok": False,
             "error": "تنظیم Margin Mode روی ISOLATED در توبیت ناموفق بود",
-            "attempts": attempts[-10:],
+            "attempts": attempts[-4:],
         }
 
     def get_margin_mode(self, symbol: str):
@@ -784,21 +911,22 @@ class ToobitClient:
         3) Last accepted set_margin_mode result for the same symbol as a short fallback.
         """
         symbol = self.normalize_futures_symbol(symbol)
+        cache_key = f"{symbol}:margin_mode"
+        cached = self._cache_get("_margin_mode_cache", cache_key, 3600)
+        if cached in {"ISOLATED", "CROSS"}:
+            return {"ok": True, "data": {"symbol": symbol, "marginMode": cached}, "source": "recent_margin_mode_cache"}
 
         pos_result = self.get_position(symbol=symbol)
         if pos_result.get("ok"):
             mode = self._extract_margin_mode_value(pos_result.get("data"))
             if mode:
+                self._cache_set("_margin_mode_cache", cache_key, mode)
                 return {"ok": True, "data": {"symbol": symbol, "marginMode": mode}, "source": "positions", "raw": pos_result}
 
         candidate_paths = (
-            "/api/v1/futures/margin-mode",
-            "/api/v1/futures/marginMode",
-            "/api/v1/futures/position/margin-mode",
-            "/api/v1/futures/position/marginMode",
             "/api/v1/futures/position/margin",
             "/api/v1/futures/symbol/config",
-            "/api/v1/futures/margin",
+            "/api/v1/futures/margin-mode",
         )
 
         attempts = []
@@ -813,6 +941,7 @@ class ToobitClient:
             if result.get("ok"):
                 mode = self._extract_margin_mode_value(result.get("data"))
                 if mode:
+                    self._cache_set("_margin_mode_cache", cache_key, mode)
                     return {"ok": True, "data": {"symbol": symbol, "marginMode": mode}, "source": path, "raw": result}
 
         cached = getattr(self, "_last_set_margin_mode", None)
@@ -836,21 +965,59 @@ class ToobitClient:
 
     def ensure_isolated_margin(self, symbol: str):
         """
-        Safety gate: force and verify ISOLATED margin before opening a real order.
+        Safety gate: verify/force ISOLATED margin before opening a real order.
 
-        If Toobit cannot set/read/confirm ISOLATED, return ok=False so the
-        real trade manager blocks the order.
+        Best behavior:
+        1) Use recent confirmed cache if available.
+        2) Read current margin mode first; if already ISOLATED, do not send SET.
+        3) Only send SET if needed.
+        4) Never allow CROSS. If Toobit cannot confirm ISOLATED, block safely.
         """
+        symbol = self.normalize_futures_symbol(symbol)
+        cache_key = f"{symbol}:margin_mode"
+
+        cached = self._cache_get("_margin_mode_cache", cache_key, 3600)
+        if cached == "ISOLATED":
+            return {"ok": True, "actual_margin_mode": "ISOLATED", "source": "recent_margin_mode_cache"}
+
+        read_before = self.get_margin_mode(symbol)
+        if read_before.get("ok"):
+            mode_before = self._extract_margin_mode_value(read_before.get("data", read_before))
+            if self._normalize_margin_mode(mode_before) == "ISOLATED":
+                self._cache_set("_margin_mode_cache", cache_key, "ISOLATED")
+                return {
+                    "ok": True,
+                    "actual_margin_mode": "ISOLATED",
+                    "source": "already_isolated_before_set",
+                    "read_result": read_before,
+                }
+            if self._normalize_margin_mode(mode_before) == "CROSS":
+                # try to set isolated below
+                pass
+
         set_result = self.set_margin_mode(symbol, "ISOLATED")
         if not set_result.get("ok"):
             return {
                 "ok": False,
                 "error": "تنظیم مارجین روی ISOLATED ناموفق بود؛ سفارش واقعی ارسال نشد.",
                 "set_result": set_result,
+                "read_before": read_before,
             }
 
         read_result = self.get_margin_mode(symbol)
         if not read_result.get("ok"):
+            # Some Toobit routes accept the setting but do not expose readback immediately.
+            # If SET was accepted, use a short cache as confirmation to avoid repeated spam.
+            if set_result.get("actual_margin_mode") == "ISOLATED":
+                self._cache_set("_margin_mode_cache", cache_key, "ISOLATED")
+                return {
+                    "ok": True,
+                    "actual_margin_mode": "ISOLATED",
+                    "source": "accepted_set_without_readback",
+                    "warning": "Toobit accepted ISOLATED set but readback did not expose margin mode immediately.",
+                    "set_result": set_result,
+                    "read_result": read_result,
+                }
             return {
                 "ok": False,
                 "error": "تایید مارجین ISOLATED از توبیت ممکن نشد؛ سفارش واقعی ارسال نشد.",
@@ -871,6 +1038,7 @@ class ToobitClient:
                 "read_result": read_result,
             }
 
+        self._cache_set("_margin_mode_cache", cache_key, "ISOLATED")
         return {
             "ok": True,
             "actual_margin_mode": "ISOLATED",
