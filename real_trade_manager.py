@@ -368,21 +368,29 @@ def load_real_trade_state() -> Dict[str, Any]:
         if _round_usd(state.get("daily_loss_limit_usd", 0)) <= 0:
             state["daily_loss_limit_usd"] = DEFAULT_REAL_DAILY_LOSS_LIMIT_USD
             changed = True
+        if int(state.get("daily_lock_duration_hours", 0) or 0) <= 0:
+            state["daily_lock_duration_hours"] = DEFAULT_REAL_LOCK_DURATION_HOURS
+            changed = True
     else:
-        # Disabled means no current lock and no automatic re-lock from old loss.
+        # Disabled means no current lock, no timer, and no automatic re-lock from old loss.
+        if _round_usd(state.get("daily_loss_limit_usd", 0)) != 0:
+            state["daily_loss_limit_usd"] = 0.0
+            changed = True
+        if int(state.get("daily_lock_duration_hours", 0) or 0) != 0:
+            state["daily_lock_duration_hours"] = 0
+            changed = True
         if int(state.get("daily_loss_locked_until", 0) or 0) != 0:
             state["daily_loss_locked_until"] = 0
             changed = True
         if state.get("daily_lock_reason"):
             state["daily_lock_reason"] = ""
             changed = True
+        if _round_usd(state.get("daily_lock_loss_value", 0)) != 0:
+            state["daily_lock_loss_value"] = 0.0
+            changed = True
         if bool(state.get("daily_lock_auto_reenable")):
             state["daily_lock_auto_reenable"] = False
             changed = True
-
-    if int(state.get("daily_lock_duration_hours", 0) or 0) <= 0:
-        state["daily_lock_duration_hours"] = DEFAULT_REAL_LOCK_DURATION_HOURS
-        changed = True
 
     state.setdefault("closed_positions", [])
     state.setdefault("daily_lock_reason", "")
@@ -455,11 +463,20 @@ def _refresh_daily_lock_state(state: Dict[str, Any]) -> bool:
         state["daily_lock_auto_reenable"] = False
 
     if not bool(state.get("daily_loss_protection_enabled", True)):
+        if _round_usd(state.get("daily_loss_limit_usd", 0)) != 0:
+            state["daily_loss_limit_usd"] = 0.0
+            changed = True
+        if int(state.get("daily_lock_duration_hours", 0) or 0) != 0:
+            state["daily_lock_duration_hours"] = 0
+            changed = True
         if int(state.get("daily_loss_locked_until", 0) or 0) != 0:
             state["daily_loss_locked_until"] = 0
             changed = True
         if state.get("daily_lock_reason"):
             state["daily_lock_reason"] = ""
+            changed = True
+        if _round_usd(state.get("daily_lock_loss_value", 0)) != 0:
+            state["daily_lock_loss_value"] = 0.0
             changed = True
         if bool(state.get("daily_lock_auto_reenable")):
             state["daily_lock_auto_reenable"] = False
@@ -502,8 +519,11 @@ def _maybe_apply_daily_lock(state: Dict[str, Any]) -> bool:
     _refresh_daily_lock_state(state)
 
     if not bool(state.get("daily_loss_protection_enabled", True)):
+        state["daily_loss_limit_usd"] = 0.0
+        state["daily_lock_duration_hours"] = 0
         state["daily_loss_locked_until"] = 0
         state["daily_lock_reason"] = ""
+        state["daily_lock_loss_value"] = 0.0
         state["daily_lock_auto_reenable"] = False
         return False
 
@@ -600,17 +620,35 @@ def set_real_daily_loss_limit(amount: float) -> str:
     amount = float(amount)
 
     if amount <= 0:
+        was_locked = int(state.get("daily_loss_locked_until", 0) or 0) > _now()
         state["daily_loss_protection_enabled"] = False
         state["daily_loss_limit_usd"] = 0.0
+        state["daily_lock_duration_hours"] = 0
         state["daily_loss_locked_until"] = 0
         state["daily_lock_reason"] = ""
         state["daily_lock_loss_value"] = 0.0
         state["daily_lock_auto_reenable"] = False
+
+        # If trading was only blocked by the daily-loss lock, allow trading again immediately.
+        try:
+            configured = (
+                float(state.get("initial_capital", 0) or 0) > 0
+                and float(state.get("position_size_usd", 0) or 0) > 0
+                and float(state.get("leverage", 0) or 0) > 0
+                and int(float(state.get("max_positions", 0) or 0)) > 0
+            )
+        except Exception:
+            configured = False
+        if was_locked and configured and not bool(state.get("emergency_stop")):
+            state["enabled"] = True
+
         save_real_trade_state(state)
-        return "✅ قفل/حد ضرر روزانه واقعی خاموش شد."
+        return "✅ قفل/حد ضرر روزانه واقعی خاموش شد و تایمر قفل صفر شد."
 
     state["daily_loss_protection_enabled"] = True
     state["daily_loss_limit_usd"] = round(amount, 4)
+    if int(state.get("daily_lock_duration_hours", 0) or 0) <= 0:
+        state["daily_lock_duration_hours"] = DEFAULT_REAL_LOCK_DURATION_HOURS
     # When re-enabled, start clean so the previous handled loss does not instantly re-lock
     # unless a new/larger loss is recorded later.
     if get_real_loss_from_protected(state) < round(amount, 4):
@@ -1849,7 +1887,7 @@ def get_real_trade_status_text() -> str:
         f"سود/ضرر امروز: {round(float(state.get('today_realized_pnl', 0)), 4)}$\n"
         f"سود/ضرر کل: {round(float(state.get('total_realized_pnl', 0)), 4)}$\n"
         f"حد ضرر روزانه: {('خاموش' if not bool(state.get('daily_loss_protection_enabled', True)) else str(state.get('daily_loss_limit_usd', 0)) + '$')}\n"
-        f"زمان قفل: {state.get('daily_lock_duration_hours', DEFAULT_REAL_LOCK_DURATION_HOURS)} ساعت\n"
+        f"زمان قفل: {(0 if not bool(state.get('daily_loss_protection_enabled', True)) else state.get('daily_lock_duration_hours', DEFAULT_REAL_LOCK_DURATION_HOURS))} ساعت\n"
         f"قفل ضرر روزانه: {('خاموش' if not bool(state.get('daily_loss_protection_enabled', True)) else lock_line)}"
     )
 
