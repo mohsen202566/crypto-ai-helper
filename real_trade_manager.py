@@ -1239,6 +1239,142 @@ def get_real_trade_status_text() -> str:
         f"قفل ضرر روزانه: {lock_line}"
     )
 
+
+
+# ---------------------------------------------------------------------------
+# Extra bot.py compatibility functions
+# bot.py imports these names directly. Keep them top-level.
+# ---------------------------------------------------------------------------
+
+def close_real_position_by_symbol(symbol: str, direction: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Close an internal real position by symbol (and optional direction).
+
+    This function exists for bot.py compatibility. It syncs with Toobit first,
+    searches the internal open_positions list, then closes the matching position
+    using close_real_position(signal_id).
+    """
+    sym = str(symbol or "").upper().strip()
+    dir_filter = str(direction or "").upper().strip()
+
+    if not sym:
+        return {"ok": False, "error": "نماد برای بستن پوزیشن مشخص نیست"}
+
+    state = load_real_trade_state()
+    sync_result = sync_real_positions_with_toobit(state, save=True)
+    if sync_result.get("ok"):
+        state = sync_result.get("state") or state
+
+    matches = []
+    for signal_id, pos in (state.get("open_positions") or {}).items():
+        if not isinstance(pos, dict):
+            continue
+        if str(pos.get("symbol") or "").upper() != sym:
+            continue
+        if dir_filter and str(pos.get("direction") or "").upper() != dir_filter:
+            continue
+        matches.append((signal_id, pos))
+
+    if not matches:
+        return {"ok": False, "error": f"پوزیشن باز برای {sym} پیدا نشد"}
+
+    if len(matches) > 1 and not dir_filter:
+        dirs = sorted({str(p.get("direction") or "").upper() for _, p in matches})
+        return {
+            "ok": False,
+            "error": f"برای {sym} چند پوزیشن/جهت پیدا شد؛ جهت را مشخص کن: {', '.join(dirs)}",
+            "matches": [{"signal_id": sid, "direction": p.get("direction")} for sid, p in matches],
+        }
+
+    signal_id, pos = matches[0]
+    result = close_real_position(signal_id=signal_id, result_type="MANUAL_CLOSE_BY_SYMBOL")
+    if result.get("ok"):
+        result["symbol"] = sym
+        result["direction"] = pos.get("direction")
+    return result
+
+
+def close_all_real_positions() -> Dict[str, Any]:
+    """
+    Close all internal real positions known by the bot.
+
+    Safety note:
+    - This only uses positions that are visible after syncing with Toobit.
+    - Each close is executed through close_real_position().
+    - It does not guess PnL; accounting is updated later when real closed PnL
+      is available from the exchange/tracker.
+    """
+    state = load_real_trade_state()
+    sync_result = sync_real_positions_with_toobit(state, save=True)
+    if sync_result.get("ok"):
+        state = sync_result.get("state") or state
+
+    open_positions = state.get("open_positions") or {}
+    if not isinstance(open_positions, dict) or not open_positions:
+        return {"ok": True, "closed_count": 0, "results": [], "message": "پوزیشن بازی برای بستن وجود ندارد."}
+
+    results = []
+    closed_count = 0
+    failed_count = 0
+
+    for signal_id, pos in list(open_positions.items()):
+        if not isinstance(pos, dict):
+            continue
+        result = close_real_position(signal_id=signal_id, result_type="MANUAL_CLOSE_ALL")
+        results.append({
+            "signal_id": signal_id,
+            "symbol": pos.get("symbol"),
+            "direction": pos.get("direction"),
+            "ok": bool(result.get("ok")),
+            "error": result.get("error"),
+            "result": result,
+        })
+        if result.get("ok"):
+            closed_count += 1
+        else:
+            failed_count += 1
+
+    return {
+        "ok": failed_count == 0,
+        "closed_count": closed_count,
+        "failed_count": failed_count,
+        "results": results,
+        "message": f"بستن همه پوزیشن‌ها انجام شد. موفق: {closed_count} | ناموفق: {failed_count}",
+    }
+
+
+def sync_real_positions_text() -> str:
+    """
+    Sync internal slots with live Toobit positions and return Telegram-ready text.
+    """
+    state = load_real_trade_state()
+    result = sync_real_positions_with_toobit(state, save=True)
+
+    if not result.get("ok"):
+        return f"❌ همگام‌سازی پوزیشن‌های واقعی ناموفق بود:\n{result.get('error') or 'خطای نامشخص'}"
+
+    state = result.get("state") or state
+    exchange_positions = result.get("exchange_positions") or []
+    open_positions = state.get("open_positions") or {}
+
+    lines = [
+        "✅ همگام‌سازی پوزیشن‌های واقعی انجام شد.",
+        f"پوزیشن واقعی در توبیت: {len(exchange_positions)}",
+        f"پوزیشن داخلی/اسلات ربات: {len(open_positions) if isinstance(open_positions, dict) else 0}",
+        f"اضافه‌شده به اسلات: {result.get('added', 0)}",
+        f"حذف‌شده از اسلات: {result.get('removed', 0)}",
+    ]
+
+    if exchange_positions:
+        lines.append("")
+        lines.append("پوزیشن‌های دیده‌شده در توبیت:")
+        for pos in exchange_positions[:10]:
+            lines.append(
+                f"• {pos.get('symbol')} {pos.get('direction')} | Qty: {pos.get('quantity')} | Lev: {pos.get('leverage') or 0}x"
+            )
+
+    return "\n".join(lines)
+
 # ---------------------------------------------------------------------------
 # Bot-facing helper functions
 # These three functions are intentionally small/stable so bot.py can import
