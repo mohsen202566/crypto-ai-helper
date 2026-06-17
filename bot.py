@@ -451,23 +451,53 @@ def disable_real_daily_loss_lock_local() -> str:
     """
     Disable daily-loss protection without touching exchange/order logic.
 
-    This only changes data/real_trade_state.json:
-    - daily_loss_limit_usd = 0
-    - clears current lock timer
-    - clears remembered lock loss so re-enabling starts fresh
+    Required behavior for `قفل ضرر خاموش`:
+    - daily loss protection OFF
+    - daily loss limit = 0
+    - lock duration = 0
+    - current lock timer cleared
+    - if trading was blocked only because of this lock, allow trading again immediately
+      when basic real-trade settings are configured and emergency stop is not active.
     """
+    # Prefer the real_trade_manager function when available, because it owns
+    # the real-trade state rules. Then enforce the same fields locally for
+    # backward compatibility with older real_trade_manager versions.
+    try:
+        if set_real_daily_loss_limit:
+            set_real_daily_loss_limit(0)
+    except Exception:
+        pass
+
     state = load_json(REAL_TRADE_STATE_FILE, {})
     if not isinstance(state, dict):
         state = {}
 
+    was_locked = int(state.get("daily_loss_locked_until", 0) or 0) > int(time.time())
+
     state["daily_loss_protection_enabled"] = False
     state["daily_loss_limit_usd"] = 0.0
+    state["daily_lock_duration_hours"] = 0
     state["daily_loss_locked_until"] = 0
     state["daily_lock_reason"] = ""
     state["daily_lock_loss_value"] = 0.0
     state["daily_lock_auto_reenable"] = False
+
+    try:
+        configured = (
+            float(state.get("initial_capital", 0) or 0) > 0
+            and float(state.get("position_size_usd", 0) or 0) > 0
+            and float(state.get("leverage", 0) or 0) > 0
+            and int(float(state.get("max_positions", 0) or 0)) > 0
+        )
+    except Exception:
+        configured = False
+
+    # If the only blocker was the daily-loss lock, let real trading be enabled again.
+    if was_locked and configured and not bool(state.get("emergency_stop")):
+        state["enabled"] = True
+
     save_json(REAL_TRADE_STATE_FILE, state)
-    return "✅ قفل/حد ضرر روزانه خاموش شد."
+    return "✅ قفل/حد ضرر روزانه خاموش شد؛ تایمر قفل صفر شد."
 
 
 def reset_active_daily_lock_from_now(hours: int) -> bool:
