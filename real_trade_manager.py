@@ -932,6 +932,7 @@ def sync_real_positions_with_toobit(state: Optional[Dict[str, Any]] = None, *, s
             "quantity": ex.get("quantity") or 0,
             "position_size_usd": state.get("position_size_usd", 0),
             "leverage": ex.get("leverage") or state.get("leverage", 0),
+            "margin_mode": "UNKNOWN_RECOVERED",
             "opened_at": now,
             "recovered_from_exchange": True,
             "exchange_position": ex.get("raw"),
@@ -1014,6 +1015,7 @@ def _register_real_open_position(state: Dict[str, Any], signal: Dict[str, Any], 
         "quantity": quantity,
         "position_size_usd": state.get("position_size_usd", 0),
         "leverage": state.get("leverage", 0),
+        "margin_mode": "ISOLATED",
         "opened_at": _now(),
         "exchange_order": order_result.get("data"),
         "execution_info": execution_info,
@@ -1050,6 +1052,7 @@ def _register_pending_real_position(
         "quantity": quantity,
         "position_size_usd": state.get("position_size_usd", 0),
         "leverage": state.get("leverage", 0),
+        "margin_mode": "ISOLATED",
         "opened_at": _now(),
         "pending_started_at": _now(),
         "real_status": PENDING_REAL_CONFIRM_STATUS,
@@ -1240,6 +1243,133 @@ def _ensure_toobit_leverage(symbol: str, desired_leverage: float) -> Dict[str, A
 
     return {"ok": True, "actual_leverage": actual, "desired_leverage": desired}
 
+
+def _extract_margin_mode_from_result(result: Dict[str, Any]) -> str:
+    """Best-effort extractor for margin mode from Toobit client results."""
+    if not isinstance(result, dict):
+        return ""
+
+    # Prefer tobit_client helper if available.
+    extractor = getattr(toobit_client, "_extract_margin_mode_value", None)
+    if callable(extractor):
+        try:
+            mode = extractor(result)
+            if mode:
+                return str(mode).upper()
+        except Exception:
+            pass
+        try:
+            mode = extractor(result.get("data"))
+            if mode:
+                return str(mode).upper()
+        except Exception:
+            pass
+
+    for item in _flatten_dicts(result.get("data", result)):
+        if not isinstance(item, dict):
+            continue
+
+        for key in (
+            "marginMode", "margin_mode", "marginType", "margin_type",
+            "tradeMode", "trade_mode", "positionMode", "position_mode"
+        ):
+            value = item.get(key)
+            text_value = str(value or "").upper()
+            if "ISOL" in text_value:
+                return "ISOLATED"
+            if "CROSS" in text_value:
+                return "CROSS"
+
+        for key in ("isolated", "isIsolated"):
+            if key in item:
+                return "ISOLATED" if bool(item.get(key)) else "CROSS"
+        for key in ("cross", "isCross"):
+            if key in item:
+                return "CROSS" if bool(item.get(key)) else "ISOLATED"
+
+    return ""
+
+
+def _ensure_toobit_isolated_margin(symbol: str) -> Dict[str, Any]:
+    """
+    Safety gate before a real order.
+
+    Required rule for the user's real account:
+    - Every Toobit futures position opened by the bot must be ISOLATED.
+    - CROSS is never allowed.
+    - If ISOLATED cannot be set/read/confirmed, block the real order.
+    """
+    # Best path: use tobit_client.ensure_isolated_margin() from the updated client.
+    ensure_method = getattr(toobit_client, "ensure_isolated_margin", None)
+    if callable(ensure_method):
+        try:
+            result = ensure_method(symbol)
+            if not isinstance(result, dict):
+                return {"ok": False, "error": "پاسخ تایید مارجین ایزوله نامعتبر بود؛ سفارش واقعی ارسال نشد."}
+            if not result.get("ok"):
+                return {
+                    "ok": False,
+                    "error": result.get("error") or "مارجین ISOLATED تایید نشد؛ سفارش واقعی ارسال نشد.",
+                    "details": result,
+                }
+
+            mode = _extract_margin_mode_from_result(result) or str(result.get("actual_margin_mode") or "").upper()
+            if mode and mode != "ISOLATED":
+                return {
+                    "ok": False,
+                    "error": f"Margin Mode توبیت ISOLATED نیست ({mode})؛ سفارش واقعی ارسال نشد.",
+                    "details": result,
+                }
+
+            return {"ok": True, "actual_margin_mode": "ISOLATED", "details": result}
+        except Exception as e:
+            return {"ok": False, "error": f"خطا در تایید مارجین ایزوله: {str(e)[:200]}"}
+
+    # Compatibility fallback for older/newer client method names.
+    set_result = _call_client_method(
+        (
+            "set_margin_mode", "set_symbol_margin_mode", "change_margin_mode",
+            "change_symbol_margin_mode", "set_futures_margin_mode"
+        ),
+        symbol,
+        "ISOLATED",
+    )
+    if not set_result.get("ok"):
+        return {
+            "ok": False,
+            "error": "تنظیم Margin Mode روی ISOLATED در توبیت ناموفق بود؛ سفارش واقعی ارسال نشد.",
+            "details": set_result.get("error"),
+            "set_result": set_result,
+        }
+
+    read_result = _call_client_method(
+        ("get_margin_mode", "get_symbol_margin_mode", "get_futures_margin_mode"),
+        symbol,
+    )
+    if not read_result.get("ok"):
+        return {
+            "ok": False,
+            "error": "تایید Margin Mode ایزوله از توبیت ممکن نشد؛ سفارش واقعی ارسال نشد.",
+            "set_result": set_result,
+            "read_result": read_result,
+        }
+
+    mode = _extract_margin_mode_from_result(read_result)
+    if mode != "ISOLATED":
+        return {
+            "ok": False,
+            "error": f"Margin Mode توبیت ISOLATED نیست ({mode or 'UNKNOWN'})؛ سفارش واقعی ارسال نشد.",
+            "set_result": set_result,
+            "read_result": read_result,
+        }
+
+    return {
+        "ok": True,
+        "actual_margin_mode": "ISOLATED",
+        "set_result": set_result,
+        "read_result": read_result,
+    }
+
 def open_real_position_from_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
     ready, reason = is_real_trade_ready()
     if not ready:
@@ -1274,6 +1404,15 @@ def open_real_position_from_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
     leverage_check = _ensure_toobit_leverage(symbol, float(state.get("leverage", 0) or 0))
     if not leverage_check.get("ok"):
         return {"ok": False, "blocked": True, "error": leverage_check.get("error"), "leverage_check": leverage_check}
+
+    isolated_check = _ensure_toobit_isolated_margin(symbol)
+    if not isolated_check.get("ok"):
+        return {
+            "ok": False,
+            "blocked": True,
+            "error": isolated_check.get("error") or "مارجین ISOLATED تایید نشد؛ سفارش واقعی ارسال نشد.",
+            "isolated_check": isolated_check,
+        }
 
     order_result = toobit_client.place_market_order(
         symbol=symbol,
