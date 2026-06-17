@@ -14,7 +14,7 @@ import time
 import hmac
 import hashlib
 import uuid
-from decimal import Decimal, ROUND_DOWN, InvalidOperation
+from decimal import Decimal, ROUND_DOWN, ROUND_UP, InvalidOperation
 from urllib.parse import urlencode
 
 import requests
@@ -27,6 +27,9 @@ TOBIT_SECRET_KEY = os.getenv("TOBIT_SECRET_KEY", "").strip()
 REAL_TRADING_ENABLED = os.getenv("REAL_TRADING_ENABLED", "false").strip().lower() == "true"
 RECV_WINDOW = int(os.getenv("TOBIT_RECV_WINDOW", "5000") or "5000")
 REQUEST_TIMEOUT = int(os.getenv("TOBIT_REQUEST_TIMEOUT", "15") or "15")
+# Keep metadata fetching disabled by default to avoid extra Toobit calls/rate limits.
+# If the exchange-info endpoint is confirmed later, set TOBIT_FETCH_SYMBOL_RULES=true.
+TOBIT_FETCH_SYMBOL_RULES = os.getenv("TOBIT_FETCH_SYMBOL_RULES", "false").strip().lower() == "true"
 
 # ---------------------------------------------------------------------------
 # Toobit futures symbol mapping
@@ -86,6 +89,10 @@ class ToobitClient:
         self._leverage_cache = {}
         self._margin_mode_cache = {}
         self._rate_limit_until = {}
+        # Symbol trading-rule cache. Used to normalize price/quantity before
+        # sending real orders, so Toobit does not reject TP/SL or qty because
+        # of unsupported precision/step sizes.
+        self._symbol_rules_cache = {}
 
     def _now_ms(self) -> int:
         return int(time.time() * 1000)
@@ -305,6 +312,261 @@ class ToobitClient:
             return str(Decimal(str(value)).quantize(q, rounding=ROUND_DOWN))
         except (InvalidOperation, ValueError, TypeError):
             return "0"
+
+
+    # ---------- Symbol trading rules / order normalization ----------
+    def _decimal_from_value(self, value, default: str = "0") -> Decimal:
+        try:
+            d = Decimal(str(value))
+            if d.is_finite():
+                return d
+        except Exception:
+            pass
+        return Decimal(str(default))
+
+    def _decimals_from_step(self, step) -> int:
+        """Return decimal places implied by a tick/step value."""
+        try:
+            d = Decimal(str(step)).normalize()
+            if d <= 0:
+                return 0
+            return max(0, -int(d.as_tuple().exponent))
+        except Exception:
+            return 0
+
+    def _fallback_price_step(self, price) -> Decimal:
+        """
+        Conservative fallback when Toobit does not expose symbol filters.
+        It avoids long floating tails while keeping enough precision for small coins.
+        """
+        p = abs(float(price or 0))
+        if p >= 1000:
+            return Decimal("0.1")
+        if p >= 100:
+            return Decimal("0.01")
+        if p >= 10:
+            return Decimal("0.001")
+        if p >= 1:
+            return Decimal("0.0001")
+        if p >= 0.1:
+            return Decimal("0.00001")
+        if p >= 0.01:
+            return Decimal("0.000001")
+        if p >= 0.001:
+            return Decimal("0.0000001")
+        return Decimal("0.00000001")
+
+    def _fallback_qty_step(self, quantity) -> Decimal:
+        q = abs(float(quantity or 0))
+        if q >= 1000:
+            return Decimal("1")
+        if q >= 100:
+            return Decimal("0.1")
+        if q >= 10:
+            return Decimal("0.01")
+        if q >= 1:
+            return Decimal("0.001")
+        return Decimal("0.0001")
+
+    def _round_to_step(self, value, step, *, mode: str = "down") -> str:
+        """Round a numeric value to an exchange step using Decimal arithmetic."""
+        d = self._decimal_from_value(value)
+        st = self._decimal_from_value(step)
+        if st <= 0:
+            return str(d)
+        rounding = ROUND_UP if str(mode).lower() == "up" else ROUND_DOWN
+        units = (d / st).to_integral_value(rounding=rounding)
+        rounded = units * st
+        decimals = self._decimals_from_step(st)
+        if decimals > 0:
+            quant = Decimal("1").scaleb(-decimals)
+            rounded = rounded.quantize(quant, rounding=ROUND_DOWN)
+        else:
+            rounded = rounded.quantize(Decimal("1"), rounding=ROUND_DOWN)
+        return format(rounded, "f")
+
+    def _extract_symbol_rules_from_data(self, data, symbol: str) -> dict:
+        """Best-effort parser for Toobit/exchange-info style symbol filters."""
+        wanted = set(self._symbol_candidates(symbol))
+        matches = []
+
+        def walk(value):
+            if isinstance(value, dict):
+                sym_text = " ".join(str(value.get(k, "")) for k in (
+                    "symbol", "contractCode", "instrument", "instId", "pair", "symbolName", "contract", "contractName"
+                ))
+                if sym_text:
+                    candidates = set()
+                    for part in sym_text.split():
+                        candidates.update(self._symbol_candidates(part))
+                    if candidates & wanted:
+                        matches.append(value)
+                for v in value.values():
+                    if isinstance(v, (dict, list)):
+                        walk(v)
+            elif isinstance(value, list):
+                for item in value:
+                    walk(item)
+
+        walk(data)
+        if not matches and isinstance(data, dict):
+            matches = [data]
+
+        price_keys = ("tickSize", "priceStep", "priceTick", "minPricePrecision", "pricePrecision", "quotePrecision")
+        qty_keys = ("stepSize", "qtyStep", "quantityStep", "lotSize", "basePrecision", "quantityPrecision", "volumePrecision")
+        min_qty_keys = ("minQty", "minQuantity", "minOrderQty", "minVolume", "minTradeVolume")
+
+        rules = {}
+        for item in matches:
+            if not isinstance(item, dict):
+                continue
+
+            # Direct keys first.
+            for key in price_keys:
+                if key in item and item.get(key) not in (None, ""):
+                    val = item.get(key)
+                    # Precision integers mean decimal places; tick/step values mean actual step.
+                    try:
+                        if "precision" in key.lower() and float(val).is_integer() and float(val) >= 0:
+                            rules["price_step"] = str(Decimal("1").scaleb(-int(float(val))))
+                        else:
+                            rules["price_step"] = str(val)
+                        break
+                    except Exception:
+                        pass
+
+            for key in qty_keys:
+                if key in item and item.get(key) not in (None, ""):
+                    val = item.get(key)
+                    try:
+                        if "precision" in key.lower() and float(val).is_integer() and float(val) >= 0:
+                            rules["qty_step"] = str(Decimal("1").scaleb(-int(float(val))))
+                        else:
+                            rules["qty_step"] = str(val)
+                        break
+                    except Exception:
+                        pass
+
+            for key in min_qty_keys:
+                if key in item and item.get(key) not in (None, ""):
+                    rules["min_qty"] = str(item.get(key))
+                    break
+
+            # Nested filter list fallback.
+            filters = item.get("filters") or item.get("filter") or []
+            if isinstance(filters, dict):
+                filters = list(filters.values())
+            if isinstance(filters, list):
+                for f in filters:
+                    if not isinstance(f, dict):
+                        continue
+                    for k in ("tickSize", "priceStep", "priceTick"):
+                        if k in f and f.get(k) not in (None, ""):
+                            rules.setdefault("price_step", str(f.get(k)))
+                    for k in ("stepSize", "qtyStep", "quantityStep"):
+                        if k in f and f.get(k) not in (None, ""):
+                            rules.setdefault("qty_step", str(f.get(k)))
+                    for k in min_qty_keys:
+                        if k in f and f.get(k) not in (None, ""):
+                            rules.setdefault("min_qty", str(f.get(k)))
+
+            if rules:
+                return rules
+        return rules
+
+    def get_symbol_trading_rules(self, symbol: str, reference_price=None, quantity=None) -> dict:
+        """
+        Return best-known price/quantity rules for a futures symbol.
+        Uses a short cache and falls back safely if Toobit metadata endpoints are unavailable.
+        """
+        normalized_symbol = self.normalize_futures_symbol(symbol)
+        cache_key = f"{normalized_symbol}:rules"
+        cached = self._cache_get("_symbol_rules_cache", cache_key, 3600)
+        if isinstance(cached, dict) and cached:
+            return dict(cached)
+
+        rules = {}
+        # Optional metadata lookup. Disabled by default because repeated/unknown
+        # Toobit metadata calls previously caused rate-limit style problems.
+        if TOBIT_FETCH_SYMBOL_RULES:
+            metadata_paths = (
+                "/api/v1/futures/exchangeInfo",
+                "/api/v1/futures/symbols",
+                "/api/v1/exchangeInfo",
+            )
+            for path in metadata_paths:
+                try:
+                    result = self._signed_request("GET", path, {"symbol": normalized_symbol})
+                    if isinstance(result, dict) and result.get("ok"):
+                        rules = self._extract_symbol_rules_from_data(result.get("data"), normalized_symbol)
+                        if rules:
+                            rules["source"] = path
+                            break
+                except Exception:
+                    pass
+
+        if not rules:
+            rules["source"] = "safe_fallback_no_extra_api_call"
+
+        if not rules.get("price_step"):
+            rules["price_step"] = str(self._fallback_price_step(reference_price))
+        if not rules.get("qty_step"):
+            rules["qty_step"] = str(self._fallback_qty_step(quantity))
+        if not rules.get("min_qty"):
+            rules["min_qty"] = "0"
+
+        self._cache_set("_symbol_rules_cache", cache_key, dict(rules))
+        return dict(rules)
+
+    def _normalize_order_values(self, symbol: str, direction: str, quantity, take_profit=None, stop_loss=None):
+        """
+        Normalize quantity/TP/SL before sending to Toobit.
+        Prevents invalid TP/SL precision and validates final side logic.
+        """
+        direction = str(direction or "").upper().strip()
+        ref_candidates = [x for x in (take_profit, stop_loss) if x not in (None, "", 0)]
+        reference_price = ref_candidates[0] if ref_candidates else 0
+        rules = self.get_symbol_trading_rules(symbol, reference_price=reference_price, quantity=quantity)
+        price_step = self._decimal_from_value(rules.get("price_step"), str(self._fallback_price_step(reference_price)))
+        qty_step = self._decimal_from_value(rules.get("qty_step"), str(self._fallback_qty_step(quantity)))
+        min_qty = self._decimal_from_value(rules.get("min_qty"), "0")
+
+        qty_down = self._decimal_from_value(self._round_to_step(quantity, qty_step, mode="down"))
+        if min_qty > 0 and qty_down < min_qty:
+            return {
+                "ok": False,
+                "error": f"quantity کمتر از حداقل مجاز نماد است: qty={qty_down}, minQty={min_qty}",
+                "rules": rules,
+            }
+        if qty_down <= 0:
+            return {"ok": False, "error": "quantity بعد از گرد کردن صفر شد", "rules": rules}
+
+        # Direction-aware rounding: move TP/SL one safe direction, not toward invalid side.
+        # LONG: TP higher, SL lower. SHORT: TP lower, SL higher.
+        tp_norm = None
+        sl_norm = None
+        if take_profit not in (None, "", 0):
+            tp_norm = self._round_to_step(take_profit, price_step, mode="up" if direction == "LONG" else "down")
+        if stop_loss not in (None, "", 0):
+            sl_norm = self._round_to_step(stop_loss, price_step, mode="down" if direction == "LONG" else "up")
+
+        # If both are present, validate that TP and SL are on opposite logical sides.
+        # We do not have guaranteed real-time entry here, so use their relative order.
+        if tp_norm is not None and sl_norm is not None:
+            tp_d = self._decimal_from_value(tp_norm)
+            sl_d = self._decimal_from_value(sl_norm)
+            if direction == "LONG" and not (tp_d > sl_d):
+                return {"ok": False, "error": "TP/SL بعد از گرد کردن برای LONG نامعتبر شد", "rules": rules, "tp": tp_norm, "sl": sl_norm}
+            if direction == "SHORT" and not (tp_d < sl_d):
+                return {"ok": False, "error": "TP/SL بعد از گرد کردن برای SHORT نامعتبر شد", "rules": rules, "tp": tp_norm, "sl": sl_norm}
+
+        return {
+            "ok": True,
+            "quantity": format(qty_down, "f"),
+            "take_profit": tp_norm,
+            "stop_loss": sl_norm,
+            "rules": rules,
+        }
 
     # ---------- Account / position ----------
     def get_account_balance(self, category: str | None = None):
@@ -973,25 +1235,50 @@ class ToobitClient:
         if float(quantity or 0) <= 0:
             return {"ok": False, "error": "quantity باید بیشتر از صفر باشد"}
 
+        normalized_values = self._normalize_order_values(
+            symbol,
+            direction,
+            quantity,
+            take_profit=take_profit,
+            stop_loss=stop_loss,
+        )
+        if not normalized_values.get("ok"):
+            return {
+                "ok": False,
+                "blocked": True,
+                "error": normalized_values.get("error", "order values normalization failed"),
+                "normalization": normalized_values,
+            }
+
         # Toobit docs use LIMIT orders with priceType=MARKET for market execution.
+        # Quantity, TP and SL are normalized before sending to avoid invalid
+        # precision/step-size errors such as invalid stop profit/loss price.
         params = {
             "symbol": symbol,
             "side": side,
             "type": "LIMIT",
             "priceType": "MARKET",
-            "quantity": self.safe_decimal(quantity, 6),
+            "quantity": normalized_values["quantity"],
             "newClientOrderId": f"bot_{uuid.uuid4().hex[:24]}",
         }
 
-        if take_profit:
-            params["takeProfit"] = str(take_profit)
+        if normalized_values.get("take_profit") is not None:
+            params["takeProfit"] = normalized_values["take_profit"]
             params["tpOrderType"] = "MARKET"
 
-        if stop_loss:
-            params["stopLoss"] = str(stop_loss)
+        if normalized_values.get("stop_loss") is not None:
+            params["stopLoss"] = normalized_values["stop_loss"]
             params["slOrderType"] = "MARKET"
 
         order_result = self._signed_request("POST", "/api/v1/futures/order", params)
+        order_result.setdefault("normalized_params", {
+            "symbol": symbol,
+            "side": side,
+            "quantity": params.get("quantity"),
+            "takeProfit": params.get("takeProfit"),
+            "stopLoss": params.get("stopLoss"),
+            "rules": normalized_values.get("rules"),
+        })
 
         if order_result.get("ok"):
             return order_result
@@ -1042,12 +1329,21 @@ class ToobitClient:
         if float(quantity or 0) <= 0:
             return {"ok": False, "error": "quantity باید بیشتر از صفر باشد"}
 
+        rules = self.get_symbol_trading_rules(symbol, quantity=quantity)
+        qty_step = self._decimal_from_value(rules.get("qty_step"), str(self._fallback_qty_step(quantity)))
+        min_qty = self._decimal_from_value(rules.get("min_qty"), "0")
+        qty_down = self._decimal_from_value(self._round_to_step(quantity, qty_step, mode="down"))
+        if min_qty > 0 and qty_down < min_qty:
+            return {"ok": False, "error": f"quantity کمتر از حداقل مجاز نماد است: qty={qty_down}, minQty={min_qty}", "rules": rules}
+        if qty_down <= 0:
+            return {"ok": False, "error": "quantity بعد از گرد کردن صفر شد", "rules": rules}
+
         params = {
             "symbol": symbol,
             "side": side,
             "type": "LIMIT",
             "priceType": "MARKET",
-            "quantity": self.safe_decimal(quantity, 6),
+            "quantity": format(qty_down, "f"),
             "newClientOrderId": f"bot_close_{uuid.uuid4().hex[:18]}",
         }
 
