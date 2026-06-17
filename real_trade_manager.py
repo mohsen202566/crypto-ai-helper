@@ -283,7 +283,14 @@ def _cleanup_unfilled_internal_positions(state: Dict[str, Any]) -> int:
         # Remove only clearly unfilled/pending records. Keep unknown old data safer.
         status = str(info.get("status") or "").upper()
         executed_qty = _safe_float_any(info.get("executed_qty"))
-        if (not confirmed) and status in {"PENDING_NEW", "NEW", "PENDING", "CREATED", "ACCEPTED", PENDING_REAL_CONFIRM_STATUS} and executed_qty <= 0 and age >= PENDING_SLOT_GRACE_SECONDS:
+        is_pending_real = str(pos.get("real_status") or "").upper() == PENDING_REAL_CONFIRM_STATUS
+        if (
+            (not confirmed)
+            and status in {"PENDING_NEW", "NEW", "PENDING", "CREATED", "ACCEPTED", PENDING_REAL_CONFIRM_STATUS}
+            and executed_qty <= 0
+            and age >= PENDING_SLOT_GRACE_SECONDS
+            and not is_pending_real
+        ):
             open_positions.pop(sid, None)
             removed += 1
 
@@ -624,10 +631,8 @@ def _base_symbol(symbol: str) -> str:
 
 
 # Conservative local minimum-quantity estimates.
-# Purpose: prevent Toobit -1202 "quantity too small" before sending an order.
-# These values are intentionally conservative and must never increase the order
-# above the user's configured margin/leverage. If the configured size is too
-# small for a symbol, the trade is blocked with a clear reason.
+# This prevents Toobit -1202 "quantity too small" before sending an order.
+# It does NOT increase order size; small orders are blocked safely.
 MIN_QTY_BY_BASE_SYMBOL = {
     "BTC": 0.001,
     "ETH": 0.01,
@@ -655,11 +660,7 @@ def _estimated_min_quantity(symbol: str, entry_price: float) -> float:
     price = float(entry_price or 0)
     if price >= 50000:
         return 0.001
-    if price >= 5000:
-        return 0.01
     if price >= 500:
-        return 0.01
-    if price >= 100:
         return 0.01
     if price >= 10:
         return 0.1
@@ -681,21 +682,15 @@ def calculate_order_quantity(entry_price: float, symbol: Optional[str] = None) -
     notional = position_usd * leverage
     quantity = notional / float(entry_price)
 
-    # Keep enough precision for high-price coins, but tobit_client will still
-    # send a safe decimal string. Do not round up because that can exceed the
-    # user's configured risk.
+    # Keep enough precision for high-price coins. Do not round up because that
+    # can exceed the user's configured real-money risk.
     if quantity >= 1:
         return round(quantity, 6)
     return round(quantity, 8)
 
 
 def validate_order_quantity(symbol: str, entry_price: float, quantity: float) -> Dict[str, Any]:
-    """
-    Pre-check quantity before sending to Toobit.
-
-    This avoids exchange error -1202 ("quantity too small"). The bot blocks
-    unsafe/small orders instead of silently increasing size beyond user settings.
-    """
+    """Pre-check quantity before sending to Toobit."""
     state = load_real_trade_state()
     position_usd = float(state.get("position_size_usd", 0) or 0)
     leverage = float(state.get("leverage", 0) or 0)
@@ -777,9 +772,9 @@ def close_real_position(
 # keep internal slots aligned with actual exchange positions.
 # ---------------------------------------------------------------------------
 
-PENDING_ORDER_POLL_SECONDS = 25.0
+PENDING_ORDER_POLL_SECONDS = 60.0
 PENDING_ORDER_POLL_INTERVAL = 2.0
-PENDING_SLOT_GRACE_SECONDS = 30
+PENDING_SLOT_GRACE_SECONDS = 75
 
 PENDING_REAL_CONFIRM_STATUS = "PENDING_REAL_CONFIRM"
 
@@ -958,12 +953,11 @@ def sync_real_positions_with_toobit(state: Optional[Dict[str, Any]] = None, *, s
         is_pending_real = str(pos.get("real_status") or "").upper() == PENDING_REAL_CONFIRM_STATUS
         is_exchange_pending = status in {"PENDING_NEW", "NEW", "PENDING", "CREATED", "ACCEPTED", PENDING_REAL_CONFIRM_STATUS}
 
-        # Do not free a just-sent real-trade slot too quickly. Pending real
-        # orders must stay reserved for at least PENDING_SLOT_GRACE_SECONDS
-        # while Toobit is repeatedly checked for the actual position.
-        if is_pending_real or is_exchange_pending:
-            if age < PENDING_SLOT_GRACE_SECONDS:
-                continue
+        # Keep newly sent real-order slots reserved long enough for Toobit to
+        # expose the futures position through the API. Do not free Pending slots
+        # immediately just because the order status is NEW/PENDING.
+        if (is_pending_real or is_exchange_pending) and age < PENDING_SLOT_GRACE_SECONDS:
+            continue
 
         if age >= PENDING_SLOT_GRACE_SECONDS:
             pos.setdefault("closed_or_missing_at", now)
@@ -1300,15 +1294,14 @@ def open_real_position_from_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
 
     if not confirmed_position:
         # Reserve the slot immediately and keep it reserved while Toobit is
-        # checked for 20-30 seconds. This prevents the bot from freeing the slot
-        # too quickly and sending another signal while the exchange is still
-        # making the position visible.
+        # checked for up to 60 seconds. This prevents the bot from freeing the
+        # slot too quickly while the exchange is still making the futures
+        # position visible through the API.
         state = load_real_trade_state()
         pending_pos = _register_pending_real_position(state, signal, signal_id, quantity, order_result, execution_info)
 
         waited = _wait_for_exchange_position(symbol, direction, quantity, timeout=PENDING_ORDER_POLL_SECONDS)
         if waited.get("ok"):
-            confirmed_position = True
             execution_info["status"] = execution_info.get("status") or "EXCHANGE_POSITION_FOUND_AFTER_PENDING"
             execution_info["recovered_by_polling"] = True
             recovered_note = "سفارش ابتدا Pending بود، سپس با چک پوزیشن توبیت تایید و وارد اسلات شد."
@@ -1325,10 +1318,8 @@ def open_real_position_from_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
                 "warning": recovered_note,
             }
 
-        # Final sync before declaring failure, in case polling response shape differed.
-        # Only exchange_positions can confirm success here. The internal pending
-        # slot alone is not enough, otherwise the bot would confirm its own
-        # temporary slot as if it were a real Toobit position.
+        # Final sync before declaring failure. Only real exchange_positions can
+        # confirm success here; the internal pending slot alone is not enough.
         sync_after = sync_real_positions_with_toobit(load_real_trade_state(), save=True)
         if sync_after.get("ok"):
             for ex in sync_after.get("exchange_positions") or []:
