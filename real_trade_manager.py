@@ -283,7 +283,7 @@ def _cleanup_unfilled_internal_positions(state: Dict[str, Any]) -> int:
         # Remove only clearly unfilled/pending records. Keep unknown old data safer.
         status = str(info.get("status") or "").upper()
         executed_qty = _safe_float_any(info.get("executed_qty"))
-        if (not confirmed) and status in {"PENDING_NEW", "NEW", "PENDING", "CREATED", "ACCEPTED"} and executed_qty <= 0 and age >= 10:
+        if (not confirmed) and status in {"PENDING_NEW", "NEW", "PENDING", "CREATED", "ACCEPTED", PENDING_REAL_CONFIRM_STATUS} and executed_qty <= 0 and age >= PENDING_SLOT_GRACE_SECONDS:
             open_positions.pop(sid, None)
             removed += 1
 
@@ -611,7 +611,66 @@ def get_toobit_balance_text() -> str:
     return f"✅ پاسخ بالانس توبیت:\n{result.get('data')}"
 
 
-def calculate_order_quantity(entry_price: float) -> float:
+def _base_symbol(symbol: str) -> str:
+    """Extract base coin from symbols like BTCUSDT or BTC-SWAP-USDT."""
+    raw = str(symbol or "").upper().strip()
+    raw = raw.replace("/", "").replace("_", "").replace("-", "")
+    for quote in ("USDT", "USDC", "USD"):
+        if raw.endswith(quote):
+            raw = raw[: -len(quote)]
+            break
+    raw = raw.replace("SWAP", "")
+    return raw
+
+
+# Conservative local minimum-quantity estimates.
+# Purpose: prevent Toobit -1202 "quantity too small" before sending an order.
+# These values are intentionally conservative and must never increase the order
+# above the user's configured margin/leverage. If the configured size is too
+# small for a symbol, the trade is blocked with a clear reason.
+MIN_QTY_BY_BASE_SYMBOL = {
+    "BTC": 0.001,
+    "ETH": 0.01,
+    "BNB": 0.01,
+    "BCH": 0.01,
+    "SOL": 0.1,
+    "LTC": 0.01,
+    "AAVE": 0.01,
+    "MKR": 0.001,
+    "XMR": 0.01,
+    "DASH": 0.01,
+    "AVAX": 0.1,
+    "LINK": 0.1,
+    "ETC": 0.1,
+    "UNI": 0.1,
+}
+
+
+def _estimated_min_quantity(symbol: str, entry_price: float) -> float:
+    """Best-effort min quantity until exchange symbol filters are available."""
+    base = _base_symbol(symbol)
+    if base in MIN_QTY_BY_BASE_SYMBOL:
+        return float(MIN_QTY_BY_BASE_SYMBOL[base])
+
+    price = float(entry_price or 0)
+    if price >= 50000:
+        return 0.001
+    if price >= 5000:
+        return 0.01
+    if price >= 500:
+        return 0.01
+    if price >= 100:
+        return 0.01
+    if price >= 10:
+        return 0.1
+    if price >= 1:
+        return 1.0
+    if price >= 0.1:
+        return 10.0
+    return 100.0
+
+
+def calculate_order_quantity(entry_price: float, symbol: Optional[str] = None) -> float:
     state = load_real_trade_state()
     position_usd = float(state.get("position_size_usd", 0))
     leverage = float(state.get("leverage", 0))
@@ -621,7 +680,52 @@ def calculate_order_quantity(entry_price: float) -> float:
 
     notional = position_usd * leverage
     quantity = notional / float(entry_price)
-    return round(quantity, 6)
+
+    # Keep enough precision for high-price coins, but tobit_client will still
+    # send a safe decimal string. Do not round up because that can exceed the
+    # user's configured risk.
+    if quantity >= 1:
+        return round(quantity, 6)
+    return round(quantity, 8)
+
+
+def validate_order_quantity(symbol: str, entry_price: float, quantity: float) -> Dict[str, Any]:
+    """
+    Pre-check quantity before sending to Toobit.
+
+    This avoids exchange error -1202 ("quantity too small"). The bot blocks
+    unsafe/small orders instead of silently increasing size beyond user settings.
+    """
+    state = load_real_trade_state()
+    position_usd = float(state.get("position_size_usd", 0) or 0)
+    leverage = float(state.get("leverage", 0) or 0)
+    notional = position_usd * leverage
+
+    min_qty = _estimated_min_quantity(symbol, entry_price)
+    min_notional = min_qty * float(entry_price or 0)
+
+    if quantity <= 0:
+        return {"ok": False, "error": "محاسبه حجم سفارش نامعتبر است"}
+
+    if min_qty > 0 and quantity < min_qty:
+        return {
+            "ok": False,
+            "error": (
+                f"حجم سفارش برای {symbol} کمتر از حداقل تخمینی توبیت است "
+                f"({quantity} < {min_qty})."
+            ),
+            "user_hint": (
+                f"برای این نماد حداقل حجم تقریبی پوزیشن حدود {round(min_notional, 4)}$ است. "
+                f"تنظیم فعلی تو {round(notional, 4)}$ است؛ ترید دلار/لوریج را بیشتر کن یا این نماد را رد کن."
+            ),
+            "quantity": quantity,
+            "min_quantity": min_qty,
+            "min_notional": round(min_notional, 6),
+            "configured_notional": round(notional, 6),
+            "blocked_reason": "QUANTITY_BELOW_ESTIMATED_MIN",
+        }
+
+    return {"ok": True, "quantity": quantity, "min_quantity": min_qty}
 
 
 def close_real_position(
@@ -673,8 +777,11 @@ def close_real_position(
 # keep internal slots aligned with actual exchange positions.
 # ---------------------------------------------------------------------------
 
-PENDING_ORDER_POLL_SECONDS = 8.0
-PENDING_ORDER_POLL_INTERVAL = 1.0
+PENDING_ORDER_POLL_SECONDS = 25.0
+PENDING_ORDER_POLL_INTERVAL = 2.0
+PENDING_SLOT_GRACE_SECONDS = 30
+
+PENDING_REAL_CONFIRM_STATUS = "PENDING_REAL_CONFIRM"
 
 
 def _plain_symbol_from_toobit(value: Any) -> str:
@@ -848,7 +955,17 @@ def sync_real_positions_with_toobit(state: Optional[Dict[str, Any]] = None, *, s
             continue
         age = now - int(pos.get("opened_at", 0) or 0)
         status = str(((pos.get("execution_info") or {}).get("status")) or "").upper()
-        if age >= 15 or status in {"PENDING_NEW", "NEW", "PENDING", "CREATED", "ACCEPTED"}:
+        is_pending_real = str(pos.get("real_status") or "").upper() == PENDING_REAL_CONFIRM_STATUS
+        is_exchange_pending = status in {"PENDING_NEW", "NEW", "PENDING", "CREATED", "ACCEPTED", PENDING_REAL_CONFIRM_STATUS}
+
+        # Do not free a just-sent real-trade slot too quickly. Pending real
+        # orders must stay reserved for at least PENDING_SLOT_GRACE_SECONDS
+        # while Toobit is repeatedly checked for the actual position.
+        if is_pending_real or is_exchange_pending:
+            if age < PENDING_SLOT_GRACE_SECONDS:
+                continue
+
+        if age >= PENDING_SLOT_GRACE_SECONDS:
             pos.setdefault("closed_or_missing_at", now)
             state.setdefault("orphaned_internal_positions", []).append(pos)
             state["orphaned_internal_positions"] = state["orphaned_internal_positions"][-200:]
@@ -910,6 +1027,78 @@ def _register_real_open_position(state: Dict[str, Any], signal: Dict[str, Any], 
     }
     save_real_trade_state(state)
     return state["open_positions"][signal_id]
+
+
+def _register_pending_real_position(
+    state: Dict[str, Any],
+    signal: Dict[str, Any],
+    signal_id: str,
+    quantity: float,
+    order_result: Dict[str, Any],
+    execution_info: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Reserve a real-trade slot while Toobit position confirmation is pending."""
+    symbol = signal.get("symbol")
+    direction = signal.get("direction")
+    entry = float(signal.get("entry", 0) or signal.get("price", 0) or 0)
+    tp1 = signal.get("tp1")
+    sl = signal.get("sl") or signal.get("stop_loss")
+
+    state.setdefault("open_positions", {})
+    state["open_positions"][signal_id] = {
+        "signal_id": signal_id,
+        "symbol": symbol,
+        "direction": direction,
+        "entry": entry,
+        "tp1": tp1,
+        "tp2": signal.get("tp2"),
+        "sl": sl,
+        "quantity": quantity,
+        "position_size_usd": state.get("position_size_usd", 0),
+        "leverage": state.get("leverage", 0),
+        "opened_at": _now(),
+        "pending_started_at": _now(),
+        "real_status": PENDING_REAL_CONFIRM_STATUS,
+        "exchange_order": order_result.get("data"),
+        "execution_info": execution_info,
+        "warning": "سفارش ارسال شده و اسلات موقتاً رزرو است؛ در حال تایید پوزیشن واقعی در توبیت.",
+    }
+    save_real_trade_state(state)
+    return state["open_positions"][signal_id]
+
+
+def _confirm_pending_real_position(
+    signal_id: str,
+    execution_info: Dict[str, Any],
+    recovered_note: str = "",
+) -> Optional[Dict[str, Any]]:
+    """Mark a pending reserved slot as an active real position."""
+    state = load_real_trade_state()
+    pos = (state.get("open_positions") or {}).get(signal_id)
+    if not isinstance(pos, dict):
+        return None
+
+    pos["real_status"] = "ACTIVE_REAL"
+    pos["confirmed_at"] = _now()
+    pos["execution_info"] = execution_info
+    pos["recovered_note"] = recovered_note
+    if recovered_note:
+        pos["warning"] = recovered_note
+    save_real_trade_state(state)
+    return pos
+
+
+def _release_pending_real_position(signal_id: str, reason: str = "") -> None:
+    """Release a pending reserved slot after the confirmation grace period."""
+    state = load_real_trade_state()
+    pos = (state.get("open_positions") or {}).get(signal_id)
+    if isinstance(pos, dict):
+        pos["released_at"] = _now()
+        pos["release_reason"] = reason
+        state.setdefault("orphaned_internal_positions", []).append(pos)
+        state["orphaned_internal_positions"] = state["orphaned_internal_positions"][-200:]
+        state.get("open_positions", {}).pop(signal_id, None)
+        save_real_trade_state(state)
 
 
 def is_real_trade_ready() -> tuple[bool, str]:
@@ -1083,9 +1272,10 @@ def open_real_position_from_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(pos, dict) and str(pos.get("symbol") or "").upper() == symbol and str(pos.get("direction") or "").upper() == direction:
             return {"ok": False, "blocked": True, "error": f"برای {symbol} {direction} از قبل پوزیشن واقعی باز است"}
 
-    quantity = calculate_order_quantity(entry)
-    if quantity <= 0:
-        return {"ok": False, "error": "محاسبه حجم سفارش نامعتبر است"}
+    quantity = calculate_order_quantity(entry, symbol=symbol)
+    quantity_check = validate_order_quantity(symbol, entry, quantity)
+    if not quantity_check.get("ok"):
+        return quantity_check
 
     leverage_check = _ensure_toobit_leverage(symbol, float(state.get("leverage", 0) or 0))
     if not leverage_check.get("ok"):
@@ -1109,48 +1299,80 @@ def open_real_position_from_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
     recovered_note = ""
 
     if not confirmed_position:
-        waited = _wait_for_exchange_position(symbol, direction, quantity)
+        # Reserve the slot immediately and keep it reserved while Toobit is
+        # checked for 20-30 seconds. This prevents the bot from freeing the slot
+        # too quickly and sending another signal while the exchange is still
+        # making the position visible.
+        state = load_real_trade_state()
+        pending_pos = _register_pending_real_position(state, signal, signal_id, quantity, order_result, execution_info)
+
+        waited = _wait_for_exchange_position(symbol, direction, quantity, timeout=PENDING_ORDER_POLL_SECONDS)
         if waited.get("ok"):
             confirmed_position = True
             execution_info["status"] = execution_info.get("status") or "EXCHANGE_POSITION_FOUND_AFTER_PENDING"
             execution_info["recovered_by_polling"] = True
             recovered_note = "سفارش ابتدا Pending بود، سپس با چک پوزیشن توبیت تایید و وارد اسلات شد."
-        else:
-            # Final sync before declaring failure, in case polling response shape differed.
-            sync_after = sync_real_positions_with_toobit(load_real_trade_state(), save=True)
-            if sync_after.get("ok"):
-                for pos in (sync_after.get("state") or {}).get("open_positions", {}).values():
-                    if isinstance(pos, dict) and str(pos.get("symbol") or "").upper() == symbol and str(pos.get("direction") or "").upper() == direction:
-                        return {
-                            "ok": True,
-                            "signal_id": pos.get("signal_id"),
-                            "symbol": symbol,
-                            "direction": direction,
-                            "quantity": pos.get("quantity"),
-                            "order": order_result.get("data"),
-                            "execution_info": execution_info,
-                            "warning": "پوزیشن از طریق sync صرافی پیدا شد.",
-                        }
+            pos = _confirm_pending_real_position(signal_id, execution_info, recovered_note) or pending_pos
             return {
-                "ok": False,
-                "blocked": True,
-                "error": (
-                    "سفارش توسط توبیت پذیرفته شد اما بعد از چند بار چک، پوزیشن واقعی دیده نشد؛ "
-                    "برای جلوگیری از اسلات اشتباه وارد لیست پوزیشن‌های باز نشد."
-                ),
-                "order_status": execution_info.get("status"),
-                "executed_qty": execution_info.get("executed_qty"),
-                "orig_qty": execution_info.get("orig_qty"),
-                "order_id": execution_info.get("order_id"),
-                "client_order_id": execution_info.get("client_order_id"),
-                "exchange_result": order_result.get("data"),
+                "ok": True,
+                "signal_id": signal_id,
+                "symbol": symbol,
+                "direction": direction,
+                "quantity": quantity,
+                "order": order_result.get("data"),
+                "execution_info": execution_info,
+                "position": pos,
+                "warning": recovered_note,
             }
+
+        # Final sync before declaring failure, in case polling response shape differed.
+        # Only exchange_positions can confirm success here. The internal pending
+        # slot alone is not enough, otherwise the bot would confirm its own
+        # temporary slot as if it were a real Toobit position.
+        sync_after = sync_real_positions_with_toobit(load_real_trade_state(), save=True)
+        if sync_after.get("ok"):
+            for ex in sync_after.get("exchange_positions") or []:
+                if str(ex.get("symbol") or "").upper() == symbol and str(ex.get("direction") or "").upper() == direction:
+                    pos = _confirm_pending_real_position(signal_id, execution_info, "پوزیشن از طریق sync صرافی پیدا شد.")
+                    if pos is None:
+                        state_after = load_real_trade_state()
+                        pos = (state_after.get("open_positions") or {}).get(signal_id) or {}
+                    return {
+                        "ok": True,
+                        "signal_id": signal_id,
+                        "symbol": symbol,
+                        "direction": direction,
+                        "quantity": quantity,
+                        "order": order_result.get("data"),
+                        "execution_info": execution_info,
+                        "position": pos,
+                        "warning": "پوزیشن از طریق sync صرافی پیدا شد.",
+                    }
+
+        _release_pending_real_position(signal_id, "No real Toobit position visible after pending confirmation window.")
+        return {
+            "ok": False,
+            "blocked": True,
+            "error": (
+                f"سفارش توسط توبیت پذیرفته شد اما بعد از حدود {int(PENDING_ORDER_POLL_SECONDS)} ثانیه چک، "
+                "پوزیشن واقعی دیده نشد؛ اسلات موقت آزاد شد."
+            ),
+            "order_status": execution_info.get("status"),
+            "executed_qty": execution_info.get("executed_qty"),
+            "orig_qty": execution_info.get("orig_qty"),
+            "order_id": execution_info.get("order_id"),
+            "client_order_id": execution_info.get("client_order_id"),
+            "exchange_result": order_result.get("data"),
+        }
 
     state = load_real_trade_state()
     if signal_id in state.get("open_positions", {}):
         return {"ok": False, "blocked": True, "error": "این سیگنال قبلاً پوزیشن باز دارد"}
 
     pos = _register_real_open_position(state, signal, signal_id, quantity, order_result, execution_info, recovered_note)
+    pos["real_status"] = "ACTIVE_REAL"
+    pos["confirmed_at"] = _now()
+    save_real_trade_state(state)
     return {
         "ok": True,
         "signal_id": signal_id,
