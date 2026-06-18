@@ -11,6 +11,8 @@ Purpose:
     coin_risk.py       -> daily/long-term risk and strictness
     coin_learning.py   -> coin personality, SL/TP patterns, extra strength
     coin_rotation.py   -> symbol priority/penalty when available
+    sr_learning.py     -> liquidity/trap/stop-hunt soft risk when available
+    meta learning      -> adaptive layer weights when coin_learning exposes it
 - Rank final candidates by ai_final_rank, not raw classic score only.
 - Save good but unused/rejected candidates as Ghost signals when appropriate.
 
@@ -64,6 +66,17 @@ try:
 except Exception:
     should_require_extra_strength = None
     get_smart_tp_suggestion = None
+
+try:
+    from sr_learning import get_liquidity_trap_profile, suggest_liquidity_aware_buffer
+except Exception:
+    get_liquidity_trap_profile = None
+    suggest_liquidity_aware_buffer = None
+
+try:
+    from coin_learning import get_meta_layer_weights
+except Exception:
+    get_meta_layer_weights = None
 
 
 SCAN_DELAY_SECONDS = 0.05
@@ -126,7 +139,11 @@ def _build_scanner_snapshot(r: Dict[str, Any]) -> Dict[str, Any]:
         "adx", "macd", "macd_signal", "macd_hist", "power2_buy", "power2_sell",
         "power3_buy", "power3_sell", "buy_power", "sell_power", "atr",
         "market_mode", "market_regime", "coin_behavior", "btc_bias",
-        "support", "resistance", "vwap_status", "entry_mode",
+        "support", "resistance", "vwap_status", "vwap_distance_pct", "entry_mode",
+        "timeframe_core", "entry_timing_tf", "rsi_slope_15m", "adx_slope_15m",
+        "macd_hist_accel_15m", "macd_hist_slope_15m", "prediction_score",
+        "reversal_risk_score", "expected_move_pct", "trap_risk", "time_risk",
+        "time_risk_score", "liquidity_risk_score", "relative_status", "move_state",
     ]:
         if key not in out and r.get(key) is not None:
             out[key] = r.get(key)
@@ -154,11 +171,14 @@ def _get_rotation_score(symbol: str, direction: str = None, snapshot: Dict[str, 
         return 50.0
 
 
-def _risk_adjustment(symbol: str, direction: str) -> Tuple[Dict[str, Any], float, int, List[str]]:
+def _risk_adjustment(symbol: str, direction: str, snapshot: Dict[str, Any] = None) -> Tuple[Dict[str, Any], float, int, List[str]]:
     if not get_direction_risk_state:
         return {}, 0.0, 0, []
     try:
-        state = get_direction_risk_state(symbol, direction)
+        try:
+            state = get_direction_risk_state(symbol, direction, snapshot=snapshot)
+        except TypeError:
+            state = get_direction_risk_state(symbol, direction)
     except Exception:
         return {}, 0.0, 0, []
 
@@ -222,6 +242,119 @@ def _classic_rank_value(r: Dict[str, Any]) -> float:
     return score + conf * 1.5 + rr * 2.0 + risk + fresh
 
 
+def _extract_nested_number(snapshot: Dict[str, Any], *keys: str, default: float = 0.0) -> float:
+    """Read a numeric value from snapshot or known nested AI layer dicts."""
+    if not isinstance(snapshot, dict):
+        return float(default)
+    for k in keys:
+        if snapshot.get(k) is not None:
+            return _safe_float(snapshot.get(k), default)
+    for nest in ("prediction_layer", "liquidity_trap", "state_awareness", "candle_behavior", "ai_layers"):
+        obj = snapshot.get(nest)
+        if isinstance(obj, dict):
+            for k in keys:
+                if obj.get(k) is not None:
+                    return _safe_float(obj.get(k), default)
+    return float(default)
+
+
+def _prediction_adjustment(snapshot: Dict[str, Any]) -> Tuple[float, List[str]]:
+    """Soft prediction bonus/penalty. It never hard-blocks; it only changes rank."""
+    pred = _extract_nested_number(snapshot, "prediction_score", "early_momentum_score", default=50.0)
+    reversal = _extract_nested_number(snapshot, "reversal_risk_score", "reversal_risk", default=50.0)
+    expected = _extract_nested_number(snapshot, "expected_move_pct", "expected_move", default=0.0)
+    adx_slope = _extract_nested_number(snapshot, "adx_slope_15m", "adx_slope", default=0.0)
+    rsi_slope = _extract_nested_number(snapshot, "rsi_slope_15m", "rsi_slope", default=0.0)
+    macd_accel = _extract_nested_number(snapshot, "macd_hist_accel_15m", "macd_acceleration", default=0.0)
+
+    adj = 0.0
+    adj += max(-6.0, min(8.0, (pred - 50.0) / 7.0))
+    adj -= max(-4.0, min(7.0, (reversal - 50.0) / 9.0))
+    adj += max(0.0, min(4.0, expected * 1.2))
+    adj += max(-2.0, min(2.0, adx_slope * 0.25))
+    adj += max(-2.0, min(2.0, rsi_slope * 0.18))
+    adj += max(-2.0, min(2.5, macd_accel * 500.0))
+
+    reasons = []
+    if pred >= 65:
+        reasons.append(f"Prediction strong={round(pred,1)}")
+    if reversal >= 65:
+        reasons.append(f"Reversal risk={round(reversal,1)}")
+    return round(max(-12.0, min(14.0, adj)), 4), reasons
+
+
+def _liquidity_adjustment(symbol: str, direction: str, snapshot: Dict[str, Any]) -> Tuple[Dict[str, Any], float, List[str]]:
+    """Soft liquidity/trap/stop-hunt rank adjustment from sr_learning and snapshot."""
+    profile = {}
+    if get_liquidity_trap_profile:
+        try:
+            price = snapshot.get("entry") or snapshot.get("price")
+            profile = get_liquidity_trap_profile(symbol, direction=direction, price=price)
+        except Exception:
+            profile = {}
+
+    snap_trap = str(snapshot.get("trap_risk") or ((snapshot.get("liquidity_trap") or {}).get("trap_risk") if isinstance(snapshot.get("liquidity_trap"), dict) else "") or "").upper()
+    risk_score = _safe_float(profile.get("trap_risk_score"), 0.0) if isinstance(profile, dict) else 0.0
+    if snap_trap == "HIGH":
+        risk_score = max(risk_score, 70.0)
+    elif snap_trap == "MEDIUM":
+        risk_score = max(risk_score, 40.0)
+
+    penalty = max(0.0, min(10.0, risk_score / 10.0))
+    reasons = []
+    if risk_score >= 45:
+        reasons.append(f"Liquidity/Trap risk={int(risk_score)}")
+    return profile if isinstance(profile, dict) else {}, round(penalty, 4), reasons
+
+
+def _time_risk_adjustment(snapshot: Dict[str, Any]) -> Tuple[float, List[str]]:
+    """Soft penalty for dangerous hours/regime shifts learned elsewhere."""
+    tr = snapshot.get("time_risk")
+    score = _extract_nested_number(snapshot, "time_risk_score", default=0.0)
+    if isinstance(tr, dict):
+        score = max(score, _safe_float(tr.get("risk_score"), 0.0))
+        label = str(tr.get("risk") or tr.get("level") or "").upper()
+    else:
+        label = str(tr or "").upper()
+
+    if label == "HIGH":
+        score = max(score, 70.0)
+    elif label == "MEDIUM":
+        score = max(score, 40.0)
+
+    penalty = max(0.0, min(7.0, score / 14.0))
+    return round(penalty, 4), ([f"Time risk={int(score)}"] if score >= 40 else [])
+
+
+def _meta_weights(symbol: str, direction: str, snapshot: Dict[str, Any]) -> Dict[str, float]:
+    """Best-effort adaptive weights. Neutral defaults keep compatibility."""
+    weights = {
+        "prediction": 1.0,
+        "risk": 1.0,
+        "learning": 1.0,
+        "liquidity": 1.0,
+        "time": 1.0,
+        "rotation": 1.0,
+    }
+    if not get_meta_layer_weights:
+        return weights
+    try:
+        meta = get_meta_layer_weights(symbol, direction=direction, snapshot=snapshot)
+    except TypeError:
+        try:
+            meta = get_meta_layer_weights(symbol, direction, snapshot)
+        except Exception:
+            meta = {}
+    except Exception:
+        meta = {}
+    if isinstance(meta, dict):
+        src = meta.get("weights") if isinstance(meta.get("weights"), dict) else meta
+        for k in list(weights.keys()):
+            if src.get(k) is not None:
+                weights[k] = max(0.4, min(1.8, _safe_float(src.get(k), 1.0)))
+    return weights
+
+
 def apply_ai_scanner_decision(r: Dict[str, Any]) -> Dict[str, Any]:
     """Attach AI-controlled ranking/approval fields to a signal.
 
@@ -240,16 +373,26 @@ def apply_ai_scanner_decision(r: Dict[str, Any]) -> Dict[str, Any]:
     base_req_conf = _safe_int(r.get("required_confirmations"), 0)
     actual_conf = _safe_int(r.get("confirmations"), 0)
 
-    risk_state, risk_penalty, risk_extra_conf, risk_reasons = _risk_adjustment(symbol, direction)
+    risk_state, risk_penalty, risk_extra_conf, risk_reasons = _risk_adjustment(symbol, direction, snapshot)
     learning_state, learning_penalty, learning_extra_conf, learning_reasons = _learning_adjustment(symbol, direction, snapshot)
     rotation_score = _get_rotation_score(symbol, direction, snapshot)
+    prediction_adj, prediction_reasons = _prediction_adjustment(snapshot)
+    liquidity_state, liquidity_penalty, liquidity_reasons = _liquidity_adjustment(symbol, direction, snapshot)
+    time_penalty, time_reasons = _time_risk_adjustment(snapshot)
+    meta_w = _meta_weights(symbol, direction, snapshot)
 
     # Rotation is the portfolio priority layer. 50 is neutral; weak coins get
     # meaningful de-prioritization, strong learned coins get a modest boost.
-    rotation_adj = max(-10.0, min(8.0, (rotation_score - 50.0) / 5.0))
+    rotation_adj = max(-10.0, min(8.0, (rotation_score - 50.0) / 5.0)) * meta_w.get('rotation', 1.0)
 
-    final_score = base_score - risk_penalty - learning_penalty + rotation_adj
-    required_score = base_min + learning_penalty + min(6.0, risk_penalty * 0.35)
+    weighted_risk_penalty = risk_penalty * meta_w.get('risk', 1.0)
+    weighted_learning_penalty = learning_penalty * meta_w.get('learning', 1.0)
+    weighted_liquidity_penalty = liquidity_penalty * meta_w.get('liquidity', 1.0)
+    weighted_time_penalty = time_penalty * meta_w.get('time', 1.0)
+    weighted_prediction_adj = prediction_adj * meta_w.get('prediction', 1.0)
+
+    final_score = base_score - weighted_risk_penalty - weighted_learning_penalty - weighted_liquidity_penalty - weighted_time_penalty + rotation_adj + weighted_prediction_adj
+    required_score = base_min + weighted_learning_penalty + min(6.0, weighted_risk_penalty * 0.35) + min(4.0, weighted_liquidity_penalty * 0.35) + min(3.0, weighted_time_penalty * 0.35)
     required_confirmations = base_req_conf + risk_extra_conf + learning_extra_conf
 
     approved = True
@@ -265,25 +408,27 @@ def apply_ai_scanner_decision(r: Dict[str, Any]) -> Dict[str, Any]:
     # for LONG/SHORT and only affect high-risk coin+direction candidates.
     risk_score_value = _safe_float(risk_state.get("risk_score"), 0.0) if isinstance(risk_state, dict) else 0.0
     sl_count_value = _safe_int(risk_state.get("sl_count"), 0) if isinstance(risk_state, dict) else 0
-    if risk_score_value >= 85 and final_score < 98:
+    if risk_score_value >= 90 and final_score < 96:
         approved = False
-        reject_reasons.append("AI scanner block: risk_score >= 85 and final_score < 98")
-    elif risk_score_value >= 70 and final_score < 95:
+        reject_reasons.append("AI scanner severe risk: ghost instead of real")
+    elif risk_score_value >= 75 and final_score < 92:
         approved = False
-        reject_reasons.append("AI scanner block: risk_score >= 70 and final_score < 95")
-    if sl_count_value >= 3 and final_score < 96:
+        reject_reasons.append("AI scanner high risk: ghost instead of real")
+    if sl_count_value >= 3 and final_score < 94:
         approved = False
-        reject_reasons.append("AI scanner block: repeated same-day SL and final_score < 96")
+        reject_reasons.append("AI scanner repeated same-day SL: ghost instead of real")
 
     # Do not fully erase high-quality analysis results; if rejected, they can
     # become Ghost signals for learning instead of Telegram/live entry.
-    ai_rank = base_rank + (final_score - base_score) + rotation_adj
+    ai_rank = base_rank + (final_score - base_score) + rotation_adj + weighted_prediction_adj
 
     r["symbol"] = symbol
     r["snapshot"] = snapshot
     r["coin_risk"] = risk_state
     r["ai_learning"] = learning_state
+    r["liquidity_trap"] = liquidity_state
     r["rotation_score"] = rotation_score
+    r["meta_weights"] = meta_w
     r["ai_scanner"] = {
         "approved": approved,
         "base_score": round(base_score, 4),
@@ -291,12 +436,15 @@ def apply_ai_scanner_decision(r: Dict[str, Any]) -> Dict[str, Any]:
         "required_score": round(required_score, 4),
         "base_rank": round(base_rank, 4),
         "ai_final_rank": round(ai_rank, 4),
-        "risk_penalty": round(risk_penalty, 4),
-        "learning_penalty": round(learning_penalty, 4),
+        "risk_penalty": round(weighted_risk_penalty, 4),
+        "learning_penalty": round(weighted_learning_penalty, 4),
+        "liquidity_penalty": round(weighted_liquidity_penalty, 4),
+        "time_penalty": round(weighted_time_penalty, 4),
+        "prediction_adjustment": round(weighted_prediction_adj, 4),
         "rotation_adjustment": round(rotation_adj, 4),
         "required_confirmations": required_confirmations,
         "actual_confirmations": actual_conf,
-        "reasons": risk_reasons + learning_reasons + reject_reasons,
+        "reasons": risk_reasons + learning_reasons + prediction_reasons + liquidity_reasons + time_reasons + reject_reasons,
     }
     r["ai_final_score"] = round(final_score, 4)
     r["ai_final_rank"] = round(ai_rank, 4)
@@ -346,6 +494,10 @@ def save_as_ghost(r, reason="SLOT_FULL"):
         snap = _build_scanner_snapshot(rr)
         if rr.get("ai_scanner"):
             snap["ai_scanner"] = rr.get("ai_scanner")
+        if rr.get("liquidity_trap"):
+            snap["liquidity_trap"] = rr.get("liquidity_trap")
+        if rr.get("meta_weights"):
+            snap["meta_weights"] = rr.get("meta_weights")
         create_ghost_signal(
             rr.get("symbol"),
             rr.get("direction"),
