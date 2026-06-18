@@ -30,6 +30,11 @@ REQUEST_TIMEOUT = int(os.getenv("TOBIT_REQUEST_TIMEOUT", "15") or "15")
 # Keep metadata fetching disabled by default to avoid extra Toobit calls/rate limits.
 # If the exchange-info endpoint is confirmed later, set TOBIT_FETCH_SYMBOL_RULES=true.
 TOBIT_FETCH_SYMBOL_RULES = os.getenv("TOBIT_FETCH_SYMBOL_RULES", "false").strip().lower() == "true"
+# Public symbol rules are fetched at most once per symbol/cache window.
+# This is safer than signed metadata calls and helps prevent Toobit -1202
+# quantity-too-small errors by reading real minQty/stepSize when available.
+TOBIT_FETCH_PUBLIC_SYMBOL_RULES = os.getenv("TOBIT_FETCH_PUBLIC_SYMBOL_RULES", "true").strip().lower() == "true"
+TOBIT_MIN_NOTIONAL_FALLBACK_USD = float(os.getenv("TOBIT_MIN_NOTIONAL_FALLBACK_USD", "5") or "5")
 REAL_PNL_ACCEPT_ZERO_WHEN_MOVE_BELOW_PCT = float(os.getenv("REAL_PNL_ACCEPT_ZERO_WHEN_MOVE_BELOW_PCT", "0.01") or "0.01")
 
 # ---------------------------------------------------------------------------
@@ -268,6 +273,34 @@ class ToobitClient:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
+    def _public_request(self, path: str, params: dict | None = None):
+        """Unsigned GET helper for public metadata endpoints.
+
+        Used only for symbol trading rules. It does not touch account/order
+        logic and it is cached by get_symbol_trading_rules().
+        """
+        try:
+            response = requests.get(
+                f"{self.base_url}{path}",
+                headers={"User-Agent": "crypto-ai-helper/1.0"},
+                params={k: v for k, v in (params or {}).items() if v is not None},
+                timeout=REQUEST_TIMEOUT,
+            )
+            raw_text = response.text
+            try:
+                data = response.json()
+            except Exception:
+                data = {"raw": raw_text}
+            ok = response.status_code == 200 and self._is_success_payload(data)
+            result = {"ok": ok, "status_code": response.status_code, "data": data, "path": path}
+            if not ok:
+                result["error"] = self._normalize_error(response.status_code, data, raw_text)
+            return result
+        except requests.RequestException as e:
+            return {"ok": False, "error": f"Network error: {e}", "path": path}
+        except Exception as e:
+            return {"ok": False, "error": f"Unexpected error: {e}", "path": path}
+
     def debug_env_masked(self):
         def mask(v: str) -> str:
             if not v:
@@ -416,6 +449,10 @@ class ToobitClient:
         price_keys = ("tickSize", "priceStep", "priceTick", "minPricePrecision", "pricePrecision", "quotePrecision")
         qty_keys = ("stepSize", "qtyStep", "quantityStep", "lotSize", "basePrecision", "quantityPrecision", "volumePrecision")
         min_qty_keys = ("minQty", "minQuantity", "minOrderQty", "minVolume", "minTradeVolume")
+        min_notional_keys = (
+            "minNotional", "minOrderValue", "minValue", "minTradeAmount",
+            "minOrderAmount", "minQuoteAmount", "minCost", "notional"
+        )
 
         rules = {}
         for item in matches:
@@ -453,6 +490,11 @@ class ToobitClient:
                     rules["min_qty"] = str(item.get(key))
                     break
 
+            for key in min_notional_keys:
+                if key in item and item.get(key) not in (None, ""):
+                    rules["min_notional"] = str(item.get(key))
+                    break
+
             # Nested filter list fallback.
             filters = item.get("filters") or item.get("filter") or []
             if isinstance(filters, dict):
@@ -470,6 +512,9 @@ class ToobitClient:
                     for k in min_qty_keys:
                         if k in f and f.get(k) not in (None, ""):
                             rules.setdefault("min_qty", str(f.get(k)))
+                    for k in min_notional_keys:
+                        if k in f and f.get(k) not in (None, ""):
+                            rules.setdefault("min_notional", str(f.get(k)))
 
             if rules:
                 return rules
@@ -487,9 +532,29 @@ class ToobitClient:
             return dict(cached)
 
         rules = {}
-        # Optional metadata lookup. Disabled by default because repeated/unknown
+
+        # Prefer unsigned/public metadata. This is cached and helps prevent
+        # Toobit -1202 by using the exchange's real minQty/qtyStep when exposed.
+        if TOBIT_FETCH_PUBLIC_SYMBOL_RULES:
+            public_paths = (
+                "/api/v1/futures/exchangeInfo",
+                "/api/v1/futures/symbols",
+                "/api/v1/exchangeInfo",
+            )
+            for path in public_paths:
+                try:
+                    result = self._public_request(path, {"symbol": normalized_symbol})
+                    if isinstance(result, dict) and result.get("ok"):
+                        rules = self._extract_symbol_rules_from_data(result.get("data"), normalized_symbol)
+                        if rules:
+                            rules["source"] = f"public:{path}"
+                            break
+                except Exception:
+                    pass
+
+        # Optional signed metadata lookup. Disabled by default because repeated/unknown
         # Toobit metadata calls previously caused rate-limit style problems.
-        if TOBIT_FETCH_SYMBOL_RULES:
+        if not rules and TOBIT_FETCH_SYMBOL_RULES:
             metadata_paths = (
                 "/api/v1/futures/exchangeInfo",
                 "/api/v1/futures/symbols",
@@ -515,6 +580,8 @@ class ToobitClient:
             rules["qty_step"] = str(self._fallback_qty_step(quantity))
         if not rules.get("min_qty"):
             rules["min_qty"] = "0"
+        if not rules.get("min_notional"):
+            rules["min_notional"] = str(TOBIT_MIN_NOTIONAL_FALLBACK_USD)
 
         self._cache_set("_symbol_rules_cache", cache_key, dict(rules))
         return dict(rules)
@@ -531,12 +598,39 @@ class ToobitClient:
         price_step = self._decimal_from_value(rules.get("price_step"), str(self._fallback_price_step(reference_price)))
         qty_step = self._decimal_from_value(rules.get("qty_step"), str(self._fallback_qty_step(quantity)))
         min_qty = self._decimal_from_value(rules.get("min_qty"), "0")
+        min_notional = self._decimal_from_value(rules.get("min_notional"), str(TOBIT_MIN_NOTIONAL_FALLBACK_USD))
+        ref_price_dec = self._decimal_from_value(reference_price, "0")
+
+        # If the exchange gives minNotional but not minQty, derive a safe
+        # minimum quantity. This blocks too-small orders before Toobit returns
+        # -1202, without increasing the user's risk automatically.
+        derived_min_qty = Decimal("0")
+        if min_notional > 0 and ref_price_dec > 0:
+            try:
+                derived_min_qty = self._decimal_from_value(
+                    self._round_to_step(min_notional / ref_price_dec, qty_step, mode="up")
+                )
+            except Exception:
+                derived_min_qty = Decimal("0")
+        effective_min_qty = max(min_qty, derived_min_qty)
 
         qty_down = self._decimal_from_value(self._round_to_step(quantity, qty_step, mode="down"))
-        if min_qty > 0 and qty_down < min_qty:
+        if effective_min_qty > 0 and qty_down < effective_min_qty:
             return {
                 "ok": False,
-                "error": f"quantity کمتر از حداقل مجاز نماد است: qty={qty_down}, minQty={min_qty}",
+                "blocked_reason": "QUANTITY_BELOW_EXCHANGE_MIN",
+                "error": (
+                    f"quantity کمتر از حداقل مجاز نماد است: "
+                    f"qty={qty_down}, minQty={effective_min_qty}"
+                ),
+                "user_hint": (
+                    "برای این نماد حجم سفارش کمتر از حداقل توبیت است؛ "
+                    "حجم دلاری/لوریج را بیشتر کن یا این نماد را برای ترید واقعی رد کن."
+                ),
+                "quantity": format(qty_down, "f"),
+                "min_quantity": format(effective_min_qty, "f"),
+                "min_notional": format(min_notional, "f"),
+                "reference_price": format(ref_price_dec, "f"),
                 "rules": rules,
             }
         if qty_down <= 0:
@@ -1284,6 +1378,22 @@ class ToobitClient:
         if order_result.get("ok"):
             return order_result
 
+        err_text = str(order_result.get("error") or order_result.get("data") or "").lower()
+        if "quantity too small" in err_text or "qty too small" in err_text or "-1202" in err_text:
+            order_result["blocked_reason"] = "TOOBIT_QUANTITY_TOO_SMALL"
+            order_result["user_hint"] = (
+                "Toobit حداقل حجم این نماد را بیشتر از مقدار ارسالی دانست. "
+                "فیلترهای نماد را از exchangeInfo چک کن یا حجم دلاری/لوریج را بیشتر کن."
+            )
+            order_result["normalized_params"] = order_result.get("normalized_params") or {
+                "symbol": symbol,
+                "side": side,
+                "quantity": params.get("quantity"),
+                "takeProfit": params.get("takeProfit"),
+                "stopLoss": params.get("stopLoss"),
+                "rules": normalized_values.get("rules"),
+            }
+
         # Critical real-trading safety:
         # Some Toobit responses may report an error even though the futures
         # position was opened. Before telling the bot that the order failed,
@@ -1335,7 +1445,14 @@ class ToobitClient:
         min_qty = self._decimal_from_value(rules.get("min_qty"), "0")
         qty_down = self._decimal_from_value(self._round_to_step(quantity, qty_step, mode="down"))
         if min_qty > 0 and qty_down < min_qty:
-            return {"ok": False, "error": f"quantity کمتر از حداقل مجاز نماد است: qty={qty_down}, minQty={min_qty}", "rules": rules}
+            return {
+                "ok": False,
+                "blocked_reason": "CLOSE_QUANTITY_BELOW_EXCHANGE_MIN",
+                "error": f"quantity کمتر از حداقل مجاز نماد است: qty={qty_down}, minQty={min_qty}",
+                "quantity": format(qty_down, "f"),
+                "min_quantity": format(min_qty, "f"),
+                "rules": rules,
+            }
         if qty_down <= 0:
             return {"ok": False, "error": "quantity بعد از گرد کردن صفر شد", "rules": rules}
 
