@@ -53,6 +53,14 @@ TOBIT_FUTURES_SYMBOL_MAP = {
 
 TOBIT_REVERSE_SYMBOL_MAP = {v: k for k, v in TOBIT_FUTURES_SYMBOL_MAP.items()}
 
+# Local safety overrides for symbols where Toobit may not expose minQty/minNotional
+# through public metadata, but the order endpoint rejects smaller quantities.
+# This only blocks too-small orders; it never increases user risk automatically.
+TOBIT_MIN_QTY_LOCAL_OVERRIDES = {
+    "AAVEUSDT": Decimal("1"),
+    "AAVE-SWAP-USDT": Decimal("1"),
+}
+
 
 def normalize_toobit_plain_symbol(symbol: str) -> str:
     """Return Toobit's plain futures symbol, e.g. SHIBUSDT -> 1000SHIBUSDT."""
@@ -520,6 +528,18 @@ class ToobitClient:
                 return rules
         return rules
 
+    def _local_min_qty_override(self, symbol: str) -> Decimal:
+        """Return hard local minQty override for known Toobit quantity errors."""
+        try:
+            candidates = self._symbol_candidates(symbol)
+        except Exception:
+            candidates = [str(symbol or "").upper().strip()]
+        for item in candidates:
+            key = str(item or "").upper().strip()
+            if key in TOBIT_MIN_QTY_LOCAL_OVERRIDES:
+                return TOBIT_MIN_QTY_LOCAL_OVERRIDES[key]
+        return Decimal("0")
+
     def get_symbol_trading_rules(self, symbol: str, reference_price=None, quantity=None) -> dict:
         """
         Return best-known price/quantity rules for a futures symbol.
@@ -582,6 +602,14 @@ class ToobitClient:
             rules["min_qty"] = "0"
         if not rules.get("min_notional"):
             rules["min_notional"] = str(TOBIT_MIN_NOTIONAL_FALLBACK_USD)
+
+        local_min_qty = self._local_min_qty_override(normalized_symbol)
+        if local_min_qty > 0:
+            current_min_qty = self._decimal_from_value(rules.get("min_qty"), "0")
+            if current_min_qty < local_min_qty:
+                rules["min_qty"] = format(local_min_qty, "f")
+                previous_source = rules.get("source", "")
+                rules["source"] = (str(previous_source) + "+local_min_qty_override").strip("+")
 
         self._cache_set("_symbol_rules_cache", cache_key, dict(rules))
         return dict(rules)
@@ -1379,7 +1407,7 @@ class ToobitClient:
             return order_result
 
         err_text = str(order_result.get("error") or order_result.get("data") or "").lower()
-        if "quantity too small" in err_text or "qty too small" in err_text or "-1202" in err_text:
+        if "quantity too small" in err_text or "qty too small" in err_text or "-1202" in err_text or "-1199" in err_text:
             order_result["blocked_reason"] = "TOOBIT_QUANTITY_TOO_SMALL"
             order_result["user_hint"] = (
                 "Toobit حداقل حجم این نماد را بیشتر از مقدار ارسالی دانست. "
