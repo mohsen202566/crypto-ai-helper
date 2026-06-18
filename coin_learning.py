@@ -71,7 +71,7 @@ def _safe_int(value: Any, default: int = 0) -> int:
 
 def _norm_result(result: Any) -> str:
     r = str(result or "").upper().strip()
-    if r in {"TP", "TP1", "TAKE_PROFIT", "TAKEPROFIT"}:
+    if r in {"TP", "TP1", "TAKE_PROFIT", "TAKEPROFIT", "EARLY_PROFIT", "AI_EXIT_PROFIT", "DYNAMIC_PROFIT", "PROFIT_PROTECT"}:
         return "TP1"
     if r == "TP2":
         return "TP2"
@@ -169,6 +169,10 @@ def _empty_bucket(symbol: str, direction: str) -> Dict[str, Any]:
         "indicator_stats": {},
         "market_stats": {},
         "entry_quality_stats": {},
+        "condition_stats": {},
+        "time_stats": {},
+        "dynamic_profit_stats": {"profit_exits": 0, "good_exits": 0, "premature_exits": 0, "reasons": {}},
+        "meta_learning": {},
         "early_5m_tp": 0.0,
         "early_5m_sl": 0.0,
         "multi_tf_tp": 0.0,
@@ -200,6 +204,14 @@ def _ensure_bucket_fields(b: Dict[str, Any], symbol: str, direction: str) -> Non
         b["market_stats"] = {}
     if not isinstance(b.get("entry_quality_stats"), dict):
         b["entry_quality_stats"] = {}
+    if not isinstance(b.get("condition_stats"), dict):
+        b["condition_stats"] = {}
+    if not isinstance(b.get("time_stats"), dict):
+        b["time_stats"] = {}
+    if not isinstance(b.get("dynamic_profit_stats"), dict):
+        b["dynamic_profit_stats"] = {"profit_exits": 0, "good_exits": 0, "premature_exits": 0, "reasons": {}}
+    if not isinstance(b.get("meta_learning"), dict):
+        b["meta_learning"] = {}
 
 
 def _bucket(s: Dict[str, Any], symbol: str, direction: str) -> Dict[str, Any]:
@@ -230,21 +242,47 @@ def _compact_snapshot(snapshot: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         return {}
     keys = [
         "symbol", "direction", "price", "entry", "score", "long_score", "short_score",
-        "rsi", "rsi_5m", "macd", "macd_signal", "macd_hist", "adx", "atr",
-        "ema20", "ema50", "ema200", "vwap", "vwap_status",
-        "power2_buy", "power2_sell", "power3_buy", "power3_sell", "buy_power", "sell_power",
-        "market_regime", "market_mode", "btc_bias", "support", "resistance",
+        "rsi", "rsi_5m", "rsi_slope_15m", "macd", "macd_signal", "macd_hist",
+        "macd_hist_slope_15m", "macd_hist_accel_15m", "adx", "adx_slope_15m", "atr",
+        "ema20", "ema50", "ema200", "ema_structure_15m", "vwap", "vwap_status", "vwap_distance_pct",
+        "volume_ratio_15m", "power2_buy", "power2_sell", "power3_buy", "power3_sell", "buy_power", "sell_power",
+        "market_regime", "market_mode", "btc_bias", "support", "resistance", "timeframe_core", "entry_timing_tf",
         "risk_level", "risk_reward", "confirmations", "freshness", "entry_mode",
-        "early_5m_trigger", "multi_tf_alignment", "late_entry",
+        "early_5m_trigger", "multi_tf_alignment", "late_entry", "pump_dump_chase",
         "early_5m_active", "early_5m_score", "multi_tf_active", "late_entry_flag",
         "rr_filter", "reject_reason", "valid_gate",
-        "result_source", "move_percent", "exit_price",
+        "prediction_score", "expected_move_atr", "reversal_risk_score", "move_state", "trap_risk",
+        "result_source", "move_percent", "exit_price", "exit_reason", "early_profit_exit",
     ]
     out = {k: snapshot.get(k) for k in keys if snapshot.get(k) is not None}
     if isinstance(snapshot.get("market_context"), dict):
         out["market_context"] = snapshot.get("market_context")
     if isinstance(snapshot.get("trends"), dict):
         out["trends"] = snapshot.get("trends")
+    for nested_key in [
+        "prediction_layer", "state_awareness", "candle_behavior", "liquidity_trap",
+        "relative_strength", "sr_levels", "dynamic_profit_protection", "trade_management",
+    ]:
+        if isinstance(snapshot.get(nested_key), dict):
+            out[nested_key] = snapshot.get(nested_key)
+
+    # Promote common nested values for fast conditional learning.
+    pred = out.get("prediction_layer") if isinstance(out.get("prediction_layer"), dict) else {}
+    state = out.get("state_awareness") if isinstance(out.get("state_awareness"), dict) else pred.get("state", {}) if isinstance(pred.get("state"), dict) else {}
+    liq = out.get("liquidity_trap") if isinstance(out.get("liquidity_trap"), dict) else pred.get("liquidity_trap", {}) if isinstance(pred.get("liquidity_trap"), dict) else {}
+    rel = out.get("relative_strength") if isinstance(out.get("relative_strength"), dict) else pred.get("relative_strength", {}) if isinstance(pred.get("relative_strength"), dict) else {}
+    if pred:
+        out.setdefault("prediction_score", pred.get("prediction_score"))
+        out.setdefault("expected_move_atr", pred.get("expected_move_atr"))
+        out.setdefault("reversal_risk_score", pred.get("reversal_risk_score"))
+    if state:
+        out.setdefault("move_state", state.get("move_state"))
+        out.setdefault("reversal_risk_score", state.get("reversal_risk_score"))
+    if liq:
+        out.setdefault("trap_risk", liq.get("trap_risk"))
+        out.setdefault("fake_break_risk", liq.get("fake_break_risk"))
+    if rel:
+        out.setdefault("relative_status", rel.get("relative_status"))
     return out
 
 
@@ -343,6 +381,102 @@ def _update_binary_quality_stat(stats: Dict[str, Any], name: str, active: bool, 
         row["tp_w"] = _safe_float(row.get("tp_w")) + weight
     elif result == "SL":
         row["sl_w"] = _safe_float(row.get("sl_w")) + weight
+
+def _bucketed_number(value: Any, step: float, default: str = "NA", min_value: float = None, max_value: float = None) -> str:
+    """Return a stable text bucket such as 20-24 for conditional learning."""
+    v = _safe_float(value, None)
+    if v is None:
+        return default
+    if min_value is not None:
+        v = max(min_value, v)
+    if max_value is not None:
+        v = min(max_value, v)
+    base = math.floor(v / step) * step
+    hi = base + step
+    if float(step).is_integer():
+        return f"{int(base)}-{int(hi)}"
+    return f"{round(base, 3)}-{round(hi, 3)}"
+
+
+def _update_condition_stat(stats: Dict[str, Any], key: str, weight: float, result: str, move_percent: Any = None) -> None:
+    if not key:
+        return
+    row = stats.setdefault(key, {"tp_w": 0.0, "sl_w": 0.0, "total_w": 0.0, "move_sum": 0.0, "move_w": 0.0})
+    row["total_w"] = _safe_float(row.get("total_w")) + weight
+    if result in {"TP1", "TP2"}:
+        row["tp_w"] = _safe_float(row.get("tp_w")) + weight
+    elif result == "SL":
+        row["sl_w"] = _safe_float(row.get("sl_w")) + weight
+    mp = _safe_float(move_percent, None)
+    if mp is not None:
+        row["move_sum"] = _safe_float(row.get("move_sum")) + mp * weight
+        row["move_w"] = _safe_float(row.get("move_w")) + weight
+
+
+def _learn_condition_matrix(b: Dict[str, Any], snap: Dict[str, Any], weight: float, result: str, move_percent: Any = None) -> None:
+    """Learn coin+direction+condition behavior instead of broad labels."""
+    stats = b.setdefault("condition_stats", {})
+    direction = str(snap.get("direction") or b.get("direction") or "").upper()
+
+    conditions = [
+        ("ADX", _bucketed_number(snap.get("adx"), 4, min_value=0, max_value=80)),
+        ("RSI", _bucketed_number(snap.get("rsi"), 5, min_value=0, max_value=100)),
+        ("RSI_SLOPE", _bucketed_number(snap.get("rsi_slope_15m"), 1.0, min_value=-10, max_value=10)),
+        ("MACD_HIST_ACCEL", _bucketed_number(snap.get("macd_hist_accel_15m"), 0.0005, min_value=-0.01, max_value=0.01)),
+        ("ADX_SLOPE", _bucketed_number(snap.get("adx_slope_15m"), 1.0, min_value=-10, max_value=10)),
+        ("VWAP", str(snap.get("vwap_status") or "NA").upper()),
+        ("EMA", str(snap.get("ema_structure_15m") or "NA").upper()),
+        ("STATE", str(snap.get("move_state") or ((snap.get("state_awareness") or {}).get("move_state") if isinstance(snap.get("state_awareness"), dict) else None) or "NA").upper()),
+        ("TRAP", str(snap.get("trap_risk") or ((snap.get("liquidity_trap") or {}).get("trap_risk") if isinstance(snap.get("liquidity_trap"), dict) else None) or "NA").upper()),
+        ("PRED", _bucketed_number(snap.get("prediction_score"), 10, min_value=0, max_value=100)),
+        ("REVERSAL", _bucketed_number(snap.get("reversal_risk_score"), 10, min_value=0, max_value=100)),
+        ("MARKET", str(snap.get("market_regime") or snap.get("market_mode") or "NA").upper()),
+        ("BTC", str(snap.get("btc_bias") or "NA").upper()),
+        ("REL", str(snap.get("relative_status") or ((snap.get("relative_strength") or {}).get("relative_status") if isinstance(snap.get("relative_strength"), dict) else "NA")).upper()),
+    ]
+    for name, val in conditions:
+        _update_condition_stat(stats, f"{direction}:{name}:{val}", weight, result, move_percent)
+
+    # Pair conditions catch examples like DOGE SHORT + ADX 18-22 + VWAP status.
+    adx_bin = _bucketed_number(snap.get("adx"), 4, min_value=0, max_value=80)
+    vwap = str(snap.get("vwap_status") or "NA").upper()
+    state = str(snap.get("move_state") or ((snap.get("state_awareness") or {}).get("move_state") if isinstance(snap.get("state_awareness"), dict) else "NA")).upper()
+    trap = str(snap.get("trap_risk") or ((snap.get("liquidity_trap") or {}).get("trap_risk") if isinstance(snap.get("liquidity_trap"), dict) else "NA")).upper()
+    for key in [f"{direction}:ADX_VWAP:{adx_bin}:{vwap}", f"{direction}:STATE_TRAP:{state}:{trap}"]:
+        _update_condition_stat(stats, key, weight, result, move_percent)
+
+
+def _learn_time_behavior(b: Dict[str, Any], snap: Dict[str, Any], weight: float, result: str, move_percent: Any = None) -> None:
+    ts = _safe_int(snap.get("snapshot_at") or snap.get("ts") or time.time(), _now())
+    hour = time.gmtime(ts).tm_hour
+    stats = b.setdefault("time_stats", {})
+    _update_condition_stat(stats, f"UTC_HOUR:{hour:02d}", weight, result, move_percent)
+
+
+def _learn_meta_layer(b: Dict[str, Any], snap: Dict[str, Any], weight: float, result: str, move_percent: Any = None) -> None:
+    """Meta learning: track which internal layers were helpful under outcomes."""
+    meta = b.setdefault("meta_learning", {})
+    pred = _safe_float(snap.get("prediction_score"), None)
+    rev = _safe_float(snap.get("reversal_risk_score"), None)
+    early = _safe_float(snap.get("early_5m_score"), None)
+    trap = str(snap.get("trap_risk") or "").upper()
+    state = str(snap.get("move_state") or "").upper()
+    candle = snap.get("candle_behavior") if isinstance(snap.get("candle_behavior"), dict) else {}
+
+    layer_flags = {
+        "prediction_high": pred is not None and pred >= 70,
+        "prediction_low": pred is not None and pred <= 45,
+        "reversal_high": rev is not None and rev >= 70,
+        "early_5m_strong": early is not None and early >= 7,
+        "trap_high": trap == "HIGH",
+        "state_late": state == "LATE_OR_EXHAUSTION",
+        "state_early_momentum": state == "EARLY_MOMENTUM",
+        "candle_strong_close": bool(candle.get("strong_close_up") or candle.get("strong_close_down")),
+        "candle_rejection": bool(candle.get("upper_rejection") or candle.get("lower_rejection")),
+    }
+    for name, active in layer_flags.items():
+        if active:
+            _update_condition_stat(meta, name, weight, result, move_percent)
 
 
 def _weighted_win_rate(b: Dict[str, Any]) -> float:
@@ -691,9 +825,23 @@ def update_signal_result(signal_id: str, result: str, exit_price: float = None, 
     except Exception:
         pass
 
-    for name in ["rsi", "rsi_5m", "macd_hist", "adx", "power2_buy", "power2_sell", "power3_buy", "power3_sell", "buy_power", "sell_power"]:
+    # Conditional AI learning: every coin+direction learns its own indicator,
+    # state, trap, time, prediction, and meta-layer outcomes.
+    try:
+        _learn_condition_matrix(b, snap, weight, r, move_percent)
+        _learn_time_behavior(b, snap, weight, r, move_percent)
+        _learn_meta_layer(b, snap, weight, r, move_percent)
+    except Exception:
+        pass
+
+    for name in [
+        "rsi", "rsi_5m", "rsi_slope_15m", "macd_hist", "macd_hist_slope_15m",
+        "macd_hist_accel_15m", "adx", "adx_slope_15m", "vwap_distance_pct",
+        "volume_ratio_15m", "prediction_score", "expected_move_atr", "reversal_risk_score",
+        "power2_buy", "power2_sell", "power3_buy", "power3_sell", "buy_power", "sell_power"
+    ]:
         _update_avg_stat(b["indicator_stats"], name, snap.get(name), weight, r)
-    for name in ["market_regime", "market_mode", "btc_bias", "vwap_status"]:
+    for name in ["market_regime", "market_mode", "btc_bias", "vwap_status", "move_state", "trap_risk", "relative_status", "ema_structure_15m"]:
         _update_market_stat(b["market_stats"], name, snap.get(name), weight, r)
 
     _recompute_bucket_behavior(b)
@@ -823,6 +971,26 @@ def should_require_extra_strength(symbol: str, direction: str, snapshot: Optiona
         extra_conf += 1 if similar_sl >= 2 else 0
         reasons.append("شباهت به الگوهای قبلی SL")
 
+    # Conditional weakness learned per coin+direction+condition.
+    try:
+        cond_stats = b.get("condition_stats", {}) if isinstance(b.get("condition_stats"), dict) else {}
+        adx_bin = _bucketed_number((snapshot or {}).get("adx"), 4, min_value=0, max_value=80)
+        vwap = str((snapshot or {}).get("vwap_status") or "NA").upper()
+        d = str(direction or "").upper()
+        weak_keys = [f"{d}:ADX:{adx_bin}", f"{d}:ADX_VWAP:{adx_bin}:{vwap}"]
+        weak_hits = 0
+        for wk in weak_keys:
+            row = cond_stats.get(wk, {})
+            tpw = _safe_float(row.get("tp_w"))
+            slw = _safe_float(row.get("sl_w"))
+            if tpw + slw >= 3 and slw > tpw:
+                weak_hits += 1
+        if weak_hits:
+            extra_score += min(4, weak_hits * 2)
+            reasons.append("شرط مشابه قبلاً SL بیشتری داده")
+    except Exception:
+        pass
+
     # Fast-entry learning: reward/penalize based on this coin+direction history.
     early_tp = _safe_float(b.get("early_5m_tp"))
     early_sl = _safe_float(b.get("early_5m_sl"))
@@ -891,6 +1059,10 @@ def get_tp_sl_v2_profile(symbol: str, direction: str, snapshot: Optional[Dict] =
         "early_5m_win_rate": round(_safe_float(b.get("early_5m_tp")) / max(_safe_float(b.get("early_5m_tp")) + _safe_float(b.get("early_5m_sl")), 1e-9), 4) if (_safe_float(b.get("early_5m_tp")) + _safe_float(b.get("early_5m_sl"))) > 0 else None,
         "late_entry_win_rate": round(_safe_float(b.get("late_entry_tp")) / max(_safe_float(b.get("late_entry_tp")) + _safe_float(b.get("late_entry_sl")), 1e-9), 4) if (_safe_float(b.get("late_entry_tp")) + _safe_float(b.get("late_entry_sl"))) > 0 else None,
         "entry_quality_stats": b.get("entry_quality_stats", {}),
+        "condition_stats": b.get("condition_stats", {}),
+        "time_stats": b.get("time_stats", {}),
+        "meta_learning": b.get("meta_learning", {}),
+        "dynamic_profit_stats": b.get("dynamic_profit_stats", {}),
         "clean_breakouts": clean,
         "bounces": bounces,
         "source": "coin_learning_v2",
@@ -945,6 +1117,68 @@ def register_tp_sl_v2_result(symbol: str, direction: str, result: str, entry: fl
     )
 
 
+
+def register_dynamic_profit_exit(symbol: str, direction: str, entry: float, exit_price: float, snapshot: Optional[Dict[str, Any]] = None, reason: str = None, source: str = "REAL", signal_id: str = None, max_favorable: float = None, max_adverse: float = None, **kwargs) -> bool:
+    """Special high-priority Trade Management AI learning hook.
+
+    Use when the manager exits a LONG or SHORT early while already in profit
+    because continuation probability dropped and reversal risk rose. It is
+    counted as a TP-side win, but the reason is stored separately so Meta
+    Learning can later detect whether exits were good or premature.
+    """
+    snap = dict(snapshot or {})
+    snap.setdefault("symbol", str(symbol).upper())
+    snap.setdefault("direction", str(direction).upper())
+    snap.setdefault("entry", entry)
+    snap.setdefault("price", entry)
+    snap["exit_reason"] = reason or "DYNAMIC_PROFIT_PROTECTION"
+    snap["early_profit_exit"] = True
+    snap["dynamic_profit_protection"] = {
+        "enabled": True,
+        "reason": snap["exit_reason"],
+        "exit_price": exit_price,
+        "applies_to": "LONG_AND_SHORT",
+    }
+
+    # Move percent is signed in trade direction.
+    e = _safe_float(entry, 0.0)
+    x = _safe_float(exit_price, 0.0)
+    if e > 0 and x > 0:
+        if str(direction).upper() == "SHORT":
+            move_percent = ((e - x) / e) * 100.0
+        else:
+            move_percent = ((x - e) / e) * 100.0
+    else:
+        move_percent = kwargs.get("move_percent")
+
+    ok = update_signal_result(
+        signal_id or snap.get("signal_id") or f"{str(symbol).upper()}_{str(direction).upper()}_AI_PROFIT_{_now()}",
+        "EARLY_PROFIT",
+        exit_price=exit_price,
+        move_percent=move_percent,
+        snapshot=snap,
+        source=source,
+        max_favorable=max_favorable,
+        max_adverse=max_adverse,
+    )
+
+    # Store a compact reason counter per coin+direction.
+    try:
+        s = _state()
+        b = _bucket(s, symbol, direction)
+        dp = b.setdefault("dynamic_profit_stats", {"profit_exits": 0, "good_exits": 0, "premature_exits": 0, "reasons": {}})
+        dp["profit_exits"] = int(dp.get("profit_exits", 0) or 0) + 1
+        rs = str(reason or "DYNAMIC_PROFIT_PROTECTION").upper()[:80]
+        dp.setdefault("reasons", {})
+        dp["reasons"][rs] = int(dp["reasons"].get(rs, 0) or 0) + 1
+        b["last_updated"] = _now()
+        s["updated_at"] = _now()
+        save_json(LEARNING_FILE, s)
+    except Exception:
+        pass
+    return bool(ok)
+
+
 def format_learning_summary() -> str:
     s = _state()
     rows = list(s.get("by_coin_direction", {}).values())
@@ -955,7 +1189,8 @@ def format_learning_summary() -> str:
     wr = round(tp / max(tp + sl, 1) * 100, 1) if (tp + sl) else 0
     good = len([r for r in rows if r.get("behavior") == "GOOD"])
     bad = len([r for r in rows if r.get("behavior") == "BAD"])
-    return f"🧠 خلاصه یادگیری\nReal: {real}\nGhost: {ghost}\nTP: {tp} | SL: {sl}\nWinRate: {wr}%\nرفتار خوب: {good} | رفتار بد: {bad}"
+    dyn = sum(int((r.get("dynamic_profit_stats") or {}).get("profit_exits", 0) or 0) for r in rows)
+    return f"🧠 خلاصه یادگیری\nReal: {real}\nGhost: {ghost}\nTP: {tp} | SL: {sl}\nWinRate: {wr}%\nخروج سود AI: {dyn}\nرفتار خوب: {good} | رفتار بد: {bad}"
 
 
 def format_coin_behavior(symbol: str = None) -> str:
