@@ -133,19 +133,25 @@ def _build_scanner_snapshot(r: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def _get_rotation_score(symbol: str) -> float:
+def _get_rotation_score(symbol: str, direction: str = None, snapshot: Dict[str, Any] = None) -> float:
     if not get_symbol_rotation_score:
-        return 0.0
+        return 50.0
     try:
-        val = get_symbol_rotation_score(symbol)
+        try:
+            val = get_symbol_rotation_score(symbol, direction=direction, snapshot=snapshot)
+        except TypeError:
+            try:
+                val = get_symbol_rotation_score(symbol, direction)
+            except TypeError:
+                val = get_symbol_rotation_score(symbol)
         if isinstance(val, dict):
             for k in ["score", "rotation_score", "priority", "rank_score"]:
                 if val.get(k) is not None:
-                    return _safe_float(val.get(k), 0.0)
-            return 0.0
-        return _safe_float(val, 0.0)
+                    return _safe_float(val.get(k), 50.0)
+            return 50.0
+        return _safe_float(val, 50.0)
     except Exception:
-        return 0.0
+        return 50.0
 
 
 def _risk_adjustment(symbol: str, direction: str) -> Tuple[Dict[str, Any], float, int, List[str]]:
@@ -158,17 +164,27 @@ def _risk_adjustment(symbol: str, direction: str) -> Tuple[Dict[str, Any], float
 
     strict = _safe_int(state.get("strictness_level"), 0)
     risk_score = _safe_float(state.get("risk_score"), 0.0)
-    penalty = min(18.0, strict * 3.0 + risk_score * 0.08)
-    extra_conf = min(2, max(0, strict // 2))
+    sl_count = _safe_int(state.get("sl_count"), 0)
+
+    # Stronger final selection penalty. analysis.py already blocks weak entries;
+    # scanner.py decides which approved signal deserves the real slot. Repeated
+    # SLs and high risk must matter more than raw technical score here.
+    penalty = min(30.0, strict * 5.0 + risk_score * 0.14 + max(0, sl_count - 1) * 3.0)
+    extra_conf = min(4, max(0, strict))
+
     reasons = []
     if strict > 0:
         reasons.append(f"AI Risk strict={strict}")
+    if sl_count >= 2:
+        reasons.append(f"AI Risk SL count={sl_count}")
     if risk_score >= 40:
         reasons.append(f"AI Risk score={int(risk_score)}")
     if state.get("recommend_reduce"):
-        penalty += 3.0
+        penalty += 5.0
+        extra_conf = min(4, extra_conf + 1)
         reasons.append("AI Risk recommend_reduce")
-    return state if isinstance(state, dict) else {}, penalty, extra_conf, reasons
+
+    return state if isinstance(state, dict) else {}, min(34.0, penalty), extra_conf, reasons
 
 
 def _learning_adjustment(symbol: str, direction: str, snapshot: Dict[str, Any]) -> Tuple[Dict[str, Any], float, int, List[str]]:
@@ -194,7 +210,7 @@ def _learning_adjustment(symbol: str, direction: str, snapshot: Dict[str, Any]) 
             reasons.append(str(extra.get("reason")))
         else:
             reasons.append("AI Learning extra strength")
-    return extra, min(12.0, max(0.0, extra_score)), min(2, max(0, extra_conf)), reasons
+    return extra, min(18.0, max(0.0, extra_score)), min(3, max(0, extra_conf)), reasons
 
 
 def _classic_rank_value(r: Dict[str, Any]) -> float:
@@ -226,10 +242,11 @@ def apply_ai_scanner_decision(r: Dict[str, Any]) -> Dict[str, Any]:
 
     risk_state, risk_penalty, risk_extra_conf, risk_reasons = _risk_adjustment(symbol, direction)
     learning_state, learning_penalty, learning_extra_conf, learning_reasons = _learning_adjustment(symbol, direction, snapshot)
-    rotation_score = _get_rotation_score(symbol)
+    rotation_score = _get_rotation_score(symbol, direction, snapshot)
 
-    # Rotation is a priority layer, not a hard filter. Keep it small.
-    rotation_adj = max(-4.0, min(4.0, rotation_score / 25.0 if abs(rotation_score) > 4 else rotation_score))
+    # Rotation is the portfolio priority layer. 50 is neutral; weak coins get
+    # meaningful de-prioritization, strong learned coins get a modest boost.
+    rotation_adj = max(-10.0, min(8.0, (rotation_score - 50.0) / 5.0))
 
     final_score = base_score - risk_penalty - learning_penalty + rotation_adj
     required_score = base_min + learning_penalty + min(6.0, risk_penalty * 0.35)
@@ -243,6 +260,20 @@ def apply_ai_scanner_decision(r: Dict[str, Any]) -> Dict[str, Any]:
     if required_confirmations and actual_conf < required_confirmations:
         approved = False
         reject_reasons.append(f"confirmations {actual_conf} < required {required_confirmations}")
+
+    # Hard safety blocks for the final real-slot selector. These are symmetric
+    # for LONG/SHORT and only affect high-risk coin+direction candidates.
+    risk_score_value = _safe_float(risk_state.get("risk_score"), 0.0) if isinstance(risk_state, dict) else 0.0
+    sl_count_value = _safe_int(risk_state.get("sl_count"), 0) if isinstance(risk_state, dict) else 0
+    if risk_score_value >= 85 and final_score < 98:
+        approved = False
+        reject_reasons.append("AI scanner block: risk_score >= 85 and final_score < 98")
+    elif risk_score_value >= 70 and final_score < 95:
+        approved = False
+        reject_reasons.append("AI scanner block: risk_score >= 70 and final_score < 95")
+    if sl_count_value >= 3 and final_score < 96:
+        approved = False
+        reject_reasons.append("AI scanner block: repeated same-day SL and final_score < 96")
 
     # Do not fully erase high-quality analysis results; if rejected, they can
     # become Ghost signals for learning instead of Telegram/live entry.
