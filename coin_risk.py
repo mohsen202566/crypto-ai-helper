@@ -258,9 +258,13 @@ def _strictness_level(daily: Dict[str, Any], archive: Dict[str, Any], recent_7d:
     if risk_score >= 90:
         level += 1
 
-    # Winning history softens strictness slightly, but never below daily SL rule.
+    # Winning history may soften strictness, but only when the same coin+direction
+    # is clearly performing well today. Do NOT let a few TPs hide repeated SLs.
+    # This prevents the old behavior where TP TP TP + SL SL SL could reduce risk
+    # too much and allow more weak real entries.
     daily_tp = int(daily.get("real_tp", 0)) + int(daily.get("ghost_tp", 0)) * 0.5
-    if daily_tp >= 3 and level > 0:
+    daily_sl = int(daily.get("real_sl", 0)) + int(daily.get("ghost_sl", 0)) * 0.5
+    if daily_tp >= 3 and daily_sl <= 1 and daily_tp >= daily_sl * 2 and level > 0:
         level -= 1
 
     return max(0, min(max_level, int(level)))
