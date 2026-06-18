@@ -30,6 +30,7 @@ REQUEST_TIMEOUT = int(os.getenv("TOBIT_REQUEST_TIMEOUT", "15") or "15")
 # Keep metadata fetching disabled by default to avoid extra Toobit calls/rate limits.
 # If the exchange-info endpoint is confirmed later, set TOBIT_FETCH_SYMBOL_RULES=true.
 TOBIT_FETCH_SYMBOL_RULES = os.getenv("TOBIT_FETCH_SYMBOL_RULES", "false").strip().lower() == "true"
+REAL_PNL_ACCEPT_ZERO_WHEN_MOVE_BELOW_PCT = float(os.getenv("REAL_PNL_ACCEPT_ZERO_WHEN_MOVE_BELOW_PCT", "0.01") or "0.01")
 
 # ---------------------------------------------------------------------------
 # Toobit futures symbol mapping
@@ -1351,25 +1352,92 @@ class ToobitClient:
 
 
     # ---------- Closed PnL / history ----------
-    def _extract_realized_pnl_value(self, item) -> float | None:
-        """Best-effort realized-PnL extractor from Toobit history rows."""
+    def _history_row_is_pnl_related(self, item: dict) -> bool:
+        """Reject unrelated wallet/income rows before extracting PnL.
+
+        Toobit history endpoints can return zero-value rows, transfers, bonuses,
+        rebates, or other account events. Those must not be treated as a real
+        closed-position PnL for the bot.
+        """
         if not isinstance(item, dict):
-            return None
-        pnl_keys = (
-            "realizedPnl", "realizedPNL", "realized_pnl", "closedPnl", "closedPNL",
-            "closePnl", "closeProfit", "profit", "pnl", "netPnl", "netProfit",
-            "realizedProfit", "income", "amount", "feeIncome", "tradePnl",
+            return False
+
+        text = " ".join(str(item.get(k, "")) for k in (
+            "incomeType", "type", "transactionType", "bizType", "businessType",
+            "eventType", "source", "reason", "remark", "remarks", "description",
+        )).upper()
+
+        # When the endpoint is specifically closed-position/trade history, a row
+        # may not include an income type. Let it pass and rely on PnL keys.
+        if not text.strip():
+            return True
+
+        blocked = (
+            "TRANSFER", "DEPOSIT", "WITHDRAW", "BONUS", "REWARD", "REBATE",
+            "AIRDROP", "COUPON", "CONVERT", "INTERNAL",
         )
-        for key in pnl_keys:
-            if key not in item:
-                continue
-            try:
-                value = item.get(key)
-                if value is not None and str(value).strip() != "":
-                    return float(value)
-            except Exception:
-                pass
+        if any(x in text for x in blocked):
+            return False
+
+        allowed = (
+            "REALIZED", "REALIZED_PNL", "REALISED", "PNL", "PROFIT", "LOSS",
+            "CLOSE", "CLOSED", "POSITION", "TRADE", "COMMISSION", "FEE", "FUNDING",
+        )
+        return any(x in text for x in allowed) or True
+
+    def _extract_realized_pnl_value(self, item) -> float | None:
+        """Best-effort realized-PnL extractor from Toobit history rows.
+
+        Prefer explicit realized/closed PnL fields first. Use generic amount only
+        after the row looks like a PnL/income row, because some Toobit responses
+        also contain unrelated zero amount rows.
+        """
+        if not isinstance(item, dict) or not self._history_row_is_pnl_related(item):
+            return None
+
+        primary_pnl_keys = (
+            "realizedPnl", "realizedPNL", "realized_pnl", "realisedPnl", "realisedPNL",
+            "closedPnl", "closedPNL", "closePnl", "closeProfit", "tradePnl",
+            "profit", "pnl", "netPnl", "netProfit", "realizedProfit",
+        )
+        secondary_amount_keys = (
+            "income", "amount", "balanceDelta", "cashFlow", "feeIncome",
+        )
+
+        for key_group in (primary_pnl_keys, secondary_amount_keys):
+            for key in key_group:
+                if key not in item:
+                    continue
+                try:
+                    value = item.get(key)
+                    if value is not None and str(value).strip() != "":
+                        return float(value)
+                except Exception:
+                    pass
         return None
+
+    def _calc_history_move_percent(self, direction: str | None, entry=None, exit_price=None) -> float:
+        try:
+            en = float(entry or 0)
+            ex = float(exit_price or 0)
+            if en <= 0 or ex <= 0:
+                return 0.0
+            if str(direction or "").upper() == "SHORT":
+                return ((en - ex) / en) * 100.0
+            return ((ex - en) / en) * 100.0
+        except Exception:
+            return 0.0
+
+    def _is_zero_pnl_suspicious(self, pnl_value: float, move_percent=None) -> bool:
+        try:
+            pnl = float(pnl_value)
+        except Exception:
+            return True
+        try:
+            movement = abs(float(move_percent or 0))
+        except Exception:
+            movement = 0.0
+        return abs(pnl) <= 0.00000001 and movement >= REAL_PNL_ACCEPT_ZERO_WHEN_MOVE_BELOW_PCT
 
     def _extract_timestamp_value(self, item) -> int:
         """Return timestamp in milliseconds when present, otherwise 0."""
@@ -1505,14 +1573,30 @@ class ToobitClient:
             params,
         )
 
-    def get_recent_closed_pnl(self, symbol: str, direction: str | None = None, opened_at: int | None = None, closed_at: int | None = None, limit: int = 80):
+    def get_recent_closed_pnl(
+        self,
+        symbol: str,
+        direction: str | None = None,
+        opened_at: int | None = None,
+        closed_at: int | None = None,
+        limit: int = 80,
+        entry=None,
+        exit_price=None,
+        move_percent=None,
+        result: str | None = None,
+        **kwargs,
+    ):
         """Return confirmed realized PnL for a recently closed futures position.
 
         The result is marked ok only when a numeric realized PnL is found from
-        Toobit history. It never fabricates a value.
+        Toobit history. It never fabricates a value and it rejects suspicious
+        0.0 PnL when the signal clearly moved.
         """
         symbol = str(symbol or "").upper().strip()
         direction = str(direction or "").upper().strip()
+        if move_percent is None:
+            move_percent = self._calc_history_move_percent(direction, entry=entry, exit_price=exit_price)
+
         now_ms = self._now_ms()
         start_ms = int(opened_at or 0)
         if start_ms and start_ms < 10_000_000_000:
@@ -1522,11 +1606,13 @@ class ToobitClient:
             end_ms *= 1000
         if not end_ms:
             end_ms = now_ms
-        # Give Toobit a small settlement window and include a pre-open buffer.
+        # Give Toobit a settlement window and include a pre-open buffer.
         query_start = max(0, (start_ms or (end_ms - 30 * 60 * 1000)) - 3 * 60 * 1000)
-        query_end = end_ms + 3 * 60 * 1000
+        query_end = end_ms + 5 * 60 * 1000
 
         sources = []
+        zero_suspicious_rows = 0
+
         for name, getter in (
             ("income_history", self.get_income_history),
             ("closed_position_history", self.get_closed_position_history),
@@ -1540,7 +1626,12 @@ class ToobitClient:
                 continue
 
             if not isinstance(res, dict) or not res.get("ok"):
-                sources.append({"source": name, "ok": False, "error": (res or {}).get("error") if isinstance(res, dict) else str(res)[:250], "attempts": (res or {}).get("attempts") if isinstance(res, dict) else None})
+                sources.append({
+                    "source": name,
+                    "ok": False,
+                    "error": (res or {}).get("error") if isinstance(res, dict) else str(res)[:250],
+                    "attempts": (res or {}).get("attempts") if isinstance(res, dict) else None,
+                })
                 continue
 
             rows = self._flatten_history_items(res)
@@ -1559,34 +1650,115 @@ class ToobitClient:
                 pnl = self._extract_realized_pnl_value(item)
                 if pnl is None:
                     continue
+
+                # Ignore temporary/placeholder zero rows when the price clearly
+                # moved. This prevents false "PnL واقعی توبیت: 0.0$" messages.
+                if self._is_zero_pnl_suspicious(pnl, move_percent=move_percent):
+                    zero_suspicious_rows += 1
+                    continue
+
                 matched.append(item)
                 pnl_sum += float(pnl)
 
-            sources.append({"source": name, "ok": True, "endpoint": res.get("history_endpoint"), "rows": len(rows), "matched": len(matched)})
+            sources.append({
+                "source": name,
+                "ok": True,
+                "endpoint": res.get("history_endpoint"),
+                "rows": len(rows),
+                "matched": len(matched),
+                "zero_suspicious_rows": zero_suspicious_rows,
+            })
             if matched:
+                final_pnl = round(pnl_sum, 8)
+                if self._is_zero_pnl_suspicious(final_pnl, move_percent=move_percent):
+                    return {
+                        "ok": False,
+                        "error": "zero pnl is suspicious while price movement is non-zero; waiting for Toobit final history",
+                        "pnl_usd": final_pnl,
+                        "zero_suspicious": True,
+                        "move_percent": move_percent,
+                        "query": {"symbol": symbol, "direction": direction, "startTime": query_start, "endTime": query_end},
+                        "sources_checked": sources,
+                    }
                 return {
                     "ok": True,
-                    "pnl_usd": round(pnl_sum, 8),
+                    "pnl_usd": final_pnl,
                     "source": name,
                     "endpoint": res.get("history_endpoint"),
                     "matched_rows": matched[-10:],
+                    "move_percent": move_percent,
                     "query": {"symbol": symbol, "direction": direction, "startTime": query_start, "endTime": query_end},
                     "sources_checked": sources,
                 }
 
-        return {"ok": False, "error": "realized pnl row not found in Toobit history", "sources_checked": sources}
+        return {
+            "ok": False,
+            "error": "realized pnl row not found in Toobit history" if not zero_suspicious_rows else "only suspicious zero-pnl rows found; waiting for Toobit final history",
+            "zero_suspicious_rows": zero_suspicious_rows,
+            "move_percent": move_percent,
+            "sources_checked": sources,
+        }
 
-    def get_closed_position_pnl(self, symbol: str, direction: str | None = None, signal_id: str | None = None, opened_at: int | None = None, closed_at: int | None = None, **kwargs):
+    def get_closed_position_pnl(
+        self,
+        symbol: str,
+        direction: str | None = None,
+        signal_id: str | None = None,
+        opened_at: int | None = None,
+        closed_at: int | None = None,
+        **kwargs,
+    ):
         """Compatibility hook used by signal_tracker/real_trade_manager."""
-        return self.get_recent_closed_pnl(symbol=symbol, direction=direction, opened_at=opened_at, closed_at=closed_at)
+        return self.get_recent_closed_pnl(
+            symbol=symbol,
+            direction=direction,
+            opened_at=opened_at,
+            closed_at=closed_at,
+            entry=kwargs.get("entry"),
+            exit_price=kwargs.get("exit_price"),
+            move_percent=kwargs.get("move_percent") or kwargs.get("pct"),
+            result=kwargs.get("result"),
+        )
 
-    def get_realized_pnl_for_position(self, symbol: str, direction: str | None = None, opened_at: int | None = None, closed_at: int | None = None, **kwargs):
+    def get_realized_pnl_for_position(
+        self,
+        symbol: str,
+        direction: str | None = None,
+        opened_at: int | None = None,
+        closed_at: int | None = None,
+        **kwargs,
+    ):
         """Compatibility alias for closed PnL lookup."""
-        return self.get_recent_closed_pnl(symbol=symbol, direction=direction, opened_at=opened_at, closed_at=closed_at)
+        return self.get_recent_closed_pnl(
+            symbol=symbol,
+            direction=direction,
+            opened_at=opened_at,
+            closed_at=closed_at,
+            entry=kwargs.get("entry"),
+            exit_price=kwargs.get("exit_price"),
+            move_percent=kwargs.get("move_percent") or kwargs.get("pct"),
+            result=kwargs.get("result"),
+        )
 
-    def get_position_realized_pnl(self, symbol: str, direction: str | None = None, opened_at: int | None = None, closed_at: int | None = None, **kwargs):
+    def get_position_realized_pnl(
+        self,
+        symbol: str,
+        direction: str | None = None,
+        opened_at: int | None = None,
+        closed_at: int | None = None,
+        **kwargs,
+    ):
         """Compatibility alias for closed PnL lookup."""
-        return self.get_recent_closed_pnl(symbol=symbol, direction=direction, opened_at=opened_at, closed_at=closed_at)
+        return self.get_recent_closed_pnl(
+            symbol=symbol,
+            direction=direction,
+            opened_at=opened_at,
+            closed_at=closed_at,
+            entry=kwargs.get("entry"),
+            exit_price=kwargs.get("exit_price"),
+            move_percent=kwargs.get("move_percent") or kwargs.get("pct"),
+            result=kwargs.get("result"),
+        )
 
 
 # Backward compatibility: both spellings work.
