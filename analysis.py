@@ -33,8 +33,18 @@ SOFT_MARKET_CONTEXT_TTL_SECONDS = 120
 AUTO_DIRECT_SCORE_MIN = max(int(MIN_DIRECT_SCORE), int(AUTO_DIRECT_SCORE_MIN))
 ADX_HARD_MIN = max(float(MIN_ADX_FOR_TREND), 20.0)
 LONG_DIRECT_SCORE_BONUS_REQUIREMENT = 0
-LONG_MIN_1H_STRICT = False
-LONG_BLOCK_IF_AGAINST_VWAP = False
+# Balanced safety gates for BOTH LONG and SHORT.
+# These are intentionally symmetric so one side is not softer than the other.
+REQUIRE_1H_CONFIRMATION = True
+BLOCK_IF_AGAINST_VWAP = True
+# Rescue is kept, but only for very strong/clean setups.
+SOFT_RESCUE_SCORE_MIN = 98
+SOFT_RESCUE_ADX_MIN = 30
+SOFT_RESCUE_POWER_MIN = 63
+SOFT_RESCUE_LONG_RSI_MIN = 52
+SOFT_RESCUE_SHORT_RSI_MAX = 48
+# If LONG and SHORT scores are too close, avoid choosing a weak side by luck.
+MIN_DIRECTION_SCORE_GAP = 4
 MIN_SL_ATR_MULTIPLIER = 1.30
 TP1_FALLBACK_ATR = 0.75
 TP2_FALLBACK_ATR = 1.40
@@ -222,20 +232,26 @@ def simple_classic_score(symbol, df_4h, df_1h, df_30m, df_15m, df_5m, market_con
 
     # Soft direction rescue: do not kill a very strong signal only because one timeframe gate is mixed.
     # Still requires strong score, trend strength, momentum, RSI side, and power/volume pressure.
-    if (not long_direction_ok) and long_score>=95 and adx>=28 and long_macd_ok and safe_float(l15['rsi'])>=50 and (buy3>=58 or buy20>=60) and (trends['5M']=='bullish' or trends['4H']=='bullish') and l15['close']>=l15['vwap']:
+    if (not long_direction_ok) and long_score>=SOFT_RESCUE_SCORE_MIN and adx>=SOFT_RESCUE_ADX_MIN and long_macd_ok and safe_float(l15['rsi'])>=SOFT_RESCUE_LONG_RSI_MIN and (buy3>=SOFT_RESCUE_POWER_MIN or buy20>=SOFT_RESCUE_POWER_MIN) and trends['5M']=='bullish' and trends['4H']=='bullish' and l15['close']>=l15['vwap'] and l1['close']>l1['ema20']:
         long_direction_ok=True
-    if (not short_direction_ok) and short_score>=95 and adx>=28 and short_macd_ok and safe_float(l15['rsi'])<=50 and (sell3>=58 or sell20>=60) and (trends['5M']=='bearish' or trends['4H']=='bearish') and l15['close']<=l15['vwap']:
+        long_reasons.append('Soft Rescue سختگیر: لانگ فقط با تایید خیلی قوی نجات شد')
+    if (not short_direction_ok) and short_score>=SOFT_RESCUE_SCORE_MIN and adx>=SOFT_RESCUE_ADX_MIN and short_macd_ok and safe_float(l15['rsi'])<=SOFT_RESCUE_SHORT_RSI_MAX and (sell3>=SOFT_RESCUE_POWER_MIN or sell20>=SOFT_RESCUE_POWER_MIN) and trends['5M']=='bearish' and trends['4H']=='bearish' and l15['close']<=l15['vwap'] and l1['close']<l1['ema20']:
         short_direction_ok=True
+        short_reasons.append('Soft Rescue سختگیر: شورت فقط با تایید خیلی قوی نجات شد')
 
-    long_1h_ok=(trends['1H']=='bullish' and l1['close']>l1['ema20'] and l1['macd']>=l1['macd_signal']) if LONG_MIN_1H_STRICT else True
-    long_vwap_ok=(l15['close']>=l15['vwap']) if LONG_BLOCK_IF_AGAINST_VWAP else True
-    if not long_direction_ok: long_reasons.append('رد لانگ: 1H و 15M صعودی نیستند')
+    long_1h_ok=(trends['1H']=='bullish' and l1['close']>l1['ema20'] and l1['macd']>=l1['macd_signal']) if REQUIRE_1H_CONFIRMATION else True
+    short_1h_ok=(trends['1H']=='bearish' and l1['close']<l1['ema20'] and l1['macd']<=l1['macd_signal']) if REQUIRE_1H_CONFIRMATION else True
+    long_vwap_ok=(l15['close']>=l15['vwap']) if BLOCK_IF_AGAINST_VWAP else True
+    short_vwap_ok=(l15['close']<=l15['vwap']) if BLOCK_IF_AGAINST_VWAP else True
+    if not long_direction_ok: long_reasons.append('رد لانگ: جهت تایم‌فریم‌ها کافی نیست')
     if not long_macd_ok: long_reasons.append('رد لانگ: MACD کافی نیست')
     if not long_1h_ok: long_reasons.append('رد لانگ: تایید 1H کافی نیست')
     if not long_vwap_ok: long_reasons.append('رد لانگ: خلاف VWAP')
-    if not short_direction_ok: short_reasons.append('رد شورت: جهت کافی نیست')
+    if not short_direction_ok: short_reasons.append('رد شورت: جهت تایم‌فریم‌ها کافی نیست')
     if not short_macd_ok: short_reasons.append('رد شورت: MACD کافی نیست')
-    return {'long_score':cap_score(long_score),'short_score':cap_score(short_score),'long_reasons':long_reasons,'short_reasons':short_reasons,'confirmations_long':cl,'confirmations_short':cs,'trends':trends,'distance_ema20_atr':round(distance_from_ema20_atr(df_15m),2),'volume_status':volume_quality(df_15m)[0],'volume_ratio':round(volume_quality(df_15m)[1],2),'power2_buy':buy2,'power2_sell':sell2,'power3_buy':buy3,'power3_sell':sell3,'buy_power':buy20,'sell_power':sell20,'long_valid':adx>=ADX_HARD_MIN and long_direction_ok and long_macd_ok and long_1h_ok and long_vwap_ok,'short_valid':adx>=ADX_HARD_MIN and short_direction_ok and short_macd_ok,'adx_15':adx,'market_regime':mb}
+    if not short_1h_ok: short_reasons.append('رد شورت: تایید 1H کافی نیست')
+    if not short_vwap_ok: short_reasons.append('رد شورت: خلاف VWAP')
+    return {'long_score':cap_score(long_score),'short_score':cap_score(short_score),'long_reasons':long_reasons,'short_reasons':short_reasons,'confirmations_long':cl,'confirmations_short':cs,'trends':trends,'distance_ema20_atr':round(distance_from_ema20_atr(df_15m),2),'volume_status':volume_quality(df_15m)[0],'volume_ratio':round(volume_quality(df_15m)[1],2),'power2_buy':buy2,'power2_sell':sell2,'power3_buy':buy3,'power3_sell':sell3,'buy_power':buy20,'sell_power':sell20,'long_valid':adx>=ADX_HARD_MIN and long_direction_ok and long_macd_ok and long_1h_ok and long_vwap_ok,'short_valid':adx>=ADX_HARD_MIN and short_direction_ok and short_macd_ok and short_1h_ok and short_vwap_ok,'adx_15':adx,'market_regime':mb}
 
 def find_swing_levels(df, timeframe, lookback=LEVEL_LOOKBACK, window=SWING_WINDOW):
     recent=df.tail(lookback).copy(); levels=[]; w=TF_LEVEL_WEIGHTS.get(timeframe,1.0)
@@ -353,8 +369,12 @@ def analyze_symbol(symbol: str) -> Dict:
     try:
         df_4h=add_indicators(get_klines(symbol,'4h')); df_1h=add_indicators(get_klines(symbol,'1h')); df_30m=add_indicators(get_klines(symbol,'30m')); df_15m=add_indicators(get_klines(symbol,'15m')); df_5m=add_indicators(get_klines(symbol,'5m'))
         market_context=get_soft_market_context(); sp=simple_classic_score(symbol,df_4h,df_1h,df_30m,df_15m,df_5m,market_context); price=safe_float(df_15m.iloc[-1]['close']); atr=safe_float(df_15m.iloc[-1]['atr']); long_score=int(sp['long_score']); short_score=int(sp['short_score'])
+        direction_gap=abs(long_score-short_score)
         if long_score>=short_score: direction='LONG'; final_score=long_score; confirmations=int(sp['confirmations_long']); reasons=list(sp['long_reasons']); valid=bool(sp['long_valid'])
         else: direction='SHORT'; final_score=short_score; confirmations=int(sp['confirmations_short']); reasons=list(sp['short_reasons']); valid=bool(sp['short_valid'])
+        if direction_gap < MIN_DIRECTION_SCORE_GAP:
+            valid=False
+            reasons.append(f'رد: اختلاف امتیاز لانگ/شورت کم است ({direction_gap} < {MIN_DIRECTION_SCORE_GAP})')
         snapshot=build_local_snapshot(symbol,direction,df_4h,df_1h,df_30m,df_15m,df_5m,sp,market_context)
         # ------------------------------------------------------------------
         # AI DECISION LAYER
@@ -383,18 +403,28 @@ def analyze_symbol(symbol: str) -> Dict:
         #   require stronger score and more confirmations.
         # - Keep it gradual so signal frequency does not collapse.
         if strict:
-            ai_penalty += min(14, max(3, strict * 3))
-            ai_min_score_add += min(10, max(2, strict * 2))
-            req_conf += min(3, max(1, strict))
+            ai_penalty += min(24, max(5, strict * 5))
+            ai_min_score_add += min(16, max(3, strict * 3))
+            req_conf += min(4, max(1, strict))
             reasons.append(f'AI Risk: سختگیری سطح {strict} | SL={sl_count}')
         elif sl_count >= 2:
             # Safety fallback if coin_risk stores SL count but strictness_level
             # is not being calculated correctly yet.
-            fallback_level=min(3, sl_count-1)
-            ai_penalty += min(9, fallback_level * 3)
-            ai_min_score_add += min(6, fallback_level * 2)
-            req_conf += min(2, fallback_level)
+            fallback_level=min(4, sl_count-1)
+            ai_penalty += min(18, fallback_level * 5)
+            ai_min_score_add += min(12, fallback_level * 3)
+            req_conf += min(3, fallback_level)
             reasons.append(f'AI Risk fallback: SLهای تکراری {sl_count}')
+
+        # Repeated SL protection is symmetric for LONG/SHORT.
+        # It does not delete learning or globally ban a coin; it blocks only
+        # borderline same coin+direction entries and lets exceptional setups pass.
+        if sl_count >= 3 and final_score < 96:
+            ai_block=True
+            reasons.append('AI Block: سه SL یا بیشتر برای همین ارز/جهت و امتیاز زیر 96')
+        if sl_count >= 4 and final_score < 98:
+            ai_block=True
+            reasons.append('AI Block: چهار SL یا بیشتر برای همین ارز/جهت و امتیاز زیر 98')
 
         # Rotation controls priority and quality gate.
         rotation=get_rotation_context(symbol)
@@ -403,13 +433,14 @@ def analyze_symbol(symbol: str) -> Dict:
             final_score+=2
             reasons.append('AI Rotation: اولویت مثبت')
         elif rs<=20:
-            ai_penalty += 6
-            ai_min_score_add += 4
-            req_conf += 1
+            ai_penalty += 10
+            ai_min_score_add += 6
+            req_conf += 2
             reasons.append('AI Rotation: کوین کم‌اولویت/پرریسک')
         elif rs<=35:
-            ai_penalty += 3
-            ai_min_score_add += 2
+            ai_penalty += 5
+            ai_min_score_add += 3
+            req_conf += 1
             reasons.append('AI Rotation: اولویت ضعیف')
 
         # Learning engine may request extra strength based on real/ghost history
@@ -422,9 +453,12 @@ def analyze_symbol(symbol: str) -> Dict:
 
         # If the coin/direction is extremely risky, AI can block borderline
         # candidates.  Strong candidates can still pass only with strict gates.
-        if risk_score >= 85 and final_score < 94:
+        if risk_score >= 70 and final_score < 95:
             ai_block=True
-            reasons.append('AI Block: ریسک کوین/جهت خیلی بالا و امتیاز کافی نیست')
+            reasons.append('AI Block: ریسک کوین/جهت بالا و امتیاز کافی نیست')
+        if risk_score >= 85 and final_score < 98:
+            ai_block=True
+            reasons.append('AI Block: ریسک کوین/جهت خیلی بالا و امتیاز بسیار قوی نیست')
 
         final_score -= ai_penalty
         min_score=min(96, base_min_score + ai_min_score_add)
@@ -432,7 +466,7 @@ def analyze_symbol(symbol: str) -> Dict:
 
         level_pack=get_strong_levels(df_5m,df_15m,df_30m,price,atr); support=level_pack.get('nearest_support'); resistance=level_pack.get('nearest_resistance')
         entry_confirmed=(not ai_block) and valid and final_score>=min_score and confirmations>=effective_req_conf
-        common={'symbol':symbol,'score':cap_score(final_score),'long_score':long_score,'short_score':short_score,'price':safe_round(price),'atr':safe_round(atr),'market_regime':market_context.get('market_regime','neutral'),'btc_bias':market_context.get('btc_bias','neutral'),'confirmations':confirmations,'required_confirmations':effective_req_conf,'rsi':safe_round(df_15m.iloc[-1]['rsi'],2),'macd':safe_round(df_15m.iloc[-1]['macd'],6),'macd_signal':safe_round(df_15m.iloc[-1]['macd_signal'],6),'macd_hist':safe_round(df_15m.iloc[-1]['macd_hist'],6),'adx':safe_round(df_15m.iloc[-1]['adx'],2),'vwap_status':vwap_status(df_15m),'support':safe_round(support),'resistance':safe_round(resistance),'trends':sp.get('trends',{}),'distance_ema20_atr':sp.get('distance_ema20_atr'),'volume_status':sp.get('volume_status'),'volume_ratio':sp.get('volume_ratio'),'buy_power':sp.get('buy_power'),'sell_power':sp.get('sell_power'),'power2_buy':sp.get('power2_buy'),'power2_sell':sp.get('power2_sell'),'power3_buy':sp.get('power3_buy'),'power3_sell':sp.get('power3_sell'),'snapshot':snapshot,'coin_risk':risk_state,'rotation':rotation,'ai_decision':{'base_min_score':base_min_score,'min_score':min_score,'ai_penalty':ai_penalty,'ai_min_score_add':ai_min_score_add,'ai_block':ai_block,'strictness_level':strict,'sl_count':sl_count,'risk_score':risk_score,'rotation_score':rs},'reasons':reasons[:20],'signal_timeframe':'AI Classic Direct'}
+        common={'symbol':symbol,'score':cap_score(final_score),'long_score':long_score,'short_score':short_score,'price':safe_round(price),'atr':safe_round(atr),'market_regime':market_context.get('market_regime','neutral'),'btc_bias':market_context.get('btc_bias','neutral'),'confirmations':confirmations,'required_confirmations':effective_req_conf,'rsi':safe_round(df_15m.iloc[-1]['rsi'],2),'macd':safe_round(df_15m.iloc[-1]['macd'],6),'macd_signal':safe_round(df_15m.iloc[-1]['macd_signal'],6),'macd_hist':safe_round(df_15m.iloc[-1]['macd_hist'],6),'adx':safe_round(df_15m.iloc[-1]['adx'],2),'vwap_status':vwap_status(df_15m),'support':safe_round(support),'resistance':safe_round(resistance),'trends':sp.get('trends',{}),'distance_ema20_atr':sp.get('distance_ema20_atr'),'volume_status':sp.get('volume_status'),'volume_ratio':sp.get('volume_ratio'),'buy_power':sp.get('buy_power'),'sell_power':sp.get('sell_power'),'power2_buy':sp.get('power2_buy'),'power2_sell':sp.get('power2_sell'),'power3_buy':sp.get('power3_buy'),'power3_sell':sp.get('power3_sell'),'snapshot':snapshot,'coin_risk':risk_state,'rotation':rotation,'ai_decision':{'base_min_score':base_min_score,'min_score':min_score,'direction_gap':direction_gap,'ai_penalty':ai_penalty,'ai_min_score_add':ai_min_score_add,'ai_block':ai_block,'strictness_level':strict,'sl_count':sl_count,'risk_score':risk_score,'rotation_score':rs},'reasons':reasons[:20],'signal_timeframe':'AI Classic Direct'}
         if not entry_confirmed:
             return {**common,'direction':'NO TRADE','status':'NO_TRADE','entry_confirmed':False,'entry_mode':'NO_ENTRY','entry':None,'stop_loss':None,'tp1':None,'tp2':None,'risk_reward':0,'risk_level':'UNKNOWN','freshness':'LOW','tp_meta':{},'validity':'سیگنال معتبر نیست','valid_gate':valid,'min_score':min_score}
         sl,tp1,tp2,rr,tp_meta=build_trade_levels(direction,price,atr,df_5m,df_15m,df_30m,snapshot,symbol); risk_level='LOW' if final_score>=92 and confirmations>=6 else 'MEDIUM' if final_score>=86 and confirmations>=5 else 'HIGH'; freshness='HIGH' if confirmations>=6 else 'MEDIUM' if confirmations>=5 else 'LOW'
