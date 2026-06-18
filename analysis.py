@@ -42,18 +42,18 @@ LONG_DIRECT_SCORE_BONUS_REQUIREMENT = 0
 LONG_MIN_1H_STRICT = False
 LONG_BLOCK_IF_AGAINST_VWAP = False
 MIN_SL_ATR_MULTIPLIER = 1.30
-TP1_FALLBACK_ATR = 0.45
-TP2_FALLBACK_ATR = 0.90
+TP1_FALLBACK_ATR = 0.62
+TP2_FALLBACK_ATR = 1.12
 MAX_REASONABLE_SL_ATR = 2.40
-MIN_TP1_ATR = 0.35
-LEVEL_BUFFER_ATR = 0.08
+MIN_TP1_ATR = 0.40
+LEVEL_BUFFER_ATR = 0.14
 SL_BUFFER_ATR = 0.25
-TF_LEVEL_WEIGHTS = {'5M': 3.0, '15M': 0.8, '30M': 0.3}
+TF_LEVEL_WEIGHTS = {'5M': 1.00, '15M': 3.00, '30M': 0.70}
 LEVEL_LOOKBACK = 160
 SWING_WINDOW = 3
 
 # ---------------------------------------------------------------------------
-# Fast-entry quality controls
+# 15M scalp + 5M timing quality controls
 # ---------------------------------------------------------------------------
 # Keep the main threshold intact, but let a truly fresh 5M trigger reach it
 # earlier when higher timeframes already agree. Late entries and bad R/R are
@@ -76,7 +76,7 @@ PUMP_DUMP_RETRACE_ATR_MIN = float(os.getenv("PUMP_DUMP_RETRACE_ATR_MIN", "0.45")
 
 
 def _is_recent_macd_cross(df: pd.DataFrame, direction: str, lookback: int = 3) -> bool:
-    """Return True when 5M MACD crossed recently in the trade direction."""
+    """Return True when 5M MACD crossed recently for entry timing."""
     try:
         recent = df.tail(max(lookback + 1, 3))
         if len(recent) < 3:
@@ -371,9 +371,239 @@ def ai_extra_strength_required(symbol, direction, snapshot):
     except Exception: pass
     return default
 
+
+# ---------------------------------------------------------------------------
+# Soft AI feature packs for prediction/learning
+# ---------------------------------------------------------------------------
+def _slope(series, periods: int = 3) -> float:
+    try:
+        s = pd.Series(series).dropna().tail(max(periods + 1, 2))
+        if len(s) < 2:
+            return 0.0
+        return safe_float(s.iloc[-1]) - safe_float(s.iloc[0])
+    except Exception:
+        return 0.0
+
+
+def _pct_distance(a, b) -> float:
+    a = safe_float(a); b = safe_float(b)
+    return ((a - b) / max(abs(b), 1e-12)) * 100.0
+
+
+def _candle_quality_pack(df: pd.DataFrame, lookback: int = 6) -> Dict[str, Any]:
+    try:
+        r = df.tail(max(lookback, 3)).copy()
+        last = r.iloc[-1]
+        rng = max(safe_float(last['high']) - safe_float(last['low']), 1e-12)
+        body = abs(safe_float(last['close']) - safe_float(last['open']))
+        upper_wick = safe_float(last['high']) - max(safe_float(last['close']), safe_float(last['open']))
+        lower_wick = min(safe_float(last['close']), safe_float(last['open'])) - safe_float(last['low'])
+        close_pos = (safe_float(last['close']) - safe_float(last['low'])) / rng
+        body_ratio = body / rng
+        same_dir = 0
+        bull = safe_float(last['close']) >= safe_float(last['open'])
+        for _, row in r.iloc[::-1].iterrows():
+            rbull = safe_float(row['close']) >= safe_float(row['open'])
+            if rbull == bull:
+                same_dir += 1
+            else:
+                break
+        return {
+            'body_ratio': round(body_ratio, 4),
+            'upper_wick_ratio': round(upper_wick / rng, 4),
+            'lower_wick_ratio': round(lower_wick / rng, 4),
+            'close_position': round(close_pos, 4),
+            'same_direction_candles': int(same_dir),
+            'candle_bias': 'bullish' if bull else 'bearish',
+            'strong_close_up': bool(close_pos >= 0.72 and body_ratio >= 0.45),
+            'strong_close_down': bool(close_pos <= 0.28 and body_ratio >= 0.45),
+            'upper_rejection': bool(upper_wick / rng >= 0.45),
+            'lower_rejection': bool(lower_wick / rng >= 0.45),
+        }
+    except Exception:
+        return {}
+
+
+def _compression_expansion_pack(df: pd.DataFrame, lookback: int = 24) -> Dict[str, Any]:
+    try:
+        recent = df.tail(max(lookback, 12))
+        last = recent.iloc[-1]
+        atr_now = safe_float(last.get('atr'), 0.0)
+        atr_avg = safe_float(recent['atr'].tail(lookback).mean(), atr_now)
+        rng_now = safe_float(last['high']) - safe_float(last['low'])
+        rng_avg = safe_float((recent['high'] - recent['low']).tail(lookback).mean(), rng_now)
+        vol_ratio = safe_float(last.get('volume_ratio'), 1.0)
+        compression = atr_now <= atr_avg * 0.82 or rng_now <= rng_avg * 0.75
+        expansion = rng_now >= rng_avg * 1.25 and vol_ratio >= 1.15
+        return {
+            'atr_now': safe_round(atr_now, 8), 'atr_avg': safe_round(atr_avg, 8),
+            'range_to_avg': round(rng_now / max(rng_avg, 1e-12), 3),
+            'volume_ratio': round(vol_ratio, 3),
+            'compression': bool(compression), 'expansion': bool(expansion),
+            'compression_to_expansion': bool(compression and expansion),
+        }
+    except Exception:
+        return {}
+
+
+def _relative_strength_pack(symbol: str, df_15m: pd.DataFrame, market_context: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        r = df_15m.tail(5)
+        coin_move = _pct_distance(r.iloc[-1]['close'], r.iloc[0]['close'])
+        btc_bias = market_context.get('btc_bias', 'neutral')
+        market_regime = market_context.get('market_regime', 'neutral')
+        status = 'neutral'
+        if coin_move > 0.45 and btc_bias != 'bullish': status = 'relative_strength'
+        if coin_move < -0.45 and btc_bias != 'bearish': status = 'relative_weakness'
+        return {'coin_15m_5bar_move_pct': round(coin_move, 4), 'relative_status': status, 'btc_bias': btc_bias, 'market_regime': market_regime}
+    except Exception:
+        return {}
+
+
+def _liquidity_trap_pack(direction: str, price: float, atr: float, df_15m: pd.DataFrame, level_pack: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        supports = level_pack.get('supports', []) or []
+        resistances = level_pack.get('resistances', []) or []
+        candle = _candle_quality_pack(df_15m, 6)
+        fake_risk = _recent_fake_break_risk(df_15m, direction, price, atr, supports, resistances)
+        nearest_above = min([safe_float(x.get('price')) for x in resistances if safe_float(x.get('price')) > price], default=None)
+        nearest_below = max([safe_float(x.get('price')) for x in supports if safe_float(x.get('price')) < price], default=None)
+        dist_above_atr = None if nearest_above is None else (nearest_above - price) / max(atr, 1e-12)
+        dist_below_atr = None if nearest_below is None else (price - nearest_below) / max(atr, 1e-12)
+        long_trap = direction == 'LONG' and fake_risk >= 0.34 and candle.get('upper_rejection')
+        short_trap = direction == 'SHORT' and fake_risk >= 0.34 and candle.get('lower_rejection')
+        return {
+            'fake_break_risk': round(fake_risk, 3),
+            'nearest_liquidity_above': safe_round(nearest_above),
+            'nearest_liquidity_below': safe_round(nearest_below),
+            'distance_above_atr': None if dist_above_atr is None else round(dist_above_atr, 3),
+            'distance_below_atr': None if dist_below_atr is None else round(dist_below_atr, 3),
+            'trap_risk': 'HIGH' if (long_trap or short_trap) else 'MEDIUM' if fake_risk >= 0.34 else 'LOW',
+            'long_trap_risk': bool(long_trap), 'short_trap_risk': bool(short_trap),
+        }
+    except Exception:
+        return {}
+
+
+def _early_momentum_pack(direction: str, df_15m: pd.DataFrame, df_5m: pd.DataFrame) -> Dict[str, Any]:
+    try:
+        l15 = df_15m.iloc[-1]; p15 = df_15m.iloc[-2]
+        rsi_slope = _slope(df_15m['rsi'], 3)
+        adx_slope = _slope(df_15m['adx'], 3)
+        hist_slope = _slope(df_15m['macd_hist'], 3)
+        hist_accel = (safe_float(l15['macd_hist']) - safe_float(p15['macd_hist'])) - (safe_float(p15['macd_hist']) - safe_float(df_15m.iloc[-3]['macd_hist']))
+        vol_ratio = safe_float(l15.get('volume_ratio'), 1.0)
+        score = 50
+        if direction == 'LONG':
+            if rsi_slope > 0: score += 9
+            if hist_slope > 0: score += 11
+            if hist_accel > 0: score += 7
+            if safe_float(l15['close']) > safe_float(l15['vwap']): score += 6
+        elif direction == 'SHORT':
+            if rsi_slope < 0: score += 9
+            if hist_slope < 0: score += 11
+            if hist_accel < 0: score += 7
+            if safe_float(l15['close']) < safe_float(l15['vwap']): score += 6
+        if adx_slope > 0: score += 8
+        if vol_ratio >= 1.2: score += 6
+        comp = _compression_expansion_pack(df_15m)
+        if comp.get('expansion'): score += 5
+        return {
+            'early_momentum_score': cap_score(score),
+            'rsi_slope_15m': round(rsi_slope, 4),
+            'adx_slope_15m': round(adx_slope, 4),
+            'macd_hist_slope_15m': round(hist_slope, 8),
+            'macd_hist_accel_15m': round(hist_accel, 8),
+            'volume_ratio_15m': round(vol_ratio, 3),
+            'compression': comp,
+        }
+    except Exception:
+        return {'early_momentum_score': 50}
+
+
+def _state_awareness_pack(direction: str, df_15m: pd.DataFrame, df_5m: pd.DataFrame) -> Dict[str, Any]:
+    try:
+        dist = distance_from_ema20_atr(df_15m)
+        mom = _early_momentum_pack(direction, df_15m, df_5m)
+        candle = _candle_quality_pack(df_15m)
+        score = safe_float(mom.get('early_momentum_score'), 50)
+        state = 'START'
+        if dist >= 1.55 and score < 68:
+            state = 'LATE_OR_EXHAUSTION'
+        elif dist >= 1.25:
+            state = 'MID_MOVE'
+        elif score >= 70:
+            state = 'EARLY_MOMENTUM'
+        reversal_risk = 25
+        if state == 'LATE_OR_EXHAUSTION': reversal_risk += 35
+        if direction == 'LONG' and candle.get('upper_rejection'): reversal_risk += 15
+        if direction == 'SHORT' and candle.get('lower_rejection'): reversal_risk += 15
+        return {'move_state': state, 'distance_ema20_atr_15m': round(dist, 3), 'reversal_risk_score': cap_score(reversal_risk), 'momentum': mom, 'candle': candle}
+    except Exception:
+        return {'move_state': 'UNKNOWN', 'reversal_risk_score': 50}
+
+
+def _prediction_layer_pack(symbol: str, direction: str, df_15m: pd.DataFrame, df_5m: pd.DataFrame, market_context: Dict[str, Any], level_pack: Dict[str, Any]) -> Dict[str, Any]:
+    price = safe_float(df_15m.iloc[-1]['close'])
+    atr = max(safe_float(df_15m.iloc[-1]['atr']), price * 0.0015)
+    momentum = _early_momentum_pack(direction, df_15m, df_5m)
+    state = _state_awareness_pack(direction, df_15m, df_5m)
+    candle = _candle_quality_pack(df_15m)
+    liquidity = _liquidity_trap_pack(direction, price, atr, df_15m, level_pack)
+    rel = _relative_strength_pack(symbol, df_15m, market_context)
+    prediction = safe_float(momentum.get('early_momentum_score'), 50)
+    if state.get('move_state') == 'LATE_OR_EXHAUSTION': prediction -= 14
+    if liquidity.get('trap_risk') == 'HIGH': prediction -= 14
+    elif liquidity.get('trap_risk') == 'MEDIUM': prediction -= 5
+    if rel.get('relative_status') in ('relative_strength', 'relative_weakness'): prediction += 5
+    if direction == 'LONG' and candle.get('strong_close_up'): prediction += 5
+    if direction == 'SHORT' and candle.get('strong_close_down'): prediction += 5
+    reversal = safe_float(state.get('reversal_risk_score'), 50)
+    if liquidity.get('trap_risk') == 'HIGH': reversal += 15
+    expected_move_atr = max(0.35, min(1.65, (prediction - 45) / 35.0))
+    return {
+        'prediction_score': cap_score(prediction),
+        'expected_move_atr': round(expected_move_atr, 3),
+        'reversal_risk_score': cap_score(reversal),
+        'state': state,
+        'candle_behavior': candle,
+        'liquidity_trap': liquidity,
+        'relative_strength': rel,
+        'soft_layer': True,
+    }
+
 def build_local_snapshot(symbol, direction, df_4h, df_1h, df_30m, df_15m, df_5m, score_pack, market_context):
-    l15=df_15m.iloc[-1]; l5=df_5m.iloc[-1]; buy2,sell2=buy_sell_power(df_5m,2); buy3,sell3=buy_sell_power(df_5m,3); buy20,sell20=buy_sell_power(df_5m,20)
-    snap={'symbol':symbol,'direction':direction,'price':safe_float(l15['close']),'entry':safe_float(l15['close']),'rsi':safe_float(l15['rsi']),'rsi_5m':safe_float(l5['rsi']),'macd':safe_float(l15['macd']),'macd_signal':safe_float(l15['macd_signal']),'macd_hist':safe_float(l15['macd_hist']),'adx':safe_float(l15['adx']),'atr':safe_float(l15['atr']),'ema20':safe_float(l15['ema20']),'ema50':safe_float(l15['ema50']),'ema200':safe_float(l15['ema200']),'vwap':safe_float(l15['vwap']),'vwap_status':vwap_status(df_15m),'power2_buy':buy2,'power2_sell':sell2,'power3_buy':buy3,'power3_sell':sell3,'buy_power':buy20,'sell_power':sell20,'early_5m_trigger':score_pack.get('early_5m_trigger',{}),'multi_tf_alignment':score_pack.get('multi_tf_alignment',{}),'late_entry':score_pack.get('late_entry',{}),'pump_dump_chase':score_pack.get('pump_dump_chase',{}),'trends':score_pack.get('trends',{}),'long_score':score_pack.get('long_score',0),'short_score':score_pack.get('short_score',0),'market_regime':market_context.get('market_regime','neutral'),'btc_bias':market_context.get('btc_bias','neutral')}
+    l15=df_15m.iloc[-1]; l5=df_5m.iloc[-1]
+    buy2,sell2=buy_sell_power(df_5m,2); buy3,sell3=buy_sell_power(df_5m,3); buy20,sell20=buy_sell_power(df_5m,20)
+    price=safe_float(l15['close']); atr=max(safe_float(l15['atr']), price*0.0015)
+    levels=get_strong_levels(df_5m,df_15m,df_30m,price,atr)
+    prediction_pack=_prediction_layer_pack(symbol, direction, df_15m, df_5m, market_context, levels)
+    snap={
+        'symbol':symbol,'direction':direction,'timeframe_core':'15M','entry_timing_tf':'5M',
+        'price':price,'entry':price,
+        'rsi':safe_float(l15['rsi']),'rsi_5m':safe_float(l5['rsi']),
+        'rsi_slope_15m':prediction_pack.get('state',{}).get('momentum',{}).get('rsi_slope_15m'),
+        'macd':safe_float(l15['macd']),'macd_signal':safe_float(l15['macd_signal']),'macd_hist':safe_float(l15['macd_hist']),
+        'macd_hist_slope_15m':prediction_pack.get('state',{}).get('momentum',{}).get('macd_hist_slope_15m'),
+        'macd_hist_accel_15m':prediction_pack.get('state',{}).get('momentum',{}).get('macd_hist_accel_15m'),
+        'adx':safe_float(l15['adx']),'adx_slope_15m':prediction_pack.get('state',{}).get('momentum',{}).get('adx_slope_15m'),
+        'atr':atr,'ema20':safe_float(l15['ema20']),'ema50':safe_float(l15['ema50']),'ema200':safe_float(l15['ema200']),
+        'ema_structure_15m':'bullish_stack' if l15['ema20']>l15['ema50']>l15['ema200'] else 'bearish_stack' if l15['ema20']<l15['ema50']<l15['ema200'] else 'mixed',
+        'vwap':safe_float(l15['vwap']),'vwap_status':vwap_status(df_15m),'vwap_distance_pct':round(_pct_distance(l15['close'], l15['vwap']),4),
+        'power2_buy':buy2,'power2_sell':sell2,'power3_buy':buy3,'power3_sell':sell3,'buy_power':buy20,'sell_power':sell20,
+        'volume_ratio_15m':safe_float(l15.get('volume_ratio'),1.0),
+        'candle_behavior':prediction_pack.get('candle_behavior',{}),
+        'state_awareness':prediction_pack.get('state',{}),
+        'prediction_layer':prediction_pack,
+        'liquidity_trap':prediction_pack.get('liquidity_trap',{}),
+        'relative_strength':prediction_pack.get('relative_strength',{}),
+        'sr_levels':{'nearest_support':levels.get('nearest_support'),'nearest_resistance':levels.get('nearest_resistance')},
+        'early_5m_trigger':score_pack.get('early_5m_trigger',{}),'multi_tf_alignment':score_pack.get('multi_tf_alignment',{}),
+        'late_entry':score_pack.get('late_entry',{}),'pump_dump_chase':score_pack.get('pump_dump_chase',{}),
+        'trends':score_pack.get('trends',{}),'long_score':score_pack.get('long_score',0),'short_score':score_pack.get('short_score',0),
+        'market_regime':market_context.get('market_regime','neutral'),'btc_bias':market_context.get('btc_bias','neutral'),
+        'learning_note':'candidate snapshot: classic is soft; AI/ghost/meta learning should evaluate this condition per coin+direction',
+    }
     if build_signal_snapshot:
         try:
             extra=build_signal_snapshot(symbol, direction, snap, market_context)
@@ -385,7 +615,7 @@ def simple_classic_score(symbol, df_4h, df_1h, df_30m, df_15m, df_5m, market_con
     market_context=market_context or {}; long_score=0.0; short_score=0.0; long_reasons=[]; short_reasons=[]; cl=0; cs=0
     trends={'4H':ema_direction(df_4h),'1H':ema_direction(df_1h),'30M':ema_direction(df_30m),'15M':ema_direction(df_15m),'5M':ema_direction(df_5m)}
     l1=df_1h.iloc[-1]; l30=df_30m.iloc[-1]; l15=df_15m.iloc[-1]; p15=df_15m.iloc[-2]; l5=df_5m.iloc[-1]; p5=df_5m.iloc[-2]
-    weights={'4H':8,'1H':22,'30M':12,'15M':18,'5M':10}
+    weights={'4H':7,'1H':18,'30M':12,'15M':25,'5M':8}
     for tf,tr in trends.items():
         if tr=='bullish': long_score+=weights[tf]; cl += 1 if tf in ['1H','30M','15M'] else 0; long_reasons.append(f'{tf}: روند صعودی')
         elif tr=='bearish': short_score+=weights[tf]; cs += 1 if tf in ['1H','30M','15M'] else 0; short_reasons.append(f'{tf}: روند نزولی')
@@ -544,7 +774,7 @@ def select_level_for_sl(direction, price, atr, levels, base_distance):
     valid.sort(key=lambda x:x['strength'], reverse=True); return safe_float(valid[0]['price'])
 
 def select_level_for_tp(direction, price, atr, levels, fallback_mult, buffer):
-    candidates=[]; min_d=atr*MIN_TP1_ATR; max_d=atr*1.8
+    candidates=[]; min_d=atr*MIN_TP1_ATR; max_d=atr*2.20
     for lv in levels:
         lp=safe_float(lv['price']); target=lp-buffer if direction=='LONG' else lp+buffer; d=abs(target-price)
         if direction=='LONG' and target<=price: continue
@@ -784,8 +1014,8 @@ def _tp_sl_v2_profile(symbol, direction, price, atr, snapshot, df_15m, levels):
         sl_mult *= 1.03  # hide SL beyond stronger invalidation zone
 
     # Keep safe bounds so this layer cannot create unrealistic orders.
-    tp1_mult = max(MIN_TP1_ATR, min(1.25, tp1_mult))
-    tp2_mult = max(tp1_mult + 0.25, min(2.0, tp2_mult))
+    tp1_mult = max(MIN_TP1_ATR, min(1.35, tp1_mult))
+    tp2_mult = max(tp1_mult + 0.28, min(2.05, tp2_mult))
     sl_mult = max(MIN_SL_ATR_MULTIPLIER * 0.95, min(MAX_REASONABLE_SL_ATR, sl_mult))
     return {
         "confidence": int(confidence), "personality": personality,
@@ -803,7 +1033,7 @@ def _apply_tp_sl_v2(direction, price, atr, sl, tp1, tp2, profile):
 
     # Blend SR levels with memory rather than replacing them. SR still controls
     # price structure; memory nudges TP/SL to what this coin+direction usually reaches.
-    w = min(0.25, max(0.10, profile.get("confidence", 0) / 250.0))
+    w = min(0.25, max(0.08, profile.get("confidence", 0) / 260.0))
     tp1_new = safe_float(tp1) * (1 - w) + tp1_mem * w
     tp2_new = safe_float(tp2) * (1 - w) + tp2_mem * w
     sl_new = safe_float(sl) * (1 - min(0.45, w)) + sl_mem * min(0.45, w)
@@ -847,7 +1077,7 @@ def build_trade_levels(direction, price, atr, df_5m, df_15m, df_30m, snapshot=No
         'volatility_factor':round(vf,3),'ai_tp_used':bool(ai_tp),'ai_tp':ai_tp,
         'nearest_support':levels.get('nearest_support'),'nearest_resistance':levels.get('nearest_resistance'),
         'tp_sl_v2':tp_sl_v2,
-        'tp_sl_layers':['SR_MEMORY','COIN_PERSONALITY','DIRECTION_MEMORY','TP_REACH_MEMORY','DYNAMIC_TP_META','SL_SURVIVAL_MEMORY']
+        'tp_sl_layers':['15M_SR_PRIMARY','5M_ENTRY_STRUCTURE','30M_CONTEXT','COIN_PERSONALITY','TP_REACH_MEMORY','LIQUIDITY_AWARE_SL','DYNAMIC_TP_META']
     }
 
 def get_soft_market_context():
@@ -913,9 +1143,9 @@ def analyze_symbol(symbol: str) -> Dict:
         #   require stronger score and more confirmations.
         # - Keep it gradual so signal frequency does not collapse.
         if strict:
-            ai_penalty += min(14, max(3, strict * 3))
-            ai_min_score_add += min(10, max(2, strict * 2))
-            req_conf += min(3, max(1, strict))
+            ai_penalty += min(9, max(2, strict * 2))
+            ai_min_score_add += min(7, max(1, strict * 1.5))
+            req_conf += min(2, max(1, strict))
             reasons.append(f'AI Risk: سختگیری سطح {strict} | SL={sl_count}')
         elif sl_count >= 2:
             # Safety fallback if coin_risk stores SL count but strictness_level
@@ -933,13 +1163,13 @@ def analyze_symbol(symbol: str) -> Dict:
             final_score+=2
             reasons.append('AI Rotation: اولویت مثبت')
         elif rs<=20:
-            ai_penalty += 6
-            ai_min_score_add += 4
+            ai_penalty += 4
+            ai_min_score_add += 2
             req_conf += 1
             reasons.append('AI Rotation: کوین کم‌اولویت/پرریسک')
         elif rs<=35:
-            ai_penalty += 3
-            ai_min_score_add += 2
+            ai_penalty += 2
+            ai_min_score_add += 1
             reasons.append('AI Rotation: اولویت ضعیف')
 
         # Learning engine may request extra strength based on real/ghost history
@@ -950,9 +1180,32 @@ def analyze_symbol(symbol: str) -> Dict:
         if extra.get('required'):
             reasons.append(extra.get('reason') or 'AI Learning: تایید بیشتر لازم است')
 
+        # Soft integrated prediction/context layers: these layers rank candidates and feed Ghost/AI learning.
+        # They are not hard blockers at startup, so the bot stays learnable and does not become dry.
+        prediction_pack = snapshot.get('prediction_layer', {}) if isinstance(snapshot, dict) else {}
+        prediction_score = safe_float(prediction_pack.get('prediction_score'), 50)
+        reversal_risk_score = safe_float(prediction_pack.get('reversal_risk_score'), 50)
+        trap_risk = str((prediction_pack.get('liquidity_trap') or {}).get('trap_risk', 'LOW')).upper()
+        move_state = str((prediction_pack.get('state') or {}).get('move_state', 'UNKNOWN')).upper()
+        if prediction_score >= 72 and reversal_risk_score <= 55:
+            final_score += 3
+            reasons.append('AI Prediction: شروع حرکت/مومنتوم مثبت')
+        elif prediction_score <= 42 or reversal_risk_score >= 78:
+            ai_penalty += 3
+            ai_min_score_add += 1
+            reasons.append('AI Prediction: ریسک برگشت یا ضعف مومنتوم')
+        if trap_risk == 'HIGH':
+            ai_penalty += 4
+            ai_min_score_add += 2
+            reasons.append('AI Trap: احتمال فیک‌بریک/تله بالا')
+        if move_state == 'LATE_OR_EXHAUSTION':
+            ai_penalty += 4
+            ai_min_score_add += 2
+            reasons.append('AI State: احتمال ورود دیر یا خستگی حرکت')
+
         # If the coin/direction is extremely risky, AI can block borderline
         # candidates.  Strong candidates can still pass only with strict gates.
-        if risk_score >= 85 and final_score < 94:
+        if risk_score >= 92 and final_score < 95:
             ai_block=True
             reasons.append('AI Block: ریسک کوین/جهت خیلی بالا و امتیاز کافی نیست')
 
@@ -962,7 +1215,7 @@ def analyze_symbol(symbol: str) -> Dict:
 
         level_pack=get_strong_levels(df_5m,df_15m,df_30m,price,atr); support=level_pack.get('nearest_support'); resistance=level_pack.get('nearest_resistance')
         entry_confirmed=(not ai_block) and valid and final_score>=min_score and confirmations>=effective_req_conf
-        common={'symbol':symbol,'score':cap_score(final_score),'long_score':long_score,'short_score':short_score,'price':safe_round(price),'closed_15m_price':safe_round(closed_15m_price),'entry_price_source':'5M_CURRENT' if USE_CURRENT_5M_FOR_ENTRY else '15M_CLOSED','atr':safe_round(atr),'market_regime':market_context.get('market_regime','neutral'),'btc_bias':market_context.get('btc_bias','neutral'),'confirmations':confirmations,'required_confirmations':effective_req_conf,'rsi':safe_round(df_15m.iloc[-1]['rsi'],2),'macd':safe_round(df_15m.iloc[-1]['macd'],6),'macd_signal':safe_round(df_15m.iloc[-1]['macd_signal'],6),'macd_hist':safe_round(df_15m.iloc[-1]['macd_hist'],6),'adx':safe_round(df_15m.iloc[-1]['adx'],2),'vwap_status':vwap_status(df_15m),'support':safe_round(support),'resistance':safe_round(resistance),'trends':sp.get('trends',{}),'distance_ema20_atr':sp.get('distance_ema20_atr'),'volume_status':sp.get('volume_status'),'volume_ratio':sp.get('volume_ratio'),'buy_power':sp.get('buy_power'),'sell_power':sp.get('sell_power'),'power2_buy':sp.get('power2_buy'),'power2_sell':sp.get('power2_sell'),'power3_buy':sp.get('power3_buy'),'power3_sell':sp.get('power3_sell'),'snapshot':snapshot,'coin_risk':risk_state,'rotation':rotation,'ai_decision':{'base_min_score':base_min_score,'min_score':min_score,'ai_penalty':ai_penalty,'ai_min_score_add':ai_min_score_add,'ai_block':ai_block,'strictness_level':strict,'sl_count':sl_count,'risk_score':risk_score,'rotation_score':rs},'reasons':reasons[:20],'signal_timeframe':'AI Classic Direct'}
+        common={'symbol':symbol,'score':cap_score(final_score),'long_score':long_score,'short_score':short_score,'price':safe_round(price),'closed_15m_price':safe_round(closed_15m_price),'entry_price_source':'5M_CURRENT' if USE_CURRENT_5M_FOR_ENTRY else '15M_CLOSED','atr':safe_round(atr),'market_regime':market_context.get('market_regime','neutral'),'btc_bias':market_context.get('btc_bias','neutral'),'confirmations':confirmations,'required_confirmations':effective_req_conf,'rsi':safe_round(df_15m.iloc[-1]['rsi'],2),'macd':safe_round(df_15m.iloc[-1]['macd'],6),'macd_signal':safe_round(df_15m.iloc[-1]['macd_signal'],6),'macd_hist':safe_round(df_15m.iloc[-1]['macd_hist'],6),'adx':safe_round(df_15m.iloc[-1]['adx'],2),'vwap_status':vwap_status(df_15m),'support':safe_round(support),'resistance':safe_round(resistance),'trends':sp.get('trends',{}),'distance_ema20_atr':sp.get('distance_ema20_atr'),'volume_status':sp.get('volume_status'),'volume_ratio':sp.get('volume_ratio'),'buy_power':sp.get('buy_power'),'sell_power':sp.get('sell_power'),'power2_buy':sp.get('power2_buy'),'power2_sell':sp.get('power2_sell'),'power3_buy':sp.get('power3_buy'),'power3_sell':sp.get('power3_sell'),'snapshot':snapshot,'coin_risk':risk_state,'rotation':rotation,'ai_decision':{'base_min_score':base_min_score,'min_score':min_score,'ai_penalty':ai_penalty,'ai_min_score_add':ai_min_score_add,'ai_block':ai_block,'strictness_level':strict,'sl_count':sl_count,'risk_score':risk_score,'rotation_score':rs,'prediction_score':safe_round(prediction_score,2),'reversal_risk_score':safe_round(reversal_risk_score,2),'trap_risk':trap_risk,'move_state':move_state},'prediction_layer':prediction_pack,'reasons':reasons[:20],'signal_timeframe':'AI 15M Scalp Candidate'}
         if not entry_confirmed:
             return {**common,'direction':'NO TRADE','status':'NO_TRADE','entry_confirmed':False,'entry_mode':'NO_ENTRY','entry':None,'stop_loss':None,'tp1':None,'tp2':None,'risk_reward':0,'risk_level':'UNKNOWN','freshness':'LOW','tp_meta':{},'validity':'سیگنال معتبر نیست','valid_gate':valid,'min_score':min_score}
         sl,tp1,tp2,rr,tp_meta=build_trade_levels(direction,price,atr,df_5m,df_15m,df_30m,snapshot,symbol)
@@ -975,6 +1228,6 @@ def analyze_symbol(symbol: str) -> Dict:
         if update_ai_summary:
             try: update_ai_summary(total_signals=1)
             except Exception: pass
-        return {**common,'direction':direction,'status':'ACTIVE','entry_confirmed':True,'entry_mode':'AI_CLASSIC_DIRECT','entry':safe_round(price),'stop_loss':sl,'tp1':tp1,'tp2':tp2,'risk_reward':rr,'risk_level':risk_level,'freshness':freshness,'tp_meta':tp_meta,'validity':'15 تا 45 دقیقه'}
+        return {**common,'direction':direction,'status':'ACTIVE','entry_confirmed':True,'entry_mode':'AI_15M_SCALP_DIRECT','entry':safe_round(price),'stop_loss':sl,'tp1':tp1,'tp2':tp2,'risk_reward':rr,'risk_level':risk_level,'freshness':freshness,'tp_meta':tp_meta,'validity':'15 تا 45 دقیقه'}
     except Exception as e:
-        return {'symbol':symbol,'direction':'NO TRADE','status':'NO_TRADE','entry_confirmed':False,'entry_mode':'ERROR','score':0,'long_score':0,'short_score':0,'price':None,'entry':None,'stop_loss':None,'tp1':None,'tp2':None,'atr':None,'risk_reward':0,'risk_level':'UNKNOWN','market_regime':'unknown','btc_bias':'unknown','freshness':'LOW','confirmations':0,'required_confirmations':0,'rsi':None,'macd':None,'macd_signal':None,'macd_hist':None,'adx':None,'vwap_status':None,'support':None,'resistance':None,'trends':{},'snapshot':{},'coin_risk':{},'rotation':{},'tp_meta':{},'reasons':[f'Analysis Error: {str(e)[:200]}'],'signal_timeframe':'AI Classic Direct','validity':'سیگنال معتبر نیست'}
+        return {'symbol':symbol,'direction':'NO TRADE','status':'NO_TRADE','entry_confirmed':False,'entry_mode':'ERROR','score':0,'long_score':0,'short_score':0,'price':None,'entry':None,'stop_loss':None,'tp1':None,'tp2':None,'atr':None,'risk_reward':0,'risk_level':'UNKNOWN','market_regime':'unknown','btc_bias':'unknown','freshness':'LOW','confirmations':0,'required_confirmations':0,'rsi':None,'macd':None,'macd_signal':None,'macd_hist':None,'adx':None,'vwap_status':None,'support':None,'resistance':None,'trends':{},'snapshot':{},'coin_risk':{},'rotation':{},'tp_meta':{},'reasons':[f'Analysis Error: {str(e)[:200]}'],'signal_timeframe':'AI 15M Scalp Candidate','validity':'سیگنال معتبر نیست'}
