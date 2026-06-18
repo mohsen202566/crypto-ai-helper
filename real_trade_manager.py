@@ -18,6 +18,12 @@ from data_store import load_json, save_json
 from tobit_client import toobit_client
 
 try:
+    from coin_learning import register_dynamic_profit_exit, register_tp_sl_v2_result
+except Exception:
+    register_dynamic_profit_exit = None
+    register_tp_sl_v2_result = None
+
+try:
     from tobit_client import normalize_bot_plain_symbol
 except Exception:
     def normalize_bot_plain_symbol(symbol: str) -> str:
@@ -70,6 +76,15 @@ DEFAULT_REAL_TRADE_STATE = {
     "daily_lock_reason": "",
     "daily_lock_loss_value": 0.0,
     "daily_lock_auto_reenable": False,
+
+    # Special high-priority AI trade-management update.
+    # Applies only to profitable TP-side management for both LONG and SHORT;
+    # it never moves/changes SL placement.
+    "dynamic_profit_protection_enabled": True,
+    "dynamic_profit_min_profit_pct": 0.18,
+    "dynamic_profit_min_tp_progress": 0.45,
+    "dynamic_profit_retrace_trigger_pct": 0.18,
+    "dynamic_profit_last_check": 0,
 
     "created_at": 0,
     "updated_at": 0,
@@ -180,6 +195,18 @@ def _safe_float_any(value: Any, default: float = 0.0) -> float:
         return float(value)
     except Exception:
         return default
+
+
+def _calc_move_percent(direction: str, entry: float, price: float) -> float:
+    """Signed move percentage in trade direction. Positive means the position is in profit."""
+    e = _safe_float_any(entry, 0.0)
+    p2 = _safe_float_any(price, 0.0)
+    if e <= 0 or p2 <= 0:
+        return 0.0
+    d = str(direction or "").upper().strip()
+    if d == "SHORT":
+        return ((e - p2) / e) * 100.0
+    return ((p2 - e) / e) * 100.0
 
 
 def _extract_order_execution_info(order_result: Dict[str, Any]) -> Dict[str, Any]:
@@ -595,8 +622,8 @@ def set_real_leverage(leverage: float) -> str:
     state = load_real_trade_state()
     leverage = float(leverage)
 
-    if leverage < 1 or leverage > 1000000:
-        return "❌ لوریج باید بین 1 تا 1000000 باشد."
+    if leverage < 1 or leverage > 50:
+        return "❌ لوریج باید بین 1 تا 50 باشد."
 
     state["leverage"] = leverage
     save_real_trade_state(state)
@@ -784,6 +811,31 @@ def record_realized_pnl(
 
     _maybe_apply_daily_lock(state)
     save_real_trade_state(state)
+
+    # Learning hook: keep TP/SL v2 memory aligned with real closed trades.
+    # This is best-effort and never blocks accounting or real-trade state.
+    try:
+        if register_tp_sl_v2_result and symbol and direction:
+            register_tp_sl_v2_result(
+                symbol=symbol,
+                direction=direction,
+                result=result,
+                entry=entry,
+                stop_loss=stop_loss,
+                tp1=tp1,
+                tp2=tp2,
+                snapshot=snapshot if isinstance(snapshot, dict) else {},
+                source="REAL",
+                max_favorable=max_favorable,
+                max_adverse=max_adverse,
+                sr_event=sr_event,
+                fake_breakout=fake_breakout,
+                signal_id=signal_id,
+                exit_price=exit_price,
+                move_percent=extra.get("move_percent") if isinstance(extra, dict) else None,
+            )
+    except Exception:
+        pass
 
     return {
         "ok": True,
@@ -1403,6 +1455,10 @@ def _register_real_open_position(state: Dict[str, Any], signal: Dict[str, Any], 
         "exchange_order": order_result.get("data"),
         "execution_info": execution_info,
         "recovered_note": recovered_note,
+        "snapshot": signal.get("snapshot") if isinstance(signal.get("snapshot"), dict) else {},
+        "max_favorable_percent": 0.0,
+        "max_adverse_percent": 0.0,
+        "dynamic_profit_protection": {"enabled": True, "applies_to": "LONG_AND_SHORT"},
     }
     save_real_trade_state(state)
     return state["open_positions"][signal_id]
@@ -1449,6 +1505,10 @@ def _register_pending_real_position(
         "exchange_order": order_result.get("data"),
         "execution_info": execution_info,
         "warning": "سفارش ارسال شده و اسلات موقتاً رزرو است؛ در حال تایید پوزیشن واقعی در توبیت.",
+        "snapshot": signal.get("snapshot") if isinstance(signal.get("snapshot"), dict) else {},
+        "max_favorable_percent": 0.0,
+        "max_adverse_percent": 0.0,
+        "dynamic_profit_protection": {"enabled": True, "applies_to": "LONG_AND_SHORT"},
     }
     save_real_trade_state(state)
     return state["open_positions"][signal_id]
@@ -1932,6 +1992,279 @@ def open_real_position_from_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+
+# ---------------------------------------------------------------------------
+# Special high-priority AI update: Dynamic Profit Protection
+# ---------------------------------------------------------------------------
+# This layer is intentionally TP-side only.  It never changes SL placement.
+# It can close either LONG or SHORT early only after the position is already
+# profitable and continuation probability drops while reversal risk rises.
+
+def _normalize_live_price_for_bot(pos: Dict[str, Any], price: float) -> float:
+    """Convert Toobit multiplier-contract price back to the bot's plain-symbol price."""
+    value = _safe_float_any(price, 0.0)
+    if value <= 0 or not isinstance(pos, dict):
+        return value
+    entry = _safe_float_any(pos.get("entry"), 0.0)
+    mult = _safe_float_any(pos.get("toobit_multiplier"), 1.0)
+    if mult <= 1:
+        try:
+            mult = _toobit_contract_multiplier(pos.get("symbol"))
+        except Exception:
+            mult = 1.0
+    if mult > 1 and entry > 0 and value > entry * 10:
+        return value / mult
+    return value
+
+
+def _get_live_price_from_position(pos: Dict[str, Any]) -> float:
+    """Best-effort live price getter for a Toobit futures position."""
+    if not isinstance(pos, dict):
+        return 0.0
+
+    # First try values already returned by Toobit position sync.
+    raw = pos.get("exchange_position") or pos.get("raw") or {}
+    if isinstance(raw, dict):
+        for key in ("markPrice", "lastPrice", "indexPrice", "price", "close", "fairPrice"):
+            v = _safe_float_any(raw.get(key), 0.0)
+            if v > 0:
+                return _normalize_live_price_for_bot(pos, v)
+
+    symbol = pos.get("symbol")
+    method_names = (
+        "get_last_price", "get_mark_price", "get_symbol_price", "get_ticker", "fetch_ticker", "ticker"
+    )
+    for method_name in method_names:
+        method = getattr(toobit_client, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            res = method(symbol)
+            if isinstance(res, dict):
+                for item in _flatten_dicts(res):
+                    if not isinstance(item, dict):
+                        continue
+                    for key in ("last", "lastPrice", "markPrice", "price", "close", "indexPrice"):
+                        v = _safe_float_any(item.get(key), 0.0)
+                        if v > 0:
+                            return _normalize_live_price_for_bot(pos, v)
+            else:
+                v = _safe_float_any(res, 0.0)
+                if v > 0:
+                    return _normalize_live_price_for_bot(pos, v)
+        except Exception:
+            continue
+    return 0.0
+
+
+def _tp_progress_percent(pos: Dict[str, Any], current_price: float) -> float:
+    entry = _safe_float_any(pos.get("entry"), 0.0)
+    direction = str(pos.get("direction") or "").upper()
+    tp1 = _safe_float_any(pos.get("tp1"), 0.0)
+    if entry <= 0 or current_price <= 0 or tp1 <= 0:
+        return 0.0
+    target_move = abs(_calc_move_percent(direction, entry, tp1))
+    if target_move <= 0:
+        return 0.0
+    return max(0.0, _calc_move_percent(direction, entry, current_price) / target_move)
+
+
+def _live_analysis_pack_for_dynamic_exit(symbol: str, direction: str) -> Dict[str, Any]:
+    """Optional live AI context; never raises and never blocks monitoring."""
+    try:
+        from analysis import analyze_symbol
+        sig = analyze_symbol(symbol)
+        if not isinstance(sig, dict):
+            return {}
+        snap = sig.get("snapshot") if isinstance(sig.get("snapshot"), dict) else {}
+        pred = snap.get("prediction_layer") if isinstance(snap.get("prediction_layer"), dict) else {}
+        state = snap.get("state_awareness") if isinstance(snap.get("state_awareness"), dict) else pred.get("state", {}) if isinstance(pred.get("state"), dict) else {}
+        liq = snap.get("liquidity_trap") if isinstance(snap.get("liquidity_trap"), dict) else pred.get("liquidity_trap", {}) if isinstance(pred.get("liquidity_trap"), dict) else {}
+        out = {
+            "direction_now": str(sig.get("direction") or "").upper(),
+            "status_now": sig.get("status"),
+            "score_now": sig.get("score"),
+            "prediction_score": pred.get("prediction_score") or snap.get("prediction_score"),
+            "reversal_risk_score": pred.get("reversal_risk_score") or state.get("reversal_risk_score") or snap.get("reversal_risk_score"),
+            "move_state": state.get("move_state") or snap.get("move_state"),
+            "trap_risk": liq.get("trap_risk") or snap.get("trap_risk"),
+            "vwap_status": snap.get("vwap_status"),
+            "rsi_slope_15m": snap.get("rsi_slope_15m"),
+            "adx_slope_15m": snap.get("adx_slope_15m"),
+            "macd_hist_accel_15m": snap.get("macd_hist_accel_15m"),
+        }
+        # Direction no longer agrees with the open trade.
+        out["direction_disagreement"] = bool(out.get("direction_now") in {"LONG", "SHORT"} and out.get("direction_now") != str(direction).upper())
+        return out
+    except Exception as e:
+        return {"error": str(e)[:160]}
+
+
+def _dynamic_profit_exit_decision(pos: Dict[str, Any], current_price: float, state: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(pos, dict):
+        return {"exit": False, "reason": "NO_POSITION"}
+    if not bool(state.get("dynamic_profit_protection_enabled", True)):
+        return {"exit": False, "reason": "DYNAMIC_PROFIT_DISABLED"}
+
+    direction = str(pos.get("direction") or "").upper()
+    entry = _safe_float_any(pos.get("entry"), 0.0)
+    if direction not in {"LONG", "SHORT"} or entry <= 0 or current_price <= 0:
+        return {"exit": False, "reason": "INVALID_DYNAMIC_INPUT"}
+
+    profit_pct = _calc_move_percent(direction, entry, current_price)
+    min_profit = _safe_float_any(state.get("dynamic_profit_min_profit_pct"), 0.18)
+    min_progress = _safe_float_any(state.get("dynamic_profit_min_tp_progress"), 0.45)
+    retrace_trigger = _safe_float_any(state.get("dynamic_profit_retrace_trigger_pct"), 0.18)
+    progress = _tp_progress_percent(pos, current_price)
+
+    # Never touch losing/breakeven trades. SL remains controlled by TP/SL layers.
+    if profit_pct < min_profit:
+        return {"exit": False, "reason": "NOT_ENOUGH_PROFIT", "profit_pct": round(profit_pct, 4), "tp_progress": round(progress, 4)}
+
+    prev_max = _safe_float_any(pos.get("max_favorable_percent"), 0.0)
+    if profit_pct > prev_max:
+        pos["max_favorable_percent"] = round(profit_pct, 6)
+    if profit_pct < 0:
+        pos["max_adverse_percent"] = min(_safe_float_any(pos.get("max_adverse_percent"), 0.0), round(profit_pct, 6))
+
+    retrace_from_peak = max(0.0, _safe_float_any(pos.get("max_favorable_percent"), 0.0) - profit_pct)
+    live_ai = _live_analysis_pack_for_dynamic_exit(str(pos.get("symbol") or ""), direction)
+
+    reasons = []
+    if progress >= min_progress and retrace_from_peak >= retrace_trigger:
+        reasons.append(f"برگشت از اوج سود {round(retrace_from_peak, 3)}%")
+
+    reversal = _safe_float_any(live_ai.get("reversal_risk_score"), 0.0)
+    pred = _safe_float_any(live_ai.get("prediction_score"), 0.0)
+    move_state = str(live_ai.get("move_state") or "").upper()
+    trap_risk = str(live_ai.get("trap_risk") or "").upper()
+
+    if progress >= min_progress and reversal >= 68:
+        reasons.append("افزایش ریسک برگشت بازار")
+    if progress >= min_progress and pred and pred <= 48:
+        reasons.append("افت احتمال ادامه حرکت")
+    if progress >= min_progress and move_state == "LATE_OR_EXHAUSTION":
+        reasons.append("خستگی حرکت")
+    if progress >= min_progress and trap_risk == "HIGH":
+        reasons.append("ریسک Trap/Liquidity بالا")
+    if progress >= min_progress and live_ai.get("direction_disagreement"):
+        reasons.append("تغییر جهت تحلیل AI")
+
+    # Direction-specific momentum fade. Applies symmetrically to LONG and SHORT.
+    rsi_slope = _safe_float_any(live_ai.get("rsi_slope_15m"), 0.0)
+    hist_accel = _safe_float_any(live_ai.get("macd_hist_accel_15m"), 0.0)
+    adx_slope = _safe_float_any(live_ai.get("adx_slope_15m"), 0.0)
+    if progress >= min_progress:
+        if direction == "LONG" and (rsi_slope < 0 or hist_accel < 0) and adx_slope <= 0:
+            reasons.append("افت فشار خرید")
+        if direction == "SHORT" and (rsi_slope > 0 or hist_accel > 0) and adx_slope <= 0:
+            reasons.append("افت فشار فروش")
+
+    should_exit = bool(reasons) and progress >= min_progress
+    return {
+        "exit": should_exit,
+        "reason": "، ".join(reasons[:3]) if reasons else "HOLD_PROFIT",
+        "profit_pct": round(profit_pct, 4),
+        "tp_progress": round(progress, 4),
+        "retrace_from_peak_pct": round(retrace_from_peak, 4),
+        "live_ai": live_ai,
+        "current_price": current_price,
+    }
+
+
+def check_dynamic_profit_protection(signal_id: Optional[str] = None) -> Dict[str, Any]:
+    """Monitor open positions and close profitable trades when momentum fades.
+
+    This function is safe to call from bot/scanner/tracker loops. It only acts
+    when a position is already in profit and the TP-side continuation quality
+    deteriorates. It applies to both LONG and SHORT.
+    """
+    state = load_real_trade_state()
+    sync_result = sync_real_positions_with_toobit(state, save=True)
+    if sync_result.get("ok"):
+        state = sync_result.get("state") or state
+    open_positions = state.get("open_positions") or {}
+    if not isinstance(open_positions, dict) or not open_positions:
+        return {"ok": True, "checked": 0, "closed": 0, "results": []}
+
+    results = []
+    checked = 0
+    closed = 0
+    for sid, pos in list(open_positions.items()):
+        if signal_id and str(sid) != str(signal_id):
+            continue
+        if not isinstance(pos, dict):
+            continue
+        if str(pos.get("real_status") or "ACTIVE_REAL").upper() == PENDING_REAL_CONFIRM_STATUS:
+            continue
+        checked += 1
+        current_price = _get_live_price_from_position(pos)
+        decision = _dynamic_profit_exit_decision(pos, current_price, state)
+        # Save updated max favorable/adverse even when no close happens.
+        state.setdefault("open_positions", {}).setdefault(sid, {}).update({
+            "max_favorable_percent": pos.get("max_favorable_percent", 0.0),
+            "max_adverse_percent": pos.get("max_adverse_percent", 0.0),
+            "last_dynamic_profit_check": _now(),
+            "last_dynamic_profit_decision": decision,
+        })
+        save_real_trade_state(state)
+
+        if not decision.get("exit"):
+            results.append({"signal_id": sid, "symbol": pos.get("symbol"), "direction": pos.get("direction"), "closed": False, "decision": decision})
+            continue
+
+        close_result = close_real_position(signal_id=sid, exit_price=current_price, result_type="AI_DYNAMIC_PROFIT_EXIT")
+        ok_close = bool(close_result.get("ok"))
+        if ok_close:
+            closed += 1
+            try:
+                if register_dynamic_profit_exit:
+                    register_dynamic_profit_exit(
+                        symbol=pos.get("symbol"),
+                        direction=pos.get("direction"),
+                        entry=pos.get("entry"),
+                        exit_price=current_price,
+                        snapshot=pos.get("snapshot") if isinstance(pos.get("snapshot"), dict) else {},
+                        reason=decision.get("reason"),
+                        source="REAL",
+                        signal_id=sid,
+                        max_favorable=pos.get("max_favorable_percent"),
+                        max_adverse=pos.get("max_adverse_percent"),
+                        decision=decision,
+                    )
+            except Exception:
+                pass
+        results.append({
+            "signal_id": sid,
+            "symbol": pos.get("symbol"),
+            "direction": pos.get("direction"),
+            "closed": ok_close,
+            "exit_price": current_price,
+            "reason": decision.get("reason"),
+            "profit_pct": decision.get("profit_pct"),
+            "close_result": close_result,
+        })
+
+    state = load_real_trade_state()
+    state["dynamic_profit_last_check"] = _now()
+    save_real_trade_state(state)
+    return {"ok": True, "checked": checked, "closed": closed, "results": results}
+
+
+def dynamic_profit_protection_text() -> str:
+    result = check_dynamic_profit_protection()
+    if not result.get("ok"):
+        return f"❌ بررسی خروج سود AI ناموفق بود: {result.get('error')}"
+    if int(result.get("checked", 0) or 0) <= 0:
+        return "ℹ️ پوزیشن بازی برای بررسی خروج سود AI وجود ندارد."
+    closed_rows = [r for r in result.get("results", []) if r.get("closed")]
+    if not closed_rows:
+        return f"✅ بررسی خروج سود AI انجام شد. پوزیشن بررسی‌شده: {result.get('checked')} | خروج لازم نبود."
+    lines = [f"✅ خروج سود AI انجام شد. تعداد خروج: {len(closed_rows)}"]
+    for r in closed_rows[:10]:
+        lines.append(f"• {r.get('symbol')} {r.get('direction')} | قیمت خروج: {r.get('exit_price')} | سود تقریبی حرکت: {r.get('profit_pct')}% | علت: {r.get('reason')}")
+    return "\n".join(lines)
+
 def get_real_trade_status_text() -> str:
     state = load_real_trade_state()
     sync_result = sync_real_positions_with_toobit(state, save=True)
@@ -2004,7 +2337,8 @@ def get_real_trade_status_text() -> str:
         f"سود/ضرر کل: {round(float(state.get('total_realized_pnl', 0)), 4)}$\n"
         f"حد ضرر روزانه: {('خاموش' if not bool(state.get('daily_loss_protection_enabled', True)) else str(state.get('daily_loss_limit_usd', 0)) + '$')}\n"
         f"زمان قفل: {(0 if not bool(state.get('daily_loss_protection_enabled', True)) else state.get('daily_lock_duration_hours', DEFAULT_REAL_LOCK_DURATION_HOURS))} ساعت\n"
-        f"قفل ضرر روزانه: {('خاموش' if not bool(state.get('daily_loss_protection_enabled', True)) else lock_line)}"
+        f"قفل ضرر روزانه: {('خاموش' if not bool(state.get('daily_loss_protection_enabled', True)) else lock_line)}\n"
+        f"محافظ سود AI: {('روشن' if bool(state.get('dynamic_profit_protection_enabled', True)) else 'خاموش')}"
     )
 
 
@@ -2601,6 +2935,8 @@ def handle_real_trade_command(text: str) -> Optional[str]:
     if msg.startswith("زمان قفل") or msg.startswith("مدت قفل"):
         value = _num()
         return set_real_lock_duration_hours(int(value)) if value is not None else "❌ مدت قفل را به ساعت وارد کن. مثال: زمان قفل 1"
+    if msg in {"بررسی خروج سود", "خروج سود AI", "محافظ سود", "محافظ سود AI"}:
+        return dynamic_profit_protection_text()
 
     return None
 
