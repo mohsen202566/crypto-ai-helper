@@ -34,11 +34,22 @@ except Exception:
     close_position = None
 
 try:
-    from real_trade_manager import load_real_trade_state, save_real_trade_state, record_realized_pnl
+    from real_trade_manager import (
+        load_real_trade_state,
+        save_real_trade_state,
+        record_realized_pnl,
+        get_real_pnl_for_closed_position,
+    )
 except Exception:
     load_real_trade_state = None
     save_real_trade_state = None
     record_realized_pnl = None
+    get_real_pnl_for_closed_position = None
+
+try:
+    from tobit_client import toobit_client
+except Exception:
+    toobit_client = None
 
 ACTIVE_SIGNALS_FILE = "active_signals.json"
 SIGNAL_STATS_FILE = "signal_stats.json"
@@ -438,19 +449,115 @@ def move_percent(signal: Dict[str, Any], exit_price: float) -> float:
     return round(((entry - float(exit_price)) / entry) * 100, 4)
 
 
+
+def _extract_realized_pnl_from_any(value: Any) -> Optional[float]:
+    """Best-effort extractor for realized PnL from Toobit-like responses."""
+    pnl_keys = (
+        "realizedPnl", "realizedPNL", "realized_pnl", "closedPnl", "closedPNL",
+        "closePnl", "closeProfit", "profit", "pnl", "netPnl", "netProfit",
+        "realizedProfit", "income", "amount",
+    )
+    def walk(v: Any):
+        if isinstance(v, dict):
+            for k in pnl_keys:
+                if k in v:
+                    try:
+                        return float(v.get(k))
+                    except Exception:
+                        pass
+            for child in v.values():
+                got = walk(child)
+                if got is not None:
+                    return got
+        elif isinstance(v, list):
+            for item in v:
+                got = walk(item)
+                if got is not None:
+                    return got
+        return None
+    return walk(value)
+
+
+def _fetch_real_closed_pnl_from_exchange(signal: Dict[str, Any], pos: Optional[Dict[str, Any]], hit_type: str, exit_price: float) -> Dict[str, Any]:
+    """Read REAL closed-position PnL from Toobit when available.
+
+    This function is fail-safe. It never guesses as 'real'. If Toobit/manager
+    cannot return a confirmed closed PnL, caller can fall back to approximate
+    calculation and label it as approximate.
+    """
+    symbol = str((pos or {}).get("symbol") or signal.get("symbol") or "").upper()
+    direction = str((pos or {}).get("direction") or signal.get("direction") or "").upper()
+    signal_id = str(signal.get("signal_id") or signal.get("id") or (pos or {}).get("signal_id") or "")
+    opened_at = int((pos or {}).get("opened_at") or signal.get("created_at") or 0)
+    closed_at = now_ts()
+
+    # Preferred project-level hook in real_trade_manager.py if it exists.
+    if callable(get_real_pnl_for_closed_position):
+        try:
+            res = get_real_pnl_for_closed_position(
+                signal_id=signal_id,
+                symbol=symbol,
+                direction=direction,
+                opened_at=opened_at,
+                closed_at=closed_at,
+                exit_price=exit_price,
+                result=hit_type,
+                position=pos,
+                signal=signal,
+            )
+            if isinstance(res, dict) and res.get("ok") and res.get("pnl_usd") is not None:
+                return {"ok": True, "pnl_usd": float(res.get("pnl_usd")), "source": res.get("source") or "TOOBIT", "raw": res}
+        except Exception as e:
+            last_error = str(e)[:250]
+        else:
+            last_error = "manager returned no confirmed pnl"
+    else:
+        last_error = "real_trade_manager pnl hook missing"
+
+    # Direct tobit_client compatibility hooks if present.
+    if toobit_client is not None:
+        candidates = (
+            "get_closed_position_pnl",
+            "get_realized_pnl_for_position",
+            "get_recent_closed_pnl",
+            "get_position_realized_pnl",
+            "get_closed_position_history",
+            "get_income_history",
+        )
+        for name in candidates:
+            method = getattr(toobit_client, name, None)
+            if not callable(method):
+                continue
+            call_styles = [
+                lambda m=method: m(symbol=symbol, direction=direction, signal_id=signal_id, opened_at=opened_at, closed_at=closed_at),
+                lambda m=method: m(symbol, direction, opened_at, closed_at),
+                lambda m=method: m(symbol=symbol),
+                lambda m=method: m(symbol),
+            ]
+            for call in call_styles:
+                try:
+                    res = call()
+                    pnl = _extract_realized_pnl_from_any(res)
+                    ok = bool(res.get("ok", True)) if isinstance(res, dict) else True
+                    if ok and pnl is not None:
+                        return {"ok": True, "pnl_usd": float(pnl), "source": f"TOOBIT:{name}", "raw": res}
+                except TypeError:
+                    continue
+                except Exception as e:
+                    last_error = str(e)[:250]
+                    break
+
+    return {"ok": False, "error": last_error or "real closed pnl not available"}
+
 def record_real_trade_result_for_signal(signal: Dict[str, Any], hit_type: str, exit_price: float, pct: float) -> Optional[Dict[str, Any]]:
     """
     Update REAL trading accounting when tracker detects TP1/SL.
 
-    PnL formula is leverage-aware:
-        pnl_usd = margin_usdt * leverage * move_percent / 100
+    Prefer REAL Toobit closed-position PnL.
 
-    Example:
-        margin=5$, leverage=12x, move=0.5733%
-        pnl = 5 * 12 * 0.5733 / 100 = 0.34398$
-
-    Fees/funding/slippage are not included here because tracker only has signal prices.
-    Toobit balance display remains the source of truth for exact exchange balance.
+    The old percent formula is kept only as a fallback and is clearly marked as
+    approximate, because fees/funding/slippage/execution price can make the
+    exchange PnL different from signal-price PnL.
     """
     if not (load_real_trade_state and save_real_trade_state and record_realized_pnl):
         return None
@@ -513,7 +620,15 @@ def record_real_trade_result_for_signal(signal: Dict[str, Any], hit_type: str, e
                 "leverage": leverage,
             }
 
-        pnl_usd = round(float(margin) * float(leverage) * float(pct) / 100.0, 6)
+        exchange_pnl = _fetch_real_closed_pnl_from_exchange(signal, pos, hit_type, exit_price)
+        pnl_source = "TOOBIT_REAL" if exchange_pnl.get("ok") else "APPROX_FALLBACK"
+        pnl_error = exchange_pnl.get("error")
+
+        if exchange_pnl.get("ok"):
+            pnl_usd = round(float(exchange_pnl.get("pnl_usd") or 0), 6)
+        else:
+            # Fallback only. Do not present this as exact real PnL.
+            pnl_usd = round(float(margin) * float(leverage) * float(pct) / 100.0, 6)
 
         # Remove from REAL open positions before accounting so status/slots are not stale.
         if pos_key:
@@ -527,11 +642,19 @@ def record_real_trade_result_for_signal(signal: Dict[str, Any], hit_type: str, e
             direction=direction,
             result=hit_type,
             exit_price=exit_price,
+            entry=(pos or {}).get("entry") or signal.get("entry"),
+            stop_loss=(pos or {}).get("sl") or (pos or {}).get("stop_loss") or signal.get("stop_loss"),
+            tp1=(pos or {}).get("tp1") or signal.get("tp1"),
+            tp2=(pos or {}).get("tp2") or signal.get("tp2"),
+            snapshot=_learning_snapshot(signal, exit_price=exit_price, move_percent=pct),
         )
 
         return {
             "ok": True,
             "pnl_usd": pnl_usd,
+            "pnl_source": pnl_source,
+            "pnl_error": pnl_error,
+            "exchange_pnl": exchange_pnl if exchange_pnl.get("ok") else None,
             "margin": margin,
             "leverage": leverage,
             "notional": round(margin * leverage, 6),
@@ -582,14 +705,21 @@ def check_active_signals() -> List[Dict[str, Any]]:
                     acc = real_trade_accounting.get("accounting") or {}
                     pnl = real_trade_accounting.get("pnl_usd", 0)
                     sign = "+" if float(pnl or 0) > 0 else ""
+                    source = real_trade_accounting.get("pnl_source")
+                    if source == "TOOBIT_REAL":
+                        pnl_label = "PnL واقعی توبیت"
+                    else:
+                        pnl_label = "PnL تقریبی"
                     text += (
-                        f"\n\nPnL واقعی تقریبی: {sign}{pnl}$"
+                        f"\n\n{pnl_label}: {sign}{pnl}$"
                         f"\nمارجین: {real_trade_accounting.get('margin')}$"
                         f"\nلوریج: {real_trade_accounting.get('leverage')}x"
                         f"\nحجم تقریبی: {real_trade_accounting.get('notional')}$"
                         f"\nبالانس داخلی: {acc.get('balance')}$"
                         f"\nسرمایه محافظت‌شده: {acc.get('protected_balance')}$"
                     )
+                    if source != "TOOBIT_REAL" and real_trade_accounting.get("pnl_error"):
+                        text += f"\n⚠️ سود واقعی از توبیت خوانده نشد؛ عدد بالا تخمینی است."
                     if acc.get("daily_locked"):
                         text += "\n🚨 قفل ضرر روزانه فعال شد."
                 elif isinstance(real_trade_accounting, dict) and real_trade_accounting.get("error"):
