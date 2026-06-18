@@ -22,6 +22,8 @@ Compatibility:
     format_learning_summary
     format_coin_behavior
     format_smart_stats
+    get_tp_sl_v2_profile
+    register_tp_sl_v2_result
 """
 
 import math
@@ -37,6 +39,7 @@ MAX_PATTERNS_PER_BUCKET = 80
 REAL_WEIGHT = 1.0
 GHOST_WEIGHT = 0.45
 MIN_TP_MEMORY_WINS = 3
+TP_SL_V2_VERSION = 1
 
 
 def _now() -> int:
@@ -141,6 +144,25 @@ def _empty_bucket(symbol: str, direction: str) -> Dict[str, Any]:
         "tp_distance_weight": 0.0,
         "atr_tp_ratio_sum": 0.0,
         "atr_tp_ratio_weight": 0.0,
+
+        # TP/SL v2 memory: all values are per coin + direction.
+        # These fields feed smart TP, SL survival, fake-breakout awareness,
+        # and coin personality without changing old public function names.
+        "tp1_reach_atr_sum": 0.0,
+        "tp1_reach_atr_weight": 0.0,
+        "tp2_reach_atr_sum": 0.0,
+        "tp2_reach_atr_weight": 0.0,
+        "sl_distance_atr_sum": 0.0,
+        "sl_distance_atr_weight": 0.0,
+        "max_favorable_atr_sum": 0.0,
+        "max_favorable_atr_weight": 0.0,
+        "max_adverse_atr_sum": 0.0,
+        "max_adverse_atr_weight": 0.0,
+        "fake_breakouts": 0,
+        "clean_breakouts": 0,
+        "bounces": 0,
+        "sr_memory": {},
+        "tp_sl_v2": {"version": TP_SL_V2_VERSION, "samples": 0},
         "events": [],
         "tp_patterns": [],
         "sl_patterns": [],
@@ -266,6 +288,53 @@ def _closed_weight(b: Dict[str, Any]) -> float:
     return _safe_float(b.get("weighted_tp")) + _safe_float(b.get("weighted_sl"))
 
 
+def _weighted_avg(b: Dict[str, Any], sum_key: str, weight_key: str, default: float = 0.0) -> float:
+    w = _safe_float(b.get(weight_key))
+    if w <= 0:
+        return default
+    return _safe_float(b.get(sum_key)) / max(w, 1e-9)
+
+
+def _add_weighted(b: Dict[str, Any], sum_key: str, weight_key: str, value: Any, weight: float) -> None:
+    val = _safe_float(value, None)
+    if val is None:
+        return
+    b[sum_key] = _safe_float(b.get(sum_key)) + val * weight
+    b[weight_key] = _safe_float(b.get(weight_key)) + weight
+
+
+def _tp_sl_v2_snapshot_metrics(sig: Dict[str, Any], snap: Dict[str, Any], result: str, exit_price: Any, weight: float, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    entry = _safe_float(sig.get("entry") or sig.get("price") or snap.get("entry") or snap.get("price"), 0.0)
+    atr = _safe_float(snap.get("atr") or kwargs.get("atr"), 0.0)
+    if atr <= 0 and entry > 0:
+        atr = entry * 0.0015
+    atr = max(atr, 1e-12)
+
+    tp1 = _safe_float(kwargs.get("tp1") or sig.get("tp1") or snap.get("tp1"), 0.0)
+    tp2 = _safe_float(kwargs.get("tp2") or sig.get("tp2") or snap.get("tp2"), 0.0)
+    sl = _safe_float(kwargs.get("stop_loss") or kwargs.get("sl") or sig.get("stop_loss") or snap.get("stop_loss"), 0.0)
+
+    out = {"entry": entry, "atr": atr}
+    if entry > 0 and tp1 > 0:
+        out["tp1_atr"] = abs(tp1 - entry) / atr
+    if entry > 0 and tp2 > 0:
+        out["tp2_atr"] = abs(tp2 - entry) / atr
+    if entry > 0 and sl > 0:
+        out["sl_atr"] = abs(entry - sl) / atr
+
+    if kwargs.get("max_favorable") is not None:
+        out["max_favorable_atr"] = abs(_safe_float(kwargs.get("max_favorable"))) / atr
+    elif exit_price and entry and result in {"TP1", "TP2"}:
+        out["max_favorable_atr"] = abs(_safe_float(exit_price) - entry) / atr
+
+    if kwargs.get("max_adverse") is not None:
+        out["max_adverse_atr"] = abs(_safe_float(kwargs.get("max_adverse"))) / atr
+    elif exit_price and entry and result == "SL":
+        out["max_adverse_atr"] = abs(_safe_float(exit_price) - entry) / atr
+
+    return out
+
+
 def _recompute_bucket_behavior(b: Dict[str, Any]) -> None:
     total_w = _closed_weight(b)
     wr = _weighted_win_rate(b)
@@ -282,11 +351,20 @@ def _recompute_bucket_behavior(b: Dict[str, Any]) -> None:
     else:
         behavior = "BAD"
 
-    if behavior == "GOOD" and avg_move > 0:
-        personality = "TREND_FRIENDLY"
+    avg_fav = _weighted_avg(b, "max_favorable_atr_sum", "max_favorable_atr_weight", 0.0)
+    avg_adv = _weighted_avg(b, "max_adverse_atr_sum", "max_adverse_atr_weight", 0.0)
+    fake = int(b.get("fake_breakouts", 0) or 0)
+    clean = int(b.get("clean_breakouts", 0) or 0)
+
+    if behavior == "GOOD" and avg_fav >= 1.4:
+        personality = "CLEAN_RUNNER"
+    elif avg_adv >= 1.45 and total_w >= 4:
+        personality = "WICKY"
+    elif fake >= max(3, clean + 2):
+        personality = "FAKE_BREAK_RISK"
     elif behavior in {"WEAK", "BAD"}:
         personality = "RISKY_DIRECTION"
-    elif total_w >= 5 and abs(avg_move) < 0.05:
+    elif total_w >= 5 and (abs(avg_move) < 0.05 or avg_fav < 0.75):
         personality = "LOW_REACH"
     else:
         personality = "NORMAL"
@@ -465,6 +543,45 @@ def update_signal_result(signal_id: str, result: str, exit_price: float = None, 
     except Exception:
         pass
 
+    # TP/SL v2 coordinated learning.
+    # This records how far this coin+direction usually moves before TP/SL,
+    # how much adverse wick it needs to survive, and SR/fake-breakout behavior.
+    try:
+        m = _tp_sl_v2_snapshot_metrics(sig, snap, r, exit_price, weight, kwargs)
+        if m.get("tp1_atr") is not None:
+            _add_weighted(b, "tp1_reach_atr_sum", "tp1_reach_atr_weight", m.get("tp1_atr"), weight)
+        if m.get("tp2_atr") is not None:
+            _add_weighted(b, "tp2_reach_atr_sum", "tp2_reach_atr_weight", m.get("tp2_atr"), weight)
+        if m.get("sl_atr") is not None:
+            _add_weighted(b, "sl_distance_atr_sum", "sl_distance_atr_weight", m.get("sl_atr"), weight)
+        if m.get("max_favorable_atr") is not None:
+            _add_weighted(b, "max_favorable_atr_sum", "max_favorable_atr_weight", m.get("max_favorable_atr"), weight)
+        if m.get("max_adverse_atr") is not None:
+            _add_weighted(b, "max_adverse_atr_sum", "max_adverse_atr_weight", m.get("max_adverse_atr"), weight)
+
+        sr_event = str(kwargs.get("sr_event") or snap.get("sr_event") or "").upper()
+        if kwargs.get("fake_breakout") is True or sr_event in {"FAKE_BREAK", "FAKE_BREAKOUT"}:
+            b["fake_breakouts"] = int(b.get("fake_breakouts", 0)) + 1
+        elif sr_event in {"CLEAN_BREAK", "BREAKOUT"}:
+            b["clean_breakouts"] = int(b.get("clean_breakouts", 0)) + 1
+        elif sr_event in {"BOUNCE", "SR_BOUNCE"}:
+            b["bounces"] = int(b.get("bounces", 0)) + 1
+
+        b["tp_sl_v2"] = {
+            "version": TP_SL_V2_VERSION,
+            "samples": int(b.get("tp1", 0)) + int(b.get("tp2", 0)) + int(b.get("sl", 0)),
+            "avg_tp1_atr": round(_weighted_avg(b, "tp1_reach_atr_sum", "tp1_reach_atr_weight", 0.0), 4),
+            "avg_tp2_atr": round(_weighted_avg(b, "tp2_reach_atr_sum", "tp2_reach_atr_weight", 0.0), 4),
+            "avg_sl_atr": round(_weighted_avg(b, "sl_distance_atr_sum", "sl_distance_atr_weight", 0.0), 4),
+            "avg_max_favorable_atr": round(_weighted_avg(b, "max_favorable_atr_sum", "max_favorable_atr_weight", 0.0), 4),
+            "avg_max_adverse_atr": round(_weighted_avg(b, "max_adverse_atr_sum", "max_adverse_atr_weight", 0.0), 4),
+            "fake_breakouts": int(b.get("fake_breakouts", 0)),
+            "clean_breakouts": int(b.get("clean_breakouts", 0)),
+            "bounces": int(b.get("bounces", 0)),
+        }
+    except Exception:
+        pass
+
     for name in ["rsi", "rsi_5m", "macd_hist", "adx", "power2_buy", "power2_sell", "power3_buy", "power3_sell", "buy_power", "sell_power"]:
         _update_avg_stat(b["indicator_stats"], name, snap.get(name), weight, r)
     for name in ["market_regime", "market_mode", "btc_bias", "vwap_status"]:
@@ -500,8 +617,16 @@ def get_smart_tp_suggestion(symbol: str, direction: str, snapshot: Optional[Dict
     price = _safe_float((snapshot or {}).get("price") or (snapshot or {}).get("entry"), 0.0)
     atr = _safe_float((snapshot or {}).get("atr"), 0.0)
     avg_dist = _avg_tp_distance(b)
+    avg_tp1_atr = _weighted_avg(b, "tp1_reach_atr_sum", "tp1_reach_atr_weight", 0.0)
+    avg_tp2_atr = _weighted_avg(b, "tp2_reach_atr_sum", "tp2_reach_atr_weight", 0.0)
+    avg_fav_atr = _weighted_avg(b, "max_favorable_atr_sum", "max_favorable_atr_weight", 0.0)
     if price <= 0:
         return {}
+
+    if atr > 0 and avg_tp1_atr > 0:
+        avg_dist = atr * avg_tp1_atr
+    elif atr > 0 and avg_fav_atr > 0:
+        avg_dist = atr * max(0.55, min(1.8, avg_fav_atr * 0.72))
 
     # Prefer learned average distance, but keep it bounded by ATR/price so TP
     # does not become absurdly tiny or too far for fast trades.
@@ -515,7 +640,10 @@ def get_smart_tp_suggestion(symbol: str, direction: str, snapshot: Optional[Dict
         return {}
 
     dist1 = max(min_dist, min(max_dist, avg_dist * 0.90))
-    dist2 = max(dist1 * 1.35, min(max_dist * 1.6, avg_dist * 1.55))
+    if atr > 0 and avg_tp2_atr > 0:
+        dist2 = max(dist1 * 1.35, min(max_dist * 1.8, atr * avg_tp2_atr))
+    else:
+        dist2 = max(dist1 * 1.35, min(max_dist * 1.6, avg_dist * 1.55))
     confidence = "high" if _safe_float(b.get("confidence")) >= 60 else "medium"
 
     if str(direction).upper() == "LONG":
@@ -592,6 +720,98 @@ def should_require_extra_strength(symbol: str, direction: str, snapshot: Optiona
     required = extra_score > 0 or extra_conf > 0
     reason = "AI Learning: " + "، ".join(reasons[:3]) if reasons else None
     return {"required": required, "extra_score": extra_score, "extra_confirmations": extra_conf, "reason": reason}
+
+
+def get_tp_sl_v2_profile(symbol: str, direction: str, snapshot: Optional[Dict] = None) -> Dict[str, Any]:
+    """Return compact TP/SL v2 profile for analysis/scanner.
+
+    Safe read-only helper. If there is not enough data, it returns neutral
+    values so old behavior remains unchanged.
+    """
+    s = _state()
+    b = s.get("by_coin_direction", {}).get(_key(symbol, direction), {})
+    if not isinstance(b, dict) or not b:
+        return {
+            "available": False,
+            "confidence": 0,
+            "personality": "UNKNOWN",
+            "tp1_atr": None,
+            "tp2_atr": None,
+            "sl_atr": None,
+            "fake_break_rate": 0.0,
+            "source": "coin_learning_v2",
+        }
+
+    samples = int(b.get("tp1", 0)) + int(b.get("tp2", 0)) + int(b.get("sl", 0))
+    fake = int(b.get("fake_breakouts", 0) or 0)
+    clean = int(b.get("clean_breakouts", 0) or 0)
+    bounces = int(b.get("bounces", 0) or 0)
+    sr_total = max(1, fake + clean + bounces)
+
+    return {
+        "available": samples >= 3,
+        "confidence": int(b.get("confidence", 0) or 0),
+        "samples": samples,
+        "behavior": b.get("behavior", "UNKNOWN"),
+        "personality": b.get("personality", "UNKNOWN"),
+        "tp1_atr": _weighted_avg(b, "tp1_reach_atr_sum", "tp1_reach_atr_weight", None),
+        "tp2_atr": _weighted_avg(b, "tp2_reach_atr_sum", "tp2_reach_atr_weight", None),
+        "sl_atr": _weighted_avg(b, "sl_distance_atr_sum", "sl_distance_atr_weight", None),
+        "max_favorable_atr": _weighted_avg(b, "max_favorable_atr_sum", "max_favorable_atr_weight", None),
+        "max_adverse_atr": _weighted_avg(b, "max_adverse_atr_sum", "max_adverse_atr_weight", None),
+        "fake_break_rate": round(fake / sr_total, 4),
+        "clean_breakouts": clean,
+        "bounces": bounces,
+        "source": "coin_learning_v2",
+    }
+
+
+def register_tp_sl_v2_result(symbol: str, direction: str, result: str, entry: float = None, stop_loss: float = None, tp1: float = None, tp2: float = None, snapshot: Optional[Dict[str, Any]] = None, source: str = "REAL", max_favorable: float = None, max_adverse: float = None, sr_event: str = None, fake_breakout: bool = None, signal_id: str = None, **kwargs) -> bool:
+    """Compatibility hook for real_trade_manager/ghost_signals.
+
+    It routes TP/SL v2 learning through update_signal_result so all existing
+    learning summaries, Smart TP memory, and behavior logic stay consistent.
+    """
+    snap = dict(snapshot or {})
+    snap.setdefault("symbol", str(symbol).upper())
+    snap.setdefault("direction", str(direction).upper())
+    if entry is not None:
+        snap.setdefault("entry", entry)
+        snap.setdefault("price", entry)
+    if stop_loss is not None:
+        snap.setdefault("stop_loss", stop_loss)
+    if tp1 is not None:
+        snap.setdefault("tp1", tp1)
+    if tp2 is not None:
+        snap.setdefault("tp2", tp2)
+    if sr_event is not None:
+        snap.setdefault("sr_event", sr_event)
+
+    sid = signal_id or snap.get("signal_id") or f"{str(symbol).upper()}_{str(direction).upper()}_{_now()}"
+    exit_price = kwargs.get("exit_price")
+    if exit_price is None:
+        if _norm_result(result) == "SL":
+            exit_price = stop_loss
+        elif _norm_result(result) == "TP2":
+            exit_price = tp2
+        else:
+            exit_price = tp1
+
+    return update_signal_result(
+        sid,
+        result,
+        exit_price=exit_price,
+        move_percent=kwargs.get("move_percent"),
+        snapshot=snap,
+        source=source,
+        stop_loss=stop_loss,
+        tp1=tp1,
+        tp2=tp2,
+        max_favorable=max_favorable,
+        max_adverse=max_adverse,
+        sr_event=sr_event,
+        fake_breakout=fake_breakout,
+    )
 
 
 def format_learning_summary() -> str:
