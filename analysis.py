@@ -11,7 +11,7 @@ import ta
 try:
     from config import MIN_DIRECT_SCORE, MIN_ADX_FOR_TREND, MIN_MANUAL_CONFIRMATIONS, AUTO_DIRECT_SCORE_MIN
 except Exception:
-    MIN_DIRECT_SCORE = 85; MIN_ADX_FOR_TREND = 20; MIN_MANUAL_CONFIRMATIONS = 3; AUTO_DIRECT_SCORE_MIN = 85
+    MIN_DIRECT_SCORE = 82; MIN_ADX_FOR_TREND = 20; MIN_MANUAL_CONFIRMATIONS = 3; AUTO_DIRECT_SCORE_MIN = 82
 try:
     from coin_learning import build_signal_snapshot, get_smart_tp_suggestion, should_require_extra_strength
 except Exception:
@@ -51,6 +51,160 @@ SL_BUFFER_ATR = 0.25
 TF_LEVEL_WEIGHTS = {'5M': 1.0, '15M': 1.6, '30M': 2.2}
 LEVEL_LOOKBACK = 160
 SWING_WINDOW = 3
+
+# ---------------------------------------------------------------------------
+# Fast-entry quality controls
+# ---------------------------------------------------------------------------
+# Keep the main threshold intact, but let a truly fresh 5M trigger reach it
+# earlier when higher timeframes already agree. Late entries and bad R/R are
+# blocked before becoming ACTIVE so they can be learned as rejected/ghost
+# candidates by scanner/bot layers instead of becoming real trades.
+EARLY_5M_BONUS_MAX = 12
+MULTI_TF_ALIGNMENT_BONUS = 6
+LATE_ENTRY_ATR_LIMIT = float(os.getenv("LATE_ENTRY_ATR_LIMIT", "2.45") or "2.45")
+LATE_ENTRY_STRONG_ALIGNMENT_ATR_LIMIT = float(os.getenv("LATE_ENTRY_STRONG_ALIGNMENT_ATR_LIMIT", "2.85") or "2.85")
+MIN_REAL_RISK_REWARD = float(os.getenv("MIN_REAL_RISK_REWARD", "0.80") or "0.80")
+
+
+def _is_recent_macd_cross(df: pd.DataFrame, direction: str, lookback: int = 3) -> bool:
+    """Return True when 5M MACD crossed recently in the trade direction."""
+    try:
+        recent = df.tail(max(lookback + 1, 3))
+        if len(recent) < 3:
+            return False
+        for i in range(1, len(recent)):
+            prev = recent.iloc[i - 1]
+            cur = recent.iloc[i]
+            if direction == "LONG" and prev["macd"] <= prev["macd_signal"] and cur["macd"] > cur["macd_signal"]:
+                return True
+            if direction == "SHORT" and prev["macd"] >= prev["macd_signal"] and cur["macd"] < cur["macd_signal"]:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _early_5m_trigger_score(direction: str, trends: Dict[str, str], df_5m: pd.DataFrame, df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> Dict[str, Any]:
+    """Score fresh 5M entry timing without lowering the global threshold."""
+    try:
+        l5 = df_5m.iloc[-1]
+        p5 = df_5m.iloc[-2]
+        l15 = df_15m.iloc[-1]
+        l1 = df_1h.iloc[-1]
+    except Exception:
+        return {"score": 0, "active": False, "reason": "NO_5M_DATA"}
+
+    direction = str(direction or "").upper().strip()
+    score = 0
+    reasons = []
+
+    if direction == "LONG":
+        aligned_15_1 = trends.get("15M") == "bullish" and trends.get("1H") == "bullish"
+        aligned_4 = trends.get("4H") == "bullish"
+        aligned_5 = trends.get("5M") == "bullish"
+        macd_fresh = _is_recent_macd_cross(df_5m, "LONG") or (l5["macd"] > l5["macd_signal"] and l5["macd_hist"] > p5["macd_hist"])
+        rsi_accel = safe_float(l5["rsi"]) >= 50 and safe_float(l5["rsi"]) > safe_float(p5["rsi"])
+        ema_reclaim = l5["close"] > l5["ema20"] and p5["close"] <= p5["ema20"]
+        vwap_reclaim = l5["close"] > l5["vwap"] and p5["close"] <= p5["vwap"]
+        buy3, sell3 = buy_sell_power(df_5m, 3)
+        power_ok = buy3 >= 58
+        higher_momentum = l15["macd_hist"] >= df_15m.iloc[-2]["macd_hist"] or l1["close"] >= l1["ema20"]
+
+        if aligned_15_1:
+            score += 3; reasons.append("1H/15M هم‌جهت")
+        if aligned_4:
+            score += 2; reasons.append("4H هم‌جهت")
+        if aligned_5:
+            score += 2; reasons.append("5M هم‌جهت")
+        if macd_fresh:
+            score += 3; reasons.append("5M MACD تازه/شتاب‌دار")
+        if rsi_accel:
+            score += 2; reasons.append("5M RSI شتاب‌دار")
+        if ema_reclaim or vwap_reclaim:
+            score += 2; reasons.append("5M برگشت EMA/VWAP")
+        if power_ok:
+            score += 2; reasons.append("قدرت خرید 5M")
+        if higher_momentum:
+            score += 1
+
+    elif direction == "SHORT":
+        aligned_15_1 = trends.get("15M") == "bearish" and trends.get("1H") == "bearish"
+        aligned_4 = trends.get("4H") == "bearish"
+        aligned_5 = trends.get("5M") == "bearish"
+        macd_fresh = _is_recent_macd_cross(df_5m, "SHORT") or (l5["macd"] < l5["macd_signal"] and l5["macd_hist"] < p5["macd_hist"])
+        rsi_accel = safe_float(l5["rsi"]) <= 50 and safe_float(l5["rsi"]) < safe_float(p5["rsi"])
+        ema_reclaim = l5["close"] < l5["ema20"] and p5["close"] >= p5["ema20"]
+        vwap_reclaim = l5["close"] < l5["vwap"] and p5["close"] >= p5["vwap"]
+        buy3, sell3 = buy_sell_power(df_5m, 3)
+        power_ok = sell3 >= 58
+        higher_momentum = l15["macd_hist"] <= df_15m.iloc[-2]["macd_hist"] or l1["close"] <= l1["ema20"]
+
+        if aligned_15_1:
+            score += 3; reasons.append("1H/15M هم‌جهت")
+        if aligned_4:
+            score += 2; reasons.append("4H هم‌جهت")
+        if aligned_5:
+            score += 2; reasons.append("5M هم‌جهت")
+        if macd_fresh:
+            score += 3; reasons.append("5M MACD تازه/شتاب‌دار")
+        if rsi_accel:
+            score += 2; reasons.append("5M RSI شتاب‌دار")
+        if ema_reclaim or vwap_reclaim:
+            score += 2; reasons.append("5M برگشت EMA/VWAP")
+        if power_ok:
+            score += 2; reasons.append("قدرت فروش 5M")
+        if higher_momentum:
+            score += 1
+    else:
+        return {"score": 0, "active": False, "reason": "NO_DIRECTION"}
+
+    final = min(EARLY_5M_BONUS_MAX, max(0, int(score)))
+    return {
+        "score": final,
+        "active": final >= 7,
+        "reason": " | ".join(reasons[:6]) if reasons else "NO_EARLY_TRIGGER",
+    }
+
+
+def _multi_tf_alignment_bonus(direction: str, trends: Dict[str, str]) -> Dict[str, Any]:
+    """Small bonus only when the major stack agrees with the selected direction."""
+    direction = str(direction or "").upper().strip()
+    wanted = "bullish" if direction == "LONG" else "bearish" if direction == "SHORT" else ""
+    if not wanted:
+        return {"score": 0, "active": False}
+    aligned = [tf for tf in ("4H", "1H", "15M", "5M") if trends.get(tf) == wanted]
+    if len(aligned) >= 4:
+        return {"score": MULTI_TF_ALIGNMENT_BONUS, "active": True, "aligned": aligned}
+    if len(aligned) == 3 and "1H" in aligned and "15M" in aligned and "5M" in aligned:
+        return {"score": 4, "active": True, "aligned": aligned}
+    return {"score": 0, "active": False, "aligned": aligned}
+
+
+def _late_entry_pack(direction: str, df_15m: pd.DataFrame, df_5m: pd.DataFrame, trends: Dict[str, str], early_pack: Dict[str, Any]) -> Dict[str, Any]:
+    """Detect chasing after the move has already stretched too far."""
+    try:
+        dist15 = float(distance_from_ema20_atr(df_15m))
+    except Exception:
+        dist15 = 0.0
+    try:
+        dist5 = float(distance_from_ema20_atr(df_5m))
+    except Exception:
+        dist5 = 0.0
+
+    direction = str(direction or "").upper().strip()
+    wanted = "bullish" if direction == "LONG" else "bearish" if direction == "SHORT" else ""
+    strong_alignment = bool(wanted and all(trends.get(tf) == wanted for tf in ("1H", "15M", "5M")))
+    limit = LATE_ENTRY_STRONG_ALIGNMENT_ATR_LIMIT if strong_alignment and early_pack.get("active") else LATE_ENTRY_ATR_LIMIT
+
+    late = max(dist15, dist5) > limit
+    return {
+        "late": bool(late),
+        "distance_15m_ema20_atr": round(dist15, 3),
+        "distance_5m_ema20_atr": round(dist5, 3),
+        "limit": round(limit, 3),
+        "reason": f"Late Entry: فاصله از EMA20 زیاد است ({round(max(dist15, dist5), 2)} ATR > {round(limit, 2)})" if late else "",
+    }
+
 
 def to_okx_symbol(symbol: str) -> str:
     coin = str(symbol).upper().replace('USDT','')
@@ -159,7 +313,7 @@ def ai_extra_strength_required(symbol, direction, snapshot):
 
 def build_local_snapshot(symbol, direction, df_4h, df_1h, df_30m, df_15m, df_5m, score_pack, market_context):
     l15=df_15m.iloc[-1]; l5=df_5m.iloc[-1]; buy2,sell2=buy_sell_power(df_5m,2); buy3,sell3=buy_sell_power(df_5m,3); buy20,sell20=buy_sell_power(df_5m,20)
-    snap={'symbol':symbol,'direction':direction,'price':safe_float(l15['close']),'entry':safe_float(l15['close']),'rsi':safe_float(l15['rsi']),'rsi_5m':safe_float(l5['rsi']),'macd':safe_float(l15['macd']),'macd_signal':safe_float(l15['macd_signal']),'macd_hist':safe_float(l15['macd_hist']),'adx':safe_float(l15['adx']),'atr':safe_float(l15['atr']),'ema20':safe_float(l15['ema20']),'ema50':safe_float(l15['ema50']),'ema200':safe_float(l15['ema200']),'vwap':safe_float(l15['vwap']),'vwap_status':vwap_status(df_15m),'power2_buy':buy2,'power2_sell':sell2,'power3_buy':buy3,'power3_sell':sell3,'buy_power':buy20,'sell_power':sell20,'trends':score_pack.get('trends',{}),'long_score':score_pack.get('long_score',0),'short_score':score_pack.get('short_score',0),'market_regime':market_context.get('market_regime','neutral'),'btc_bias':market_context.get('btc_bias','neutral')}
+    snap={'symbol':symbol,'direction':direction,'price':safe_float(l15['close']),'entry':safe_float(l15['close']),'rsi':safe_float(l15['rsi']),'rsi_5m':safe_float(l5['rsi']),'macd':safe_float(l15['macd']),'macd_signal':safe_float(l15['macd_signal']),'macd_hist':safe_float(l15['macd_hist']),'adx':safe_float(l15['adx']),'atr':safe_float(l15['atr']),'ema20':safe_float(l15['ema20']),'ema50':safe_float(l15['ema50']),'ema200':safe_float(l15['ema200']),'vwap':safe_float(l15['vwap']),'vwap_status':vwap_status(df_15m),'power2_buy':buy2,'power2_sell':sell2,'power3_buy':buy3,'power3_sell':sell3,'buy_power':buy20,'sell_power':sell20,'early_5m_trigger':score_pack.get('early_5m_trigger',{}),'multi_tf_alignment':score_pack.get('multi_tf_alignment',{}),'late_entry':score_pack.get('late_entry',{}),'trends':score_pack.get('trends',{}),'long_score':score_pack.get('long_score',0),'short_score':score_pack.get('short_score',0),'market_regime':market_context.get('market_regime','neutral'),'btc_bias':market_context.get('btc_bias','neutral')}
     if build_signal_snapshot:
         try:
             extra=build_signal_snapshot(symbol, direction, snap, market_context)
@@ -219,6 +373,42 @@ def simple_classic_score(symbol, df_4h, df_1h, df_30m, df_15m, df_5m, market_con
     buy2,sell2=buy_sell_power(df_5m,2); buy3,sell3=buy_sell_power(df_5m,3); buy20,sell20=buy_sell_power(df_5m,20)
     if buy3>=62: long_score+=3
     if sell3>=62: short_score+=3
+
+    # Fast-entry upgrades:
+    # - Do not lower threshold.
+    # - Reward only fresh 5M triggers when higher timeframes agree.
+    # - Penalize clearly late/chasing entries.
+    long_alignment = _multi_tf_alignment_bonus("LONG", trends)
+    short_alignment = _multi_tf_alignment_bonus("SHORT", trends)
+    long_early = _early_5m_trigger_score("LONG", trends, df_5m, df_15m, df_1h)
+    short_early = _early_5m_trigger_score("SHORT", trends, df_5m, df_15m, df_1h)
+    long_late = _late_entry_pack("LONG", df_15m, df_5m, trends, long_early)
+    short_late = _late_entry_pack("SHORT", df_15m, df_5m, trends, short_early)
+
+    if long_alignment.get("score"):
+        long_score += safe_float(long_alignment.get("score"))
+        long_reasons.append("Multi-TF هم‌جهت لانگ")
+    if short_alignment.get("score"):
+        short_score += safe_float(short_alignment.get("score"))
+        short_reasons.append("Multi-TF هم‌جهت شورت")
+
+    if long_early.get("score"):
+        long_score += safe_float(long_early.get("score"))
+        if long_early.get("active"):
+            cl += 1
+        long_reasons.append(f"5M Early Trigger لانگ +{long_early.get('score')}")
+    if short_early.get("score"):
+        short_score += safe_float(short_early.get("score"))
+        if short_early.get("active"):
+            cs += 1
+        short_reasons.append(f"5M Early Trigger شورت +{short_early.get('score')}")
+
+    if long_late.get("late"):
+        long_score -= 10
+        long_reasons.append(long_late.get("reason") or "رد لانگ: ورود دیرهنگام")
+    if short_late.get("late"):
+        short_score -= 10
+        short_reasons.append(short_late.get("reason") or "رد شورت: ورود دیرهنگام")
     # Balanced auto-signal rules: normal classic gates + soft escape for very strong technical signals.
     # The bot should stay technical and medium-soft; AI/risk modules can tighten later.
     long_direction_ok=(trends['15M']=='bullish') or (trends['1H']=='bullish' and trends['5M']=='bullish') or (trends['30M']=='bullish' and safe_float(l15['rsi'])>=50)
@@ -241,7 +431,7 @@ def simple_classic_score(symbol, df_4h, df_1h, df_30m, df_15m, df_5m, market_con
     if not long_vwap_ok: long_reasons.append('رد لانگ: خلاف VWAP')
     if not short_direction_ok: short_reasons.append('رد شورت: جهت کافی نیست')
     if not short_macd_ok: short_reasons.append('رد شورت: MACD کافی نیست')
-    return {'long_score':cap_score(long_score),'short_score':cap_score(short_score),'long_reasons':long_reasons,'short_reasons':short_reasons,'confirmations_long':cl,'confirmations_short':cs,'trends':trends,'distance_ema20_atr':round(distance_from_ema20_atr(df_15m),2),'volume_status':volume_quality(df_15m)[0],'volume_ratio':round(volume_quality(df_15m)[1],2),'power2_buy':buy2,'power2_sell':sell2,'power3_buy':buy3,'power3_sell':sell3,'buy_power':buy20,'sell_power':sell20,'long_valid':adx>=ADX_HARD_MIN and long_direction_ok and long_macd_ok and long_1h_ok and long_vwap_ok,'short_valid':adx>=ADX_HARD_MIN and short_direction_ok and short_macd_ok,'adx_15':adx,'market_regime':mb}
+    return {'long_score':cap_score(long_score),'short_score':cap_score(short_score),'long_reasons':long_reasons,'short_reasons':short_reasons,'confirmations_long':cl,'confirmations_short':cs,'trends':trends,'distance_ema20_atr':round(distance_from_ema20_atr(df_15m),2),'volume_status':volume_quality(df_15m)[0],'volume_ratio':round(volume_quality(df_15m)[1],2),'power2_buy':buy2,'power2_sell':sell2,'power3_buy':buy3,'power3_sell':sell3,'buy_power':buy20,'sell_power':sell20,'early_5m_trigger':{'LONG':long_early,'SHORT':short_early},'multi_tf_alignment':{'LONG':long_alignment,'SHORT':short_alignment},'late_entry':{'LONG':long_late,'SHORT':short_late},'long_valid':adx>=ADX_HARD_MIN and long_direction_ok and long_macd_ok and long_1h_ok and long_vwap_ok and not long_late.get('late'),'short_valid':adx>=ADX_HARD_MIN and short_direction_ok and short_macd_ok and not short_late.get('late'),'adx_15':adx,'market_regime':mb}
 
 def find_swing_levels(df, timeframe, lookback=LEVEL_LOOKBACK, window=SWING_WINDOW):
     recent=df.tail(lookback).copy(); levels=[]; w=TF_LEVEL_WEIGHTS.get(timeframe,1.0)
@@ -635,10 +825,9 @@ def analyze_symbol(symbol: str) -> Dict:
         sl_count=int(risk_state.get('sl_count',0) or 0)
         risk_score=safe_float(risk_state.get('risk_score',0),0)
 
-        # Base threshold comes from config/env, never hardcoded 82.
-        # Default target is slightly stricter than before, while still allowing
-        # the AI layer to add more strictness per coin+direction after losses.
-        base_min_score=max(int(MIN_DIRECT_SCORE), int(AUTO_DIRECT_SCORE_MIN), 85)
+        # Base threshold comes from config/env; default target stays 82 unless AI/risk raises it.
+        # AI can still add more strictness per coin+direction after losses.
+        base_min_score=max(int(MIN_DIRECT_SCORE), int(AUTO_DIRECT_SCORE_MIN))
         base_conf=max(3, int(MIN_MANUAL_CONFIRMATIONS))
         req_conf=base_conf
         ai_penalty=0
@@ -702,7 +891,13 @@ def analyze_symbol(symbol: str) -> Dict:
         common={'symbol':symbol,'score':cap_score(final_score),'long_score':long_score,'short_score':short_score,'price':safe_round(price),'atr':safe_round(atr),'market_regime':market_context.get('market_regime','neutral'),'btc_bias':market_context.get('btc_bias','neutral'),'confirmations':confirmations,'required_confirmations':effective_req_conf,'rsi':safe_round(df_15m.iloc[-1]['rsi'],2),'macd':safe_round(df_15m.iloc[-1]['macd'],6),'macd_signal':safe_round(df_15m.iloc[-1]['macd_signal'],6),'macd_hist':safe_round(df_15m.iloc[-1]['macd_hist'],6),'adx':safe_round(df_15m.iloc[-1]['adx'],2),'vwap_status':vwap_status(df_15m),'support':safe_round(support),'resistance':safe_round(resistance),'trends':sp.get('trends',{}),'distance_ema20_atr':sp.get('distance_ema20_atr'),'volume_status':sp.get('volume_status'),'volume_ratio':sp.get('volume_ratio'),'buy_power':sp.get('buy_power'),'sell_power':sp.get('sell_power'),'power2_buy':sp.get('power2_buy'),'power2_sell':sp.get('power2_sell'),'power3_buy':sp.get('power3_buy'),'power3_sell':sp.get('power3_sell'),'snapshot':snapshot,'coin_risk':risk_state,'rotation':rotation,'ai_decision':{'base_min_score':base_min_score,'min_score':min_score,'ai_penalty':ai_penalty,'ai_min_score_add':ai_min_score_add,'ai_block':ai_block,'strictness_level':strict,'sl_count':sl_count,'risk_score':risk_score,'rotation_score':rs},'reasons':reasons[:20],'signal_timeframe':'AI Classic Direct'}
         if not entry_confirmed:
             return {**common,'direction':'NO TRADE','status':'NO_TRADE','entry_confirmed':False,'entry_mode':'NO_ENTRY','entry':None,'stop_loss':None,'tp1':None,'tp2':None,'risk_reward':0,'risk_level':'UNKNOWN','freshness':'LOW','tp_meta':{},'validity':'سیگنال معتبر نیست','valid_gate':valid,'min_score':min_score}
-        sl,tp1,tp2,rr,tp_meta=build_trade_levels(direction,price,atr,df_5m,df_15m,df_30m,snapshot,symbol); risk_level='LOW' if final_score>=92 and confirmations>=6 else 'MEDIUM' if final_score>=86 and confirmations>=5 else 'HIGH'; freshness='HIGH' if confirmations>=6 else 'MEDIUM' if confirmations>=5 else 'LOW'
+        sl,tp1,tp2,rr,tp_meta=build_trade_levels(direction,price,atr,df_5m,df_15m,df_30m,snapshot,symbol)
+        if safe_float(rr, 0.0) < MIN_REAL_RISK_REWARD:
+            rr_reason = f"رد R/R: نسبت سود به ضرر {rr} کمتر از حداقل {MIN_REAL_RISK_REWARD}"
+            reasons.append(rr_reason)
+            common["reasons"] = reasons[:20]
+            return {**common,'direction':'NO TRADE','status':'NO_TRADE','entry_confirmed':False,'entry_mode':'RR_FILTER','entry':None,'stop_loss':sl,'tp1':tp1,'tp2':tp2,'risk_reward':rr,'risk_level':'UNKNOWN','freshness':'LOW','tp_meta':tp_meta,'validity':'سیگنال معتبر نیست','valid_gate':valid,'min_score':min_score}
+        risk_level='LOW' if final_score>=92 and confirmations>=6 else 'MEDIUM' if final_score>=86 and confirmations>=5 else 'HIGH'; freshness='HIGH' if confirmations>=6 else 'MEDIUM' if confirmations>=5 else 'LOW'
         if update_ai_summary:
             try: update_ai_summary(total_signals=1)
             except Exception: pass
