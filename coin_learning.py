@@ -168,6 +168,14 @@ def _empty_bucket(symbol: str, direction: str) -> Dict[str, Any]:
         "sl_patterns": [],
         "indicator_stats": {},
         "market_stats": {},
+        "entry_quality_stats": {},
+        "early_5m_tp": 0.0,
+        "early_5m_sl": 0.0,
+        "multi_tf_tp": 0.0,
+        "multi_tf_sl": 0.0,
+        "late_entry_tp": 0.0,
+        "late_entry_sl": 0.0,
+        "rr_filter_count": 0,
         "behavior": "UNKNOWN",
         "personality": "UNKNOWN",
         "confidence": 0,
@@ -190,6 +198,8 @@ def _ensure_bucket_fields(b: Dict[str, Any], symbol: str, direction: str) -> Non
         b["indicator_stats"] = {}
     if not isinstance(b.get("market_stats"), dict):
         b["market_stats"] = {}
+    if not isinstance(b.get("entry_quality_stats"), dict):
+        b["entry_quality_stats"] = {}
 
 
 def _bucket(s: Dict[str, Any], symbol: str, direction: str) -> Dict[str, Any]:
@@ -225,6 +235,9 @@ def _compact_snapshot(snapshot: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "power2_buy", "power2_sell", "power3_buy", "power3_sell", "buy_power", "sell_power",
         "market_regime", "market_mode", "btc_bias", "support", "resistance",
         "risk_level", "risk_reward", "confirmations", "freshness", "entry_mode",
+        "early_5m_trigger", "multi_tf_alignment", "late_entry",
+        "early_5m_active", "early_5m_score", "multi_tf_active", "late_entry_flag",
+        "rr_filter", "reject_reason", "valid_gate",
         "result_source", "move_percent", "exit_price",
     ]
     out = {k: snapshot.get(k) for k in keys if snapshot.get(k) is not None}
@@ -271,6 +284,61 @@ def _update_market_stat(stats: Dict[str, Any], name: str, value: Any, weight: fl
         return
     key = f"{name}:{str(value).upper()}"
     row = stats.setdefault(key, {"tp_w": 0.0, "sl_w": 0.0})
+    if result in {"TP1", "TP2"}:
+        row["tp_w"] = _safe_float(row.get("tp_w")) + weight
+    elif result == "SL":
+        row["sl_w"] = _safe_float(row.get("sl_w")) + weight
+
+
+
+def _extract_direction_pack(value: Any, direction: str) -> Dict[str, Any]:
+    """Return direction-specific metadata from nested analysis packs."""
+    if not isinstance(value, dict):
+        return {}
+    direction = str(direction or "").upper().strip()
+    if direction and isinstance(value.get(direction), dict):
+        return value.get(direction) or {}
+    return value
+
+
+def _boolish(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on", "active"}
+
+
+def _fast_entry_flags(snap: Dict[str, Any], direction: str) -> Dict[str, Any]:
+    """Normalize Early-5M / Multi-TF / Late-Entry metadata for learning."""
+    direction = str(direction or snap.get("direction") or "").upper().strip()
+    early = _extract_direction_pack(snap.get("early_5m_trigger"), direction)
+    align = _extract_direction_pack(snap.get("multi_tf_alignment"), direction)
+    late = _extract_direction_pack(snap.get("late_entry"), direction)
+
+    early_active = _boolish(early.get("active") if isinstance(early, dict) else snap.get("early_5m_active"))
+    early_score = _safe_float((early or {}).get("score") if isinstance(early, dict) else snap.get("early_5m_score"), 0.0)
+    multi_active = _boolish(align.get("active") if isinstance(align, dict) else snap.get("multi_tf_active"))
+    multi_score = _safe_float((align or {}).get("score") if isinstance(align, dict) else 0.0, 0.0)
+    late_active = _boolish(late.get("late") if isinstance(late, dict) else snap.get("late_entry_flag"))
+    rr_filter = str(snap.get("entry_mode") or "").upper() == "RR_FILTER" or _boolish(snap.get("rr_filter"))
+
+    return {
+        "early_5m_active": early_active,
+        "early_5m_score": early_score,
+        "multi_tf_active": multi_active,
+        "multi_tf_score": multi_score,
+        "late_entry": late_active,
+        "rr_filter": rr_filter,
+    }
+
+
+def _update_binary_quality_stat(stats: Dict[str, Any], name: str, active: bool, weight: float, result: str) -> None:
+    """Track TP/SL outcomes for boolean setup features like Early Trigger."""
+    row = stats.setdefault(name, {"tp_w": 0.0, "sl_w": 0.0, "total_w": 0.0})
+    if not active:
+        return
+    row["total_w"] = _safe_float(row.get("total_w")) + weight
     if result in {"TP1", "TP2"}:
         row["tp_w"] = _safe_float(row.get("tp_w")) + weight
     elif result == "SL":
@@ -356,8 +424,21 @@ def _recompute_bucket_behavior(b: Dict[str, Any]) -> None:
     fake = int(b.get("fake_breakouts", 0) or 0)
     clean = int(b.get("clean_breakouts", 0) or 0)
 
+    late_tp = _safe_float(b.get("late_entry_tp"))
+    late_sl = _safe_float(b.get("late_entry_sl"))
+    late_total = late_tp + late_sl
+    early_tp = _safe_float(b.get("early_5m_tp"))
+    early_sl = _safe_float(b.get("early_5m_sl"))
+    early_total = early_tp + early_sl
+    early_wr = early_tp / max(early_total, 1e-9) if early_total else 0.0
+    late_wr = late_tp / max(late_total, 1e-9) if late_total else 0.0
+
     if behavior == "GOOD" and avg_fav >= 1.4:
         personality = "CLEAN_RUNNER"
+    elif early_total >= 3 and early_wr >= 0.62:
+        personality = "EARLY_TRIGGER_FRIENDLY"
+    elif late_total >= 3 and late_wr <= 0.42:
+        personality = "LATE_ENTRY_RISK"
     elif avg_adv >= 1.45 and total_w >= 4:
         personality = "WICKY"
     elif fake >= max(3, clean + 2):
@@ -491,6 +572,7 @@ def update_signal_result(signal_id: str, result: str, exit_price: float = None, 
     })
 
     b = _bucket(s, sig.get("symbol"), sig.get("direction"))
+    fast_flags = _fast_entry_flags(snap, sig.get("direction"))
     event = {
         "ts": ts,
         "result": r,
@@ -498,6 +580,7 @@ def update_signal_result(signal_id: str, result: str, exit_price: float = None, 
         "exit_price": exit_price,
         "move_percent": move_percent,
         "snapshot": snap,
+        "entry_quality": fast_flags,
     }
     b.setdefault("events", []).append(event)
     b["events"] = b["events"][-MAX_EVENTS_PER_BUCKET:]
@@ -523,6 +606,32 @@ def update_signal_result(signal_id: str, result: str, exit_price: float = None, 
         b["weighted_sl"] = _safe_float(b.get("weighted_sl")) + weight
         b.setdefault("sl_patterns", []).append(event)
         b["sl_patterns"] = b["sl_patterns"][-MAX_PATTERNS_PER_BUCKET:]
+
+    # Learn whether fast-entry features actually lead to TP or SL.
+    try:
+        if fast_flags.get("early_5m_active"):
+            if r in {"TP1", "TP2"}:
+                b["early_5m_tp"] = _safe_float(b.get("early_5m_tp")) + weight
+            elif r == "SL":
+                b["early_5m_sl"] = _safe_float(b.get("early_5m_sl")) + weight
+        if fast_flags.get("multi_tf_active"):
+            if r in {"TP1", "TP2"}:
+                b["multi_tf_tp"] = _safe_float(b.get("multi_tf_tp")) + weight
+            elif r == "SL":
+                b["multi_tf_sl"] = _safe_float(b.get("multi_tf_sl")) + weight
+        if fast_flags.get("late_entry"):
+            if r in {"TP1", "TP2"}:
+                b["late_entry_tp"] = _safe_float(b.get("late_entry_tp")) + weight
+            elif r == "SL":
+                b["late_entry_sl"] = _safe_float(b.get("late_entry_sl")) + weight
+        if fast_flags.get("rr_filter"):
+            b["rr_filter_count"] = int(b.get("rr_filter_count", 0) or 0) + 1
+
+        _update_binary_quality_stat(b["entry_quality_stats"], "early_5m_active", fast_flags.get("early_5m_active"), weight, r)
+        _update_binary_quality_stat(b["entry_quality_stats"], "multi_tf_active", fast_flags.get("multi_tf_active"), weight, r)
+        _update_binary_quality_stat(b["entry_quality_stats"], "late_entry", fast_flags.get("late_entry"), weight, r)
+    except Exception:
+        pass
 
     mp = _safe_float(move_percent, 0.0)
     b["move_sum"] = _safe_float(b.get("move_sum")) + mp
@@ -690,6 +799,7 @@ def should_require_extra_strength(symbol: str, direction: str, snapshot: Optiona
     wr = tp / max(total, 1e-9) if total else 0.0
     risk_bias = _safe_int(b.get("risk_bias"), 0)
     similar_sl = _similar_sl_pressure(b, snapshot)
+    fast_flags = _fast_entry_flags(snapshot or {}, direction)
 
     extra_score = 0
     extra_conf = 0
@@ -712,6 +822,24 @@ def should_require_extra_strength(symbol: str, direction: str, snapshot: Optiona
         extra_score += similar_sl * 2
         extra_conf += 1 if similar_sl >= 2 else 0
         reasons.append("شباهت به الگوهای قبلی SL")
+
+    # Fast-entry learning: reward/penalize based on this coin+direction history.
+    early_tp = _safe_float(b.get("early_5m_tp"))
+    early_sl = _safe_float(b.get("early_5m_sl"))
+    early_total = early_tp + early_sl
+    early_wr = early_tp / max(early_total, 1e-9) if early_total else 0.0
+    late_tp = _safe_float(b.get("late_entry_tp"))
+    late_sl = _safe_float(b.get("late_entry_sl"))
+    late_total = late_tp + late_sl
+    late_wr = late_tp / max(late_total, 1e-9) if late_total else 0.0
+
+    if fast_flags.get("early_5m_active") and early_total >= 5 and early_wr < 0.45:
+        extra_score += 3
+        reasons.append("Early 5M قبلاً ضعیف بوده")
+    if fast_flags.get("late_entry") and late_total >= 3 and late_wr < 0.50:
+        extra_score += 5
+        extra_conf += 1
+        reasons.append("Late Entry قبلاً پرریسک بوده")
 
     # Keep this module adaptive but not over-restrictive. coin_risk.py already
     # handles hard daily/long-term risk. This layer focuses on learned quality.
@@ -760,6 +888,9 @@ def get_tp_sl_v2_profile(symbol: str, direction: str, snapshot: Optional[Dict] =
         "max_favorable_atr": _weighted_avg(b, "max_favorable_atr_sum", "max_favorable_atr_weight", None),
         "max_adverse_atr": _weighted_avg(b, "max_adverse_atr_sum", "max_adverse_atr_weight", None),
         "fake_break_rate": round(fake / sr_total, 4),
+        "early_5m_win_rate": round(_safe_float(b.get("early_5m_tp")) / max(_safe_float(b.get("early_5m_tp")) + _safe_float(b.get("early_5m_sl")), 1e-9), 4) if (_safe_float(b.get("early_5m_tp")) + _safe_float(b.get("early_5m_sl"))) > 0 else None,
+        "late_entry_win_rate": round(_safe_float(b.get("late_entry_tp")) / max(_safe_float(b.get("late_entry_tp")) + _safe_float(b.get("late_entry_sl")), 1e-9), 4) if (_safe_float(b.get("late_entry_tp")) + _safe_float(b.get("late_entry_sl"))) > 0 else None,
+        "entry_quality_stats": b.get("entry_quality_stats", {}),
         "clean_breakouts": clean,
         "bounces": bounces,
         "source": "coin_learning_v2",
@@ -842,7 +973,8 @@ def format_coin_behavior(symbol: str = None) -> str:
         wr = round(tp / max(tp + sl, 1) * 100, 1) if tp + sl else 0
         lines.append(
             f"{r.get('symbol')} {r.get('direction')} | TP:{tp} SL:{sl} WR:{wr}% | "
-            f"رفتار:{r.get('behavior','UNKNOWN')} | شخصیت:{r.get('personality','UNKNOWN')} | اعتماد:{r.get('confidence',0)}"
+            f"رفتار:{r.get('behavior','UNKNOWN')} | شخصیت:{r.get('personality','UNKNOWN')} | اعتماد:{r.get('confidence',0)} | "
+            f"E5M:{round(_safe_float(r.get('early_5m_tp')) / max(_safe_float(r.get('early_5m_tp')) + _safe_float(r.get('early_5m_sl')), 1e-9) * 100, 1) if (_safe_float(r.get('early_5m_tp')) + _safe_float(r.get('early_5m_sl'))) > 0 else '-'}%"
         )
     return "\n".join(lines)
 
