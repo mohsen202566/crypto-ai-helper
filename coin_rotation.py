@@ -160,12 +160,20 @@ def _behavior_adjustment(bucket: Dict[str, Any]) -> int:
     elif behavior == "BAD":
         adj -= 15
 
-    if personality == "TREND_FRIENDLY":
-        adj += 5
+    # Backward-compatible old personalities + TP/SL v2 personalities from
+    # coin_learning.py. This stays soft; scanner/coin_risk still make final blocks.
+    if personality in {"TREND_FRIENDLY", "CLEAN_RUNNER"}:
+        adj += 6
+    elif personality == "NORMAL":
+        adj += 0
     elif personality == "LOW_REACH":
+        adj -= 6
+    elif personality == "WICKY":
         adj -= 5
-    elif personality == "RISKY_DIRECTION":
+    elif personality == "FAKE_BREAK_RISK":
         adj -= 8
+    elif personality == "RISKY_DIRECTION":
+        adj -= 9
     return adj
 
 
@@ -228,6 +236,84 @@ def _sl_pattern_adjustment(bucket: Dict[str, Any], snapshot: Optional[Dict[str, 
     return -min(10, hits * 3)
 
 
+def _weighted_avg(bucket: Dict[str, Any], sum_key: str, weight_key: str, default: float = 0.0) -> float:
+    w = _safe_float(bucket.get(weight_key), 0.0)
+    if w <= 0:
+        return float(default)
+    return _safe_float(bucket.get(sum_key), 0.0) / max(w, 1e-9)
+
+
+def _tp_sl_v2_adjustment(bucket: Dict[str, Any]) -> tuple[int, List[str]]:
+    """Soft rotation adjustment from TP/SL v2 memory.
+
+    Uses fields written by coin_learning.py: avg reachable TP in ATR, adverse
+    wick survival, fake/clean breakout behavior and max favorable movement.
+    It never hard-bans a coin; it only changes priority for scanner selection.
+    """
+    samples = _safe_int((bucket.get("tp_sl_v2") or {}).get("samples"), 0)
+    if samples < 3:
+        return 0, []
+
+    adj = 0
+    reasons: List[str] = []
+
+    avg_tp1 = _weighted_avg(bucket, "tp1_reach_atr_sum", "tp1_reach_atr_weight", 0.0)
+    avg_tp2 = _weighted_avg(bucket, "tp2_reach_atr_sum", "tp2_reach_atr_weight", 0.0)
+    avg_sl = _weighted_avg(bucket, "sl_distance_atr_sum", "sl_distance_atr_weight", 0.0)
+    avg_fav = _weighted_avg(bucket, "max_favorable_atr_sum", "max_favorable_atr_weight", 0.0)
+    avg_adv = _weighted_avg(bucket, "max_adverse_atr_sum", "max_adverse_atr_weight", 0.0)
+
+    fake = _safe_int(bucket.get("fake_breakouts"), 0)
+    clean = _safe_int(bucket.get("clean_breakouts"), 0)
+    bounce = _safe_int(bucket.get("bounces"), 0)
+    sr_total = max(1, fake + clean + bounce)
+    fake_rate = fake / sr_total
+    clean_rate = clean / sr_total
+    bounce_rate = bounce / sr_total
+
+    if avg_tp1 >= 0.85:
+        adj += 3
+        reasons.append("TP1 reach +3")
+    elif 0 < avg_tp1 < 0.55:
+        adj -= 4
+        reasons.append("low TP1 reach -4")
+
+    if avg_tp2 >= 1.45:
+        adj += 3
+        reasons.append("TP2 reach +3")
+    elif 0 < avg_tp2 < 0.95 and samples >= 5:
+        adj -= 2
+        reasons.append("low TP2 reach -2")
+
+    if avg_fav >= 1.25:
+        adj += 3
+        reasons.append("MFE +3")
+    elif 0 < avg_fav < 0.75 and samples >= 5:
+        adj -= 4
+        reasons.append("weak MFE -4")
+
+    # Wicky coins need more survival room; reduce priority only when adverse
+    # movement is large compared with reachable profit.
+    if avg_adv >= 1.35 and (avg_fav <= 0 or avg_adv > avg_fav * 0.95):
+        adj -= 5
+        reasons.append("SL survival risk -5")
+    elif 0 < avg_sl <= 1.05 and avg_fav >= 1.15:
+        adj += 2
+        reasons.append("clean SL profile +2")
+
+    if fake_rate >= 0.45 and fake >= 3:
+        adj -= 7
+        reasons.append("fake break -7")
+    elif clean_rate >= 0.45 and clean >= 3:
+        adj += 4
+        reasons.append("clean break +4")
+    elif bounce_rate >= 0.50 and bounce >= 3:
+        adj += 2
+        reasons.append("bounce +2")
+
+    return max(-18, min(14, int(round(adj)))), reasons[:5]
+
+
 def _direction_learning_score(symbol: str, direction: str, snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     b = _learning_bucket(symbol, direction)
     tp_w, sl_w, total_w = _weighted_counts(b)
@@ -278,6 +364,12 @@ def _direction_learning_score(symbol: str, direction: str, snapshot: Optional[Di
         adj += pattern_adj
         reasons.append(f"SL pattern {pattern_adj:+d}")
 
+    tp_sl_adj, tp_sl_reasons = _tp_sl_v2_adjustment(b)
+    if tp_sl_adj:
+        adj += tp_sl_adj
+        reasons.append(f"TP/SL v2 {tp_sl_adj:+d}")
+        reasons.extend(tp_sl_reasons)
+
     confidence = _safe_int(b.get("confidence"), 0)
     if total_w < 2:
         # With very low data, keep adjustment small so new coins are not buried.
@@ -296,9 +388,10 @@ def _direction_learning_score(symbol: str, direction: str, snapshot: Optional[Di
         "win_rate": None if win_rate is None else round(win_rate * 100, 1),
         "behavior": b.get("behavior", "UNKNOWN"),
         "personality": b.get("personality", "UNKNOWN"),
+        "tp_sl_v2": b.get("tp_sl_v2", {}),
         "confidence": confidence,
-        "adjustment": max(-35, min(35, int(round(adj)))),
-        "reasons": reasons[:6],
+        "adjustment": max(-40, min(40, int(round(adj)))),
+        "reasons": reasons[:8],
     }
 
 
