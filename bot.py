@@ -112,6 +112,8 @@ try:
         close_real_position_by_symbol,
         close_all_real_positions,
         sync_real_positions_text,
+        check_dynamic_profit_protection,
+        dynamic_profit_protection_text,
     )
 except Exception:
     get_real_trade_status_text = None
@@ -131,6 +133,8 @@ except Exception:
     close_real_position_by_symbol = None
     close_all_real_positions = None
     sync_real_positions_text = None
+    check_dynamic_profit_protection = None
+    dynamic_profit_protection_text = None
 
 
 # ============================================================
@@ -187,6 +191,7 @@ logger = logging.getLogger("crypto-ai-bot")
 LAST_AUTO_SIGNAL_TIME: Dict[str, int] = {}
 AUTO_SIGNAL_COOLDOWN_SECONDS = int(AUTO_SIGNAL_COOLDOWN_MINUTES) * 60
 REAL_TRACKING_LOOP_INTERVAL_SECONDS = int(os.getenv("REAL_TRACKING_LOOP_INTERVAL_SECONDS", "2") or "2")
+DYNAMIC_PROFIT_LOOP_INTERVAL_SECONDS = int(os.getenv("DYNAMIC_PROFIT_LOOP_INTERVAL_SECONDS", "10") or "10")
 
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -636,7 +641,7 @@ async def set_leverage_command(update: Update, context: ContextTypes.DEFAULT_TYP
     if not set_real_leverage:
         await update.message.reply_text("ماژول ترید واقعی فعال نیست.")
         return
-    value = max(1.0, min(float(value), 100.0))
+    value = max(1.0, min(float(value), 50.0))
     await update.message.reply_text(set_real_leverage(value) + "\n\n" + format_trade_status())
 
 
@@ -786,7 +791,7 @@ async def set_real_leverage_command(update: Update, context: ContextTypes.DEFAUL
     if value is None or value <= 0:
         await update.message.reply_text("مثال درست: لوریج واقعی 5")
         return
-    value = max(1.0, min(float(value), 100.0))
+    value = max(1.0, min(float(value), 50.0))
     await update.message.reply_text(set_real_leverage(value) + "\n\n" + get_real_trade_status_text())
 
 
@@ -887,6 +892,19 @@ async def sync_real_positions_command(update: Update, context: ContextTypes.DEFA
         await send_long_text(update, sync_real_positions_text())
     except Exception as e:
         await update.message.reply_text(f"❌ خطا در همگام‌سازی:\n{str(e)[:250]}")
+
+
+async def dynamic_profit_protection_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        await reject_unauthorized(update)
+        return
+    if not dynamic_profit_protection_text:
+        await update.message.reply_text("ماژول محافظ سود AI فعال نیست. فایل real_trade_manager.py را به‌روزرسانی کن.")
+        return
+    try:
+        await send_long_text(update, dynamic_profit_protection_text())
+    except Exception as e:
+        await update.message.reply_text(f"❌ خطا در بررسی خروج سود AI:\n{str(e)[:250]}")
 
 
 async def close_all_positions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1057,6 +1075,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "ترید خاموش\n"
         "توقف اضطراری\n"
         "همگام سازی پوزیشن ها\n"
+        "بررسی خروج سود\n"
         "بستن OPUSDT\n"
         "بستن همه پوزیشن ها\n"
         "ریست ترید\n\n"
@@ -1528,6 +1547,47 @@ async def auto_signal_loop(app: Application) -> None:
 
 
 # ============================================================
+# Dynamic Profit Protection Loop - Special AI Update
+# ============================================================
+
+async def dynamic_profit_protection_loop(app: Application) -> None:
+    """Special high-priority update: monitor REAL positions after entry.
+
+    It applies to both LONG and SHORT, only exits when the position is already
+    profitable, does not move/touch SL, and lets real_trade_manager record the
+    reason and learning outcome.
+    """
+    if not check_dynamic_profit_protection or not OWNER_ID:
+        logger.warning("Dynamic Profit Protection is not available")
+        return
+
+    await asyncio.sleep(20)
+
+    while True:
+        try:
+            result = check_dynamic_profit_protection()
+            if isinstance(result, dict) and result.get("ok"):
+                closed_rows = [r for r in (result.get("results") or []) if isinstance(r, dict) and r.get("closed")]
+                for r in closed_rows[:10]:
+                    text = (
+                        "🧠 خروج زودتر AI در سود\n"
+                        f"نماد: {r.get('symbol')}\n"
+                        f"جهت: {fa_direction(r.get('direction'))}\n"
+                        f"قیمت خروج: {r.get('exit_price')}\n"
+                        f"سود تقریبی حرکت: {r.get('profit_pct')}%\n"
+                        f"علت: {r.get('reason')}"
+                    )
+                    await app.bot.send_message(chat_id=OWNER_ID, text=text)
+                    await asyncio.sleep(1)
+            elif isinstance(result, dict) and not result.get("ok"):
+                logger.warning(f"Dynamic Profit Protection error: {result.get('error')}")
+        except Exception as e:
+            logger.error(f"dynamic_profit_protection_loop error: {e}")
+
+        await asyncio.sleep(max(5, int(DYNAMIC_PROFIT_LOOP_INTERVAL_SECONDS)))
+
+
+# ============================================================
 # Signal Tracker Loop
 # ============================================================
 
@@ -1675,6 +1735,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await sync_real_positions_command(update, context)
         return
 
+    if low in ["بررسی خروج سود", "خروج سود ai", "خروج سود AI", "محافظ سود", "محافظ سود ai", "محافظ سود AI", "dynamic profit", "profit protection"]:
+        await dynamic_profit_protection_command(update, context)
+        return
+
     if low in ["بستن همه", "بستن همه پوزیشن ها", "بستن همه پوزیشن‌ها", "close all", "close all positions"]:
         await close_all_positions_command(update, context)
         return
@@ -1796,6 +1860,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def post_init(app: Application) -> None:
     asyncio.create_task(auto_signal_loop(app))
+    asyncio.create_task(dynamic_profit_protection_loop(app))
     asyncio.create_task(signal_tracking_loop(app))
 
 
