@@ -978,38 +978,116 @@ def calculate_order_quantity(entry_price: float, symbol: Optional[str] = None) -
     return round(quantity, 8)
 
 
+def _safe_get_toobit_symbol_rules(symbol: str, reference_price: float, quantity: float) -> Dict[str, Any]:
+    """Read Toobit symbol rules when the client supports it; never raise."""
+    getter = getattr(toobit_client, "get_symbol_trading_rules", None)
+    if not callable(getter):
+        return {"source": "real_trade_manager_estimate_only"}
+    try:
+        rules = getter(symbol, reference_price=reference_price, quantity=quantity)
+        return rules if isinstance(rules, dict) else {"source": "invalid_rules_response", "raw": rules}
+    except Exception as e:
+        return {"source": "rules_read_failed", "error": str(e)[:250]}
+
+
+def _decimal_rule_value(rules: Dict[str, Any], key: str, default: float = 0.0) -> float:
+    try:
+        value = (rules or {}).get(key)
+        if value is None or str(value).strip() == "":
+            return float(default)
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _round_quantity_to_client_step(quantity: float, qty_step: float) -> float:
+    """Mirror the client-side down-rounding when possible, for pre-check only."""
+    try:
+        if qty_step and qty_step > 0 and hasattr(toobit_client, "_round_to_step"):
+            return float(toobit_client._round_to_step(quantity, qty_step, mode="down"))
+    except Exception:
+        pass
+    try:
+        return float(quantity)
+    except Exception:
+        return 0.0
+
+
 def validate_order_quantity(symbol: str, entry_price: float, quantity: float) -> Dict[str, Any]:
-    """Pre-check quantity before sending to Toobit."""
+    """Pre-check quantity before sending to Toobit.
+
+    This does not increase the user's order size. It only blocks orders that
+    would likely fail with Toobit -1202 (quantity too small), using the same
+    Toobit symbol rules that tobit_client.py uses when available.
+    """
     state = load_real_trade_state()
     position_usd = float(state.get("position_size_usd", 0) or 0)
     leverage = float(state.get("leverage", 0) or 0)
-    notional = position_usd * leverage
+    configured_notional = position_usd * leverage
 
-    min_qty = _estimated_min_quantity(symbol, entry_price)
-    min_notional = min_qty * float(entry_price or 0)
+    try:
+        price = float(entry_price or 0)
+        qty = float(quantity or 0)
+    except Exception:
+        return {"ok": False, "error": "محاسبه حجم سفارش نامعتبر است", "blocked_reason": "INVALID_QUANTITY"}
 
-    if quantity <= 0:
-        return {"ok": False, "error": "محاسبه حجم سفارش نامعتبر است"}
+    if price <= 0 or qty <= 0:
+        return {"ok": False, "error": "محاسبه حجم سفارش نامعتبر است", "blocked_reason": "INVALID_QUANTITY"}
 
-    if min_qty > 0 and quantity < min_qty:
+    rules = _safe_get_toobit_symbol_rules(symbol, reference_price=price, quantity=qty)
+    qty_step = _decimal_rule_value(rules, "qty_step", 0.0)
+    exchange_min_qty = _decimal_rule_value(rules, "min_qty", 0.0)
+    exchange_min_notional = _decimal_rule_value(rules, "min_notional", 0.0)
+
+    # Fallback only when Toobit rules do not expose a usable minQty. Keep this
+    # conservative and local; do not use it to increase order size automatically.
+    estimated_min_qty = _estimated_min_quantity(symbol, price)
+    effective_min_qty = exchange_min_qty if exchange_min_qty > 0 else float(estimated_min_qty or 0)
+
+    # If minNotional is available, derive a min quantity from the exchange value.
+    derived_min_qty = 0.0
+    if exchange_min_notional > 0 and price > 0:
+        derived_min_qty = exchange_min_notional / price
+        if qty_step > 0 and hasattr(toobit_client, "_round_to_step"):
+            try:
+                derived_min_qty = float(toobit_client._round_to_step(derived_min_qty, qty_step, mode="up"))
+            except Exception:
+                pass
+        effective_min_qty = max(effective_min_qty, derived_min_qty)
+
+    normalized_qty = _round_quantity_to_client_step(qty, qty_step)
+    min_notional_usd = effective_min_qty * price if effective_min_qty > 0 else exchange_min_notional
+
+    if effective_min_qty > 0 and normalized_qty < effective_min_qty:
         return {
             "ok": False,
+            "blocked": True,
+            "blocked_reason": "QUANTITY_BELOW_TOOBIT_MIN",
             "error": (
-                f"حجم سفارش برای {symbol} کمتر از حداقل تخمینی توبیت است "
-                f"({quantity} < {min_qty})."
+                f"حجم سفارش برای {symbol} کمتر از حداقل مجاز توبیت است "
+                f"({normalized_qty} < {effective_min_qty})."
             ),
             "user_hint": (
-                f"برای این نماد حداقل حجم تقریبی پوزیشن حدود {round(min_notional, 4)}$ است. "
-                f"تنظیم فعلی تو {round(notional, 4)}$ است؛ ترید دلار/لوریج را بیشتر کن یا این نماد را رد کن."
+                f"برای این نماد حداقل حجم تقریبی/صرافی حدود {round(min_notional_usd, 4)}$ است. "
+                f"تنظیم فعلی تو {round(configured_notional, 4)}$ است؛ حجم دلاری/لوریج را بیشتر کن یا این نماد را رد کن."
             ),
-            "quantity": quantity,
-            "min_quantity": min_qty,
-            "min_notional": round(min_notional, 6),
-            "configured_notional": round(notional, 6),
-            "blocked_reason": "QUANTITY_BELOW_ESTIMATED_MIN",
+            "quantity": round(qty, 10),
+            "normalized_quantity": round(normalized_qty, 10),
+            "min_quantity": round(effective_min_qty, 10),
+            "min_notional": round(min_notional_usd, 6),
+            "configured_notional": round(configured_notional, 6),
+            "rules": rules,
         }
 
-    return {"ok": True, "quantity": quantity, "min_quantity": min_qty}
+    return {
+        "ok": True,
+        "quantity": round(qty, 10),
+        "normalized_quantity": round(normalized_qty, 10),
+        "min_quantity": round(effective_min_qty, 10),
+        "min_notional": round(min_notional_usd, 6),
+        "configured_notional": round(configured_notional, 6),
+        "rules": rules,
+    }
 
 
 def close_real_position(
@@ -1744,8 +1822,20 @@ def open_real_position_from_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
 
     if not order_result.get("ok"):
         err = str(order_result.get("error") or order_result.get("data") or "")
-        if "quantity too small" in err.lower() or "qty too small" in err.lower():
-            order_result["user_hint"] = "حجم سفارش برای این نماد کم است؛ حجم دلاری یا لوریج را بیشتر کن یا این نماد را از ترید واقعی حذف کن."
+        order_result.setdefault("toobit_order", toobit_order)
+        order_result.setdefault("quantity_check", quantity_check)
+        if (
+            "quantity too small" in err.lower()
+            or "qty too small" in err.lower()
+            or "-1202" in err
+            or order_result.get("blocked_reason") in {"TOOBIT_QUANTITY_TOO_SMALL", "QUANTITY_BELOW_EXCHANGE_MIN"}
+        ):
+            order_result["blocked"] = True
+            order_result["blocked_reason"] = order_result.get("blocked_reason") or "TOOBIT_QUANTITY_TOO_SMALL"
+            order_result["user_hint"] = (
+                "حجم سفارش برای این نماد کم است؛ حجم دلاری یا لوریج را بیشتر کن "
+                "یا این نماد را برای ترید واقعی رد کن."
+            )
         return order_result
 
     confirmed_position, execution_info = _order_is_confirmed_position(order_result)
