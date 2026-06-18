@@ -2,6 +2,8 @@
 """AI Classic Direct Analysis Engine - complete integrated version."""
 import math
 import time
+import os
+import json
 from typing import Dict, List, Optional, Tuple, Any
 import ccxt
 import pandas as pd
@@ -26,6 +28,10 @@ try:
     from ai_memory import update_ai_summary
 except Exception:
     update_ai_summary = None
+try:
+    from data_store import load_json as _ds_load_json, save_json as _ds_save_json
+except Exception:
+    _ds_load_json = None; _ds_save_json = None
 
 exchange = ccxt.okx({'enableRateLimit': True, 'timeout': 20000, 'options': {'defaultType': 'swap'}})
 _SOFT_MARKET_CONTEXT_CACHE = {'ts': 0, 'data': None}
@@ -33,18 +39,8 @@ SOFT_MARKET_CONTEXT_TTL_SECONDS = 120
 AUTO_DIRECT_SCORE_MIN = max(int(MIN_DIRECT_SCORE), int(AUTO_DIRECT_SCORE_MIN))
 ADX_HARD_MIN = max(float(MIN_ADX_FOR_TREND), 20.0)
 LONG_DIRECT_SCORE_BONUS_REQUIREMENT = 0
-# Balanced safety gates for BOTH LONG and SHORT.
-# These are intentionally symmetric so one side is not softer than the other.
-REQUIRE_1H_CONFIRMATION = True
-BLOCK_IF_AGAINST_VWAP = True
-# Rescue is kept, but only for very strong/clean setups.
-SOFT_RESCUE_SCORE_MIN = 98
-SOFT_RESCUE_ADX_MIN = 30
-SOFT_RESCUE_POWER_MIN = 63
-SOFT_RESCUE_LONG_RSI_MIN = 52
-SOFT_RESCUE_SHORT_RSI_MAX = 48
-# If LONG and SHORT scores are too close, avoid choosing a weak side by luck.
-MIN_DIRECTION_SCORE_GAP = 4
+LONG_MIN_1H_STRICT = False
+LONG_BLOCK_IF_AGAINST_VWAP = False
 MIN_SL_ATR_MULTIPLIER = 1.30
 TP1_FALLBACK_ATR = 0.75
 TP2_FALLBACK_ATR = 1.40
@@ -232,26 +228,20 @@ def simple_classic_score(symbol, df_4h, df_1h, df_30m, df_15m, df_5m, market_con
 
     # Soft direction rescue: do not kill a very strong signal only because one timeframe gate is mixed.
     # Still requires strong score, trend strength, momentum, RSI side, and power/volume pressure.
-    if (not long_direction_ok) and long_score>=SOFT_RESCUE_SCORE_MIN and adx>=SOFT_RESCUE_ADX_MIN and long_macd_ok and safe_float(l15['rsi'])>=SOFT_RESCUE_LONG_RSI_MIN and (buy3>=SOFT_RESCUE_POWER_MIN or buy20>=SOFT_RESCUE_POWER_MIN) and trends['5M']=='bullish' and trends['4H']=='bullish' and l15['close']>=l15['vwap'] and l1['close']>l1['ema20']:
+    if (not long_direction_ok) and long_score>=95 and adx>=28 and long_macd_ok and safe_float(l15['rsi'])>=50 and (buy3>=58 or buy20>=60) and (trends['5M']=='bullish' or trends['4H']=='bullish') and l15['close']>=l15['vwap']:
         long_direction_ok=True
-        long_reasons.append('Soft Rescue سختگیر: لانگ فقط با تایید خیلی قوی نجات شد')
-    if (not short_direction_ok) and short_score>=SOFT_RESCUE_SCORE_MIN and adx>=SOFT_RESCUE_ADX_MIN and short_macd_ok and safe_float(l15['rsi'])<=SOFT_RESCUE_SHORT_RSI_MAX and (sell3>=SOFT_RESCUE_POWER_MIN or sell20>=SOFT_RESCUE_POWER_MIN) and trends['5M']=='bearish' and trends['4H']=='bearish' and l15['close']<=l15['vwap'] and l1['close']<l1['ema20']:
+    if (not short_direction_ok) and short_score>=95 and adx>=28 and short_macd_ok and safe_float(l15['rsi'])<=50 and (sell3>=58 or sell20>=60) and (trends['5M']=='bearish' or trends['4H']=='bearish') and l15['close']<=l15['vwap']:
         short_direction_ok=True
-        short_reasons.append('Soft Rescue سختگیر: شورت فقط با تایید خیلی قوی نجات شد')
 
-    long_1h_ok=(trends['1H']=='bullish' and l1['close']>l1['ema20'] and l1['macd']>=l1['macd_signal']) if REQUIRE_1H_CONFIRMATION else True
-    short_1h_ok=(trends['1H']=='bearish' and l1['close']<l1['ema20'] and l1['macd']<=l1['macd_signal']) if REQUIRE_1H_CONFIRMATION else True
-    long_vwap_ok=(l15['close']>=l15['vwap']) if BLOCK_IF_AGAINST_VWAP else True
-    short_vwap_ok=(l15['close']<=l15['vwap']) if BLOCK_IF_AGAINST_VWAP else True
-    if not long_direction_ok: long_reasons.append('رد لانگ: جهت تایم‌فریم‌ها کافی نیست')
+    long_1h_ok=(trends['1H']=='bullish' and l1['close']>l1['ema20'] and l1['macd']>=l1['macd_signal']) if LONG_MIN_1H_STRICT else True
+    long_vwap_ok=(l15['close']>=l15['vwap']) if LONG_BLOCK_IF_AGAINST_VWAP else True
+    if not long_direction_ok: long_reasons.append('رد لانگ: 1H و 15M صعودی نیستند')
     if not long_macd_ok: long_reasons.append('رد لانگ: MACD کافی نیست')
     if not long_1h_ok: long_reasons.append('رد لانگ: تایید 1H کافی نیست')
     if not long_vwap_ok: long_reasons.append('رد لانگ: خلاف VWAP')
-    if not short_direction_ok: short_reasons.append('رد شورت: جهت تایم‌فریم‌ها کافی نیست')
+    if not short_direction_ok: short_reasons.append('رد شورت: جهت کافی نیست')
     if not short_macd_ok: short_reasons.append('رد شورت: MACD کافی نیست')
-    if not short_1h_ok: short_reasons.append('رد شورت: تایید 1H کافی نیست')
-    if not short_vwap_ok: short_reasons.append('رد شورت: خلاف VWAP')
-    return {'long_score':cap_score(long_score),'short_score':cap_score(short_score),'long_reasons':long_reasons,'short_reasons':short_reasons,'confirmations_long':cl,'confirmations_short':cs,'trends':trends,'distance_ema20_atr':round(distance_from_ema20_atr(df_15m),2),'volume_status':volume_quality(df_15m)[0],'volume_ratio':round(volume_quality(df_15m)[1],2),'power2_buy':buy2,'power2_sell':sell2,'power3_buy':buy3,'power3_sell':sell3,'buy_power':buy20,'sell_power':sell20,'long_valid':adx>=ADX_HARD_MIN and long_direction_ok and long_macd_ok and long_1h_ok and long_vwap_ok,'short_valid':adx>=ADX_HARD_MIN and short_direction_ok and short_macd_ok and short_1h_ok and short_vwap_ok,'adx_15':adx,'market_regime':mb}
+    return {'long_score':cap_score(long_score),'short_score':cap_score(short_score),'long_reasons':long_reasons,'short_reasons':short_reasons,'confirmations_long':cl,'confirmations_short':cs,'trends':trends,'distance_ema20_atr':round(distance_from_ema20_atr(df_15m),2),'volume_status':volume_quality(df_15m)[0],'volume_ratio':round(volume_quality(df_15m)[1],2),'power2_buy':buy2,'power2_sell':sell2,'power3_buy':buy3,'power3_sell':sell3,'buy_power':buy20,'sell_power':sell20,'long_valid':adx>=ADX_HARD_MIN and long_direction_ok and long_macd_ok and long_1h_ok and long_vwap_ok,'short_valid':adx>=ADX_HARD_MIN and short_direction_ok and short_macd_ok,'adx_15':adx,'market_regime':mb}
 
 def find_swing_levels(df, timeframe, lookback=LEVEL_LOOKBACK, window=SWING_WINDOW):
     recent=df.tail(lookback).copy(); levels=[]; w=TF_LEVEL_WEIGHTS.get(timeframe,1.0)
@@ -324,9 +314,263 @@ def merge_tp_with_ai_memory(direction, price, atr, sr_tp1, sr_tp2, ai_tp):
     if direction=='SHORT' and tp2>=tp1: tp2=tp1-atr*0.45
     return tp1,tp2
 
+
+
+# ---------------------------------------------------------------------------
+# AI TP/SL v2 memory helpers
+# ---------------------------------------------------------------------------
+# Entry-time TP/SL is now built from 6 coordinated layers:
+# 1) SR memory/quality, 2) coin personality, 3) direction memory,
+# 4) TP reach memory, 5) dynamic TP metadata, 6) SL survival memory.
+# Result learning hooks are exposed here; managers/learning modules can call
+# register_tp_sl_v2_result without breaking old code.
+TP_SL_AI_FILE = "tp_sl_ai_memory.json"
+
+
+def _ai_mem_load(default=None):
+    default = default if isinstance(default, dict) else {"version": 1, "coin_direction": {}, "sr": {}, "events": []}
+    if _ds_load_json:
+        try:
+            data = _ds_load_json(TP_SL_AI_FILE, default)
+            return data if isinstance(data, dict) else default
+        except Exception:
+            pass
+    try:
+        paths = [TP_SL_AI_FILE, os.path.join("data", TP_SL_AI_FILE)]
+        for path in paths:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return data if isinstance(data, dict) else default
+    except Exception:
+        pass
+    return default
+
+
+def _ai_mem_save(data):
+    if not isinstance(data, dict):
+        return False
+    data["version"] = 1
+    if _ds_save_json:
+        try:
+            _ds_save_json(TP_SL_AI_FILE, data)
+            return True
+        except Exception:
+            pass
+    try:
+        os.makedirs("data", exist_ok=True)
+        with open(os.path.join("data", TP_SL_AI_FILE), "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+
+def _cd_key(symbol, direction):
+    sym = str(symbol or "UNKNOWN").upper().strip()
+    direct = str(direction or "UNKNOWN").upper().strip()
+    return f"{sym}:{direct}"
+
+
+def _memory_bucket(symbol, direction):
+    data = _ai_mem_load()
+    key = _cd_key(symbol, direction)
+    bucket = data.setdefault("coin_direction", {}).setdefault(key, {
+        "symbol": str(symbol or "UNKNOWN").upper(),
+        "direction": str(direction or "UNKNOWN").upper(),
+        "tp1_hits": 0, "tp2_hits": 0, "sl_hits": 0,
+        "avg_tp1_atr": None, "avg_tp2_atr": None, "avg_sl_wick_atr": None,
+        "avg_max_favorable_atr": None, "avg_max_adverse_atr": None,
+        "fake_breakouts": 0, "breakouts": 0, "bounces": 0,
+        "personality": "UNKNOWN", "confidence": 0, "updated_at": 0,
+    })
+    return data, bucket
+
+
+def _weighted_update(old, value, weight=0.25):
+    try:
+        value = float(value)
+        if old is None:
+            return value
+        return float(old) * (1.0 - weight) + value * weight
+    except Exception:
+        return old
+
+
+def register_tp_sl_v2_result(symbol, direction, result, entry=None, stop_loss=None, tp1=None, tp2=None, snapshot=None, max_favorable=None, max_adverse=None):
+    """Optional learning hook for TP/SL v2.
+
+    Safe to call from real_trade_manager, ghost_signals, or coin_learning.
+    It preserves existing files and only writes a compact per coin+direction
+    memory used by build_trade_levels on future entries.
+    """
+    data, b = _memory_bucket(symbol, direction)
+    res = str(result or "").upper().strip()
+    atr = max(safe_float((snapshot or {}).get("atr"), 0.0), safe_float(entry, 0.0) * 0.0015, 1e-12)
+    price = safe_float(entry, 0.0)
+    if res in {"TP", "TP1", "TAKE_PROFIT", "TAKEPROFIT"}:
+        b["tp1_hits"] = int(b.get("tp1_hits", 0)) + 1
+    elif res == "TP2":
+        b["tp2_hits"] = int(b.get("tp2_hits", 0)) + 1
+    elif res in {"SL", "STOP", "STOP_LOSS", "STOPLOSS"}:
+        b["sl_hits"] = int(b.get("sl_hits", 0)) + 1
+    if price and tp1:
+        b["avg_tp1_atr"] = _weighted_update(b.get("avg_tp1_atr"), abs(safe_float(tp1) - price) / atr)
+    if price and tp2:
+        b["avg_tp2_atr"] = _weighted_update(b.get("avg_tp2_atr"), abs(safe_float(tp2) - price) / atr)
+    if price and stop_loss:
+        b["avg_sl_wick_atr"] = _weighted_update(b.get("avg_sl_wick_atr"), abs(price - safe_float(stop_loss)) / atr)
+    if max_favorable is not None:
+        b["avg_max_favorable_atr"] = _weighted_update(b.get("avg_max_favorable_atr"), abs(safe_float(max_favorable)) / atr)
+    if max_adverse is not None:
+        b["avg_max_adverse_atr"] = _weighted_update(b.get("avg_max_adverse_atr"), abs(safe_float(max_adverse)) / atr)
+    total = int(b.get("tp1_hits", 0)) + int(b.get("tp2_hits", 0)) + int(b.get("sl_hits", 0))
+    wins = int(b.get("tp1_hits", 0)) + int(b.get("tp2_hits", 0))
+    wr = wins / max(total, 1)
+    if total >= 8 and wr >= 0.62:
+        b["personality"] = "CLEAN_RUNNER"
+    elif total >= 8 and wr <= 0.42:
+        b["personality"] = "CHOPPY_RISKY"
+    elif safe_float(b.get("avg_sl_wick_atr"), 0.0) >= 1.6:
+        b["personality"] = "WICKY"
+    else:
+        b["personality"] = "NORMAL" if total >= 3 else "UNKNOWN"
+    b["confidence"] = min(100, total * 8)
+    b["updated_at"] = int(time.time())
+    data.setdefault("events", []).append({"ts": int(time.time()), "symbol": str(symbol).upper(), "direction": str(direction).upper(), "result": res})
+    data["events"] = data.get("events", [])[-500:]
+    _ai_mem_save(data)
+    return dict(b)
+
+
+def _sr_quality_pack(levels, price, atr, direction):
+    supports = levels.get("supports", []) or []
+    resistances = levels.get("resistances", []) or []
+    target_levels = resistances if direction == "LONG" else supports
+    stop_levels = supports if direction == "LONG" else resistances
+    best_target = target_levels[0] if target_levels else {}
+    best_stop = stop_levels[0] if stop_levels else {}
+    target_strength = safe_float(best_target.get("strength"), 0.0)
+    stop_strength = safe_float(best_stop.get("strength"), 0.0)
+    target_tfs = len(best_target.get("timeframes", []) or []) if isinstance(best_target, dict) else 0
+    stop_tfs = len(best_stop.get("timeframes", []) or []) if isinstance(best_stop, dict) else 0
+    return {
+        "target_strength": round(target_strength, 3),
+        "stop_strength": round(stop_strength, 3),
+        "target_timeframes": target_tfs,
+        "stop_timeframes": stop_tfs,
+        "target_level": best_target,
+        "stop_level": best_stop,
+    }
+
+
+def _recent_fake_break_risk(df_15m, direction, price, atr, supports, resistances):
+    try:
+        recent = df_15m.tail(18)
+        if direction == "LONG":
+            near = min([safe_float(x.get("price")) for x in resistances if safe_float(x.get("price")) > price], default=None)
+            if near is None:
+                return 0.0
+            fake = ((recent["high"] > near) & (recent["close"] < near)).sum()
+        else:
+            near = max([safe_float(x.get("price")) for x in supports if safe_float(x.get("price")) < price], default=None)
+            if near is None:
+                return 0.0
+            fake = ((recent["low"] < near) & (recent["close"] > near)).sum()
+        return min(1.0, float(fake) / 3.0)
+    except Exception:
+        return 0.0
+
+
+def _tp_sl_v2_profile(symbol, direction, price, atr, snapshot, df_15m, levels):
+    data, b = _memory_bucket(symbol, direction)
+    confidence = safe_float(b.get("confidence"), 0.0)
+    personality = str(b.get("personality") or "UNKNOWN").upper()
+    supports = levels.get("supports", []) or []
+    resistances = levels.get("resistances", []) or []
+    srq = _sr_quality_pack(levels, price, atr, direction)
+    fake_risk = _recent_fake_break_risk(df_15m, direction, price, atr, supports, resistances)
+
+    tp1_memory = safe_float(b.get("avg_tp1_atr"), 0.0)
+    tp2_memory = safe_float(b.get("avg_tp2_atr"), 0.0)
+    sl_memory = safe_float(b.get("avg_sl_wick_atr"), 0.0)
+    tp1_mult = tp1_memory if confidence >= 20 and tp1_memory > 0 else TP1_FALLBACK_ATR
+    tp2_mult = tp2_memory if confidence >= 20 and tp2_memory > 0 else TP2_FALLBACK_ATR
+    sl_mult = max(MIN_SL_ATR_MULTIPLIER, sl_memory if confidence >= 20 and sl_memory > 0 else MIN_SL_ATR_MULTIPLIER)
+
+    # Coin personality layer.
+    if personality == "CLEAN_RUNNER":
+        tp2_mult *= 1.12
+        tp1_mult *= 1.04
+    elif personality == "WICKY":
+        sl_mult *= 1.12
+        tp1_mult *= 0.96
+    elif personality == "CHOPPY_RISKY":
+        tp1_mult *= 0.92
+        tp2_mult *= 0.88
+        sl_mult *= 1.05
+
+    # Fake breakout + SR quality layer.
+    if fake_risk >= 0.67:
+        tp1_mult *= 0.88
+        tp2_mult *= 0.82
+        sl_mult *= 1.08
+    elif fake_risk >= 0.34:
+        tp1_mult *= 0.94
+        tp2_mult *= 0.92
+
+    if srq["target_strength"] >= 8 and srq["target_timeframes"] >= 2:
+        tp1_mult *= 0.96  # strong nearby target/resistance: take a little earlier
+    if srq["stop_strength"] >= 8 and srq["stop_timeframes"] >= 2:
+        sl_mult *= 1.03  # hide SL beyond stronger invalidation zone
+
+    # Keep safe bounds so this layer cannot create unrealistic orders.
+    tp1_mult = max(MIN_TP1_ATR, min(2.2, tp1_mult))
+    tp2_mult = max(tp1_mult + 0.35, min(4.0, tp2_mult))
+    sl_mult = max(MIN_SL_ATR_MULTIPLIER * 0.95, min(MAX_REASONABLE_SL_ATR, sl_mult))
+    return {
+        "confidence": int(confidence), "personality": personality,
+        "tp1_mult": round(tp1_mult, 4), "tp2_mult": round(tp2_mult, 4), "sl_mult": round(sl_mult, 4),
+        "fake_break_risk": round(fake_risk, 3), "sr_quality": srq,
+        "memory": {k: b.get(k) for k in ["tp1_hits", "tp2_hits", "sl_hits", "avg_tp1_atr", "avg_tp2_atr", "avg_sl_wick_atr"]},
+        "dynamic_tp": {"enabled": True, "extend_tp2_if_trend_strong": True, "tighten_tp2_if_momentum_fades": True},
+    }
+
+
+def _apply_tp_sl_v2(direction, price, atr, sl, tp1, tp2, profile):
+    tp1_mem = price + atr * profile["tp1_mult"] if direction == "LONG" else price - atr * profile["tp1_mult"]
+    tp2_mem = price + atr * profile["tp2_mult"] if direction == "LONG" else price - atr * profile["tp2_mult"]
+    sl_mem = price - atr * profile["sl_mult"] if direction == "LONG" else price + atr * profile["sl_mult"]
+
+    # Blend SR levels with memory rather than replacing them. SR still controls
+    # price structure; memory nudges TP/SL to what this coin+direction usually reaches.
+    w = min(0.55, max(0.18, profile.get("confidence", 0) / 180.0))
+    tp1_new = safe_float(tp1) * (1 - w) + tp1_mem * w
+    tp2_new = safe_float(tp2) * (1 - w) + tp2_mem * w
+    sl_new = safe_float(sl) * (1 - min(0.45, w)) + sl_mem * min(0.45, w)
+
+    mind = max(atr * MIN_TP1_ATR, price * 0.0015)
+    if direction == "LONG":
+        tp1_new = max(tp1_new, price + mind)
+        tp2_new = max(tp2_new, tp1_new + atr * 0.35)
+        sl_new = min(sl_new, price - atr * MIN_SL_ATR_MULTIPLIER * 0.95)
+        if abs(price - sl_new) > atr * MAX_REASONABLE_SL_ATR:
+            sl_new = price - atr * MAX_REASONABLE_SL_ATR
+    else:
+        tp1_new = min(tp1_new, price - mind)
+        tp2_new = min(tp2_new, tp1_new - atr * 0.35)
+        sl_new = max(sl_new, price + atr * MIN_SL_ATR_MULTIPLIER * 0.95)
+        if abs(price - sl_new) > atr * MAX_REASONABLE_SL_ATR:
+            sl_new = price + atr * MAX_REASONABLE_SL_ATR
+    return sl_new, tp1_new, tp2_new
+
 def build_trade_levels(direction, price, atr, df_5m, df_15m, df_30m, snapshot=None, symbol=None):
     price=safe_float(price); atr=max(safe_float(atr), price*0.0015); vf=coin_volatility_factor(df_15m,price); min_sl=atr*MIN_SL_ATR_MULTIPLIER*vf; buf_tp=max(atr*LEVEL_BUFFER_ATR*vf, price*0.0007); buf_sl=max(atr*SL_BUFFER_ATR*vf, price*0.001)
     levels=get_strong_levels(df_5m,df_15m,df_30m,price,atr); supports=levels['supports']; res=levels['resistances']; ai_tp=get_ai_tp_memory(symbol,direction,price,atr,snapshot) if symbol and snapshot else {}
+    tp_sl_v2=_tp_sl_v2_profile(symbol or (snapshot or {}).get('symbol'),direction,price,atr,snapshot or {},df_15m,levels)
+    # Layer 6: SL survival memory gently adjusts the classic SR/ATR base distance.
+    learned_min_sl=atr*safe_float(tp_sl_v2.get('sl_mult'),MIN_SL_ATR_MULTIPLIER)*vf
+    min_sl=max(min_sl, learned_min_sl)
     if direction=='LONG':
         classic_sl=price-min_sl; sp=select_level_for_sl(direction,price,atr,supports,min_sl); sl=min(sp-buf_sl, classic_sl) if sp else classic_sl
         if abs(price-sl)>atr*MAX_REASONABLE_SL_ATR*vf: sl=classic_sl
@@ -337,8 +581,15 @@ def build_trade_levels(direction, price, atr, df_5m, df_15m, df_30m, snapshot=No
         if abs(price-sl)>atr*MAX_REASONABLE_SL_ATR*vf: sl=classic_sl
         sr_tp1=select_level_for_tp(direction,price,atr,supports,TP1_FALLBACK_ATR*vf,buf_tp); sr_tp2=select_level_for_tp(direction,price,atr,[x for x in supports if x['price']<sr_tp1],TP2_FALLBACK_ATR*vf,buf_tp)
         if sr_tp2>=sr_tp1: sr_tp2=price-atr*TP2_FALLBACK_ATR*vf
-    tp1,tp2=merge_tp_with_ai_memory(direction,price,atr,sr_tp1,sr_tp2,ai_tp); risk=abs(price-sl); reward=abs(tp1-price); rr=round(reward/risk,2) if risk>0 else 0
-    return safe_round(sl), safe_round(tp1), safe_round(tp2), rr, {'volatility_factor':round(vf,3),'ai_tp_used':bool(ai_tp),'ai_tp':ai_tp,'nearest_support':levels.get('nearest_support'),'nearest_resistance':levels.get('nearest_resistance')}
+    tp1,tp2=merge_tp_with_ai_memory(direction,price,atr,sr_tp1,sr_tp2,ai_tp)
+    sl,tp1,tp2=_apply_tp_sl_v2(direction,price,atr,sl,tp1,tp2,tp_sl_v2)
+    risk=abs(price-sl); reward=abs(tp1-price); rr=round(reward/risk,2) if risk>0 else 0
+    return safe_round(sl), safe_round(tp1), safe_round(tp2), rr, {
+        'volatility_factor':round(vf,3),'ai_tp_used':bool(ai_tp),'ai_tp':ai_tp,
+        'nearest_support':levels.get('nearest_support'),'nearest_resistance':levels.get('nearest_resistance'),
+        'tp_sl_v2':tp_sl_v2,
+        'tp_sl_layers':['SR_MEMORY','COIN_PERSONALITY','DIRECTION_MEMORY','TP_REACH_MEMORY','DYNAMIC_TP_META','SL_SURVIVAL_MEMORY']
+    }
 
 def get_soft_market_context():
     now = time.time() if 'time' in globals() else 0
@@ -369,12 +620,8 @@ def analyze_symbol(symbol: str) -> Dict:
     try:
         df_4h=add_indicators(get_klines(symbol,'4h')); df_1h=add_indicators(get_klines(symbol,'1h')); df_30m=add_indicators(get_klines(symbol,'30m')); df_15m=add_indicators(get_klines(symbol,'15m')); df_5m=add_indicators(get_klines(symbol,'5m'))
         market_context=get_soft_market_context(); sp=simple_classic_score(symbol,df_4h,df_1h,df_30m,df_15m,df_5m,market_context); price=safe_float(df_15m.iloc[-1]['close']); atr=safe_float(df_15m.iloc[-1]['atr']); long_score=int(sp['long_score']); short_score=int(sp['short_score'])
-        direction_gap=abs(long_score-short_score)
         if long_score>=short_score: direction='LONG'; final_score=long_score; confirmations=int(sp['confirmations_long']); reasons=list(sp['long_reasons']); valid=bool(sp['long_valid'])
         else: direction='SHORT'; final_score=short_score; confirmations=int(sp['confirmations_short']); reasons=list(sp['short_reasons']); valid=bool(sp['short_valid'])
-        if direction_gap < MIN_DIRECTION_SCORE_GAP:
-            valid=False
-            reasons.append(f'رد: اختلاف امتیاز لانگ/شورت کم است ({direction_gap} < {MIN_DIRECTION_SCORE_GAP})')
         snapshot=build_local_snapshot(symbol,direction,df_4h,df_1h,df_30m,df_15m,df_5m,sp,market_context)
         # ------------------------------------------------------------------
         # AI DECISION LAYER
@@ -403,28 +650,18 @@ def analyze_symbol(symbol: str) -> Dict:
         #   require stronger score and more confirmations.
         # - Keep it gradual so signal frequency does not collapse.
         if strict:
-            ai_penalty += min(24, max(5, strict * 5))
-            ai_min_score_add += min(16, max(3, strict * 3))
-            req_conf += min(4, max(1, strict))
+            ai_penalty += min(14, max(3, strict * 3))
+            ai_min_score_add += min(10, max(2, strict * 2))
+            req_conf += min(3, max(1, strict))
             reasons.append(f'AI Risk: سختگیری سطح {strict} | SL={sl_count}')
         elif sl_count >= 2:
             # Safety fallback if coin_risk stores SL count but strictness_level
             # is not being calculated correctly yet.
-            fallback_level=min(4, sl_count-1)
-            ai_penalty += min(18, fallback_level * 5)
-            ai_min_score_add += min(12, fallback_level * 3)
-            req_conf += min(3, fallback_level)
+            fallback_level=min(3, sl_count-1)
+            ai_penalty += min(9, fallback_level * 3)
+            ai_min_score_add += min(6, fallback_level * 2)
+            req_conf += min(2, fallback_level)
             reasons.append(f'AI Risk fallback: SLهای تکراری {sl_count}')
-
-        # Repeated SL protection is symmetric for LONG/SHORT.
-        # It does not delete learning or globally ban a coin; it blocks only
-        # borderline same coin+direction entries and lets exceptional setups pass.
-        if sl_count >= 3 and final_score < 96:
-            ai_block=True
-            reasons.append('AI Block: سه SL یا بیشتر برای همین ارز/جهت و امتیاز زیر 96')
-        if sl_count >= 4 and final_score < 98:
-            ai_block=True
-            reasons.append('AI Block: چهار SL یا بیشتر برای همین ارز/جهت و امتیاز زیر 98')
 
         # Rotation controls priority and quality gate.
         rotation=get_rotation_context(symbol)
@@ -433,14 +670,13 @@ def analyze_symbol(symbol: str) -> Dict:
             final_score+=2
             reasons.append('AI Rotation: اولویت مثبت')
         elif rs<=20:
-            ai_penalty += 10
-            ai_min_score_add += 6
-            req_conf += 2
+            ai_penalty += 6
+            ai_min_score_add += 4
+            req_conf += 1
             reasons.append('AI Rotation: کوین کم‌اولویت/پرریسک')
         elif rs<=35:
-            ai_penalty += 5
-            ai_min_score_add += 3
-            req_conf += 1
+            ai_penalty += 3
+            ai_min_score_add += 2
             reasons.append('AI Rotation: اولویت ضعیف')
 
         # Learning engine may request extra strength based on real/ghost history
@@ -453,12 +689,9 @@ def analyze_symbol(symbol: str) -> Dict:
 
         # If the coin/direction is extremely risky, AI can block borderline
         # candidates.  Strong candidates can still pass only with strict gates.
-        if risk_score >= 70 and final_score < 95:
+        if risk_score >= 85 and final_score < 94:
             ai_block=True
-            reasons.append('AI Block: ریسک کوین/جهت بالا و امتیاز کافی نیست')
-        if risk_score >= 85 and final_score < 98:
-            ai_block=True
-            reasons.append('AI Block: ریسک کوین/جهت خیلی بالا و امتیاز بسیار قوی نیست')
+            reasons.append('AI Block: ریسک کوین/جهت خیلی بالا و امتیاز کافی نیست')
 
         final_score -= ai_penalty
         min_score=min(96, base_min_score + ai_min_score_add)
@@ -466,7 +699,7 @@ def analyze_symbol(symbol: str) -> Dict:
 
         level_pack=get_strong_levels(df_5m,df_15m,df_30m,price,atr); support=level_pack.get('nearest_support'); resistance=level_pack.get('nearest_resistance')
         entry_confirmed=(not ai_block) and valid and final_score>=min_score and confirmations>=effective_req_conf
-        common={'symbol':symbol,'score':cap_score(final_score),'long_score':long_score,'short_score':short_score,'price':safe_round(price),'atr':safe_round(atr),'market_regime':market_context.get('market_regime','neutral'),'btc_bias':market_context.get('btc_bias','neutral'),'confirmations':confirmations,'required_confirmations':effective_req_conf,'rsi':safe_round(df_15m.iloc[-1]['rsi'],2),'macd':safe_round(df_15m.iloc[-1]['macd'],6),'macd_signal':safe_round(df_15m.iloc[-1]['macd_signal'],6),'macd_hist':safe_round(df_15m.iloc[-1]['macd_hist'],6),'adx':safe_round(df_15m.iloc[-1]['adx'],2),'vwap_status':vwap_status(df_15m),'support':safe_round(support),'resistance':safe_round(resistance),'trends':sp.get('trends',{}),'distance_ema20_atr':sp.get('distance_ema20_atr'),'volume_status':sp.get('volume_status'),'volume_ratio':sp.get('volume_ratio'),'buy_power':sp.get('buy_power'),'sell_power':sp.get('sell_power'),'power2_buy':sp.get('power2_buy'),'power2_sell':sp.get('power2_sell'),'power3_buy':sp.get('power3_buy'),'power3_sell':sp.get('power3_sell'),'snapshot':snapshot,'coin_risk':risk_state,'rotation':rotation,'ai_decision':{'base_min_score':base_min_score,'min_score':min_score,'direction_gap':direction_gap,'ai_penalty':ai_penalty,'ai_min_score_add':ai_min_score_add,'ai_block':ai_block,'strictness_level':strict,'sl_count':sl_count,'risk_score':risk_score,'rotation_score':rs},'reasons':reasons[:20],'signal_timeframe':'AI Classic Direct'}
+        common={'symbol':symbol,'score':cap_score(final_score),'long_score':long_score,'short_score':short_score,'price':safe_round(price),'atr':safe_round(atr),'market_regime':market_context.get('market_regime','neutral'),'btc_bias':market_context.get('btc_bias','neutral'),'confirmations':confirmations,'required_confirmations':effective_req_conf,'rsi':safe_round(df_15m.iloc[-1]['rsi'],2),'macd':safe_round(df_15m.iloc[-1]['macd'],6),'macd_signal':safe_round(df_15m.iloc[-1]['macd_signal'],6),'macd_hist':safe_round(df_15m.iloc[-1]['macd_hist'],6),'adx':safe_round(df_15m.iloc[-1]['adx'],2),'vwap_status':vwap_status(df_15m),'support':safe_round(support),'resistance':safe_round(resistance),'trends':sp.get('trends',{}),'distance_ema20_atr':sp.get('distance_ema20_atr'),'volume_status':sp.get('volume_status'),'volume_ratio':sp.get('volume_ratio'),'buy_power':sp.get('buy_power'),'sell_power':sp.get('sell_power'),'power2_buy':sp.get('power2_buy'),'power2_sell':sp.get('power2_sell'),'power3_buy':sp.get('power3_buy'),'power3_sell':sp.get('power3_sell'),'snapshot':snapshot,'coin_risk':risk_state,'rotation':rotation,'ai_decision':{'base_min_score':base_min_score,'min_score':min_score,'ai_penalty':ai_penalty,'ai_min_score_add':ai_min_score_add,'ai_block':ai_block,'strictness_level':strict,'sl_count':sl_count,'risk_score':risk_score,'rotation_score':rs},'reasons':reasons[:20],'signal_timeframe':'AI Classic Direct'}
         if not entry_confirmed:
             return {**common,'direction':'NO TRADE','status':'NO_TRADE','entry_confirmed':False,'entry_mode':'NO_ENTRY','entry':None,'stop_loss':None,'tp1':None,'tp2':None,'risk_reward':0,'risk_level':'UNKNOWN','freshness':'LOW','tp_meta':{},'validity':'سیگنال معتبر نیست','valid_gate':valid,'min_score':min_score}
         sl,tp1,tp2,rr,tp_meta=build_trade_levels(direction,price,atr,df_5m,df_15m,df_30m,snapshot,symbol); risk_level='LOW' if final_score>=92 and confirmations>=6 else 'MEDIUM' if final_score>=86 and confirmations>=5 else 'HIGH'; freshness='HIGH' if confirmations>=6 else 'MEDIUM' if confirmations>=5 else 'LOW'
