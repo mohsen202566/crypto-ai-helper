@@ -1906,6 +1906,52 @@ class ToobitClient:
         )
 
 
+    # ---------- Compatibility aliases for managers / trackers ----------
+    def get_closed_positions(self, symbol: str | None = None, startTime: int | None = None, endTime: int | None = None, limit: int = 50, **kwargs):
+        """Backward-compatible alias for closed position history."""
+        return self.get_closed_position_history(symbol=symbol, startTime=startTime, endTime=endTime, limit=limit)
+
+    def get_futures_closed_positions(self, symbol: str | None = None, startTime: int | None = None, endTime: int | None = None, limit: int = 50, **kwargs):
+        """Backward-compatible alias for closed futures position history."""
+        return self.get_closed_position_history(symbol=symbol, startTime=startTime, endTime=endTime, limit=limit)
+
+    def get_trade_income_history(self, symbol: str | None = None, startTime: int | None = None, endTime: int | None = None, limit: int = 50, **kwargs):
+        """Backward-compatible alias for futures income/realized-PnL history."""
+        return self.get_income_history(symbol=symbol, startTime=startTime, endTime=endTime, limit=limit)
+
+    def get_futures_income_history(self, symbol: str | None = None, startTime: int | None = None, endTime: int | None = None, limit: int = 50, **kwargs):
+        """Backward-compatible alias for futures income/realized-PnL history."""
+        return self.get_income_history(symbol=symbol, startTime=startTime, endTime=endTime, limit=limit)
+
+    def get_account_income_history(self, symbol: str | None = None, startTime: int | None = None, endTime: int | None = None, limit: int = 50, **kwargs):
+        """Backward-compatible alias for account income/realized-PnL history."""
+        return self.get_income_history(symbol=symbol, startTime=startTime, endTime=endTime, limit=limit)
+
+    def get_order_history(self, symbol: str | None = None, startTime: int | None = None, endTime: int | None = None, limit: int = 50, **kwargs):
+        """Best-effort order/trade history alias used by older managers."""
+        return self.get_closed_position_history(symbol=symbol, startTime=startTime, endTime=endTime, limit=limit)
+
+    def get_closed_orders(self, symbol: str | None = None, startTime: int | None = None, endTime: int | None = None, limit: int = 50, **kwargs):
+        """Backward-compatible alias for closed order/position history."""
+        return self.get_closed_position_history(symbol=symbol, startTime=startTime, endTime=endTime, limit=limit)
+
+    def close_position(self, symbol: str, direction: str, quantity: float, **kwargs):
+        """Backward-compatible alias for closing a market futures position."""
+        return self.close_market_position(symbol, direction, quantity)
+
+    def close_futures_position(self, symbol: str, direction: str, quantity: float, **kwargs):
+        """Backward-compatible alias for closing a market futures position."""
+        return self.close_market_position(symbol, direction, quantity)
+
+    def place_order(self, symbol: str, direction: str, quantity: float, take_profit: float | None = None, stop_loss: float | None = None, **kwargs):
+        """Backward-compatible alias for placing a market futures order with TP/SL."""
+        return self.place_market_order(symbol, direction, quantity, take_profit=take_profit, stop_loss=stop_loss)
+
+    def place_futures_order(self, symbol: str, direction: str, quantity: float, take_profit: float | None = None, stop_loss: float | None = None, **kwargs):
+        """Backward-compatible alias for placing a market futures order with TP/SL."""
+        return self.place_market_order(symbol, direction, quantity, take_profit=take_profit, stop_loss=stop_loss)
+
+
 # Backward compatibility: both spellings work.
 ToBitClient = ToobitClient
 
