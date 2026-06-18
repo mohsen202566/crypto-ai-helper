@@ -36,6 +36,29 @@ except Exception:
         return raw
 
 
+
+# Optional AI learning hooks. All are fail-safe so real trading never breaks
+# if a learning module is missing or being edited during deployment.
+try:
+    from coin_learning import (
+        record_signal as _coin_record_signal,
+        update_signal_result as _coin_update_signal_result,
+        register_tp_sl_v2_result as _coin_register_tp_sl_v2_result,
+    )
+except Exception:
+    _coin_record_signal = None
+    _coin_update_signal_result = None
+    _coin_register_tp_sl_v2_result = None
+
+try:
+    from sr_learning import (
+        record_sr_event as _sr_record_event,
+        classify_sr_event_from_prices as _sr_classify_event_from_prices,
+    )
+except Exception:
+    _sr_record_event = None
+    _sr_classify_event_from_prices = None
+
 REAL_TRADE_FILE = "data/real_trade_state.json"
 
 DEFAULT_REAL_LOCK_DURATION_HOURS = 1
@@ -181,6 +204,185 @@ def _safe_float_any(value: Any, default: float = 0.0) -> float:
     except Exception:
         return default
 
+
+
+
+def _calc_move_percent(direction: Any, entry: Any, exit_price: Any) -> float:
+    try:
+        en = float(entry or 0)
+        ex = float(exit_price or 0)
+        if en <= 0 or ex <= 0:
+            return 0.0
+        direct = str(direction or "").upper()
+        if direct == "SHORT":
+            return round(((en - ex) / en) * 100.0, 6)
+        return round(((ex - en) / en) * 100.0, 6)
+    except Exception:
+        return 0.0
+
+
+def _safe_snapshot_from_signal_or_position(obj: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(obj, dict):
+        return {}
+    snap = obj.get("snapshot") if isinstance(obj.get("snapshot"), dict) else {}
+    out = dict(snap)
+    for key in (
+        "signal_id", "symbol", "direction", "entry", "price", "stop_loss", "sl", "tp1", "tp2",
+        "score", "risk_level", "risk_reward", "atr", "support", "resistance", "tp_meta",
+    ):
+        if obj.get(key) is not None and out.get(key) is None:
+            out[key] = obj.get(key)
+    if out.get("stop_loss") is None and out.get("sl") is not None:
+        out["stop_loss"] = out.get("sl")
+    return out
+
+
+def _record_real_signal_open(signal: Dict[str, Any], signal_id: str) -> None:
+    """Register an opened REAL signal for coin_learning without touching order flow."""
+    if not _coin_record_signal or not isinstance(signal, dict):
+        return
+    try:
+        item = dict(signal)
+        item["signal_id"] = signal_id
+        item["id"] = signal_id
+        item["source"] = "REAL"
+        item["signal_type"] = "REAL"
+        item["snapshot"] = _safe_snapshot_from_signal_or_position(item)
+        _coin_record_signal(item, signal_type="REAL")
+    except Exception:
+        pass
+
+
+def _classify_result_for_learning(result: Any, pnl_usd: Any = None) -> str:
+    r = str(result or "").upper().strip()
+    if r in {"TP", "TP1", "TP2", "TAKE_PROFIT", "TAKEPROFIT"}:
+        return "TP2" if r == "TP2" else "TP1"
+    if r in {"SL", "STOP", "STOP_LOSS", "STOPLOSS"}:
+        return "SL"
+    try:
+        pnl = float(pnl_usd or 0)
+        if pnl > 0:
+            return "TP1"
+        if pnl < 0:
+            return "SL"
+    except Exception:
+        pass
+    return r or "REALIZED"
+
+
+def _register_real_tp_sl_learning(
+    *,
+    signal_id: Optional[str],
+    symbol: Optional[str],
+    direction: Optional[str],
+    result: str,
+    pnl_usd: Optional[float] = None,
+    entry: Optional[float] = None,
+    exit_price: Optional[float] = None,
+    stop_loss: Optional[float] = None,
+    tp1: Optional[float] = None,
+    tp2: Optional[float] = None,
+    snapshot: Optional[Dict[str, Any]] = None,
+    max_favorable: Optional[float] = None,
+    max_adverse: Optional[float] = None,
+    sr_event: Optional[str] = None,
+    fake_breakout: Optional[bool] = None,
+) -> None:
+    """Feed REAL close results into TP/SL v2 + SR learning.
+
+    This is intentionally best-effort. Any learning error is swallowed so it can
+    never block real accounting, slot cleanup, or Toobit closing logic.
+    """
+    sym = str(symbol or "").upper().strip()
+    direct = str(direction or "").upper().strip()
+    if not sym or direct not in {"LONG", "SHORT"}:
+        return
+
+    snap = dict(snapshot or {})
+    if signal_id is not None:
+        snap.setdefault("signal_id", signal_id)
+    snap.setdefault("symbol", sym)
+    snap.setdefault("direction", direct)
+    if entry is not None:
+        snap.setdefault("entry", entry)
+        snap.setdefault("price", entry)
+    if stop_loss is not None:
+        snap.setdefault("stop_loss", stop_loss)
+    if tp1 is not None:
+        snap.setdefault("tp1", tp1)
+    if tp2 is not None:
+        snap.setdefault("tp2", tp2)
+
+    learned_result = _classify_result_for_learning(result, pnl_usd)
+    move_percent = _calc_move_percent(direct, entry or snap.get("entry") or snap.get("price"), exit_price)
+
+    # Avoid double-counting: coin_learning.register_tp_sl_v2_result itself routes
+    # through update_signal_result in the v2 learning file. Use it as the main
+    # path when available, and fall back to update_signal_result only for older
+    # coin_learning.py versions.
+    if _coin_register_tp_sl_v2_result:
+        try:
+            _coin_register_tp_sl_v2_result(
+                sym,
+                direct,
+                learned_result,
+                entry=entry or snap.get("entry") or snap.get("price"),
+                stop_loss=stop_loss,
+                tp1=tp1,
+                tp2=tp2,
+                snapshot=snap,
+                source="REAL",
+                max_favorable=max_favorable,
+                max_adverse=max_adverse,
+                sr_event=sr_event,
+                fake_breakout=fake_breakout,
+                signal_id=signal_id,
+                exit_price=exit_price,
+                move_percent=move_percent,
+            )
+        except Exception:
+            pass
+    elif _coin_update_signal_result:
+        try:
+            _coin_update_signal_result(
+                signal_id or f"REAL_{sym}_{direct}_{_now()}",
+                learned_result,
+                exit_price=exit_price,
+                move_percent=move_percent,
+                snapshot=snap,
+                source="REAL",
+                stop_loss=stop_loss,
+                tp1=tp1,
+                tp2=tp2,
+                max_favorable=max_favorable,
+                max_adverse=max_adverse,
+                sr_event=sr_event,
+                fake_breakout=fake_breakout,
+            )
+        except Exception:
+            pass
+
+    # SR learning: record both the protective level and first target level when available.
+    if _sr_record_event:
+        try:
+            en = float(entry or snap.get("entry") or snap.get("price") or 0)
+            ex = float(exit_price or 0)
+            if en > 0:
+                if stop_loss:
+                    level_type = "SUPPORT" if direct == "LONG" else "RESISTANCE"
+                    event_name = "SL" if learned_result == "SL" else "BOUNCE"
+                    _sr_record_event(sym, direct, level_type, float(stop_loss), event_name, snapshot=snap, source="REAL")
+                if tp1:
+                    level_type = "RESISTANCE" if direct == "LONG" else "SUPPORT"
+                    event_name = learned_result
+                    if _sr_classify_event_from_prices and ex > 0:
+                        try:
+                            event_name = _sr_classify_event_from_prices(direct, level_type, float(tp1), en, ex, learned_result)
+                        except Exception:
+                            event_name = learned_result
+                    _sr_record_event(sym, direct, level_type, float(tp1), event_name, snapshot=snap, source="REAL")
+        except Exception:
+            pass
 
 def _extract_order_execution_info(order_result: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -730,6 +932,15 @@ def record_realized_pnl(
     direction: Optional[str] = None,
     result: str = "REALIZED",
     exit_price: Optional[float] = None,
+    entry: Optional[float] = None,
+    stop_loss: Optional[float] = None,
+    tp1: Optional[float] = None,
+    tp2: Optional[float] = None,
+    snapshot: Optional[Dict[str, Any]] = None,
+    max_favorable: Optional[float] = None,
+    max_adverse: Optional[float] = None,
+    sr_event: Optional[str] = None,
+    fake_breakout: Optional[bool] = None,
 ) -> Dict[str, Any]:
     state = load_real_trade_state()
     _new_day_if_needed(state)
@@ -747,6 +958,11 @@ def record_realized_pnl(
         "direction": direction,
         "result": result,
         "exit_price": exit_price,
+        "entry": entry,
+        "stop_loss": stop_loss,
+        "tp1": tp1,
+        "tp2": tp2,
+        "move_percent": _calc_move_percent(direction, entry, exit_price),
         "pnl_usd": pnl_usd,
         "protected_added": protected_added,
         "balance_after": state.get("balance"),
@@ -755,6 +971,24 @@ def record_realized_pnl(
     }
     state.setdefault("closed_positions", []).append(closed_record)
     state["closed_positions"] = state["closed_positions"][-2000:]
+
+    _register_real_tp_sl_learning(
+        signal_id=signal_id,
+        symbol=symbol,
+        direction=direction,
+        result=result,
+        pnl_usd=pnl_usd,
+        entry=entry,
+        exit_price=exit_price,
+        stop_loss=stop_loss,
+        tp1=tp1,
+        tp2=tp2,
+        snapshot=snapshot,
+        max_favorable=max_favorable,
+        max_adverse=max_adverse,
+        sr_event=sr_event,
+        fake_breakout=fake_breakout,
+    )
 
     _maybe_apply_daily_lock(state)
     save_real_trade_state(state)
@@ -1019,6 +1253,11 @@ def close_real_position(
             direction=pos.get("direction"),
             result=result_type,
             exit_price=exit_price,
+            entry=pos.get("entry"),
+            stop_loss=pos.get("sl") or pos.get("stop_loss"),
+            tp1=pos.get("tp1"),
+            tp2=pos.get("tp2"),
+            snapshot=_safe_snapshot_from_signal_or_position(pos),
         )
 
     return {
@@ -1299,6 +1538,11 @@ def _register_real_open_position(state: Dict[str, Any], signal: Dict[str, Any], 
         "exchange_order": order_result.get("data"),
         "execution_info": execution_info,
         "recovered_note": recovered_note,
+        "score": signal.get("score"),
+        "risk_level": signal.get("risk_level"),
+        "risk_reward": signal.get("risk_reward"),
+        "snapshot": _safe_snapshot_from_signal_or_position(signal),
+        "tp_meta": signal.get("tp_meta"),
     }
     save_real_trade_state(state)
     return state["open_positions"][signal_id]
@@ -1345,6 +1589,11 @@ def _register_pending_real_position(
         "exchange_order": order_result.get("data"),
         "execution_info": execution_info,
         "warning": "سفارش ارسال شده و اسلات موقتاً رزرو است؛ در حال تایید پوزیشن واقعی در توبیت.",
+        "score": signal.get("score"),
+        "risk_level": signal.get("risk_level"),
+        "risk_reward": signal.get("risk_reward"),
+        "snapshot": _safe_snapshot_from_signal_or_position(signal),
+        "tp_meta": signal.get("tp_meta"),
     }
     save_real_trade_state(state)
     return state["open_positions"][signal_id]
@@ -1739,6 +1988,7 @@ def open_real_position_from_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
             execution_info["recovered_by_polling"] = True
             recovered_note = "سفارش ابتدا Pending بود، سپس با چک پوزیشن توبیت تایید و وارد اسلات شد."
             pos = _confirm_pending_real_position(signal_id, execution_info, recovered_note) or pending_pos
+            _record_real_signal_open(signal, signal_id)
             return {
                 "ok": True,
                 "signal_id": signal_id,
@@ -1763,6 +2013,7 @@ def open_real_position_from_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
                     if pos is None:
                         state_after = load_real_trade_state()
                         pos = (state_after.get("open_positions") or {}).get(signal_id) or {}
+                    _record_real_signal_open(signal, signal_id)
                     return {
                         "ok": True,
                         "signal_id": signal_id,
@@ -1798,6 +2049,7 @@ def open_real_position_from_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": False, "blocked": True, "error": "این سیگنال قبلاً پوزیشن باز دارد"}
 
     pos = _register_real_open_position(state, signal, signal_id, toobit_quantity, order_result, execution_info, recovered_note)
+    _record_real_signal_open(signal, signal_id)
     pos["real_status"] = "ACTIVE_REAL"
     pos["confirmed_at"] = _now()
     save_real_trade_state(state)
