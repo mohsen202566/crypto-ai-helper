@@ -42,13 +42,13 @@ LONG_DIRECT_SCORE_BONUS_REQUIREMENT = 0
 LONG_MIN_1H_STRICT = False
 LONG_BLOCK_IF_AGAINST_VWAP = False
 MIN_SL_ATR_MULTIPLIER = 1.30
-TP1_FALLBACK_ATR = 0.75
-TP2_FALLBACK_ATR = 1.40
+TP1_FALLBACK_ATR = 0.45
+TP2_FALLBACK_ATR = 0.90
 MAX_REASONABLE_SL_ATR = 2.40
-MIN_TP1_ATR = 0.55
-LEVEL_BUFFER_ATR = 0.14
+MIN_TP1_ATR = 0.35
+LEVEL_BUFFER_ATR = 0.08
 SL_BUFFER_ATR = 0.25
-TF_LEVEL_WEIGHTS = {'5M': 1.0, '15M': 1.6, '30M': 2.2}
+TF_LEVEL_WEIGHTS = {'5M': 3.0, '15M': 0.8, '30M': 0.3}
 LEVEL_LOOKBACK = 160
 SWING_WINDOW = 3
 
@@ -544,7 +544,7 @@ def select_level_for_sl(direction, price, atr, levels, base_distance):
     valid.sort(key=lambda x:x['strength'], reverse=True); return safe_float(valid[0]['price'])
 
 def select_level_for_tp(direction, price, atr, levels, fallback_mult, buffer):
-    candidates=[]; min_d=atr*MIN_TP1_ATR; max_d=atr*3.0
+    candidates=[]; min_d=atr*MIN_TP1_ATR; max_d=atr*1.8
     for lv in levels:
         lp=safe_float(lv['price']); target=lp-buffer if direction=='LONG' else lp+buffer; d=abs(target-price)
         if direction=='LONG' and target<=price: continue
@@ -759,8 +759,8 @@ def _tp_sl_v2_profile(symbol, direction, price, atr, snapshot, df_15m, levels):
 
     # Coin personality layer.
     if personality == "CLEAN_RUNNER":
-        tp2_mult *= 1.12
-        tp1_mult *= 1.04
+        tp2_mult *= 1.05
+        tp1_mult *= 1.02
     elif personality == "WICKY":
         sl_mult *= 1.12
         tp1_mult *= 0.96
@@ -784,8 +784,8 @@ def _tp_sl_v2_profile(symbol, direction, price, atr, snapshot, df_15m, levels):
         sl_mult *= 1.03  # hide SL beyond stronger invalidation zone
 
     # Keep safe bounds so this layer cannot create unrealistic orders.
-    tp1_mult = max(MIN_TP1_ATR, min(2.2, tp1_mult))
-    tp2_mult = max(tp1_mult + 0.35, min(4.0, tp2_mult))
+    tp1_mult = max(MIN_TP1_ATR, min(1.25, tp1_mult))
+    tp2_mult = max(tp1_mult + 0.25, min(2.0, tp2_mult))
     sl_mult = max(MIN_SL_ATR_MULTIPLIER * 0.95, min(MAX_REASONABLE_SL_ATR, sl_mult))
     return {
         "confidence": int(confidence), "personality": personality,
@@ -803,7 +803,7 @@ def _apply_tp_sl_v2(direction, price, atr, sl, tp1, tp2, profile):
 
     # Blend SR levels with memory rather than replacing them. SR still controls
     # price structure; memory nudges TP/SL to what this coin+direction usually reaches.
-    w = min(0.55, max(0.18, profile.get("confidence", 0) / 180.0))
+    w = min(0.25, max(0.10, profile.get("confidence", 0) / 250.0))
     tp1_new = safe_float(tp1) * (1 - w) + tp1_mem * w
     tp2_new = safe_float(tp2) * (1 - w) + tp2_mem * w
     sl_new = safe_float(sl) * (1 - min(0.45, w)) + sl_mem * min(0.45, w)
