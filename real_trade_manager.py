@@ -2145,6 +2145,336 @@ def get_real_trade_status_text() -> str:
 
 
 
+
+
+# ---------------------------------------------------------------------------
+# Real closed-position PnL reader
+# Used by signal_tracker.py to avoid approximate percent-based PnL.
+# ---------------------------------------------------------------------------
+
+_REAL_PNL_KEYS = (
+    "netPnl", "netPNL", "netProfit", "realizedPnl", "realizedPNL", "realized_pnl",
+    "closedPnl", "closedPNL", "closePnl", "closeProfit", "realizedProfit",
+    "profit", "pnl", "income", "amount",
+)
+
+_REAL_PNL_TIME_KEYS = (
+    "time", "timestamp", "ts", "createTime", "createdTime", "updateTime",
+    "updatedTime", "closeTime", "closedTime", "transactTime", "eventTime",
+)
+
+_REAL_PNL_SYMBOL_KEYS = (
+    "symbol", "contractCode", "instrument", "instId", "pair", "positionSymbol",
+)
+
+_REAL_PNL_DIRECTION_KEYS = (
+    "direction", "side", "positionSide", "holdSide", "tradeSide", "positionType",
+)
+
+
+def _real_pnl_timestamp_seconds(value: Any) -> int:
+    try:
+        raw = str(value or "").strip()
+        if not raw:
+            return 0
+        if raw.isdigit():
+            n = int(raw)
+            # Toobit/API timestamps are often milliseconds.
+            if n > 10_000_000_000:
+                n = int(n / 1000)
+            return n
+        # Best-effort ISO-ish parse without importing heavy deps.
+        import datetime as _dt
+        raw = raw.replace("Z", "+00:00")
+        return int(_dt.datetime.fromisoformat(raw).timestamp())
+    except Exception:
+        return 0
+
+
+def _real_pnl_symbol_from_item(item: Dict[str, Any]) -> str:
+    if not isinstance(item, dict):
+        return ""
+    for key in _REAL_PNL_SYMBOL_KEYS:
+        if item.get(key):
+            return normalize_bot_plain_symbol(str(item.get(key)))
+    return ""
+
+
+def _real_pnl_direction_from_item(item: Dict[str, Any]) -> str:
+    if not isinstance(item, dict):
+        return ""
+    text = " ".join(str(item.get(k, "")) for k in _REAL_PNL_DIRECTION_KEYS).upper()
+    if "SHORT" in text or "SELL" in text:
+        return "SHORT"
+    if "LONG" in text or "BUY" in text:
+        return "LONG"
+    return ""
+
+
+def _real_pnl_time_from_item(item: Dict[str, Any]) -> int:
+    if not isinstance(item, dict):
+        return 0
+    for key in _REAL_PNL_TIME_KEYS:
+        if item.get(key) is not None:
+            ts = _real_pnl_timestamp_seconds(item.get(key))
+            if ts > 0:
+                return ts
+    return 0
+
+
+def _real_pnl_income_type(item: Dict[str, Any]) -> str:
+    if not isinstance(item, dict):
+        return ""
+    return str(
+        item.get("incomeType")
+        or item.get("type")
+        or item.get("business")
+        or item.get("tranType")
+        or item.get("eventType")
+        or ""
+    ).upper()
+
+
+def _real_pnl_value_from_item(item: Dict[str, Any]) -> tuple[Optional[float], str]:
+    """Return (pnl, key). Keep amount/income conservative for income-history rows."""
+    if not isinstance(item, dict):
+        return None, ""
+    income_type = _real_pnl_income_type(item)
+
+    for key in _REAL_PNL_KEYS:
+        if key not in item:
+            continue
+        # Generic income history often uses `amount` for fees/funding too.
+        # Only accept amount/income as PnL when the row itself says realized/closed/profit/pnl.
+        if key in {"amount", "income"}:
+            if income_type and not any(x in income_type for x in ("REALIZED", "PNL", "PROFIT", "CLOSED", "CLOSE")):
+                continue
+        try:
+            return float(item.get(key)), key
+        except Exception:
+            continue
+    return None, ""
+
+
+def _real_pnl_records_from_response(value: Any) -> list:
+    """Flatten a Toobit-like response into realized-PnL candidate rows."""
+    rows = []
+    for item in _flatten_dicts(value):
+        if not isinstance(item, dict):
+            continue
+        pnl, key = _real_pnl_value_from_item(item)
+        if pnl is None:
+            continue
+        income_type = _real_pnl_income_type(item)
+        rows.append({
+            "pnl_usd": float(pnl),
+            "pnl_key": key,
+            "income_type": income_type,
+            "symbol": _real_pnl_symbol_from_item(item),
+            "direction": _real_pnl_direction_from_item(item),
+            "time": _real_pnl_time_from_item(item),
+            "raw": item,
+        })
+    return rows
+
+
+def _real_pnl_score_candidate(row: Dict[str, Any], symbol: str, direction: str, opened_at: int, closed_at: int) -> int:
+    score = 0
+    row_symbol = normalize_bot_plain_symbol(str(row.get("symbol") or ""))
+    wanted_symbol = normalize_bot_plain_symbol(str(symbol or ""))
+    if row_symbol and wanted_symbol and row_symbol == wanted_symbol:
+        score += 4
+    elif row_symbol:
+        score -= 8
+
+    row_dir = str(row.get("direction") or "").upper()
+    wanted_dir = str(direction or "").upper()
+    if row_dir and wanted_dir and row_dir == wanted_dir:
+        score += 2
+    elif row_dir:
+        score -= 3
+
+    ts = int(row.get("time") or 0)
+    if ts > 0 and opened_at > 0:
+        # Allow API/reporting delay after close and a small buffer before open.
+        if opened_at - 180 <= ts <= max(closed_at, opened_at) + 600:
+            score += 4
+        else:
+            score -= 4
+    elif ts > 0:
+        score += 1
+
+    key = str(row.get("pnl_key") or "")
+    income_type = str(row.get("income_type") or "").upper()
+    if key.lower().startswith("net"):
+        score += 3
+    if any(x in key.lower() for x in ("realized", "closed", "close")):
+        score += 2
+    if income_type and any(x in income_type for x in ("REALIZED", "PNL", "PROFIT", "CLOSED", "CLOSE")):
+        score += 2
+    return score
+
+
+def _call_toobit_pnl_method(method_name: str, *, symbol: str, direction: str, signal_id: str, opened_at: int, closed_at: int) -> list:
+    method = getattr(toobit_client, method_name, None)
+    if not callable(method):
+        return []
+    calls = [
+        lambda: method(symbol=symbol, direction=direction, signal_id=signal_id, opened_at=opened_at, closed_at=closed_at),
+        lambda: method(symbol=symbol, start_time=opened_at, end_time=closed_at),
+        lambda: method(symbol=symbol, startTime=opened_at * 1000 if opened_at else None, endTime=closed_at * 1000 if closed_at else None),
+        lambda: method(symbol, direction, opened_at, closed_at),
+        lambda: method(symbol, opened_at, closed_at),
+        lambda: method(symbol=symbol),
+        lambda: method(symbol),
+        lambda: method(),
+    ]
+    out = []
+    last_error = ""
+    for call in calls:
+        try:
+            res = call()
+            out.append({"method": method_name, "response": res})
+            # If one call style works, do not keep calling the same endpoint repeatedly.
+            break
+        except TypeError:
+            continue
+        except Exception as e:
+            last_error = str(e)[:250]
+            break
+    if not out and last_error:
+        out.append({"method": method_name, "error": last_error})
+    return out
+
+
+def get_real_pnl_for_closed_position(
+    *,
+    signal_id: Optional[str] = None,
+    symbol: Optional[str] = None,
+    direction: Optional[str] = None,
+    opened_at: Optional[int] = None,
+    closed_at: Optional[int] = None,
+    exit_price: Optional[float] = None,
+    result: Optional[str] = None,
+    position: Optional[Dict[str, Any]] = None,
+    signal: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Return confirmed REAL Toobit PnL for a recently closed futures position.
+
+    This function intentionally does NOT use the old percent formula. It only
+    returns ok=True when a Toobit/client history endpoint provides a realized or
+    closed PnL row that matches the symbol/time reasonably well. If no confirmed
+    exchange row is available, signal_tracker.py will label its own fallback as
+    approximate.
+    """
+    pos = position if isinstance(position, dict) else {}
+    sig = signal if isinstance(signal, dict) else {}
+    sym = normalize_bot_plain_symbol(str(symbol or pos.get("symbol") or sig.get("symbol") or ""))
+    direct = str(direction or pos.get("direction") or sig.get("direction") or "").upper()
+    sid = str(signal_id or pos.get("signal_id") or sig.get("signal_id") or sig.get("id") or "")
+    opened = int(opened_at or pos.get("opened_at") or sig.get("created_at") or 0)
+    closed = int(closed_at or _now())
+
+    if not sym:
+        return {"ok": False, "error": "symbol missing for real pnl lookup"}
+
+    # Most reliable first. Names are compatibility hooks for future/current tobit_client.py versions.
+    methods = (
+        "get_closed_position_pnl",
+        "get_realized_pnl_for_position",
+        "get_recent_closed_pnl",
+        "get_position_realized_pnl",
+        "get_closed_position_history",
+        "get_closed_positions",
+        "get_futures_closed_positions",
+        "get_income_history",
+        "get_trade_income_history",
+        "get_futures_income_history",
+        "get_account_income_history",
+        "get_order_history",
+        "get_closed_orders",
+    )
+
+    all_rows = []
+    raw_sources = []
+    errors = []
+    for method_name in methods:
+        calls = _call_toobit_pnl_method(
+            method_name,
+            symbol=sym,
+            direction=direct,
+            signal_id=sid,
+            opened_at=opened,
+            closed_at=closed,
+        )
+        for call_result in calls:
+            if call_result.get("error"):
+                errors.append(f"{method_name}: {call_result.get('error')}")
+                continue
+            raw = call_result.get("response")
+            raw_sources.append({"method": method_name, "raw": raw})
+            for row in _real_pnl_records_from_response(raw):
+                row["method"] = method_name
+                row["score"] = _real_pnl_score_candidate(row, sym, direct, opened, closed)
+                all_rows.append(row)
+        # A strong match from a reliable closed-position method is enough.
+        strong = [r for r in all_rows if r.get("method") == method_name and int(r.get("score") or 0) >= 6]
+        if strong and method_name not in {"get_income_history", "get_trade_income_history", "get_futures_income_history", "get_account_income_history"}:
+            break
+
+    if not all_rows:
+        return {
+            "ok": False,
+            "error": "confirmed Toobit closed PnL not found",
+            "methods_checked": list(methods),
+            "errors": errors[-5:],
+        }
+
+    # Prefer rows that match symbol/time/direction. Avoid random account-level amounts.
+    candidates = [r for r in all_rows if int(r.get("score") or 0) >= 4]
+    if not candidates:
+        return {
+            "ok": False,
+            "error": "Toobit PnL rows found but none matched this symbol/time",
+            "candidate_count": len(all_rows),
+            "best_score": max(int(r.get("score") or 0) for r in all_rows),
+        }
+
+    # For income-history realized PnL, multiple rows may belong to the same close.
+    income_rows = [
+        r for r in candidates
+        if str(r.get("method") or "") in {"get_income_history", "get_trade_income_history", "get_futures_income_history", "get_account_income_history"}
+        and any(x in str(r.get("income_type") or "").upper() for x in ("REALIZED", "PNL", "PROFIT", "CLOSED", "CLOSE"))
+    ]
+    if income_rows:
+        # Deduplicate by method/time/symbol/type/pnl to avoid double-counting nested response copies.
+        unique = {}
+        for r in income_rows:
+            key = (r.get("method"), r.get("time"), r.get("symbol"), r.get("income_type"), r.get("pnl_usd"))
+            unique[key] = r
+        rows = list(unique.values())
+        pnl_sum = round(sum(float(r.get("pnl_usd") or 0) for r in rows), 6)
+        return {
+            "ok": True,
+            "pnl_usd": pnl_sum,
+            "source": "TOOBIT_INCOME_HISTORY",
+            "matched_rows": len(rows),
+            "symbol": sym,
+            "direction": direct,
+            "raw": [r.get("raw") for r in rows[:10]],
+        }
+
+    best = sorted(candidates, key=lambda r: (int(r.get("score") or 0), int(r.get("time") or 0)), reverse=True)[0]
+    return {
+        "ok": True,
+        "pnl_usd": round(float(best.get("pnl_usd") or 0), 6),
+        "source": f"TOOBIT:{best.get('method')}:{best.get('pnl_key')}",
+        "symbol": sym,
+        "direction": direct,
+        "score": best.get("score"),
+        "raw": best.get("raw"),
+    }
+
 # ---------------------------------------------------------------------------
 # Extra bot.py compatibility functions
 # bot.py imports these names directly. Keep them top-level.
