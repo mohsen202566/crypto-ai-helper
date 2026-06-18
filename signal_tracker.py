@@ -59,6 +59,13 @@ TRACKER_LOOKBACK_BUFFER_SECONDS = 90
 TRACKER_MAX_OHLCV_LIMIT = 180
 SAME_CANDLE_HIT_POLICY = "SL_FIRST"
 
+# Real Toobit PnL can appear in history a little late after TP/SL closes.
+# Do not send/record an exchange PnL immediately as "real" unless a valid
+# non-suspicious realized PnL row is found.
+REAL_PNL_WAIT_SECONDS = int(os.getenv("REAL_PNL_WAIT_SECONDS", "45") or "45")
+REAL_PNL_RETRY_INTERVAL_SECONDS = int(os.getenv("REAL_PNL_RETRY_INTERVAL_SECONDS", "5") or "5")
+REAL_PNL_ACCEPT_ZERO_WHEN_MOVE_BELOW_PCT = float(os.getenv("REAL_PNL_ACCEPT_ZERO_WHEN_MOVE_BELOW_PCT", "0.01") or "0.01")
+
 exchange = ccxt.okx({
     "enableRateLimit": True,
     "timeout": 20000,
@@ -478,76 +485,133 @@ def _extract_realized_pnl_from_any(value: Any) -> Optional[float]:
     return walk(value)
 
 
-def _fetch_real_closed_pnl_from_exchange(signal: Dict[str, Any], pos: Optional[Dict[str, Any]], hit_type: str, exit_price: float) -> Dict[str, Any]:
-    """Read REAL closed-position PnL from Toobit when available.
 
-    This function is fail-safe. It never guesses as 'real'. If Toobit/manager
-    cannot return a confirmed closed PnL, caller can fall back to approximate
-    calculation and label it as approximate.
+def _is_real_pnl_value_confirmed(pnl: Any, pct: Optional[float]) -> Tuple[bool, str]:
+    """Reject suspicious 0.0 PnL when the signal clearly moved.
+
+    Toobit history can temporarily return rows with amount/income=0 or no final
+    realized PnL right after TP/SL. Treat those as NOT_READY instead of real.
+    """
+    try:
+        value = float(pnl)
+    except Exception:
+        return False, "PNL_NOT_NUMERIC"
+
+    try:
+        movement = abs(float(pct or 0))
+    except Exception:
+        movement = 0.0
+
+    if abs(value) <= 0.00000001 and movement >= REAL_PNL_ACCEPT_ZERO_WHEN_MOVE_BELOW_PCT:
+        return False, "ZERO_PNL_SUSPICIOUS_WAITING_FOR_TOOBIT"
+
+    return True, "OK"
+
+
+def _fetch_real_closed_pnl_from_exchange(signal: Dict[str, Any], pos: Optional[Dict[str, Any]], hit_type: str, exit_price: float, pct: Optional[float] = None) -> Dict[str, Any]:
+    """Read REAL closed-position PnL from Toobit with delayed retries.
+
+    The tracker waits up to REAL_PNL_WAIT_SECONDS and retries every
+    REAL_PNL_RETRY_INTERVAL_SECONDS. It never labels 0.0 as real when the signal
+    movement is clearly non-zero, because Toobit sometimes exposes final history
+    a few seconds after the position disappears from open positions.
     """
     symbol = str((pos or {}).get("symbol") or signal.get("symbol") or "").upper()
     direction = str((pos or {}).get("direction") or signal.get("direction") or "").upper()
     signal_id = str(signal.get("signal_id") or signal.get("id") or (pos or {}).get("signal_id") or "")
     opened_at = int((pos or {}).get("opened_at") or signal.get("created_at") or 0)
-    closed_at = now_ts()
+    last_error = "real closed pnl not available"
+    checked_sources: List[Dict[str, Any]] = []
 
-    # Preferred project-level hook in real_trade_manager.py if it exists.
-    if callable(get_real_pnl_for_closed_position):
-        try:
-            res = get_real_pnl_for_closed_position(
-                signal_id=signal_id,
-                symbol=symbol,
-                direction=direction,
-                opened_at=opened_at,
-                closed_at=closed_at,
-                exit_price=exit_price,
-                result=hit_type,
-                position=pos,
-                signal=signal,
-            )
-            if isinstance(res, dict) and res.get("ok") and res.get("pnl_usd") is not None:
-                return {"ok": True, "pnl_usd": float(res.get("pnl_usd")), "source": res.get("source") or "TOOBIT", "raw": res}
-        except Exception as e:
-            last_error = str(e)[:250]
+    wait_seconds = max(0, int(REAL_PNL_WAIT_SECONDS))
+    interval = max(1, int(REAL_PNL_RETRY_INTERVAL_SECONDS))
+    deadline = time.time() + wait_seconds
+    attempt = 0
+
+    while True:
+        attempt += 1
+        closed_at = now_ts()
+
+        # Preferred project-level hook in real_trade_manager.py if it exists.
+        if callable(get_real_pnl_for_closed_position):
+            try:
+                res = get_real_pnl_for_closed_position(
+                    signal_id=signal_id,
+                    symbol=symbol,
+                    direction=direction,
+                    opened_at=opened_at,
+                    closed_at=closed_at,
+                    exit_price=exit_price,
+                    result=hit_type,
+                    position=pos,
+                    signal=signal,
+                )
+                if isinstance(res, dict) and res.get("ok") and res.get("pnl_usd") is not None:
+                    pnl_value = float(res.get("pnl_usd"))
+                    confirmed, reason = _is_real_pnl_value_confirmed(pnl_value, pct)
+                    checked_sources.append({"attempt": attempt, "source": "manager", "confirmed": confirmed, "reason": reason, "pnl": pnl_value})
+                    if confirmed:
+                        return {"ok": True, "pnl_usd": pnl_value, "source": res.get("source") or "TOOBIT", "raw": res, "attempts": attempt}
+                    last_error = reason
+                else:
+                    last_error = "manager returned no confirmed pnl"
+                    checked_sources.append({"attempt": attempt, "source": "manager", "confirmed": False, "reason": last_error})
+            except Exception as e:
+                last_error = str(e)[:250]
+                checked_sources.append({"attempt": attempt, "source": "manager", "confirmed": False, "error": last_error})
         else:
-            last_error = "manager returned no confirmed pnl"
-    else:
-        last_error = "real_trade_manager pnl hook missing"
+            last_error = "real_trade_manager pnl hook missing"
 
-    # Direct tobit_client compatibility hooks if present.
-    if toobit_client is not None:
-        candidates = (
-            "get_closed_position_pnl",
-            "get_realized_pnl_for_position",
-            "get_recent_closed_pnl",
-            "get_position_realized_pnl",
-            "get_closed_position_history",
-            "get_income_history",
-        )
-        for name in candidates:
-            method = getattr(toobit_client, name, None)
-            if not callable(method):
-                continue
-            call_styles = [
-                lambda m=method: m(symbol=symbol, direction=direction, signal_id=signal_id, opened_at=opened_at, closed_at=closed_at),
-                lambda m=method: m(symbol, direction, opened_at, closed_at),
-                lambda m=method: m(symbol=symbol),
-                lambda m=method: m(symbol),
-            ]
-            for call in call_styles:
-                try:
-                    res = call()
-                    pnl = _extract_realized_pnl_from_any(res)
-                    ok = bool(res.get("ok", True)) if isinstance(res, dict) else True
-                    if ok and pnl is not None:
-                        return {"ok": True, "pnl_usd": float(pnl), "source": f"TOOBIT:{name}", "raw": res}
-                except TypeError:
+        # Direct tobit_client compatibility hooks if present.
+        if toobit_client is not None:
+            candidates = (
+                "get_closed_position_pnl",
+                "get_realized_pnl_for_position",
+                "get_recent_closed_pnl",
+                "get_position_realized_pnl",
+                "get_closed_position_history",
+                "get_income_history",
+            )
+            for name in candidates:
+                method = getattr(tobit_client, name, None)
+                if not callable(method):
                     continue
-                except Exception as e:
-                    last_error = str(e)[:250]
-                    break
+                call_styles = [
+                    lambda m=method: m(symbol=symbol, direction=direction, signal_id=signal_id, opened_at=opened_at, closed_at=closed_at),
+                    lambda m=method: m(symbol, direction, opened_at, closed_at),
+                    lambda m=method: m(symbol=symbol),
+                    lambda m=method: m(symbol),
+                ]
+                for call in call_styles:
+                    try:
+                        res = call()
+                        pnl = _extract_realized_pnl_from_any(res)
+                        ok = bool(res.get("ok", True)) if isinstance(res, dict) else True
+                        if ok and pnl is not None:
+                            confirmed, reason = _is_real_pnl_value_confirmed(pnl, pct)
+                            checked_sources.append({"attempt": attempt, "source": name, "confirmed": confirmed, "reason": reason, "pnl": pnl})
+                            if confirmed:
+                                return {"ok": True, "pnl_usd": float(pnl), "source": f"TOOBIT:{name}", "raw": res, "attempts": attempt}
+                            last_error = reason
+                    except TypeError:
+                        continue
+                    except Exception as e:
+                        last_error = str(e)[:250]
+                        checked_sources.append({"attempt": attempt, "source": name, "confirmed": False, "error": last_error})
+                        break
 
-    return {"ok": False, "error": last_error or "real closed pnl not available"}
+        if time.time() >= deadline:
+            break
+        time.sleep(interval)
+
+    return {
+        "ok": False,
+        "error": last_error or "real closed pnl not available after retries",
+        "attempts": attempt,
+        "wait_seconds": wait_seconds,
+        "retry_interval": interval,
+        "sources_checked": checked_sources[-20:],
+    }
 
 def record_real_trade_result_for_signal(signal: Dict[str, Any], hit_type: str, exit_price: float, pct: float) -> Optional[Dict[str, Any]]:
     """
@@ -620,7 +684,7 @@ def record_real_trade_result_for_signal(signal: Dict[str, Any], hit_type: str, e
                 "leverage": leverage,
             }
 
-        exchange_pnl = _fetch_real_closed_pnl_from_exchange(signal, pos, hit_type, exit_price)
+        exchange_pnl = _fetch_real_closed_pnl_from_exchange(signal, pos, hit_type, exit_price, pct=pct)
         pnl_source = "TOOBIT_REAL" if exchange_pnl.get("ok") else "APPROX_FALLBACK"
         pnl_error = exchange_pnl.get("error")
 
@@ -719,7 +783,7 @@ def check_active_signals() -> List[Dict[str, Any]]:
                         f"\nسرمایه محافظت‌شده: {acc.get('protected_balance')}$"
                     )
                     if source != "TOOBIT_REAL" and real_trade_accounting.get("pnl_error"):
-                        text += f"\n⚠️ سود واقعی از توبیت خوانده نشد؛ عدد بالا تخمینی است."
+                        text += f"\n⚠️ سود واقعی از توبیت بعد از چند تلاش خوانده نشد؛ عدد بالا تخمینی است."
                     if acc.get("daily_locked"):
                         text += "\n🚨 قفل ضرر روزانه فعال شد."
                 elif isinstance(real_trade_accounting, dict) and real_trade_accounting.get("error"):
