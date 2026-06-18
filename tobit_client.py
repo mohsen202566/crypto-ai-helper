@@ -1350,6 +1350,245 @@ class ToobitClient:
         return self._signed_request("POST", "/api/v1/futures/order", params)
 
 
+    # ---------- Closed PnL / history ----------
+    def _extract_realized_pnl_value(self, item) -> float | None:
+        """Best-effort realized-PnL extractor from Toobit history rows."""
+        if not isinstance(item, dict):
+            return None
+        pnl_keys = (
+            "realizedPnl", "realizedPNL", "realized_pnl", "closedPnl", "closedPNL",
+            "closePnl", "closeProfit", "profit", "pnl", "netPnl", "netProfit",
+            "realizedProfit", "income", "amount", "feeIncome", "tradePnl",
+        )
+        for key in pnl_keys:
+            if key not in item:
+                continue
+            try:
+                value = item.get(key)
+                if value is not None and str(value).strip() != "":
+                    return float(value)
+            except Exception:
+                pass
+        return None
+
+    def _extract_timestamp_value(self, item) -> int:
+        """Return timestamp in milliseconds when present, otherwise 0."""
+        if not isinstance(item, dict):
+            return 0
+        for key in ("time", "timestamp", "ts", "createdTime", "createTime", "updatedTime", "closeTime", "closedTime", "transactTime"):
+            try:
+                value = item.get(key)
+                if value is None or str(value).strip() == "":
+                    continue
+                ts = int(float(value))
+                # seconds -> milliseconds
+                if ts and ts < 10_000_000_000:
+                    ts *= 1000
+                return ts
+            except Exception:
+                pass
+        return 0
+
+    def _history_symbol_matches(self, item: dict, symbol: str) -> bool:
+        if not isinstance(item, dict):
+            return False
+        wanted = set(self._symbol_candidates(symbol))
+        if not wanted:
+            return False
+        for key in ("symbol", "contractCode", "instrument", "instId", "pair", "symbolName", "contract", "contractName"):
+            value = item.get(key)
+            if value is None or str(value).strip() == "":
+                continue
+            if set(self._symbol_candidates(str(value))) & wanted:
+                return True
+        # Some income endpoints omit symbol when symbol filter was accepted.
+        return not any(item.get(k) for k in ("symbol", "contractCode", "instrument", "instId", "pair", "symbolName", "contract", "contractName"))
+
+    def _history_direction_matches(self, item: dict, direction: str) -> bool:
+        """Best-effort direction matcher; accepts unknown side to avoid missing PnL rows."""
+        direction = str(direction or "").upper().strip()
+        if direction not in {"LONG", "SHORT"}:
+            return True
+        raw = " ".join(str(item.get(k, "")) for k in (
+            "side", "positionSide", "direction", "positionType", "holdSide", "tradeSide", "sideType", "positionDirection"
+        )).upper()
+        if not raw.strip():
+            return True
+        if direction == "LONG":
+            return "LONG" in raw or "BUY" in raw or "SELL_CLOSE" in raw or "CLOSE_LONG" in raw
+        return "SHORT" in raw or "SELL" in raw or "BUY_CLOSE" in raw or "CLOSE_SHORT" in raw
+
+    def _flatten_history_items(self, result):
+        """Return rows that may contain realized pnl/history information."""
+        data = (result or {}).get("data") if isinstance(result, dict) else result
+        out = []
+        history_keys = {
+            "realizedPnl", "realizedPNL", "realized_pnl", "closedPnl", "closedPNL", "closePnl",
+            "closeProfit", "profit", "pnl", "netPnl", "netProfit", "realizedProfit", "income", "amount",
+            "symbol", "contractCode", "instrument", "instId", "pair", "time", "timestamp", "closeTime", "closedTime",
+        }
+        def walk(value):
+            if isinstance(value, dict):
+                if any(k in value for k in history_keys):
+                    out.append(value)
+                for v in value.values():
+                    if isinstance(v, (dict, list)):
+                        walk(v)
+            elif isinstance(value, list):
+                for item in value:
+                    walk(item)
+        walk(data)
+        if not out and isinstance(data, dict):
+            out.append(data)
+        return out
+
+    def _signed_history_request_candidates(self, paths: tuple[str, ...], params: dict):
+        """Try several compatible Toobit history endpoints without raising."""
+        attempts = []
+        for path in paths:
+            try:
+                result = self._signed_request("GET", path, params)
+            except Exception as e:
+                result = {"ok": False, "error": str(e), "path": path}
+            attempts.append({
+                "path": path,
+                "ok": bool(isinstance(result, dict) and result.get("ok")),
+                "error": (result or {}).get("error") if isinstance(result, dict) else None,
+            })
+            if isinstance(result, dict) and result.get("ok"):
+                result.setdefault("history_endpoint", path)
+                result.setdefault("attempts", attempts[-3:])
+                return result
+        return {"ok": False, "error": "No Toobit history endpoint returned success", "attempts": attempts[-8:]}
+
+    def get_income_history(self, symbol: str | None = None, startTime: int | None = None, endTime: int | None = None, limit: int = 50):
+        """Read futures income/realized-PnL history using safe endpoint fallbacks."""
+        params = {"limit": int(limit or 50)}
+        if symbol:
+            params["symbol"] = self.normalize_futures_symbol(symbol)
+        if startTime:
+            params["startTime"] = int(startTime)
+        if endTime:
+            params["endTime"] = int(endTime)
+
+        return self._signed_history_request_candidates(
+            (
+                "/api/v1/futures/income",
+                "/api/v1/futures/incomeHistory",
+                "/api/v1/futures/income/history",
+                "/api/v1/futures/account/income",
+            ),
+            params,
+        )
+
+    def get_closed_position_history(self, symbol: str | None = None, startTime: int | None = None, endTime: int | None = None, limit: int = 50):
+        """Read closed-position/order/trade history using compatible Toobit endpoint fallbacks."""
+        params = {"limit": int(limit or 50)}
+        if symbol:
+            params["symbol"] = self.normalize_futures_symbol(symbol)
+        if startTime:
+            params["startTime"] = int(startTime)
+        if endTime:
+            params["endTime"] = int(endTime)
+
+        return self._signed_history_request_candidates(
+            (
+                "/api/v1/futures/closedPositions",
+                "/api/v1/futures/closedPosition",
+                "/api/v1/futures/positionHistory",
+                "/api/v1/futures/position/history",
+                "/api/v1/futures/userTrades",
+                "/api/v1/futures/myTrades",
+                "/api/v1/futures/trades",
+                "/api/v1/futures/order/trades",
+            ),
+            params,
+        )
+
+    def get_recent_closed_pnl(self, symbol: str, direction: str | None = None, opened_at: int | None = None, closed_at: int | None = None, limit: int = 80):
+        """Return confirmed realized PnL for a recently closed futures position.
+
+        The result is marked ok only when a numeric realized PnL is found from
+        Toobit history. It never fabricates a value.
+        """
+        symbol = str(symbol or "").upper().strip()
+        direction = str(direction or "").upper().strip()
+        now_ms = self._now_ms()
+        start_ms = int(opened_at or 0)
+        if start_ms and start_ms < 10_000_000_000:
+            start_ms *= 1000
+        end_ms = int(closed_at or 0)
+        if end_ms and end_ms < 10_000_000_000:
+            end_ms *= 1000
+        if not end_ms:
+            end_ms = now_ms
+        # Give Toobit a small settlement window and include a pre-open buffer.
+        query_start = max(0, (start_ms or (end_ms - 30 * 60 * 1000)) - 3 * 60 * 1000)
+        query_end = end_ms + 3 * 60 * 1000
+
+        sources = []
+        for name, getter in (
+            ("income_history", self.get_income_history),
+            ("closed_position_history", self.get_closed_position_history),
+        ):
+            try:
+                res = getter(symbol=symbol, startTime=query_start, endTime=query_end, limit=limit)
+            except TypeError:
+                res = getter(symbol)
+            except Exception as e:
+                sources.append({"source": name, "ok": False, "error": str(e)[:250]})
+                continue
+
+            if not isinstance(res, dict) or not res.get("ok"):
+                sources.append({"source": name, "ok": False, "error": (res or {}).get("error") if isinstance(res, dict) else str(res)[:250], "attempts": (res or {}).get("attempts") if isinstance(res, dict) else None})
+                continue
+
+            rows = self._flatten_history_items(res)
+            matched = []
+            pnl_sum = 0.0
+            for item in rows:
+                if not isinstance(item, dict):
+                    continue
+                if not self._history_symbol_matches(item, symbol):
+                    continue
+                if direction and not self._history_direction_matches(item, direction):
+                    continue
+                ts = self._extract_timestamp_value(item)
+                if ts and (ts < query_start or ts > query_end):
+                    continue
+                pnl = self._extract_realized_pnl_value(item)
+                if pnl is None:
+                    continue
+                matched.append(item)
+                pnl_sum += float(pnl)
+
+            sources.append({"source": name, "ok": True, "endpoint": res.get("history_endpoint"), "rows": len(rows), "matched": len(matched)})
+            if matched:
+                return {
+                    "ok": True,
+                    "pnl_usd": round(pnl_sum, 8),
+                    "source": name,
+                    "endpoint": res.get("history_endpoint"),
+                    "matched_rows": matched[-10:],
+                    "query": {"symbol": symbol, "direction": direction, "startTime": query_start, "endTime": query_end},
+                    "sources_checked": sources,
+                }
+
+        return {"ok": False, "error": "realized pnl row not found in Toobit history", "sources_checked": sources}
+
+    def get_closed_position_pnl(self, symbol: str, direction: str | None = None, signal_id: str | None = None, opened_at: int | None = None, closed_at: int | None = None, **kwargs):
+        """Compatibility hook used by signal_tracker/real_trade_manager."""
+        return self.get_recent_closed_pnl(symbol=symbol, direction=direction, opened_at=opened_at, closed_at=closed_at)
+
+    def get_realized_pnl_for_position(self, symbol: str, direction: str | None = None, opened_at: int | None = None, closed_at: int | None = None, **kwargs):
+        """Compatibility alias for closed PnL lookup."""
+        return self.get_recent_closed_pnl(symbol=symbol, direction=direction, opened_at=opened_at, closed_at=closed_at)
+
+    def get_position_realized_pnl(self, symbol: str, direction: str | None = None, opened_at: int | None = None, closed_at: int | None = None, **kwargs):
+        """Compatibility alias for closed PnL lookup."""
+        return self.get_recent_closed_pnl(symbol=symbol, direction=direction, opened_at=opened_at, closed_at=closed_at)
+
+
 # Backward compatibility: both spellings work.
 ToBitClient = ToobitClient
 
