@@ -62,10 +62,11 @@ except Exception:
     get_direction_risk_state = None
 
 try:
-    from coin_learning import should_require_extra_strength, get_smart_tp_suggestion
+    from coin_learning import should_require_extra_strength, get_smart_tp_suggestion, get_similarity_adjustment
 except Exception:
     should_require_extra_strength = None
     get_smart_tp_suggestion = None
+    get_similarity_adjustment = None
 
 try:
     from sr_learning import get_liquidity_trap_profile, suggest_liquidity_aware_buffer
@@ -326,12 +327,77 @@ def _time_risk_adjustment(snapshot: Dict[str, Any]) -> Tuple[float, List[str]]:
     return round(penalty, 4), ([f"Time risk={int(score)}"] if score >= 40 else [])
 
 
+
+
+def _similarity_adjustment(symbol: str, direction: str, snapshot: Dict[str, Any]) -> Tuple[Dict[str, Any], float, List[str]]:
+    """Historical Similarity Engine layer.
+
+    Uses coin_learning.get_similarity_adjustment when available. This is a soft
+    decision layer only: similar profitable historical snapshots can improve the
+    final AI rank, while similar weak/SL-heavy snapshots reduce priority or send
+    the signal to Ghost through the normal scanner approval path.
+    """
+    if not get_similarity_adjustment:
+        return {}, 0.0, []
+    try:
+        try:
+            sim = get_similarity_adjustment(symbol, direction, snapshot=snapshot)
+        except TypeError:
+            sim = get_similarity_adjustment(symbol, direction, snapshot)
+    except Exception:
+        return {}, 0.0, []
+
+    if not isinstance(sim, dict):
+        return {}, 0.0, []
+
+    # Accept several possible field names to stay compatible with future
+    # coin_learning.py versions.
+    adj = None
+    for key in ("rank_adjustment", "score_adjustment", "adjustment", "ai_adjustment"):
+        if sim.get(key) is not None:
+            adj = _safe_float(sim.get(key), 0.0)
+            break
+    if adj is None:
+        wr = _safe_float(sim.get("win_rate"), None)
+        matches = _safe_int(sim.get("matches") or sim.get("sample_count") or sim.get("similar_count"), 0)
+        confidence = _safe_float(sim.get("confidence"), 0.0)
+        if wr is None:
+            adj = 0.0
+        else:
+            # Conservative fallback: no strong effect unless there are enough
+            # similar examples. Ghost has lower weight inside coin_learning.
+            match_factor = min(1.0, max(0.0, matches / 20.0))
+            conf_factor = min(1.0, max(0.25, confidence / 100.0))
+            adj = (wr - 55.0) / 7.5 * match_factor * conf_factor
+
+    adj = max(-8.0, min(8.0, _safe_float(adj, 0.0)))
+
+    reasons: List[str] = []
+    matches = _safe_int(sim.get("matches") or sim.get("sample_count") or sim.get("similar_count"), 0)
+    wr_val = sim.get("win_rate")
+    risk = str(sim.get("risk") or sim.get("pattern_risk") or "").upper()
+    label = str(sim.get("label") or sim.get("pattern_label") or sim.get("status") or "").upper()
+
+    if matches:
+        if wr_val is not None:
+            reasons.append(f"Similarity {matches}x WR={round(_safe_float(wr_val),1)} adj={round(adj,1)}")
+        else:
+            reasons.append(f"Similarity {matches}x adj={round(adj,1)}")
+    elif abs(adj) >= 1.0:
+        reasons.append(f"Similarity adj={round(adj,1)}")
+    if risk in {"HIGH", "BAD", "WEAK"}:
+        reasons.append(f"Similarity risk={risk}")
+    if label and label not in {"UNKNOWN", "NA", "NONE"} and len(reasons) < 3:
+        reasons.append(f"Similarity {label}")
+
+    return sim, round(adj, 4), reasons
 def _meta_weights(symbol: str, direction: str, snapshot: Dict[str, Any]) -> Dict[str, float]:
     """Best-effort adaptive weights. Neutral defaults keep compatibility."""
     weights = {
         "prediction": 1.0,
         "risk": 1.0,
         "learning": 1.0,
+        "similarity": 1.0,
         "liquidity": 1.0,
         "time": 1.0,
         "rotation": 1.0,
@@ -375,6 +441,7 @@ def apply_ai_scanner_decision(r: Dict[str, Any]) -> Dict[str, Any]:
 
     risk_state, risk_penalty, risk_extra_conf, risk_reasons = _risk_adjustment(symbol, direction, snapshot)
     learning_state, learning_penalty, learning_extra_conf, learning_reasons = _learning_adjustment(symbol, direction, snapshot)
+    similarity_state, similarity_adj, similarity_reasons = _similarity_adjustment(symbol, direction, snapshot)
     rotation_score = _get_rotation_score(symbol, direction, snapshot)
     prediction_adj, prediction_reasons = _prediction_adjustment(snapshot)
     liquidity_state, liquidity_penalty, liquidity_reasons = _liquidity_adjustment(symbol, direction, snapshot)
@@ -387,11 +454,12 @@ def apply_ai_scanner_decision(r: Dict[str, Any]) -> Dict[str, Any]:
 
     weighted_risk_penalty = risk_penalty * meta_w.get('risk', 1.0)
     weighted_learning_penalty = learning_penalty * meta_w.get('learning', 1.0)
+    weighted_similarity_adj = similarity_adj * meta_w.get('similarity', 1.0)
     weighted_liquidity_penalty = liquidity_penalty * meta_w.get('liquidity', 1.0)
     weighted_time_penalty = time_penalty * meta_w.get('time', 1.0)
     weighted_prediction_adj = prediction_adj * meta_w.get('prediction', 1.0)
 
-    final_score = base_score - weighted_risk_penalty - weighted_learning_penalty - weighted_liquidity_penalty - weighted_time_penalty + rotation_adj + weighted_prediction_adj
+    final_score = base_score - weighted_risk_penalty - weighted_learning_penalty - weighted_liquidity_penalty - weighted_time_penalty + rotation_adj + weighted_prediction_adj + weighted_similarity_adj
     required_score = base_min + weighted_learning_penalty + min(6.0, weighted_risk_penalty * 0.35) + min(4.0, weighted_liquidity_penalty * 0.35) + min(3.0, weighted_time_penalty * 0.35)
     required_confirmations = base_req_conf + risk_extra_conf + learning_extra_conf
 
@@ -420,12 +488,13 @@ def apply_ai_scanner_decision(r: Dict[str, Any]) -> Dict[str, Any]:
 
     # Do not fully erase high-quality analysis results; if rejected, they can
     # become Ghost signals for learning instead of Telegram/live entry.
-    ai_rank = base_rank + (final_score - base_score) + rotation_adj + weighted_prediction_adj
+    ai_rank = base_rank + (final_score - base_score) + rotation_adj + weighted_prediction_adj + weighted_similarity_adj
 
     r["symbol"] = symbol
     r["snapshot"] = snapshot
     r["coin_risk"] = risk_state
     r["ai_learning"] = learning_state
+    r["similarity_learning"] = similarity_state
     r["liquidity_trap"] = liquidity_state
     r["rotation_score"] = rotation_score
     r["meta_weights"] = meta_w
@@ -438,13 +507,14 @@ def apply_ai_scanner_decision(r: Dict[str, Any]) -> Dict[str, Any]:
         "ai_final_rank": round(ai_rank, 4),
         "risk_penalty": round(weighted_risk_penalty, 4),
         "learning_penalty": round(weighted_learning_penalty, 4),
+        "similarity_adjustment": round(weighted_similarity_adj, 4),
         "liquidity_penalty": round(weighted_liquidity_penalty, 4),
         "time_penalty": round(weighted_time_penalty, 4),
         "prediction_adjustment": round(weighted_prediction_adj, 4),
         "rotation_adjustment": round(rotation_adj, 4),
         "required_confirmations": required_confirmations,
         "actual_confirmations": actual_conf,
-        "reasons": risk_reasons + learning_reasons + prediction_reasons + liquidity_reasons + time_reasons + reject_reasons,
+        "reasons": risk_reasons + learning_reasons + similarity_reasons + prediction_reasons + liquidity_reasons + time_reasons + reject_reasons,
     }
     r["ai_final_score"] = round(final_score, 4)
     r["ai_final_rank"] = round(ai_rank, 4)
@@ -494,6 +564,8 @@ def save_as_ghost(r, reason="SLOT_FULL"):
         snap = _build_scanner_snapshot(rr)
         if rr.get("ai_scanner"):
             snap["ai_scanner"] = rr.get("ai_scanner")
+        if rr.get("similarity_learning"):
+            snap["similarity_learning"] = rr.get("similarity_learning")
         if rr.get("liquidity_trap"):
             snap["liquidity_trap"] = rr.get("liquidity_trap")
         if rr.get("meta_weights"):
