@@ -21,6 +21,11 @@ except Exception:
     update_signal_result = None
 
 try:
+    from coin_learning import register_dynamic_profit_exit
+except Exception:
+    register_dynamic_profit_exit = None
+
+try:
     from coin_risk import register_result, register_real_result, register_ghost_result
 except Exception:
     register_result = None
@@ -39,12 +44,16 @@ try:
         save_real_trade_state,
         record_realized_pnl,
         get_real_pnl_for_closed_position,
+        check_dynamic_profit_protection,
+        close_real_position,
     )
 except Exception:
     load_real_trade_state = None
     save_real_trade_state = None
     record_realized_pnl = None
     get_real_pnl_for_closed_position = None
+    check_dynamic_profit_protection = None
+    close_real_position = None
 
 try:
     from tobit_client import toobit_client
@@ -65,6 +74,18 @@ SAME_CANDLE_HIT_POLICY = "SL_FIRST"
 REAL_PNL_WAIT_SECONDS = int(os.getenv("REAL_PNL_WAIT_SECONDS", "45") or "45")
 REAL_PNL_RETRY_INTERVAL_SECONDS = int(os.getenv("REAL_PNL_RETRY_INTERVAL_SECONDS", "5") or "5")
 REAL_PNL_ACCEPT_ZERO_WHEN_MOVE_BELOW_PCT = float(os.getenv("REAL_PNL_ACCEPT_ZERO_WHEN_MOVE_BELOW_PCT", "0.01") or "0.01")
+
+# Special Trade Management AI / Dynamic Profit Protection.
+# Important behavior:
+# - Only exits profitable trades. It never touches losing/breakeven positions.
+# - It does not move SL or TP. It only closes when continuation quality fails.
+# - Shock Exit is intentionally fast for ADA-style one-candle profit collapse.
+DYNAMIC_PROFIT_EVENT = "AI_DYNAMIC_PROFIT_EXIT"
+DYNAMIC_PROFIT_MIN_PROFIT_PCT = float(os.getenv("TRACKER_DYNAMIC_MIN_PROFIT_PCT", "0.005") or "0.005")
+DYNAMIC_PROFIT_SHOCK_RETRACE_PCT = float(os.getenv("TRACKER_DYNAMIC_SHOCK_RETRACE_PCT", "0.035") or "0.035")
+DYNAMIC_PROFIT_COLLAPSE_RATIO = float(os.getenv("TRACKER_DYNAMIC_COLLAPSE_RATIO", "0.45") or "0.45")
+DYNAMIC_PROFIT_VOLUME_SPIKE_MULT = float(os.getenv("TRACKER_DYNAMIC_VOLUME_SPIKE_MULT", "1.8") or "1.8")
+DYNAMIC_PROFIT_BODY_SPIKE_MULT = float(os.getenv("TRACKER_DYNAMIC_BODY_SPIKE_MULT", "1.35") or "1.35")
 
 exchange = ccxt.okx({
     "enableRateLimit": True,
@@ -730,6 +751,356 @@ def record_real_trade_result_for_signal(signal: Dict[str, Any], hit_type: str, e
         return {"ok": False, "error": str(e)[:250]}
 
 
+
+
+def _safe_percent(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _dynamic_event_fa(event_type: str) -> str:
+    if event_type == DYNAMIC_PROFIT_EVENT:
+        return "خروج هوشمند سود"
+    if event_type == "TP1":
+        return "حد سود 1"
+    if event_type == "SL":
+        return "حد ضرر"
+    return str(event_type)
+
+
+def _is_profit_event(event_type: str) -> bool:
+    return event_type in {"TP1", DYNAMIC_PROFIT_EVENT}
+
+
+def _is_closed_event(event_type: str) -> bool:
+    return event_type in {"TP1", "SL", DYNAMIC_PROFIT_EVENT}
+
+
+def _candle_close(candle: List[Any]) -> float:
+    return float(candle[4])
+
+
+def _candle_open(candle: List[Any]) -> float:
+    return float(candle[1])
+
+
+def _candle_high(candle: List[Any]) -> float:
+    return float(candle[2])
+
+
+def _candle_low(candle: List[Any]) -> float:
+    return float(candle[3])
+
+
+def _candle_volume(candle: List[Any]) -> float:
+    try:
+        return float(candle[5])
+    except Exception:
+        return 0.0
+
+
+def _body_pct(candle: List[Any]) -> float:
+    close = _candle_close(candle)
+    if close <= 0:
+        return 0.0
+    return abs(_candle_close(candle) - _candle_open(candle)) / close * 100.0
+
+
+def _avg(values: List[float], default: float = 0.0) -> float:
+    clean = [float(x) for x in values if x is not None]
+    return sum(clean) / len(clean) if clean else default
+
+
+def _is_against_trade_candle(signal: Dict[str, Any], candle: List[Any]) -> bool:
+    direction = str(signal.get("direction") or "").upper()
+    open_price = _candle_open(candle)
+    close = _candle_close(candle)
+    if direction == "LONG":
+        return close < open_price
+    if direction == "SHORT":
+        return close > open_price
+    return False
+
+
+def _favorable_price_for_signal(signal: Dict[str, Any], candle: List[Any]) -> float:
+    return _candle_high(candle) if signal.get("direction") == "LONG" else _candle_low(candle)
+
+
+def _adverse_price_for_signal(signal: Dict[str, Any], candle: List[Any]) -> float:
+    return _candle_low(candle) if signal.get("direction") == "LONG" else _candle_high(candle)
+
+
+def _update_signal_mfe_mae(signal: Dict[str, Any], candle: List[Any]) -> None:
+    """Keep max favorable/adverse movement for Dynamic Profit AI learning."""
+    try:
+        fav_pct = move_percent(signal, _favorable_price_for_signal(signal, candle))
+        adv_pct = move_percent(signal, _adverse_price_for_signal(signal, candle))
+        signal["max_favorable_percent"] = round(max(_safe_percent(signal.get("max_favorable_percent"), 0.0), fav_pct), 6)
+        signal["max_adverse_percent"] = round(min(_safe_percent(signal.get("max_adverse_percent"), 0.0), adv_pct), 6)
+    except Exception:
+        pass
+
+
+def _tracker_dynamic_profit_decision(signal: Dict[str, Any], candle: List[Any], recent_candles: List[List[Any]]) -> Dict[str, Any]:
+    """Fast tracker-side Dynamic Profit decision.
+
+    This is intentionally conservative about one weak indicator, but fast about
+    shock reversal. It exits only when the trade is already profitable.
+    It does not change SL/TP and does not close losing/breakeven trades.
+    """
+    close = _candle_close(candle)
+    profit_pct = move_percent(signal, close)
+
+    if profit_pct <= DYNAMIC_PROFIT_MIN_PROFIT_PCT:
+        return {"exit": False, "reason": "NOT_IN_PROFIT", "profit_pct": profit_pct}
+
+    peak_profit = _safe_percent(signal.get("max_favorable_percent"), 0.0)
+    retrace = max(0.0, peak_profit - profit_pct)
+    against = _is_against_trade_candle(signal, candle)
+
+    prev = recent_candles[-8:-1] if len(recent_candles) > 1 else []
+    avg_body = _avg([_body_pct(x) for x in prev], 0.0)
+    avg_vol = _avg([_candle_volume(x) for x in prev], 0.0)
+    body = _body_pct(candle)
+    vol = _candle_volume(candle)
+    body_spike = bool(avg_body > 0 and body >= avg_body * DYNAMIC_PROFIT_BODY_SPIKE_MULT)
+    volume_spike = bool(avg_vol > 0 and vol >= avg_vol * DYNAMIC_PROFIT_VOLUME_SPIKE_MULT)
+
+    reasons: List[str] = []
+    risk_score = 0.0
+    continue_score = 0.0
+
+    def add_risk(points: float, text: str) -> None:
+        nonlocal risk_score
+        risk_score += float(points)
+        if text not in reasons:
+            reasons.append(text)
+
+    def add_continue(points: float) -> None:
+        nonlocal continue_score
+        continue_score += float(points)
+
+    # 1) ADA-style shock path: one opposite candle suddenly takes back floating profit.
+    if peak_profit > 0 and retrace >= DYNAMIC_PROFIT_SHOCK_RETRACE_PCT and against:
+        add_risk(4.5, f"برگشت ناگهانی از اوج سود ({round(retrace, 3)}٪)")
+    if peak_profit >= 0.08 and retrace >= max(0.03, peak_profit * DYNAMIC_PROFIT_COLLAPSE_RATIO):
+        add_risk(5.0, "پس‌گرفتن بخش بزرگی از سود شناور")
+    if against and body_spike:
+        add_risk(2.0, "کندل مخالف قوی")
+    if against and volume_spike:
+        add_risk(1.5, "افزایش حجم روی کندل برگشتی")
+
+    # 2) Simple candle-structure continuation guard.
+    # If the candle extends the trade direction and closes favorably, do not exit from noise.
+    direction = str(signal.get("direction") or "").upper()
+    if direction == "LONG" and _candle_close(candle) > _candle_open(candle) and _candle_close(candle) >= (_candle_high(candle) + _candle_low(candle)) / 2:
+        add_continue(1.5)
+    elif direction == "SHORT" and _candle_close(candle) < _candle_open(candle) and _candle_close(candle) <= (_candle_high(candle) + _candle_low(candle)) / 2:
+        add_continue(1.5)
+
+    net_score = risk_score - continue_score
+    has_shock = any("ناگهانی" in r or "شناور" in r for r in reasons)
+
+    # Fast rule: shock exits immediately if still profitable.
+    # Normal rule: several risks must combine; one weak clue alone is not enough.
+    should_exit = False
+    if has_shock and profit_pct > 0:
+        should_exit = True
+    elif profit_pct > 0 and net_score >= 6.0 and len(reasons) >= 2:
+        should_exit = True
+
+    return {
+        "exit": bool(should_exit),
+        "reason": "، ".join(reasons[:4]) if should_exit else "HOLD_PROFIT",
+        "profit_pct": round(profit_pct, 4),
+        "peak_profit_pct": round(peak_profit, 4),
+        "retrace_from_peak_pct": round(retrace, 4),
+        "risk_score": round(risk_score, 3),
+        "continuation_score": round(continue_score, 3),
+        "net_exit_score": round(net_score, 3),
+        "exit_price": close,
+    }
+
+
+def _normalize_dynamic_close_accounting(
+    signal: Dict[str, Any],
+    close_result: Optional[Dict[str, Any]],
+    pct: float,
+) -> Optional[Dict[str, Any]]:
+    """Convert real_trade_manager.close_real_position() output to tracker message shape.
+
+    Dynamic Profit accounting is performed by real_trade_manager after the
+    exchange close is verified. The tracker must not record PnL a second time.
+    """
+    if not isinstance(close_result, dict) or not close_result.get("ok"):
+        return close_result if isinstance(close_result, dict) else None
+
+    accounting = close_result.get("accounting")
+    if not isinstance(accounting, dict):
+        accounting = {}
+
+    try:
+        margin = float(signal.get("position_size_usd") or 0)
+    except Exception:
+        margin = 0.0
+    try:
+        leverage = float(signal.get("leverage") or 0)
+    except Exception:
+        leverage = 0.0
+
+    pnl = accounting.get("pnl_usd")
+    if pnl is None:
+        pnl = close_result.get("pnl_usd", 0)
+
+    return {
+        "ok": True,
+        "pnl_usd": pnl,
+        "pnl_source": "DYNAMIC_REAL_CLOSE",
+        "pnl_error": None,
+        "exchange_pnl": close_result.get("exchange_result"),
+        "margin": margin,
+        "leverage": leverage,
+        "notional": round(margin * leverage, 6) if margin and leverage else None,
+        "accounting": accounting,
+        "removed_position": True,
+        "close_verified": True,
+        "close_result": close_result,
+        "move_percent": pct,
+    }
+
+
+def _check_real_dynamic_profit_exit(signal: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Ask real_trade_manager to close a profitable REAL position if the special AI exit fires.
+
+    This path is authoritative: if real_trade_manager says it closed, it has
+    already sent the close order and recorded accounting. The tracker must only
+    record stats/Telegram result and must not call record_real_trade_result_for_signal.
+    """
+    if not callable(check_dynamic_profit_protection):
+        return None
+    try:
+        sid = str(signal.get("signal_id") or signal.get("id") or "")
+        if not sid:
+            return None
+        result = check_dynamic_profit_protection(signal_id=sid)
+        if not isinstance(result, dict) or not result.get("ok"):
+            return None
+        for row in result.get("results") or []:
+            if str(row.get("signal_id") or "") != sid:
+                continue
+            if row.get("closed"):
+                close_result = row.get("close_result") if isinstance(row.get("close_result"), dict) else {}
+                return {
+                    "exit": True,
+                    "exit_price": float(row.get("exit_price") or 0),
+                    "reason": row.get("reason") or "خروج هوشمند سود",
+                    "profit_pct": _safe_percent(row.get("profit_pct"), 0.0),
+                    "source": "REAL_TRADE_MANAGER",
+                    "raw": row,
+                    "close_result": close_result,
+                    "already_accounted": True,
+                }
+            if row.get("exit") and not row.get("closed"):
+                signal["last_dynamic_profit_error"] = str((row.get("close_result") or {}).get("error") or row)[:250]
+        return None
+    except Exception as e:
+        signal["last_dynamic_profit_error"] = str(e)[:250]
+        return None
+
+
+def _execute_tracker_dynamic_real_close(signal: Dict[str, Any], exit_price: float, decision: Dict[str, Any]) -> Dict[str, Any]:
+    """Close a REAL position for tracker-side Shock/Dynamic Exit.
+
+    Tracker-side Dynamic Profit is allowed to become final only after
+    real_trade_manager.close_real_position() returns ok=True. If the close fails,
+    the active signal must remain open.
+    """
+    if not callable(close_real_position):
+        return {"ok": False, "error": "real_trade_manager.close_real_position در دسترس نیست"}
+
+    sid = str(signal.get("signal_id") or signal.get("id") or "")
+    if not sid:
+        return {"ok": False, "error": "signal_id برای بستن پوزیشن واقعی پیدا نشد"}
+
+    try:
+        return close_real_position(
+            signal_id=sid,
+            exit_price=float(exit_price),
+            result_type=DYNAMIC_PROFIT_EVENT,
+        )
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:250]}
+
+
+def _record_dynamic_learning(signal: Dict[str, Any], exit_price: float, pct: float, decision: Optional[Dict[str, Any]] = None) -> None:
+    try:
+        if callable(register_dynamic_profit_exit):
+            register_dynamic_profit_exit(
+                symbol=signal.get("symbol"),
+                direction=signal.get("direction"),
+                entry=signal.get("entry"),
+                exit_price=exit_price,
+                snapshot=_learning_snapshot(signal, exit_price=exit_price, move_percent=pct),
+                reason=(decision or {}).get("reason"),
+                source="TRACKER",
+                signal_id=signal.get("signal_id") or signal.get("id"),
+                max_favorable=signal.get("max_favorable_percent"),
+                max_adverse=signal.get("max_adverse_percent"),
+                decision=decision or {},
+            )
+    except Exception:
+        pass
+
+
+def _build_result_message(signal: Dict[str, Any], hit_type: str, exit_price: float, pct: float, real_trade_accounting: Optional[Dict[str, Any]], reason: str = "") -> str:
+    if hit_type == DYNAMIC_PROFIT_EVENT:
+        icon = "🟢"
+        result_fa = "خروج زودتر با سود"
+        text = (
+            f"{icon} خروج هوشمند سود {signal.get('symbol')}\n"
+            f"جهت: {fa_direction(signal.get('direction'))}\n"
+            f"ورود: {signal.get('entry')}\n"
+            f"قیمت خروج: {exit_price}\n"
+            f"نتیجه: {result_fa}\n"
+            f"درصد حرکت: {pct}٪"
+        )
+        if reason:
+            text += f"\nدلیل خروج: {reason}"
+    else:
+        icon = "✅" if hit_type == "TP1" else "❌"
+        result_fa = "حد سود 1" if hit_type == "TP1" else "حد ضرر"
+        text = (
+            f"{icon} نتیجه سیگنال {signal.get('symbol')}\n"
+            f"جهت: {fa_direction(signal.get('direction'))}\n"
+            f"ورود: {signal.get('entry')}\n"
+            f"قیمت خروج: {exit_price}\n"
+            f"نتیجه: {result_fa}\n"
+            f"درصد حرکت: {pct}٪"
+        )
+
+    if isinstance(real_trade_accounting, dict) and real_trade_accounting.get("ok"):
+        acc = real_trade_accounting.get("accounting") or {}
+        pnl = real_trade_accounting.get("pnl_usd", 0)
+        sign = "+" if float(pnl or 0) > 0 else ""
+        source = real_trade_accounting.get("pnl_source")
+        pnl_label = "PnL واقعی توبیت" if source == "TOOBIT_REAL" else "PnL تقریبی"
+        text += (
+            f"\n\n{pnl_label}: {sign}{pnl}$"
+            f"\nمارجین: {real_trade_accounting.get('margin')}$"
+            f"\nلوریج: {real_trade_accounting.get('leverage')}x"
+            f"\nحجم تقریبی: {real_trade_accounting.get('notional')}$"
+            f"\nبالانس داخلی: {acc.get('balance')}$"
+            f"\nسرمایه محافظت‌شده: {acc.get('protected_balance')}$"
+        )
+        if source != "TOOBIT_REAL" and real_trade_accounting.get("pnl_error"):
+            text += "\n⚠️ سود واقعی از توبیت بعد از چند تلاش خوانده نشد؛ عدد بالا تخمینی است."
+        if acc.get("daily_locked"):
+            text += "\n🚨 قفل ضرر روزانه فعال شد."
+    elif isinstance(real_trade_accounting, dict) and real_trade_accounting.get("error"):
+        text += f"\n\n⚠️ ثبت PnL واقعی انجام نشد: {real_trade_accounting.get('error')}"
+    return text
 def check_active_signals() -> List[Dict[str, Any]]:
     active = get_active_signals()
     remaining: List[Dict[str, Any]] = []
@@ -741,53 +1112,101 @@ def check_active_signals() -> List[Dict[str, Any]]:
         try:
             hit_type = None
             exit_price = None
+            dynamic_decision: Optional[Dict[str, Any]] = None
+            real_trade_accounting: Optional[Dict[str, Any]] = None
+            dynamic_close_verified = False
+
+            # 1) Special update first: let real_trade_manager close profitable
+            # REAL positions immediately when continuation quality fails.
+            # This never touches losing/breakeven positions by design.
+            real_dynamic = _check_real_dynamic_profit_exit(signal)
+            if real_dynamic and real_dynamic.get("exit"):
+                hit_type = DYNAMIC_PROFIT_EVENT
+                exit_price = float(real_dynamic.get("exit_price") or 0)
+                dynamic_decision = real_dynamic
+                dynamic_close_verified = True
+                # real_trade_manager has already closed and recorded accounting.
+                pct_preview = move_percent(signal, exit_price)
+                real_trade_accounting = _normalize_dynamic_close_accounting(
+                    signal,
+                    real_dynamic.get("close_result"),
+                    pct_preview,
+                )
+
             candles = get_recent_1m_candles_since(signal["symbol"], signal.get("last_checked_at") or signal.get("created_at"))
-            for candle in candles:
-                hit_type, exit_price = candle_path_hit(signal, candle)
-                if hit_type:
-                    break
+            recent_seen: List[List[Any]] = []
+
+            # 2) If REAL dynamic exit did not already close it, monitor candle path.
+            # TP/SL logic is preserved. Tracker-side Dynamic Exit only acts while
+            # the signal is in profit and is only final after real close succeeds.
+            if not hit_type:
+                for candle in candles:
+                    recent_seen.append(candle)
+                    _update_signal_mfe_mae(signal, candle)
+
+                    path_hit, path_exit = candle_path_hit(signal, candle)
+                    if path_hit:
+                        hit_type, exit_price = path_hit, path_exit
+                        break
+
+                    decision = _tracker_dynamic_profit_decision(signal, candle, recent_seen)
+                    if decision.get("exit"):
+                        hit_type = DYNAMIC_PROFIT_EVENT
+                        exit_price = float(decision.get("exit_price") or _candle_close(candle))
+                        dynamic_decision = decision
+                        break
 
             signal["last_checked_at"] = now_ts()
             if hit_type:
                 pct = move_percent(signal, exit_price)
+
+                # Final safety: Dynamic Profit must never close a non-profitable trade.
+                if hit_type == DYNAMIC_PROFIT_EVENT and pct <= 0:
+                    signal["last_dynamic_profit_skip"] = "NOT_IN_PROFIT_AFTER_RECHECK"
+                    remaining.append(signal)
+                    continue
+
+                if hit_type == DYNAMIC_PROFIT_EVENT:
+                    # If real_trade_manager did not already close it, the tracker
+                    # must close through real_trade_manager now. Do not record stats,
+                    # learning, slot close, or Telegram result unless exchange close
+                    # is confirmed ok=True.
+                    if not dynamic_close_verified:
+                        close_result = _execute_tracker_dynamic_real_close(signal, exit_price, dynamic_decision or {})
+                        if not isinstance(close_result, dict) or not close_result.get("ok"):
+                            signal["last_dynamic_profit_error"] = str((close_result or {}).get("error") or close_result)[:250]
+                            remaining.append(signal)
+                            messages.append({
+                                "chat_id": signal.get("chat_id"),
+                                "message": (
+                                    f"⚠️ خروج هوشمند سود برای {signal.get('symbol')} تشخیص داده شد، "
+                                    f"اما بستن پوزیشن در توبیت تایید نشد.\n"
+                                    f"پوزیشن همچنان فعال نگه داشته شد.\n"
+                                    f"خطا: {signal.get('last_dynamic_profit_error')}"
+                                ),
+                                "reply_to_message_id": signal.get("message_id") or signal.get("reply_to_message_id"),
+                            })
+                            continue
+                        dynamic_close_verified = True
+                        real_trade_accounting = _normalize_dynamic_close_accounting(signal, close_result, pct)
+
+                    # Dynamic learning is recorded by real_trade_manager for the
+                    # manager-side close. For tracker-side close, record once here.
+                    if not (isinstance(dynamic_decision, dict) and dynamic_decision.get("source") == "REAL_TRADE_MANAGER"):
+                        _record_dynamic_learning(signal, exit_price, pct, dynamic_decision)
+
                 record_stat_event(signal, hit_type, exit_price, pct)
                 ai_record_result(signal, hit_type, exit_price, pct)
-                real_trade_accounting = record_real_trade_result_for_signal(signal, hit_type, exit_price, pct)
-                ai_close_slot(signal)
-                icon = "✅" if hit_type == "TP1" else "❌"
-                result_fa = "حد سود 1" if hit_type == "TP1" else "حد ضرر"
-                text = (
-                    f"{icon} نتیجه سیگنال {signal.get('symbol')}\n"
-                    f"جهت: {fa_direction(signal.get('direction'))}\n"
-                    f"ورود: {signal.get('entry')}\n"
-                    f"قیمت خروج: {exit_price}\n"
-                    f"نتیجه: {result_fa}\n"
-                    f"درصد حرکت: {pct}٪"
-                )
 
-                if isinstance(real_trade_accounting, dict) and real_trade_accounting.get("ok"):
-                    acc = real_trade_accounting.get("accounting") or {}
-                    pnl = real_trade_accounting.get("pnl_usd", 0)
-                    sign = "+" if float(pnl or 0) > 0 else ""
-                    source = real_trade_accounting.get("pnl_source")
-                    if source == "TOOBIT_REAL":
-                        pnl_label = "PnL واقعی توبیت"
-                    else:
-                        pnl_label = "PnL تقریبی"
-                    text += (
-                        f"\n\n{pnl_label}: {sign}{pnl}$"
-                        f"\nمارجین: {real_trade_accounting.get('margin')}$"
-                        f"\nلوریج: {real_trade_accounting.get('leverage')}x"
-                        f"\nحجم تقریبی: {real_trade_accounting.get('notional')}$"
-                        f"\nبالانس داخلی: {acc.get('balance')}$"
-                        f"\nسرمایه محافظت‌شده: {acc.get('protected_balance')}$"
-                    )
-                    if source != "TOOBIT_REAL" and real_trade_accounting.get("pnl_error"):
-                        text += f"\n⚠️ سود واقعی از توبیت بعد از چند تلاش خوانده نشد؛ عدد بالا تخمینی است."
-                    if acc.get("daily_locked"):
-                        text += "\n🚨 قفل ضرر روزانه فعال شد."
-                elif isinstance(real_trade_accounting, dict) and real_trade_accounting.get("error"):
-                    text += f"\n\n⚠️ ثبت PnL واقعی انجام نشد: {real_trade_accounting.get('error')}"
+                if hit_type != DYNAMIC_PROFIT_EVENT:
+                    real_trade_accounting = record_real_trade_result_for_signal(signal, hit_type, exit_price, pct)
+
+                ai_close_slot(signal)
+
+                reason = ""
+                if isinstance(dynamic_decision, dict):
+                    reason = str(dynamic_decision.get("reason") or "")
+                text = _build_result_message(signal, hit_type, exit_price, pct, real_trade_accounting, reason=reason)
                 messages.append({
                     "chat_id": signal.get("chat_id"),
                     "message": text,
@@ -802,7 +1221,6 @@ def check_active_signals() -> List[Dict[str, Any]]:
 
     save_active_signals(remaining)
     return messages
-
 
 def parse_days_from_text(text: str) -> int:
     m = re.search(r"(\d+)", text or "")
@@ -894,14 +1312,17 @@ def get_stats_report(days: int = 7) -> str:
     data = [s for s in stats if _event_ts(s) >= since]
     created = [s for s in data if s.get("event_type") == "SIGNAL_CREATED"]
     tp1 = [s for s in data if s.get("event_type") == "TP1"]
+    dynamic = [s for s in data if s.get("event_type") == DYNAMIC_PROFIT_EVENT]
     sl = [s for s in data if s.get("event_type") == "SL"]
-    total = len(tp1) + len(sl)
-    win_rate = round((len(tp1) / total) * 100, 1) if total else 0
+    total = len(tp1) + len(dynamic) + len(sl)
+    wins = len(tp1) + len(dynamic)
+    win_rate = round((wins / total) * 100, 1) if total else 0
     active_count = len(get_active_signals())
-    longs = [s for s in tp1 + sl if s.get("direction") == "LONG"]
-    shorts = [s for s in tp1 + sl if s.get("direction") == "SHORT"]
-    long_tp = len([s for s in longs if s.get("event_type") == "TP1"])
-    short_tp = len([s for s in shorts if s.get("event_type") == "TP1"])
+    closed_rows = tp1 + dynamic + sl
+    longs = [s for s in closed_rows if s.get("direction") == "LONG"]
+    shorts = [s for s in closed_rows if s.get("direction") == "SHORT"]
+    long_tp = len([s for s in longs if _is_profit_event(str(s.get("event_type")))])
+    short_tp = len([s for s in shorts if _is_profit_event(str(s.get("event_type")))])
     return (
         f"📊 آمار {days} روز اخیر\n\n"
         f"سیگنال مستقیم صادرشده: {len(created)}\n"
@@ -930,7 +1351,7 @@ def get_symbol_stats_report(days: int = 3650, mode: str = "all") -> str:
     stats = get_signal_stats()
     data = [s for s in stats if _event_ts(s) >= since]
     created = [s for s in data if s.get("event_type") == "SIGNAL_CREATED"]
-    closed = [s for s in data if s.get("event_type") in ["TP1", "SL"] and s.get("symbol")]
+    closed = [s for s in data if _is_closed_event(str(s.get("event_type"))) and s.get("symbol")]
 
     if not closed:
         return f"📊 آمار ارزها ({_format_days_label(days)})\n\nهنوز نتیجه TP1/SL ثبت نشده است."
@@ -940,11 +1361,13 @@ def get_symbol_stats_report(days: int = 3650, mode: str = "all") -> str:
 
     for item in closed:
         symbol = str(item.get("symbol") or "UNKNOWN")
-        row = by_symbol.setdefault(symbol, {"symbol": symbol, "tp1": 0, "sl": 0, "total": 0, "move_sum": 0.0, "long": 0, "short": 0})
+        row = by_symbol.setdefault(symbol, {"symbol": symbol, "tp1": 0, "dynamic": 0, "sl": 0, "total": 0, "move_sum": 0.0, "long": 0, "short": 0})
         event = item.get("event_type")
         row["total"] += 1
         if event == "TP1":
             row["tp1"] += 1
+        elif event == DYNAMIC_PROFIT_EVENT:
+            row["dynamic"] += 1
         elif event == "SL":
             row["sl"] += 1
             reason = _infer_sl_reason(item)
@@ -957,7 +1380,7 @@ def get_symbol_stats_report(days: int = 3650, mode: str = "all") -> str:
 
     rows: List[Dict[str, Any]] = []
     for row in by_symbol.values():
-        row["win_rate"] = round((row["tp1"] / row["total"]) * 100, 1) if row["total"] else 0
+        row["win_rate"] = round(((row["tp1"] + row.get("dynamic", 0)) / row["total"]) * 100, 1) if row["total"] else 0
         row["move_sum"] = round(row["move_sum"], 4)
         rows.append(row)
 
@@ -976,16 +1399,17 @@ def get_symbol_stats_report(days: int = 3650, mode: str = "all") -> str:
         title = f"📊 آمار کلی ارزها ({_format_days_label(days)})"
 
     total_tp1 = len([x for x in closed if x.get("event_type") == "TP1"])
+    total_dynamic = len([x for x in closed if x.get("event_type") == DYNAMIC_PROFIT_EVENT])
     total_sl = len([x for x in closed if x.get("event_type") == "SL"])
-    total_closed = total_tp1 + total_sl
-    total_wr = round((total_tp1 / total_closed) * 100, 1) if total_closed else 0
+    total_closed = total_tp1 + total_dynamic + total_sl
+    total_wr = round(((total_tp1 + total_dynamic) / total_closed) * 100, 1) if total_closed else 0
     total_move = round(sum(_safe_float(x.get("move_percent"), 0) for x in closed), 4)
 
     lines = [
         title,
         "",
         f"سیگنال‌های ثبت‌شده: {len(created)}",
-        f"نتایج بسته‌شده: {total_closed} | TP1: {total_tp1} | SL: {total_sl}",
+        f"نتایج بسته‌شده: {total_closed} | TP1: {total_tp1} | خروج هوشمند: {total_dynamic} | SL: {total_sl}",
         f"Win Rate کلی: {total_wr}%",
         f"جمع درصد حرکت: {total_move}%",
         "--------------------",
@@ -995,7 +1419,7 @@ def get_symbol_stats_report(days: int = 3650, mode: str = "all") -> str:
     for i, row in enumerate(selected[:max_rows], start=1):
         sign = "+" if row["move_sum"] > 0 else ""
         lines.append(
-            f"{i}) {row['symbol']} | معاملات: {row['total']} | TP1: {row['tp1']} | SL: {row['sl']} | "
+            f"{i}) {row['symbol']} | معاملات: {row['total']} | TP1: {row['tp1']} | خروج هوشمند: {row.get('dynamic', 0)} | SL: {row['sl']} | "
             f"WR: {row['win_rate']}% | حرکت: {sign}{row['move_sum']}% | L/S: {row['long']}/{row['short']}"
         )
 
