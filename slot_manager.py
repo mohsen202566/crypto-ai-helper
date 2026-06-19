@@ -49,7 +49,7 @@ except Exception:
 
 SLOT_FILE = "slot_state.json"
 TRADE_SETTINGS_FILE = "trade_settings.json"
-DEFAULT_PENDING_CONFIRM_SECONDS = 30
+DEFAULT_PENDING_CONFIRM_SECONDS = 75
 MAX_QUEUE_SIZE = 80
 MIN_GHOST_SCORE = 80
 
@@ -104,7 +104,7 @@ def _norm_direction(direction: str) -> str:
 def _position_is_active(p: Dict[str, Any]) -> bool:
     status = str(p.get("status") or "ACTIVE").upper()
     # PENDING_REAL_CONFIRM must reserve a slot too.
-    return status in {"ACTIVE", "OPEN", "PENDING", "PENDING_REAL_CONFIRM"}
+    return status in {"ACTIVE", "OPEN", "PENDING", "PENDING_REAL_CONFIRM", "PENDING_REAL_CLOSE"}
 
 
 def get_active_positions() -> List[Dict[str, Any]]:
@@ -116,14 +116,31 @@ def get_all_positions() -> List[Dict[str, Any]]:
 
 
 def get_max_active_positions() -> int:
-    """Use live trade settings first, then fall back to config default."""
+    """Use real trade state first, then legacy trade settings, then config default.
+
+    real_trade_manager.py stores the user's live REAL max_positions in
+    real_trade_state.json. This must be the first source so slot capacity matches
+    actual Toobit/real-trade settings. trade_settings.json is kept only as a
+    legacy fallback for older paper-mode flows.
+    """
+    try:
+        real_state = load_json("real_trade_state.json", {})
+        if isinstance(real_state, dict):
+            value = _safe_int(real_state.get("max_positions"), 0)
+            if value > 0:
+                return max(1, value)
+    except Exception:
+        pass
+
     try:
         settings = load_json(TRADE_SETTINGS_FILE, {})
         if isinstance(settings, dict):
-            value = int(settings.get("max_positions") or MAX_ACTIVE_POSITIONS)
-            return max(1, value)
+            value = _safe_int(settings.get("max_positions"), 0)
+            if value > 0:
+                return max(1, value)
     except Exception:
         pass
+
     try:
         return max(1, int(MAX_ACTIVE_POSITIONS))
     except Exception:
