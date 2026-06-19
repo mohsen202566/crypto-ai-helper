@@ -21,7 +21,7 @@ from typing import Any, Dict, Optional, Tuple
 
 
 MIN_LEVERAGE = 1.0
-MAX_LEVERAGE = 100.0
+MAX_LEVERAGE = 50.0
 MIN_MARGIN_USD = 1.0
 MAX_MARGIN_USD = 1_000_000.0
 TP_SL_MIN_DISTANCE_PCT = 0.00005  # 0.005% safety floor against equal/invalid TP/SL
@@ -86,6 +86,42 @@ def normalize_direction(direction: Any) -> str:
         return "LONG"
     if d in {"SHORT", "SELL", "SELL_OPEN"}:
         return "SHORT"
+    return ""
+
+
+
+
+def normalize_margin_mode(value: Any) -> str:
+    m = str(value or "").upper().strip().replace("-", "_").replace(" ", "_")
+    if m in {"ISOLATED", "ISOLATE", "ISOLATED_MARGIN", "ISOLATEDMARGIN", "FIXED"}:
+        return "ISOLATED"
+    if m in {"CROSS", "CROSSED", "CROSS_MARGIN", "CROSSMARGIN"}:
+        return "CROSS"
+    return m
+
+
+def extract_position_direction(position: Dict[str, Any]) -> str:
+    if not isinstance(position, dict):
+        return ""
+    for key in ("direction", "side", "positionSide", "holdSide", "tradeSide", "posSide"):
+        d = normalize_direction(position.get(key))
+        if d:
+            return d
+    qty = _safe_float(position.get("positionAmt") or position.get("size") or position.get("qty"), 0.0)
+    if qty > 0:
+        return "LONG"
+    if qty < 0:
+        return "SHORT"
+    return ""
+
+
+def extract_margin_mode(position: Dict[str, Any]) -> str:
+    if not isinstance(position, dict):
+        return ""
+    for key in ("marginMode", "margin_mode", "marginType", "margin_type", "positionMode", "mode"):
+        mode = normalize_margin_mode(position.get(key))
+        if mode:
+            return mode
     return ""
 
 
@@ -256,6 +292,14 @@ def position_matches_order(
     if pos_symbol and pos_symbol != sym:
         return SafetyResult(False, True, f"نماد پوزیشن با سفارش یکی نیست: {pos_symbol} != {sym}", symbol=sym, direction=side, details={"position": position})
 
+    pos_side = extract_position_direction(position)
+    if pos_side and side and pos_side != side:
+        return SafetyResult(False, True, f"جهت پوزیشن با سفارش یکی نیست: {pos_side} != {side}", symbol=sym, direction=side, details={"position": position})
+
+    margin_mode = extract_margin_mode(position)
+    if margin_mode and margin_mode != "ISOLATED":
+        return SafetyResult(False, True, f"مارجین پوزیشن باید ISOLATED باشد، مقدار فعلی: {margin_mode}", symbol=sym, direction=side, details={"position": position})
+
     pos_lev = extract_position_leverage(position)
     if pos_lev > 0 and lev_expected > 0 and abs(pos_lev - lev_expected) > LEVERAGE_TOLERANCE:
         return SafetyResult(False, True, f"لوریج پوزیشن با تنظیم ربات یکی نیست: {pos_lev} != {lev_expected}", symbol=sym, direction=side, leverage=lev_expected, details={"position": position})
@@ -283,6 +327,54 @@ def position_matches_order(
         quantity=pos_qty,
         details={"position_margin": pos_margin, "position_notional": pos_notional, "position": position},
     )
+
+
+def ensure_isolated_margin(client: Any, symbol: Any) -> Dict[str, Any]:
+    """Set and verify ISOLATED margin mode before every real order.
+
+    This is intentionally strict: if the client cannot set/read/verify isolated
+    mode, the real order must be blocked rather than opened with CROSS margin.
+    """
+    sym = _plain_symbol(symbol)
+    if not sym:
+        return {"ok": False, "blocked": True, "error": "نماد برای تنظیم مارجین نامعتبر است"}
+
+    candidate_names = (
+        "ensure_isolated_margin",
+        "verify_isolated_margin",
+        "set_and_verify_isolated_margin",
+        "set_isolated_margin",
+        "set_margin_mode_isolated",
+    )
+    last_result = None
+    for name in candidate_names:
+        if not hasattr(client, name):
+            continue
+        try:
+            fn = getattr(client, name)
+            try:
+                result = fn(sym)
+            except TypeError:
+                result = fn(symbol=sym)
+            last_result = result
+            if isinstance(result, dict):
+                mode = normalize_margin_mode(
+                    result.get("margin_mode")
+                    or result.get("marginMode")
+                    or result.get("mode")
+                    or result.get("actual_margin_mode")
+                    or result.get("data", {}).get("marginMode") if isinstance(result.get("data"), dict) else None
+                )
+                if result.get("ok") and (not mode or mode == "ISOLATED"):
+                    return {"ok": True, "symbol": sym, "margin_mode": "ISOLATED", "data": result}
+                if mode and mode != "ISOLATED":
+                    return {"ok": False, "blocked": True, "error": f"مارجین توبیت ISOLATED تأیید نشد: {mode}", "data": result}
+            elif result is True:
+                return {"ok": True, "symbol": sym, "margin_mode": "ISOLATED", "data": result}
+        except Exception as e:
+            return {"ok": False, "blocked": True, "error": f"خطا در تنظیم/تأیید ISOLATED margin: {str(e)[:250]}"}
+
+    return {"ok": False, "blocked": True, "error": "تابع تنظیم/تأیید ISOLATED margin در tobit_client.py وجود ندارد", "data": last_result}
 
 
 def ensure_exchange_leverage(client: Any, symbol: Any, leverage: Any) -> Dict[str, Any]:
@@ -330,6 +422,7 @@ def pre_order_safety_check(
 
     Returns a dict with ok=True only when:
     - inputs are valid,
+    - margin mode is set/read/verified as ISOLATED on Toobit,
     - leverage is set/read/verified on Toobit,
     - quantity is calculated from margin * leverage,
     - TP/SL direction is valid.
@@ -338,13 +431,20 @@ def pre_order_safety_check(
     if not basic.ok:
         return basic.to_dict()
 
+    margin_result = ensure_isolated_margin(client, basic.symbol)
+    if not margin_result.get("ok"):
+        data = basic.to_dict()
+        data.update({"ok": False, "blocked": True, "error": margin_result.get("error"), "margin_mode_check": margin_result})
+        return data
+
     lev_result = ensure_exchange_leverage(client, basic.symbol, basic.leverage)
     if not lev_result.get("ok"):
         data = basic.to_dict()
-        data.update({"ok": False, "blocked": True, "error": lev_result.get("error"), "leverage_check": lev_result})
+        data.update({"ok": False, "blocked": True, "error": lev_result.get("error"), "margin_mode_check": margin_result, "leverage_check": lev_result})
         return data
 
     data = basic.to_dict()
+    data["margin_mode_check"] = margin_result
     data["leverage_check"] = lev_result
     data["ok"] = True
     data["blocked"] = False
@@ -374,9 +474,13 @@ __all__ = [
     "validate_basic_order_inputs",
     "calculate_quantity_from_margin",
     "ensure_exchange_leverage",
+    "ensure_isolated_margin",
     "pre_order_safety_check",
     "post_order_position_safety_check",
     "position_matches_order",
     "normalize_direction",
+    "normalize_margin_mode",
+    "extract_position_direction",
+    "extract_margin_mode",
     "quantize_down",
 ]
