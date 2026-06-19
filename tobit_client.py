@@ -1447,7 +1447,64 @@ class ToobitClient:
 
         return order_result
 
-    def close_market_position(self, symbol: str, direction: str, quantity: float):
+    def _find_open_position_for_close(self, symbol: str, direction: str):
+        """Read Toobit first and return the real live position used for closing.
+
+        Closing must use the exchange position quantity, not the bot's old
+        calculated quantity. Toobit can expose a different quantity after
+        execution/rounding, especially for multiplier symbols such as
+        1000FLOKIUSDT. This helper checks symbol-specific and all-position
+        endpoints and returns the matched raw row plus detected quantity.
+        """
+        symbol = str(symbol or "").upper().strip()
+        direction = str(direction or "").upper().strip()
+        checked = []
+
+        for query_symbol in (symbol, self.normalize_futures_symbol(symbol), None):
+            try:
+                result = self.get_position(symbol=query_symbol)
+            except Exception as e:
+                result = {"ok": False, "error": str(e), "query_symbol": query_symbol}
+
+            checked.append({
+                "query_symbol": query_symbol,
+                "ok": bool(isinstance(result, dict) and result.get("ok")),
+                "error": (result or {}).get("error") if isinstance(result, dict) else None,
+            })
+
+            if not isinstance(result, dict) or not result.get("ok"):
+                continue
+
+            for item in self._flatten_position_items(result):
+                if not isinstance(item, dict):
+                    continue
+                qty = self._position_qty(item)
+                if qty <= 0:
+                    continue
+                if not self._position_symbol_matches(item, symbol):
+                    continue
+                if not self._position_side_matches(item, direction):
+                    continue
+                return {
+                    "ok": True,
+                    "symbol": self.normalize_futures_symbol(symbol),
+                    "direction": direction,
+                    "quantity": float(qty),
+                    "position": item,
+                    "query_symbol": query_symbol,
+                    "raw": result,
+                    "checked": checked[-3:],
+                }
+
+        return {
+            "ok": False,
+            "error": "پوزیشن باز مطابق نماد/جهت در توبیت پیدا نشد",
+            "symbol": symbol,
+            "direction": direction,
+            "checked": checked[-3:],
+        }
+
+    def close_market_position(self, symbol: str, direction: str, quantity: float = 0):
         if not REAL_TRADING_ENABLED:
             return {
                 "ok": False,
@@ -1455,7 +1512,8 @@ class ToobitClient:
                 "error": "ترید واقعی غیرفعال است. REAL_TRADING_ENABLED=false",
             }
 
-        symbol = self.normalize_futures_symbol(symbol)
+        requested_symbol = str(symbol or "").upper().strip()
+        symbol = self.normalize_futures_symbol(requested_symbol)
         direction = str(direction or "").upper().strip()
 
         if direction == "LONG":
@@ -1465,35 +1523,94 @@ class ToobitClient:
         else:
             return {"ok": False, "error": "direction باید LONG یا SHORT باشد"}
 
-        if float(quantity or 0) <= 0:
-            return {"ok": False, "error": "quantity باید بیشتر از صفر باشد"}
-
-        rules = self.get_symbol_trading_rules(symbol, quantity=quantity)
-        qty_step = self._decimal_from_value(rules.get("qty_step"), str(self._fallback_qty_step(quantity)))
-        min_qty = self._decimal_from_value(rules.get("min_qty"), "0")
-        qty_down = self._decimal_from_value(self._round_to_step(quantity, qty_step, mode="down"))
-        if min_qty > 0 and qty_down < min_qty:
+        # Critical close safety: use Toobit's actual live position quantity.
+        # The bot's internal quantity is only a fallback hint and may differ
+        # after Toobit execution, rounding, or multiplier-symbol conversion.
+        live_position = self._find_open_position_for_close(symbol, direction)
+        if not live_position.get("ok"):
             return {
                 "ok": False,
-                "blocked_reason": "CLOSE_QUANTITY_BELOW_EXCHANGE_MIN",
-                "error": f"quantity کمتر از حداقل مجاز نماد است: qty={qty_down}, minQty={min_qty}",
-                "quantity": format(qty_down, "f"),
-                "min_quantity": format(min_qty, "f"),
-                "rules": rules,
+                "blocked_reason": "LIVE_POSITION_NOT_FOUND_FOR_CLOSE",
+                "error": live_position.get("error"),
+                "requested_symbol": requested_symbol,
+                "symbol": symbol,
+                "direction": direction,
+                "quantity_hint": quantity,
+                "position_check": live_position,
             }
+
+        close_quantity = float(live_position.get("quantity") or 0)
+        if close_quantity <= 0:
+            return {
+                "ok": False,
+                "blocked_reason": "LIVE_POSITION_QUANTITY_INVALID",
+                "error": "حجم واقعی پوزیشن از توبیت معتبر نیست",
+                "position_check": live_position,
+            }
+
+        # For closing an existing position, do not block because of minQty.
+        # The position already exists on Toobit; using the exact exchange qty is
+        # safer than rejecting the close. Only round to qtyStep when it keeps a
+        # positive value; otherwise keep the raw live quantity.
+        rules = self.get_symbol_trading_rules(symbol, quantity=close_quantity)
+        qty_step = self._decimal_from_value(rules.get("qty_step"), str(self._fallback_qty_step(close_quantity)))
+        qty_down = self._decimal_from_value(self._round_to_step(close_quantity, qty_step, mode="down"))
         if qty_down <= 0:
-            return {"ok": False, "error": "quantity بعد از گرد کردن صفر شد", "rules": rules}
+            qty_to_send = str(close_quantity)
+            close_quantity_source = "live_position_raw_no_step_rounding"
+        else:
+            qty_to_send = format(qty_down, "f")
+            close_quantity_source = "live_position_qty_step_down"
 
         params = {
             "symbol": symbol,
             "side": side,
             "type": "LIMIT",
             "priceType": "MARKET",
-            "quantity": format(qty_down, "f"),
+            "quantity": qty_to_send,
             "newClientOrderId": f"bot_close_{uuid.uuid4().hex[:18]}",
         }
 
-        return self._signed_request("POST", "/api/v1/futures/order", params)
+        result = self._signed_request("POST", "/api/v1/futures/order", params)
+        result.setdefault("close_params", {
+            "symbol": symbol,
+            "side": side,
+            "quantity": qty_to_send,
+            "quantity_source": close_quantity_source,
+            "live_quantity": close_quantity,
+            "quantity_hint": quantity,
+            "rules": rules,
+            "position_check": {
+                "ok": live_position.get("ok"),
+                "query_symbol": live_position.get("query_symbol"),
+                "detected_quantity": live_position.get("quantity"),
+            },
+        })
+
+        # If Toobit returns an error, immediately check whether the position
+        # disappeared anyway. Some order endpoints can be ambiguous under load.
+        if not result.get("ok"):
+            try:
+                time.sleep(1.2)
+                still_open, position_result = self._has_open_position(symbol, direction, close_quantity)
+                result["post_error_position_check"] = position_result
+                if not still_open:
+                    return {
+                        "ok": True,
+                        "close_recovered_after_error": True,
+                        "warning": result.get("error"),
+                        "data": {
+                            "close_order_response": result.get("data"),
+                            "position_check": position_result,
+                            "requested_params": params,
+                        },
+                        "path": "/api/v1/futures/order",
+                        "close_params": result.get("close_params"),
+                    }
+            except Exception as e:
+                result["post_error_position_check_error"] = str(e)[:300]
+
+        return result
 
 
     # ---------- Closed PnL / history ----------
