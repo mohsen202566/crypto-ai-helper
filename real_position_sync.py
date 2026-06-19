@@ -290,28 +290,86 @@ def sync_once(*, repair_tpsl: bool = True, save: bool = True) -> Dict[str, Any]:
     """
     Run one real-position sync cycle.
 
-    This primarily delegates state reconciliation and balance-based PnL accounting
-    to real_trade_manager.sync_real_positions_with_toobit, then adds a clean event
-    and integrity layer for tracker/bot usage.
+    Safety fix:
+    real_trade_manager.sync_real_positions_with_toobit can remove a position
+    from open_positions when Toobit no longer reports it, but older/current
+    manager versions may not return a POSITION_CLOSED_OR_MISSING event.
+    Without that event, bot.py has nothing to send to Telegram.
+
+    This function now compares open_positions before/after sync and generates
+    the missing close/missing event exactly once for positions that disappeared.
     """
     rtm = _rtm()
-    state = rtm.load_real_trade_state()
+    state_before = rtm.load_real_trade_state()
+
+    before_open = {}
+    if isinstance(state_before, dict) and isinstance(state_before.get("open_positions"), dict):
+        before_open = {
+            str(k): dict(v)
+            for k, v in state_before.get("open_positions", {}).items()
+            if isinstance(v, dict)
+        }
 
     # Primary source of truth and accounting.
-    sync = rtm.sync_real_positions_with_toobit(state, save=save)
+    sync = rtm.sync_real_positions_with_toobit(state_before, save=save)
     if not isinstance(sync, dict) or not sync.get("ok"):
         return {
             "ok": False,
             "error": str((sync or {}).get("error") or "sync failed")[:300],
             "events": [],
             "messages": [],
-            "state": state,
+            "state": state_before,
         }
 
-    state = sync.get("state") or state
+    state = sync.get("state") or state_before
     exchange_positions = sync.get("exchange_positions") or []
     events = list(sync.get("events") or [])
     integrity_reports: List[Dict[str, Any]] = []
+
+    # ------------------------------------------------------------------
+    # Critical Telegram-result fix:
+    # If the manager removed a position but did not create a close/missing
+    # event, create it here so bot.py can send a result message.
+    # ------------------------------------------------------------------
+    after_open = {}
+    if isinstance(state, dict) and isinstance(state.get("open_positions"), dict):
+        after_open = state.get("open_positions", {})
+
+    existing_close_keys = set()
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        if str(ev.get("type") or "") == "POSITION_CLOSED_OR_MISSING":
+            existing_close_keys.add(str(ev.get("signal_id") or ""))
+
+    removed_ids = [sid for sid in before_open.keys() if sid not in after_open]
+    for sid in removed_ids:
+        if sid in existing_close_keys:
+            continue
+        pos = before_open.get(sid) or {}
+        # Do not announce very fresh pending/unfilled records as trade results.
+        age = _now() - _safe_int(pos.get("opened_at"), _now())
+        real_status = str(pos.get("real_status") or pos.get("status") or "").upper()
+        if real_status in {"PENDING_REAL_CONFIRM", "PENDING", "NEW", "ACCEPTED", "CREATED"} and age < DEFAULT_PENDING_TIMEOUT_SECONDS:
+            continue
+
+        pos["signal_id"] = pos.get("signal_id") or sid
+        pos["closed_or_missing_at"] = _now()
+        pos.setdefault("accounting", {
+            "ok": False,
+            "pnl_usd": None,
+            "balance": None,
+            "error": "position removed by sync but no accounting event was returned by real_trade_manager",
+        })
+
+        events.append({
+            "type": "POSITION_CLOSED_OR_MISSING",
+            "signal_id": sid,
+            "position": pos,
+            "accounting": pos.get("accounting"),
+            "source": "real_position_sync_missing_event_repair",
+        })
+        existing_close_keys.add(sid)
 
     # Verify/repair every active internal position.
     open_positions = state.get("open_positions", {}) if isinstance(state.get("open_positions"), dict) else {}
@@ -409,17 +467,25 @@ def build_tracker_messages(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]
 
         if etype == "POSITION_CLOSED_OR_MISSING":
             acc = event.get("accounting") or pos.get("accounting") or {}
-            pnl = _safe_float(acc.get("pnl_usd"), 0)
-            icon, result_fa = _closed_result_text(pnl)
+            pnl_raw = acc.get("pnl_usd") if isinstance(acc, dict) else None
+            has_real_pnl = pnl_raw is not None and str(pnl_raw).strip() != ""
+            pnl = _safe_float(pnl_raw, 0)
+            icon, result_fa = _closed_result_text(pnl) if has_real_pnl else ("ℹ️", "پوزیشن بسته/ناپدید شد")
             sign = "+" if pnl > 0 else ""
+
             text = (
                 f"{icon} نتیجه پوزیشن واقعی {pos.get('symbol')}\n"
                 f"جهت: {_fa_direction(pos.get('direction'))}\n"
-                f"نتیجه: {result_fa}\n"
-                f"سود/ضرر واقعی از بالانس توبیت: {sign}{round(pnl, 6)}$\n"
-                f"بالانس بعد: {acc.get('balance')}$"
+                f"نتیجه: {result_fa}"
             )
-            if acc.get("daily_locked"):
+            if has_real_pnl:
+                text += (
+                    f"\nسود/ضرر واقعی از بالانس توبیت: {sign}{round(pnl, 6)}$"
+                    f"\nبالانس بعد: {acc.get('balance')}$"
+                )
+            else:
+                text += "\n⚠️ پوزیشن از توبیت/Sync بسته یا ناپدید شده، اما PnL واقعی هنوز از توبیت خوانده/ثبت نشده است."
+            if isinstance(acc, dict) and acc.get("daily_locked"):
                 text += "\n🚨 قفل ضرر روزانه فعال شد."
             messages.append({
                 "chat_id": pos.get("chat_id"),
