@@ -666,6 +666,41 @@ def _fetch_real_closed_pnl_from_exchange(signal: Dict[str, Any], pos: Optional[D
         "sources_checked": checked_sources[-20:],
     }
 
+
+
+def _real_position_still_open_on_toobit(signal: Dict[str, Any], pos: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Verify real Toobit position is no longer open before final TP/SL accounting.
+
+    Tracker candles are from market-data feed, while real TP/SL execution happens
+    on Toobit. If OKX candle touches TP/SL but Toobit still reports the futures
+    position open, the bot must keep tracking and must not free slots or record
+    a final result yet.
+    """
+    if toobit_client is None or not isinstance(pos, dict):
+        return {"checked": False, "still_open": False, "reason": "NO_REAL_POSITION_OR_CLIENT"}
+
+    symbol = str(pos.get("symbol") or signal.get("symbol") or "").upper()
+    direction = str(pos.get("direction") or signal.get("direction") or "").upper()
+    quantity = _safe_percent(pos.get("quantity"), 0.0)
+
+    if not symbol or direction not in {"LONG", "SHORT"}:
+        return {"checked": False, "still_open": False, "reason": "MISSING_SYMBOL_DIRECTION"}
+
+    try:
+        checker = getattr(toobit_client, "_has_open_position", None)
+        if callable(checker):
+            opened, position_result = checker(symbol, direction, quantity)
+            return {
+                "checked": True,
+                "still_open": bool(opened),
+                "source": "toobit_client._has_open_position",
+                "position_result": position_result,
+            }
+    except Exception as e:
+        return {"checked": True, "still_open": False, "error": str(e)[:250], "source": "toobit_client._has_open_position"}
+
+    return {"checked": False, "still_open": False, "reason": "NO_POSITION_CHECKER"}
+
 def record_real_trade_result_for_signal(signal: Dict[str, Any], hit_type: str, exit_price: float, pct: float) -> Optional[Dict[str, Any]]:
     """
     Update REAL trading accounting when tracker detects TP1/SL.
@@ -735,6 +770,21 @@ def record_real_trade_result_for_signal(signal: Dict[str, Any], hit_type: str, e
                 "error": "margin/leverage missing",
                 "margin": margin,
                 "leverage": leverage,
+            }
+
+        # Safety before finalizing TP/SL: real execution is Toobit, not OKX.
+        # If Toobit still shows the matching futures position open, keep the
+        # signal active and wait for exchange TP/SL/close confirmation.
+        open_check = _real_position_still_open_on_toobit(signal, pos)
+        if open_check.get("checked") and open_check.get("still_open"):
+            return {
+                "ok": False,
+                "keep_open": True,
+                "error": "OKX candle touched TP/SL but Toobit position is still open; waiting for real exchange close.",
+                "position_check": open_check,
+                "margin": margin,
+                "leverage": leverage,
+                "notional": round(margin * leverage, 6),
             }
 
         exchange_pnl = _fetch_real_closed_pnl_from_exchange(signal, pos, hit_type, exit_price, pct=pct)
@@ -1460,11 +1510,16 @@ def check_active_signals() -> List[Dict[str, Any]]:
                     if not (isinstance(dynamic_decision, dict) and dynamic_decision.get("source") == "REAL_TRADE_MANAGER"):
                         _record_dynamic_learning(signal, exit_price, pct, dynamic_decision)
 
-                record_stat_event(signal, hit_type, exit_price, pct)
-                ai_record_result(signal, hit_type, exit_price, pct)
-
                 if hit_type != DYNAMIC_PROFIT_EVENT:
                     real_trade_accounting = record_real_trade_result_for_signal(signal, hit_type, exit_price, pct)
+                    if isinstance(real_trade_accounting, dict) and real_trade_accounting.get("keep_open"):
+                        signal["last_toobit_wait_reason"] = str(real_trade_accounting.get("error") or "waiting for Toobit close")[:250]
+                        signal["last_checked_at"] = now_ts()
+                        remaining.append(signal)
+                        continue
+
+                record_stat_event(signal, hit_type, exit_price, pct)
+                ai_record_result(signal, hit_type, exit_price, pct)
 
                 ai_close_slot(signal)
 
