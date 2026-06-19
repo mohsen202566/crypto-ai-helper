@@ -1613,6 +1613,195 @@ class ToobitClient:
         return result
 
 
+    # ---------- TP/SL verify / repair for real position sync ----------
+    def _extract_tpsl_values_from_position_item(self, item: dict) -> dict:
+        """Best-effort TP/SL extractor from Toobit position/order response rows."""
+        if not isinstance(item, dict):
+            return {"take_profit": None, "stop_loss": None, "raw_keys": []}
+
+        tp_keys = (
+            "takeProfit", "take_profit", "tp", "tpPrice", "takeProfitPrice",
+            "stopProfitPrice", "profitTriggerPrice", "takeProfitTriggerPrice",
+            "tpTriggerPrice", "takeProfitOrderPrice", "takeProfitStopPrice",
+        )
+        sl_keys = (
+            "stopLoss", "stop_loss", "sl", "slPrice", "stopLossPrice",
+            "lossTriggerPrice", "stopLossTriggerPrice", "slTriggerPrice",
+            "stopLossOrderPrice", "stopLossStopPrice",
+        )
+
+        found_keys = []
+        tp_val = None
+        sl_val = None
+
+        def walk(value):
+            if isinstance(value, dict):
+                yield value
+                for v in value.values():
+                    if isinstance(v, (dict, list)):
+                        yield from walk(v)
+            elif isinstance(value, list):
+                for x in value:
+                    yield from walk(x)
+
+        for row in walk(item):
+            if not isinstance(row, dict):
+                continue
+            for key in tp_keys:
+                if key in row and row.get(key) not in (None, "", 0, "0"):
+                    try:
+                        val = float(row.get(key))
+                        if val > 0:
+                            tp_val = val
+                            found_keys.append(key)
+                            break
+                    except Exception:
+                        pass
+            for key in sl_keys:
+                if key in row and row.get(key) not in (None, "", 0, "0"):
+                    try:
+                        val = float(row.get(key))
+                        if val > 0:
+                            sl_val = val
+                            found_keys.append(key)
+                            break
+                    except Exception:
+                        pass
+
+        return {"take_profit": tp_val, "stop_loss": sl_val, "raw_keys": sorted(set(found_keys))}
+
+    def verify_position_has_tpsl(self, symbol: str, direction: str, take_profit=None, stop_loss=None, **kwargs):
+        """Verify that an existing Toobit futures position appears to have TP/SL attached.
+
+        This is intentionally conservative:
+        - ok=False only when the live position cannot be read/found.
+        - ok=True, verified=False means the position exists but TP/SL was not
+          visible in Toobit's position payload, so sync may try repair_tpsl().
+        """
+        symbol = str(symbol or "").upper().strip()
+        direction = str(direction or "").upper().strip()
+        opened, position_result = self._has_open_position(symbol, direction, kwargs.get("quantity") or 0)
+        if not opened:
+            return {
+                "ok": False,
+                "verified": False,
+                "error": "live position not found while verifying TP/SL",
+                "position_check": position_result,
+            }
+
+        item = (position_result or {}).get("position") or {}
+        tpsl = self._extract_tpsl_values_from_position_item(item)
+        tp_found = tpsl.get("take_profit") is not None
+        sl_found = tpsl.get("stop_loss") is not None
+
+        return {
+            "ok": True,
+            "verified": bool(tp_found and sl_found),
+            "take_profit_found": bool(tp_found),
+            "stop_loss_found": bool(sl_found),
+            "take_profit": tpsl.get("take_profit"),
+            "stop_loss": tpsl.get("stop_loss"),
+            "raw_keys": tpsl.get("raw_keys") or [],
+            "position": item,
+            "note": "TP/SL fields are verified only when Toobit exposes them in the position payload.",
+        }
+
+    def verify_tpsl(self, symbol: str, direction: str, **kwargs):
+        """Backward-compatible alias for real_position_sync.py."""
+        return self.verify_position_has_tpsl(symbol, direction, **kwargs)
+
+    def place_position_tpsl(self, symbol: str, direction: str, take_profit=None, stop_loss=None, quantity: float = 0, **kwargs):
+        """Best-effort repair of TP/SL on an already-open futures position.
+
+        Safety rules:
+        - Never opens a new entry.
+        - First verifies a matching live position exists.
+        - Uses close/TP-SL style endpoints only; if Toobit rejects or endpoint is
+          unavailable, returns ok=False instead of sending a market close/order.
+        """
+        if not REAL_TRADING_ENABLED:
+            return {"ok": False, "blocked": True, "error": "ترید واقعی غیرفعال است. REAL_TRADING_ENABLED=false"}
+
+        symbol = str(symbol or "").upper().strip()
+        direction = str(direction or "").upper().strip()
+        if direction not in {"LONG", "SHORT"}:
+            return {"ok": False, "error": "direction باید LONG یا SHORT باشد"}
+        if take_profit in (None, "", 0) or stop_loss in (None, "", 0):
+            return {"ok": False, "error": "take_profit و stop_loss برای ترمیم TP/SL لازم است"}
+
+        live = self._find_open_position_for_close(symbol, direction)
+        if not live.get("ok"):
+            return {
+                "ok": False,
+                "blocked_reason": "LIVE_POSITION_NOT_FOUND_FOR_TPSL_REPAIR",
+                "error": live.get("error"),
+                "position_check": live,
+            }
+
+        live_qty = float(live.get("quantity") or quantity or 0)
+        if live_qty <= 0:
+            return {"ok": False, "blocked_reason": "LIVE_POSITION_QUANTITY_INVALID", "error": "حجم پوزیشن برای TP/SL معتبر نیست", "position_check": live}
+
+        norm = self._normalize_order_values(symbol, direction, live_qty, take_profit=take_profit, stop_loss=stop_loss)
+        if not norm.get("ok"):
+            return {"ok": False, "blocked": True, "error": norm.get("error", "TP/SL normalization failed"), "normalization": norm}
+
+        normalized_symbol = self.normalize_futures_symbol(symbol)
+        close_side = "SELL_CLOSE" if direction == "LONG" else "BUY_CLOSE"
+        params = {
+            "symbol": normalized_symbol,
+            "side": close_side,
+            "quantity": norm.get("quantity"),
+            "takeProfit": norm.get("take_profit"),
+            "stopLoss": norm.get("stop_loss"),
+            "tpOrderType": "MARKET",
+            "slOrderType": "MARKET",
+            "newClientOrderId": f"bot_tpsl_{uuid.uuid4().hex[:20]}",
+        }
+        params = {k: v for k, v in params.items() if v not in (None, "")}
+
+        # Known/likely TP-SL edit endpoints. All are TP/SL-specific paths; no
+        # generic market-entry endpoint is used here. If Toobit does not support
+        # these paths, the call fails safely and sync will keep warning.
+        candidate_paths = (
+            "/api/v1/futures/tpsl",
+            "/api/v1/futures/order/tpsl",
+            "/api/v1/futures/position/tpsl",
+            "/api/v1/futures/position/modify-tpsl",
+        )
+
+        attempts = []
+        for path in candidate_paths:
+            result = self._signed_request("POST", path, params)
+            attempts.append({
+                "path": path,
+                "ok": bool(isinstance(result, dict) and result.get("ok")),
+                "error": (result or {}).get("error") if isinstance(result, dict) else str(result)[:250],
+                "data": (result or {}).get("data") if isinstance(result, dict) else None,
+            })
+            if isinstance(result, dict) and result.get("ok"):
+                time.sleep(0.8)
+                verify = self.verify_position_has_tpsl(symbol, direction, quantity=live_qty)
+                result["repair_params"] = params
+                result["verify_after_repair"] = verify
+                result["attempts"] = attempts[-4:]
+                return result
+            if isinstance(result, dict) and self._is_rate_limit_error(result):
+                break
+
+        return {
+            "ok": False,
+            "error": "ترمیم TP/SL از مسیرهای شناخته‌شده توبیت موفق نشد؛ پوزیشن باید دستی یا با endpoint صحیح بررسی شود.",
+            "repair_params": params,
+            "attempts": attempts[-4:],
+            "position_check": live,
+        }
+
+    def repair_tpsl(self, symbol: str, direction: str, take_profit=None, stop_loss=None, quantity: float = 0, **kwargs):
+        """Backward-compatible alias used by real_position_sync.py."""
+        return self.place_position_tpsl(symbol, direction, take_profit=take_profit, stop_loss=stop_loss, quantity=quantity, **kwargs)
+
+
     # ---------- Closed PnL / history ----------
     def _history_row_is_pnl_related(self, item: dict) -> bool:
         """Reject unrelated wallet/income rows before extracting PnL.
