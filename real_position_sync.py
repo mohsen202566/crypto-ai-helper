@@ -39,7 +39,7 @@ from typing import Any, Dict, List, Optional, Tuple
 DEFAULT_FAST_SYNC_SECONDS = 2
 DEFAULT_FAST_SYNC_WINDOW_SECONDS = 30
 DEFAULT_SLOW_SYNC_SECONDS = 10
-DEFAULT_PENDING_TIMEOUT_SECONDS = 20
+DEFAULT_PENDING_TIMEOUT_SECONDS = 75
 
 
 # ---------------------------------------------------------------------------
@@ -89,11 +89,25 @@ def _norm_symbol(symbol: Any) -> str:
 
 def _norm_direction(direction: Any) -> str:
     text = str(direction or "").upper().strip()
-    if text in {"LONG", "BUY", "BUY_OPEN"}:
+    if text in {"LONG", "BUY", "BUY_OPEN", "OPEN_LONG", "POSITION_LONG"}:
         return "LONG"
-    if text in {"SHORT", "SELL", "SELL_OPEN"}:
+    if text in {"SHORT", "SELL", "SELL_OPEN", "OPEN_SHORT", "POSITION_SHORT"}:
         return "SHORT"
+    # Toobit/ccxt-style fallbacks sometimes expose side/positionSide as "BOTH",
+    # "NET", or empty. Keep unknown values unchanged rather than guessing.
     return text
+
+
+def _extract_exchange_direction(ex: Dict[str, Any], fallback: Any = None) -> str:
+    """Read direction from the common normalized/Toobit/ccxt position fields."""
+    if not isinstance(ex, dict):
+        return _norm_direction(fallback)
+    for key in ("direction", "position_side", "positionSide", "holdSide", "side", "posSide"):
+        val = ex.get(key)
+        norm = _norm_direction(val)
+        if norm in {"LONG", "SHORT"}:
+            return norm
+    return _norm_direction(fallback)
 
 
 def _position_key(symbol: Any, direction: Any) -> str:
@@ -101,7 +115,7 @@ def _position_key(symbol: Any, direction: Any) -> str:
 
 
 def _positions_match(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
-    return _position_key(a.get("symbol"), a.get("direction")) == _position_key(b.get("symbol"), b.get("direction"))
+    return _position_key(a.get("symbol"), a.get("direction")) == _position_key(b.get("symbol"), _extract_exchange_direction(b, fallback=b.get("direction")))
 
 
 # ---------------------------------------------------------------------------
@@ -181,7 +195,7 @@ def verify_position_integrity(position: Dict[str, Any], exchange_position: Optio
     expected_symbol = _norm_symbol(position.get("symbol"))
     expected_direction = _norm_direction(position.get("direction"))
     actual_symbol = _norm_symbol(ex.get("symbol") or position.get("symbol"))
-    actual_direction = _norm_direction(ex.get("direction") or position.get("direction"))
+    actual_direction = _extract_exchange_direction(ex, fallback=position.get("direction"))
 
     expected_leverage = _safe_float(position.get("leverage") or position.get("configured_leverage"), 0)
     actual_leverage = _safe_float(ex.get("leverage") or position.get("exchange_leverage"), 0)
