@@ -28,8 +28,12 @@ AI_MEMORY_FILE = "ai_memory.json"
 COIN_LEARNING_FILE = "coin_learning.json"
 GHOST_FILE = "ghost_signals.json"
 
+VERSION = 4
+MAX_MARKET_HISTORY = 20000
+MAX_DAILY_REPORTS = 90
+
 DEFAULT_STATE = {
-    "version": 3,
+    "version": VERSION,
     "settings": {
         "enabled": True,
         "learning_enabled": True,
@@ -108,7 +112,7 @@ def _state() -> Dict[str, Any]:
         s = _deepcopy_dict(DEFAULT_STATE)
 
     # Migration / field repair for old ai_memory.json shape.
-    s.setdefault("version", 3)
+    s.setdefault("version", VERSION)
     s.setdefault("settings", {})
     for k, v in DEFAULT_STATE["settings"].items():
         s["settings"].setdefault(k, v)
@@ -145,7 +149,7 @@ def _state() -> Dict[str, Any]:
 
 
 def _save_state(s: Dict[str, Any]) -> Dict[str, Any]:
-    s["version"] = 3
+    s["version"] = VERSION
     save_json(AI_MEMORY_FILE, s)
     return s
 
@@ -201,7 +205,11 @@ def _iter_learning_signals() -> List[Dict[str, Any]]:
 
 def _norm_result(result: Any) -> str:
     r = str(result or "").upper().strip()
-    if r in {"TP", "TP1", "TAKE_PROFIT", "TAKEPROFIT"}:
+    if r in {
+        "TP", "TP1", "TAKE_PROFIT", "TAKEPROFIT",
+        "EARLY_PROFIT", "AI_EXIT_PROFIT", "DYNAMIC_PROFIT",
+        "PROFIT_PROTECT", "PROFIT_PROTECTION"
+    }:
         return "TP1"
     if r == "TP2":
         return "TP2"
@@ -211,7 +219,18 @@ def _norm_result(result: Any) -> str:
 
 
 def _norm_type(item: Dict[str, Any]) -> str:
-    t = str(item.get("signal_type") or item.get("type") or item.get("source") or "REAL").upper()
+    """Normalize stored signal source.
+
+    Prefer explicit result_source/source fields so Ghost and Real stats do not
+    mix when older records use different key names.
+    """
+    t = str(
+        item.get("result_source")
+        or item.get("signal_type")
+        or item.get("type")
+        or item.get("source")
+        or "REAL"
+    ).upper()
     return "GHOST" if "GHOST" in t or "SHADOW" in t else "REAL"
 
 
@@ -370,10 +389,19 @@ def update_ai_summary(
     for k in list(increments.keys()):
         if kwargs.get(k) is not None:
             increments[k] += _safe_int(kwargs.get(k))
+    # Backward compatibility: older modules may send generic total_tp/total_sl.
+    # Route them by source when possible so Ghost results do not pollute Real stats.
+    generic_source = str(kwargs.get("source") or kwargs.get("result_source") or "REAL").upper()
     if kwargs.get("total_tp") is not None:
-        increments["total_real_tp"] += _safe_int(kwargs.get("total_tp"))
+        if "GHOST" in generic_source or "SHADOW" in generic_source:
+            increments["total_ghost_tp"] += _safe_int(kwargs.get("total_tp"))
+        else:
+            increments["total_real_tp"] += _safe_int(kwargs.get("total_tp"))
     if kwargs.get("total_sl") is not None:
-        increments["total_real_sl"] += _safe_int(kwargs.get("total_sl"))
+        if "GHOST" in generic_source or "SHADOW" in generic_source:
+            increments["total_ghost_sl"] += _safe_int(kwargs.get("total_sl"))
+        else:
+            increments["total_real_sl"] += _safe_int(kwargs.get("total_sl"))
 
     for k, v in increments.items():
         sm[k] = _safe_int(sm.get(k)) + _safe_int(v)
@@ -419,7 +447,7 @@ def update_ai_summary(
             "btc_bias": btc,
             "source": str(kwargs.get("source") or "update_ai_summary"),
         })
-        mm["history"] = mm["history"][-240:]
+        mm["history"] = mm["history"][-MAX_MARKET_HISTORY:]
 
     sm["last_update"] = _now()
     _refresh_health_in_state(s)
@@ -442,7 +470,7 @@ def update_market_memory(market_mode: str = None, btc_bias: str = None, snapshot
     mm.setdefault("btc_bias_counts", {})[btc] = _safe_int(mm.setdefault("btc_bias_counts", {}).get(btc)) + 1
     event = {"ts": ts, "market_mode": mode, "btc_bias": btc, "source": source}
     mm.setdefault("history", []).append(event)
-    mm["history"] = mm["history"][-240:]
+    mm["history"] = mm["history"][-MAX_MARKET_HISTORY:]
     _save_state(s)
     return mm
 
@@ -470,9 +498,9 @@ def update_daily_report_memory(date: str = None, report: Optional[Dict[str, Any]
     row["updated_at"] = _now()
     s.setdefault("daily_reports", {})[d] = row
 
-    # Keep last 45 daily reports.
+    # Keep enough daily reports for the 90-day time-weighted learning window.
     keys = sorted(s["daily_reports"].keys())
-    for old in keys[:-45]:
+    for old in keys[:-MAX_DAILY_REPORTS]:
         s["daily_reports"].pop(old, None)
     _save_state(s)
     return row
@@ -556,3 +584,29 @@ def format_ai_daily_report(date: str = None) -> str:
 
 def format_ai_memory_summary() -> str:
     return format_ai_status() + "\n" + _format_rotation_short()
+
+# -------------------- compatibility aliases --------------------
+
+def format_learning_summary() -> str:
+    """Compatibility helper used by bot.py in some deployments."""
+    return format_ai_memory_summary()
+
+
+def ai_status_text() -> str:
+    return format_ai_status()
+
+
+def enable_ai() -> Dict[str, Any]:
+    return set_ai_enabled(True)
+
+
+def disable_ai() -> Dict[str, Any]:
+    return set_ai_enabled(False)
+
+
+def enable_ai_learning() -> Dict[str, Any]:
+    return set_ai_learning_enabled(True)
+
+
+def disable_ai_learning() -> Dict[str, Any]:
+    return set_ai_learning_enabled(False)
