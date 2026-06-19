@@ -263,7 +263,7 @@ def _prediction_adjustment(snapshot: Dict[str, Any]) -> Tuple[float, List[str]]:
     """Soft prediction bonus/penalty. It never hard-blocks; it only changes rank."""
     pred = _extract_nested_number(snapshot, "prediction_score", "early_momentum_score", default=50.0)
     reversal = _extract_nested_number(snapshot, "reversal_risk_score", "reversal_risk", default=50.0)
-    expected = _extract_nested_number(snapshot, "expected_move_pct", "expected_move", default=0.0)
+    expected = _extract_nested_number(snapshot, "expected_move_pct", "expected_move", "expected_move_atr", default=0.0)
     adx_slope = _extract_nested_number(snapshot, "adx_slope_15m", "adx_slope", default=0.0)
     rsi_slope = _extract_nested_number(snapshot, "rsi_slope_15m", "rsi_slope", default=0.0)
     macd_accel = _extract_nested_number(snapshot, "macd_hist_accel_15m", "macd_acceleration", default=0.0)
@@ -488,7 +488,10 @@ def apply_ai_scanner_decision(r: Dict[str, Any]) -> Dict[str, Any]:
 
     # Do not fully erase high-quality analysis results; if rejected, they can
     # become Ghost signals for learning instead of Telegram/live entry.
-    ai_rank = base_rank + (final_score - base_score) + rotation_adj + weighted_prediction_adj + weighted_similarity_adj
+    # final_score already includes rotation/prediction/similarity and penalties.
+    # Do not add those positive layers a second time here; otherwise AI rank
+    # can over-prioritize noisy boosts and ignore risk/liquidity penalties.
+    ai_rank = base_rank + (final_score - base_score)
 
     r["symbol"] = symbol
     r["snapshot"] = snapshot
