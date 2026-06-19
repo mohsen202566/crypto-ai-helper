@@ -377,6 +377,50 @@ def update_ai_summary(
 
     for k, v in increments.items():
         sm[k] = _safe_int(sm.get(k)) + _safe_int(v)
+
+    # New compatibility path:
+    # analysis.py / scanner.py may call update_ai_summary(...) with BTC Lead
+    # or Market Mode values in kwargs. Older update_ai_summary ignored these
+    # fields, so "وضعیت AI" kept showing BTC: UNKNOWN / Market: UNKNOWN even
+    # when analysis.py calculated them correctly. Store them here as market
+    # memory without forcing callers to import update_market_memory directly.
+    market_mode = (
+        kwargs.get("market_mode")
+        or kwargs.get("market_regime")
+        or kwargs.get("last_mode")
+    )
+    btc_bias = (
+        kwargs.get("btc_bias")
+        or kwargs.get("btc_lead_bias")
+        or kwargs.get("last_btc_bias")
+    )
+    snapshot = kwargs.get("market_context") or kwargs.get("snapshot") or {}
+    if isinstance(snapshot, dict):
+        if market_mode is None:
+            market_mode = snapshot.get("market_mode") or snapshot.get("market_regime")
+        if btc_bias is None:
+            btc_bias = snapshot.get("btc_bias")
+    else:
+        snapshot = {}
+
+    if market_mode is not None or btc_bias is not None:
+        mm = s.setdefault("market_memory", {})
+        mode = str(market_mode or mm.get("last_mode") or "UNKNOWN").upper()
+        btc = str(btc_bias or mm.get("last_btc_bias") or "UNKNOWN").upper()
+        ts = _now()
+        mm["last_mode"] = mode
+        mm["last_btc_bias"] = btc
+        mm["last_update"] = ts
+        mm.setdefault("mode_counts", {})[mode] = _safe_int(mm.setdefault("mode_counts", {}).get(mode)) + 1
+        mm.setdefault("btc_bias_counts", {})[btc] = _safe_int(mm.setdefault("btc_bias_counts", {}).get(btc)) + 1
+        mm.setdefault("history", []).append({
+            "ts": ts,
+            "market_mode": mode,
+            "btc_bias": btc,
+            "source": str(kwargs.get("source") or "update_ai_summary"),
+        })
+        mm["history"] = mm["history"][-240:]
+
     sm["last_update"] = _now()
     _refresh_health_in_state(s)
     _save_state(s)
