@@ -33,9 +33,23 @@ try:
 except Exception:
     _ds_load_json = None; _ds_save_json = None
 
+# Optional soft trend-analysis layer.
+# It must never become a hard gate by itself; it only adds small balanced
+# points so simple trendline/breakout logic cannot confuse the AI.
+try:
+    from trend_analysis import detect_trendline, detect_breakout
+except Exception:
+    detect_trendline = None
+    detect_breakout = None
+
 exchange = ccxt.okx({'enableRateLimit': True, 'timeout': 20000, 'options': {'defaultType': 'swap'}})
 _SOFT_MARKET_CONTEXT_CACHE = {'ts': 0, 'data': None}
 SOFT_MARKET_CONTEXT_TTL_SECONDS = 120
+# Keep simple structure/breakout tools soft. Previous standalone weights such
+# as +12/+15 are too strong for 5M/15M scalping and can override AI context.
+SOFT_TRENDLINE_MAX_SCORE = 6
+SOFT_BREAKOUT_MAX_SCORE = 8
+SOFT_FAKE_BREAKOUT_MAX_SCORE = 5
 AUTO_DIRECT_SCORE_MIN = max(int(MIN_DIRECT_SCORE), int(AUTO_DIRECT_SCORE_MIN))
 ADX_HARD_MIN = max(float(MIN_ADX_FOR_TREND), 20.0)
 LONG_DIRECT_SCORE_BONUS_REQUIREMENT = 0
@@ -372,6 +386,51 @@ def ai_extra_strength_required(symbol, direction, snapshot):
     return default
 
 
+def _soft_trend_analysis_pack(df_15m: pd.DataFrame) -> Dict[str, Any]:
+    """Optional trendline/breakout pack with deliberately soft weights.
+
+    trend_analysis.py returns simple labels. This helper makes them useful
+    without letting them dominate Market Mode, BTC, Trap, Similarity, Risk, or
+    the final AI ranking.
+    """
+    out = {
+        'enabled': bool(callable(detect_trendline) and callable(detect_breakout)),
+        'trendline': 'unavailable',
+        'breakout': 'unavailable',
+        'long_score': 0,
+        'short_score': 0,
+        'soft_layer': True,
+    }
+    if not out['enabled']:
+        return out
+    try:
+        trendline = detect_trendline(df_15m)
+        breakout = detect_breakout(df_15m)
+        out['trendline'] = trendline
+        out['breakout'] = breakout
+
+        if trendline == 'uptrend':
+            out['long_score'] += SOFT_TRENDLINE_MAX_SCORE
+        elif trendline == 'downtrend':
+            out['short_score'] += SOFT_TRENDLINE_MAX_SCORE
+
+        if breakout == 'bullish_breakout':
+            out['long_score'] += SOFT_BREAKOUT_MAX_SCORE
+        elif breakout == 'bearish_breakout':
+            out['short_score'] += SOFT_BREAKOUT_MAX_SCORE
+        elif breakout == 'fake_bullish_breakout':
+            out['short_score'] += SOFT_FAKE_BREAKOUT_MAX_SCORE
+        elif breakout == 'fake_bearish_breakout':
+            out['long_score'] += SOFT_FAKE_BREAKOUT_MAX_SCORE
+
+        out['long_score'] = int(max(0, min(12, out['long_score'])))
+        out['short_score'] = int(max(0, min(12, out['short_score'])))
+    except Exception as e:
+        out['enabled'] = False
+        out['error'] = str(e)[:120]
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Soft AI feature packs for prediction/learning
 # ---------------------------------------------------------------------------
@@ -599,6 +658,7 @@ def build_local_snapshot(symbol, direction, df_4h, df_1h, df_30m, df_15m, df_5m,
         'liquidity_trap':prediction_pack.get('liquidity_trap',{}),
         'relative_strength':prediction_pack.get('relative_strength',{}),
         'sr_levels':{'nearest_support':levels.get('nearest_support'),'nearest_resistance':levels.get('nearest_resistance')},
+        'trend_analysis':score_pack.get('trend_analysis',{}),
         'early_5m_trigger':score_pack.get('early_5m_trigger',{}),'multi_tf_alignment':score_pack.get('multi_tf_alignment',{}),
         'late_entry':score_pack.get('late_entry',{}),'pump_dump_chase':score_pack.get('pump_dump_chase',{}),
         'trends':score_pack.get('trends',{}),'long_score':score_pack.get('long_score',0),'short_score':score_pack.get('short_score',0),
@@ -671,6 +731,16 @@ def simple_classic_score(symbol, df_4h, df_1h, df_30m, df_15m, df_5m, market_con
     if buy3>=62: long_score+=3
     if sell3>=62: short_score+=3
 
+    # Optional trendline/breakout layer stays soft. It helps direction detection
+    # but never decides the signal alone.
+    trend_pack = _soft_trend_analysis_pack(df_15m)
+    if safe_float(trend_pack.get('long_score'), 0) > 0:
+        long_score += safe_float(trend_pack.get('long_score'))
+        long_reasons.append(f"Trend soft لانگ +{trend_pack.get('long_score')} ({trend_pack.get('trendline')}/{trend_pack.get('breakout')})")
+    if safe_float(trend_pack.get('short_score'), 0) > 0:
+        short_score += safe_float(trend_pack.get('short_score'))
+        short_reasons.append(f"Trend soft شورت +{trend_pack.get('short_score')} ({trend_pack.get('trendline')}/{trend_pack.get('breakout')})")
+
     # Fast-entry upgrades:
     # - Do not lower threshold.
     # - Reward only fresh 5M triggers when higher timeframes agree.
@@ -737,7 +807,7 @@ def simple_classic_score(symbol, df_4h, df_1h, df_30m, df_15m, df_5m, market_con
     if not long_vwap_ok: long_reasons.append('رد لانگ: خلاف VWAP')
     if not short_direction_ok: short_reasons.append('رد شورت: جهت کافی نیست')
     if not short_macd_ok: short_reasons.append('رد شورت: MACD کافی نیست')
-    return {'long_score':cap_score(long_score),'short_score':cap_score(short_score),'long_reasons':long_reasons,'short_reasons':short_reasons,'confirmations_long':cl,'confirmations_short':cs,'trends':trends,'distance_ema20_atr':round(distance_from_ema20_atr(df_15m),2),'volume_status':volume_quality(df_15m)[0],'volume_ratio':round(volume_quality(df_15m)[1],2),'power2_buy':buy2,'power2_sell':sell2,'power3_buy':buy3,'power3_sell':sell3,'buy_power':buy20,'sell_power':sell20,'early_5m_trigger':{'LONG':long_early,'SHORT':short_early},'multi_tf_alignment':{'LONG':long_alignment,'SHORT':short_alignment},'late_entry':{'LONG':long_late,'SHORT':short_late},'pump_dump_chase':{'LONG':long_chase,'SHORT':short_chase},'long_valid':adx>=ADX_HARD_MIN and long_direction_ok and long_macd_ok and long_1h_ok and long_vwap_ok and not long_late.get('late') and not long_chase.get('late'),'short_valid':adx>=ADX_HARD_MIN and short_direction_ok and short_macd_ok and not short_late.get('late') and not short_chase.get('late'),'adx_15':adx,'market_regime':mb}
+    return {'long_score':cap_score(long_score),'short_score':cap_score(short_score),'long_reasons':long_reasons,'short_reasons':short_reasons,'confirmations_long':cl,'confirmations_short':cs,'trends':trends,'distance_ema20_atr':round(distance_from_ema20_atr(df_15m),2),'volume_status':volume_quality(df_15m)[0],'volume_ratio':round(volume_quality(df_15m)[1],2),'power2_buy':buy2,'power2_sell':sell2,'power3_buy':buy3,'power3_sell':sell3,'buy_power':buy20,'sell_power':sell20,'trend_analysis':trend_pack,'early_5m_trigger':{'LONG':long_early,'SHORT':short_early},'multi_tf_alignment':{'LONG':long_alignment,'SHORT':short_alignment},'late_entry':{'LONG':long_late,'SHORT':short_late},'pump_dump_chase':{'LONG':long_chase,'SHORT':short_chase},'long_valid':adx>=ADX_HARD_MIN and long_direction_ok and long_macd_ok and long_1h_ok and long_vwap_ok and not long_late.get('late') and not long_chase.get('late'),'short_valid':adx>=ADX_HARD_MIN and short_direction_ok and short_macd_ok and not short_late.get('late') and not short_chase.get('late'),'adx_15':adx,'market_regime':mb}
 
 def find_swing_levels(df, timeframe, lookback=LEVEL_LOOKBACK, window=SWING_WINDOW):
     recent=df.tail(lookback).copy(); levels=[]; w=TF_LEVEL_WEIGHTS.get(timeframe,1.0)
