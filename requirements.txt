@@ -5,3 +5,5 @@ numpy
 ta
 requests
 python-dotenv
+python-dateutil
+pytz
