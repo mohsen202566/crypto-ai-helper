@@ -28,13 +28,13 @@ from data_store import load_json, save_json
 try:
     from config import DAILY_SL_STRICTNESS_START, MAX_DAILY_STRICTNESS_LEVEL
 except Exception:
-    DAILY_SL_STRICTNESS_START = 2
+    DAILY_SL_STRICTNESS_START = 3
     MAX_DAILY_STRICTNESS_LEVEL = 5
 
 RISK_FILE = "coin_risk.json"
 DAY_SECONDS = 86400
-MAX_RECENT_EVENTS = 500
-VERSION = 3
+MAX_RECENT_EVENTS = 20000
+VERSION = 4
 
 
 def _now() -> int:
@@ -301,11 +301,39 @@ def _count_recent_events(s: Dict[str, Any], symbol: str, direction: str, days: i
     return out
 
 
-def _risk_score(daily: Dict[str, Any], archive: Dict[str, Any], recent_7d: Dict[str, int]) -> int:
-    daily_score = int(daily.get("real_sl", 0)) * 24 + int(daily.get("ghost_sl", 0)) * 14 - int(daily.get("real_tp", 0)) * 8 - int(daily.get("ghost_tp", 0)) * 4
-    recent_score = int(recent_7d.get("real_sl", 0)) * 10 + int(recent_7d.get("ghost_sl", 0)) * 6 - int(recent_7d.get("real_tp", 0)) * 4 - int(recent_7d.get("ghost_tp", 0)) * 2
-    long_score = int(archive.get("real_sl", 0)) * 4 + int(archive.get("ghost_sl", 0)) * 2 - int(archive.get("real_tp", 0)) * 2 - int(archive.get("ghost_tp", 0))
-    return max(0, min(100, int(daily_score + recent_score + long_score)))
+def _risk_score(daily: Dict[str, Any], archive: Dict[str, Any], recent_7d: Dict[str, int], recent_30d: Dict[str, int] = None) -> int:
+    """Time-weighted risk score.
+
+    Recent behavior should dominate old archive data for scalping.
+    0-1 day has the highest weight, 7 days medium/high, 30 days medium,
+    and all-time archive only a small background influence.
+    """
+    recent_30d = recent_30d or _empty_counts()
+    daily_score = (
+        int(daily.get("real_sl", 0)) * 24
+        + int(daily.get("ghost_sl", 0)) * 12
+        - int(daily.get("real_tp", 0)) * 9
+        - int(daily.get("ghost_tp", 0)) * 4
+    )
+    recent_7_score = (
+        int(recent_7d.get("real_sl", 0)) * 10
+        + int(recent_7d.get("ghost_sl", 0)) * 5
+        - int(recent_7d.get("real_tp", 0)) * 4
+        - int(recent_7d.get("ghost_tp", 0)) * 2
+    )
+    recent_30_score = (
+        int(recent_30d.get("real_sl", 0)) * 4
+        + int(recent_30d.get("ghost_sl", 0)) * 2
+        - int(recent_30d.get("real_tp", 0)) * 2
+        - int(recent_30d.get("ghost_tp", 0))
+    )
+    long_score = (
+        int(archive.get("real_sl", 0)) * 1.2
+        + int(archive.get("ghost_sl", 0)) * 0.6
+        - int(archive.get("real_tp", 0)) * 0.6
+        - int(archive.get("ghost_tp", 0)) * 0.3
+    )
+    return max(0, min(100, int(daily_score + recent_7_score + recent_30_score + long_score)))
 
 
 def _behavior_from_stats(tp: int, sl: int) -> str:
@@ -323,7 +351,9 @@ def _behavior_from_stats(tp: int, sl: int) -> str:
 
 
 def _strictness_level(daily: Dict[str, Any], archive: Dict[str, Any], recent_7d: Dict[str, int], risk_score: int, condition_penalty: int = 0) -> int:
-    start = max(1, int(DAILY_SL_STRICTNESS_START))
+    # User preference: adaptive strictness must start from the 3rd SL
+    # for the same coin+direction, not earlier.
+    start = max(3, int(DAILY_SL_STRICTNESS_START))
     max_level = max(1, int(MAX_DAILY_STRICTNESS_LEVEL))
     daily_sl_weighted = int(daily.get("real_sl", 0)) + int(daily.get("ghost_sl", 0)) * 0.5
     recent_sl_weighted = int(recent_7d.get("real_sl", 0)) + int(recent_7d.get("ghost_sl", 0)) * 0.5
@@ -371,7 +401,7 @@ def _refresh_archive_computed_fields(s: Dict[str, Any], symbol: str, direction: 
     archive = _get_archive_row(s, symbol, direction)
     recent_7d = _count_recent_events(s, symbol, direction, 7)
     recent_30d = _count_recent_events(s, symbol, direction, 30)
-    score = _risk_score(daily, archive, recent_7d)
+    score = _risk_score(daily, archive, recent_7d, recent_30d)
     cond = _condition_penalty_from_stats(archive, direction, snapshot)
     strict = _strictness_level(daily, archive, recent_7d, score, cond.get("condition_penalty", 0))
     archive["recent_7d"] = recent_7d
@@ -428,7 +458,7 @@ def get_direction_risk_state(symbol: str, direction: str, snapshot: Optional[Dic
         "tp_count": daily_tp,
         "strictness_level": strict,
         "risk_score": risk_score,
-        "bad_day": daily_sl >= int(DAILY_SL_STRICTNESS_START),
+        "bad_day": daily_sl >= max(3, int(DAILY_SL_STRICTNESS_START)),
         "recommend_reduce": strict >= 3 or risk_score >= 70,
         "hard_block": False,
         "soft_layer": True,
@@ -447,7 +477,7 @@ def get_direction_risk_state(symbol: str, direction: str, snapshot: Optional[Dic
         },
         "recent_7d": dict(recent_7d),
         "recent_30d": dict(recent_30d),
-        "source_weights": {"real_sl": 1.0, "ghost_sl": 0.5, "real_tp": 1.0, "ghost_tp": 0.5},
+        "source_weights": {"real_sl": 1.0, "ghost_sl": 0.5, "real_tp": 1.0, "ghost_tp": 0.5, "time_weighting": "daily > 7d > 30d > archive"},
         "message": "ریسک نرم/تدریجی است؛ این لایه به‌تنهایی سیگنال را بلاک نمی‌کند.",
     }
     return out
