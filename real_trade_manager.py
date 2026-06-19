@@ -48,7 +48,7 @@ except Exception:
         return raw
 
 
-REAL_TRADE_FILE = "data/real_trade_state.json"
+REAL_TRADE_FILE = "real_trade_state.json"
 
 DEFAULT_REAL_LOCK_DURATION_HOURS = 1
 DEFAULT_REAL_DAILY_LOSS_LIMIT_USD = 7.0
