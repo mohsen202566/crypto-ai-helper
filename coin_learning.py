@@ -23,6 +23,8 @@ Compatibility:
     format_coin_behavior
     format_smart_stats
     get_tp_sl_v2_profile
+    find_similar_patterns
+    get_similarity_adjustment
     register_tp_sl_v2_result
 """
 
@@ -40,6 +42,16 @@ REAL_WEIGHT = 1.0
 GHOST_WEIGHT = 0.45
 MIN_TP_MEMORY_WINS = 3
 TP_SL_V2_VERSION = 1
+
+# Historical Similarity Engine
+# Soft decision layer: compares the current technical snapshot with prior
+# TP/SL snapshots for the same coin+direction. It never hard-blocks signals by
+# itself; scanner/slot_manager can use the returned adjustment for ranking.
+SIMILARITY_MIN_SAMPLES = 4
+SIMILARITY_MAX_MATCHES = 60
+SIMILARITY_MIN_SCORE = 0.58
+SIMILARITY_REAL_WEIGHT = 1.0
+SIMILARITY_GHOST_WEIGHT = 0.55
 
 
 def _now() -> int:
@@ -935,6 +947,272 @@ def _similar_sl_pressure(b: Dict[str, Any], snapshot: Optional[Dict[str, Any]]) 
     return min(3, pressure)
 
 
+
+# ---------------------------------------------------------------------------
+# Historical Similarity Engine
+# ---------------------------------------------------------------------------
+# This is the active use of stored snapshots:
+# current snapshot -> compare with past result snapshots -> TP/SL probability,
+# average move/MFE/MAE, and a soft adjustment for AI ranking/strictness.
+def _extract_nested_value(snapshot: Dict[str, Any], key: str, default: Any = None) -> Any:
+    if not isinstance(snapshot, dict):
+        return default
+    if snapshot.get(key) is not None:
+        return snapshot.get(key)
+    for nest in ("prediction_layer", "state_awareness", "liquidity_trap", "relative_strength", "candle_behavior", "market_context"):
+        obj = snapshot.get(nest)
+        if isinstance(obj, dict) and obj.get(key) is not None:
+            return obj.get(key)
+    return default
+
+
+def _similarity_numeric(a: Any, b: Any, tolerance: float) -> float:
+    av = _safe_float(a, None)
+    bv = _safe_float(b, None)
+    if av is None or bv is None:
+        return 0.0
+    tolerance = max(float(tolerance or 1.0), 1e-9)
+    return max(0.0, 1.0 - min(1.0, abs(av - bv) / tolerance))
+
+
+def _similarity_category(a: Any, b: Any) -> float:
+    if a is None or b is None:
+        return 0.0
+    return 1.0 if str(a).upper() == str(b).upper() else 0.0
+
+
+def _snapshot_similarity(current: Dict[str, Any], past: Dict[str, Any]) -> float:
+    """Weighted similarity between two compact technical snapshots.
+
+    The tolerance values are intentionally broad; this is not exact matching.
+    Goal: find historically similar market/indicator states without making AI
+    too strict in the early data phase.
+    """
+    if not isinstance(current, dict) or not isinstance(past, dict):
+        return 0.0
+
+    numeric_specs = [
+        ("rsi", 8.0, 1.10),
+        ("rsi_5m", 10.0, 0.65),
+        ("rsi_slope_15m", 3.0, 0.75),
+        ("adx", 8.0, 1.00),
+        ("adx_slope_15m", 3.0, 0.75),
+        ("macd_hist", 0.0015, 0.80),
+        ("macd_hist_slope_15m", 0.0015, 0.80),
+        ("macd_hist_accel_15m", 0.0015, 0.90),
+        ("vwap_distance_pct", 0.45, 0.95),
+        ("volume_ratio_15m", 0.75, 0.65),
+        ("power2_buy", 18.0, 0.75),
+        ("power2_sell", 18.0, 0.75),
+        ("power3_buy", 16.0, 0.85),
+        ("power3_sell", 16.0, 0.85),
+        ("buy_power", 14.0, 0.55),
+        ("sell_power", 14.0, 0.55),
+        ("prediction_score", 18.0, 0.95),
+        ("reversal_risk_score", 20.0, 0.90),
+        ("expected_move_atr", 0.70, 0.65),
+    ]
+    category_specs = [
+        ("vwap_status", 0.90),
+        ("ema_structure_15m", 0.80),
+        ("market_regime", 0.85),
+        ("market_mode", 0.65),
+        ("btc_bias", 0.90),
+        ("move_state", 1.00),
+        ("trap_risk", 0.95),
+        ("relative_status", 0.55),
+        ("timeframe_core", 0.25),
+        ("entry_timing_tf", 0.25),
+    ]
+
+    total_w = 0.0
+    score = 0.0
+    for key, tolerance, weight in numeric_specs:
+        c = _extract_nested_value(current, key)
+        p = _extract_nested_value(past, key)
+        if c is None or p is None:
+            continue
+        total_w += weight
+        score += _similarity_numeric(c, p, tolerance) * weight
+
+    for key, weight in category_specs:
+        c = _extract_nested_value(current, key)
+        p = _extract_nested_value(past, key)
+        if c is None or p is None:
+            continue
+        total_w += weight
+        score += _similarity_category(c, p) * weight
+
+    # Direction-specific nested packs: early trigger / late entry are important
+    # but should not dominate the whole comparison.
+    try:
+        direction = str(current.get("direction") or past.get("direction") or "").upper()
+        c_flags = _fast_entry_flags(current, direction)
+        p_flags = _fast_entry_flags(past, direction)
+        for key, weight in [("early_5m_active", 0.55), ("multi_tf_active", 0.45), ("late_entry", 0.70), ("rr_filter", 0.40)]:
+            total_w += weight
+            score += (1.0 if bool(c_flags.get(key)) == bool(p_flags.get(key)) else 0.0) * weight
+    except Exception:
+        pass
+
+    if total_w <= 0:
+        return 0.0
+    return round(max(0.0, min(1.0, score / total_w)), 4)
+
+
+def _event_similarity_weight(event: Dict[str, Any], similarity: float) -> float:
+    src = _norm_source(event.get("source"))
+    base = SIMILARITY_GHOST_WEIGHT if src == "GHOST" else SIMILARITY_REAL_WEIGHT
+    # More similar cases matter disproportionately more than barely similar
+    # cases, but keep it bounded.
+    return base * max(0.05, min(1.0, similarity)) ** 2
+
+
+def _event_move_atr(event: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
+    snap = event.get("snapshot", {}) if isinstance(event, dict) else {}
+    if not isinstance(snap, dict):
+        return None, None
+    atr = _safe_float(snap.get("atr"), 0.0)
+    entry = _safe_float(snap.get("entry") or snap.get("price"), 0.0)
+    if atr <= 0 and entry > 0:
+        atr = entry * 0.0015
+    if atr <= 0:
+        return None, None
+    fav = _safe_float(event.get("max_favorable") or snap.get("max_favorable") or snap.get("max_favorable_atr"), None)
+    adv = _safe_float(event.get("max_adverse") or snap.get("max_adverse") or snap.get("max_adverse_atr"), None)
+    return fav, adv
+
+
+def find_similar_patterns(symbol: str, direction: str, snapshot: Optional[Dict[str, Any]] = None, limit: int = SIMILARITY_MAX_MATCHES, min_similarity: float = SIMILARITY_MIN_SCORE) -> Dict[str, Any]:
+    """Find historically similar TP/SL snapshots for symbol+direction.
+
+    Read-only and safe for scanner/slot_manager. It uses stored bucket events
+    and returns a compact profile:
+      - match_count / confidence
+      - TP/SL weighted win-rate
+      - average move and MFE/MAE when available
+      - soft adjustment score for AI ranking
+    """
+    current = _compact_snapshot(build_signal_snapshot(symbol, direction, snapshot or {}, (snapshot or {}).get("market_context") if isinstance(snapshot, dict) else None))
+    s = _state()
+    b = s.get("by_coin_direction", {}).get(_key(symbol, direction), {})
+    if not isinstance(b, dict) or not b:
+        return {"available": False, "reason": "NO_BUCKET", "match_count": 0, "confidence": 0, "adjustment": 0.0, "source": "historical_similarity"}
+
+    events = b.get("events", [])
+    if not isinstance(events, list) or not events:
+        return {"available": False, "reason": "NO_EVENTS", "match_count": 0, "confidence": 0, "adjustment": 0.0, "source": "historical_similarity"}
+
+    matches: List[Dict[str, Any]] = []
+    for ev in events[-MAX_EVENTS_PER_BUCKET:]:
+        if not isinstance(ev, dict):
+            continue
+        result = _norm_result(ev.get("result"))
+        if result not in {"TP1", "TP2", "SL"}:
+            continue
+        ps = ev.get("snapshot", {})
+        if not isinstance(ps, dict):
+            continue
+        sim = _snapshot_similarity(current, ps)
+        if sim >= float(min_similarity):
+            row = {
+                "similarity": sim,
+                "result": result,
+                "source": _norm_source(ev.get("source")),
+                "move_percent": _safe_float(ev.get("move_percent"), 0.0),
+                "ts": _safe_int(ev.get("ts"), 0),
+                "weight": _event_similarity_weight(ev, sim),
+            }
+            fav, adv = _event_move_atr(ev)
+            if fav is not None:
+                row["max_favorable_atr"] = fav
+            if adv is not None:
+                row["max_adverse_atr"] = adv
+            matches.append(row)
+
+    matches.sort(key=lambda x: (x.get("similarity", 0), x.get("ts", 0)), reverse=True)
+    matches = matches[:max(1, int(limit or SIMILARITY_MAX_MATCHES))]
+
+    if not matches:
+        return {"available": False, "reason": "NO_SIMILAR_MATCH", "match_count": 0, "confidence": 0, "adjustment": 0.0, "source": "historical_similarity"}
+
+    tp_w = sl_w = total_w = 0.0
+    move_sum = move_w = 0.0
+    fav_sum = fav_w = 0.0
+    adv_sum = adv_w = 0.0
+    for m in matches:
+        w = _safe_float(m.get("weight"), 0.0)
+        if w <= 0:
+            continue
+        total_w += w
+        if m.get("result") in {"TP1", "TP2"}:
+            tp_w += w
+        elif m.get("result") == "SL":
+            sl_w += w
+        if m.get("move_percent") is not None:
+            move_sum += _safe_float(m.get("move_percent"), 0.0) * w
+            move_w += w
+        if m.get("max_favorable_atr") is not None:
+            fav_sum += _safe_float(m.get("max_favorable_atr"), 0.0) * w
+            fav_w += w
+        if m.get("max_adverse_atr") is not None:
+            adv_sum += _safe_float(m.get("max_adverse_atr"), 0.0) * w
+            adv_w += w
+
+    wr = tp_w / max(tp_w + sl_w, 1e-9)
+    avg_similarity = sum(_safe_float(m.get("similarity")) for m in matches) / max(len(matches), 1)
+    confidence = min(100, int(len(matches) * 10 + total_w * 8 + avg_similarity * 18))
+
+    # Soft rank effect only. Low sample profiles are deliberately weak.
+    if len(matches) < SIMILARITY_MIN_SAMPLES:
+        adjustment = 0.0
+        verdict = "LOW_DATA"
+    else:
+        adjustment = (wr - 0.50) * 18.0
+        if wr >= 0.68:
+            verdict = "FAVORABLE"
+        elif wr <= 0.42:
+            verdict = "RISKY"
+        else:
+            verdict = "MIXED"
+        # If similar cases moved profitably but not far, avoid over-bonus.
+        avg_move = move_sum / max(move_w, 1e-9) if move_w else 0.0
+        if wr >= 0.60 and avg_move < 0.10:
+            adjustment -= 1.5
+        adjustment = max(-8.0, min(8.0, adjustment))
+
+    return {
+        "available": len(matches) >= SIMILARITY_MIN_SAMPLES,
+        "source": "historical_similarity",
+        "match_count": len(matches),
+        "weighted_samples": round(total_w, 3),
+        "confidence": confidence,
+        "win_rate": round(wr * 100.0, 1),
+        "tp_weight": round(tp_w, 3),
+        "sl_weight": round(sl_w, 3),
+        "avg_similarity": round(avg_similarity, 4),
+        "avg_move_percent": round(move_sum / max(move_w, 1e-9), 4) if move_w else None,
+        "avg_max_favorable_atr": round(fav_sum / max(fav_w, 1e-9), 4) if fav_w else None,
+        "avg_max_adverse_atr": round(adv_sum / max(adv_w, 1e-9), 4) if adv_w else None,
+        "adjustment": round(adjustment, 3),
+        "verdict": verdict,
+        "top_matches": matches[:8],
+    }
+
+
+def get_similarity_adjustment(symbol: str, direction: str, snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Public helper for scanner/slot_manager.
+
+    Returns the same profile plus explicit rank/strictness fields.
+    """
+    profile = find_similar_patterns(symbol, direction, snapshot)
+    adj = _safe_float(profile.get("adjustment"), 0.0)
+    profile["rank_adjustment"] = adj
+    profile["extra_strength_score"] = 0 if adj >= 0 else min(6, int(abs(adj) // 2 + 1))
+    profile["extra_confirmations"] = 1 if profile.get("available") and profile.get("verdict") == "RISKY" and _safe_float(profile.get("win_rate"), 50.0) <= 40 else 0
+    return profile
+
+
 def should_require_extra_strength(symbol: str, direction: str, snapshot: Optional[Dict] = None) -> Dict:
     s = _state()
     b = s.get("by_coin_direction", {}).get(_key(symbol, direction), {})
@@ -1009,6 +1287,26 @@ def should_require_extra_strength(symbol: str, direction: str, snapshot: Optiona
         extra_conf += 1
         reasons.append("Late Entry قبلاً پرریسک بوده")
 
+    # Historical similarity: compare the current snapshot with prior TP/SL
+    # snapshots for this exact coin+direction. This is a soft learning layer;
+    # it increases required strength only when similar past cases were risky.
+    try:
+        sim_profile = get_similarity_adjustment(symbol, direction, snapshot or {})
+        if sim_profile.get("available"):
+            wr_sim = _safe_float(sim_profile.get("win_rate"), 50.0)
+            adj_sim = _safe_float(sim_profile.get("rank_adjustment"), 0.0)
+            if wr_sim <= 42 or adj_sim <= -4:
+                extra_score += min(5, int(abs(adj_sim)) if adj_sim < 0 else 3)
+                extra_conf += 1 if wr_sim <= 38 else 0
+                reasons.append("شباهت تاریخی به نمونه‌های پرریسک")
+            elif wr_sim >= 68 and adj_sim >= 3:
+                # Favorable similarity should reduce only the added strictness,
+                # never bypass base technical/risk rules.
+                extra_score = max(0, extra_score - 2)
+                reasons.append("شباهت تاریخی مثبت")
+    except Exception:
+        pass
+
     # Keep this module adaptive but not over-restrictive. coin_risk.py already
     # handles hard daily/long-term risk. This layer focuses on learned quality.
     extra_score = min(10, extra_score)
@@ -1063,6 +1361,7 @@ def get_tp_sl_v2_profile(symbol: str, direction: str, snapshot: Optional[Dict] =
         "time_stats": b.get("time_stats", {}),
         "meta_learning": b.get("meta_learning", {}),
         "dynamic_profit_stats": b.get("dynamic_profit_stats", {}),
+        "similarity_profile": get_similarity_adjustment(symbol, direction, snapshot or {}) if snapshot else {"available": False, "source": "historical_similarity"},
         "clean_breakouts": clean,
         "bounces": bounces,
         "source": "coin_learning_v2",
