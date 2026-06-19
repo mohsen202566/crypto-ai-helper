@@ -28,7 +28,10 @@ This keeps the public function names used by bot.py:
 """
 
 import time
+import logging
 from typing import Dict, List, Optional, Any, Tuple
+
+logger = logging.getLogger("crypto-bot")
 
 from analysis import analyze_symbol, add_indicators, get_klines, ema_direction
 
@@ -118,17 +121,48 @@ def get_scan_symbols():
     return symbols
 
 
+def _base_reject_reason(r: Dict[str, Any]) -> str:
+    """Explain why a raw analysis result is not allowed to become a real auto signal.
+
+    This keeps the real-order path safe, but prevents silent scanner behavior.
+    The bot.py auto_signal_gate still performs the final real-trading checks.
+    """
+    if not isinstance(r, dict):
+        return "ANALYSIS_NOT_DICT"
+    if r.get("status") != "ACTIVE":
+        return f"SIGNAL_NOT_ACTIVE:{r.get('status')}"
+    if not bool(r.get("entry_confirmed")):
+        return "ENTRY_NOT_CONFIRMED"
+    if r.get("direction") not in ["LONG", "SHORT"]:
+        return f"BAD_DIRECTION:{r.get('direction')}"
+    if _safe_int(r.get("score"), 0) < MIN_SCANNER_SCORE:
+        return f"LOW_SCORE:{_safe_int(r.get('score'), 0)}<{MIN_SCANNER_SCORE}"
+    if r.get("entry") is None:
+        return "NO_ENTRY"
+    if r.get("stop_loss") is None:
+        return "NO_STOP_LOSS"
+    if r.get("tp1") is None:
+        return "NO_TP1"
+    return "OK"
+
+
 def _base_valid_signal(r: Dict[str, Any]) -> bool:
-    return (
-        isinstance(r, dict)
-        and r.get("status") == "ACTIVE"
-        and bool(r.get("entry_confirmed"))
-        and r.get("direction") in ["LONG", "SHORT"]
-        and _safe_int(r.get("score"), 0) >= MIN_SCANNER_SCORE
-        and r.get("entry") is not None
-        and r.get("stop_loss") is not None
-        and r.get("tp1") is not None
-    )
+    return _base_reject_reason(r) == "OK"
+
+
+def _can_store_rejected_as_ghost(r: Dict[str, Any]) -> bool:
+    """Store useful rejected candidates as Ghost for learning/diagnostics only.
+
+    This does not send Telegram signals and does not open real trades.
+    It only helps us see why auto signals are not reaching the final gate.
+    """
+    if not isinstance(r, dict):
+        return False
+    if r.get("direction") not in ["LONG", "SHORT"]:
+        return False
+    if r.get("entry") is None or r.get("stop_loss") is None or r.get("tp1") is None:
+        return False
+    return _safe_int(r.get("score"), 0) >= max(65, MIN_SCANNER_SCORE - 12)
 
 
 def _build_scanner_snapshot(r: Dict[str, Any]) -> Dict[str, Any]:
@@ -601,8 +635,17 @@ def scan_market(symbols: Optional[List[str]] = None, max_results: int = MAX_SCAN
     for sym in symbols:
         try:
             res = analyze_symbol(normalize_symbol(sym))
-            if not _base_valid_signal(res):
+            reject_reason = _base_reject_reason(res)
+            if reject_reason != "OK":
                 no_trade += 1
+                if allow_ghost and _can_store_rejected_as_ghost(res):
+                    rr = dict(res)
+                    rr["scanner_reject_reason"] = reject_reason
+                    if save_as_ghost(rr, f"BASE_REJECTED:{reject_reason}"):
+                        ghost_count += 1
+                        logger.info(
+                            f"scanner candidate saved as ghost: {rr.get('symbol')} {rr.get('direction')} | BASE_REJECTED:{reject_reason}"
+                        )
                 continue
 
             enriched = apply_ai_scanner_decision(res)
@@ -615,11 +658,16 @@ def scan_market(symbols: Optional[List[str]] = None, max_results: int = MAX_SCAN
                 ai_rejected.append(enriched)
                 if allow_ghost and save_as_ghost(enriched, "AI_SCANNER_REJECTED"):
                     ghost_count += 1
-        except Exception:
+        except Exception as e:
             errors += 1
+            logger.warning(f"scanner analyze error: {normalize_symbol(sym)} | {str(e)[:160]}")
         time.sleep(SCAN_DELAY_SECONDS)
 
     valid.sort(key=signal_rank_value, reverse=True)
+    logger.info(
+        f"scanner scan complete: scanned={len(symbols)} valid={len(valid)} ai_rejected={len(ai_rejected)} "
+        f"no_trade={no_trade} errors={errors} ghosts={ghost_count}"
+    )
     return {
         "signals": valid[:max_results],
         "all_valid_signals": valid,
@@ -647,6 +695,10 @@ def scan_for_auto_signals(symbols: Optional[List[str]] = None, max_results: int 
     if not valid:
         sr["signals"] = []
         sr["mode"] = "NO_SIGNAL"
+        logger.info(
+            f"auto scan result: NO_SIGNAL | scanned={sr.get('scanned')} no_trade={sr.get('no_trade_count')} "
+            f"errors={sr.get('error_count')} ghosts={sr.get('ghost_count')}"
+        )
         return sr
 
     free = get_available_slots()
@@ -661,6 +713,7 @@ def scan_for_auto_signals(symbols: Optional[List[str]] = None, max_results: int 
         sr["signals"] = []
         sr["ghost_count"] = gc
         sr["mode"] = "GHOST_ONLY"
+        logger.info(f"auto scan result: GHOST_ONLY | free_slots={free} ghosts={gc}")
         return sr
 
     candidates = valid
@@ -677,6 +730,7 @@ def scan_for_auto_signals(symbols: Optional[List[str]] = None, max_results: int 
     candidates = sorted(candidates, key=signal_rank_value, reverse=True)
     sr["signals"] = candidates[: min(max_results, free)]
     sr["mode"] = "ACTIVE_SIGNALS"
+    logger.info(f"auto scan result: ACTIVE_SIGNALS | count={len(sr['signals'])} free_slots={free}")
     return sr
 
 
