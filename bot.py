@@ -136,6 +136,15 @@ except Exception:
     check_dynamic_profit_protection = None
     dynamic_profit_protection_text = None
 
+try:
+    from real_position_sync import (
+        check_real_position_events_for_tracker,
+        format_sync_status as format_real_position_sync_status,
+    )
+except Exception:
+    check_real_position_events_for_tracker = None
+    format_real_position_sync_status = None
+
 
 # ============================================================
 # Config
@@ -192,6 +201,9 @@ LAST_AUTO_SIGNAL_TIME: Dict[str, int] = {}
 AUTO_SIGNAL_COOLDOWN_SECONDS = int(AUTO_SIGNAL_COOLDOWN_MINUTES) * 60
 REAL_TRACKING_LOOP_INTERVAL_SECONDS = int(os.getenv("REAL_TRACKING_LOOP_INTERVAL_SECONDS", "2") or "2")
 DYNAMIC_PROFIT_LOOP_INTERVAL_SECONDS = int(os.getenv("DYNAMIC_PROFIT_LOOP_INTERVAL_SECONDS", "10") or "10")
+REAL_SYNC_LOOP_ENABLED = os.getenv("REAL_SYNC_LOOP_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on", "enabled"}
+RECENT_SENT_EVENT_KEYS: Dict[str, int] = {}
+EVENT_DEDUP_SECONDS = int(os.getenv("EVENT_DEDUP_SECONDS", "180") or "180")
 
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -1064,11 +1076,15 @@ async def sync_real_positions_command(update: Update, context: ContextTypes.DEFA
     if not is_allowed(update):
         await reject_unauthorized(update)
         return
-    if not sync_real_positions_text:
+    if not sync_real_positions_text and not format_real_position_sync_status:
         await update.message.reply_text("ماژول همگام‌سازی توبیت فعال نیست.")
         return
     try:
-        await send_long_text(update, sync_real_positions_text())
+        # Prefer the dedicated sync layer when available because it also verifies/repairs TP/SL.
+        if format_real_position_sync_status:
+            await send_long_text(update, format_real_position_sync_status())
+        else:
+            await send_long_text(update, sync_real_positions_text())
     except Exception as e:
         await update.message.reply_text(f"❌ خطا در همگام‌سازی:\n{str(e)[:250]}")
 
@@ -1777,28 +1793,66 @@ async def dynamic_profit_protection_loop(app: Application) -> None:
 # Signal Tracker Loop
 # ============================================================
 
+def _event_dedup_key(event: Dict[str, Any]) -> str:
+    signal_id = str(event.get("signal_id") or "")
+    event_type = str(event.get("event_type") or event.get("type") or "")
+    reply_to = str(event.get("reply_to_message_id") or "")
+    text = str(event.get("message") or event.get("text") or "")
+    if signal_id or event_type:
+        return f"{signal_id}:{event_type}:{reply_to}:{hash(text[:200])}"
+    return f"{reply_to}:{hash(text[:200])}"
+
+
+def _should_send_event(event: Dict[str, Any]) -> bool:
+    now = int(time.time())
+    # Periodically clean old keys so the process memory stays tiny.
+    for k, ts in list(RECENT_SENT_EVENT_KEYS.items()):
+        if now - int(ts or 0) > EVENT_DEDUP_SECONDS:
+            RECENT_SENT_EVENT_KEYS.pop(k, None)
+    key = _event_dedup_key(event)
+    last = int(RECENT_SENT_EVENT_KEYS.get(key, 0) or 0)
+    if now - last <= EVENT_DEDUP_SECONDS:
+        return False
+    RECENT_SENT_EVENT_KEYS[key] = now
+    return True
+
+
 async def signal_tracking_loop(app: Application) -> None:
-    if not check_active_signals:
-        logger.warning("Signal tracker is not available")
+    if not check_active_signals and not check_real_position_events_for_tracker:
+        logger.warning("Signal tracker and real-position sync are not available")
         return
 
     await asyncio.sleep(15)
 
     while True:
         try:
-            events = check_active_signals() or []
-            if isinstance(events, dict):
-                events = [events]
+            events: List[Dict[str, Any]] = []
+
+            if check_active_signals:
+                tracker_events = check_active_signals() or []
+                if isinstance(tracker_events, dict):
+                    tracker_events = [tracker_events]
+                events.extend([e for e in tracker_events if isinstance(e, dict)])
+
+            # Dedicated Toobit sync layer: confirms/repairs TP-SL and reports real closes.
+            # Kept behind a switch and deduplicated to prevent duplicate Telegram messages.
+            if REAL_SYNC_LOOP_ENABLED and check_real_position_events_for_tracker:
+                try:
+                    sync_events = check_real_position_events_for_tracker() or []
+                    if isinstance(sync_events, dict):
+                        sync_events = [sync_events]
+                    events.extend([e for e in sync_events if isinstance(e, dict)])
+                except Exception as sync_error:
+                    logger.error(f"real_position_sync loop error: {sync_error}")
 
             for event in events:
-                if not isinstance(event, dict):
-                    continue
-
                 text = event.get("message") or event.get("text")
                 chat_id = event.get("chat_id") or OWNER_ID
                 reply_to_message_id = event.get("reply_to_message_id")
 
-                if not text:
+                if not text or not chat_id:
+                    continue
+                if not _should_send_event(event):
                     continue
 
                 try:
@@ -1917,7 +1971,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await real_emergency_stop_command(update, context)
         return
 
-    if low in ["همگام سازی", "همگام‌سازی", "همگام سازی پوزیشن ها", "همگام‌سازی پوزیشن‌ها", "sync", "sync positions"]:
+    if low in ["همگام سازی", "همگام‌سازی", "همگام سازی پوزیشن ها", "همگام سازی پوزیشن‌ها", "همگام‌سازی پوزیشن ها", "همگام‌سازی پوزیشن‌ها", "سینک", "سینک پوزیشن ها", "سینک پوزیشن‌ها", "sync", "sync positions"]:
         await sync_real_positions_command(update, context)
         return
 
