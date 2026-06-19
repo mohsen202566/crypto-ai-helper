@@ -24,6 +24,12 @@ except Exception:
     register_tp_sl_v2_result = None
 
 try:
+    from coin_learning import get_similarity_adjustment, find_similar_patterns
+except Exception:
+    get_similarity_adjustment = None
+    find_similar_patterns = None
+
+try:
     from tobit_client import normalize_bot_plain_symbol
 except Exception:
     def normalize_bot_plain_symbol(symbol: str) -> str:
@@ -1336,7 +1342,12 @@ def close_real_position(
             stop_loss=pos.get("sl") or pos.get("stop_loss"),
             tp1=pos.get("tp1"),
             tp2=pos.get("tp2"),
-            snapshot=pos.get("snapshot") if isinstance(pos.get("snapshot"), dict) else {},
+            snapshot=_position_learning_snapshot(pos, {
+                "exit_price": exit_price,
+                "move_percent": move_pct,
+                "result_type": result_type,
+                "exchange_close_confirmed": True,
+            }),
             max_favorable=pos.get("max_favorable_percent"),
             max_adverse=pos.get("max_adverse_percent"),
             pnl_source="APPROX_FROM_EXIT_PRICE" if result_type == "AI_DYNAMIC_PROFIT_EXIT" else "APPROX_OR_MANUAL",
@@ -2333,6 +2344,165 @@ def _live_analysis_pack_for_dynamic_exit(symbol: str, direction: str) -> Dict[st
         return {"error": str(e)[:160]}
 
 
+
+def _read_similarity_number(data: Any, *keys: str, default: float = 0.0) -> float:
+    """Read a numeric Similarity Engine value across several compatible shapes."""
+    if not isinstance(data, dict):
+        return float(default)
+    for key in keys:
+        if data.get(key) is not None:
+            return _safe_float_any(data.get(key), default)
+    nested = data.get("similarity") if isinstance(data.get("similarity"), dict) else {}
+    if isinstance(nested, dict):
+        for key in keys:
+            if nested.get(key) is not None:
+                return _safe_float_any(nested.get(key), default)
+    return float(default)
+
+
+def _position_learning_snapshot(pos: Dict[str, Any], extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Build a safe learning snapshot for REAL trade manager events.
+
+    It preserves the original analysis snapshot and adds real-time management
+    fields such as current profit, MFE/MAE and Similarity/Dynamic decision data.
+    """
+    base = pos.get("snapshot") if isinstance(pos.get("snapshot"), dict) else {}
+    snap = dict(base)
+    for key in [
+        "signal_id", "symbol", "direction", "entry", "tp1", "tp2", "sl",
+        "stop_loss", "quantity", "position_size_usd", "leverage",
+        "max_favorable_percent", "max_adverse_percent", "ai_final_rank",
+        "ai_final_score", "score", "market_mode", "market_regime", "btc_bias",
+    ]:
+        if key not in snap and pos.get(key) is not None:
+            snap[key] = pos.get(key)
+
+    decision = pos.get("last_dynamic_profit_decision")
+    if isinstance(decision, dict):
+        snap["dynamic_profit_decision"] = decision
+        if isinstance(decision.get("similarity_learning"), dict):
+            snap["similarity_learning"] = decision.get("similarity_learning")
+
+    if isinstance(pos.get("similarity_learning"), dict):
+        snap["similarity_learning"] = pos.get("similarity_learning")
+
+    if isinstance(extra, dict):
+        for k, v in extra.items():
+            if v is not None:
+                snap[k] = v
+
+    snap["result_source"] = "REAL"
+    snap["trade_management_source"] = "real_trade_manager"
+    return snap
+
+
+def _dynamic_similarity_snapshot(
+    pos: Dict[str, Any],
+    current_price: float,
+    profit_pct: float,
+    peak_profit: float,
+    retrace_from_peak: float,
+    tp_progress: float,
+    live_ai: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Build the current-state snapshot used by the Historical Similarity layer."""
+    snap = _position_learning_snapshot(pos)
+    live_ai = live_ai if isinstance(live_ai, dict) else {}
+
+    snap.update({
+        "symbol": normalize_bot_plain_symbol(str(pos.get("symbol") or "")) or str(pos.get("symbol") or "").upper(),
+        "direction": str(pos.get("direction") or "").upper(),
+        "entry": pos.get("entry"),
+        "price": current_price,
+        "current_price": current_price,
+        "profit_pct": round(float(profit_pct or 0.0), 6),
+        "tp_progress": round(float(tp_progress or 0.0), 6),
+        "peak_profit_pct": round(float(peak_profit or 0.0), 6),
+        "retrace_from_peak_pct": round(float(retrace_from_peak or 0.0), 6),
+        "max_favorable_percent": pos.get("max_favorable_percent"),
+        "max_adverse_percent": pos.get("max_adverse_percent"),
+        "mode": "dynamic_exit",
+        "snapshot_at": _now(),
+    })
+
+    # Promote live analysis values into the snapshot so Similarity can compare
+    # current post-entry state with past TP/SL/profit-exit states.
+    for key in [
+        "prediction_score", "reversal_risk_score", "move_state", "trap_risk",
+        "vwap_status", "rsi_slope_15m", "adx_slope_15m",
+        "macd_hist_accel_15m", "direction_now", "score_now", "status_now",
+    ]:
+        if live_ai.get(key) is not None:
+            snap[key] = live_ai.get(key)
+    if live_ai:
+        snap["live_ai"] = live_ai
+    return snap
+
+
+def _dynamic_similarity_context(pos: Dict[str, Any], snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    """Return normalized Historical Similarity data for REAL dynamic exits.
+
+    Missing/old coin_learning.py is safe: it simply returns available=False.
+    The output is used as a soft score only and never closes losing trades.
+    """
+    symbol = str(snapshot.get("symbol") or pos.get("symbol") or "").upper()
+    direction = str(snapshot.get("direction") or pos.get("direction") or "").upper()
+    if not symbol or not direction:
+        return {"available": False, "reason": "NO_SYMBOL_DIRECTION"}
+
+    raw: Dict[str, Any] = {}
+    if callable(get_similarity_adjustment):
+        try:
+            try:
+                raw = get_similarity_adjustment(symbol, direction, snapshot=snapshot, mode="dynamic_exit") or {}
+            except TypeError:
+                raw = get_similarity_adjustment(symbol, direction, snapshot) or {}
+        except Exception as e:
+            return {"available": False, "reason": str(e)[:160]}
+    elif callable(find_similar_patterns):
+        try:
+            try:
+                raw = find_similar_patterns(symbol, direction, snapshot=snapshot, limit=40, mode="dynamic_exit") or {}
+            except TypeError:
+                raw = find_similar_patterns(symbol, direction, snapshot) or {}
+        except Exception as e:
+            return {"available": False, "reason": str(e)[:160]}
+    else:
+        return {"available": False, "reason": "SIMILARITY_ENGINE_MISSING"}
+
+    if not isinstance(raw, dict):
+        return {"available": False, "reason": "BAD_SIMILARITY_RESULT"}
+
+    samples = int(_read_similarity_number(raw, "samples", "similar_samples", "match_count", "count", default=0))
+    winrate = _read_similarity_number(raw, "win_rate", "winrate", "similar_winrate", "tp_rate", default=50.0)
+    rank_adj = _read_similarity_number(raw, "rank_adjustment", "similarity_adjustment", "adjustment", default=0.0)
+    avg_move = _read_similarity_number(raw, "avg_move", "average_move", "avg_move_percent", default=0.0)
+    avg_mfe = _read_similarity_number(raw, "avg_mfe", "avg_max_favorable", "avg_max_favorable_pct", default=0.0)
+    avg_mae = _read_similarity_number(raw, "avg_mae", "avg_max_adverse", "avg_max_adverse_pct", default=0.0)
+    confidence = _read_similarity_number(raw, "confidence", "similarity_confidence", default=min(100.0, samples * 8.0))
+
+    if samples <= 0:
+        return {"available": False, "reason": "NO_SIMILAR_MATCHES", "raw": raw}
+
+    weak = bool(samples >= 3 and (winrate <= 42.0 or rank_adj <= -3.0))
+    strong = bool(samples >= 3 and (winrate >= 65.0 or rank_adj >= 3.0))
+
+    return {
+        "available": True,
+        "samples": samples,
+        "winrate": round(winrate, 3),
+        "rank_adjustment": round(rank_adj, 4),
+        "avg_move": round(avg_move, 6),
+        "avg_mfe": round(avg_mfe, 6),
+        "avg_mae": round(avg_mae, 6),
+        "confidence": round(confidence, 3),
+        "weak_similarity": weak,
+        "strong_similarity": strong,
+        "raw": raw,
+    }
+
+
+
 def _dynamic_profit_exit_decision(pos: Dict[str, Any], current_price: float, state: Dict[str, Any]) -> Dict[str, Any]:
     """Decide whether an already-profitable REAL position should be closed early.
 
@@ -2404,6 +2574,41 @@ def _dynamic_profit_exit_decision(pos: Dict[str, Any], current_price: float, sta
         nonlocal continuation_score
         continuation_score += float(points)
         debug["signals"].append({"type": "continue", "code": code, "points": points})
+
+    # Historical Similarity Engine: compare the current in-profit trade state
+    # with prior real/ghost TP/SL/profit-exit snapshots. This is a soft layer:
+    # weak similar history increases exit pressure; strong similar continuation
+    # reduces premature exits. It never acts before the profit check above.
+    similarity_snapshot = _dynamic_similarity_snapshot(
+        pos,
+        current_price=current_price,
+        profit_pct=profit_pct,
+        peak_profit=peak_profit,
+        retrace_from_peak=retrace_from_peak,
+        tp_progress=progress,
+        live_ai=live_ai,
+    )
+    similarity_ctx = _dynamic_similarity_context(pos, similarity_snapshot)
+    debug["similarity_learning"] = similarity_ctx
+    pos["last_similarity_learning"] = similarity_ctx
+
+    if similarity_ctx.get("available") and int(similarity_ctx.get("samples", 0) or 0) >= 3:
+        sim_wr = _safe_float_any(similarity_ctx.get("winrate"), 50.0)
+        sim_adj = _safe_float_any(similarity_ctx.get("rank_adjustment"), 0.0)
+        sim_samples = int(similarity_ctx.get("samples", 0) or 0)
+        sim_avg_mfe = _safe_float_any(similarity_ctx.get("avg_mfe"), 0.0)
+
+        if similarity_ctx.get("weak_similarity"):
+            points = max(1.2, min(3.8, abs(sim_adj) * 0.55 + max(0.0, 50.0 - sim_wr) / 12.0))
+            add_risk(points, f"شباهت به الگوهای ضعیف گذشته ({sim_samples} نمونه، WR {round(sim_wr, 1)}%)", "SIMILARITY_WEAK")
+        elif similarity_ctx.get("strong_similarity"):
+            points = max(1.0, min(3.0, abs(sim_adj) * 0.40 + max(0.0, sim_wr - 55.0) / 18.0))
+            add_continue(points, "SIMILARITY_CONTINUATION")
+
+        # If history says similar setups usually had limited favorable movement
+        # and the current trade is already near/above that learned MFE, protect profit.
+        if sim_avg_mfe > 0 and peak_profit >= sim_avg_mfe * 0.80 and sim_wr < 58.0:
+            add_risk(1.6, "سود فعلی نزدیک محدوده معمول الگوهای مشابه است", "SIMILARITY_MFE_LIMIT")
 
     # 1) SHOCK EXIT: this is the fast ADA-style path. If the position was in a
     # decent profit and a single move quickly takes back a meaningful part of
@@ -2503,6 +2708,7 @@ def _dynamic_profit_exit_decision(pos: Dict[str, Any], current_price: float, sta
         "continuation_score": round(continuation_score, 3),
         "net_exit_score": round(net_exit_score, 3),
         "live_ai": live_ai,
+        "similarity_learning": similarity_ctx if 'similarity_ctx' in locals() else {"available": False},
         "debug": debug,
         "current_price": current_price,
     }
@@ -2541,6 +2747,7 @@ def check_dynamic_profit_protection(signal_id: Optional[str] = None) -> Dict[str
             "max_adverse_percent": pos.get("max_adverse_percent", 0.0),
             "last_dynamic_profit_check": _now(),
             "last_dynamic_profit_decision": decision,
+            "similarity_learning": decision.get("similarity_learning") if isinstance(decision, dict) else None,
         })
         save_real_trade_state(state)
 
@@ -2559,7 +2766,12 @@ def check_dynamic_profit_protection(signal_id: Optional[str] = None) -> Dict[str
                         direction=pos.get("direction"),
                         entry=pos.get("entry"),
                         exit_price=current_price,
-                        snapshot=pos.get("snapshot") if isinstance(pos.get("snapshot"), dict) else {},
+                        snapshot=_position_learning_snapshot(pos, {
+                            "exit_price": current_price,
+                            "move_percent": decision.get("profit_pct"),
+                            "dynamic_profit_decision": decision,
+                            "similarity_learning": decision.get("similarity_learning") if isinstance(decision, dict) else None,
+                        }),
                         reason=decision.get("reason"),
                         source="REAL",
                         signal_id=sid,
