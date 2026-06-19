@@ -1147,6 +1147,62 @@ def validate_order_quantity(symbol: str, entry_price: float, quantity: float) ->
     }
 
 
+
+def _save_real_close_pending_state(
+    signal_id: str,
+    pos: Dict[str, Any],
+    close_result: Dict[str, Any],
+    verify_result: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Mark a real position as pending close without freeing slot/accounting.
+
+    This state prevents repeated Telegram/error spam and prevents sending close
+    orders back-to-back. The tracker/manager can retry after
+    next_close_retry_at. The position remains in open_positions until Toobit
+    confirms it is actually gone.
+    """
+    state = load_real_trade_state()
+    open_positions = state.setdefault("open_positions", {})
+    current = open_positions.get(signal_id)
+    if not isinstance(current, dict):
+        current = dict(pos or {})
+        open_positions[signal_id] = current
+
+    attempts = int(current.get("close_attempts", 0) or 0) + 1
+    current["real_status"] = PENDING_REAL_CLOSE_STATUS
+    current["close_pending"] = True
+    current["close_order_sent"] = True
+    current["close_attempts"] = attempts
+    current["last_close_attempt_at"] = _now()
+    current["next_close_retry_at"] = _now() + int(REAL_CLOSE_RETRY_DELAY_SECONDS)
+    current["last_close_result"] = close_result
+    current["last_close_verify_result"] = verify_result
+    current["last_close_error"] = "سفارش خروج ارسال شد ولی بسته‌شدن پوزیشن در توبیت هنوز تایید نشد"
+    save_real_trade_state(state)
+    return current
+
+
+def _close_retry_not_allowed_yet(pos: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return a throttling response if a pending close retry is too early."""
+    if not isinstance(pos, dict):
+        return None
+    if str(pos.get("real_status") or "").upper() != PENDING_REAL_CLOSE_STATUS:
+        return None
+    next_retry = int(pos.get("next_close_retry_at", 0) or 0)
+    if next_retry > _now():
+        return {
+            "ok": False,
+            "closed": False,
+            "close_pending": True,
+            "retry_allowed": False,
+            "next_close_retry_at": next_retry,
+            "seconds_until_retry": max(0, next_retry - _now()),
+            "close_attempts": int(pos.get("close_attempts", 0) or 0),
+            "error": "خروج قبلاً ارسال شده؛ برای جلوگیری از رد شدن توسط توبیت هنوز زمان تلاش بعدی نرسیده است.",
+        }
+    return None
+
+
 def close_real_position(
     signal_id: str,
     pnl_usd: Optional[float] = None,
@@ -1154,20 +1210,20 @@ def close_real_position(
     result_type: str = "MANUAL_CLOSE",
     require_exchange_confirm: bool = True,
 ) -> Dict[str, Any]:
-    """Close a REAL Toobit position safely.
+    """Close a REAL Toobit position safely with pending/retry protection.
 
-    Critical safety behavior:
-    - Sends the close order to Toobit.
-    - Verifies the matching live position is gone before removing the internal
-      slot or recording PnL.
-    - If confirmation fails, returns ok=False and keeps the internal position so
-      signal_tracker keeps monitoring instead of assuming the trade is closed.
+    Behavior:
+    - Sends one close order only when retry is allowed.
+    - Verifies that the matching Toobit position disappeared.
+    - If still visible, keeps the internal position open as PENDING_CLOSE and
+      sets next_close_retry_at instead of freeing the slot or recording PnL.
+    - A later call can retry after REAL_CLOSE_RETRY_DELAY_SECONDS.
     """
     state = load_real_trade_state()
     pos = state.get("open_positions", {}).get(signal_id)
 
-    if not pos:
-        return {"ok": False, "error": "پوزیشن پیدا نشد"}
+    if not isinstance(pos, dict):
+        return {"ok": False, "closed": False, "error": "پوزیشن پیدا نشد"}
 
     symbol = str(pos.get("symbol") or "")
     direction = str(pos.get("direction") or "")
@@ -1176,10 +1232,30 @@ def close_real_position(
     if not symbol or not direction or quantity <= 0:
         return {
             "ok": False,
+            "closed": False,
             "error": "اطلاعات پوزیشن برای بستن کامل نیست",
             "symbol": symbol,
             "direction": direction,
             "quantity": quantity,
+        }
+
+    # If a close order was already sent and Toobit still had not confirmed the
+    # close, do not hammer the exchange with back-to-back close requests.
+    throttled = _close_retry_not_allowed_yet(pos)
+    if throttled is not None:
+        throttled["signal_id"] = signal_id
+        return throttled
+
+    attempts_so_far = int(pos.get("close_attempts", 0) or 0)
+    if attempts_so_far >= int(REAL_CLOSE_MAX_ATTEMPTS):
+        return {
+            "ok": False,
+            "closed": False,
+            "close_pending": True,
+            "max_attempts_reached": True,
+            "signal_id": signal_id,
+            "close_attempts": attempts_so_far,
+            "error": "حداکثر تلاش برای بستن پوزیشن انجام شده؛ نیاز به بررسی دستی توبیت دارد.",
         }
 
     result = toobit_client.close_market_position(
@@ -1189,26 +1265,34 @@ def close_real_position(
     )
 
     if not isinstance(result, dict) or not result.get("ok"):
+        # Keep retry timing even on API rejection, because immediate repeated
+        # requests can make Toobit reject again.
+        verify_result = {"ok": False, "closed_confirmed": False, "error": "close order rejected/not ok"}
+        _save_real_close_pending_state(signal_id, pos, result if isinstance(result, dict) else {"raw": result}, verify_result)
         return {
             "ok": False,
             "closed": False,
+            "close_pending": True,
             "signal_id": signal_id,
             "error": (result or {}).get("error") if isinstance(result, dict) else str(result),
             "exchange_result": result.get("data") if isinstance(result, dict) else result,
+            "next_close_retry_at": _now() + int(REAL_CLOSE_RETRY_DELAY_SECONDS),
         }
 
     verify_result = {"ok": True, "closed_confirmed": True, "skipped": True}
     if require_exchange_confirm:
         verify_result = _verify_exchange_position_closed(symbol=symbol, direction=direction)
         if not verify_result.get("ok"):
-            # Keep the position internally open. The close order was sent, but
-            # until Toobit confirms the position disappeared, the tracker must
-            # not record PnL, free the slot, or remove active monitoring.
+            pending_pos = _save_real_close_pending_state(signal_id, pos, result, verify_result)
             return {
                 "ok": False,
                 "closed": False,
+                "close_pending": True,
                 "close_order_sent": True,
+                "retry_allowed": False,
                 "signal_id": signal_id,
+                "close_attempts": int(pending_pos.get("close_attempts", 0) or 0),
+                "next_close_retry_at": pending_pos.get("next_close_retry_at"),
                 "error": "سفارش خروج ارسال شد ولی بسته‌شدن پوزیشن در توبیت هنوز تایید نشد",
                 "exchange_result": result.get("data"),
                 "verify_result": verify_result,
@@ -1222,12 +1306,6 @@ def close_real_position(
     save_real_trade_state(state)
 
     accounting = None
-
-    # If explicit exchange PnL is not supplied, record a conservative approximate
-    # PnL from exit price. This is important for AI_DYNAMIC_PROFIT_EXIT so real
-    # profit protection updates internal balance/learning immediately instead of
-    # closing the exchange position silently. The tracker can still show this as
-    # approximate and avoid double-recording.
     move_pct = None
     if exit_price is not None:
         move_pct = _calc_move_percent(
@@ -1271,6 +1349,7 @@ def close_real_position(
         "closed": True,
         "close_order_sent": True,
         "close_confirmed": True,
+        "close_pending": False,
         "signal_id": signal_id,
         "exchange_result": result.get("data"),
         "verify_result": verify_result,
@@ -1296,6 +1375,15 @@ PENDING_REAL_CONFIRM_STATUS = "PENDING_REAL_CONFIRM"
 # still open.
 REAL_CLOSE_VERIFY_SECONDS = 12.0
 REAL_CLOSE_VERIFY_INTERVAL = 1.5
+
+# Anti-spam close retry state. If Toobit accepts a close order but the
+# position is still visible, keep the internal position as PENDING_CLOSE and
+# do not send another close order until this delay has passed. This avoids
+# back-to-back close requests that Toobit may reject, while still retrying
+# automatically later.
+PENDING_REAL_CLOSE_STATUS = "PENDING_REAL_CLOSE"
+REAL_CLOSE_RETRY_DELAY_SECONDS = 5
+REAL_CLOSE_MAX_ATTEMPTS = 6
 
 
 def _verify_exchange_position_closed(symbol: str, direction: str, timeout: float = REAL_CLOSE_VERIFY_SECONDS) -> Dict[str, Any]:
