@@ -18,7 +18,26 @@ import uuid
 from typing import Dict, Any, List, Optional, Tuple
 
 from data_store import load_json, save_json
-from config import MAX_GHOST_SIGNALS, GHOST_LEARNING_ENABLED
+
+try:
+    from config import MAX_GHOST_SIGNALS, GHOST_LEARNING_ENABLED
+except Exception:
+    MAX_GHOST_SIGNALS = 20000
+    GHOST_LEARNING_ENABLED = True
+
+MIN_GHOST_MEMORY_STORED = 20000
+
+def _ghost_memory_limit() -> int:
+    """Keep enough Ghost history for the agreed 20k learning memory.
+
+    config.MAX_GHOST_SIGNALS may exist from older deployments and can be too
+    small (for example 500/1000).  Use it only when it is larger than the
+    agreed learning floor so updates do not silently erase Ghost evidence.
+    """
+    try:
+        return max(MIN_GHOST_MEMORY_STORED, int(MAX_GHOST_SIGNALS or 0))
+    except Exception:
+        return MIN_GHOST_MEMORY_STORED
 
 try:
     import ccxt
@@ -96,26 +115,48 @@ def _move_percent(direction: str, entry: float, exit_price: float) -> float:
 
 
 def _fetch_prices(symbols: List[str]) -> Dict[str, float]:
+    """Fetch live prices with a short cache, without starving new symbols.
+
+    Older logic returned immediately from cache when the cache was fresh, even
+    if the current check requested symbols that were not already cached.  That
+    could make newly opened Ghost signals look like price-fetch errors for up
+    to the cache TTL.  This version serves cached symbols and fetches only the
+    missing ones.
+    """
     now = _now()
+    requested = [str(s).upper() for s in symbols if s]
     cached_ts = int(_GHOST_PRICE_CACHE.get("ts") or 0)
     cached_prices = _GHOST_PRICE_CACHE.setdefault("prices", {})
-    if cached_prices and now - cached_ts <= _GHOST_PRICE_TTL_SECONDS:
-        return {s: cached_prices.get(s) for s in symbols if cached_prices.get(s) is not None}
+    cache_fresh = bool(cached_prices) and now - cached_ts <= _GHOST_PRICE_TTL_SECONDS
 
     prices: Dict[str, float] = {}
+    missing: List[str] = []
+    for symbol in requested:
+        cached_price = cached_prices.get(symbol) if cache_fresh else None
+        if cached_price is not None:
+            prices[symbol] = cached_price
+        else:
+            missing.append(symbol)
+
+    if not missing:
+        return prices
+
     ex = _get_exchange()
     if ex is None:
         return prices
-    for symbol in symbols:
+
+    for symbol in missing:
         try:
             ticker = ex.fetch_ticker(_to_okx_symbol(symbol))
             price = _safe_float(ticker.get("last") or ticker.get("close"))
             if price and price > 0:
-                prices[str(symbol).upper()] = price
+                prices[symbol] = price
+                cached_prices[symbol] = price
         except Exception:
             continue
+
     _GHOST_PRICE_CACHE["ts"] = now
-    _GHOST_PRICE_CACHE["prices"] = dict(prices)
+    _GHOST_PRICE_CACHE["prices"] = dict(cached_prices)
     return prices
 
 
@@ -170,8 +211,10 @@ def _learning_snapshot(g: Dict[str, Any], result: Optional[str] = None, exit_pri
         out["exit_price"] = exit_price
     if move_percent is not None:
         out["move_percent"] = move_percent
+    ts = _now()
+    out.setdefault("snapshot_at", g.get("created_at") or ts)
     out["result_source"] = "GHOST"
-    out["result_recorded_at"] = _now()
+    out["result_recorded_at"] = ts
     return out
 
 
@@ -250,7 +293,8 @@ def create_ghost_signal(
         "status": "OPEN",
     }
     s["open"][gid] = g
-    while len(s["open"]) > MAX_GHOST_SIGNALS:
+    limit = _ghost_memory_limit()
+    while len(s["open"]) > limit:
         first = sorted(s["open"].keys())[0]
         del s["open"][first]
     save_json(GHOST_FILE, s)
@@ -283,7 +327,7 @@ def close_ghost_signal(signal_id: str, result: str, exit_price: float, move_perc
         "closed_at": _now(),
     })
     s["closed"].append(g)
-    s["closed"] = s["closed"][-MAX_GHOST_SIGNALS:]
+    s["closed"] = s["closed"][-_ghost_memory_limit():]
     save_json(GHOST_FILE, s)
 
     _record_ghost_outcome_to_ai(g, result, exit_price, move_percent)
