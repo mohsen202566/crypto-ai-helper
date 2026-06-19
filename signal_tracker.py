@@ -26,6 +26,12 @@ except Exception:
     register_dynamic_profit_exit = None
 
 try:
+    from coin_learning import get_similarity_adjustment, find_similar_patterns
+except Exception:
+    get_similarity_adjustment = None
+    find_similar_patterns = None
+
+try:
     from coin_risk import register_result, register_real_result, register_ghost_result
 except Exception:
     register_result = None
@@ -86,6 +92,15 @@ DYNAMIC_PROFIT_SHOCK_RETRACE_PCT = float(os.getenv("TRACKER_DYNAMIC_SHOCK_RETRAC
 DYNAMIC_PROFIT_COLLAPSE_RATIO = float(os.getenv("TRACKER_DYNAMIC_COLLAPSE_RATIO", "0.45") or "0.45")
 DYNAMIC_PROFIT_VOLUME_SPIKE_MULT = float(os.getenv("TRACKER_DYNAMIC_VOLUME_SPIKE_MULT", "1.8") or "1.8")
 DYNAMIC_PROFIT_BODY_SPIKE_MULT = float(os.getenv("TRACKER_DYNAMIC_BODY_SPIKE_MULT", "1.35") or "1.35")
+
+# Historical Similarity / Pattern Memory layer for Dynamic Profit AI.
+# This is a soft layer: it can strengthen/soften an exit decision, but it
+# never closes a losing trade and never bypasses the real Toobit close verify.
+DYNAMIC_SIMILARITY_MIN_SAMPLES = int(os.getenv("TRACKER_DYNAMIC_SIM_MIN_SAMPLES", "6") or "6")
+DYNAMIC_SIMILARITY_BAD_WR = float(os.getenv("TRACKER_DYNAMIC_SIM_BAD_WR", "46") or "46")
+DYNAMIC_SIMILARITY_GOOD_WR = float(os.getenv("TRACKER_DYNAMIC_SIM_GOOD_WR", "66") or "66")
+DYNAMIC_SIMILARITY_MAX_RISK_POINTS = float(os.getenv("TRACKER_DYNAMIC_SIM_MAX_RISK_POINTS", "3.5") or "3.5")
+DYNAMIC_SIMILARITY_MAX_CONTINUE_POINTS = float(os.getenv("TRACKER_DYNAMIC_SIM_MAX_CONTINUE_POINTS", "2.2") or "2.2")
 
 # Anti-spam / delayed retry for REAL dynamic exits.
 # Toobit may reject repeated close orders if sent back-to-back. The tracker
@@ -244,7 +259,9 @@ def _learning_snapshot(signal: Dict[str, Any], exit_price: Optional[float] = Non
         "macd_signal", "macd_hist", "power2_buy", "power2_sell",
         "power3_buy", "power3_sell", "buy_power", "sell_power", "atr",
         "market_mode", "coin_behavior", "btc_bias", "support", "resistance",
-        "entry_mode",
+        "entry_mode", "market_regime", "vwap_status", "ai_scanner",
+        "similarity_learning", "similarity_score", "similarity_winrate",
+        "similarity_samples", "similarity_adjustment",
     ]:
         if key not in out and signal.get(key) is not None:
             out[key] = signal.get(key)
@@ -419,6 +436,12 @@ def add_signal_to_tracking(*args, **kwargs) -> Tuple[bool, str]:
         "coin_risk": result.get("coin_risk", {}),
         "rotation": result.get("rotation", {}),
         "snapshot": result.get("snapshot", {}),
+        "ai_scanner": result.get("ai_scanner", {}),
+        "similarity_learning": result.get("similarity_learning") or result.get("similarity") or ((result.get("snapshot") or {}).get("similarity_learning") if isinstance(result.get("snapshot"), dict) else None),
+        "similarity_score": result.get("similarity_score"),
+        "similarity_winrate": result.get("similarity_winrate"),
+        "similarity_samples": result.get("similarity_samples"),
+        "similarity_adjustment": result.get("similarity_adjustment"),
         "reasons": result.get("reasons", []),
         "created_at": now_ts(),
         "created_at_text": now_text(),
@@ -852,6 +875,107 @@ def _update_signal_mfe_mae(signal: Dict[str, Any], candle: List[Any]) -> None:
         pass
 
 
+
+def _build_dynamic_similarity_snapshot(
+    signal: Dict[str, Any],
+    candle: List[Any],
+    recent_candles: List[List[Any]],
+    profit_pct: float,
+    peak_profit: float,
+    retrace: float,
+    body: float,
+    volume_spike: bool,
+    body_spike: bool,
+) -> Dict[str, Any]:
+    """Build the current in-trade snapshot for Historical Similarity.
+
+    It reuses the original signal snapshot and adds live trade-management
+    features. The Similarity Engine can then compare this live state to past
+    REAL/GHOST outcomes for the same coin+direction.
+    """
+    snap = _learning_snapshot(signal, exit_price=_candle_close(candle), move_percent=profit_pct)
+    snap.update({
+        "symbol": signal.get("symbol"),
+        "direction": signal.get("direction"),
+        "dynamic_profit_check": True,
+        "current_profit_pct": round(float(profit_pct), 6),
+        "peak_profit_pct": round(float(peak_profit), 6),
+        "retrace_from_peak_pct": round(float(retrace), 6),
+        "max_favorable_percent": signal.get("max_favorable_percent"),
+        "max_adverse_percent": signal.get("max_adverse_percent"),
+        "against_trade_candle": _is_against_trade_candle(signal, candle),
+        "current_body_pct": round(float(body), 6),
+        "body_spike": bool(body_spike),
+        "volume_spike": bool(volume_spike),
+        "recent_candle_count": len(recent_candles or []),
+        "move_state": snap.get("move_state") or "IN_TRADE_PROFIT_MANAGEMENT",
+    })
+    return snap
+
+
+def _read_similarity_number(data: Dict[str, Any], *keys: str, default: float = 0.0) -> float:
+    if not isinstance(data, dict):
+        return float(default)
+    for key in keys:
+        if data.get(key) is not None:
+            return _safe_percent(data.get(key), default)
+    return float(default)
+
+
+def _dynamic_similarity_context(signal: Dict[str, Any], snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a normalized Similarity Engine result for dynamic exits.
+
+    Supports both new get_similarity_adjustment(...) and the lower-level
+    find_similar_patterns(...). Missing/old coin_learning.py remains safe and
+    simply returns unavailable=False.
+    """
+    symbol = str(signal.get("symbol") or snapshot.get("symbol") or "").upper()
+    direction = str(signal.get("direction") or snapshot.get("direction") or "").upper()
+    if not symbol or not direction:
+        return {"available": False, "reason": "NO_SYMBOL_DIRECTION"}
+
+    raw: Dict[str, Any] = {}
+    if callable(get_similarity_adjustment):
+        try:
+            try:
+                raw = get_similarity_adjustment(symbol, direction, snapshot=snapshot, mode="dynamic_exit") or {}
+            except TypeError:
+                raw = get_similarity_adjustment(symbol, direction, snapshot) or {}
+        except Exception as e:
+            return {"available": False, "reason": str(e)[:160]}
+    elif callable(find_similar_patterns):
+        try:
+            try:
+                raw = find_similar_patterns(symbol, direction, snapshot=snapshot, limit=40, mode="dynamic_exit") or {}
+            except TypeError:
+                raw = find_similar_patterns(symbol, direction, snapshot) or {}
+        except Exception as e:
+            return {"available": False, "reason": str(e)[:160]}
+    else:
+        return {"available": False, "reason": "SIMILARITY_ENGINE_MISSING"}
+
+    if not isinstance(raw, dict):
+        return {"available": False, "reason": "BAD_SIMILARITY_RESULT"}
+
+    nested = raw.get("similarity") if isinstance(raw.get("similarity"), dict) else {}
+    samples = int(_read_similarity_number(raw, "samples", "similar_samples", "match_count", "count", default=_read_similarity_number(nested, "samples", "similar_samples", "match_count", "count", default=0)))
+    winrate = _read_similarity_number(raw, "win_rate", "winrate", "similar_winrate", "tp_rate", default=_read_similarity_number(nested, "win_rate", "winrate", "similar_winrate", "tp_rate", default=50.0))
+    rank_adj = _read_similarity_number(raw, "rank_adjustment", "similarity_adjustment", "adjustment", default=_read_similarity_number(nested, "rank_adjustment", "similarity_adjustment", "adjustment", default=0.0))
+    avg_move = _read_similarity_number(raw, "avg_move", "average_move", "avg_move_percent", default=_read_similarity_number(nested, "avg_move", "average_move", "avg_move_percent", default=0.0))
+    avg_mfe = _read_similarity_number(raw, "avg_mfe", "avg_max_favorable", "avg_max_favorable_pct", default=_read_similarity_number(nested, "avg_mfe", "avg_max_favorable", "avg_max_favorable_pct", default=0.0))
+    avg_mae = _read_similarity_number(raw, "avg_mae", "avg_max_adverse", "avg_max_adverse_pct", default=_read_similarity_number(nested, "avg_mae", "avg_max_adverse", "avg_max_adverse_pct", default=0.0))
+
+    return {
+        "available": samples >= max(1, DYNAMIC_SIMILARITY_MIN_SAMPLES),
+        "samples": samples,
+        "winrate": round(winrate, 2),
+        "rank_adjustment": round(rank_adj, 4),
+        "avg_move": round(avg_move, 6),
+        "avg_mfe": round(avg_mfe, 6),
+        "avg_mae": round(avg_mae, 6),
+        "raw": raw,
+    }
+
 def _tracker_dynamic_profit_decision(signal: Dict[str, Any], candle: List[Any], recent_candles: List[List[Any]]) -> Dict[str, Any]:
     """Fast tracker-side Dynamic Profit decision.
 
@@ -876,6 +1000,11 @@ def _tracker_dynamic_profit_decision(signal: Dict[str, Any], candle: List[Any], 
     vol = _candle_volume(candle)
     body_spike = bool(avg_body > 0 and body >= avg_body * DYNAMIC_PROFIT_BODY_SPIKE_MULT)
     volume_spike = bool(avg_vol > 0 and vol >= avg_vol * DYNAMIC_PROFIT_VOLUME_SPIKE_MULT)
+
+    similarity_snapshot = _build_dynamic_similarity_snapshot(
+        signal, candle, recent_candles, profit_pct, peak_profit, retrace, body, volume_spike, body_spike
+    )
+    similarity = _dynamic_similarity_context(signal, similarity_snapshot)
 
     reasons: List[str] = []
     risk_score = 0.0
@@ -909,6 +1038,23 @@ def _tracker_dynamic_profit_decision(signal: Dict[str, Any], candle: List[Any], 
     elif direction == "SHORT" and _candle_close(candle) < _candle_open(candle) and _candle_close(candle) <= (_candle_high(candle) + _candle_low(candle)) / 2:
         add_continue(1.5)
 
+    # 3) Historical Similarity / Pattern Memory layer.
+    # If the live profitable state resembles past weak/failed states for this
+    # coin+direction, strengthen the exit decision. If similar states usually
+    # continued to TP, protect against premature exits. This is soft and only
+    # runs after the trade is already profitable.
+    if similarity.get("available"):
+        sim_samples = int(similarity.get("samples") or 0)
+        sim_wr = _safe_percent(similarity.get("winrate"), 50.0)
+        sim_adj = _safe_percent(similarity.get("rank_adjustment"), 0.0)
+        sim_avg_move = _safe_percent(similarity.get("avg_move"), 0.0)
+        if sim_wr <= DYNAMIC_SIMILARITY_BAD_WR or sim_adj <= -2.0 or sim_avg_move < 0:
+            risk_points = min(DYNAMIC_SIMILARITY_MAX_RISK_POINTS, max(1.0, (50.0 - sim_wr) / 8.0 + max(0.0, -sim_adj) * 0.22))
+            add_risk(risk_points, f"شباهت به الگوهای برگشتی/ضعیف قبلی ({sim_samples} نمونه، WR {round(sim_wr,1)}٪)")
+        elif sim_wr >= DYNAMIC_SIMILARITY_GOOD_WR and sim_adj >= 1.5:
+            cont_points = min(DYNAMIC_SIMILARITY_MAX_CONTINUE_POINTS, max(0.8, (sim_wr - 55.0) / 10.0 + sim_adj * 0.12))
+            add_continue(cont_points)
+
     net_score = risk_score - continue_score
     has_shock = any("ناگهانی" in r or "شناور" in r for r in reasons)
 
@@ -930,6 +1076,8 @@ def _tracker_dynamic_profit_decision(signal: Dict[str, Any], candle: List[Any], 
         "continuation_score": round(continue_score, 3),
         "net_exit_score": round(net_score, 3),
         "exit_price": close,
+        "similarity_learning": {k: v for k, v in similarity.items() if k != "raw"},
+        "similarity_snapshot": similarity_snapshot,
     }
 
 
@@ -1117,7 +1265,7 @@ def _record_dynamic_learning(signal: Dict[str, Any], exit_price: float, pct: flo
                 direction=signal.get("direction"),
                 entry=signal.get("entry"),
                 exit_price=exit_price,
-                snapshot=_learning_snapshot(signal, exit_price=exit_price, move_percent=pct),
+                snapshot={**_learning_snapshot(signal, exit_price=exit_price, move_percent=pct), **({"similarity_learning": (decision or {}).get("similarity_learning"), "dynamic_similarity_snapshot": (decision or {}).get("similarity_snapshot")} if isinstance(decision, dict) else {})},
                 reason=(decision or {}).get("reason"),
                 source="TRACKER",
                 signal_id=signal.get("signal_id") or signal.get("id"),
