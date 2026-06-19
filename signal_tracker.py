@@ -87,6 +87,15 @@ DYNAMIC_PROFIT_COLLAPSE_RATIO = float(os.getenv("TRACKER_DYNAMIC_COLLAPSE_RATIO"
 DYNAMIC_PROFIT_VOLUME_SPIKE_MULT = float(os.getenv("TRACKER_DYNAMIC_VOLUME_SPIKE_MULT", "1.8") or "1.8")
 DYNAMIC_PROFIT_BODY_SPIKE_MULT = float(os.getenv("TRACKER_DYNAMIC_BODY_SPIKE_MULT", "1.35") or "1.35")
 
+# Anti-spam / delayed retry for REAL dynamic exits.
+# Toobit may reject repeated close orders if sent back-to-back. The tracker
+# sends one close command, waits a few seconds, then retries only after the
+# cooldown. It sends at most one pending/failure notification and one final
+# close notification.
+DYNAMIC_CLOSE_RETRY_SECONDS = int(os.getenv("TRACKER_DYNAMIC_CLOSE_RETRY_SECONDS", "5") or "5")
+DYNAMIC_CLOSE_MAX_ATTEMPTS = int(os.getenv("TRACKER_DYNAMIC_CLOSE_MAX_ATTEMPTS", "6") or "6")
+DYNAMIC_CLOSE_LONG_RETRY_SECONDS = int(os.getenv("TRACKER_DYNAMIC_CLOSE_LONG_RETRY_SECONDS", "60") or "60")
+
 exchange = ccxt.okx({
     "enableRateLimit": True,
     "timeout": 20000,
@@ -1010,6 +1019,72 @@ def _check_real_dynamic_profit_exit(signal: Dict[str, Any]) -> Optional[Dict[str
         return None
 
 
+
+def _dynamic_pending_reason(signal: Dict[str, Any]) -> str:
+    reason = str(signal.get("dynamic_exit_reason") or signal.get("last_dynamic_profit_reason") or "خروج هوشمند سود")
+    return reason[:500]
+
+
+def _set_dynamic_close_pending(signal: Dict[str, Any], exit_price: float, decision: Optional[Dict[str, Any]], close_result: Optional[Dict[str, Any]]) -> None:
+    """Store pending close state so the bot does not spam Telegram or Toobit."""
+    attempts = int(signal.get("dynamic_exit_attempts", 0) or 0) + 1
+    signal["dynamic_exit_pending"] = True
+    signal["dynamic_exit_attempts"] = attempts
+    signal["dynamic_exit_first_detected_at"] = int(signal.get("dynamic_exit_first_detected_at") or now_ts())
+    signal["last_dynamic_exit_attempt_at"] = now_ts()
+    signal["next_dynamic_exit_retry_at"] = now_ts() + max(3, int(DYNAMIC_CLOSE_RETRY_SECONDS))
+    signal["dynamic_exit_price"] = float(exit_price or signal.get("dynamic_exit_price") or 0)
+    if isinstance(decision, dict):
+        signal["dynamic_exit_decision"] = decision
+        signal["dynamic_exit_reason"] = str(decision.get("reason") or signal.get("dynamic_exit_reason") or "خروج هوشمند سود")[:500]
+    err = ""
+    if isinstance(close_result, dict):
+        err = str(close_result.get("error") or close_result.get("message") or close_result)[:500]
+    signal["last_dynamic_profit_error"] = err or str(close_result)[:500]
+
+
+def _clear_dynamic_close_pending(signal: Dict[str, Any]) -> None:
+    for key in [
+        "dynamic_exit_pending", "dynamic_exit_attempts", "dynamic_exit_first_detected_at",
+        "last_dynamic_exit_attempt_at", "next_dynamic_exit_retry_at", "dynamic_exit_price",
+        "dynamic_exit_decision", "dynamic_exit_reason", "dynamic_exit_notified",
+        "dynamic_exit_gave_up_notified", "last_dynamic_profit_error",
+    ]:
+        signal.pop(key, None)
+
+
+def _build_dynamic_pending_message(signal: Dict[str, Any]) -> str:
+    attempts = int(signal.get("dynamic_exit_attempts", 0) or 0)
+    reason = _dynamic_pending_reason(signal)
+    err = str(signal.get("last_dynamic_profit_error") or "")[:250]
+    text = (
+        f"⚠️ خروج هوشمند سود برای {signal.get('symbol')} تشخیص داده شد.\n"
+        f"دستور بستن ارسال/تلاش شد اما بستن پوزیشن هنوز در توبیت تایید نشد.\n"
+        f"ربات بدون اسپم، با فاصله چند ثانیه دوباره تلاش می‌کند.\n"
+        f"تلاش: {attempts}/{DYNAMIC_CLOSE_MAX_ATTEMPTS}\n"
+        f"دلیل: {reason}"
+    )
+    if err:
+        text += f"\nخطا: {err}"
+    return text
+
+
+def _build_dynamic_giveup_message(signal: Dict[str, Any]) -> str:
+    err = str(signal.get("last_dynamic_profit_error") or "")[:250]
+    return (
+        f"⚠️ خروج هوشمند سود برای {signal.get('symbol')} چند بار تلاش شد اما هنوز تایید بسته‌شدن نگرفت.\n"
+        f"پوزیشن در لیست فعال نگه داشته شد و ربات با فاصله طولانی‌تر دوباره چک می‌کند.\n"
+        f"لطفاً وضعیت پوزیشن را در توبیت بررسی کن."
+        + (f"\nآخرین خطا: {err}" if err else "")
+    )
+
+
+def _should_retry_dynamic_close(signal: Dict[str, Any]) -> bool:
+    if not bool(signal.get("dynamic_exit_pending")):
+        return False
+    return now_ts() >= int(signal.get("next_dynamic_exit_retry_at", 0) or 0)
+
+
 def _execute_tracker_dynamic_real_close(signal: Dict[str, Any], exit_price: float, decision: Dict[str, Any]) -> Dict[str, Any]:
     """Close a REAL position for tracker-side Shock/Dynamic Exit.
 
@@ -1116,6 +1191,49 @@ def check_active_signals() -> List[Dict[str, Any]]:
             real_trade_accounting: Optional[Dict[str, Any]] = None
             dynamic_close_verified = False
 
+            # 0) Pending Dynamic Exit retry state.
+            # If a close was already attempted, do NOT rescan/re-alert every loop.
+            # Retry only after a cooldown so Toobit is not spammed with close orders.
+            if bool(signal.get("dynamic_exit_pending")):
+                if not _should_retry_dynamic_close(signal):
+                    signal["last_checked_at"] = now_ts()
+                    remaining.append(signal)
+                    continue
+
+                exit_price = float(signal.get("dynamic_exit_price") or signal.get("price") or signal.get("entry") or 0)
+                dynamic_decision = signal.get("dynamic_exit_decision") if isinstance(signal.get("dynamic_exit_decision"), dict) else {"reason": _dynamic_pending_reason(signal)}
+
+                close_result = _execute_tracker_dynamic_real_close(signal, exit_price, dynamic_decision or {})
+                if isinstance(close_result, dict) and close_result.get("ok"):
+                    hit_type = DYNAMIC_PROFIT_EVENT
+                    dynamic_close_verified = True
+                    pct_preview = move_percent(signal, exit_price)
+                    real_trade_accounting = _normalize_dynamic_close_accounting(signal, close_result, pct_preview)
+                    _clear_dynamic_close_pending(signal)
+                else:
+                    _set_dynamic_close_pending(signal, exit_price, dynamic_decision, close_result)
+                    attempts = int(signal.get("dynamic_exit_attempts", 0) or 0)
+                    # After several fast retries, slow down. Send only one final warning.
+                    if attempts >= DYNAMIC_CLOSE_MAX_ATTEMPTS:
+                        signal["next_dynamic_exit_retry_at"] = now_ts() + max(30, int(DYNAMIC_CLOSE_LONG_RETRY_SECONDS))
+                        if not bool(signal.get("dynamic_exit_gave_up_notified")):
+                            signal["dynamic_exit_gave_up_notified"] = True
+                            messages.append({
+                                "chat_id": signal.get("chat_id"),
+                                "message": _build_dynamic_giveup_message(signal),
+                                "reply_to_message_id": signal.get("message_id") or signal.get("reply_to_message_id"),
+                            })
+                    elif not bool(signal.get("dynamic_exit_notified")):
+                        signal["dynamic_exit_notified"] = True
+                        messages.append({
+                            "chat_id": signal.get("chat_id"),
+                            "message": _build_dynamic_pending_message(signal),
+                            "reply_to_message_id": signal.get("message_id") or signal.get("reply_to_message_id"),
+                        })
+                    signal["last_checked_at"] = now_ts()
+                    remaining.append(signal)
+                    continue
+
             # 1) Special update first: let real_trade_manager close profitable
             # REAL positions immediately when continuation quality fails.
             # This never touches losing/breakeven positions by design.
@@ -1174,18 +1292,17 @@ def check_active_signals() -> List[Dict[str, Any]]:
                     if not dynamic_close_verified:
                         close_result = _execute_tracker_dynamic_real_close(signal, exit_price, dynamic_decision or {})
                         if not isinstance(close_result, dict) or not close_result.get("ok"):
-                            signal["last_dynamic_profit_error"] = str((close_result or {}).get("error") or close_result)[:250]
+                            _set_dynamic_close_pending(signal, exit_price, dynamic_decision, close_result)
+                            # Only one pending notification. Next message is only when closed,
+                            # or after max attempts as a final warning.
+                            if not bool(signal.get("dynamic_exit_notified")):
+                                signal["dynamic_exit_notified"] = True
+                                messages.append({
+                                    "chat_id": signal.get("chat_id"),
+                                    "message": _build_dynamic_pending_message(signal),
+                                    "reply_to_message_id": signal.get("message_id") or signal.get("reply_to_message_id"),
+                                })
                             remaining.append(signal)
-                            messages.append({
-                                "chat_id": signal.get("chat_id"),
-                                "message": (
-                                    f"⚠️ خروج هوشمند سود برای {signal.get('symbol')} تشخیص داده شد، "
-                                    f"اما بستن پوزیشن در توبیت تایید نشد.\n"
-                                    f"پوزیشن همچنان فعال نگه داشته شد.\n"
-                                    f"خطا: {signal.get('last_dynamic_profit_error')}"
-                                ),
-                                "reply_to_message_id": signal.get("message_id") or signal.get("reply_to_message_id"),
-                            })
                             continue
                         dynamic_close_verified = True
                         real_trade_accounting = _normalize_dynamic_close_accounting(signal, close_result, pct)
