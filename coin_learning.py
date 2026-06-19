@@ -35,11 +35,22 @@ from typing import Dict, Any, Optional, List, Tuple
 from data_store import load_json, save_json
 
 LEARNING_FILE = "coin_learning.json"
-MAX_SIGNALS_STORED = 800
+MAX_SIGNALS_STORED = 20000
 MAX_EVENTS_PER_BUCKET = 240
 MAX_PATTERNS_PER_BUCKET = 80
 REAL_WEIGHT = 1.0
 GHOST_WEIGHT = 0.45
+
+# Time-Weighted Learning (Mode B)
+# Recent market behavior should affect scalping decisions more than old data.
+# 0-7d: full weight, 8-30d: medium, 31-90d: low, 90d+: archive/weak.
+TIME_WEIGHT_RECENT_DAYS = 7
+TIME_WEIGHT_MEDIUM_DAYS = 30
+TIME_WEIGHT_OLD_DAYS = 90
+TIME_WEIGHT_RECENT = 1.0
+TIME_WEIGHT_MEDIUM = 0.70
+TIME_WEIGHT_OLD = 0.40
+TIME_WEIGHT_ARCHIVE = 0.20
 MIN_TP_MEMORY_WINS = 3
 TP_SL_V2_VERSION = 1
 
@@ -101,6 +112,59 @@ def _norm_source(source: Any = None, signal_type: Any = None) -> str:
 
 def _source_weight(source: str) -> float:
     return GHOST_WEIGHT if str(source).upper() == "GHOST" else REAL_WEIGHT
+
+
+def _time_decay_weight(ts: Any, now: Optional[int] = None) -> float:
+    """Return recency weight for Mode B time-weighted learning.
+
+    This keeps the bot adaptive for 5M-15M scalping:
+    fresh outcomes matter most, 30-90 day data still helps, and very old
+    outcomes remain archive evidence with weak influence.
+    """
+    event_ts = _safe_int(ts, 0)
+    if event_ts <= 0:
+        return TIME_WEIGHT_RECENT
+    current = int(now or _now())
+    age_days = max(0.0, (current - event_ts) / 86400.0)
+    if age_days <= TIME_WEIGHT_RECENT_DAYS:
+        return TIME_WEIGHT_RECENT
+    if age_days <= TIME_WEIGHT_MEDIUM_DAYS:
+        return TIME_WEIGHT_MEDIUM
+    if age_days <= TIME_WEIGHT_OLD_DAYS:
+        return TIME_WEIGHT_OLD
+    return TIME_WEIGHT_ARCHIVE
+
+
+def _learning_weight(source: str, ts: Any = None) -> float:
+    return _source_weight(source) * _time_decay_weight(ts)
+
+
+def _bucket_time_weighted_outcomes(b: Dict[str, Any]) -> Dict[str, float]:
+    """Recalculate current TP/SL influence from bucket events with recency decay.
+
+    Stored cumulative fields are preserved for counters/history, but decisions
+    should prefer this live time-weighted view when enough event data exists.
+    """
+    events = b.get("events", []) if isinstance(b, dict) else []
+    if not isinstance(events, list) or not events:
+        return {"tp": _safe_float(b.get("weighted_tp") if isinstance(b, dict) else 0), "sl": _safe_float(b.get("weighted_sl") if isinstance(b, dict) else 0), "total": 0.0, "move_sum": _safe_float(b.get("weighted_move_sum") if isinstance(b, dict) else 0)}
+    tp = sl = move_sum = move_w = 0.0
+    now = _now()
+    for ev in events[-MAX_EVENTS_PER_BUCKET:]:
+        if not isinstance(ev, dict):
+            continue
+        r = _norm_result(ev.get("result"))
+        if r not in {"TP1", "TP2", "SL"}:
+            continue
+        w = _source_weight(_norm_source(ev.get("source"))) * _time_decay_weight(ev.get("ts"), now)
+        if r in {"TP1", "TP2"}:
+            tp += w
+        elif r == "SL":
+            sl += w
+        if ev.get("move_percent") is not None:
+            move_sum += _safe_float(ev.get("move_percent"), 0.0) * w
+            move_w += w
+    return {"tp": tp, "sl": sl, "total": tp + sl, "move_sum": move_sum, "move_w": move_w}
 
 
 def _default_state() -> Dict[str, Any]:
@@ -492,13 +556,18 @@ def _learn_meta_layer(b: Dict[str, Any], snap: Dict[str, Any], weight: float, re
 
 
 def _weighted_win_rate(b: Dict[str, Any]) -> float:
-    tp = _safe_float(b.get("weighted_tp"))
-    sl = _safe_float(b.get("weighted_sl"))
+    tw = _bucket_time_weighted_outcomes(b)
+    tp = _safe_float(tw.get("tp"))
+    sl = _safe_float(tw.get("sl"))
     total = tp + sl
     return tp / total if total > 0 else 0.0
 
 
 def _closed_weight(b: Dict[str, Any]) -> float:
+    tw = _bucket_time_weighted_outcomes(b)
+    total = _safe_float(tw.get("total"))
+    if total > 0:
+        return total
     return _safe_float(b.get("weighted_tp")) + _safe_float(b.get("weighted_sl"))
 
 
@@ -552,7 +621,11 @@ def _tp_sl_v2_snapshot_metrics(sig: Dict[str, Any], snap: Dict[str, Any], result
 def _recompute_bucket_behavior(b: Dict[str, Any]) -> None:
     total_w = _closed_weight(b)
     wr = _weighted_win_rate(b)
-    avg_move = _safe_float(b.get("weighted_move_sum")) / max(total_w, 1e-9) if total_w else 0.0
+    tw_outcomes = _bucket_time_weighted_outcomes(b)
+    if _safe_float(tw_outcomes.get("move_w")) > 0:
+        avg_move = _safe_float(tw_outcomes.get("move_sum")) / max(_safe_float(tw_outcomes.get("move_w")), 1e-9)
+    else:
+        avg_move = _safe_float(b.get("weighted_move_sum")) / max(total_w, 1e-9) if total_w else 0.0
 
     if total_w < 3:
         behavior = "UNKNOWN"
@@ -706,7 +779,9 @@ def update_signal_result(signal_id: str, result: str, exit_price: float = None, 
     r = _norm_result(result)
     ts = _now()
     snap = _compact_snapshot(snapshot if isinstance(snapshot, dict) else sig.get("snapshot", {}))
-    weight = _source_weight(source_norm)
+    # Store cumulative counters, but apply Mode-B recency weight to learning
+    # influence so fresh market behavior matters most.
+    weight = _learning_weight(source_norm, sig.get("recorded_at") or (snapshot or {}).get("snapshot_at") or ts)
 
     sig.update({
         "result": r,
@@ -727,6 +802,8 @@ def update_signal_result(signal_id: str, result: str, exit_price: float = None, 
         "move_percent": move_percent,
         "snapshot": snap,
         "entry_quality": fast_flags,
+        "learning_weight": weight,
+        "time_weight": _time_decay_weight(ts),
     }
     b.setdefault("events", []).append(event)
     b["events"] = b["events"][-MAX_EVENTS_PER_BUCKET:]
@@ -1063,9 +1140,10 @@ def _snapshot_similarity(current: Dict[str, Any], past: Dict[str, Any]) -> float
 def _event_similarity_weight(event: Dict[str, Any], similarity: float) -> float:
     src = _norm_source(event.get("source"))
     base = SIMILARITY_GHOST_WEIGHT if src == "GHOST" else SIMILARITY_REAL_WEIGHT
-    # More similar cases matter disproportionately more than barely similar
-    # cases, but keep it bounded.
-    return base * max(0.05, min(1.0, similarity)) ** 2
+    recency = _time_decay_weight(event.get("ts"))
+    # More similar and more recent cases matter disproportionately more than
+    # barely similar / stale cases, but keep every old event as weak archive data.
+    return base * recency * max(0.05, min(1.0, similarity)) ** 2
 
 
 def _event_move_atr(event: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
@@ -1219,8 +1297,9 @@ def should_require_extra_strength(symbol: str, direction: str, snapshot: Optiona
     if not b:
         return {"required": False, "extra_score": 0, "extra_confirmations": 0}
 
-    tp = _safe_float(b.get("weighted_tp"))
-    sl = _safe_float(b.get("weighted_sl"))
+    tw_outcomes = _bucket_time_weighted_outcomes(b)
+    tp = _safe_float(tw_outcomes.get("tp"), _safe_float(b.get("weighted_tp")))
+    sl = _safe_float(tw_outcomes.get("sl"), _safe_float(b.get("weighted_sl")))
     total = tp + sl
     wr = tp / max(total, 1e-9) if total else 0.0
     risk_bias = _safe_int(b.get("risk_bias"), 0)
