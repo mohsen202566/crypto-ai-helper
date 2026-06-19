@@ -453,8 +453,9 @@ def _relative_strength_pack(symbol: str, df_15m: pd.DataFrame, market_context: D
         btc_bias = market_context.get('btc_bias', 'neutral')
         market_regime = market_context.get('market_regime', 'neutral')
         status = 'neutral'
-        if coin_move > 0.45 and btc_bias != 'bullish': status = 'relative_strength'
-        if coin_move < -0.45 and btc_bias != 'bearish': status = 'relative_weakness'
+        btc_legacy = _soft_bias_for_legacy(btc_bias)
+        if coin_move > 0.45 and btc_legacy != 'bullish': status = 'relative_strength'
+        if coin_move < -0.45 and btc_legacy != 'bearish': status = 'relative_weakness'
         return {'coin_15m_5bar_move_pct': round(coin_move, 4), 'relative_status': status, 'btc_bias': btc_bias, 'market_regime': market_regime}
     except Exception:
         return {}
@@ -601,7 +602,7 @@ def build_local_snapshot(symbol, direction, df_4h, df_1h, df_30m, df_15m, df_5m,
         'early_5m_trigger':score_pack.get('early_5m_trigger',{}),'multi_tf_alignment':score_pack.get('multi_tf_alignment',{}),
         'late_entry':score_pack.get('late_entry',{}),'pump_dump_chase':score_pack.get('pump_dump_chase',{}),
         'trends':score_pack.get('trends',{}),'long_score':score_pack.get('long_score',0),'short_score':score_pack.get('short_score',0),
-        'market_regime':market_context.get('market_regime','neutral'),'btc_bias':market_context.get('btc_bias','neutral'),
+        'market_regime':market_context.get('market_regime','NEUTRAL'),'btc_bias':market_context.get('btc_bias','NEUTRAL'),'btc_lead':market_context.get('btc_lead',{}),'market_regime_legacy':market_context.get('market_regime_legacy','neutral'),'btc_bias_legacy':market_context.get('btc_bias_legacy','neutral'),
         'learning_note':'candidate snapshot: classic is soft; AI/ghost/meta learning should evaluate this condition per coin+direction',
     }
     if build_signal_snapshot:
@@ -657,9 +658,15 @@ def simple_classic_score(symbol, df_4h, df_1h, df_30m, df_15m, df_5m, market_con
     else: long_score=min(long_score,69); short_score=min(short_score,69); long_reasons.append('رد: ADX پایین'); short_reasons.append('رد: ADX پایین')
     if l15['close']>l15['vwap']: long_score+=4; short_score-=4
     else: short_score+=4; long_score-=4
-    mb=market_context.get('market_regime','neutral')
+    mb_raw=market_context.get('market_regime','neutral')
+    mb=_soft_bias_for_legacy(mb_raw)
+    btc_lead_effect=safe_float((market_context.get('btc_lead') or {}).get('effect'), 0.0)
     if mb=='bullish': long_score+=3; short_score-=3
     elif mb=='bearish': short_score+=3; long_score-=3
+    if btc_lead_effect > 0:
+        long_score += min(4, btc_lead_effect); short_score -= min(4, btc_lead_effect)
+    elif btc_lead_effect < 0:
+        short_score += min(4, abs(btc_lead_effect)); long_score -= min(4, abs(btc_lead_effect))
     buy2,sell2=buy_sell_power(df_5m,2); buy3,sell3=buy_sell_power(df_5m,3); buy20,sell20=buy_sell_power(df_5m,20)
     if buy3>=62: long_score+=3
     if sell3>=62: short_score+=3
@@ -1080,6 +1087,145 @@ def build_trade_levels(direction, price, atr, df_5m, df_15m, df_30m, snapshot=No
         'tp_sl_layers':['15M_SR_PRIMARY','5M_ENTRY_STRUCTURE','30M_CONTEXT','COIN_PERSONALITY','TP_REACH_MEMORY','LIQUIDITY_AWARE_SL','DYNAMIC_TP_META']
     }
 
+# ---------------------------------------------------------------------------
+# BTC Lead Indicator / Market Regime
+# ---------------------------------------------------------------------------
+def _trend_to_bias_score(trend: str) -> int:
+    t = str(trend or '').lower().strip()
+    if t == 'bullish':
+        return 2
+    if t == 'weak_bullish':
+        return 1
+    if t == 'bearish':
+        return -2
+    if t == 'weak_bearish':
+        return -1
+    return 0
+
+
+def _btc_power_pack(df: pd.DataFrame) -> Dict[str, Any]:
+    try:
+        buy2, sell2 = buy_sell_power(df, 2)
+        buy3, sell3 = buy_sell_power(df, 3)
+        buy6, sell6 = buy_sell_power(df, 6)
+        return {'buy2': buy2, 'sell2': sell2, 'buy3': buy3, 'sell3': sell3, 'buy6': buy6, 'sell6': sell6}
+    except Exception:
+        return {'buy2': 50.0, 'sell2': 50.0, 'buy3': 50.0, 'sell3': 50.0, 'buy6': 50.0, 'sell6': 50.0}
+
+
+def _btc_tf_score(df: pd.DataFrame, tf_name: str) -> Dict[str, Any]:
+    try:
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+        score = 0
+        reasons = []
+
+        close = safe_float(last.get('close'))
+        ema20 = safe_float(last.get('ema20'))
+        vwap = safe_float(last.get('vwap'))
+        rsi = safe_float(last.get('rsi'))
+        prev_rsi = safe_float(prev.get('rsi'))
+        macd = safe_float(last.get('macd'))
+        macd_signal = safe_float(last.get('macd_signal'))
+        hist = safe_float(last.get('macd_hist'))
+        prev_hist = safe_float(prev.get('macd_hist'))
+        hist_slope = hist - prev_hist
+        power = _btc_power_pack(df)
+
+        if close > ema20:
+            score += 2; reasons.append(f'{tf_name}: بالای EMA20')
+        elif close < ema20:
+            score -= 2; reasons.append(f'{tf_name}: زیر EMA20')
+
+        if close > vwap:
+            score += 2; reasons.append(f'{tf_name}: بالای VWAP')
+        elif close < vwap:
+            score -= 2; reasons.append(f'{tf_name}: زیر VWAP')
+
+        if macd > macd_signal:
+            score += 2
+        elif macd < macd_signal:
+            score -= 2
+
+        if hist_slope > 0:
+            score += 2; reasons.append(f'{tf_name}: هیستوگرام رو به بالا')
+        elif hist_slope < 0:
+            score -= 2; reasons.append(f'{tf_name}: هیستوگرام رو به پایین')
+
+        if rsi >= 52 and rsi > prev_rsi:
+            score += 2; reasons.append(f'{tf_name}: RSI صعودی')
+        elif rsi <= 48 and rsi < prev_rsi:
+            score -= 2; reasons.append(f'{tf_name}: RSI نزولی')
+
+        if power.get('buy3', 50) >= 58 or power.get('buy2', 50) >= 62:
+            score += 2; reasons.append(f'{tf_name}: قدرت خرید کوتاه‌مدت')
+        if power.get('sell3', 50) >= 58 or power.get('sell2', 50) >= 62:
+            score -= 2; reasons.append(f'{tf_name}: قدرت فروش کوتاه‌مدت')
+
+        return {
+            'tf': tf_name, 'score': int(score), 'reasons': reasons[:6],
+            'close': safe_round(close), 'ema20': safe_round(ema20), 'vwap': safe_round(vwap),
+            'rsi': safe_round(rsi, 2), 'rsi_slope': safe_round(rsi - prev_rsi, 4),
+            'macd_hist': safe_round(hist, 8), 'macd_hist_slope': safe_round(hist_slope, 8),
+            'power': power, 'trend': trend_direction(df),
+        }
+    except Exception as e:
+        return {'tf': tf_name, 'score': 0, 'reasons': [f'{tf_name}: خطا در BTC Lead {str(e)[:80]}'], 'trend': 'range'}
+
+
+def _classify_btc_bias(score: float) -> str:
+    if score >= 10:
+        return 'STRONG_BULLISH'
+    if score >= 4:
+        return 'BULLISH'
+    if score <= -10:
+        return 'STRONG_BEARISH'
+    if score <= -4:
+        return 'BEARISH'
+    return 'NEUTRAL'
+
+
+def _classify_market_regime(score: float, t4: str, t1: str, t15: str) -> str:
+    if score >= 9 and t4 in {'bullish', 'weak_bullish'} and t1 in {'bullish', 'weak_bullish'}:
+        return 'STRONG_BULLISH'
+    if score >= 3:
+        return 'BULLISH'
+    if score <= -9 and t4 in {'bearish', 'weak_bearish'} and t1 in {'bearish', 'weak_bearish'}:
+        return 'STRONG_BEARISH'
+    if score <= -3:
+        return 'BEARISH'
+    return 'NEUTRAL'
+
+
+def _soft_bias_for_legacy(value: str) -> str:
+    v = str(value or '').upper()
+    if 'BULLISH' in v:
+        return 'bullish'
+    if 'BEARISH' in v:
+        return 'bearish'
+    return 'neutral'
+
+
+def _persist_market_context_to_ai_summary(data: Dict[str, Any]) -> None:
+    if not callable(update_ai_summary):
+        return
+    try:
+        update_ai_summary(
+            market_regime=data.get('market_regime'),
+            btc_bias=data.get('btc_bias'),
+            btc_lead=data.get('btc_lead'),
+            market_context=data,
+            last_market_update=int(time.time()),
+        )
+    except TypeError:
+        try:
+            update_ai_summary({'market_regime': data.get('market_regime'), 'btc_bias': data.get('btc_bias'), 'btc_lead': data.get('btc_lead'), 'market_context': data})
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
 def get_soft_market_context():
     now = time.time() if 'time' in globals() else 0
     try:
@@ -1090,19 +1236,64 @@ def get_soft_market_context():
     except Exception:
         pass
     try:
-        b4=add_indicators(get_klines('BTCUSDT','4h')); b1=add_indicators(get_klines('BTCUSDT','1h')); b15=add_indicators(get_klines('BTCUSDT','15m'))
-        t4=ema_direction(b4); t1=ema_direction(b1); t15=ema_direction(b15); last=b15.iloc[-1]
-        regime='bullish' if t4=='bullish' and t1=='bullish' else 'bearish' if t4=='bearish' and t1=='bearish' else 'neutral'
-        btc_bias='bullish' if regime=='bullish' and last['macd']>=last['macd_signal'] else 'bearish' if regime=='bearish' and last['macd']<=last['macd_signal'] else 'neutral'
-        data={'market_regime':regime,'btc_bias':btc_bias,'btc_4h':t4,'btc_1h':t1,'btc_15m':t15}
+        b4 = add_indicators(get_klines('BTCUSDT', '4h'))
+        b1 = add_indicators(get_klines('BTCUSDT', '1h'))
+        b15 = add_indicators(get_klines('BTCUSDT', '15m'))
+        b5 = add_indicators(get_klines('BTCUSDT', '5m', include_current=USE_CURRENT_5M_FOR_ENTRY))
+
+        t4 = trend_direction(b4)
+        t1 = trend_direction(b1)
+        t15 = trend_direction(b15)
+        t5 = trend_direction(b5)
+
+        s15 = _btc_tf_score(b15, '15M')
+        s5 = _btc_tf_score(b5, '5M')
+
+        # 15M is the lead scalp context; 5M is the fast turn/entry context.
+        btc_score = (s15.get('score', 0) * 1.45) + (s5.get('score', 0) * 1.25)
+        btc_score += _trend_to_bias_score(t4) * 1.2
+        btc_score += _trend_to_bias_score(t1) * 1.6
+
+        btc_bias = _classify_btc_bias(btc_score)
+        regime_score = btc_score + _trend_to_bias_score(t4) * 2.0 + _trend_to_bias_score(t1) * 2.0 + _trend_to_bias_score(t15)
+        market_regime = _classify_market_regime(regime_score, t4, t1, t15)
+
+        data = {
+            'market_regime': market_regime,
+            'btc_bias': btc_bias,
+            'market_regime_legacy': _soft_bias_for_legacy(market_regime),
+            'btc_bias_legacy': _soft_bias_for_legacy(btc_bias),
+            'btc_4h': t4, 'btc_1h': t1, 'btc_15m': t15, 'btc_5m': t5,
+            'btc_lead': {
+                'enabled': True,
+                'bias': btc_bias,
+                'score': round(btc_score, 3),
+                'market_regime': market_regime,
+                'regime_score': round(regime_score, 3),
+                'effect': 4 if btc_bias == 'STRONG_BULLISH' else 2 if btc_bias == 'BULLISH' else -4 if btc_bias == 'STRONG_BEARISH' else -2 if btc_bias == 'BEARISH' else 0,
+                'tf_15m': s15,
+                'tf_5m': s5,
+                'trends': {'4H': t4, '1H': t1, '15M': t15, '5M': t5},
+                'updated_at': int(time.time()),
+            },
+        }
         try:
             _SOFT_MARKET_CONTEXT_CACHE['data'] = dict(data)
             _SOFT_MARKET_CONTEXT_CACHE['ts'] = now or 0
         except Exception:
             pass
+        _persist_market_context_to_ai_summary(data)
         return data
-    except Exception:
-        return {'market_regime':'neutral','btc_bias':'neutral'}
+    except Exception as e:
+        data = {
+            'market_regime': 'NEUTRAL',
+            'btc_bias': 'NEUTRAL',
+            'market_regime_legacy': 'neutral',
+            'btc_bias_legacy': 'neutral',
+            'btc_lead': {'enabled': False, 'bias': 'NEUTRAL', 'score': 0, 'error': str(e)[:160]},
+        }
+        _persist_market_context_to_ai_summary(data)
+        return data
 
 def analyze_symbol(symbol: str) -> Dict:
     symbol=str(symbol).upper().strip()
@@ -1215,7 +1406,7 @@ def analyze_symbol(symbol: str) -> Dict:
 
         level_pack=get_strong_levels(df_5m,df_15m,df_30m,price,atr); support=level_pack.get('nearest_support'); resistance=level_pack.get('nearest_resistance')
         entry_confirmed=(not ai_block) and valid and final_score>=min_score and confirmations>=effective_req_conf
-        common={'symbol':symbol,'score':cap_score(final_score),'long_score':long_score,'short_score':short_score,'price':safe_round(price),'closed_15m_price':safe_round(closed_15m_price),'entry_price_source':'5M_CURRENT' if USE_CURRENT_5M_FOR_ENTRY else '15M_CLOSED','atr':safe_round(atr),'market_regime':market_context.get('market_regime','neutral'),'btc_bias':market_context.get('btc_bias','neutral'),'confirmations':confirmations,'required_confirmations':effective_req_conf,'rsi':safe_round(df_15m.iloc[-1]['rsi'],2),'macd':safe_round(df_15m.iloc[-1]['macd'],6),'macd_signal':safe_round(df_15m.iloc[-1]['macd_signal'],6),'macd_hist':safe_round(df_15m.iloc[-1]['macd_hist'],6),'adx':safe_round(df_15m.iloc[-1]['adx'],2),'vwap_status':vwap_status(df_15m),'support':safe_round(support),'resistance':safe_round(resistance),'trends':sp.get('trends',{}),'distance_ema20_atr':sp.get('distance_ema20_atr'),'volume_status':sp.get('volume_status'),'volume_ratio':sp.get('volume_ratio'),'buy_power':sp.get('buy_power'),'sell_power':sp.get('sell_power'),'power2_buy':sp.get('power2_buy'),'power2_sell':sp.get('power2_sell'),'power3_buy':sp.get('power3_buy'),'power3_sell':sp.get('power3_sell'),'snapshot':snapshot,'coin_risk':risk_state,'rotation':rotation,'ai_decision':{'base_min_score':base_min_score,'min_score':min_score,'ai_penalty':ai_penalty,'ai_min_score_add':ai_min_score_add,'ai_block':ai_block,'strictness_level':strict,'sl_count':sl_count,'risk_score':risk_score,'rotation_score':rs,'prediction_score':safe_round(prediction_score,2),'reversal_risk_score':safe_round(reversal_risk_score,2),'trap_risk':trap_risk,'move_state':move_state},'prediction_layer':prediction_pack,'reasons':reasons[:20],'signal_timeframe':'AI 15M Scalp Candidate'}
+        common={'symbol':symbol,'score':cap_score(final_score),'long_score':long_score,'short_score':short_score,'price':safe_round(price),'closed_15m_price':safe_round(closed_15m_price),'entry_price_source':'5M_CURRENT' if USE_CURRENT_5M_FOR_ENTRY else '15M_CLOSED','atr':safe_round(atr),'market_regime':market_context.get('market_regime','NEUTRAL'),'btc_bias':market_context.get('btc_bias','NEUTRAL'),'btc_lead':market_context.get('btc_lead',{}),'market_regime_legacy':market_context.get('market_regime_legacy','neutral'),'btc_bias_legacy':market_context.get('btc_bias_legacy','neutral'),'confirmations':confirmations,'required_confirmations':effective_req_conf,'rsi':safe_round(df_15m.iloc[-1]['rsi'],2),'macd':safe_round(df_15m.iloc[-1]['macd'],6),'macd_signal':safe_round(df_15m.iloc[-1]['macd_signal'],6),'macd_hist':safe_round(df_15m.iloc[-1]['macd_hist'],6),'adx':safe_round(df_15m.iloc[-1]['adx'],2),'vwap_status':vwap_status(df_15m),'support':safe_round(support),'resistance':safe_round(resistance),'trends':sp.get('trends',{}),'distance_ema20_atr':sp.get('distance_ema20_atr'),'volume_status':sp.get('volume_status'),'volume_ratio':sp.get('volume_ratio'),'buy_power':sp.get('buy_power'),'sell_power':sp.get('sell_power'),'power2_buy':sp.get('power2_buy'),'power2_sell':sp.get('power2_sell'),'power3_buy':sp.get('power3_buy'),'power3_sell':sp.get('power3_sell'),'snapshot':snapshot,'coin_risk':risk_state,'rotation':rotation,'ai_decision':{'base_min_score':base_min_score,'min_score':min_score,'ai_penalty':ai_penalty,'ai_min_score_add':ai_min_score_add,'ai_block':ai_block,'strictness_level':strict,'sl_count':sl_count,'risk_score':risk_score,'rotation_score':rs,'prediction_score':safe_round(prediction_score,2),'reversal_risk_score':safe_round(reversal_risk_score,2),'trap_risk':trap_risk,'move_state':move_state},'prediction_layer':prediction_pack,'reasons':reasons[:20],'signal_timeframe':'AI 15M Scalp Candidate'}
         if not entry_confirmed:
             return {**common,'direction':'NO TRADE','status':'NO_TRADE','entry_confirmed':False,'entry_mode':'NO_ENTRY','entry':None,'stop_loss':None,'tp1':None,'tp2':None,'risk_reward':0,'risk_level':'UNKNOWN','freshness':'LOW','tp_meta':{},'validity':'سیگنال معتبر نیست','valid_gate':valid,'min_score':min_score}
         sl,tp1,tp2,rr,tp_meta=build_trade_levels(direction,price,atr,df_5m,df_15m,df_30m,snapshot,symbol)
@@ -1226,7 +1417,11 @@ def analyze_symbol(symbol: str) -> Dict:
             return {**common,'direction':'NO TRADE','status':'NO_TRADE','entry_confirmed':False,'entry_mode':'RR_FILTER','entry':None,'stop_loss':sl,'tp1':tp1,'tp2':tp2,'risk_reward':rr,'risk_level':'UNKNOWN','freshness':'LOW','tp_meta':tp_meta,'validity':'سیگنال معتبر نیست','valid_gate':valid,'min_score':min_score}
         risk_level='LOW' if final_score>=92 and confirmations>=6 else 'MEDIUM' if final_score>=86 and confirmations>=5 else 'HIGH'; freshness='HIGH' if confirmations>=6 else 'MEDIUM' if confirmations>=5 else 'LOW'
         if update_ai_summary:
-            try: update_ai_summary(total_signals=1)
+            try:
+                update_ai_summary(total_signals=1, market_regime=market_context.get('market_regime'), btc_bias=market_context.get('btc_bias'), btc_lead=market_context.get('btc_lead'), market_context=market_context)
+            except TypeError:
+                try: update_ai_summary(total_signals=1)
+                except Exception: pass
             except Exception: pass
         return {**common,'direction':direction,'status':'ACTIVE','entry_confirmed':True,'entry_mode':'AI_15M_SCALP_DIRECT','entry':safe_round(price),'stop_loss':sl,'tp1':tp1,'tp2':tp2,'risk_reward':rr,'risk_level':risk_level,'freshness':freshness,'tp_meta':tp_meta,'validity':'15 تا 45 دقیقه'}
     except Exception as e:
