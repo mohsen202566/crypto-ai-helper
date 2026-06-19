@@ -80,10 +80,15 @@ DEFAULT_REAL_TRADE_STATE = {
     # Special high-priority AI trade-management update.
     # Applies only to profitable TP-side management for both LONG and SHORT;
     # it never moves/changes SL placement.
+    # Goal: if an open trade is already in profit and evidence shows the trade
+    # probably cannot continue to TP, close immediately and preserve whatever
+    # profit exists. This is NOT a trailing stop and never acts on losing trades.
     "dynamic_profit_protection_enabled": True,
-    "dynamic_profit_min_profit_pct": 0.18,
-    "dynamic_profit_min_tp_progress": 0.45,
-    "dynamic_profit_retrace_trigger_pct": 0.18,
+    "dynamic_profit_min_profit_pct": 0.01,
+    "dynamic_profit_min_tp_progress": 0.0,
+    "dynamic_profit_retrace_trigger_pct": 0.06,
+    "dynamic_profit_shock_retrace_pct": 0.05,
+    "dynamic_profit_score_exit_threshold": 6.0,
     "dynamic_profit_last_check": 0,
 
     "created_at": 0,
@@ -1147,26 +1152,100 @@ def close_real_position(
     pnl_usd: Optional[float] = None,
     exit_price: Optional[float] = None,
     result_type: str = "MANUAL_CLOSE",
+    require_exchange_confirm: bool = True,
 ) -> Dict[str, Any]:
+    """Close a REAL Toobit position safely.
+
+    Critical safety behavior:
+    - Sends the close order to Toobit.
+    - Verifies the matching live position is gone before removing the internal
+      slot or recording PnL.
+    - If confirmation fails, returns ok=False and keeps the internal position so
+      signal_tracker keeps monitoring instead of assuming the trade is closed.
+    """
     state = load_real_trade_state()
     pos = state.get("open_positions", {}).get(signal_id)
 
     if not pos:
         return {"ok": False, "error": "پوزیشن پیدا نشد"}
 
+    symbol = str(pos.get("symbol") or "")
+    direction = str(pos.get("direction") or "")
+    quantity = _safe_float_any(pos.get("quantity"), 0.0)
+
+    if not symbol or not direction or quantity <= 0:
+        return {
+            "ok": False,
+            "error": "اطلاعات پوزیشن برای بستن کامل نیست",
+            "symbol": symbol,
+            "direction": direction,
+            "quantity": quantity,
+        }
+
     result = toobit_client.close_market_position(
-        symbol=pos["symbol"],
-        direction=pos["direction"],
-        quantity=float(pos["quantity"]),
+        symbol=symbol,
+        direction=direction,
+        quantity=float(quantity),
     )
 
-    if not result.get("ok"):
-        return result
+    if not isinstance(result, dict) or not result.get("ok"):
+        return {
+            "ok": False,
+            "closed": False,
+            "signal_id": signal_id,
+            "error": (result or {}).get("error") if isinstance(result, dict) else str(result),
+            "exchange_result": result.get("data") if isinstance(result, dict) else result,
+        }
 
-    state["open_positions"].pop(signal_id, None)
+    verify_result = {"ok": True, "closed_confirmed": True, "skipped": True}
+    if require_exchange_confirm:
+        verify_result = _verify_exchange_position_closed(symbol=symbol, direction=direction)
+        if not verify_result.get("ok"):
+            # Keep the position internally open. The close order was sent, but
+            # until Toobit confirms the position disappeared, the tracker must
+            # not record PnL, free the slot, or remove active monitoring.
+            return {
+                "ok": False,
+                "closed": False,
+                "close_order_sent": True,
+                "signal_id": signal_id,
+                "error": "سفارش خروج ارسال شد ولی بسته‌شدن پوزیشن در توبیت هنوز تایید نشد",
+                "exchange_result": result.get("data"),
+                "verify_result": verify_result,
+            }
+
+    # Reload state after verification to avoid overwriting concurrent sync/state
+    # changes, then remove only the confirmed closed position.
+    state = load_real_trade_state()
+    pos = state.get("open_positions", {}).get(signal_id, pos)
+    state.setdefault("open_positions", {}).pop(signal_id, None)
     save_real_trade_state(state)
 
     accounting = None
+
+    # If explicit exchange PnL is not supplied, record a conservative approximate
+    # PnL from exit price. This is important for AI_DYNAMIC_PROFIT_EXIT so real
+    # profit protection updates internal balance/learning immediately instead of
+    # closing the exchange position silently. The tracker can still show this as
+    # approximate and avoid double-recording.
+    move_pct = None
+    if exit_price is not None:
+        move_pct = _calc_move_percent(
+            str(pos.get("direction") or ""),
+            _safe_float_any(pos.get("entry"), 0.0),
+            _safe_float_any(exit_price, 0.0),
+        )
+
+    if pnl_usd is None and exit_price is not None:
+        try:
+            entry = _safe_float_any(pos.get("entry"), 0.0)
+            margin = _safe_float_any(pos.get("position_size_usd") or state.get("position_size_usd"), 0.0)
+            leverage = _safe_float_any(pos.get("leverage") or state.get("leverage"), 0.0)
+            if entry > 0 and margin > 0 and leverage > 0:
+                pnl_usd = _round_usd(margin * leverage * float(move_pct or 0.0) / 100.0)
+        except Exception:
+            pnl_usd = None
+
     if pnl_usd is not None:
         accounting = record_realized_pnl(
             pnl_usd=float(pnl_usd),
@@ -1175,15 +1254,29 @@ def close_real_position(
             direction=pos.get("direction"),
             result=result_type,
             exit_price=exit_price,
+            entry=pos.get("entry"),
+            stop_loss=pos.get("sl") or pos.get("stop_loss"),
+            tp1=pos.get("tp1"),
+            tp2=pos.get("tp2"),
+            snapshot=pos.get("snapshot") if isinstance(pos.get("snapshot"), dict) else {},
+            max_favorable=pos.get("max_favorable_percent"),
+            max_adverse=pos.get("max_adverse_percent"),
+            pnl_source="APPROX_FROM_EXIT_PRICE" if result_type == "AI_DYNAMIC_PROFIT_EXIT" else "APPROX_OR_MANUAL",
+            move_percent=move_pct,
+            exchange_close_confirmed=True,
         )
 
     return {
         "ok": True,
         "closed": True,
+        "close_order_sent": True,
+        "close_confirmed": True,
         "signal_id": signal_id,
         "exchange_result": result.get("data"),
+        "verify_result": verify_result,
         "accounting": accounting,
     }
+
 
 # ---------------------------------------------------------------------------
 # Robust Toobit synchronization layer
@@ -1196,6 +1289,58 @@ PENDING_ORDER_POLL_INTERVAL = 2.0
 PENDING_SLOT_GRACE_SECONDS = 75
 
 PENDING_REAL_CONFIRM_STATUS = "PENDING_REAL_CONFIRM"
+
+# After sending a dynamic/manual close order, do not mark a real trade as closed
+# until Toobit no longer reports the matching live position. This prevents the
+# bot from freeing slots or recording profit while the exchange position is
+# still open.
+REAL_CLOSE_VERIFY_SECONDS = 12.0
+REAL_CLOSE_VERIFY_INTERVAL = 1.5
+
+
+def _verify_exchange_position_closed(symbol: str, direction: str, timeout: float = REAL_CLOSE_VERIFY_SECONDS) -> Dict[str, Any]:
+    """Poll Toobit briefly and confirm the matching futures position is gone.
+
+    Returns ok=True only when the exchange position is not visible anymore.
+    If Toobit position fetch fails, the function is conservative and returns
+    ok=False so the tracker keeps monitoring instead of assuming a close.
+    """
+    end = time.time() + float(timeout)
+    last_error = ""
+    last_positions = []
+    plain_symbol = normalize_bot_plain_symbol(str(symbol or ""))
+    direct = str(direction or "").upper()
+
+    while time.time() <= end:
+        result = get_toobit_open_positions_normalized(symbol)
+        if not isinstance(result, dict) or not result.get("ok"):
+            last_error = str((result or {}).get("error") or "position fetch failed")[:250]
+            time.sleep(float(REAL_CLOSE_VERIFY_INTERVAL))
+            continue
+
+        positions = result.get("positions") or []
+        last_positions = positions
+        still_open = False
+        for ex in positions:
+            if not isinstance(ex, dict):
+                continue
+            ex_symbol = normalize_bot_plain_symbol(str(ex.get("symbol") or ""))
+            ex_direction = str(ex.get("direction") or "").upper()
+            if ex_symbol == plain_symbol and ex_direction == direct:
+                still_open = True
+                break
+
+        if not still_open:
+            return {"ok": True, "closed_confirmed": True, "positions": positions}
+
+        time.sleep(float(REAL_CLOSE_VERIFY_INTERVAL))
+
+    return {
+        "ok": False,
+        "closed_confirmed": False,
+        "error": last_error or "position still visible after close order",
+        "positions": last_positions,
+    }
 
 
 def _plain_symbol_from_toobit(value: Any) -> str:
@@ -2101,6 +2246,15 @@ def _live_analysis_pack_for_dynamic_exit(symbol: str, direction: str) -> Dict[st
 
 
 def _dynamic_profit_exit_decision(pos: Dict[str, Any], current_price: float, state: Dict[str, Any]) -> Dict[str, Any]:
+    """Decide whether an already-profitable REAL position should be closed early.
+
+    Design rules from the current bot architecture:
+    - Only act when the trade is in profit. Never touch losing/breakeven trades.
+    - Do not move SL and do not change TP. This is a pure profit-protection exit.
+    - Do not wait for multiple candles when a clear shock reversal appears.
+    - Do not exit from one weak indicator alone; combine RSI/MACD/Histogram/ADX,
+      trend/EMA/VWAP, power/momentum, candle shock, trap/liquidity and AI direction.
+    """
     if not isinstance(pos, dict):
         return {"exit": False, "reason": "NO_POSITION"}
     if not bool(state.get("dynamic_profit_protection_enabled", True)):
@@ -2112,65 +2266,158 @@ def _dynamic_profit_exit_decision(pos: Dict[str, Any], current_price: float, sta
         return {"exit": False, "reason": "INVALID_DYNAMIC_INPUT"}
 
     profit_pct = _calc_move_percent(direction, entry, current_price)
-    min_profit = _safe_float_any(state.get("dynamic_profit_min_profit_pct"), 0.18)
-    min_progress = _safe_float_any(state.get("dynamic_profit_min_tp_progress"), 0.45)
-    retrace_trigger = _safe_float_any(state.get("dynamic_profit_retrace_trigger_pct"), 0.18)
+
+    # Hard rule: never interfere in loss or breakeven. Let SL/TP logic handle it.
+    if profit_pct <= 0:
+        if profit_pct < 0:
+            pos["max_adverse_percent"] = min(_safe_float_any(pos.get("max_adverse_percent"), 0.0), round(profit_pct, 6))
+        return {"exit": False, "reason": "NOT_IN_PROFIT", "profit_pct": round(profit_pct, 4)}
+
     progress = _tp_progress_percent(pos, current_price)
 
-    # Never touch losing/breakeven trades. SL remains controlled by TP/SL layers.
-    if profit_pct < min_profit:
-        return {"exit": False, "reason": "NOT_ENOUGH_PROFIT", "profit_pct": round(profit_pct, 4), "tp_progress": round(progress, 4)}
-
+    # Keep MFE/MAE memory. MFE is needed for shock-reversal detection.
     prev_max = _safe_float_any(pos.get("max_favorable_percent"), 0.0)
     if profit_pct > prev_max:
         pos["max_favorable_percent"] = round(profit_pct, 6)
-    if profit_pct < 0:
-        pos["max_adverse_percent"] = min(_safe_float_any(pos.get("max_adverse_percent"), 0.0), round(profit_pct, 6))
+        prev_max = profit_pct
+    peak_profit = _safe_float_any(pos.get("max_favorable_percent"), 0.0)
+    retrace_from_peak = max(0.0, peak_profit - profit_pct)
 
-    retrace_from_peak = max(0.0, _safe_float_any(pos.get("max_favorable_percent"), 0.0) - profit_pct)
+    # Existing state values are backward-compatible, but the new special update
+    # must not require 45% TP progress or 0.18% profit before acting. Cap the old
+    # thresholds so old saved JSON state cannot make the feature too slow.
+    configured_min_profit = _safe_float_any(state.get("dynamic_profit_min_profit_pct"), 0.01)
+    min_profit_for_normal_exit = min(max(configured_min_profit, 0.0), 0.03)
+    shock_retrace = _safe_float_any(state.get("dynamic_profit_shock_retrace_pct"), 0.05)
+    shock_retrace = min(max(shock_retrace, 0.02), 0.12)
+    score_exit_threshold = _safe_float_any(state.get("dynamic_profit_score_exit_threshold"), 6.0)
+    score_exit_threshold = min(max(score_exit_threshold, 4.0), 9.0)
+
     live_ai = _live_analysis_pack_for_dynamic_exit(str(pos.get("symbol") or ""), direction)
 
+    reversal_score = 0.0
+    continuation_score = 0.0
     reasons = []
-    if progress >= min_progress and retrace_from_peak >= retrace_trigger:
-        reasons.append(f"برگشت از اوج سود {round(retrace_from_peak, 3)}%")
+    debug = {
+        "profit_pct": round(profit_pct, 4),
+        "tp_progress": round(progress, 4),
+        "peak_profit_pct": round(peak_profit, 4),
+        "retrace_from_peak_pct": round(retrace_from_peak, 4),
+        "signals": [],
+    }
 
+    def add_risk(points: float, reason: str, code: str) -> None:
+        nonlocal reversal_score
+        reversal_score += float(points)
+        reasons.append(reason)
+        debug["signals"].append({"type": "risk", "code": code, "points": points, "reason": reason})
+
+    def add_continue(points: float, code: str) -> None:
+        nonlocal continuation_score
+        continuation_score += float(points)
+        debug["signals"].append({"type": "continue", "code": code, "points": points})
+
+    # 1) SHOCK EXIT: this is the fast ADA-style path. If the position was in a
+    # decent profit and a single move quickly takes back a meaningful part of
+    # the floating profit, exit without waiting for RSI/MACD confirmation.
+    if peak_profit >= max(0.04, min_profit_for_normal_exit) and retrace_from_peak >= shock_retrace:
+        add_risk(4.5, f"بازگشت سریع از اوج سود ({round(retrace_from_peak, 3)}%)", "SHOCK_RETRACE")
+    if peak_profit >= 0.08 and retrace_from_peak >= max(0.04, peak_profit * 0.45):
+        add_risk(5.0, "پس‌گرفتن بخش بزرگی از سود شناور", "FLOATING_PROFIT_COLLAPSE")
+
+    # 2) Optional live AI/analysis layer. A single weak RSI is not enough; it
+    # contributes points. Several independent weaknesses together can close.
     reversal = _safe_float_any(live_ai.get("reversal_risk_score"), 0.0)
     pred = _safe_float_any(live_ai.get("prediction_score"), 0.0)
     move_state = str(live_ai.get("move_state") or "").upper()
     trap_risk = str(live_ai.get("trap_risk") or "").upper()
+    vwap_status = str(live_ai.get("vwap_status") or "").upper()
 
-    if progress >= min_progress and reversal >= 68:
-        reasons.append("افزایش ریسک برگشت بازار")
-    if progress >= min_progress and pred and pred <= 48:
-        reasons.append("افت احتمال ادامه حرکت")
-    if progress >= min_progress and move_state == "LATE_OR_EXHAUSTION":
-        reasons.append("خستگی حرکت")
-    if progress >= min_progress and trap_risk == "HIGH":
-        reasons.append("ریسک Trap/Liquidity بالا")
-    if progress >= min_progress and live_ai.get("direction_disagreement"):
-        reasons.append("تغییر جهت تحلیل AI")
+    if live_ai.get("direction_disagreement"):
+        add_risk(4.0, "تغییر جهت تحلیل AI", "AI_DIRECTION_FLIP")
+    if reversal >= 75:
+        add_risk(3.5, "ریسک برگشت خیلی بالا", "REVERSAL_RISK_HIGH")
+    elif reversal >= 62:
+        add_risk(2.0, "افزایش ریسک برگشت", "REVERSAL_RISK_MEDIUM")
+    if pred and pred <= 38:
+        add_risk(3.0, "افت شدید احتمال ادامه حرکت", "PREDICTION_COLLAPSE")
+    elif pred and pred <= 48:
+        add_risk(1.5, "افت احتمال ادامه حرکت", "PREDICTION_WEAK")
+    elif pred and pred >= 65:
+        add_continue(2.0, "PREDICTION_STILL_STRONG")
+    if move_state in {"LATE_OR_EXHAUSTION", "EXHAUSTION", "REVERSAL", "REVERSAL_PHASE"}:
+        add_risk(2.5, "خستگی/تغییر فاز حرکت", "MOVE_STATE_EXHAUSTION")
+    if trap_risk == "HIGH":
+        add_risk(3.0, "ریسک Trap/Liquidity بالا", "TRAP_RISK_HIGH")
+    elif trap_risk == "MEDIUM":
+        add_risk(1.0, "ریسک Trap/Liquidity متوسط", "TRAP_RISK_MEDIUM")
 
-    # Direction-specific momentum fade. Applies symmetrically to LONG and SHORT.
+    # VWAP/EMA/trend status if provided by analysis snapshot. Do not require it,
+    # but use it as a strong immediate reversal clue when against the position.
+    if direction == "LONG" and any(x in vwap_status for x in ("BELOW", "LOST", "BEAR", "SELL")):
+        add_risk(2.5, "از دست رفتن VWAP/روند کوتاه", "VWAP_AGAINST_LONG")
+    if direction == "SHORT" and any(x in vwap_status for x in ("ABOVE", "RECLAIM", "BULL", "BUY")):
+        add_risk(2.5, "پس‌گرفتن VWAP/روند کوتاه", "VWAP_AGAINST_SHORT")
+
+    # Direction-specific momentum fade. RSI alone only adds small risk; MACD
+    # histogram/ADX/power/trend together make the exit decisive.
     rsi_slope = _safe_float_any(live_ai.get("rsi_slope_15m"), 0.0)
     hist_accel = _safe_float_any(live_ai.get("macd_hist_accel_15m"), 0.0)
     adx_slope = _safe_float_any(live_ai.get("adx_slope_15m"), 0.0)
-    if progress >= min_progress:
-        if direction == "LONG" and (rsi_slope < 0 or hist_accel < 0) and adx_slope <= 0:
-            reasons.append("افت فشار خرید")
-        if direction == "SHORT" and (rsi_slope > 0 or hist_accel > 0) and adx_slope <= 0:
-            reasons.append("افت فشار فروش")
 
-    should_exit = bool(reasons) and progress >= min_progress
+    if direction == "LONG":
+        if rsi_slope < 0:
+            add_risk(1.0, "ضعف RSI", "RSI_FADE_LONG")
+        if hist_accel < 0:
+            add_risk(2.0, "ضعف MACD Histogram", "HIST_FADE_LONG")
+        if adx_slope < 0:
+            add_risk(1.5, "افت قدرت روند", "ADX_FADE_LONG")
+        if rsi_slope > 0 and hist_accel > 0:
+            add_continue(2.0, "MOMENTUM_STILL_LONG")
+    else:  # SHORT
+        if rsi_slope > 0:
+            add_risk(1.0, "ضعف RSI به نفع برگشت", "RSI_FADE_SHORT")
+        if hist_accel > 0:
+            add_risk(2.0, "ضعف MACD Histogram به ضرر شورت", "HIST_FADE_SHORT")
+        if adx_slope < 0:
+            add_risk(1.5, "افت قدرت روند", "ADX_FADE_SHORT")
+        if rsi_slope < 0 and hist_accel < 0:
+            add_continue(2.0, "MOMENTUM_STILL_SHORT")
+
+    # If the trade is barely positive, do not close on soft/ambiguous evidence;
+    # only a real shock/direction flip should close it. This prevents fee/noise exits.
+    has_shock = any(x.get("code") in {"SHOCK_RETRACE", "FLOATING_PROFIT_COLLAPSE"} for x in debug["signals"])
+    has_hard_flip = any(x.get("code") in {"AI_DIRECTION_FLIP", "VWAP_AGAINST_LONG", "VWAP_AGAINST_SHORT"} for x in debug["signals"])
+
+    net_exit_score = reversal_score - continuation_score
+    can_normal_exit = profit_pct >= min_profit_for_normal_exit
+    should_exit = False
+
+    if has_shock and profit_pct > 0:
+        should_exit = True
+    elif has_hard_flip and net_exit_score >= 4.0 and profit_pct > 0:
+        should_exit = True
+    elif can_normal_exit and net_exit_score >= score_exit_threshold:
+        should_exit = True
+
+    # One weak indicator alone must never close the trade.
+    if should_exit and len(reasons) == 1 and not (has_shock or has_hard_flip):
+        should_exit = False
+
     return {
-        "exit": should_exit,
-        "reason": "، ".join(reasons[:3]) if reasons else "HOLD_PROFIT",
+        "exit": bool(should_exit),
+        "reason": "، ".join(reasons[:4]) if should_exit and reasons else "HOLD_PROFIT",
         "profit_pct": round(profit_pct, 4),
         "tp_progress": round(progress, 4),
+        "peak_profit_pct": round(peak_profit, 4),
         "retrace_from_peak_pct": round(retrace_from_peak, 4),
+        "reversal_score": round(reversal_score, 3),
+        "continuation_score": round(continuation_score, 3),
+        "net_exit_score": round(net_exit_score, 3),
         "live_ai": live_ai,
+        "debug": debug,
         "current_price": current_price,
     }
-
 
 def check_dynamic_profit_protection(signal_id: Optional[str] = None) -> Dict[str, Any]:
     """Monitor open positions and close profitable trades when momentum fades.
