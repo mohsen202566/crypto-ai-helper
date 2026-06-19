@@ -341,12 +341,20 @@ def sync_once(*, repair_tpsl: bool = True, save: bool = True) -> Dict[str, Any]:
             pos["last_real_position_sync_tpsl_repair"] = repair
             pos["last_real_position_sync_tpsl_repair_at"] = _now()
             changed = True
-            events.append({
-                "type": "TPSL_REPAIR_ATTEMPTED",
-                "signal_id": sid,
-                "position": pos,
-                "repair": repair,
-            })
+
+            # Telegram anti-spam:
+            # TP/SL verification/repair may fail on every sync cycle while the
+            # position remains open. Send the warning only once per internal
+            # position; keep later repair attempts in state/logs only.
+            if not bool(pos.get("tpsl_repair_warning_sent")):
+                pos["tpsl_repair_warning_sent"] = True
+                pos["tpsl_repair_warning_sent_at"] = _now()
+                events.append({
+                    "type": "TPSL_REPAIR_ATTEMPTED",
+                    "signal_id": sid,
+                    "position": pos,
+                    "repair": repair,
+                })
 
     if changed and save:
         rtm.save_real_trade_state(state)
