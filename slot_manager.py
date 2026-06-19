@@ -348,9 +348,30 @@ def _risk_context(symbol: str, direction: str) -> Dict[str, Any]:
 def _candidate_snapshot(x: Dict[str, Any]) -> Dict[str, Any]:
     snap = x.get("snapshot") if isinstance(x.get("snapshot"), dict) else {}
     out = dict(snap)
-    for key in ["symbol", "direction", "entry", "price", "score", "ai_final_score", "ai_final_rank", "risk_level", "risk_reward", "confirmations", "freshness", "market_mode", "market_regime", "btc_bias"]:
+    for key in ["symbol", "direction", "entry", "price", "score", "ai_final_score", "ai_final_rank", "risk_level", "risk_reward", "confirmations", "freshness", "market_mode", "market_regime", "btc_bias", "similarity_score", "similarity_winrate", "similarity_samples", "similarity_adjustment"]:
         if key not in out and x.get(key) is not None:
             out[key] = x.get(key)
+    # Preserve Historical Similarity Engine metadata from scanner/coin_learning.
+    # This is intentionally storage-only here: scanner.py already applies the
+    # similarity adjustment to ai_final_rank, so slot_manager must not score it
+    # a second time.
+    if isinstance(x.get("similarity_learning"), dict):
+        out["similarity_learning"] = x.get("similarity_learning")
+    elif isinstance(x.get("ai_scanner"), dict) and isinstance(x["ai_scanner"].get("similarity_learning"), dict):
+        out["similarity_learning"] = x["ai_scanner"].get("similarity_learning")
+    if isinstance(out.get("similarity_learning"), dict):
+        sim = out["similarity_learning"]
+        for src_key, dst_key in [
+            ("similarity_score", "similarity_score"),
+            ("win_rate", "similarity_winrate"),
+            ("similar_win_rate", "similarity_winrate"),
+            ("samples", "similarity_samples"),
+            ("similar_samples", "similarity_samples"),
+            ("rank_adjustment", "similarity_adjustment"),
+            ("adjustment", "similarity_adjustment"),
+        ]:
+            if out.get(dst_key) is None and sim.get(src_key) is not None:
+                out[dst_key] = sim.get(src_key)
     return out
 
 
@@ -422,6 +443,10 @@ def save_candidate_as_ghost(x: Dict[str, Any], reason: str = "SLOT_MANAGER_UNUSE
         snap["slot_rank"] = candidate_rank_value(x)
         if isinstance(x.get("ai_scanner"), dict):
             snap["ai_scanner"] = x.get("ai_scanner")
+        if isinstance(x.get("similarity_learning"), dict):
+            snap["similarity_learning"] = x.get("similarity_learning")
+        elif isinstance(snap.get("similarity_learning"), dict):
+            pass
         create_ghost_signal(
             _norm_symbol(x.get("symbol")),
             _norm_direction(x.get("direction")),
