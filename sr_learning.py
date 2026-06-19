@@ -28,14 +28,37 @@ from typing import Dict, Any, Optional, List
 from data_store import load_json, save_json
 
 SR_FILE = "sr_learning.json"
-MAX_EVENTS = 1800
-MAX_EVENTS_PER_LEVEL = 100
+MAX_EVENTS = 20000
+MAX_EVENTS_PER_LEVEL = 300
 LEVEL_BUCKET_PCT = 0.0015  # 0.15% buckets so near levels merge safely
 VERSION = 3
+DAY_SECONDS = 86400
+
 
 
 def _now() -> int:
     return int(time.time())
+
+
+def _time_weight(ts: Any) -> float:
+    """Recency weight used by SR/Liquidity memory.
+
+    Matches the bot-wide Mode B learning preference:
+    0-7 days = 1.00, 8-30 days = 0.70, 31-90 days = 0.40,
+    older = 0.20. This keeps old experience useful but prevents stale market
+    behavior from dominating current scalping decisions.
+    """
+    t = _safe_float(ts, 0.0)
+    if t <= 0:
+        return 0.70
+    age_days = max(0.0, (_now() - t) / DAY_SECONDS)
+    if age_days <= 7:
+        return 1.00
+    if age_days <= 30:
+        return 0.70
+    if age_days <= 90:
+        return 0.40
+    return 0.20
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -62,11 +85,11 @@ def _norm_direction(direction: str) -> str:
 
 def _norm_level_type(level_type: str) -> str:
     lt = str(level_type or "").upper().strip()
-    if lt in {"SUPPORT", "S", "LOW"}:
+    if lt in {"SUPPORT", "S", "LOW", "DEMAND", "DEMAND_ZONE", "BUY_ZONE"}:
         return "SUPPORT"
-    if lt in {"RESISTANCE", "R", "HIGH"}:
+    if lt in {"RESISTANCE", "R", "HIGH", "SUPPLY", "SUPPLY_ZONE", "SELL_ZONE"}:
         return "RESISTANCE"
-    if lt in {"LIQUIDITY", "LIQUIDITY_ZONE", "STOP_ZONE"}:
+    if lt in {"LIQUIDITY", "LIQUIDITY_ZONE", "STOP_ZONE", "STOP_CLUSTER", "LIQUIDITY_POOL"}:
         return "LIQUIDITY"
     return lt or "UNKNOWN"
 
@@ -266,8 +289,8 @@ def _snapshot_compact(snapshot: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if not isinstance(snapshot, dict):
         return {}
     keys = [
-        "atr", "adx", "adx_slope_15m", "rsi", "rsi_slope_15m", "macd_hist", "macd_hist_accel_15m",
-        "vwap_status", "vwap_distance_pct", "market_regime", "btc_bias", "move_state", "trap_risk",
+        "snapshot_at", "atr", "adx", "adx_slope_15m", "rsi", "rsi_slope_15m", "macd_hist", "macd_hist_accel_15m",
+        "vwap_status", "vwap_distance_pct", "market_regime", "market_mode", "btc_bias", "move_state", "trap_risk",
         "prediction_score", "reversal_risk_score", "timeframe_core", "entry_timing_tf",
     ]
     out = {k: snapshot.get(k) for k in keys if snapshot.get(k) is not None}
@@ -340,7 +363,11 @@ def record_sr_event(
         event["timeframe"] = str(timeframe).upper()
     if strength is not None:
         event["strength"] = _safe_float(strength)
-    for k in ("move_percent", "source", "trap_type", "liquidity_zone", "stop_hunt", "market_memory_test", "failed_move"):
+    for k in (
+        "move_percent", "source", "trap_type", "liquidity_zone", "stop_hunt",
+        "market_memory_test", "failed_move", "zone_strength", "freshness",
+        "reaction_percent", "clean_breakout", "fake_breakout", "liquidity_grab",
+    ):
         if kwargs.get(k) is not None:
             event[k] = kwargs.get(k)
     snap = _snapshot_compact(snapshot)
@@ -393,8 +420,58 @@ def _aggregate_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     stop = sum(int(r.get("stop_hunts", 0) or 0) for r in rows)
     sl = sum(int(r.get("sl_after_touch", 0) or 0) for r in rows)
     tp = sum(int(r.get("tp_after_touch", 0) or 0) for r in rows)
+
+    # Time-weighted view from raw events. This is additive and does not break
+    # old fields that other modules may already consume.
+    wt = wfake = wbounce = wclean = wtrap = wliq = wstop = wsl = wtp = 0.0
+    for r in rows:
+        events = r.get("events", []) if isinstance(r.get("events"), list) else []
+        if not events:
+            # Fallback when only aggregate old rows exist.
+            w = _time_weight(r.get("last_updated")) * max(1, int(r.get("touches", 0) or 0))
+            wt += w
+            wfake += _safe_float(r.get("fake_breakouts")) * _time_weight(r.get("last_updated"))
+            wbounce += _safe_float(r.get("bounces")) * _time_weight(r.get("last_updated"))
+            wclean += _safe_float(r.get("clean_breaks")) * _time_weight(r.get("last_updated"))
+            wtrap += _safe_float(r.get("trap_events")) * _time_weight(r.get("last_updated"))
+            wliq += _safe_float(r.get("liquidity_grabs")) * _time_weight(r.get("last_updated"))
+            wstop += _safe_float(r.get("stop_hunts")) * _time_weight(r.get("last_updated"))
+            wsl += _safe_float(r.get("sl_after_touch")) * _time_weight(r.get("last_updated"))
+            wtp += _safe_float(r.get("tp_after_touch")) * _time_weight(r.get("last_updated"))
+            continue
+        for ev in events:
+            if not isinstance(ev, dict):
+                continue
+            w = _time_weight(ev.get("ts"))
+            wt += w
+            res = _norm_result(ev.get("result"))
+            if res == "FAKE_BREAKOUT": wfake += w
+            elif res == "BOUNCE": wbounce += w
+            elif res == "CLEAN_BREAK": wclean += w
+            elif res == "TRAP": wtrap += w
+            elif res == "LIQUIDITY_GRAB":
+                wliq += w
+                if ev.get("stop_hunt") or str(ev.get("trap_type") or "").upper() in {"STOP_HUNT", "STOPHUNT"}:
+                    wstop += w
+            elif res == "SL": wsl += w
+            elif res == "TP": wtp += w
+
+    wt_base = max(wt, 1e-9)
+    weighted_trap_pressure = (wfake / wt_base) * 35 + (wtrap / wt_base) * 35 + (wstop / wt_base) * 20 + (wliq / wt_base) * 10
+    weighted_clean_pressure = (wbounce / wt_base) * 30 + (wclean / wt_base) * 30 + (wtp / wt_base) * 25 - (wsl / wt_base) * 20
+
+    preferred_action = "NEUTRAL"
+    if wt >= 3:
+        if weighted_trap_pressure >= 35:
+            preferred_action = "CAUTION_TRAP_OR_STOP_HUNT"
+        elif weighted_clean_pressure >= 35:
+            preferred_action = "CLEAN_REACTION_ZONE"
+        elif (wsl / wt_base) >= 0.45:
+            preferred_action = "LOW_QUALITY_ZONE"
+
     return {
         "samples": total_touches,
+        "weighted_samples": round(wt, 3),
         "strength_score": round(avg_strength, 2),
         "fake_break_rate": round(fake / max(1, total_touches), 4),
         "bounce_rate": round(bounce / max(1, total_touches), 4),
@@ -402,12 +479,23 @@ def _aggregate_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "trap_rate": round(trap / max(1, total_touches), 4),
         "liquidity_grab_rate": round(liq / max(1, total_touches), 4),
         "stop_hunt_rate": round(stop / max(1, total_touches), 4),
+        "weighted_fake_break_rate": round(wfake / wt_base, 4) if wt else 0.0,
+        "weighted_bounce_rate": round(wbounce / wt_base, 4) if wt else 0.0,
+        "weighted_break_rate": round(wclean / wt_base, 4) if wt else 0.0,
+        "weighted_trap_rate": round(wtrap / wt_base, 4) if wt else 0.0,
+        "weighted_liquidity_grab_rate": round(wliq / wt_base, 4) if wt else 0.0,
+        "weighted_stop_hunt_rate": round(wstop / wt_base, 4) if wt else 0.0,
         "tp_after_touch": tp,
         "sl_after_touch": sl,
+        "weighted_tp_after_touch": round(wtp, 3),
+        "weighted_sl_after_touch": round(wsl, 3),
         "fake_breakouts": fake,
         "trap_events": trap,
         "liquidity_grabs": liq,
         "stop_hunts": stop,
+        "weighted_trap_pressure": round(max(0, min(100, weighted_trap_pressure)), 2),
+        "weighted_clean_pressure": round(max(0, min(100, weighted_clean_pressure)), 2),
+        "preferred_action": preferred_action,
     }
 
 
@@ -472,10 +560,10 @@ def get_liquidity_trap_profile(symbol: str, direction: str = None, price: float 
     profile = get_sr_profile(symbol, direction=direction, price=price)
     samples = int(profile.get("samples", 0) or 0)
     trap_risk_score = 0
-    trap_risk_score += int(profile.get("fake_break_rate", 0.0) * 35)
-    trap_risk_score += int(profile.get("trap_rate", 0.0) * 35)
-    trap_risk_score += int(profile.get("stop_hunt_rate", 0.0) * 20)
-    trap_risk_score += int(profile.get("liquidity_grab_rate", 0.0) * 10)
+    trap_risk_score += int(profile.get("weighted_fake_break_rate", profile.get("fake_break_rate", 0.0)) * 35)
+    trap_risk_score += int(profile.get("weighted_trap_rate", profile.get("trap_rate", 0.0)) * 35)
+    trap_risk_score += int(profile.get("weighted_stop_hunt_rate", profile.get("stop_hunt_rate", 0.0)) * 20)
+    trap_risk_score += int(profile.get("weighted_liquidity_grab_rate", profile.get("liquidity_grab_rate", 0.0)) * 10)
     if samples < 3:
         risk = "UNKNOWN"
     elif trap_risk_score >= 45:
@@ -533,6 +621,50 @@ def suggest_liquidity_aware_buffer(symbol: str, direction: str, level_type: str,
         "soft_layer": True,
     }
 
+
+
+def get_dynamic_zone_bias(symbol: str, direction: str = None, price: float = None) -> Dict[str, Any]:
+    """Return a compact dynamic supply/demand bias for AI ranking/TP logic.
+
+    LONG near demand/support with clean reaction is favorable; LONG near strong
+    resistance/supply or trap-heavy area is caution. SHORT is symmetric. This
+    stays soft and never blocks by itself.
+    """
+    direct = _norm_direction(direction) if direction else None
+    support = get_sr_profile(symbol, direction=direction, level_type="SUPPORT", price=price)
+    resistance = get_sr_profile(symbol, direction=direction, level_type="RESISTANCE", price=price)
+    liquidity = get_liquidity_trap_profile(symbol, direction=direction, price=price)
+
+    score = 0
+    reasons: List[str] = []
+    if direct == "LONG":
+        if support.get("available") and support.get("weighted_clean_pressure", 0) >= 30:
+            score += 4; reasons.append("demand/support reaction")
+        if resistance.get("available") and resistance.get("weighted_trap_pressure", 0) >= 30:
+            score -= 4; reasons.append("supply/trap pressure")
+    elif direct == "SHORT":
+        if resistance.get("available") and resistance.get("weighted_clean_pressure", 0) >= 30:
+            score += 4; reasons.append("supply/resistance reaction")
+        if support.get("available") and support.get("weighted_trap_pressure", 0) >= 30:
+            score -= 4; reasons.append("demand/trap pressure")
+
+    trap_score = int(liquidity.get("trap_risk_score", 0) or 0)
+    if trap_score >= 45:
+        score -= 3; reasons.append("liquidity trap high")
+    elif trap_score <= 15 and liquidity.get("available"):
+        score += 1; reasons.append("liquidity risk low")
+
+    return {
+        "symbol": _norm_symbol(symbol),
+        "direction": direct,
+        "zone_bias_score": max(-8, min(8, int(score))),
+        "support": support,
+        "resistance": resistance,
+        "liquidity": liquidity,
+        "reasons": reasons[:4],
+        "soft_layer": True,
+        "source": "sr_learning_v3",
+    }
 
 def format_sr_report(symbol: str = None, limit: int = 12) -> str:
     s = _state()
