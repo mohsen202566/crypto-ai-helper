@@ -247,6 +247,185 @@ def save_json(path: str, data: Any) -> None:
 
 
 # ============================================================
+# AI Similarity / Pattern Memory display helpers
+# ============================================================
+
+def _load_first_existing_json(paths: List[str], default: Any) -> Any:
+    for path in paths:
+        data = load_json(path, default)
+        if data != default:
+            return data
+    return default
+
+
+def _similarity_row_from_any(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    # Different modules may store this block under slightly different names.
+    for key in [
+        "similarity_learning",
+        "similarity",
+        "historical_similarity",
+        "pattern_similarity",
+    ]:
+        obj = value.get(key)
+        if isinstance(obj, dict):
+            return obj
+    # Some rows may already be the similarity object.
+    if any(k in value for k in ["similar_samples", "samples", "similarity_winrate", "rank_adjustment"]):
+        return value
+    return {}
+
+
+def _fmt_pct(value: Any, default: str = "-") -> str:
+    try:
+        v = float(value)
+        if 0 <= v <= 1:
+            v *= 100.0
+        return f"{round(v, 1)}%"
+    except Exception:
+        return default
+
+
+def _fmt_num(value: Any, default: str = "-") -> str:
+    try:
+        return str(round(float(value), 3))
+    except Exception:
+        return default
+
+
+def format_similarity_status() -> str:
+    """Compact read-only report for Historical Similarity / Pattern Memory.
+
+    This does not change trading logic. It only displays whether the newly
+    connected similarity engine is producing/using comparable historical
+    snapshots across coin_learning/scanner/tracker/real-trade paths.
+    """
+    learning = _load_first_existing_json(
+        ["coin_learning.json", os.path.join(DATA_DIR, "coin_learning.json")],
+        {},
+    )
+    real_state = load_json(REAL_TRADE_STATE_FILE, {})
+    slot_state = _load_first_existing_json(
+        ["slot_state.json", os.path.join(DATA_DIR, "slot_state.json")],
+        {},
+    )
+
+    buckets = []
+    if isinstance(learning, dict):
+        rows = learning.get("by_coin_direction", {})
+        if isinstance(rows, dict):
+            buckets = [r for r in rows.values() if isinstance(r, dict)]
+
+    total_events = 0
+    buckets_with_events = 0
+    tp_events = 0.0
+    sl_events = 0.0
+    sim_blocks_seen = 0
+    dynamic_profit_exits = 0
+    top_rows = []
+
+    for b in buckets:
+        events = b.get("events") if isinstance(b.get("events"), list) else []
+        if events:
+            buckets_with_events += 1
+            total_events += len(events)
+        tp = float(b.get("weighted_tp") or 0)
+        sl = float(b.get("weighted_sl") or 0)
+        tp_events += tp
+        sl_events += sl
+        dyn = b.get("dynamic_profit_stats") if isinstance(b.get("dynamic_profit_stats"), dict) else {}
+        dynamic_profit_exits += int(dyn.get("profit_exits", 0) or 0)
+
+        # Count rows/events carrying an explicit similarity block.
+        for ev in events[-50:]:
+            if isinstance(ev, dict):
+                snap = ev.get("snapshot") if isinstance(ev.get("snapshot"), dict) else ev
+                if _similarity_row_from_any(snap):
+                    sim_blocks_seen += 1
+
+        total_w = tp + sl
+        if total_w > 0:
+            wr = tp / total_w * 100.0
+            top_rows.append({
+                "symbol": b.get("symbol"),
+                "direction": b.get("direction"),
+                "samples": round(total_w, 2),
+                "wr": wr,
+                "behavior": b.get("behavior", "UNKNOWN"),
+            })
+
+    # Also check active/open real positions and queue for recently attached similarity metadata.
+    open_positions = []
+    if isinstance(real_state, dict) and isinstance(real_state.get("open_positions"), dict):
+        open_positions = [p for p in real_state.get("open_positions", {}).values() if isinstance(p, dict)]
+    queue = []
+    if isinstance(slot_state, dict) and isinstance(slot_state.get("queue"), list):
+        queue = [q for q in slot_state.get("queue", []) if isinstance(q, dict)]
+
+    active_similarity = 0
+    for row in open_positions + queue:
+        if _similarity_row_from_any(row) or _similarity_row_from_any(row.get("snapshot") if isinstance(row.get("snapshot"), dict) else {}):
+            active_similarity += 1
+
+    total_closed_w = tp_events + sl_events
+    overall_wr = (tp_events / total_closed_w * 100.0) if total_closed_w > 0 else 0.0
+
+    top_rows.sort(key=lambda x: (x["wr"], x["samples"]), reverse=True)
+    weak_rows = sorted(top_rows, key=lambda x: (x["wr"], -x["samples"]))[:3]
+    best_rows = top_rows[:3]
+
+    lines = [
+        "🧩 Similarity / Pattern Memory",
+        f"وضعیت: {'فعال' if buckets_with_events or active_similarity else 'در انتظار داده'}",
+        f"باکت‌های دارای نمونه: {buckets_with_events}",
+        f"کل Snapshot نتیجه‌دار: {total_events}",
+        f"WR یادگیری وزنی: {round(overall_wr, 1)}%",
+        f"خروج سود AI ثبت‌شده: {dynamic_profit_exits}",
+        f"Similarity metadata فعال/صف: {active_similarity}",
+    ]
+
+    if sim_blocks_seen:
+        lines.append(f"Similarity blocks ثبت‌شده اخیر: {sim_blocks_seen}")
+
+    if best_rows:
+        lines.append("بهترین الگوها:")
+        for r in best_rows:
+            lines.append(f"{r.get('symbol')} {r.get('direction')} | WR:{round(r.get('wr',0),1)}% | نمونه:{r.get('samples')}")
+    if weak_rows:
+        lines.append("ضعیف‌ترین الگوها:")
+        for r in weak_rows:
+            lines.append(f"{r.get('symbol')} {r.get('direction')} | WR:{round(r.get('wr',0),1)}% | نمونه:{r.get('samples')}")
+
+    return "\n".join(lines)
+
+
+def format_dynamic_result_similarity_note(row: Dict[str, Any]) -> str:
+    """Optional short note for Dynamic Profit messages."""
+    if not isinstance(row, dict):
+        return ""
+    sim = _similarity_row_from_any(row)
+    if not sim and isinstance(row.get("raw"), dict):
+        sim = _similarity_row_from_any(row.get("raw"))
+    if not sim and isinstance(row.get("close_result"), dict):
+        sim = _similarity_row_from_any(row.get("close_result"))
+    if not sim:
+        return ""
+
+    samples = sim.get("similar_samples") or sim.get("samples") or sim.get("count")
+    wr = sim.get("similarity_winrate") or sim.get("win_rate") or sim.get("winrate")
+    adj = sim.get("rank_adjustment") or sim.get("adjustment") or sim.get("exit_adjustment")
+    parts = []
+    if samples is not None:
+        parts.append(f"نمونه مشابه: {samples}")
+    if wr is not None:
+        parts.append(f"WR مشابه: {_fmt_pct(wr)}")
+    if adj is not None:
+        parts.append(f"اثر: {_fmt_num(adj)}")
+    return "\n".join(parts)
+
+
+# ============================================================
 # Access control
 # ============================================================
 
@@ -1081,7 +1260,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "ریست ترید\n\n"
         "AI و مدیریت:\n"
         "هوش مصنوعی\n"
-        "حافظه ربات\n"
+        "حافظه ربات\nSimilarity / Pattern Memory داخل وضعیت AI نمایش داده می‌شود\n"
         "ریسک کوین‌ها\n"
         "بهترین کوین‌ها\n"
         "بدترین کوین‌ها\n"
@@ -1228,7 +1407,7 @@ async def ai_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     parts = []
-    for fn in [format_ai_status, format_learning_summary, format_rotation_report, format_ghost_report, format_slot_report]:
+    for fn in [format_ai_status, format_learning_summary, format_similarity_status, format_rotation_report, format_ghost_report, format_slot_report]:
         if not fn:
             continue
         try:
@@ -1250,6 +1429,10 @@ async def learning_memory_command(update: Update, context: ContextTypes.DEFAULT_
             parts.append(format_learning_summary())
         except Exception:
             pass
+    try:
+        parts.append(format_similarity_status())
+    except Exception:
+        pass
     if format_smart_stats:
         try:
             parts.append(format_smart_stats())
@@ -1577,6 +1760,9 @@ async def dynamic_profit_protection_loop(app: Application) -> None:
                         f"سود تقریبی حرکت: {r.get('profit_pct')}%\n"
                         f"علت: {r.get('reason')}"
                     )
+                    sim_note = format_dynamic_result_similarity_note(r)
+                    if sim_note:
+                        text += "\n" + sim_note
                     await app.bot.send_message(chat_id=OWNER_ID, text=text)
                     await asyncio.sleep(1)
             elif isinstance(result, dict) and not result.get("ok"):
