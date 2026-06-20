@@ -1689,7 +1689,26 @@ def ai_movement_hunter_decision(symbol: str, sensors: Dict[str, Any], market_con
     trap_risk = selected.get("trap", {}).get("trap_risk", "LOW")
     evidence_count = len(selected.get("evidence") or [])
 
-    if score >= AI_MOVEMENT_REAL_MIN_SCORE and selected.get("phase", {}).get("real_allowed") and trap_risk != "HIGH" and evidence_count >= 2:
+    if (
+        score >= AI_MOVEMENT_REAL_MIN_SCORE
+        and selected.get("phase", {}).get("real_allowed")
+        and trap_risk != "HIGH"
+        and evidence_count >= 2
+    ):
+        decision = "REAL"
+    elif (
+        score >= AI_MOVEMENT_REAL_MIN_SCORE + 4
+        and phase_name in {"SETUP", "WATCH"}
+        and trap_risk in {"LOW", "MEDIUM"}
+        and evidence_count >= 2
+    ):
+        decision = "REAL"
+    elif (
+        score >= AI_MOVEMENT_REAL_MIN_SCORE + 8
+        and phase_name == "MID"
+        and trap_risk == "LOW"
+        and evidence_count >= 3
+    ):
         decision = "REAL"
     elif score >= AI_MOVEMENT_SETUP_MIN_SCORE and phase_name not in {"EXHAUSTION", "RANGE_AFTER_MOVE"} and trap_risk != "HIGH":
         decision = "GHOST"
@@ -1823,20 +1842,21 @@ def analyze_symbol(symbol: str) -> Dict:
             ai_block = True
             reasons.append(f'AI State Block: حرکت تازه نیست ({move_phase})')
         elif move_phase == 'MID':
-            ai_penalty += 8
-            ai_min_score_add += 3
-            reasons.append('AI State: حرکت در میانه راه است، فقط با قدرت خیلی بالا مجاز است')
-        elif move_phase == 'SETUP':
+            # Softer Movement Hunter mode: MID is not automatically dead.
+            # It is still penalized, but strong fresh momentum can pass as REAL.
             ai_penalty += 4
-            ai_min_score_add += 2
-            reasons.append('AI Setup: آماده حرکت است ولی ورود هنوز فعال نشده')
+            ai_min_score_add += 1
+            reasons.append('AI State: حرکت در میانه راه است، فقط با قدرت بالاتر مجاز است')
+        elif move_phase == 'SETUP':
+            # SETUP should be able to activate when score/evidence are strong.
+            ai_penalty += 1
+            reasons.append('AI Setup: آماده حرکت است؛ با تایید قوی می‌تواند فعال شود')
 
         if trap_risk == 'HIGH':
             ai_block = True
             reasons.append('AI Trap Block: ریسک تله/لیکوییدیتی بالا')
         elif trap_risk == 'MEDIUM':
-            ai_penalty += 3
-            ai_min_score_add += 1
+            ai_penalty += 2
             reasons.append('AI Trap: ریسک متوسط')
 
         if risk_score >= 92 and final_score < 95:
@@ -1844,21 +1864,58 @@ def analyze_symbol(symbol: str) -> Dict:
             reasons.append('AI Block: ریسک کوین/جهت خیلی بالا و امتیاز کافی نیست')
 
         final_score -= ai_penalty
-        min_score = min(96, base_min_score + ai_min_score_add)
-        effective_req_conf = min(8, max(base_conf, req_conf))
+        min_score = min(94, base_min_score + ai_min_score_add)
+        effective_req_conf = min(6, max(1, req_conf))
 
         level_pack = get_strong_levels(df_5m, df_15m, df_30m, price, atr)
         support = level_pack.get('nearest_support')
         resistance = level_pack.get('nearest_resistance')
 
         ai_decision_kind = str(movement_decision.get('decision', 'REJECT')).upper()
-        entry_confirmed = (
+        selected_pack = movement_decision.get('selected', {}) if isinstance(movement_decision, dict) else {}
+        selected_evidence_count = len(selected_pack.get('evidence') or []) if isinstance(selected_pack, dict) else 0
+
+        # Normal REAL path stays safest.
+        real_confirmed = (
             direction in {'LONG', 'SHORT'}
             and not ai_block
-            and ai_decision_kind == 'REAL'
+            and ai_decision_kind in {'REAL', 'ACTIVE', 'ENTRY'}
             and final_score >= min_score
             and confirmations >= effective_req_conf
         )
+
+        # Soft activation path: some strong SETUP/GHOST/WATCH candidates should
+        # become ACTIVE instead of staying Ghost forever. This still blocks HIGH
+        # trap and exhausted/range-after-move states, and requires enough score,
+        # evidence, and at least minimal confirmation.
+        soft_setup_confirmed = (
+            direction in {'LONG', 'SHORT'}
+            and not ai_block
+            and ai_decision_kind in {'GHOST', 'SETUP', 'WATCH'}
+            and move_phase in {'START', 'EARLY', 'SETUP', 'WATCH'}
+            and trap_risk in {'LOW', 'MEDIUM'}
+            and final_score >= max(int(AI_MOVEMENT_REAL_MIN_SCORE) - 2, min_score - 4)
+            and confirmations >= max(1, effective_req_conf - 1)
+            and selected_evidence_count >= 2
+        )
+
+        # Very strong MID moves can pass only when trap is LOW and evidence is strong.
+        soft_mid_confirmed = (
+            direction in {'LONG', 'SHORT'}
+            and not ai_block
+            and ai_decision_kind in {'GHOST', 'SETUP', 'WATCH', 'REAL'}
+            and move_phase == 'MID'
+            and trap_risk == 'LOW'
+            and final_score >= int(AI_MOVEMENT_REAL_MIN_SCORE) + 6
+            and confirmations >= max(1, effective_req_conf - 1)
+            and selected_evidence_count >= 3
+        )
+
+        entry_confirmed = bool(real_confirmed or soft_setup_confirmed or soft_mid_confirmed)
+        effective_ai_decision_kind = 'REAL' if entry_confirmed else ai_decision_kind
+        soft_activation = bool((soft_setup_confirmed or soft_mid_confirmed) and not real_confirmed)
+        if soft_activation:
+            reasons.append('AI Soft Activation: ستاپ قوی به ورود فعال تبدیل شد')
 
         # For backward compatibility, long_score/short_score are now AI movement
         # candidate scores, not classic scores.
@@ -1919,7 +1976,9 @@ def analyze_symbol(symbol: str) -> Dict:
                 'ai_penalty': ai_penalty,
                 'ai_min_score_add': ai_min_score_add,
                 'ai_block': ai_block,
-                'decision': ai_decision_kind,
+                'decision': effective_ai_decision_kind,
+                'raw_decision': ai_decision_kind,
+                'soft_activation': soft_activation,
                 'strictness_level': strict,
                 'sl_count': sl_count,
                 'risk_score': risk_score,
@@ -2023,7 +2082,7 @@ def analyze_symbol(symbol: str) -> Dict:
             'direction': direction,
             'status': 'ACTIVE',
             'entry_confirmed': True,
-            'entry_mode': 'AI_MOVEMENT_HUNTER',
+            'entry_mode': 'AI_SOFT_MOVEMENT_HUNTER' if soft_activation else 'AI_MOVEMENT_HUNTER',
             'entry': safe_round(price),
             'stop_loss': sl,
             'tp1': tp1,
