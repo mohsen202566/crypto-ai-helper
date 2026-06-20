@@ -1,8 +1,13 @@
 # -*- coding: utf-8 -*-
-"""Signal tracker for AI Classic Direct bot.
+"""Signal tracker for AI Movement Hunter bot.
 
-Tracks ACTIVE signals until TP1 or SL, records stats, updates AI learning/risk,
-closes slot and returns Telegram reply events.
+Tracks AI-approved REAL movement entries until TP1, SL, or Dynamic Profit Exit.
+Classic signal scoring is not used here; technical/classic data is preserved only
+as sensors inside the snapshot so AI learning can evaluate move freshness, phase,
+trap/liquidity risk, MFE/MAE, and real trading outcomes.
+
+Real trading paths, Telegram reply events, and public command-compatible helpers
+are preserved.
 """
 
 import json
@@ -65,6 +70,11 @@ try:
     from tobit_client import toobit_client
 except Exception:
     toobit_client = None
+
+try:
+    from ai_memory import record_movement_decision
+except Exception:
+    record_movement_decision = None
 
 ACTIVE_SIGNALS_FILE = "active_signals.json"
 SIGNAL_STATS_FILE = "signal_stats.json"
@@ -214,6 +224,101 @@ def can_add_automatic_signal(user_id: int, symbol: str, direction: Optional[str]
     return True, "ok"
 
 
+def _nested_get(data: Dict[str, Any], *keys: str, default: Any = None) -> Any:
+    """Read Movement Hunter fields from top-level or nested snapshot dictionaries."""
+    if not isinstance(data, dict):
+        return default
+    for key in keys:
+        if data.get(key) is not None:
+            return data.get(key)
+    for nest in ("ai_movement_hunter", "movement_hunter", "ai_movement", "ai_decision", "prediction_layer", "state_awareness", "state", "liquidity_trap"):
+        obj = data.get(nest)
+        if isinstance(obj, dict):
+            got = _nested_get(obj, *keys, default=None)
+            if got is not None:
+                return got
+    return default
+
+
+def _movement_metadata(source: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize AI Movement Hunter metadata without affecting trade execution."""
+    src = source if isinstance(source, dict) else {}
+    snap = src.get("snapshot") if isinstance(src.get("snapshot"), dict) else {}
+    merged = dict(snap)
+    merged.update({k: v for k, v in src.items() if v is not None})
+    ai_decision = merged.get("ai_decision") if isinstance(merged.get("ai_decision"), dict) else {}
+    hunter = merged.get("ai_movement_hunter") if isinstance(merged.get("ai_movement_hunter"), dict) else {}
+    if hunter:
+        merged.setdefault("movement_hunter", hunter)
+    decision = (
+        _nested_get(merged, "decision", "final_decision", default=None)
+        or _nested_get(ai_decision, "decision", default=None)
+        or _nested_get(hunter, "decision", default=None)
+        or "REAL"
+    )
+    phase = (
+        _nested_get(merged, "move_phase", "movement_phase", "move_state", default=None)
+        or _nested_get(hunter, "move_phase", default=None)
+        or "UNKNOWN"
+    )
+    freshness = (
+        _nested_get(merged, "move_freshness", "freshness", "fresh_momentum", default=None)
+        or _nested_get(hunter, "move_freshness", default=None)
+        or "UNKNOWN"
+    )
+    trap = (
+        _nested_get(merged, "trap_risk", "liquidity_trap_risk", default=None)
+        or _nested_get(hunter, "trap_risk", default=None)
+        or "UNKNOWN"
+    )
+    movement_type = (
+        _nested_get(merged, "movement_type", "move_type", "setup_type", default=None)
+        or _nested_get(hunter, "movement_type", "move_type", default=None)
+        or "UNKNOWN"
+    )
+    confidence = (
+        _nested_get(merged, "ai_movement_score", "movement_score", "ai_score", "confidence", "prediction_score", default=None)
+        or _nested_get(hunter, "ai_score", "confidence", default=None)
+    )
+    out = {
+        "architecture": "AI_MOVEMENT_HUNTER",
+        "classic_signal_disabled": True,
+        "classic_score_disabled": True,
+        "ai_final_decision": str(decision or "REAL").upper(),
+        "move_phase": str(phase or "UNKNOWN").upper(),
+        "move_freshness": str(freshness or "UNKNOWN").upper(),
+        "trap_risk": str(trap or "UNKNOWN").upper(),
+        "movement_type": str(movement_type or "UNKNOWN").upper(),
+        "movement_confidence": confidence,
+        "ai_movement_hunter": hunter,
+    }
+    return out
+
+
+def _record_movement_event(signal: Dict[str, Any], decision: str, source: str = "signal_tracker") -> None:
+    """Persist tracker-side movement outcome to ai_memory if the hook exists."""
+    if not callable(record_movement_decision):
+        return
+    try:
+        meta = _movement_metadata(signal)
+        snap = _learning_snapshot(signal) if "_learning_snapshot" in globals() else dict(signal.get("snapshot") or {})
+        snap.update(meta)
+        record_movement_decision(
+            symbol=signal.get("symbol"),
+            direction=signal.get("direction"),
+            decision=decision,
+            move_phase=meta.get("move_phase"),
+            movement_type=meta.get("movement_type"),
+            confidence=meta.get("movement_confidence"),
+            snapshot=snap,
+            source=source,
+            trap_risk=meta.get("trap_risk"),
+            freshness=meta.get("move_freshness"),
+        )
+    except Exception:
+        pass
+
+
 def record_stat_event(signal: Dict[str, Any], event_type: str, exit_price: Optional[float] = None, move_percent: Optional[float] = None) -> None:
     stats = get_signal_stats()
     item = dict(signal)
@@ -222,6 +327,8 @@ def record_stat_event(signal: Dict[str, Any], event_type: str, exit_price: Optio
     item["status"] = event_type
     item["event_at"] = now_ts()
     item["event_at_text"] = now_text()
+    movement_meta = _movement_metadata(signal)
+    item.update({k: v for k, v in movement_meta.items() if k not in item or item.get(k) is None})
     if exit_price is not None:
         item["exit_price"] = exit_price
     if move_percent is not None:
@@ -262,9 +369,16 @@ def _learning_snapshot(signal: Dict[str, Any], exit_price: Optional[float] = Non
         "entry_mode", "market_regime", "vwap_status", "ai_scanner",
         "similarity_learning", "similarity_score", "similarity_winrate",
         "similarity_samples", "similarity_adjustment",
+        "ai_movement_hunter", "movement_hunter", "movement_type", "move_type",
+        "move_phase", "movement_phase", "move_state", "move_freshness",
+        "fresh_momentum", "trap_risk", "liquidity_trap", "ai_final_decision",
+        "ai_movement_score", "movement_score", "classic_signal_disabled",
+        "classic_score_disabled", "max_favorable_percent", "max_adverse_percent",
     ]:
         if key not in out and signal.get(key) is not None:
             out[key] = signal.get(key)
+    movement_meta = _movement_metadata(signal)
+    out.update({k: v for k, v in movement_meta.items() if k not in out or out.get(k) is None})
     if exit_price is not None:
         out["exit_price"] = exit_price
     if move_percent is not None:
@@ -409,7 +523,7 @@ def add_signal_to_tracking(*args, **kwargs) -> Tuple[bool, str]:
         "real_order": result.get("real_order"),
         "position_size_usd": result.get("position_size_usd"),
         "leverage": result.get("leverage"),
-        "entry_mode": result.get("entry_mode") or "AI_CLASSIC_DIRECT",
+        "entry_mode": result.get("entry_mode") or "AI_MOVEMENT_HUNTER",
         "confirmations": result.get("confirmations"),
         "freshness": result.get("freshness"),
         "rsi": result.get("rsi"),
@@ -433,6 +547,16 @@ def add_signal_to_tracking(*args, **kwargs) -> Tuple[bool, str]:
         "min_score": result.get("min_score"),
         "required_confirmations": result.get("required_confirmations"),
         "ai_decision": result.get("ai_decision", {}),
+        "ai_movement_hunter": result.get("ai_movement_hunter") or ((result.get("snapshot") or {}).get("ai_movement_hunter") if isinstance(result.get("snapshot"), dict) else {}),
+        "movement_hunter": result.get("movement_hunter") or ((result.get("snapshot") or {}).get("movement_hunter") if isinstance(result.get("snapshot"), dict) else {}),
+        "movement_type": result.get("movement_type") or result.get("move_type"),
+        "move_phase": result.get("move_phase") or result.get("movement_phase") or result.get("move_state"),
+        "move_freshness": result.get("move_freshness") or result.get("fresh_momentum"),
+        "trap_risk": result.get("trap_risk") or ((result.get("liquidity_trap") or {}).get("trap_risk") if isinstance(result.get("liquidity_trap"), dict) else None),
+        "ai_final_decision": result.get("ai_final_decision") or ((result.get("ai_decision") or {}).get("decision") if isinstance(result.get("ai_decision"), dict) else None),
+        "ai_movement_score": result.get("ai_movement_score") or result.get("movement_score"),
+        "classic_signal_disabled": True,
+        "classic_score_disabled": True,
         "coin_risk": result.get("coin_risk", {}),
         "rotation": result.get("rotation", {}),
         "snapshot": result.get("snapshot", {}),
@@ -452,6 +576,7 @@ def add_signal_to_tracking(*args, **kwargs) -> Tuple[bool, str]:
     save_active_signals(active)
     record_stat_event(signal, "SIGNAL_CREATED")
     ai_record_signal(signal)
+    _record_movement_event(signal, "REAL", source="signal_tracker_open")
     ai_open_slot(signal)
 
     msg = (
@@ -1520,6 +1645,7 @@ def check_active_signals() -> List[Dict[str, Any]]:
 
                 record_stat_event(signal, hit_type, exit_price, pct)
                 ai_record_result(signal, hit_type, exit_price, pct)
+                _record_movement_event(signal, "REAL", source=f"signal_tracker_result:{hit_type}")
 
                 ai_close_slot(signal)
 
