@@ -29,7 +29,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 
-VERSION = "1.0.0-movement-hunter"
+VERSION = "1.0.1-soft-range-safe"
 
 DECISION_REAL = "REAL"
 DECISION_GHOST = "GHOST"
@@ -52,6 +52,16 @@ MOVE_NONE = "NONE"
 
 DEFAULT_AI_REAL_THRESHOLD = 72.0
 DEFAULT_AI_GHOST_THRESHOLD = 55.0
+
+# Soft activation rules:
+# - Keep obvious danger blocked.
+# - Do not hard-reject RANGE_AFTER_MOVE by itself when evidence is strong and trap is LOW.
+# - Let strong MID/RANGE_AFTER_MOVE candidates become SETUP/ENTRY so scanner can learn and send real signals selectively.
+SOFT_RANGE_REAL_THRESHOLD = 66.0
+SOFT_RANGE_GHOST_THRESHOLD = 52.0
+SOFT_MID_REAL_THRESHOLD = 64.0
+MIN_SOFT_EVIDENCE = 3
+MIN_SOFT_STRENGTH = 3.0
 
 
 # ---------------------------------------------------------------------------
@@ -766,9 +776,15 @@ def decide_movement(raw: Dict[str, Any], *, mode: str = "auto") -> Dict[str, Any
     elif phase == PHASE_EARLY:
         ai_score += 7.0
     elif phase == PHASE_MID:
-        ai_score -= 18.0
-    elif phase in {PHASE_EXHAUSTION, PHASE_RANGE_AFTER_MOVE}:
-        ai_score -= 45.0
+        # MID is not ideal, but for 5M/15M scalping it can still be a valid continuation entry.
+        ai_score -= 10.0
+    elif phase == PHASE_RANGE_AFTER_MOVE:
+        # Previously this was a near-hard rejection (-45). That made the bot too dry:
+        # many strong candidates with LOW trap were forced to REJECT. Keep caution, not a kill-switch.
+        ai_score -= 16.0
+    elif phase == PHASE_EXHAUSTION:
+        # True exhaustion remains dangerous.
+        ai_score -= 42.0
     elif phase == PHASE_RANGE:
         ai_score -= 8.0
 
@@ -799,20 +815,61 @@ def decide_movement(raw: Dict[str, Any], *, mode: str = "auto") -> Dict[str, Any
 
     ai_score = round(max(0.0, min(100.0, ai_score)), 4)
 
-    setup_detected = phase in {PHASE_PRE_START, PHASE_START, PHASE_EARLY} and direction in {"LONG", "SHORT"} and freshness >= 60
-    entry_confirmed = phase in {PHASE_START, PHASE_EARLY} and direction in {"LONG", "SHORT"} and ai_score >= DEFAULT_AI_REAL_THRESHOLD
+    evidence_count = len(direction_info.get("reasons", []) or [])
+    trap_level = str(trap.get("trap_risk") or "LOW").upper()
+    reversal_level = str(reversal.get("reversal_risk") or "LOW").upper()
+    trap_score_value = _safe_float(trap.get("trap_risk_score"), 0.0)
+    reversal_score_value = _safe_float(reversal.get("reversal_risk_score"), 0.0)
+
+    strong_evidence = (
+        direction in {"LONG", "SHORT"}
+        and evidence_count >= MIN_SOFT_EVIDENCE
+        and strength >= MIN_SOFT_STRENGTH
+        and trap_level != "HIGH"
+    )
+    low_risk_context = trap_level == "LOW" and reversal_level != "HIGH"
+
+    early_phase = phase in {PHASE_PRE_START, PHASE_START, PHASE_EARLY}
+    mid_phase = phase == PHASE_MID
+    soft_range_phase = phase == PHASE_RANGE_AFTER_MOVE and low_risk_context and strong_evidence
+
+    setup_detected = (
+        direction in {"LONG", "SHORT"}
+        and (
+            (early_phase and (freshness >= 52 or ai_score >= DEFAULT_AI_GHOST_THRESHOLD))
+            or (mid_phase and ai_score >= SOFT_RANGE_GHOST_THRESHOLD and strong_evidence)
+            or (soft_range_phase and ai_score >= SOFT_RANGE_GHOST_THRESHOLD)
+            or ai_score >= DEFAULT_AI_GHOST_THRESHOLD
+        )
+    )
+
+    entry_confirmed = (
+        direction in {"LONG", "SHORT"}
+        and (
+            (phase in {PHASE_START, PHASE_EARLY} and ai_score >= DEFAULT_AI_REAL_THRESHOLD)
+            or (mid_phase and strong_evidence and low_risk_context and ai_score >= SOFT_MID_REAL_THRESHOLD)
+            or (soft_range_phase and ai_score >= SOFT_RANGE_REAL_THRESHOLD)
+        )
+    )
     if phase == PHASE_PRE_START:
         entry_confirmed = False
 
     hard_reject_reasons: List[str] = []
     if direction not in {"LONG", "SHORT"}:
         hard_reject_reasons.append("NO_CLEAR_DIRECTION")
-    if phase in {PHASE_EXHAUSTION, PHASE_RANGE_AFTER_MOVE}:
-        hard_reject_reasons.append("MOVE_ALREADY_DONE_OR_RANGE_AFTER_MOVE")
-    if trap.get("trap_risk") == "HIGH" and ai_score < 86:
+    # Keep true exhaustion as hard reject, but do not kill RANGE_AFTER_MOVE by label alone.
+    if phase == PHASE_EXHAUSTION and not (ai_score >= 88 and trap_level == "LOW" and reversal_level != "HIGH"):
+        hard_reject_reasons.append("MOVE_EXHAUSTION")
+    if phase == PHASE_RANGE_AFTER_MOVE and not soft_range_phase and ai_score < SOFT_RANGE_GHOST_THRESHOLD:
+        hard_reject_reasons.append("RANGE_AFTER_MOVE_WEAK")
+    if trap_level == "HIGH" and ai_score < 86:
         hard_reject_reasons.append("HIGH_TRAP_RISK")
-    if reversal.get("reversal_risk") == "HIGH" and ai_score < 86:
+    if reversal_level == "HIGH" and ai_score < 86:
         hard_reject_reasons.append("HIGH_REVERSAL_RISK")
+    if trap_score_value >= 85 and ai_score < 90:
+        hard_reject_reasons.append("EXTREME_TRAP_SCORE")
+    if reversal_score_value >= 88 and ai_score < 90:
+        hard_reject_reasons.append("EXTREME_REVERSAL_SCORE")
 
     if hard_reject_reasons:
         decision = DECISION_REJECT
@@ -876,6 +933,9 @@ def decide_movement(raw: Dict[str, Any], *, mode: str = "auto") -> Dict[str, Any
             "setup_detected": bool(setup_detected),
             "entry_confirmed": bool(entry_confirmed),
             "classic_engine_role": "SENSOR_ONLY",
+            "evidence_count": evidence_count,
+            "strong_evidence": bool(strong_evidence),
+            "soft_range_phase": bool(soft_range_phase),
         },
         "ai_layers": {
             "direction": direction_info,
@@ -907,6 +967,9 @@ def decide_movement(raw: Dict[str, Any], *, mode: str = "auto") -> Dict[str, Any
             "trap_risk": trap.get("trap_risk"),
             "reversal_risk": reversal.get("reversal_risk"),
             "result_source": "AI_MOVEMENT_HUNTER",
+            "evidence_count": evidence_count,
+            "strong_evidence": bool(strong_evidence),
+            "soft_range_phase": bool(soft_range_phase),
         },
         "reasons": (
             direction_info.get("reasons", [])
