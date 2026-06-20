@@ -1,2404 +1,454 @@
-# -*- coding: utf-8 -*-
-"""
-Crypto AI Telegram Bot - AI Movement Hunter Real Trade Version
+from __future__ import annotations
 
-این نسخه برای معماری AI Movement Hunter نوشته شده:
-- AI Movement Hunter تصمیم نهایی REAL/GHOST/REJECT را می‌گیرد؛ کلاسیک فقط سنسور است.
-- سیگنال‌ها خودکار Track می‌شوند؛ دستور دستی «زیر نظر» حذف شده.
-- دستورهای ترید واقعی/سرمایه/لوریج/حجم پوزیشن اضافه شده.
-- آمار، حذف آمار، بررسی بازار، بهترین سیگنال، وضعیت AI، Ghost/Slot/Coin reports حفظ شده.
+"""
+Telegram bot interface.
+
+Responsibilities:
+- Fast responses for status commands.
+- Background tasks for heavy scans/auto signals.
+- Preserve commands/options.
+- Owner/user access control.
+- No heavy scan inside fast commands unless explicitly requested.
 """
 
-import os
-import re
-import json
-import time
 import asyncio
-import logging
-from typing import Dict, List, Any, Optional, Callable
-
-from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
-
-from analysis import analyze_symbol
-from scanner import scan_for_auto_signals, get_top_signals, scan_market_overview
-
-
-# ============================================================
-# Optional project imports
-# ============================================================
+import time
+from typing import Any, Dict, List, Optional
 
 try:
-    from signal_tracker import (
-        add_signal_to_tracking,
-        check_active_signals,
-        format_active_signals,
-        format_signal_stats,
-        reset_signal_stats,
-        parse_days_from_text,
-        get_symbol_stats_report,
-    )
-except Exception:
-    add_signal_to_tracking = None
-    check_active_signals = None
-    format_active_signals = None
-    format_signal_stats = None
-    reset_signal_stats = None
-
-    def parse_days_from_text(text: str) -> int:
-        m = re.search(r"\d+", text or "")
-        if m:
-            return int(m.group(0))
-        if text and "کل" in text:
-            return 3650
-        return 7
-
-    get_symbol_stats_report = None
-
-
-try:
-    from ai_memory import format_ai_status
-except Exception:
-    format_ai_status = None
-
-try:
-    from coin_learning import (
-        format_learning_summary,
-        format_coin_behavior,
-        format_smart_stats,
-    )
-except Exception:
-    format_learning_summary = None
-    format_coin_behavior = None
-    format_smart_stats = None
-
-try:
-    from coin_rotation import format_rotation_report
-except Exception:
-    format_rotation_report = None
-
-try:
-    from ghost_signals import format_ghost_report, create_ghost_signal
-except Exception:
-    format_ghost_report = None
-    create_ghost_signal = None
-
-try:
-    from slot_manager import format_slot_report
-except Exception:
-    format_slot_report = None
-
-try:
-    from real_trade_manager import (
-        get_real_trade_status_text,
-        get_toobit_balance_text,
-        set_real_initial_capital,
-        set_real_position_size,
-        set_real_leverage,
-        set_real_max_positions,
-        set_real_daily_loss_limit,
-        set_real_lock_duration_hours,
-        enable_real_trading,
-        disable_real_trading,
-        activate_real_emergency_stop,
-        reset_real_trade_state,
-        open_real_position_from_signal,
-        is_real_trade_ready,
-        close_real_position_by_symbol,
-        close_all_real_positions,
-        sync_real_positions_text,
-        check_dynamic_profit_protection,
-        dynamic_profit_protection_text,
-    )
-except Exception:
-    get_real_trade_status_text = None
-    get_toobit_balance_text = None
-    set_real_initial_capital = None
-    set_real_position_size = None
-    set_real_leverage = None
-    set_real_max_positions = None
-    set_real_daily_loss_limit = None
-    set_real_lock_duration_hours = None
-    enable_real_trading = None
-    disable_real_trading = None
-    activate_real_emergency_stop = None
-    reset_real_trade_state = None
-    open_real_position_from_signal = None
-    is_real_trade_ready = None
-    close_real_position_by_symbol = None
-    close_all_real_positions = None
-    sync_real_positions_text = None
-    check_dynamic_profit_protection = None
-    dynamic_profit_protection_text = None
-
-try:
-    from real_position_sync import (
-        check_real_position_events_for_tracker,
-        format_sync_status as format_real_position_sync_status,
-    )
-except Exception:
-    check_real_position_events_for_tracker = None
-    format_real_position_sync_status = None
-
-
-# ============================================================
-# Config
-# ============================================================
-
-try:
-    from config import (
-        BOT_TOKEN,
-        OWNER_ID,
-        ALLOWED_USER_IDS,
-        AUTO_SIGNAL_ENABLED,
-        AUTO_SCAN_INTERVAL_MINUTES,
-        AUTO_DIRECT_SCORE_MIN,
-        AUTO_SIGNAL_COOLDOWN_MINUTES,
-    )
-except Exception:
-    BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-    OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
-
-    allowed_raw = os.getenv("ALLOWED_USER_IDS", "")
-    ALLOWED_USER_IDS = [
-        int(x.strip())
-        for x in allowed_raw.split(",")
-        if x.strip().isdigit()
-    ]
-
-    AUTO_SIGNAL_ENABLED = os.getenv("AUTO_SIGNAL_ENABLED", "true").lower() == "true"
-    AUTO_SCAN_INTERVAL_MINUTES = int(os.getenv("AUTO_SCAN_INTERVAL_MINUTES", "5"))
-    AUTO_DIRECT_SCORE_MIN = int(os.getenv("AUTO_DIRECT_SCORE_MIN", "82"))
-    AUTO_SIGNAL_COOLDOWN_MINUTES = int(os.getenv("AUTO_SIGNAL_COOLDOWN_MINUTES", "30"))
-
-
-if OWNER_ID and OWNER_ID not in ALLOWED_USER_IDS:
-    ALLOWED_USER_IDS.append(OWNER_ID)
-
-
-# ============================================================
-# Logging
-# ============================================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-
-logger = logging.getLogger("crypto-ai-bot")
-
-
-# ============================================================
-# Runtime state
-# ============================================================
-
-LAST_AUTO_SIGNAL_TIME: Dict[str, int] = {}
-AUTO_SIGNAL_COOLDOWN_SECONDS = int(AUTO_SIGNAL_COOLDOWN_MINUTES) * 60
-REAL_TRACKING_LOOP_INTERVAL_SECONDS = int(os.getenv("REAL_TRACKING_LOOP_INTERVAL_SECONDS", "2") or "2")
-DYNAMIC_PROFIT_LOOP_INTERVAL_SECONDS = int(os.getenv("DYNAMIC_PROFIT_LOOP_INTERVAL_SECONDS", "10") or "10")
-REAL_SYNC_LOOP_ENABLED = os.getenv("REAL_SYNC_LOOP_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on", "enabled"}
-RECENT_SENT_EVENT_KEYS: Dict[str, int] = {}
-EVENT_DEDUP_SECONDS = int(os.getenv("EVENT_DEDUP_SECONDS", "180") or "180")
-
-DATA_DIR = "data"
-os.makedirs(DATA_DIR, exist_ok=True)
-TRADE_SETTINGS_FILE = os.path.join(DATA_DIR, "trade_settings.json")
-BOT_SETTINGS_FILE = os.path.join(DATA_DIR, "bot_settings.json")
-REAL_TRADE_STATE_FILE = os.path.join(DATA_DIR, "real_trade_state.json")
-
-
-DEFAULT_BOT_SETTINGS = {
-    "trading_enabled": True,
-    "auto_signal_enabled": bool(AUTO_SIGNAL_ENABLED),
-    "updated_at": None,
-}
-
-
-def load_bot_settings() -> Dict[str, Any]:
-    state = load_json(BOT_SETTINGS_FILE, DEFAULT_BOT_SETTINGS.copy())
-    merged = DEFAULT_BOT_SETTINGS.copy()
-    if isinstance(state, dict):
-        merged.update(state)
-    return merged
-
-
-def save_bot_settings(state: Dict[str, Any]) -> Dict[str, Any]:
-    state["updated_at"] = int(time.time())
-    save_json(BOT_SETTINGS_FILE, state)
-    return state
-
-
-# ============================================================
-# JSON helpers
-# ============================================================
-
-def load_json(path: str, default: Any) -> Any:
-    try:
-        if not os.path.exists(path):
-            return default
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, type(default)):
-            return default
-        return data
-    except Exception:
-        return default
-
-
-def save_json(path: str, data: Any) -> None:
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
-
-
-# ============================================================
-# Async / responsiveness helpers
-# ============================================================
-
-async def run_blocking(fn: Callable, *args, timeout: int = 30, **kwargs):
-    """Run heavy sync bot work outside Telegram's event loop.
-
-    Scanner, AI reports and JSON-heavy trade status functions can take seconds.
-    If they run directly inside async handlers/loops, urgent commands like
-    `ترید خاموش` or `توقف اضطراری` wait behind them.
-    """
-    return await asyncio.wait_for(asyncio.to_thread(fn, *args, **kwargs), timeout=timeout)
-
-
-async def safe_reply_text(update: Update, text: str) -> None:
-    try:
-        if update.message:
-            await update.message.reply_text(text)
-    except Exception as e:
-        logger.error(f"reply_text error: {e}")
-
-
-# ============================================================
-# AI Similarity / Pattern Memory display helpers
-# ============================================================
-
-def _load_first_existing_json(paths: List[str], default: Any) -> Any:
-    for path in paths:
-        data = load_json(path, default)
-        if data != default:
-            return data
-    return default
-
-
-def _similarity_row_from_any(value: Any) -> Dict[str, Any]:
-    if not isinstance(value, dict):
-        return {}
-    # Different modules may store this block under slightly different names.
-    for key in [
-        "similarity_learning",
-        "similarity",
-        "historical_similarity",
-        "pattern_similarity",
-    ]:
-        obj = value.get(key)
-        if isinstance(obj, dict):
-            return obj
-    # Some rows may already be the similarity object.
-    if any(k in value for k in ["similar_samples", "samples", "similarity_winrate", "rank_adjustment"]):
-        return value
-    return {}
-
-
-def _fmt_pct(value: Any, default: str = "-") -> str:
-    try:
-        v = float(value)
-        if 0 <= v <= 1:
-            v *= 100.0
-        return f"{round(v, 1)}%"
-    except Exception:
-        return default
-
-
-def _fmt_num(value: Any, default: str = "-") -> str:
-    try:
-        return str(round(float(value), 3))
-    except Exception:
-        return default
-
-
-def format_similarity_status() -> str:
-    """Compact read-only report for Historical Similarity / Pattern Memory.
-
-    This does not change trading logic. It only displays whether the newly
-    connected similarity engine is producing/using comparable historical
-    snapshots across coin_learning/scanner/tracker/real-trade paths.
-    """
-    learning = _load_first_existing_json(
-        ["coin_learning.json", os.path.join(DATA_DIR, "coin_learning.json")],
-        {},
-    )
-    real_state = load_json(REAL_TRADE_STATE_FILE, {})
-    slot_state = _load_first_existing_json(
-        ["slot_state.json", os.path.join(DATA_DIR, "slot_state.json")],
-        {},
-    )
-
-    buckets = []
-    if isinstance(learning, dict):
-        rows = learning.get("by_coin_direction", {})
-        if isinstance(rows, dict):
-            buckets = [r for r in rows.values() if isinstance(r, dict)]
-
-    total_events = 0
-    buckets_with_events = 0
-    tp_events = 0.0
-    sl_events = 0.0
-    sim_blocks_seen = 0
-    dynamic_profit_exits = 0
-    top_rows = []
-
-    for b in buckets:
-        events = b.get("events") if isinstance(b.get("events"), list) else []
-        if events:
-            buckets_with_events += 1
-            total_events += len(events)
-        tp = float(b.get("weighted_tp") or 0)
-        sl = float(b.get("weighted_sl") or 0)
-        tp_events += tp
-        sl_events += sl
-        dyn = b.get("dynamic_profit_stats") if isinstance(b.get("dynamic_profit_stats"), dict) else {}
-        dynamic_profit_exits += int(dyn.get("profit_exits", 0) or 0)
-
-        # Count rows/events carrying an explicit similarity block.
-        for ev in events[-50:]:
-            if isinstance(ev, dict):
-                snap = ev.get("snapshot") if isinstance(ev.get("snapshot"), dict) else ev
-                if _similarity_row_from_any(snap):
-                    sim_blocks_seen += 1
-
-        total_w = tp + sl
-        if total_w > 0:
-            wr = tp / total_w * 100.0
-            top_rows.append({
-                "symbol": b.get("symbol"),
-                "direction": b.get("direction"),
-                "samples": round(total_w, 2),
-                "wr": wr,
-                "behavior": b.get("behavior", "UNKNOWN"),
-            })
-
-    # Also check active/open real positions and queue for recently attached similarity metadata.
-    open_positions = []
-    if isinstance(real_state, dict) and isinstance(real_state.get("open_positions"), dict):
-        open_positions = [p for p in real_state.get("open_positions", {}).values() if isinstance(p, dict)]
-    queue = []
-    if isinstance(slot_state, dict) and isinstance(slot_state.get("queue"), list):
-        queue = [q for q in slot_state.get("queue", []) if isinstance(q, dict)]
-
-    active_similarity = 0
-    for row in open_positions + queue:
-        if _similarity_row_from_any(row) or _similarity_row_from_any(row.get("snapshot") if isinstance(row.get("snapshot"), dict) else {}):
-            active_similarity += 1
-
-    total_closed_w = tp_events + sl_events
-    overall_wr = (tp_events / total_closed_w * 100.0) if total_closed_w > 0 else 0.0
-
-    top_rows.sort(key=lambda x: (x["wr"], x["samples"]), reverse=True)
-    weak_rows = sorted(top_rows, key=lambda x: (x["wr"], -x["samples"]))[:3]
-    best_rows = top_rows[:3]
-
-    lines = [
-        "🧩 Similarity / Pattern Memory",
-        f"وضعیت: {'فعال' if buckets_with_events or active_similarity else 'در انتظار داده'}",
-        f"باکت‌های دارای نمونه: {buckets_with_events}",
-        f"کل Snapshot نتیجه‌دار: {total_events}",
-        f"WR یادگیری وزنی: {round(overall_wr, 1)}%",
-        f"خروج سود AI ثبت‌شده: {dynamic_profit_exits}",
-        f"Similarity metadata فعال/صف: {active_similarity}",
-    ]
-
-    if sim_blocks_seen:
-        lines.append(f"Similarity blocks ثبت‌شده اخیر: {sim_blocks_seen}")
-
-    if best_rows:
-        lines.append("بهترین الگوها:")
-        for r in best_rows:
-            lines.append(f"{r.get('symbol')} {r.get('direction')} | WR:{round(r.get('wr',0),1)}% | نمونه:{r.get('samples')}")
-    if weak_rows:
-        lines.append("ضعیف‌ترین الگوها:")
-        for r in weak_rows:
-            lines.append(f"{r.get('symbol')} {r.get('direction')} | WR:{round(r.get('wr',0),1)}% | نمونه:{r.get('samples')}")
-
-    return "\n".join(lines)
-
-
-def format_dynamic_result_similarity_note(row: Dict[str, Any]) -> str:
-    """Optional short note for Dynamic Profit messages."""
-    if not isinstance(row, dict):
-        return ""
-    sim = _similarity_row_from_any(row)
-    if not sim and isinstance(row.get("raw"), dict):
-        sim = _similarity_row_from_any(row.get("raw"))
-    if not sim and isinstance(row.get("close_result"), dict):
-        sim = _similarity_row_from_any(row.get("close_result"))
-    if not sim:
-        return ""
-
-    samples = sim.get("similar_samples") or sim.get("samples") or sim.get("count")
-    wr = sim.get("similarity_winrate") or sim.get("win_rate") or sim.get("winrate")
-    adj = sim.get("rank_adjustment") or sim.get("adjustment") or sim.get("exit_adjustment")
-    parts = []
-    if samples is not None:
-        parts.append(f"نمونه مشابه: {samples}")
-    if wr is not None:
-        parts.append(f"WR مشابه: {_fmt_pct(wr)}")
-    if adj is not None:
-        parts.append(f"اثر: {_fmt_num(adj)}")
-    return "\n".join(parts)
-
-
-# ============================================================
-# Access control
-# ============================================================
-
-def get_user_id(update: Update) -> int:
-    try:
-        return int(update.effective_user.id)
-    except Exception:
-        return 0
-
-
-def is_allowed(update: Update) -> bool:
-    uid = get_user_id(update)
-    if not OWNER_ID:
-        return True
-    return uid == OWNER_ID or uid in ALLOWED_USER_IDS
-
-
-async def reject_unauthorized(update: Update) -> None:
+    from telegram import Update
+    from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+except Exception:  # Allows offline compile/import before requirements are installed.
+    Update = Any  # type: ignore
+    Application = Any  # type: ignore
+    CommandHandler = MessageHandler = None  # type: ignore
+    ContextTypes = Any  # type: ignore
+    filters = None  # type: ignore
+
+from config import BOT_TOKEN, OWNER_ID, DEFAULT_SYMBOLS, AUTO_SCAN_INTERVAL_SECONDS, AUTO_SIGNAL_ENABLED
+from diagnostics import safe, record_error, health_report, tail_log
+import users
+import coins_fa
+import ai_memory
+import coin_learning
+import coin_risk
+import coin_rotation
+import sr_learning
+import ghost_signals
+import slot_manager
+import signal_tracker
+import real_trade_manager
+import real_position_sync
+import market_scanner
+import scanner
+import reply_manager
+import recovery_manager
+import daily_report
+import command_registry
+import integration_status
+
+
+AUTO_TASK_NAME = "auto_scan_loop"
+TRACKER_TASK_NAME = "tracker_loop"
+
+
+def _ts() -> int:
+    return int(time.time())
+
+
+def _uid(update: Update) -> int:
+    return int(update.effective_user.id if update.effective_user else 0)
+
+
+def _text(update: Update) -> str:
+    return (update.message.text or "").strip() if update.message else ""
+
+
+async def _reply(update: Update, text: str) -> None:
     if update.message:
-        await update.message.reply_text("⛔️ شما اجازه استفاده از این ربات را ندارید.")
-
-
-# ============================================================
-# Persian symbol mapping
-# ============================================================
-
-PERSIAN_SYMBOLS = {
-    "بیتکوین": "BTCUSDT",
-    "بیت کوین": "BTCUSDT",
-    "btc": "BTCUSDT",
-    "اتریوم": "ETHUSDT",
-    "اتر": "ETHUSDT",
-    "eth": "ETHUSDT",
-    "سولانا": "SOLUSDT",
-    "سول": "SOLUSDT",
-    "sol": "SOLUSDT",
-    "دوج": "DOGEUSDT",
-    "دوج کوین": "DOGEUSDT",
-    "doge": "DOGEUSDT",
-    "ریپل": "XRPUSDT",
-    "xrp": "XRPUSDT",
-    "کاردانو": "ADAUSDT",
-    "ada": "ADAUSDT",
-    "آواکس": "AVAXUSDT",
-    "avax": "AVAXUSDT",
-    "بایننس": "BNBUSDT",
-    "bnb": "BNBUSDT",
-    "تون": "TONUSDT",
-    "ton": "TONUSDT",
-    "لینک": "LINKUSDT",
-    "link": "LINKUSDT",
-    "اپتوس": "APTUSDT",
-    "apt": "APTUSDT",
-    "آربیتروم": "ARBUSDT",
-    "arb": "ARBUSDT",
-    "پالیگان": "POLUSDT",
-    "متیک": "POLUSDT",
-    "matic": "POLUSDT",
-    "شیبا": "SHIBUSDT",
-    "shib": "SHIBUSDT",
-    "پپه": "PEPEUSDT",
-    "pepe": "PEPEUSDT",
-    "فلوکی": "FLOKIUSDT",
-    "floki": "FLOKIUSDT",
-    "بونک": "BONKUSDT",
-    "bonk": "BONKUSDT",
-    "سوئی": "SUIUSDT",
-    "sui": "SUIUSDT",
-    "سی": "SEIUSDT",
-    "sei": "SEIUSDT",
-    "اینترنت کامپیوتر": "ICPUSDT",
-    "icp": "ICPUSDT",
-    "فایل کوین": "FILUSDT",
-    "fil": "FILUSDT",
-    "یونی": "UNIUSDT",
-    "uni": "UNIUSDT",
-    "آوه": "AAVEUSDT",
-    "aave": "AAVEUSDT",
-}
-
-
-COMMAND_ONLY_PHRASES = {
-    "ترید", "ترید فعال", "فعال ترید", "وضعیت ترید", "تریدها",
-    "آمار ترید", "امار ترید", "ریست ترید", "حجم پوزیشن",
-    "حداکثر پوزیشن", "پوزیشن‌ها", "پوزیشن ها", "positions",
-    "بهترین سیگنال", "بهترین", "بررسی", "بررسی بازار", "بازار", "وضعیت بازار",
-    "آمار", "امار", "حذف آمار", "حذف امار", "ریست آمار",
-    "هوش مصنوعی", "ai", "وضعیت ai", "وضعیت هوش مصنوعی",
-    "حافظه ربات", "حافظه ai", "یادگیری", "learning",
-    "ریسک کوین‌ها", "ریسک کوین ها", "چرخش کوین",
-    "سیگنال‌های مخفی", "سیگنال های مخفی", "ghost", "ghost signals",
-    "اسلات‌ها", "اسلات ها", "slots", "slot",
-}
-
-COMMAND_WORDS = {
-    "ترید", "فعال", "وضعیت", "آمار", "امار", "ریست", "حذف", "حجم", "پوزیشن",
-    "پوزیشن‌ها", "پوزیشنها", "حداکثر", "بهترین", "بدترین", "سیگنال", "سیگنال‌ها",
-    "سیگنالهای", "بررسی", "بازار", "ربات", "هوش", "مصنوعی", "حافظه", "یادگیری",
-    "ریسک", "چرخش", "اسلات", "اسلات‌ها", "مخفی", "دلار", "لوریج",
-}
-
-def _normalize_command_text(text: str) -> str:
-    return (
-        str(text or "")
-        .lower()
-        .replace("ي", "ی")
-        .replace("ك", "ک")
-        .replace("‌", " ")
-        .strip()
-    )
-
-def is_command_only_text(text: str) -> bool:
-    t = _normalize_command_text(text)
-    compact = t.replace(" ", "")
-    if t in COMMAND_ONLY_PHRASES or compact in {x.replace(" ", "") for x in COMMAND_ONLY_PHRASES}:
-        return True
-    words = [w for w in re.split(r"\s+", t) if w]
-    return bool(words) and all(w in COMMAND_WORDS or w.isdigit() for w in words)
-
-def normalize_symbol_text(text: str) -> Optional[str]:
-    raw_text = str(text or "").strip()
-    t = _normalize_command_text(raw_text)
-
-    # Safety gate: pure bot/trade/stat commands must never become fake symbols like USDT.
-    if is_command_only_text(t):
-        return None
-
-    cleaned = (
-        t.replace("تحلیل", "")
-        .replace("سیگنال", "")
-        .replace("بررسی", "")
-        .replace("خرید", "")
-        .replace("فروش", "")
-        .replace("لانگ", "")
-        .replace("شورت", "")
-        .replace("/", "")
-        .replace("-", "")
-        .strip()
-    )
-
-    # After removing analysis words, check again; empty/command text is not a symbol.
-    if not cleaned or is_command_only_text(cleaned):
-        return None
-
-    for key, symbol in PERSIAN_SYMBOLS.items():
-        if key in cleaned:
-            return symbol
-
-    raw = cleaned.upper().replace(" ", "")
-    blocked_raw = {"USDT", "تریدفعال", "وضعیتترید", "آمارترید", "امارترید", "حجمپوزیشن"}
-    if raw in blocked_raw:
-        return None
-    if raw.endswith("USDT") and len(raw) >= 6 and raw != "USDT":
-        return raw
-    if raw.isascii() and raw.isalpha() and 2 <= len(raw) <= 10:
-        return raw + "USDT"
-    return None
-
-
-# ============================================================
-# Text helpers
-# ============================================================
-
-def fa_direction(direction: str) -> str:
-    if direction == "LONG":
-        return "لانگ"
-    if direction == "SHORT":
-        return "شورت"
-    return "بدون سیگنال"
-
-
-def safe_num(value: Any, default: float = 0.0) -> float:
-    try:
-        if value is None:
-            return default
-        return float(value)
-    except Exception:
-        return default
-
-
-def extract_first_number(text: str) -> Optional[float]:
-    nums = re.findall(r"\d+(?:\.\d+)?", text or "")
-    if not nums:
-        return None
-    try:
-        return float(nums[0])
-    except Exception:
-        return None
-
-
-def is_disable_loss_lock_text(text: str) -> bool:
-    t = _normalize_command_text(text)
-    compact = t.replace(" ", "")
-    if any(x in t for x in ["خاموش", "غیرفعال", "غیر فعال", "لغو", "حذف", "off", "disable"]):
-        return True
-    return bool(re.search(r"(^|\s)0(?:\.0+)?($|\s)", t)) or "صفر" in t or compact in {
-        "قفلضرر0",
-        "قفلضررصفر",
-        "ضررروزانه0",
-        "ضررروزانهصفر",
-        "حدضررروزانه0",
-        "حدضررروزانهصفر",
-    }
-
-
-def disable_real_daily_loss_lock_local() -> str:
-    """
-    Disable daily-loss protection without touching exchange/order logic.
-
-    Required behavior for `قفل ضرر خاموش`:
-    - daily loss protection OFF
-    - daily loss limit = 0
-    - lock duration = 0
-    - current lock timer cleared
-    - if trading was blocked only because of this lock, allow trading again immediately
-      when basic real-trade settings are configured and emergency stop is not active.
-    """
-    # Prefer the real_trade_manager function when available, because it owns
-    # the real-trade state rules. Then enforce the same fields locally for
-    # backward compatibility with older real_trade_manager versions.
-    try:
-        if set_real_daily_loss_limit:
-            set_real_daily_loss_limit(0)
-    except Exception:
-        pass
-
-    state = load_json(REAL_TRADE_STATE_FILE, {})
-    if not isinstance(state, dict):
-        state = {}
-
-    was_locked = int(state.get("daily_loss_locked_until", 0) or 0) > int(time.time())
-
-    state["daily_loss_protection_enabled"] = False
-    state["daily_loss_limit_usd"] = 0.0
-    state["daily_lock_duration_hours"] = 0
-    state["daily_loss_locked_until"] = 0
-    state["daily_lock_reason"] = ""
-    state["daily_lock_loss_value"] = 0.0
-    state["daily_lock_auto_reenable"] = False
-
-    try:
-        configured = (
-            float(state.get("initial_capital", 0) or 0) > 0
-            and float(state.get("position_size_usd", 0) or 0) > 0
-            and float(state.get("leverage", 0) or 0) > 0
-            and int(float(state.get("max_positions", 0) or 0)) > 0
-        )
-    except Exception:
-        configured = False
-
-    # If the only blocker was the daily-loss lock, let real trading be enabled again.
-    if was_locked and configured and not bool(state.get("emergency_stop")):
-        state["enabled"] = True
-
-    save_json(REAL_TRADE_STATE_FILE, state)
-    return "✅ قفل/حد ضرر روزانه خاموش شد؛ تایمر قفل صفر شد."
-
-
-def reset_active_daily_lock_from_now(hours: int) -> bool:
-    """
-    If a daily-loss lock is already active, restart its countdown from now.
-    Example: `قفل ضرر 1 ساعت` while locked means 1 hour from this command.
-    """
-    state = load_json(REAL_TRADE_STATE_FILE, {})
-    if not isinstance(state, dict):
-        return False
-
-    locked_until = int(state.get("daily_loss_locked_until", 0) or 0)
-    if locked_until <= int(time.time()):
-        return False
-
-    hours = max(1, min(int(hours), 168))
-    state["daily_loss_locked_until"] = int(time.time()) + hours * 3600
-    save_json(REAL_TRADE_STATE_FILE, state)
-    return True
-
-
-async def disable_daily_loss_lock_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    try:
-        msg = disable_real_daily_loss_lock_local()
-        await update.message.reply_text(msg + "\n\n" + format_trade_status())
-    except Exception as e:
-        await update.message.reply_text(f"❌ خطا در خاموش کردن قفل ضرر:\n{str(e)[:250]}")
-
-
-async def send_long_text(update: Update, text: str, max_len: int = 3900) -> None:
-    if not update.message:
-        return
-    if len(text) <= max_len:
         await update.message.reply_text(text)
-        return
-    chunks = []
-    current = []
-    current_len = 0
-    for line in text.splitlines():
-        if current_len + len(line) + 1 > max_len:
-            chunks.append("\n".join(current))
-            current = [line]
-            current_len = len(line) + 1
-        else:
-            current.append(line)
-            current_len += len(line) + 1
-    if current:
-        chunks.append("\n".join(current))
-    for chunk in chunks[:4]:
-        await update.message.reply_text(chunk)
-        await asyncio.sleep(0.3)
 
 
-# ============================================================
-# Trade settings commands
-# ============================================================
+def _allowed(update: Update) -> bool:
+    return users.is_allowed(_uid(update))
 
-DEFAULT_TRADE_SETTINGS = {
-    "capital_usd": 50.0,
-    "trade_margin_usd": 5.0,
-    "leverage": 10.0,
-    "max_positions": 5,
-    "updated_at": None,
-}
 
+def _owner(update: Update) -> bool:
+    return users.is_owner(_uid(update))
 
-def load_trade_settings() -> Dict[str, Any]:
-    state = load_json(TRADE_SETTINGS_FILE, DEFAULT_TRADE_SETTINGS.copy())
-    merged = DEFAULT_TRADE_SETTINGS.copy()
-    if isinstance(state, dict):
-        merged.update(state)
-    return merged
 
-
-def save_trade_settings(state: Dict[str, Any]) -> Dict[str, Any]:
-    state["updated_at"] = int(time.time())
-    save_json(TRADE_SETTINGS_FILE, state)
-    return state
-
-
-def calc_position_size(settings: Dict[str, Any]) -> float:
-    margin = safe_num(settings.get("trade_margin_usd"), 0.0)
-    leverage = safe_num(settings.get("leverage"), 1.0)
-    return round(margin * leverage, 4)
-
-
-def _real_status_or_unavailable() -> str:
-    if get_real_trade_status_text:
-        try:
-            return get_real_trade_status_text()
-        except Exception as e:
-            return f"❌ خطا در دریافت وضعیت ترید واقعی:\n{str(e)[:250]}"
-    return "ماژول ترید واقعی توبیت فعال نیست یا فایل real_trade_manager.py پیدا نشد."
-
-
-def format_trade_status() -> str:
-    # Generic trade commands now control REAL / TOBIT trading only.
-    return _real_status_or_unavailable()
-
-async def trade_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    try:
-        text = await run_blocking(format_trade_status, timeout=12)
-        await update.message.reply_text(text)
-    except asyncio.TimeoutError:
-        await update.message.reply_text("⏱️ وضعیت ترید کند شد؛ اما ربات فعال است. برای خاموشی فوری: ترید خاموش")
-    except Exception as e:
-        await update.message.reply_text(f"❌ خطا در وضعیت ترید:\n{str(e)[:250]}")
-
-
-async def set_capital_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    value = extract_first_number(update.message.text)
-    if value is None or value <= 0:
-        await update.message.reply_text("مثال درست: سرمایه ترید 1000")
-        return
-    if not set_real_initial_capital:
-        await update.message.reply_text("ماژول ترید واقعی فعال نیست.")
-        return
-    value = max(1.0, min(float(value), 1_000_000.0))
-    await update.message.reply_text(set_real_initial_capital(value) + "\n\n" + format_trade_status())
-
-
-
-async def set_trade_margin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    value = extract_first_number(update.message.text)
-    if value is None or value <= 0:
-        await update.message.reply_text("مثال درست: ترید دلار 20")
-        return
-    if not set_real_position_size:
-        await update.message.reply_text("ماژول ترید واقعی فعال نیست.")
-        return
-    value = max(1.0, min(float(value), 1_000_000.0))
-    await update.message.reply_text(set_real_position_size(value) + "\n\n" + format_trade_status())
-
-
-
-async def set_leverage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    value = extract_first_number(update.message.text)
-    if value is None or value <= 0:
-        await update.message.reply_text("مثال درست: ترید لوریج 5")
-        return
-    if not set_real_leverage:
-        await update.message.reply_text("ماژول ترید واقعی فعال نیست.")
-        return
-    value = max(1.0, min(float(value), 50.0))
-    await update.message.reply_text(set_real_leverage(value) + "\n\n" + format_trade_status())
-
-
-
-async def position_size_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(format_trade_status())
-
-
-
-async def reset_trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if get_user_id(update) != OWNER_ID:
-        await reject_unauthorized(update)
-        return
-    if not reset_real_trade_state:
-        await update.message.reply_text("ماژول ترید واقعی فعال نیست.")
-        return
-    await update.message.reply_text(reset_real_trade_state() + "\n\n" + format_trade_status())
-
-
-
-async def trade_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_allowed(update):
-        await reject_unauthorized(update)
-        return
-    await send_long_text(update, format_trade_status())
-
-
-
-async def set_max_positions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    value = extract_first_number(update.message.text)
-    if value is None or value <= 0:
-        await update.message.reply_text("مثال درست: حداکثر پوزیشن 10")
-        return
-    if not set_real_max_positions:
-        await update.message.reply_text("ماژول ترید واقعی فعال نیست.")
-        return
-    value = max(1, min(int(value), 100))
-    await update.message.reply_text(set_real_max_positions(value) + "\n\n" + format_trade_status())
-
-
-
-async def set_daily_loss_limit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = update.message.text or ""
-    if is_disable_loss_lock_text(text):
-        await disable_daily_loss_lock_command(update, context)
-        return
-
-    value = extract_first_number(text)
-    if value is None or value <= 0:
-        await update.message.reply_text("مثال درست: حد ضرر روزانه 5\nبرای خاموش کردن: قفل ضرر خاموش")
-        return
-    if not set_real_daily_loss_limit:
-        await update.message.reply_text("ماژول تنظیم حد ضرر روزانه واقعی فعال نیست. فایل real_trade_manager.py را به‌روزرسانی کن.")
-        return
-    try:
-        msg = set_real_daily_loss_limit(float(value))
-        await update.message.reply_text(msg + "\n\n" + format_trade_status())
-    except Exception as e:
-        await update.message.reply_text(f"❌ خطا در تنظیم حد ضرر روزانه:\n{str(e)[:250]}")
-
-
-
-async def set_daily_lock_hours_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = update.message.text or ""
-    if is_disable_loss_lock_text(text):
-        await disable_daily_loss_lock_command(update, context)
-        return
-
-    value = extract_first_number(text)
-    if value is None or value <= 0:
-        await update.message.reply_text("مثال درست: قفل ضرر 1 ساعت\nبرای خاموش کردن: قفل ضرر خاموش")
-        return
-    if not set_real_lock_duration_hours:
-        await update.message.reply_text("ماژول تنظیم زمان قفل ضرر واقعی فعال نیست. فایل real_trade_manager.py را به‌روزرسانی کن.")
-        return
-    try:
-        hours = max(1, min(int(value), 168))
-        msg = set_real_lock_duration_hours(hours)
-        restarted = reset_active_daily_lock_from_now(hours)
-        if restarted:
-            msg += "\n⏱️ شمارش قفل فعال از همین لحظه دوباره محاسبه شد."
-        await update.message.reply_text(msg + "\n\n" + format_trade_status())
-    except Exception as e:
-        await update.message.reply_text(f"❌ خطا در تنظیم زمان قفل ضرر:\n{str(e)[:250]}")
-
-
-
-def real_trade_module_available() -> bool:
-    return all([
-        get_real_trade_status_text,
-        get_toobit_balance_text,
-        set_real_initial_capital,
-        set_real_position_size,
-        set_real_leverage,
-        set_real_max_positions,
-        set_real_daily_loss_limit,
-        set_real_lock_duration_hours,
-        enable_real_trading,
-        disable_real_trading,
-        activate_real_emergency_stop,
-        reset_real_trade_state,
-        is_real_trade_ready,
-        open_real_position_from_signal,
-    ])
-
-async def real_trade_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not real_trade_module_available() or not get_real_trade_status_text:
-        await update.message.reply_text("ماژول ترید واقعی توبیت فعال نیست یا فایل real_trade_manager.py پیدا نشد.")
-        return
-    await update.message.reply_text(get_real_trade_status_text())
-
-
-async def toobit_balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not get_toobit_balance_text:
-        await update.message.reply_text("ماژول اتصال توبیت فعال نیست یا فایل tobit_client.py پیدا نشد.")
-        return
-    await send_long_text(update, get_toobit_balance_text())
-
-
-async def set_real_capital_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not set_real_initial_capital:
-        await update.message.reply_text("ماژول ترید واقعی فعال نیست.")
-        return
-    value = extract_first_number(update.message.text)
-    if value is None or value <= 0:
-        await update.message.reply_text("مثال درست: سرمایه واقعی 50")
-        return
-    await update.message.reply_text(set_real_initial_capital(float(value)) + "\n\n" + get_real_trade_status_text())
-
-
-async def set_real_position_size_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not set_real_position_size:
-        await update.message.reply_text("ماژول ترید واقعی فعال نیست.")
-        return
-    value = extract_first_number(update.message.text)
-    if value is None or value <= 0:
-        await update.message.reply_text("مثال درست: ترید واقعی دلار 2")
-        return
-    await update.message.reply_text(set_real_position_size(float(value)) + "\n\n" + get_real_trade_status_text())
-
-
-async def set_real_leverage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not set_real_leverage:
-        await update.message.reply_text("ماژول ترید واقعی فعال نیست.")
-        return
-    value = extract_first_number(update.message.text)
-    if value is None or value <= 0:
-        await update.message.reply_text("مثال درست: لوریج واقعی 5")
-        return
-    value = max(1.0, min(float(value), 50.0))
-    await update.message.reply_text(set_real_leverage(value) + "\n\n" + get_real_trade_status_text())
-
-
-async def set_real_max_positions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not set_real_max_positions:
-        await update.message.reply_text("ماژول ترید واقعی فعال نیست.")
-        return
-    value = extract_first_number(update.message.text)
-    if value is None or value <= 0:
-        await update.message.reply_text("مثال درست: حداکثر پوزیشن واقعی 3")
-        return
-    await update.message.reply_text(set_real_max_positions(int(value)) + "\n\n" + get_real_trade_status_text())
-
-
-async def set_real_daily_loss_limit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = update.message.text or ""
-    if is_disable_loss_lock_text(text):
-        await disable_daily_loss_lock_command(update, context)
-        return
-
-    if not set_real_daily_loss_limit:
-        await update.message.reply_text("ماژول تنظیم حد ضرر روزانه واقعی فعال نیست. فایل real_trade_manager.py را به‌روزرسانی کن.")
-        return
-    value = extract_first_number(text)
-    if value is None or value <= 0:
-        await update.message.reply_text("مثال درست: حد ضرر روزانه واقعی 5\nبرای خاموش کردن: قفل ضرر خاموش")
-        return
-    try:
-        msg = set_real_daily_loss_limit(float(value))
-        await update.message.reply_text(msg + "\n\n" + get_real_trade_status_text())
-    except Exception as e:
-        await update.message.reply_text(f"❌ خطا در تنظیم حد ضرر روزانه واقعی:\n{str(e)[:250]}")
-
-
-async def set_real_lock_hours_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = update.message.text or ""
-    if is_disable_loss_lock_text(text):
-        await disable_daily_loss_lock_command(update, context)
-        return
-
-    if not set_real_lock_duration_hours:
-        await update.message.reply_text("ماژول تنظیم زمان قفل ضرر واقعی فعال نیست. فایل real_trade_manager.py را به‌روزرسانی کن.")
-        return
-    value = extract_first_number(text)
-    if value is None or value <= 0:
-        await update.message.reply_text("مثال درست: قفل ضرر واقعی 1 ساعت\nبرای خاموش کردن: قفل ضرر خاموش")
-        return
-    try:
-        hours = max(1, min(int(value), 168))
-        msg = set_real_lock_duration_hours(hours)
-        restarted = reset_active_daily_lock_from_now(hours)
-        if restarted:
-            msg += "\n⏱️ شمارش قفل فعال از همین لحظه دوباره محاسبه شد."
-        await update.message.reply_text(msg + "\n\n" + get_real_trade_status_text())
-    except Exception as e:
-        await update.message.reply_text(f"❌ خطا در تنظیم زمان قفل ضرر واقعی:\n{str(e)[:250]}")
-
-
-async def enable_real_trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not enable_real_trading:
-        await update.message.reply_text("ماژول ترید واقعی فعال نیست.")
-        return
-    try:
-        msg = await run_blocking(enable_real_trading, timeout=10)
-        await update.message.reply_text(msg or "✅ ترید فعال شد.")
-    except Exception as e:
-        await update.message.reply_text(f"❌ خطا در فعال کردن ترید:\n{str(e)[:250]}")
-
-
-async def disable_real_trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # High-priority safety command: never wait for heavy status/AI/scan work.
-    if not disable_real_trading:
-        await update.message.reply_text("ماژول ترید واقعی فعال نیست.")
-        return
-    try:
-        msg = await run_blocking(disable_real_trading, timeout=10)
-        # Also stop auto-signal delivery at bot-settings level immediately.
-        try:
-            st = load_bot_settings()
-            st["trading_enabled"] = False
-            st["auto_signal_enabled"] = False
-            save_bot_settings(st)
-        except Exception:
-            pass
-        await update.message.reply_text((msg or "✅ ترید خاموش شد.") + "\n✅ Auto Signal هم خاموش شد.")
-    except Exception as e:
-        await update.message.reply_text(f"❌ خطا در خاموش کردن ترید:\n{str(e)[:250]}")
-
-
-async def real_emergency_stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Highest-priority safety command. Keep response short and do not build slow status report.
-    if not activate_real_emergency_stop:
-        await update.message.reply_text("ماژول ترید واقعی فعال نیست.")
-        return
-    try:
-        msg = await run_blocking(activate_real_emergency_stop, timeout=10)
-        try:
-            st = load_bot_settings()
-            st["trading_enabled"] = False
-            st["auto_signal_enabled"] = False
-            save_bot_settings(st)
-        except Exception:
-            pass
-        await update.message.reply_text((msg or "🛑 توقف اضطراری فعال شد.") + "\n✅ Auto Signal خاموش شد.")
-    except Exception as e:
-        await update.message.reply_text(f"❌ خطا در توقف اضطراری:\n{str(e)[:250]}")
-
-
-async def reset_real_trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if get_user_id(update) != OWNER_ID:
-        await reject_unauthorized(update)
-        return
-    if not reset_real_trade_state:
-        await update.message.reply_text("ماژول ترید واقعی فعال نیست.")
-        return
-    await update.message.reply_text(reset_real_trade_state() + "\n\n" + get_real_trade_status_text())
-
-
-async def sync_real_positions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_allowed(update):
-        await reject_unauthorized(update)
-        return
-    if not sync_real_positions_text and not format_real_position_sync_status:
-        await update.message.reply_text("ماژول همگام‌سازی توبیت فعال نیست.")
-        return
-    try:
-        # Prefer the dedicated sync layer when available because it also verifies/repairs TP/SL.
-        if format_real_position_sync_status:
-            await send_long_text(update, format_real_position_sync_status())
-        else:
-            await send_long_text(update, sync_real_positions_text())
-    except Exception as e:
-        await update.message.reply_text(f"❌ خطا در همگام‌سازی:\n{str(e)[:250]}")
-
-
-async def dynamic_profit_protection_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_allowed(update):
-        await reject_unauthorized(update)
-        return
-    if not dynamic_profit_protection_text:
-        await update.message.reply_text("ماژول محافظ سود AI فعال نیست. فایل real_trade_manager.py را به‌روزرسانی کن.")
-        return
-    try:
-        await send_long_text(update, dynamic_profit_protection_text())
-    except Exception as e:
-        await update.message.reply_text(f"❌ خطا در بررسی خروج سود AI:\n{str(e)[:250]}")
-
-
-async def close_all_positions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if get_user_id(update) != OWNER_ID:
-        await reject_unauthorized(update)
-        return
-    if not close_all_real_positions:
-        await update.message.reply_text("ماژول بستن پوزیشن‌های واقعی فعال نیست.")
-        return
-    try:
-        res = close_all_real_positions()
-        lines = [f"✅ درخواست بستن همه پوزیشن‌ها ارسال شد. بسته‌شده: {res.get('closed_count', 0)}"]
-        for item in (res.get("results") or [])[:10]:
-            r = item.get("result") or {}
-            ok = "✅" if isinstance(r, dict) and r.get("ok") else "❌"
-            lines.append(f"{ok} {item.get('symbol')} {item.get('direction', '')}: {str(r.get('error') or r.get('message') or 'OK')[:120]}")
-        lines.append("\n" + format_trade_status())
-        await send_long_text(update, "\n".join(lines))
-    except Exception as e:
-        await update.message.reply_text(f"❌ خطا در بستن همه پوزیشن‌ها:\n{str(e)[:250]}")
-
-
-async def close_symbol_position_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if get_user_id(update) != OWNER_ID:
-        await reject_unauthorized(update)
-        return
-    if not close_real_position_by_symbol:
-        await update.message.reply_text("ماژول بستن پوزیشن واقعی فعال نیست.")
-        return
-
-    text = update.message.text or ""
-    symbol = normalize_symbol_text(text.replace("بستن", "").replace("پوزیشن", ""))
-    if not symbol:
-        await update.message.reply_text("مثال درست: بستن OPUSDT")
-        return
-    try:
-        res = close_real_position_by_symbol(symbol)
-        if res.get("ok"):
-            await update.message.reply_text(f"✅ درخواست بستن {symbol} ارسال شد.\n\n" + format_trade_status())
-        else:
-            await update.message.reply_text(f"❌ بسته نشد: {res.get('error') or res.get('data')}\n\n" + format_trade_status())
-    except Exception as e:
-        await update.message.reply_text(f"❌ خطا در بستن {symbol}:\n{str(e)[:250]}")
-
-
-
-# ============================================================
-# Movement Hunter helpers
-# ============================================================
-
-MOVEMENT_REAL_DECISIONS = {"REAL", "REAL_SIGNAL", "ENTRY", "ACTIVE", "OPEN_REAL"}
-MOVEMENT_GHOST_DECISIONS = {"GHOST", "GHOST_ONLY", "SHADOW"}
-MOVEMENT_REJECT_DECISIONS = {"REJECT", "NO_TRADE", "BLOCK", "WAIT", "SETUP_ONLY"}
-MOVEMENT_EARLY_PHASES = {"START", "EARLY", "PRE_START", "SETUP", "ENTRY_START"}
-# MID is no longer treated as a hard-late/blocking phase for auto signals.
-# Scanner/analysis may legitimately mark a confirmed Movement Hunter entry as MID.
-# Hard-late phases below are still blocked to avoid exhaustion/range-after-move entries.
-MOVEMENT_LATE_PHASES = {"LATE", "EXHAUSTION", "RANGE", "RANGE_AFTER_MOVE", "DONE", "FINISHED"}
-
-
-def _read_nested(data: Dict[str, Any], *keys: str, default: Any = None) -> Any:
-    if not isinstance(data, dict):
-        return default
-    for key in keys:
-        if data.get(key) is not None:
-            return data.get(key)
-    for parent in [
-        "ai_movement", "movement_hunter", "movement", "ai_decision",
-        "ai_scanner", "snapshot", "ai_layers", "state_awareness",
-        "move_state", "movement_state",
-    ]:
-        obj = data.get(parent)
-        if isinstance(obj, dict):
-            for key in keys:
-                if obj.get(key) is not None:
-                    return obj.get(key)
-            nested = _read_nested(obj, *keys, default=None)
-            if nested is not None:
-                return nested
-    return default
-
-
-def movement_decision(signal: Dict[str, Any]) -> str:
-    val = _read_nested(
-        signal,
-        "decision", "ai_decision", "final_decision", "movement_decision",
-        "signal_decision", "trade_decision", "status_decision",
-        default=None,
-    )
-    # Backward compatibility: scanner already returns ACTIVE only for accepted signals.
-    if val is None and signal.get("status") == "ACTIVE":
-        val = "REAL"
-    return str(val or "UNKNOWN").upper().strip()
-
-
-def movement_phase(signal: Dict[str, Any]) -> str:
-    val = _read_nested(
-        signal,
-        "move_phase", "movement_phase", "phase", "state", "move_state",
-        "freshness_phase", default="UNKNOWN",
-    )
-    return str(val or "UNKNOWN").upper().strip()
-
-
-def movement_freshness(signal: Dict[str, Any]) -> str:
-    val = _read_nested(
-        signal,
-        "move_freshness", "freshness", "fresh_momentum", "momentum_freshness",
-        default="UNKNOWN",
-    )
-    return str(val or "UNKNOWN").upper().strip()
-
-
-def movement_trap_risk(signal: Dict[str, Any]) -> str:
-    val = _read_nested(
-        signal,
-        "trap_risk", "liquidity_trap_risk", "liquidity_risk", "fakeout_risk",
-        default="UNKNOWN",
-    )
-    return str(val or "UNKNOWN").upper().strip()
-
-
-def movement_confidence(signal: Dict[str, Any]) -> str:
-    val = _read_nested(
-        signal,
-        "confidence", "ai_confidence", "movement_confidence", "decision_confidence",
-        default="UNKNOWN",
-    )
-    if isinstance(val, (int, float)):
-        return str(round(float(val), 1))
-    return str(val or "UNKNOWN").upper().strip()
-
-
-def movement_type(signal: Dict[str, Any]) -> str:
-    val = _read_nested(
-        signal,
-        "movement_type", "move_type", "hunt_type", "setup_type", "pattern_type",
-        default="MOVEMENT",
-    )
-    return str(val or "MOVEMENT").upper().strip()
-
-
-def is_ai_real_signal(signal: Dict[str, Any]) -> bool:
-    decision = movement_decision(signal)
-    phase = movement_phase(signal)
-
-    if decision in MOVEMENT_REJECT_DECISIONS or decision in MOVEMENT_GHOST_DECISIONS:
-        return False
-
-    if decision in MOVEMENT_REAL_DECISIONS:
-        return phase not in MOVEMENT_LATE_PHASES
-
-    # Compatibility fallback for scanner outputs that already passed AI gates.
-    # In the current Movement Hunter scanner, status=ACTIVE means the analysis/scanner
-    # has accepted the candidate for auto signal selection. Do not block MID here.
-    if signal.get("status") == "ACTIVE":
-        return phase not in MOVEMENT_LATE_PHASES
-
+async def require_access(update: Update) -> bool:
+    if _allowed(update):
+        return True
+    await _reply(update, "⛔️ دسترسی نداری.")
     return False
 
 
-def movement_metadata(signal: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "ai_architecture": "AI_MOVEMENT_HUNTER",
-        "movement_decision": movement_decision(signal),
-        "movement_type": movement_type(signal),
-        "move_phase": movement_phase(signal),
-        "move_freshness": movement_freshness(signal),
-        "trap_risk": movement_trap_risk(signal),
-        "movement_confidence": movement_confidence(signal),
-        "classic_score_role": "display_only_not_decision",
-    }
-
-
-def _movement_line(signal: Dict[str, Any]) -> str:
-    return (
-        f"AI Hunter: {movement_type(signal)} | فاز: {movement_phase(signal)} | "
-        f"تازگی: {movement_freshness(signal)} | تله: {movement_trap_risk(signal)} | "
-        f"اعتماد: {movement_confidence(signal)}"
-    )
-
-# ============================================================
-# Formatting analysis output
-# ============================================================
-
-def format_signal_message(result: Dict[str, Any]) -> str:
-    """Telegram REAL signal text for AI Movement Hunter architecture.
-
-    The old classic score is kept only as display/diagnostic metadata. The
-    actual decision must already be made by AI Movement Hunter in scanner.py.
-    """
-    if result.get("status") != "ACTIVE":
-        return format_manual_analysis(result)
-
-    score_line = ""
-    if result.get("score") is not None:
-        score_line = f"\nامتیاز کلاسیک: {result.get('score')} (فقط اطلاعاتی)"
-
-    return (
-        "🚨 سیگنال خودکار AI Movement Hunter\n"
-        f"نماد: {result.get('symbol')}\n"
-        f"جهت: {fa_direction(result.get('direction'))}\n"
-        "وضعیت: ✅ ورود فعال\n"
-        f"{_movement_line(result)}\n\n"
-        f"ورود: {result.get('entry')}\n"
-        f"حد ضرر: {result.get('stop_loss')}\n"
-        f"حد سود ۱: {result.get('tp1')}\n"
-        f"حد سود ۲: {result.get('tp2')}\n"
-        f"{score_line}\n"
-        f"ریسک: {result.get('risk_level')}\n"
-        f"R/R: {result.get('risk_reward')}\n"
-        f"اعتبار: {result.get('validity', '15 تا 45 دقیقه')}"
-    )
-
-def format_manual_analysis(result: Dict[str, Any]) -> str:
-    """Manual analysis output.
-
-    In Movement Hunter mode, manual analysis should explain what the AI sees:
-    fresh setup, entry, ghost/reject, phase and trap risk. Classic indicator
-    scores are shown only as raw sensor info for compatibility.
-    """
-    if result.get("status") != "ACTIVE":
-        reasons = "\n".join([f"• {x}" for x in result.get("reasons", [])[:8]]) or "AI هنوز ورود واقعی را تایید نکرده."
-        return (
-            f"📊 تحلیل {result.get('symbol')}\n\n"
-            "وضعیت: ❌ بدون ورود واقعی\n"
-            f"تصمیم AI: {movement_decision(result)}\n"
-            f"{_movement_line(result)}\n\n"
-            "داده‌های سنسوری:\n"
-            f"RSI: {result.get('rsi')}\n"
-            f"ADX: {result.get('adx')}\n"
-            f"VWAP: {result.get('vwap_status')}\n"
-            f"Histogram: {result.get('macd_hist')}\n\n"
-            f"دلایل:\n{reasons}"
-        )
-
-    score_line = ""
-    if result.get("score") is not None:
-        score_line = f"\nامتیاز کلاسیک: {result.get('score')} (فقط اطلاعاتی)"
-
-    return (
-        f"📊 تحلیل {result.get('symbol')}\n\n"
-        "وضعیت: ✅ ورود AI تایید شده\n"
-        f"جهت: {fa_direction(result.get('direction'))}\n"
-        f"{_movement_line(result)}\n\n"
-        f"ورود: {result.get('entry')}\n"
-        f"حد ضرر: {result.get('stop_loss')}\n"
-        f"حد سود ۱: {result.get('tp1')}\n"
-        f"حد سود ۲: {result.get('tp2')}\n"
-        f"{score_line}\n"
-        f"ریسک: {result.get('risk_level')}\n"
-        f"R/R: {result.get('risk_reward')}\n\n"
-        "سنسورها:\n"
-        f"RSI: {result.get('rsi')}\n"
-        f"ADX: {result.get('adx')}\n"
-        f"VWAP: {result.get('vwap_status')}\n"
-        f"روند بازار: {result.get('market_regime') or result.get('market_mode')}\n\n"
-        f"اعتبار: {result.get('validity', '15 تا 45 دقیقه')}"
-    )
-
-def format_top_signals(signals: List[Dict[str, Any]]) -> str:
-    if not signals:
-        return "فعلاً حرکت تازه مناسبی پیدا نشد."
-
-    lines = ["🏆 بهترین شکارهای فعلی AI Movement Hunter:"]
-    for i, sig in enumerate(signals, 1):
-        score_text = f" | امتیاز کلاسیک:{sig.get('score')}" if sig.get("score") is not None else ""
-        lines.append(
-            f"\n{i}) {sig.get('symbol')} | {fa_direction(sig.get('direction'))}\n"
-            f"{_movement_line(sig)}{score_text}\n"
-            f"ورود: {sig.get('entry')}\n"
-            f"SL: {sig.get('stop_loss')} | TP1: {sig.get('tp1')}"
-        )
-    return "\n".join(lines)
-
-def format_market_overview_text(result: Dict[str, Any]) -> str:
-    return (
-        "📌 بررسی کلی بازار\n\n"
-        f"{result.get('summary')}\n\n"
-        f"صعودی: {result.get('bullish_pct')}٪\n"
-        f"نزولی: {result.get('bearish_pct')}٪\n"
-        f"رنج/نامشخص: {result.get('neutral_pct')}٪\n"
-        f"تعداد بررسی‌شده: {result.get('scanned')}"
-    )
-
-
-def attach_signal_metadata(signal: Dict[str, Any], message_id: int, chat_id: int, source: str = "auto_signal") -> Dict[str, Any]:
-    s = dict(signal)
-    s["telegram_message_id"] = message_id
-    s["message_id"] = message_id
-    s["chat_id"] = chat_id
-    s["user_id"] = OWNER_ID or chat_id
-    s["source"] = source
-    # Preserve Movement Hunter metadata everywhere: tracker, real trade,
-    # learning, Ghost, and result messages.
-    mh = movement_metadata(s)
-    s.update({k: v for k, v in mh.items() if s.get(k) is None})
-    snap = s.get("snapshot") if isinstance(s.get("snapshot"), dict) else {}
-    snap = dict(snap)
-    snap.update({k: v for k, v in mh.items() if snap.get(k) is None})
-    s["snapshot"] = snap
-    return s
-
-# ============================================================
-# Core commands
-# ============================================================
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_allowed(update):
-        await reject_unauthorized(update)
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_access(update):
         return
-
-    text = (
-        "🤖 Crypto AI Bot\n\n"
-        "دستورهای اصلی:\n"
-        "تحلیل بیتکوین\n"
-        "سیگنال سولانا\n"
-        "بهترین سیگنال\n"
-        "بررسی / بررسی بازار\n"
-        "آمار / آمار 7 روز / آمار کل\n"
-        "حذف آمار\n\n"
-        "دستورهای ترید واقعی توبیت:\n"
-        "ترید / وضعیت ترید\n"
-        "بالانس توبیت\n"
-        "سرمایه ترید 1000\n"
-        "ترید دلار 20\n"
-        "ترید لوریج 5\n"
-        "حداکثر پوزیشن 10\n"
-        "حد ضرر روزانه 5\n"
-        "قفل ضرر 1 ساعت\nقفل ضرر خاموش\n"
-        "ترید فعال\n"
-        "ترید خاموش\n"
-        "توقف اضطراری\n"
-        "همگام سازی پوزیشن ها\n"
-        "بررسی خروج سود\n"
-        "بستن OPUSDT\n"
-        "بستن همه پوزیشن ها\n"
-        "ریست ترید\n\n"
-        "AI و مدیریت:\n"
-        "هوش مصنوعی\n"
-        "حافظه ربات\nSimilarity / Pattern Memory داخل وضعیت AI نمایش داده می‌شود\n"
-        "ریسک کوین‌ها\n"
-        "بهترین کوین‌ها\n"
-        "بدترین کوین‌ها\n"
-        "سیگنال‌های مخفی\n"
-        "اسلات‌ها\n"
-        "پوزیشن‌ها\n"
-        "سیگنال‌های فعال\n\n"
-        "یادداشت: دستورهای ترید مستقیم برای REAL / TOBIT هستند."
-    )
-    await update.message.reply_text(text)
+    await _reply(update, "ربات AI Movement Hunter فعال است.\nدستور: هوش مصنوعی | ترید | وضعیت بازار | بهترین سیگنال")
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await start_command(update, context)
+async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _reply(update, f"ID شما:\n`{_uid(update)}`")
 
 
-async def analyze_request(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol: str) -> None:
-    waiting = await update.message.reply_text("⏳ در حال تحلیل...")
+async def adduser_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _owner(update):
+        await _reply(update, "فقط مالک می‌تواند کاربر اضافه کند.")
+        return
+    if not context.args:
+        await _reply(update, "مثال: /adduser 123456")
+        return
+    users.add_user(int(context.args[0]))
+    await _reply(update, "✅ کاربر اضافه شد.")
+
+
+async def removeuser_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _owner(update):
+        await _reply(update, "فقط مالک می‌تواند کاربر حذف کند.")
+        return
+    if not context.args:
+        await _reply(update, "مثال: /removeuser 123456")
+        return
+    users.remove_user(int(context.args[0]))
+    await _reply(update, "✅ کاربر حذف شد.")
+
+
+async def listusers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _owner(update):
+        await _reply(update, "فقط مالک.")
+        return
+    await _reply(update, users.list_users_fa())
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_access(update):
+        return
+    txt = _text(update)
     try:
-        result = await run_blocking(analyze_symbol, symbol, timeout=60)
-        await waiting.edit_text(format_manual_analysis(result))
+        await dispatch_text(update, context, txt)
     except Exception as e:
-        await waiting.edit_text(f"❌ خطا در تحلیل:\n{str(e)[:300]}")
+        record_error(e, module="bot", function="handle_message", context={"text": txt})
+        await _reply(update, "⚠️ خطای داخلی رخ داد. جزئیات در لاگ ذخیره شد.")
 
 
-async def best_signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_allowed(update):
-        await reject_unauthorized(update)
+async def dispatch_text(update: Update, context: ContextTypes.DEFAULT_TYPE, txt: str) -> None:
+    t = txt.strip()
+    low = t.lower()
+
+    # Fast status commands
+    if t in {"هوش مصنوعی", "وضعیت هوش مصنوعی", "حافظه ربات"}:
+        await _reply(update, ai_status_fa())
+        return
+    if t in {"ترید", "وضعیت ترید"}:
+        await _reply(update, real_trade_manager.status_fa())
+        return
+    if t in {"اسلات‌ها", "اسلات ها"}:
+        await _reply(update, slot_manager.summary_fa())
+        return
+    if t in {"سیگنال‌های مخفی", "سیگنال های مخفی"}:
+        await _reply(update, ghost_signals.summary_fa())
+        return
+    if t in {"آمار", "آمار هوشمند"}:
+        await _reply(update, smart_stats_fa())
+        return
+    if t in {"ریسک کوین‌ها", "ریسک کوین ها"}:
+        await _reply(update, coin_risk.summary_fa())
+        return
+    if t in {"بهترین کوین‌ها", "بهترین کوین ها"}:
+        await _reply(update, coin_rotation.summary_fa())
+        return
+    if t in {"رفتار کوین"}:
+        await _reply(update, "مثال: رفتار کوین DOGE")
+        return
+    if t.startswith("رفتار کوین"):
+        sym = coins_fa.normalize_symbol(t.replace("رفتار کوین", "").strip())
+        await _reply(update, coin_behavior_fa(sym))
+        return
+    if t in {"وضعیت بازار", "بررسی بازار"}:
+        msg = market_scanner.market_status_fa()
+        await _reply(update, msg)
         return
 
-    waiting = await update.message.reply_text("⏳ در حال بررسی بازار...")
-    try:
-        signals = await run_blocking(get_top_signals, limit=5, timeout=90)
-        await waiting.edit_text(format_top_signals(signals))
-    except Exception as e:
-        await waiting.edit_text(f"❌ خطا:\n{str(e)[:300]}")
-
-
-async def market_overview_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_allowed(update):
-        await reject_unauthorized(update)
+    # Heavy commands: background-ish by sending quick ack, then running.
+    if t in {"بهترین سیگنال"}:
+        await _reply(update, "در حال بررسی بهترین سیگنال...")
+        res = await asyncio.to_thread(scanner.best_signal)
+        await _reply(update, res.get("message", "سیگنال مناسبی پیدا نشد."))
         return
 
-    waiting = await update.message.reply_text("⏳ در حال بررسی بازار...")
-    try:
-        overview = await run_blocking(scan_market_overview, timeout=90)
-        await waiting.edit_text(format_market_overview_text(overview))
-    except Exception as e:
-        await waiting.edit_text(f"❌ خطا:\n{str(e)[:300]}")
-
-
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_allowed(update):
-        await reject_unauthorized(update)
+    if t in {"بررسی", "اسکن"}:
+        await _reply(update, "اسکن بازار شروع شد...")
+        res = await asyncio.to_thread(scanner.scan_report_fa)
+        await _reply(update, res)
         return
 
-    text = update.message.text if update.message else ""
-    days = parse_days_from_text(text)
-    parts = []
-
-    if format_signal_stats:
-        try:
-            try:
-                parts.append(format_signal_stats(days))
-            except TypeError:
-                parts.append(format_signal_stats())
-        except Exception as e:
-            parts.append(f"خطا در آمار سیگنال: {str(e)[:120]}")
-
-    await send_long_text(update, "\n\n".join(parts) if parts else "آماری موجود نیست.")
-
-
-async def reset_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if get_user_id(update) != OWNER_ID:
-        await reject_unauthorized(update)
+    # Settings commands
+    if t == "AI روشن" or t == "هوش مصنوعی روشن":
+        real_trade_manager.set_trade_setting("ai_enabled", True)
+        await _reply(update, "✅ هوش مصنوعی روشن شد.")
+        return
+    if t == "AI خاموش" or t == "هوش مصنوعی خاموش":
+        real_trade_manager.set_trade_setting("ai_enabled", False)
+        await _reply(update, "✅ هوش مصنوعی خاموش شد.")
+        return
+    if t == "یادگیری روشن":
+        real_trade_manager.set_trade_setting("learning_enabled", True)
+        await _reply(update, "✅ یادگیری روشن شد.")
+        return
+    if t == "یادگیری خاموش":
+        real_trade_manager.set_trade_setting("learning_enabled", False)
+        await _reply(update, "✅ یادگیری خاموش شد.")
         return
 
-    done = []
-    try:
-        if reset_signal_stats:
-            reset_signal_stats()
-            done.append("آمار سیگنال")
-    except Exception:
-        pass
-
-    await update.message.reply_text("✅ حذف آمار انجام شد." if done else "ماژول آمار در دسترس نیست.")
-
-
-async def symbol_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE, mode: str = "all") -> None:
-    if not is_allowed(update):
-        await reject_unauthorized(update)
+    if t.startswith("ترید دلار"):
+        val = float(t.replace("ترید دلار", "").strip())
+        real_trade_manager.set_trade_setting("position_size_usd", val)
+        await _reply(update, f"✅ حجم هر پوزیشن شد {val}$")
+        return
+    if t.startswith("ترید لوریج"):
+        val = int(t.replace("ترید لوریج", "").strip())
+        val = max(1, min(50, val))
+        real_trade_manager.set_trade_setting("leverage", val)
+        await _reply(update, f"✅ لوریج شد {val}x")
+        return
+    if t.startswith("حداکثر پوزیشن"):
+        val = int(t.replace("حداکثر پوزیشن", "").strip())
+        val = max(1, min(20, val))
+        real_trade_manager.set_trade_setting("max_positions", val)
+        await _reply(update, f"✅ حداکثر پوزیشن شد {val}")
+        return
+    if t.startswith("سرمایه ترید"):
+        val = float(t.replace("سرمایه ترید", "").strip())
+        real_trade_manager.set_trade_setting("initial_capital", val)
+        real_trade_manager.set_trade_setting("balance", val)
+        real_trade_manager.set_trade_setting("protected_balance", val)
+        await _reply(update, f"✅ سرمایه ترید شد {val}$")
+        return
+    if t.startswith("قفل ضرر"):
+        # Example: قفل ضرر 5 1
+        parts = t.split()
+        if len(parts) >= 4:
+            amount = float(parts[2])
+            hours = float(parts[3])
+            real_trade_manager.set_trade_setting("daily_loss_lock_amount", amount)
+            real_trade_manager.set_trade_setting("daily_lock_hours", hours)
+            await _reply(update, f"✅ قفل ضرر: {amount}$ برای {hours} ساعت")
+        else:
+            await _reply(update, "مثال: قفل ضرر 5 1")
         return
 
-    if not get_symbol_stats_report:
-        await update.message.reply_text("گزارش آمار ارزها در دسترس نیست.")
+    if t == "توقف اضطراری روشن":
+        real_trade_manager.set_trade_setting("emergency_stop", True)
+        await _reply(update, "⛔️ توقف اضطراری روشن شد.")
+        return
+    if t == "توقف اضطراری خاموش":
+        real_trade_manager.set_trade_setting("emergency_stop", False)
+        await _reply(update, "✅ توقف اضطراری خاموش شد.")
         return
 
-    days = parse_days_from_text(update.message.text if update.message else "")
-    try:
-        try:
-            text = get_symbol_stats_report(days, mode=mode)
-        except TypeError:
-            text = get_symbol_stats_report(days)
-        await send_long_text(update, text)
-    except Exception as e:
-        await update.message.reply_text(f"❌ خطا در آمار ارزها:\n{str(e)[:250]}")
-
-
-
-async def positions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_allowed(update):
-        await reject_unauthorized(update)
+    if t == "گزارش روزانه روشن":
+        daily_report.set_enabled(True)
+        await _reply(update, "✅ گزارش روزانه روشن شد.")
+        return
+    if t == "گزارش روزانه خاموش":
+        daily_report.set_enabled(False)
+        await _reply(update, "✅ گزارش روزانه خاموش شد.")
+        return
+    if t == "گزارش روزانه":
+        await _reply(update, daily_report.build_report_fa())
+        return
+    if t == "حالت محافظه‌کار":
+        real_trade_manager.set_trade_setting("conservative_mode", True)
+        await _reply(update, "✅ حالت محافظه‌کار فعال شد.")
+        return
+    if t == "حالت عادی":
+        real_trade_manager.set_trade_setting("conservative_mode", False)
+        await _reply(update, "✅ حالت عادی فعال شد.")
+        return
+    if t in {"بدترین کوین‌ها", "بدترین کوین ها"}:
+        rot = coin_rotation.summary()
+        worst = rot.get("worst", [])[:8]
+        msg = "ضعیف‌ترین‌ها:\n" + ("\n".join(f"{x.get('key')} امتیاز {x.get('score')}" for x in worst) if worst else "داده کافی نیست.")
+        await _reply(update, msg)
+        return
+    if t.startswith("آمار "):
+        await _reply(update, smart_stats_fa())
+        return
+    if t == "حذف آمار":
+        await _reply(update, "⚠️ ریست کامل آمار در مرحله نهایی با تایید جداگانه انجام می‌شود تا حافظه یادگیری پاک نشود.")
+        return
+    if t == "بازیابی":
+        await _reply(update, recovery_manager.startup_report_fa())
         return
 
-    if get_real_trade_status_text:
-        try:
-            await send_long_text(update, get_real_trade_status_text())
-            return
-        except Exception as e:
-            await update.message.reply_text(f"❌ خطا در دریافت پوزیشن‌های توبیت:\n{str(e)[:250]}")
-            return
-
-    await update.message.reply_text("ماژول ترید واقعی توبیت فعال نیست.")
-
-
-async def active_signals_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_allowed(update):
-        await reject_unauthorized(update)
+    if t == "گزارش خطا" and _owner(update):
+        await _reply(update, tail_log(20) or "لاگ خالی است.")
         return
 
-    if not format_active_signals:
-        await update.message.reply_text("ماژول Tracker فعال نیست.")
-        return
-
-    try:
-        await send_long_text(update, format_active_signals())
-    except Exception as e:
-        await update.message.reply_text(str(e)[:250])
+    await _reply(update, help_fa())
 
 
-async def ai_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_allowed(update):
-        await reject_unauthorized(update)
-        return
-
-    waiting = None
-    try:
-        waiting = await update.message.reply_text("⏳ در حال آماده‌سازی وضعیت AI...")
-    except Exception:
-        pass
-
-    parts = []
-    for fn in [format_ai_status, format_learning_summary, format_similarity_status, format_rotation_report, format_ghost_report, format_slot_report]:
-        if not fn:
-            continue
-        try:
-            parts.append(await run_blocking(fn, timeout=20))
-        except Exception as e:
-            logger.warning(f"ai_status part failed: {getattr(fn, '__name__', fn)} {e}")
-
-    text = "\n\n".join(parts) if parts else "AI Status در دسترس نیست."
-    if waiting:
-        try:
-            await waiting.edit_text(text[:3900])
-            if len(text) > 3900:
-                for i in range(3900, min(len(text), 12000), 3900):
-                    await update.message.reply_text(text[i:i+3900])
-            return
-        except Exception:
-            pass
-    await send_long_text(update, text)
+def ai_status_fa() -> str:
+    return integration_status.full_status_fa()
 
 
-async def learning_memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_allowed(update):
-        await reject_unauthorized(update)
-        return
-
-    parts = []
-    if format_learning_summary:
-        try:
-            parts.append(format_learning_summary())
-        except Exception:
-            pass
-    try:
-        parts.append(format_similarity_status())
-    except Exception:
-        pass
-    if format_smart_stats:
-        try:
-            parts.append(format_smart_stats())
-        except Exception:
-            pass
-    await send_long_text(update, "\n\n".join(parts) if parts else "حافظه ربات در دسترس نیست.")
+def smart_stats_fa() -> str:
+    return "\n\n".join([
+        signal_tracker.summary_fa(),
+        ai_memory.summary_fa(),
+        coin_learning.summary_fa(),
+        ghost_signals.summary_fa(),
+    ])
 
 
-async def coin_behavior_command(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol: Optional[str] = None) -> None:
-    if not is_allowed(update):
-        await reject_unauthorized(update)
-        return
-
-    if not format_coin_behavior:
-        await update.message.reply_text("گزارش رفتار کوین در دسترس نیست.")
-        return
-
-    symbol = symbol or normalize_symbol_text(update.message.text or "")
+def coin_behavior_fa(symbol: str) -> str:
     if not symbol:
-        await update.message.reply_text("مثال: رفتار بیتکوین")
-        return
-
-    try:
-        await send_long_text(update, format_coin_behavior(symbol))
-    except Exception as e:
-        await update.message.reply_text(f"❌ خطا:\n{str(e)[:250]}")
-
-
-async def rotation_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_allowed(update):
-        await reject_unauthorized(update)
-        return
-
-    if not format_rotation_report:
-        await update.message.reply_text("گزارش Coin Rotation در دسترس نیست.")
-        return
-
-    try:
-        await send_long_text(update, format_rotation_report())
-    except Exception as e:
-        await update.message.reply_text(f"❌ خطا:\n{str(e)[:250]}")
-
-
-async def ghost_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_allowed(update):
-        await reject_unauthorized(update)
-        return
-
-    if not format_ghost_report:
-        await update.message.reply_text("گزارش سیگنال‌های مخفی در دسترس نیست.")
-        return
-
-    try:
-        await send_long_text(update, format_ghost_report())
-    except Exception as e:
-        await update.message.reply_text(f"❌ خطا:\n{str(e)[:250]}")
-
-
-async def slot_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_allowed(update):
-        await reject_unauthorized(update)
-        return
-
-    if not format_slot_report:
-        await update.message.reply_text("گزارش Slot Manager در دسترس نیست.")
-        return
-
-    try:
-        await send_long_text(update, format_slot_report())
-    except Exception as e:
-        await update.message.reply_text(f"❌ خطا:\n{str(e)[:250]}")
-
-
-# ============================================================
-# Register signal after sending
-# ============================================================
-
-async def register_sent_signal(signal: Dict[str, Any], sent_message: Any, source: str = "auto_signal") -> None:
-    """
-    Register a signal after it is sent to Telegram.
-
-    Real-trading safety architecture:
-    - Auto signals keep the existing AI/scanner/ghost/learning flow untouched.
-    - The real order request is sent through real_trade_manager.
-    - If Toobit accepts the request, the signal enters tracking as PENDING_REAL_CONFIRM.
-    - No false "order not registered / slot not entered" message is sent for delayed Toobit visibility.
-    - If real_trade_manager blocks the order for a true safety reason, the signal is not tracked.
-    """
-    try:
-        chat_id = sent_message.chat_id
-        message_id = sent_message.message_id
-
-        meta = attach_signal_metadata(signal, message_id, chat_id, source)
-
-        if source == "auto_signal":
-            if not open_real_position_from_signal:
-                logger.error("REAL order module unavailable; auto signal was not tracked.")
-                try:
-                    await sent_message.reply_text("⛔ سفارش واقعی ارسال نشد: ماژول توبیت در دسترس نیست.")
-                except Exception:
-                    pass
-                return
-
-            try:
-                real_result = open_real_position_from_signal(meta)
-            except Exception as e:
-                logger.error(f"open_real_position_from_signal error: {e}")
-                try:
-                    await sent_message.reply_text(f"⛔ سفارش واقعی به دلیل خطای ایمنی ارسال نشد:\n{str(e)[:250]}")
-                except Exception:
-                    pass
-                return
-
-            if not isinstance(real_result, dict):
-                logger.error(f"open_real_position_from_signal returned non-dict: {real_result}")
-                return
-
-            if not real_result.get("ok"):
-                reason = real_result.get("error") or real_result.get("message") or real_result.get("data") or "نامشخص"
-                logger.warning(f"real Toobit order blocked/not accepted; signal will not be tracked: {real_result}")
-
-                # This is a true safety/block condition, not the old delayed-position false error.
-                # Never send the old misleading delayed-position error text.
-                try:
-                    await sent_message.reply_text(f"⛔ سفارش واقعی ارسال/تأیید نشد:\n{str(reason)[:250]}")
-                except Exception:
-                    pass
-                return
-
-            logger.info(f"real Toobit order accepted/pending confirmation: {real_result}")
-
-            meta["real_order"] = real_result
-            meta["real_status"] = (
-                real_result.get("real_status")
-                or real_result.get("status")
-                or "PENDING_REAL_CONFIRM"
-            )
-            meta["real_signal_id"] = real_result.get("signal_id") or meta.get("signal_id") or meta.get("id")
-            meta["position_size_usd"] = (
-                real_result.get("position_size_usd")
-                or meta.get("position_size_usd")
-            )
-            meta["leverage"] = real_result.get("leverage") or meta.get("leverage")
-
-        if add_signal_to_tracking:
-            try:
-                add_signal_to_tracking(meta)
-            except TypeError:
-                try:
-                    add_signal_to_tracking(
-                        user_id=OWNER_ID or chat_id,
-                        chat_id=chat_id,
-                        message_id=message_id,
-                        result=meta,
-                    )
-                except TypeError:
-                    add_signal_to_tracking(OWNER_ID or chat_id, chat_id, message_id, meta)
-            except Exception as e:
-                logger.error(f"add_signal_to_tracking error: {e}")
-
-    except Exception as e:
-        logger.error(f"register_sent_signal error: {e}")
-
-
-# ============================================================
-# Auto Signal Loop
-# ============================================================
-
-def auto_signal_key(signal: Dict[str, Any]) -> str:
-    return f"{signal.get('symbol')}_{signal.get('direction')}"
-
-
-def auto_signal_gate(signal: Dict[str, Any]) -> tuple[bool, str, bool]:
-    """
-    Returns: (can_send_to_telegram, reason, save_as_ghost)
-
-    Movement Hunter rule:
-    - Classic score / classic entry_confirmed are NOT decision makers anymore.
-    - AI Movement Hunter must decide REAL/ENTRY/ACTIVE.
-    - Real-trade safety checks still remain fully active.
-    """
-    try:
-        st = load_bot_settings()
-
-        if not st.get("trading_enabled", True):
-            return False, "BOT_TRADING_DISABLED", True
-
-        if not st.get("auto_signal_enabled", bool(AUTO_SIGNAL_ENABLED)):
-            return False, "AUTO_SIGNAL_DISABLED", False
-
-        if signal.get("status") != "ACTIVE":
-            return False, "SIGNAL_NOT_ACTIVE", True
-
-        if signal.get("direction") not in ["LONG", "SHORT"]:
-            return False, "BAD_DIRECTION", True
-
-        # Required for real order placement, but not a classic-score gate.
-        if signal.get("entry") is None or (signal.get("stop_loss") is None and signal.get("sl") is None) or signal.get("tp1") is None:
-            return False, "MISSING_TRADE_LEVELS", True
-
-        # AI is the only signal authority.
-        if not is_ai_real_signal(signal):
-            return False, f"AI_NOT_REAL:{movement_decision(signal)}:{movement_phase(signal)}", True
-
-        phase = movement_phase(signal)
-        # Keep only truly late/exhausted/range-after-move states blocked.
-        # MID is intentionally allowed because scanner.py can already return
-        # valid ACTIVE Movement Hunter signals with phase=MID.
-        if phase in MOVEMENT_LATE_PHASES:
-            return False, f"MOVE_NOT_FRESH:{phase}", True
-
-        key = auto_signal_key(signal)
-        now = int(time.time())
-        last = int(LAST_AUTO_SIGNAL_TIME.get(key, 0))
-        if now - last < AUTO_SIGNAL_COOLDOWN_SECONDS:
-            return False, "COOLDOWN", False
-
-        # Telegram auto-signal delivery must not be blocked by the real-order
-        # readiness check. Real trading safety is enforced later inside
-        # register_sent_signal() -> open_real_position_from_signal(), where
-        # leverage/margin/isolated/TP/SL/order checks can safely block the order.
-        # This fixes the case where scanner finds ACTIVE_SIGNALS but no Telegram
-        # signal is sent because the auto gate saves them as Ghost.
-        return True, "OK", False
-
-    except Exception as e:
-        return False, f"GATE_ERROR: {str(e)[:120]}", True
-
-def can_send_auto_signal(signal: Dict[str, Any]) -> bool:
-    ok, _reason, _ghost = auto_signal_gate(signal)
-    return ok
-
-
-def save_auto_signal_as_ghost(signal: Dict[str, Any], reason: str) -> None:
-    if not create_ghost_signal:
-        return
-
-    try:
-        snap = signal.get("snapshot") if isinstance(signal.get("snapshot"), dict) else {}
-        snap = dict(snap)
-        snap.update(movement_metadata(signal))
-        snap["auto_gate_reason"] = reason
-        create_ghost_signal(
-            symbol=signal.get("symbol"),
-            direction=signal.get("direction"),
-            entry=signal.get("entry"),
-            stop_loss=signal.get("stop_loss") or signal.get("sl"),
-            tp1=signal.get("tp1"),
-            tp2=signal.get("tp2"),
-            score=signal.get("score"),
-            snapshot=snap,
-            source="auto_signal_gate",
-            reason=reason,
-        )
-        logger.info(f"auto Movement Hunter candidate saved as ghost: {signal.get('symbol')} {signal.get('direction')} | {reason}")
-    except TypeError:
-        try:
-            create_ghost_signal(
-                signal.get("symbol"),
-                signal.get("direction"),
-                signal.get("entry"),
-                signal.get("stop_loss") or signal.get("sl"),
-                signal.get("tp1"),
-                signal.get("tp2"),
-                signal.get("score"),
-                {**(signal.get("snapshot", {}) if isinstance(signal.get("snapshot"), dict) else {}), **movement_metadata(signal), "auto_gate_reason": reason},
-                "auto_signal_gate",
-                reason,
-            )
-        except Exception as e:
-            logger.error(f"save_auto_signal_as_ghost fallback error: {e}")
-    except Exception as e:
-        logger.error(f"save_auto_signal_as_ghost error: {e}")
-
-def mark_auto_signal_sent(signal: Dict[str, Any]) -> None:
-    LAST_AUTO_SIGNAL_TIME[auto_signal_key(signal)] = int(time.time())
-
-
-async def auto_signal_loop(app: Application) -> None:
-    if not AUTO_SIGNAL_ENABLED or not OWNER_ID:
-        logger.info("Auto signal disabled or OWNER_ID missing")
-        return
-
-    await asyncio.sleep(10)
-
-    while True:
-        try:
-            result = await run_blocking(scan_for_auto_signals, max_results=3, allow_ghost=True, timeout=120)
-            signals = result.get("signals") or result.get("all_valid_signals") or []
-            logger.info(
-                f"auto_signal_loop candidates: signals={len(signals)} "
-                f"mode={result.get('mode')} free_slots={result.get('free_slots')}"
-            )
-
-            for signal in signals:
-                can_send, reason, should_ghost = auto_signal_gate(signal)
-                logger.info(
-                    f"auto_signal_gate: {signal.get('symbol')} {signal.get('direction')} "
-                    f"status={signal.get('status')} phase={movement_phase(signal)} "
-                    f"decision={movement_decision(signal)} can_send={can_send} reason={reason}"
-                )
-                if not can_send:
-                    if should_ghost:
-                        save_auto_signal_as_ghost(signal, reason)
-                    continue
-
-                sent = await app.bot.send_message(chat_id=OWNER_ID, text=format_signal_message(signal))
-                await register_sent_signal(signal, sent, "auto_signal")
-                mark_auto_signal_sent(signal)
-                await asyncio.sleep(1)
-
-        except Exception as e:
-            logger.error(f"auto_signal_loop error: {e}")
-
-        await asyncio.sleep(max(60, int(AUTO_SCAN_INTERVAL_MINUTES) * 60))
-
-
-# ============================================================
-# Dynamic Profit Protection Loop - Special AI Update
-# ============================================================
-
-async def dynamic_profit_protection_loop(app: Application) -> None:
-    """Special high-priority update: monitor REAL positions after entry.
-
-    It applies to both LONG and SHORT, only exits when the position is already
-    profitable, does not move/touch SL, and lets real_trade_manager record the
-    reason and learning outcome.
-    """
-    if not check_dynamic_profit_protection or not OWNER_ID:
-        logger.warning("Dynamic Profit Protection is not available")
-        return
-
-    await asyncio.sleep(20)
-
-    while True:
-        try:
-            result = await run_blocking(check_dynamic_profit_protection, timeout=45)
-            if isinstance(result, dict) and result.get("ok"):
-                closed_rows = [r for r in (result.get("results") or []) if isinstance(r, dict) and r.get("closed")]
-                for r in closed_rows[:10]:
-                    text = (
-                        "🧠 خروج زودتر AI در سود\n"
-                        f"نماد: {r.get('symbol')}\n"
-                        f"جهت: {fa_direction(r.get('direction'))}\n"
-                        f"قیمت خروج: {r.get('exit_price')}\n"
-                        f"سود تقریبی حرکت: {r.get('profit_pct')}%\n"
-                        f"علت: {r.get('reason')}"
-                    )
-                    sim_note = format_dynamic_result_similarity_note(r)
-                    if sim_note:
-                        text += "\n" + sim_note
-                    await app.bot.send_message(chat_id=OWNER_ID, text=text)
-                    await asyncio.sleep(1)
-            elif isinstance(result, dict) and not result.get("ok"):
-                logger.warning(f"Dynamic Profit Protection error: {result.get('error')}")
-        except Exception as e:
-            logger.error(f"dynamic_profit_protection_loop error: {e}")
-
-        await asyncio.sleep(max(5, int(DYNAMIC_PROFIT_LOOP_INTERVAL_SECONDS)))
-
-
-# ============================================================
-# Signal Tracker Loop
-# ============================================================
-
-def _event_dedup_key(event: Dict[str, Any]) -> str:
-    signal_id = str(event.get("signal_id") or "")
-    event_type = str(event.get("event_type") or event.get("type") or "")
-    reply_to = str(event.get("reply_to_message_id") or "")
-    text = str(event.get("message") or event.get("text") or "")
-    if signal_id or event_type:
-        return f"{signal_id}:{event_type}:{reply_to}:{hash(text[:200])}"
-    return f"{reply_to}:{hash(text[:200])}"
-
-
-def _should_send_event(event: Dict[str, Any]) -> bool:
-    now = int(time.time())
-    # Periodically clean old keys so the process memory stays tiny.
-    for k, ts in list(RECENT_SENT_EVENT_KEYS.items()):
-        if now - int(ts or 0) > EVENT_DEDUP_SECONDS:
-            RECENT_SENT_EVENT_KEYS.pop(k, None)
-    key = _event_dedup_key(event)
-    last = int(RECENT_SENT_EVENT_KEYS.get(key, 0) or 0)
-    if now - last <= EVENT_DEDUP_SECONDS:
-        return False
-    RECENT_SENT_EVENT_KEYS[key] = now
-    return True
-
-
-async def signal_tracking_loop(app: Application) -> None:
-    if not check_active_signals and not check_real_position_events_for_tracker:
-        logger.warning("Signal tracker and real-position sync are not available")
-        return
-
-    await asyncio.sleep(15)
-
-    while True:
-        try:
-            events: List[Dict[str, Any]] = []
-
-            if check_active_signals:
-                tracker_events = await run_blocking(check_active_signals, timeout=45) or []
-                if isinstance(tracker_events, dict):
-                    tracker_events = [tracker_events]
-                events.extend([e for e in tracker_events if isinstance(e, dict)])
-
-            # Dedicated Toobit sync layer: confirms/repairs TP-SL and reports real closes.
-            # Kept behind a switch and deduplicated to prevent duplicate Telegram messages.
-            if REAL_SYNC_LOOP_ENABLED and check_real_position_events_for_tracker:
-                try:
-                    sync_events = await run_blocking(check_real_position_events_for_tracker, timeout=45) or []
-                    if isinstance(sync_events, dict):
-                        sync_events = [sync_events]
-                    events.extend([e for e in sync_events if isinstance(e, dict)])
-                except Exception as sync_error:
-                    logger.error(f"real_position_sync loop error: {sync_error}")
-
-            for event in events:
-                text = event.get("message") or event.get("text")
-                chat_id = event.get("chat_id") or OWNER_ID
-                reply_to_message_id = event.get("reply_to_message_id")
-
-                if not text or not chat_id:
-                    continue
-                if not _should_send_event(event):
-                    continue
-
-                try:
-                    await app.bot.send_message(
-                        chat_id=chat_id,
-                        text=text,
-                        reply_to_message_id=reply_to_message_id,
-                    )
-                except Exception:
-                    await app.bot.send_message(chat_id=chat_id, text=text)
-
-                await asyncio.sleep(1)
-
-        except Exception as e:
-            logger.error(f"signal_tracking_loop error: {e}")
-
-        await asyncio.sleep(max(2, int(REAL_TRACKING_LOOP_INTERVAL_SECONDS)))
-
-
-# ============================================================
-# Text handler
-# ============================================================
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_allowed(update):
-        await reject_unauthorized(update)
-        return
-
-    text = (update.message.text or "").strip()
-    if not text:
-        return
-
-    low = text.lower().strip()
-
-    # High-priority safety commands first. They must never wait behind AI/scan/status work.
-    if low in ["ترید خاموش", "خاموش ترید", "غیرفعال ترید", "ترید غیرفعال", "ترید واقعی خاموش", "خاموش ترید واقعی", "غیرفعال ترید واقعی", "ترید واقعی غیرفعال"]:
-        await disable_real_trade_command(update, context)
-        return
-
-    if low in ["توقف اضطراری", "استاپ اضطراری", "خاموش اضطراری", "توقف اضطراری واقعی", "استاپ اضطراری واقعی", "خاموش اضطراری واقعی"]:
-        await real_emergency_stop_command(update, context)
-        return
-
-    if low in ["ترید فعال", "فعال ترید", "فعال سازی ترید", "فعال‌سازی ترید", "ترید واقعی فعال", "فعال ترید واقعی", "فعال سازی ترید واقعی", "فعال‌سازی ترید واقعی"]:
-        await enable_real_trade_command(update, context)
-        return
-
-    # Removed manual tracking commands
-    if low in ["زیر نظر", "زیرنظر", "زیر نظر بگیر", "نظر"]:
-        await update.message.reply_text("نیازی به دستور زیر نظر نیست؛ همه سیگنال‌های معتبر خودکار Track می‌شوند.")
-        return
-
-    # Real Toobit trade commands - must be checked before generic trade commands.
-    if low in ["ترید واقعی", "وضعیت ترید واقعی", "ترید توبیت", "وضعیت ترید توبیت"]:
-        await real_trade_status_command(update, context)
-        return
-
-    if low in ["بالانس توبیت", "موجودی توبیت"]:
-        await toobit_balance_command(update, context)
-        return
-
-    if low.startswith("سرمایه واقعی") or low.startswith("سرمایه ترید واقعی"):
-        await set_real_capital_command(update, context)
-        return
-
-    if low.startswith("ترید واقعی دلار") or low.startswith("حجم واقعی") or low.startswith("حجم ترید واقعی"):
-        await set_real_position_size_command(update, context)
-        return
-
-    if low.startswith("لوریج واقعی") or low.startswith("لوریج ترید واقعی"):
-        await set_real_leverage_command(update, context)
-        return
-
-    if low.startswith("حداکثر پوزیشن واقعی") or low.startswith("حداکثر پوزیشن توبیت"):
-        await set_real_max_positions_command(update, context)
-        return
-
-    if low.startswith("حد ضرر روزانه واقعی") or low.startswith("حدضرر روزانه واقعی") or low.startswith("حد ضرر توبیت"):
-        await set_real_daily_loss_limit_command(update, context)
-        return
-
-    if low.startswith("قفل ضرر واقعی") or low.startswith("قفل ضرر توبیت"):
-        await set_real_lock_hours_command(update, context)
-        return
-
-    if low in ["ترید واقعی فعال", "فعال ترید واقعی", "فعال سازی ترید واقعی", "فعال‌سازی ترید واقعی"]:
-        await enable_real_trade_command(update, context)
-        return
-
-    if low in ["ترید واقعی خاموش", "خاموش ترید واقعی", "غیرفعال ترید واقعی", "ترید واقعی غیرفعال"]:
-        await disable_real_trade_command(update, context)
-        return
-
-    if low in ["توقف اضطراری واقعی", "استاپ اضطراری واقعی", "خاموش اضطراری واقعی"]:
-        await real_emergency_stop_command(update, context)
-        return
-
-    if low == "ریست ترید واقعی":
-        await reset_real_trade_command(update, context)
-        return
-
-    # Real risk protection commands.
-    if (
-        low.startswith("حد ضرر روزانه")
-        or low.startswith("حدضرر روزانه")
-        or low.startswith("ضرر روزانه")
-    ):
-        await set_daily_loss_limit_command(update, context)
-        return
-
-    if low.startswith("قفل ضرر"):
-        await set_daily_lock_hours_command(update, context)
-        return
-
-    # Trade commands - generic names now control REAL / TOBIT only.
-    if low in ["ترید", "وضعیت ترید", "تریدها"]:
-        await trade_status_command(update, context)
-        return
-
-    if low in ["ترید فعال", "فعال ترید", "فعال سازی ترید", "فعال‌سازی ترید"]:
-        await enable_real_trade_command(update, context)
-        return
-
-    if low in ["ترید خاموش", "خاموش ترید", "غیرفعال ترید", "ترید غیرفعال"]:
-        await disable_real_trade_command(update, context)
-        return
-
-    if low in ["توقف اضطراری", "استاپ اضطراری", "خاموش اضطراری"]:
-        await real_emergency_stop_command(update, context)
-        return
-
-    if low in ["همگام سازی", "همگام‌سازی", "همگام سازی پوزیشن ها", "همگام سازی پوزیشن‌ها", "همگام‌سازی پوزیشن ها", "همگام‌سازی پوزیشن‌ها", "سینک", "سینک پوزیشن ها", "سینک پوزیشن‌ها", "sync", "sync positions"]:
-        await sync_real_positions_command(update, context)
-        return
-
-    if low in ["بررسی خروج سود", "خروج سود ai", "خروج سود AI", "محافظ سود", "محافظ سود ai", "محافظ سود AI", "dynamic profit", "profit protection"]:
-        await dynamic_profit_protection_command(update, context)
-        return
-
-    if low in ["بستن همه", "بستن همه پوزیشن ها", "بستن همه پوزیشن‌ها", "close all", "close all positions"]:
-        await close_all_positions_command(update, context)
-        return
-
-    if low.startswith("بستن ") or low.startswith("close "):
-        await close_symbol_position_command(update, context)
-        return
-
-    if low in ["آمار ترید", "امار ترید"]:
-        await trade_stats_command(update, context)
-        return
-
-    if low.startswith("سرمایه ترید"):
-        await set_capital_command(update, context)
-        return
-
-    if low.startswith("ترید دلار"):
-        await set_trade_margin_command(update, context)
-        return
-
-    if low.startswith("ترید لوریج") or low.startswith("لوریج دلار") or low.startswith("لوریج"):
-        await set_leverage_command(update, context)
-        return
-
-    if low.startswith("حداکثر پوزیشن"):
-        await set_max_positions_command(update, context)
-        return
-
-    if low == "حجم پوزیشن":
-        await position_size_command(update, context)
-        return
-
-    if low == "ریست ترید":
-        await reset_trade_command(update, context)
-        return
-
-    # Main commands
-    if low in ["بهترین سیگنال", "بهترین", "top", "best"]:
-        await best_signal_command(update, context)
-        return
-
-    if low in ["بررسی", "بررسی بازار", "بازار", "وضعیت بازار"]:
-        await market_overview_command(update, context)
-        return
-
-    if low in ["حذف آمار", "حذف امار", "ریست آمار", "reset stats"]:
-        await reset_stats_command(update, context)
-        return
-
-    if low.startswith("آمار ارز") or low.startswith("امار ارز"):
-        await symbol_stats_command(update, context, mode="all")
-        return
-
-    if low.startswith("بهترین ارز") or low.startswith("بهترین کوین"):
-        await symbol_stats_command(update, context, mode="best")
-        return
-
-    if low.startswith("بدترین ارز") or low.startswith("بدترین کوین"):
-        await symbol_stats_command(update, context, mode="worst")
-        return
-
-    if low.startswith("آمار") or low.startswith("امار") or low == "stats":
-        await stats_command(update, context)
-        return
-
-    if low in ["پوزیشن‌ها", "پوزیشن ها", "positions"]:
-        await positions_command(update, context)
-        return
-
-    if low in ["سیگنال‌های فعال", "سیگنال های فعال", "active signals"]:
-        await active_signals_command(update, context)
-        return
-
-    if low in ["هوش مصنوعی", "ai", "وضعیت ai", "وضعیت هوش مصنوعی"]:
-        await ai_status_command(update, context)
-        return
-
-    if low in ["حافظه ربات", "حافظه ai", "یادگیری", "learning"]:
-        await learning_memory_command(update, context)
-        return
-
-    if low.startswith("رفتار "):
-        await coin_behavior_command(update, context)
-        return
-
-    if low in ["ریسک کوین‌ها", "ریسک کوین ها", "بهترین کوین‌ها", "بهترین کوین ها", "بدترین کوین‌ها", "بدترین کوین ها", "چرخش کوین", "coin rotation"]:
-        await rotation_command(update, context)
-        return
-
-    if low in ["سیگنال‌های مخفی", "سیگنال های مخفی", "ghost", "ghost signals"]:
-        await ghost_command(update, context)
-        return
-
-    if low in ["اسلات‌ها", "اسلات ها", "slots", "slot"]:
-        await slot_command(update, context)
-        return
-
-    symbol = normalize_symbol_text(text)
-    if symbol:
-        await analyze_request(update, context, symbol)
-        return
-
-    await update.message.reply_text(
-        "متوجه نشدم. مثلا بنویس:\n"
-        "تحلیل بیتکوین\n"
-        "بهترین سیگنال\n"
-        "بررسی\n"
-        "وضعیت ترید"
+        return "نماد را درست وارد کن. مثال: رفتار کوین DOGE"
+    long_p = coin_learning.profile(symbol, "LONG").get("profile", {})
+    short_p = coin_learning.profile(symbol, "SHORT").get("profile", {})
+    return (
+        f"🧬 رفتار {coins_fa.display_symbol(symbol)}\n"
+        f"LONG: نمونه {long_p.get('samples',0)} | WR {long_p.get('win_rate',0)}% | {long_p.get('personality','UNKNOWN')}\n"
+        f"SHORT: نمونه {short_p.get('samples',0)} | WR {short_p.get('win_rate',0)}% | {short_p.get('personality','UNKNOWN')}"
     )
 
 
-# ============================================================
-# Telegram application
-# ============================================================
+def help_fa() -> str:
+    return command_registry.help_fa()
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error("Telegram error", exc_info=context.error)
+
+
+async def send_routed_results(app: Application, routed: List[Dict[str, Any]]) -> None:
+    """
+    Send only user-visible routed signals and register their Telegram message IDs
+    so later TP/SL replies stay attached to the original message.
+    Ghosts are tracked silently unless explicitly requested.
+    """
+    if not OWNER_ID:
+        return
+    for r in routed or []:
+        if not r.get("ok") or not r.get("routed"):
+            continue
+        typ = str(r.get("type", ""))
+        decision = r.get("decision", {}) or {}
+        signal_id = r.get("signal_id") or r.get("trade", {}).get("signal_id") or decision.get("record_id")
+        if not signal_id:
+            continue
+        # Keep Ghost silent by default.
+        if "GHOST" in typ:
+            continue
+        if typ == "SETUP":
+            text = reply_manager.setup_message_fa(decision)
+        else:
+            text = reply_manager.active_signal_message_fa(decision)
+        msg = await app.bot.send_message(chat_id=OWNER_ID, text=text)
+        reply_manager.register_signal_message(
+            signal_id=str(signal_id),
+            chat_id=OWNER_ID,
+            message_id=msg.message_id,
+            symbol=decision.get("symbol", ""),
+            direction=decision.get("direction", ""),
+            signal_type=typ,
+        )
+
+
+async def auto_scan_loop(app: Application) -> None:
+    while True:
+        try:
+            if AUTO_SIGNAL_ENABLED:
+                # Heavy work in thread so event loop stays responsive.
+                routed = await asyncio.to_thread(scanner.auto_scan_and_route)
+                await send_routed_results(app, routed)
+        except Exception as e:
+            record_error(e, module="bot", function="auto_scan_loop")
+        await asyncio.sleep(max(30, int(AUTO_SCAN_INTERVAL_SECONDS)))
+
+
+async def tracker_loop(app: Application) -> None:
+    while True:
+        try:
+            await asyncio.to_thread(scanner.update_active_from_market)
+            routed = await asyncio.to_thread(scanner.process_watching_setups)
+            await send_routed_results(app, routed)
+            await asyncio.to_thread(real_position_sync.confirm_all_pending_slots)
+            await asyncio.to_thread(reply_manager.queue_recent_results_once)
+            await asyncio.to_thread(market_scanner.scan_market, DEFAULT_SYMBOLS[:20], None, 120, None, True)
+        except Exception as e:
+            record_error(e, module="bot", function="tracker_loop")
+        await asyncio.sleep(20)
 
 
 async def post_init(app: Application) -> None:
-    asyncio.create_task(auto_signal_loop(app))
-    asyncio.create_task(dynamic_profit_protection_loop(app))
-    asyncio.create_task(signal_tracking_loop(app))
+    recovery_manager.startup_recovery()
+    app.create_task(auto_scan_loop(app), name=AUTO_TASK_NAME)
+    app.create_task(tracker_loop(app), name=TRACKER_TASK_NAME)
+    app.create_task(reply_sender_loop(app), name="reply_sender_loop")
+    app.create_task(daily_report_loop(app), name="daily_report_loop")
 
 
-def build_application() -> Application:
+
+async def reply_sender_loop(app: Application) -> None:
+    while True:
+        try:
+            rows = reply_manager.pop_pending_replies(20)
+            for r in rows:
+                await app.bot.send_message(
+                    chat_id=r["chat_id"],
+                    text=r["text"],
+                    reply_to_message_id=r.get("reply_to_message_id"),
+                )
+        except Exception as e:
+            record_error(e, module="bot", function="reply_sender_loop")
+        await asyncio.sleep(3)
+
+
+async def daily_report_loop(app: Application) -> None:
+    while True:
+        try:
+            msg = daily_report.maybe_build_daily_report(force=False)
+            if msg and OWNER_ID:
+                await app.bot.send_message(chat_id=OWNER_ID, text=msg)
+        except Exception as e:
+            record_error(e, module="bot", function="daily_report_loop")
+        await asyncio.sleep(1800)
+
+
+def initialize_all() -> None:
+    users.initialize()
+    ai_memory.initialize_memory_files()
+    coin_learning.initialize()
+    coin_risk.initialize()
+    coin_rotation.initialize()
+    sr_learning.initialize()
+    ghost_signals.initialize()
+    slot_manager.initialize()
+    signal_tracker.initialize()
+    real_trade_manager.initialize()
+    reply_manager.initialize()
+    daily_report.initialize()
+
+
+def build_app() -> Application:
+    if Application is Any or Application is None or CommandHandler is None or MessageHandler is None or filters is None:
+        raise RuntimeError("python-telegram-bot is not installed. Run: pip install -r requirements.txt")
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is not set")
-
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).concurrent_updates(True).build()
-
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("stats", stats_command))
-    app.add_handler(CommandHandler("positions", positions_command))
-    app.add_handler(CommandHandler("active", active_signals_command))
-    app.add_handler(CommandHandler("ai", ai_status_command))
-    app.add_handler(CommandHandler("resetstats", reset_stats_command))
-
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.add_error_handler(error_handler)
-
+        raise RuntimeError("BOT_TOKEN is missing")
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("id", id_cmd))
+    app.add_handler(CommandHandler("adduser", adduser_cmd))
+    app.add_handler(CommandHandler("removeuser", removeuser_cmd))
+    app.add_handler(CommandHandler("listusers", listusers_cmd))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     return app
 
 
 def main() -> None:
-    app = build_application()
-    logger.info("Crypto AI Bot started")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, close_loop=False)
+    app = build_app()
+    app.run_polling(close_loop=False)
 
 
 if __name__ == "__main__":
