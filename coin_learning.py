@@ -327,7 +327,7 @@ def _compact_snapshot(snapshot: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "early_5m_trigger", "multi_tf_alignment", "late_entry", "pump_dump_chase",
         "early_5m_active", "early_5m_score", "multi_tf_active", "late_entry_flag",
         "rr_filter", "reject_reason", "valid_gate",
-        "prediction_score", "expected_move_atr", "reversal_risk_score", "move_state", "trap_risk",
+        "prediction_score", "expected_move_atr", "reversal_risk_score", "move_state", "trap_risk", "move_phase", "freshness_score", "move_done_pct", "movement_type", "ai_score",
         "result_source", "move_percent", "exit_price", "exit_reason", "early_profit_exit",
     ]
     out = {k: snapshot.get(k) for k in keys if snapshot.get(k) is not None}
@@ -503,6 +503,9 @@ def _learn_condition_matrix(b: Dict[str, Any], snap: Dict[str, Any], weight: flo
         ("VWAP", str(snap.get("vwap_status") or "NA").upper()),
         ("EMA", str(snap.get("ema_structure_15m") or "NA").upper()),
         ("STATE", str(snap.get("move_state") or ((snap.get("state_awareness") or {}).get("move_state") if isinstance(snap.get("state_awareness"), dict) else None) or "NA").upper()),
+        ("MOVE_PHASE", str(snap.get("move_phase") or "NA").upper()),
+        ("FRESHNESS", _bucketed_number(snap.get("freshness_score"), 10, min_value=0, max_value=100)),
+        ("MOVE_DONE", _bucketed_number(snap.get("move_done_pct"), 10, min_value=0, max_value=100)),
         ("TRAP", str(snap.get("trap_risk") or ((snap.get("liquidity_trap") or {}).get("trap_risk") if isinstance(snap.get("liquidity_trap"), dict) else None) or "NA").upper()),
         ("PRED", _bucketed_number(snap.get("prediction_score"), 10, min_value=0, max_value=100)),
         ("REVERSAL", _bucketed_number(snap.get("reversal_risk_score"), 10, min_value=0, max_value=100)),
