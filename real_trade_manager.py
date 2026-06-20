@@ -220,6 +220,87 @@ def _calc_move_percent(direction: str, entry: float, price: float) -> float:
     return ((p2 - e) / e) * 100.0
 
 
+
+
+def _movement_hunter_metadata(source: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Extract AI Movement Hunter metadata without affecting real-order safety.
+
+    Real trading still uses the existing Toobit/risk checks.  This helper only
+    preserves the new architecture fields so open/closed REAL positions can be
+    learned later as movement-hunter outcomes instead of classic-score trades.
+    """
+    if not isinstance(source, dict):
+        return {}
+
+    snap = source.get("snapshot") if isinstance(source.get("snapshot"), dict) else {}
+    ai_decision = source.get("ai_decision") if isinstance(source.get("ai_decision"), dict) else {}
+    ai_scanner = source.get("ai_scanner") if isinstance(source.get("ai_scanner"), dict) else {}
+
+    nested_candidates = [
+        source,
+        snap,
+        ai_decision,
+        ai_scanner,
+        snap.get("movement_hunter") if isinstance(snap.get("movement_hunter"), dict) else {},
+        snap.get("ai_movement_hunter") if isinstance(snap.get("ai_movement_hunter"), dict) else {},
+        snap.get("prediction_layer") if isinstance(snap.get("prediction_layer"), dict) else {},
+        snap.get("state_awareness") if isinstance(snap.get("state_awareness"), dict) else {},
+        snap.get("liquidity_trap") if isinstance(snap.get("liquidity_trap"), dict) else {},
+    ]
+
+    def first_value(*keys: str):
+        for obj in nested_candidates:
+            if not isinstance(obj, dict):
+                continue
+            for key in keys:
+                value = obj.get(key)
+                if value is not None and value != "":
+                    return value
+        return None
+
+    out: Dict[str, Any] = {
+        "architecture": "AI_MOVEMENT_HUNTER",
+        "classic_engine_role": "SENSOR_ONLY",
+        "movement_hunter_enabled": True,
+    }
+
+    fields = {
+        "ai_decision": ("decision", "ai_decision", "final_decision"),
+        "movement_decision": ("movement_decision", "decision"),
+        "movement_type": ("movement_type", "move_type", "setup_type"),
+        "move_phase": ("move_phase", "move_state", "state", "phase"),
+        "move_freshness": ("move_freshness", "freshness", "freshness_label"),
+        "fresh_momentum": ("fresh_momentum", "fresh_momentum_score", "early_momentum_score"),
+        "movement_score": ("movement_score", "ai_final_score", "final_score", "prediction_score"),
+        "movement_rank": ("movement_rank", "ai_final_rank", "final_rank"),
+        "reversal_risk_score": ("reversal_risk_score", "reversal_risk"),
+        "trap_risk": ("trap_risk", "liquidity_trap_risk"),
+        "liquidity_risk_score": ("liquidity_risk_score", "fake_break_risk"),
+        "setup_status": ("setup_status", "setup_state"),
+        "entry_activation": ("entry_activation", "entry_status", "entry_confirmed"),
+        "candidate_source": ("candidate_source", "source"),
+        "market_regime": ("market_regime", "market_mode"),
+        "btc_bias": ("btc_bias", "btc_lead_bias"),
+    }
+
+    for out_key, keys in fields.items():
+        value = first_value(*keys)
+        if value is not None:
+            out[out_key] = value
+
+    # Preserve compact nested layer summaries where available.
+    if ai_decision:
+        out["ai_decision_pack"] = ai_decision
+    if ai_scanner:
+        out["ai_scanner_pack"] = ai_scanner
+    for key in ("movement_hunter", "ai_movement_hunter", "prediction_layer", "state_awareness", "liquidity_trap"):
+        value = snap.get(key)
+        if isinstance(value, dict):
+            out[key] = value
+
+    return out
+
+
 def _extract_order_execution_info(order_result: Dict[str, Any]) -> Dict[str, Any]:
     """
     Extract execution info from Toobit order response.
@@ -807,6 +888,12 @@ def record_realized_pnl(
     }
     if isinstance(snapshot, dict) and snapshot:
         closed_record["snapshot"] = snapshot
+        movement_meta = _movement_hunter_metadata({"snapshot": snapshot, "symbol": symbol, "direction": direction})
+        if movement_meta:
+            closed_record["movement_hunter"] = movement_meta
+            for k in ("move_phase", "move_freshness", "movement_type", "trap_risk", "movement_score", "reversal_risk_score"):
+                if movement_meta.get(k) is not None:
+                    closed_record[k] = movement_meta.get(k)
     if max_favorable is not None:
         closed_record["max_favorable"] = max_favorable
     if max_adverse is not None:
@@ -1675,6 +1762,8 @@ def _register_real_open_position(state: Dict[str, Any], signal: Dict[str, Any], 
     entry = float(signal.get("entry", 0) or 0)
     tp1 = signal.get("tp1")
     sl = signal.get("sl") or signal.get("stop_loss")
+    movement_meta = _movement_hunter_metadata(signal)
+    movement_meta = _movement_hunter_metadata(signal)
     state.setdefault("open_positions", {})
     state["open_positions"][signal_id] = {
         "signal_id": signal_id,
@@ -1700,6 +1789,14 @@ def _register_real_open_position(state: Dict[str, Any], signal: Dict[str, Any], 
         "execution_info": execution_info,
         "recovered_note": recovered_note,
         "snapshot": signal.get("snapshot") if isinstance(signal.get("snapshot"), dict) else {},
+        "movement_hunter": movement_meta,
+        "ai_decision": signal.get("ai_decision") if isinstance(signal.get("ai_decision"), dict) else {},
+        "ai_scanner": signal.get("ai_scanner") if isinstance(signal.get("ai_scanner"), dict) else {},
+        "entry_mode": signal.get("entry_mode") or movement_meta.get("architecture") or "AI_MOVEMENT_HUNTER",
+        "move_phase": movement_meta.get("move_phase"),
+        "move_freshness": movement_meta.get("move_freshness"),
+        "movement_type": movement_meta.get("movement_type"),
+        "trap_risk": movement_meta.get("trap_risk"),
         "max_favorable_percent": 0.0,
         "max_adverse_percent": 0.0,
         "dynamic_profit_protection": {"enabled": True, "applies_to": "LONG_AND_SHORT"},
@@ -1750,6 +1847,14 @@ def _register_pending_real_position(
         "execution_info": execution_info,
         "warning": "سفارش ارسال شده و اسلات موقتاً رزرو است؛ در حال تایید پوزیشن واقعی در توبیت.",
         "snapshot": signal.get("snapshot") if isinstance(signal.get("snapshot"), dict) else {},
+        "movement_hunter": movement_meta,
+        "ai_decision": signal.get("ai_decision") if isinstance(signal.get("ai_decision"), dict) else {},
+        "ai_scanner": signal.get("ai_scanner") if isinstance(signal.get("ai_scanner"), dict) else {},
+        "entry_mode": signal.get("entry_mode") or movement_meta.get("architecture") or "AI_MOVEMENT_HUNTER",
+        "move_phase": movement_meta.get("move_phase"),
+        "move_freshness": movement_meta.get("move_freshness"),
+        "movement_type": movement_meta.get("movement_type"),
+        "trap_risk": movement_meta.get("trap_risk"),
         "max_favorable_percent": 0.0,
         "max_adverse_percent": 0.0,
         "dynamic_profit_protection": {"enabled": True, "applies_to": "LONG_AND_SHORT"},
@@ -2102,6 +2207,8 @@ def open_real_position_from_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
 
     signal = dict(signal)
     signal["toobit_order"] = toobit_order
+    signal.setdefault("entry_mode", "AI_MOVEMENT_HUNTER")
+    movement_meta_for_order = _movement_hunter_metadata(signal)
 
     leverage_check = _ensure_toobit_leverage(symbol, float(state.get("leverage", 0) or 0))
     if not leverage_check.get("ok"):
@@ -2170,6 +2277,8 @@ def open_real_position_from_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
                 "order": order_result.get("data"),
                 "execution_info": execution_info,
                 "position": pos,
+                "movement_hunter": movement_meta_for_order,
+                "entry_mode": signal.get("entry_mode"),
                 "warning": recovered_note,
             }
 
@@ -2232,6 +2341,8 @@ def open_real_position_from_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
         "order": order_result.get("data"),
         "execution_info": execution_info,
         "position": pos,
+        "movement_hunter": movement_meta_for_order,
+        "entry_mode": signal.get("entry_mode"),
         "warning": recovered_note or order_result.get("warning"),
     }
 
@@ -2373,6 +2484,8 @@ def _position_learning_snapshot(pos: Dict[str, Any], extra: Optional[Dict[str, A
         "stop_loss", "quantity", "position_size_usd", "leverage",
         "max_favorable_percent", "max_adverse_percent", "ai_final_rank",
         "ai_final_score", "score", "market_mode", "market_regime", "btc_bias",
+        "entry_mode", "movement_type", "move_phase", "move_freshness",
+        "trap_risk", "movement_hunter", "ai_decision", "ai_scanner",
     ]:
         if key not in snap and pos.get(key) is not None:
             snap[key] = pos.get(key)
@@ -2385,6 +2498,13 @@ def _position_learning_snapshot(pos: Dict[str, Any], extra: Optional[Dict[str, A
 
     if isinstance(pos.get("similarity_learning"), dict):
         snap["similarity_learning"] = pos.get("similarity_learning")
+
+    movement_meta = _movement_hunter_metadata(pos)
+    if movement_meta:
+        snap.setdefault("movement_hunter", movement_meta)
+        for k, v in movement_meta.items():
+            if k not in snap and v is not None:
+                snap[k] = v
 
     if isinstance(extra, dict):
         for k, v in extra.items():
@@ -3500,6 +3620,12 @@ def format_real_trade_open_result(result: Dict[str, Any]) -> str:
             f"جهت: {result.get('direction')}\n"
             f"حجم: {result.get('quantity')}"
         )
+        mh = result.get("movement_hunter") if isinstance(result.get("movement_hunter"), dict) else {}
+        if mh:
+            phase = mh.get("move_phase") or mh.get("move_state")
+            fresh = mh.get("move_freshness")
+            if phase or fresh:
+                msg += f"\nAI حرکت: {phase or '-'} | تازگی: {fresh or '-'}"
         if warning:
             msg += f"\n⚠️ {warning}"
         return msg
