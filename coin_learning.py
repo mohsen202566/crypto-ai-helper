@@ -104,8 +104,24 @@ def _norm_result(result: Any) -> str:
 
 
 def _norm_source(source: Any = None, signal_type: Any = None) -> str:
-    src = str(source or signal_type or "REAL").upper().strip()
-    if src in {"GHOST", "SHADOW", "PAPER_GHOST"}:
+    """Normalize learning source as REAL or GHOST.
+
+    Important compatibility fix:
+    older Ghost records often arrived with source="auto_signal_gate" and
+    signal_type="GHOST".  The old implementation preferred source first, so
+    those records were incorrectly counted as REAL.  Prefer any explicit Ghost
+    marker from either field and also recognize Ghost-only gate sources.
+    """
+    src = str(source or "").upper().strip()
+    typ = str(signal_type or "").upper().strip()
+    combined = f"{typ} {src}".strip()
+    ghost_markers = {
+        "GHOST", "SHADOW", "PAPER_GHOST", "GHOST_ONLY", "AI_SETUP_GHOST",
+        "AUTO_SIGNAL_GATE", "SLOT_FULL", "AI_NOT_REAL", "SIGNAL_NOT_ACTIVE",
+        "MOVE_NOT_FRESH", "BOT_TRADING_DISABLED", "BAD_DIRECTION",
+        "MISSING_TRADE_LEVELS",
+    }
+    if any(marker in combined for marker in ghost_markers):
         return "GHOST"
     return "REAL"
 
@@ -1560,18 +1576,73 @@ def register_dynamic_profit_exit(symbol: str, direction: str, entry: float, exit
     return bool(ok)
 
 
+def _display_learning_counts(s: Optional[Dict[str, Any]] = None) -> Dict[str, int]:
+    """Display-safe REAL/GHOST counts from the actual signals table.
+
+    Bucket totals are useful for long-term learning, but they can drift after
+    migrations or older Ghost records that were misclassified.  Reports should
+    show the same accounting basis as ai_memory.py: registered signals from
+    signals{}, closed TP/SL from each signal result, and pending/no-result as
+    registered minus closed.
+    """
+    s = s or _state()
+    signals = s.get("signals", {}) if isinstance(s.get("signals"), dict) else {}
+    out = {
+        "real": 0, "ghost": 0,
+        "real_tp": 0, "real_sl": 0,
+        "ghost_tp": 0, "ghost_sl": 0,
+    }
+    for item in signals.values():
+        if not isinstance(item, dict):
+            continue
+        src = _norm_source(
+            item.get("source") or item.get("result_source"),
+            item.get("signal_type") or item.get("type"),
+        )
+        res = _norm_result(item.get("result"))
+        if src == "GHOST":
+            out["ghost"] += 1
+            if res in {"TP1", "TP2"}:
+                out["ghost_tp"] += 1
+            elif res == "SL":
+                out["ghost_sl"] += 1
+        else:
+            out["real"] += 1
+            if res in {"TP1", "TP2"}:
+                out["real_tp"] += 1
+            elif res == "SL":
+                out["real_sl"] += 1
+    out["tp"] = out["real_tp"] + out["ghost_tp"]
+    out["sl"] = out["real_sl"] + out["ghost_sl"]
+    out["real_closed"] = out["real_tp"] + out["real_sl"]
+    out["ghost_closed"] = out["ghost_tp"] + out["ghost_sl"]
+    out["real_pending"] = max(0, out["real"] - out["real_closed"])
+    out["ghost_pending"] = max(0, out["ghost"] - out["ghost_closed"])
+    return out
+
+
 def format_learning_summary() -> str:
     s = _state()
     rows = list(s.get("by_coin_direction", {}).values())
-    real = sum(int(r.get("real_total", 0)) for r in rows)
-    ghost = sum(int(r.get("ghost_total", 0)) for r in rows)
-    sl = sum(int(r.get("sl", 0)) for r in rows)
-    tp = sum(int(r.get("tp1", 0)) + int(r.get("tp2", 0)) for r in rows)
+    c = _display_learning_counts(s)
+    tp = int(c.get("tp", 0))
+    sl = int(c.get("sl", 0))
     wr = round(tp / max(tp + sl, 1) * 100, 1) if (tp + sl) else 0
+    real_wr = round(c["real_tp"] / max(c["real_tp"] + c["real_sl"], 1) * 100, 1) if (c["real_tp"] + c["real_sl"]) else 0
+    ghost_wr = round(c["ghost_tp"] / max(c["ghost_tp"] + c["ghost_sl"], 1) * 100, 1) if (c["ghost_tp"] + c["ghost_sl"]) else 0
     good = len([r for r in rows if r.get("behavior") == "GOOD"])
     bad = len([r for r in rows if r.get("behavior") == "BAD"])
     dyn = sum(int((r.get("dynamic_profit_stats") or {}).get("profit_exits", 0) or 0) for r in rows)
-    return f"🧠 خلاصه یادگیری\nReal: {real}\nGhost: {ghost}\nTP: {tp} | SL: {sl}\nWinRate: {wr}%\nخروج سود AI: {dyn}\nرفتار خوب: {good} | رفتار بد: {bad}"
+    return (
+        "🧠 خلاصه یادگیری\n"
+        f"Real ثبت‌شده: {c['real']} | بسته‌شده: {c['real_closed']} | بی‌نتیجه/باز: {c['real_pending']}\n"
+        f"Real TP/SL: TP:{c['real_tp']} | SL:{c['real_sl']} | WR:{real_wr}%\n"
+        f"Ghost ثبت‌شده در Learning: {c['ghost']} | بسته‌شده: {c['ghost_closed']} | بی‌نتیجه/باز: {c['ghost_pending']}\n"
+        f"Ghost TP/SL: TP:{c['ghost_tp']} | SL:{c['ghost_sl']} | WR:{ghost_wr}%\n"
+        f"کل نتیجه‌دار: TP:{tp} | SL:{sl} | WR:{wr}%\n"
+        f"خروج سود AI: {dyn}\n"
+        f"رفتار خوب: {good} | رفتار بد: {bad}"
+    )
 
 
 def format_coin_behavior(symbol: str = None) -> str:
