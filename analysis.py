@@ -1758,6 +1758,16 @@ def analyze_symbol(symbol: str) -> Dict:
         snapshot['technical_sensors'] = sensors
         snapshot['ai_movement_hunter'] = movement_decision
         snapshot['classic_signal_disabled'] = True
+        # Movement Hunter fields must be available at top snapshot level too.
+        # scanner/ghost/learning modules read these flat keys.
+        snapshot['ai_score'] = cap_score(movement_decision.get('ai_score') or 0)
+        snapshot['move_phase'] = movement_decision.get('move_phase')
+        snapshot['move_state'] = movement_decision.get('move_phase')
+        snapshot['movement_type'] = movement_decision.get('movement_type') or (
+            'PUMP_SETUP' if direction == 'LONG' else 'DUMP_SETUP' if direction == 'SHORT' else 'NONE'
+        )
+        snapshot['trap_risk'] = movement_decision.get('trap_risk')
+        snapshot['move_freshness'] = movement_decision.get('move_freshness')
         snapshot['classic_score_disabled'] = True
         snapshot['live_entry_price'] = safe_float(price)
         snapshot['closed_15m_price'] = safe_float(closed_15m_price)
@@ -1870,6 +1880,17 @@ def analyze_symbol(symbol: str) -> Dict:
         common = {
             'symbol': symbol,
             'score': cap_score(final_score),
+            'ai_score': cap_score(final_score),
+            'movement_score': cap_score(final_score),
+            'move_phase': move_phase,
+            'move_state': move_phase,
+            'movement_type': movement_decision.get('movement_type') or (
+                'PUMP_START' if direction == 'LONG' and ai_decision_kind == 'REAL' else
+                'DUMP_START' if direction == 'SHORT' and ai_decision_kind == 'REAL' else
+                'PUMP_SETUP' if direction == 'LONG' else
+                'DUMP_SETUP' if direction == 'SHORT' else 'NONE'
+            ),
+            'trap_risk': trap_risk,
             'long_score': long_score,
             'short_score': short_score,
             'classic_long_score': sp.get('long_score', 0),
@@ -1936,29 +1957,47 @@ def analyze_symbol(symbol: str) -> Dict:
             'signal_timeframe': 'AI Movement Hunter 5M/15M',
         }
 
+        # Build TP/SL before the final REAL gate too.
+        # If AI says GHOST/SETUP, scanner can store it as a Ghost Signal for learning.
+        ghost_sl = ghost_tp1 = ghost_tp2 = ghost_rr = None
+        ghost_tp_meta = {}
+        if direction in {'LONG', 'SHORT'}:
+            try:
+                ghost_sl, ghost_tp1, ghost_tp2, ghost_rr, ghost_tp_meta = build_trade_levels(
+                    direction, price, atr, df_5m, df_15m, df_30m, snapshot, symbol
+                )
+            except Exception as _level_err:
+                reasons.append(f'TP/SL build error: {str(_level_err)[:120]}')
+
         if not entry_confirmed:
             entry_mode = 'AI_GHOST_SETUP' if ai_decision_kind == 'GHOST' else 'AI_NO_ENTRY'
+            can_ghost = (
+                ai_decision_kind in {'GHOST', 'SETUP', 'WATCH'}
+                and direction in {'LONG', 'SHORT'}
+                and ghost_sl is not None
+                and ghost_tp1 is not None
+            )
             return {
                 **common,
-                'direction': 'NO TRADE',
+                'direction': direction if can_ghost else 'NO TRADE',
                 'candidate_direction': direction if direction in {'LONG', 'SHORT'} else None,
-                'status': 'NO_TRADE',
+                'status': 'SETUP' if can_ghost else 'NO_TRADE',
                 'entry_confirmed': False,
                 'entry_mode': entry_mode,
-                'entry': None,
-                'stop_loss': None,
-                'tp1': None,
-                'tp2': None,
-                'risk_reward': 0,
-                'risk_level': 'UNKNOWN',
+                'entry': safe_round(price) if can_ghost else None,
+                'stop_loss': ghost_sl if can_ghost else None,
+                'tp1': ghost_tp1 if can_ghost else None,
+                'tp2': ghost_tp2 if can_ghost else None,
+                'risk_reward': ghost_rr if can_ghost else 0,
+                'risk_level': 'GHOST' if can_ghost else 'UNKNOWN',
                 'freshness': move_freshness,
-                'tp_meta': {},
-                'validity': 'سیگنال معتبر نیست',
+                'tp_meta': ghost_tp_meta if can_ghost else {},
+                'validity': 'Ghost/Setup برای یادگیری - سفارش واقعی نیست' if can_ghost else 'سیگنال معتبر نیست',
                 'valid_gate': False,
                 'min_score': min_score,
             }
 
-        sl, tp1, tp2, rr, tp_meta = build_trade_levels(direction, price, atr, df_5m, df_15m, df_30m, snapshot, symbol)
+        sl, tp1, tp2, rr, tp_meta = ghost_sl, ghost_tp1, ghost_tp2, ghost_rr, ghost_tp_meta
         if safe_float(rr, 0.0) < MIN_REAL_RISK_REWARD:
             rr_reason = f"رد R/R: نسبت سود به ضرر {rr} کمتر از حداقل {MIN_REAL_RISK_REWARD}"
             reasons.append(rr_reason)
@@ -1970,7 +2009,7 @@ def analyze_symbol(symbol: str) -> Dict:
                 'status': 'NO_TRADE',
                 'entry_confirmed': False,
                 'entry_mode': 'RR_FILTER',
-                'entry': None,
+                'entry': safe_round(price),
                 'stop_loss': sl,
                 'tp1': tp1,
                 'tp2': tp2,
