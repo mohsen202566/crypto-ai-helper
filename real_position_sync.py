@@ -355,6 +355,14 @@ def sync_once(*, repair_tpsl: bool = True, save: bool = True) -> Dict[str, Any]:
 
         pos["signal_id"] = pos.get("signal_id") or sid
         pos["closed_or_missing_at"] = _now()
+        snap = pos.get("snapshot") if isinstance(pos.get("snapshot"), dict) else {}
+        if snap:
+            for mk in ("move_phase", "freshness_score", "move_done_pct", "movement_type", "ai_score", "trap_risk", "reversal_risk"):
+                if pos.get(mk) is None and snap.get(mk) is not None:
+                    pos[mk] = snap.get(mk)
+                mh = snap.get("ai_movement_hunter") if isinstance(snap.get("ai_movement_hunter"), dict) else {}
+                if pos.get(mk) is None and mh.get(mk) is not None:
+                    pos[mk] = mh.get(mk)
         pos.setdefault("accounting", {
             "ok": False,
             "pnl_usd": None,
@@ -460,7 +468,7 @@ def build_tracker_messages(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     for event in events or []:
         if not isinstance(event, dict):
             continue
-        etype = str(event.get("type") or "")
+        etype = str(event.get("type") or event.get("event_type") or "")
         pos = event.get("position") or {}
         if not isinstance(pos, dict):
             pos = {}
@@ -478,6 +486,10 @@ def build_tracker_messages(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 f"جهت: {_fa_direction(pos.get('direction'))}\n"
                 f"نتیجه: {result_fa}"
             )
+            phase = pos.get("move_phase") or pos.get("move_state")
+            fresh = pos.get("freshness_score")
+            if phase or fresh is not None:
+                text += f"\nفاز حرکت: {phase or '-'}" + (f" | تازگی: {fresh}" if fresh is not None else "")
             if has_real_pnl:
                 text += (
                     f"\nسود/ضرر واقعی از بالانس توبیت: {sign}{round(pnl, 6)}$"
