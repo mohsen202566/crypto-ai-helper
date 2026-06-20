@@ -348,35 +348,46 @@ def _confidence_label(closed: int, learned_dirs: int, learned_coins: int) -> str
 
 
 def get_ai_summary_counts() -> Dict[str, Any]:
-    """Return display-safe AI counters from real stored learning/Ghost data."""
-    s = _state()
-    sm = s.get("summary", {})
+    """Return consistent AI counters from one source per concept.
+
+    Final display rule:
+    - Real counts/results come only from coin_learning.json.
+    - Ghost open/closed/results come only from ghost_signals.json.
+    - ai_memory.summary is only a legacy backup and must not inflate display
+      numbers when real files are available.
+    This prevents mixed/drifting values like Real=867 in one line and
+    Real=989 in another, or Ghost totals that do not equal open+closed.
+    """
     lc = _learning_counts()
     gc = _ghost_counts()
     bs = _learning_bucket_stats()
 
     real = int(lc.get("real", 0))
-    ghost_learning = int(lc.get("ghost", 0))
-    ghost_file_total = int(gc.get("open", 0)) + int(gc.get("closed", 0))
-    ghost_total = max(ghost_learning, ghost_file_total, _safe_int(sm.get("total_ghost_signals")))
-    total_signals = real if real > 0 else _safe_int(sm.get("total_signals"))
+
+    # Ghost display is based only on the Ghost file because it is the source
+    # of truth for open/closed shadow signals.  Do not use max(...) with
+    # legacy counters; that caused inconsistent reports.
+    ghost_open = int(gc.get("open", 0))
+    ghost_closed = int(gc.get("closed", 0))
+    ghost_total = ghost_open + ghost_closed
 
     real_tp = int(lc.get("real_tp", 0))
     real_sl = int(lc.get("real_sl", 0))
-    ghost_tp = max(int(lc.get("ghost_tp", 0)), int(gc.get("tp", 0)))
-    ghost_sl = max(int(lc.get("ghost_sl", 0)), int(gc.get("sl", 0)))
+    ghost_tp = int(gc.get("tp", 0))
+    ghost_sl = int(gc.get("sl", 0))
+
     total_tp = real_tp + ghost_tp
     total_sl = real_sl + ghost_sl
     closed = total_tp + total_sl
     confidence = _confidence_label(closed, int(bs.get("learned_directions", 0)), int(bs.get("learned_coins", 0)))
 
     return {
-        "total_signals": total_signals,
+        "total_signals": real,
         "total_ghost_signals": ghost_total,
         "real_learning": real,
-        "ghost_learning": ghost_learning,
-        "ghost_open": int(gc.get("open", 0)),
-        "ghost_closed": int(gc.get("closed", 0)),
+        "ghost_learning": ghost_total,
+        "ghost_open": ghost_open,
+        "ghost_closed": ghost_closed,
         "real_tp": real_tp,
         "real_sl": real_sl,
         "ghost_tp": ghost_tp,
@@ -394,7 +405,6 @@ def get_ai_summary_counts() -> Dict[str, Any]:
         "bad_behaviors": int(bs.get("bad", 0)),
         "confidence": confidence,
     }
-
 
 # -------------------- update hooks --------------------
 
