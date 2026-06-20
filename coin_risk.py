@@ -203,6 +203,7 @@ def _compact_snapshot(snapshot: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "macd_hist_accel_15m", "adx", "adx_slope_15m", "vwap_status",
         "vwap_distance_pct", "ema_structure_15m", "market_regime", "market_mode",
         "btc_bias", "move_state", "trap_risk", "prediction_score", "reversal_risk_score",
+        "move_phase", "freshness_score", "move_done_pct", "movement_type", "ai_score",
         "relative_status", "timeframe_core", "entry_timing_tf",
     ]
     out = {k: snapshot.get(k) for k in keys if snapshot.get(k) is not None}
@@ -226,6 +227,10 @@ def _condition_keys(direction: str, snapshot: Optional[Dict[str, Any]]) -> List[
         f"{d}:VWAP:{str(snap.get('vwap_status') or 'NA').upper()}",
         f"{d}:EMA:{str(snap.get('ema_structure_15m') or 'NA').upper()}",
         f"{d}:STATE:{str(state).upper()}",
+        f"{d}:MOVE_PHASE:{str(snap.get('move_phase') or state or 'NA').upper()}",
+        f"{d}:FRESHNESS:{_bucket_number(snap.get('freshness_score'), 10, min_value=0, max_value=100)}",
+        f"{d}:MOVE_DONE:{_bucket_number(snap.get('move_done_pct'), 10, min_value=0, max_value=100)}",
+        f"{d}:MOVEMENT_TYPE:{str(snap.get('movement_type') or 'NA').upper()}",
         f"{d}:TRAP:{str(trap).upper()}",
         f"{d}:PRED:{_bucket_number(snap.get('prediction_score'), 10, min_value=0, max_value=100)}",
         f"{d}:REVERSAL:{_bucket_number(snap.get('reversal_risk_score'), 10, min_value=0, max_value=100)}",
@@ -236,6 +241,11 @@ def _condition_keys(direction: str, snapshot: Optional[Dict[str, Any]]) -> List[
     vwap = str(snap.get("vwap_status") or "NA").upper()
     keys.append(f"{d}:ADX_VWAP:{adx}:{vwap}")
     keys.append(f"{d}:STATE_TRAP:{str(state).upper()}:{str(trap).upper()}")
+    phase = str(snap.get("move_phase") or state or "NA").upper()
+    fresh = _bucket_number(snap.get("freshness_score"), 10, min_value=0, max_value=100)
+    done = _bucket_number(snap.get("move_done_pct"), 10, min_value=0, max_value=100)
+    keys.append(f"{d}:PHASE_TRAP:{phase}:{str(trap).upper()}")
+    keys.append(f"{d}:FRESH_DONE:{fresh}:{done}")
     return keys
 
 
@@ -503,7 +513,7 @@ def format_coin_risk_report(symbol: Optional[str] = None, limit: int = 12) -> st
     rows.sort(reverse=True, key=lambda x: (x[0], x[1]))
     if not rows:
         return "هنوز داده ریسک کوین ثبت نشده."
-    lines = ["🧠 گزارش ریسک AI کوین‌ها"]
+    lines = ["🧠 گزارش ریسک AI کوین‌ها / Movement Hunter"]
     for risk, strict, sym, direction, st in rows[:max(1, int(limit))]:
         ar = st.get("archive", {})
         lines.append(
