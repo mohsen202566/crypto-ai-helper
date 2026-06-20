@@ -28,6 +28,7 @@ This keeps the public function names used by bot.py:
 """
 
 import time
+import os
 import logging
 from typing import Dict, List, Optional, Any, Tuple
 
@@ -85,7 +86,12 @@ except Exception:
 
 SCAN_DELAY_SECONDS = 0.05
 MAX_SCAN_RESULTS = 10
-MIN_SCANNER_SCORE = int(AUTO_DIRECT_SCORE_MIN or 82)
+# Movement Hunter thresholds.
+# AUTO_DIRECT_SCORE_MIN may still be 82 from the old classic engine. Scanner must
+# not harden AI Movement Hunter back to the classic threshold. analysis.py and
+# ai_movement_hunter.py use ~72 for REAL and ~55 for GHOST/SETUP.
+MIN_SCANNER_SCORE = int(float(os.getenv("AI_REAL_THRESHOLD", os.getenv("AUTO_REAL_AI_SCORE", "72")) or 72))
+MIN_GHOST_SCORE = int(float(os.getenv("AI_GHOST_THRESHOLD", os.getenv("AUTO_GHOST_AI_SCORE", "55")) or 55))
 
 
 def normalize_symbol(symbol):
@@ -163,6 +169,50 @@ def _base_valid_signal(r: Dict[str, Any]) -> bool:
     return _base_reject_reason(r) == "OK"
 
 
+def _extract_ai_decision_kind(r: Dict[str, Any]) -> str:
+    """Return AI decision kind from all compatible Movement Hunter locations."""
+    if not isinstance(r, dict):
+        return ""
+    ai_decision = r.get("ai_decision") if isinstance(r.get("ai_decision"), dict) else {}
+    hunter = r.get("ai_movement_hunter") if isinstance(r.get("ai_movement_hunter"), dict) else {}
+    movement_hunter = r.get("movement_hunter") if isinstance(r.get("movement_hunter"), dict) else {}
+    snapshot = r.get("snapshot") if isinstance(r.get("snapshot"), dict) else {}
+    snap_hunter = snapshot.get("ai_movement_hunter") if isinstance(snapshot.get("ai_movement_hunter"), dict) else {}
+    return str(
+        ai_decision.get("decision")
+        or hunter.get("decision")
+        or movement_hunter.get("decision")
+        or snap_hunter.get("decision")
+        or r.get("decision")
+        or ""
+    ).upper()
+
+
+def _is_setup_candidate(r: Dict[str, Any]) -> bool:
+    """AI setup/watch/ghost candidates are valid learning candidates, not real entries.
+
+    This prevents SETUP from being counted as plain NO_TRADE while preserving
+    real-trade safety. SETUP must not be sent to the real-order path.
+    """
+    if not isinstance(r, dict):
+        return False
+    status = str(r.get("status") or "").upper()
+    entry_mode = str(r.get("entry_mode") or "").upper()
+    decision = _extract_ai_decision_kind(r)
+    direction = r.get("direction") if r.get("direction") in ["LONG", "SHORT"] else r.get("candidate_direction")
+    if direction not in ["LONG", "SHORT"]:
+        return False
+    if r.get("entry") is None or r.get("stop_loss") is None or r.get("tp1") is None:
+        return False
+    if status in {"SETUP", "WATCH", "GHOST"}:
+        return True
+    if decision in {"GHOST", "SETUP", "WATCH"}:
+        return True
+    if "GHOST" in entry_mode or "SETUP" in entry_mode or "WATCH" in entry_mode:
+        return True
+    return _safe_float(r.get("score"), 0.0) >= MIN_GHOST_SCORE
+
+
 def _can_store_rejected_as_ghost(r: Dict[str, Any]) -> bool:
     """Store safe AI movement candidates as Ghost for learning only.
 
@@ -178,14 +228,12 @@ def _can_store_rejected_as_ghost(r: Dict[str, Any]) -> bool:
     if r.get("entry") is None or r.get("stop_loss") is None or r.get("tp1") is None:
         return False
 
-    ai_decision = r.get("ai_decision") if isinstance(r.get("ai_decision"), dict) else {}
-    hunter = r.get("ai_movement_hunter") if isinstance(r.get("ai_movement_hunter"), dict) else {}
-    decision = str(ai_decision.get("decision") or hunter.get("decision") or "").upper()
+    decision = _extract_ai_decision_kind(r)
     if decision in {"GHOST", "SETUP", "WATCH"}:
         return True
 
     # score is AI movement score, not classic score.
-    return _safe_int(r.get("score"), 0) >= max(60, MIN_SCANNER_SCORE - 18)
+    return _safe_int(r.get("score"), 0) >= MIN_GHOST_SCORE
 
 
 def _build_scanner_snapshot(r: Dict[str, Any]) -> Dict[str, Any]:
@@ -201,7 +249,7 @@ def _build_scanner_snapshot(r: Dict[str, Any]) -> Dict[str, Any]:
         "timeframe_core", "entry_timing_tf", "rsi_slope_15m", "adx_slope_15m",
         "macd_hist_accel_15m", "macd_hist_slope_15m", "prediction_score",
         "reversal_risk_score", "expected_move_pct", "trap_risk", "time_risk",
-        "time_risk_score", "liquidity_risk_score", "relative_status", "move_state",
+        "time_risk_score", "liquidity_risk_score", "relative_status", "move_state", "move_phase", "ai_score", "freshness_score", "move_done_pct",
         "ai_decision", "ai_movement_hunter", "technical_sensors", "candidate_direction",
         "classic_signal_disabled", "classic_score_disabled",
     ]:
@@ -522,7 +570,7 @@ def apply_ai_scanner_decision(r: Dict[str, Any]) -> Dict[str, Any]:
 
     base_score = _safe_float(r.get("score"), 0.0)
     base_rank = _classic_rank_value(r)
-    base_min = max(MIN_SCANNER_SCORE, _safe_int(r.get("min_score"), MIN_SCANNER_SCORE))
+    base_min = _safe_int(r.get("min_score"), MIN_SCANNER_SCORE)
     base_req_conf = _safe_int(r.get("required_confirmations"), 0)
     actual_conf = _safe_int(r.get("confirmations"), 0)
 
@@ -555,9 +603,24 @@ def apply_ai_scanner_decision(r: Dict[str, Any]) -> Dict[str, Any]:
 
     ai_decision = r.get("ai_decision") if isinstance(r.get("ai_decision"), dict) else {}
     hunter = r.get("ai_movement_hunter") if isinstance(r.get("ai_movement_hunter"), dict) else {}
-    decision_kind = str(ai_decision.get("decision") or hunter.get("decision") or "REAL").upper()
-    move_phase = str(ai_decision.get("move_phase") or hunter.get("move_phase") or snapshot.get("move_state") or "").upper()
-    trap_risk = str(ai_decision.get("trap_risk") or hunter.get("trap_risk") or snapshot.get("trap_risk") or "").upper()
+    movement_hunter = r.get("movement_hunter") if isinstance(r.get("movement_hunter"), dict) else {}
+    decision_kind = _extract_ai_decision_kind(r) or "REAL"
+    move_phase = str(
+        ai_decision.get("move_phase")
+        or hunter.get("move_phase")
+        or movement_hunter.get("move_phase")
+        or movement_hunter.get("phase")
+        or snapshot.get("move_phase")
+        or snapshot.get("move_state")
+        or ""
+    ).upper()
+    trap_risk = str(
+        ai_decision.get("trap_risk")
+        or hunter.get("trap_risk")
+        or movement_hunter.get("trap_risk")
+        or snapshot.get("trap_risk")
+        or ""
+    ).upper()
 
     if decision_kind not in {"REAL", "ACTIVE", "ENTRY"}:
         approved = False
@@ -705,29 +768,41 @@ def scan_market(symbols: Optional[List[str]] = None, max_results: int = MAX_SCAN
     for sym in symbols:
         try:
             res = analyze_symbol(normalize_symbol(sym))
-            reject_reason = _base_reject_reason(res)
+            if not isinstance(res, dict):
+                no_trade += 1
+                continue
+
+            # Always enrich first. The old code ran the REAL gate before the
+            # SETUP/GHOST path, so every AI_GHOST_SETUP was counted as NO_TRADE.
+            enriched = apply_ai_scanner_decision(res)
+
+            reject_reason = _base_reject_reason(enriched)
+            if reject_reason == "OK" and enriched.get("ai_scanner_approved"):
+                if should_skip_duplicate(enriched):
+                    continue
+                valid.append(enriched)
+                continue
+
+            # SETUP/GHOST/WATCH candidates are not real entries, but they are
+            # valuable Movement Hunter learning candidates and must not be
+            # counted as plain no_trade. They are stored as Ghost only.
+            if allow_ghost and _can_store_rejected_as_ghost(enriched):
+                rr = dict(enriched)
+                rr["scanner_reject_reason"] = reject_reason
+                reason = "AI_SETUP_GHOST" if _is_setup_candidate(rr) else f"BASE_REJECTED:{reject_reason}"
+                if save_as_ghost(rr, reason):
+                    ghost_count += 1
+                    logger.info(
+                        f"scanner candidate saved as ghost: {rr.get('symbol')} {rr.get('direction')} | {reason}"
+                    )
+                ai_rejected.append(rr)
+                continue
+
             if reject_reason != "OK":
                 no_trade += 1
-                if allow_ghost and _can_store_rejected_as_ghost(res):
-                    rr = dict(res)
-                    rr["scanner_reject_reason"] = reject_reason
-                    if save_as_ghost(rr, f"BASE_REJECTED:{reject_reason}"):
-                        ghost_count += 1
-                        logger.info(
-                            f"scanner candidate saved as ghost: {rr.get('symbol')} {rr.get('direction')} | BASE_REJECTED:{reject_reason}"
-                        )
                 continue
 
-            enriched = apply_ai_scanner_decision(res)
-            if should_skip_duplicate(enriched):
-                continue
-
-            if enriched.get("ai_scanner_approved"):
-                valid.append(enriched)
-            else:
-                ai_rejected.append(enriched)
-                if allow_ghost and save_as_ghost(enriched, "AI_SCANNER_REJECTED"):
-                    ghost_count += 1
+            ai_rejected.append(enriched)
         except Exception as e:
             errors += 1
             logger.warning(f"scanner analyze error: {normalize_symbol(sym)} | {str(e)[:160]}")
