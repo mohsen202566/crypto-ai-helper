@@ -28,9 +28,11 @@ AI_MEMORY_FILE = "ai_memory.json"
 COIN_LEARNING_FILE = "coin_learning.json"
 GHOST_FILE = "ghost_signals.json"
 
-VERSION = 4
+VERSION = 5
 MAX_MARKET_HISTORY = 20000
 MAX_DAILY_REPORTS = 90
+MAX_MOVEMENT_HISTORY = 50000
+MAX_MOVEMENT_RECENT = 200
 
 DEFAULT_STATE = {
     "version": VERSION,
@@ -39,6 +41,7 @@ DEFAULT_STATE = {
         "learning_enabled": True,
         "soft_mode": True,
         "daily_report_enabled": True,
+        "movement_hunter_enabled": True,
     },
     "summary": {
         "total_signals": 0,
@@ -55,6 +58,25 @@ DEFAULT_STATE = {
         "history": [],
         "mode_counts": {},
         "btc_bias_counts": {},
+        "last_update": None,
+    },
+    "movement_hunter": {
+        "enabled": True,
+        "last_decision": {},
+        "history": [],
+        "decision_counts": {},
+        "phase_counts": {},
+        "movement_type_counts": {},
+        "direction_counts": {},
+        "symbol_counts": {},
+        "real_count": 0,
+        "ghost_count": 0,
+        "reject_count": 0,
+        "setup_count": 0,
+        "entry_count": 0,
+        "fresh_count": 0,
+        "late_count": 0,
+        "trap_high_count": 0,
         "last_update": None,
     },
     "daily_reports": {},
@@ -133,6 +155,21 @@ def _state() -> Dict[str, Any]:
                 s["market_memory"][k] = {}
         else:
             s["market_memory"].setdefault(k, v)
+
+    s.setdefault("movement_hunter", {})
+    if not isinstance(s.get("movement_hunter"), dict):
+        s["movement_hunter"] = {}
+    for k, v in DEFAULT_STATE["movement_hunter"].items():
+        if k == "history":
+            s["movement_hunter"].setdefault(k, [])
+            if not isinstance(s["movement_hunter"].get(k), list):
+                s["movement_hunter"][k] = []
+        elif k in {"last_decision", "decision_counts", "phase_counts", "movement_type_counts", "direction_counts", "symbol_counts"}:
+            s["movement_hunter"].setdefault(k, {})
+            if not isinstance(s["movement_hunter"].get(k), dict):
+                s["movement_hunter"][k] = {}
+        else:
+            s["movement_hunter"].setdefault(k, v)
 
     s.setdefault("daily_reports", {})
     if not isinstance(s.get("daily_reports"), dict):
@@ -431,6 +468,31 @@ def update_ai_summary(
     else:
         snapshot = {}
 
+    # Movement Hunter compatibility: callers can pass final AI movement fields
+    # without importing record_movement_decision directly. This records only
+    # metadata and does not trigger Telegram or real trading.
+    movement_decision = (
+        kwargs.get("movement_decision")
+        or kwargs.get("ai_decision")
+        or kwargs.get("final_decision")
+        or kwargs.get("decision")
+    )
+    if movement_decision is not None:
+        try:
+            _record_movement_decision_in_state(
+                s,
+                symbol=kwargs.get("symbol") or snapshot.get("symbol"),
+                direction=kwargs.get("direction") or snapshot.get("direction"),
+                decision=movement_decision,
+                move_phase=kwargs.get("move_phase") or kwargs.get("move_state") or snapshot.get("move_phase") or snapshot.get("move_state"),
+                movement_type=kwargs.get("movement_type") or kwargs.get("move_type") or snapshot.get("movement_type") or snapshot.get("move_type"),
+                confidence=kwargs.get("confidence") or kwargs.get("ai_confidence") or snapshot.get("confidence") or snapshot.get("prediction_score"),
+                snapshot=snapshot,
+                source=str(kwargs.get("source") or "update_ai_summary"),
+            )
+        except Exception:
+            pass
+
     if market_mode is not None or btc_bias is not None:
         mm = s.setdefault("market_memory", {})
         mode = str(market_mode or mm.get("last_mode") or "UNKNOWN").upper()
@@ -475,6 +537,208 @@ def update_market_memory(market_mode: str = None, btc_bias: str = None, snapshot
     return mm
 
 
+
+# -------------------- AI Movement Hunter memory --------------------
+
+def _norm_decision(value: Any) -> str:
+    d = str(value or "").upper().strip()
+    if d in {"REAL", "REAL_SIGNAL", "ACTIVE", "ENTRY", "ENTRY_ACTIVE", "ACTIVATED"}:
+        return "REAL"
+    if d in {"GHOST", "SHADOW", "GHOST_ONLY", "PAPER_ONLY"}:
+        return "GHOST"
+    if d in {"REJECT", "REJECTED", "NO_TRADE", "NONE", "NO_SIGNAL"}:
+        return "REJECT"
+    if d in {"SETUP", "WATCH", "WATCHLIST", "CANDIDATE"}:
+        return "SETUP"
+    return d or "UNKNOWN"
+
+
+def _norm_phase(value: Any) -> str:
+    p = str(value or "").upper().strip()
+    aliases = {
+        "START": "START", "FRESH": "START", "NEW": "START",
+        "EARLY": "EARLY", "EARLY_MOMENTUM": "EARLY",
+        "MID": "MID", "MID_MOVE": "MID", "MIDDLE": "MID",
+        "EXHAUSTION": "EXHAUSTION", "LATE": "EXHAUSTION", "LATE_OR_EXHAUSTION": "EXHAUSTION",
+        "RANGE": "RANGE", "RANGE_AFTER_MOVE": "RANGE_AFTER_MOVE", "POST_MOVE_RANGE": "RANGE_AFTER_MOVE",
+    }
+    return aliases.get(p, p or "UNKNOWN")
+
+
+def _movement_field(snapshot: Dict[str, Any], *keys: str, default: Any = None) -> Any:
+    if not isinstance(snapshot, dict):
+        return default
+    for k in keys:
+        if snapshot.get(k) is not None:
+            return snapshot.get(k)
+    for nest in ("movement_hunter", "ai_movement", "ai_decision", "prediction_layer", "state_awareness", "state", "liquidity_trap"):
+        obj = snapshot.get(nest)
+        if isinstance(obj, dict):
+            for k in keys:
+                if obj.get(k) is not None:
+                    return obj.get(k)
+    return default
+
+
+def _record_movement_decision_in_state(
+    s: Dict[str, Any],
+    symbol: str = None,
+    direction: str = None,
+    decision: str = None,
+    move_phase: str = None,
+    movement_type: str = None,
+    confidence: Any = None,
+    snapshot: Optional[Dict[str, Any]] = None,
+    source: str = "movement_hunter",
+    **kwargs,
+) -> Dict[str, Any]:
+    mh = s.setdefault("movement_hunter", {})
+    snap = snapshot if isinstance(snapshot, dict) else {}
+    sym = str(symbol or _movement_field(snap, "symbol", default="UNKNOWN") or "UNKNOWN").upper().strip()
+    direct = str(direction or _movement_field(snap, "direction", default="NONE") or "NONE").upper().strip()
+    dec = _norm_decision(decision or _movement_field(snap, "decision", "ai_decision", "final_decision", default=None) or kwargs.get("ai_decision"))
+    phase = _norm_phase(move_phase or _movement_field(snap, "move_phase", "movement_phase", "move_state", "state", default=None) or kwargs.get("move_state"))
+    mtype = str(movement_type or _movement_field(snap, "movement_type", "move_type", "setup_type", default="UNKNOWN") or "UNKNOWN").upper().strip()
+    trap = str(_movement_field(snap, "trap_risk", "liquidity_trap_risk", default=kwargs.get("trap_risk") or "UNKNOWN") or "UNKNOWN").upper()
+    freshness = str(_movement_field(snap, "freshness", "move_freshness", "fresh_momentum", default=kwargs.get("freshness") or "UNKNOWN") or "UNKNOWN").upper()
+    score = _safe_float(confidence if confidence is not None else _movement_field(snap, "confidence", "ai_confidence", "movement_score", "prediction_score", default=0.0), 0.0)
+    ts = _now()
+    event = {
+        "ts": ts,
+        "symbol": sym,
+        "direction": direct,
+        "decision": dec,
+        "move_phase": phase,
+        "movement_type": mtype,
+        "freshness": freshness,
+        "trap_risk": trap,
+        "confidence": score,
+        "source": str(source or "movement_hunter"),
+    }
+    mh["last_decision"] = event
+    mh["last_update"] = ts
+    mh.setdefault("history", []).append(event)
+    mh["history"] = mh["history"][-MAX_MOVEMENT_HISTORY:]
+
+    def inc_map(name: str, key: str):
+        mp = mh.setdefault(name, {})
+        mp[key] = _safe_int(mp.get(key)) + 1
+
+    inc_map("decision_counts", dec)
+    inc_map("phase_counts", phase)
+    inc_map("movement_type_counts", mtype)
+    inc_map("direction_counts", direct)
+    inc_map("symbol_counts", sym)
+
+    if dec == "REAL":
+        mh["real_count"] = _safe_int(mh.get("real_count")) + 1
+        mh["entry_count"] = _safe_int(mh.get("entry_count")) + 1
+    elif dec == "GHOST":
+        mh["ghost_count"] = _safe_int(mh.get("ghost_count")) + 1
+    elif dec == "REJECT":
+        mh["reject_count"] = _safe_int(mh.get("reject_count")) + 1
+    elif dec == "SETUP":
+        mh["setup_count"] = _safe_int(mh.get("setup_count")) + 1
+
+    if phase in {"START", "EARLY"}:
+        mh["fresh_count"] = _safe_int(mh.get("fresh_count")) + 1
+    if phase in {"MID", "EXHAUSTION", "RANGE_AFTER_MOVE"}:
+        mh["late_count"] = _safe_int(mh.get("late_count")) + 1
+    if trap == "HIGH":
+        mh["trap_high_count"] = _safe_int(mh.get("trap_high_count")) + 1
+    return event
+
+
+def record_movement_decision(
+    symbol: str = None,
+    direction: str = None,
+    decision: str = None,
+    move_phase: str = None,
+    movement_type: str = None,
+    confidence: Any = None,
+    snapshot: Optional[Dict[str, Any]] = None,
+    source: str = "movement_hunter",
+    **kwargs,
+) -> Dict[str, Any]:
+    """Persist one AI Movement Hunter decision without touching trade execution.
+
+    This is a compatibility-safe memory hook. analysis.py/scanner.py/bot.py can
+    call it for SETUP, ENTRY/REAL, GHOST, and REJECT decisions. It records how
+    the AI judged move freshness/phase/trap context so later learning can see
+    whether the bot hunted the start of a move or chased an exhausted move.
+    """
+    s = _state()
+    event = _record_movement_decision_in_state(
+        s,
+        symbol=symbol,
+        direction=direction,
+        decision=decision,
+        move_phase=move_phase,
+        movement_type=movement_type,
+        confidence=confidence,
+        snapshot=snapshot,
+        source=source,
+        **kwargs,
+    )
+    _refresh_health_in_state(s)
+    _save_state(s)
+    return event
+
+def update_movement_memory(*args, **kwargs) -> Dict[str, Any]:
+    """Alias kept for future modules."""
+    return record_movement_decision(*args, **kwargs)
+
+
+def get_movement_hunter_summary() -> Dict[str, Any]:
+    mh = _state().get("movement_hunter", {})
+    hist = mh.get("history", []) if isinstance(mh.get("history"), list) else []
+    recent = hist[-MAX_MOVEMENT_RECENT:]
+    fresh = len([x for x in recent if _norm_phase(x.get("move_phase")) in {"START", "EARLY"}])
+    late = len([x for x in recent if _norm_phase(x.get("move_phase")) in {"MID", "EXHAUSTION", "RANGE_AFTER_MOVE"}])
+    real = len([x for x in recent if _norm_decision(x.get("decision")) == "REAL"])
+    ghost = len([x for x in recent if _norm_decision(x.get("decision")) == "GHOST"])
+    reject = len([x for x in recent if _norm_decision(x.get("decision")) == "REJECT"])
+    total = max(len(recent), 1)
+    return {
+        "enabled": bool(mh.get("enabled", True)),
+        "last_decision": mh.get("last_decision", {}),
+        "total_events": len(hist),
+        "recent_events": len(recent),
+        "recent_fresh": fresh,
+        "recent_late": late,
+        "recent_real": real,
+        "recent_ghost": ghost,
+        "recent_reject": reject,
+        "recent_fresh_pct": round(fresh / total * 100, 1) if recent else 0.0,
+        "decision_counts": mh.get("decision_counts", {}),
+        "phase_counts": mh.get("phase_counts", {}),
+        "movement_type_counts": mh.get("movement_type_counts", {}),
+        "real_count": _safe_int(mh.get("real_count")),
+        "ghost_count": _safe_int(mh.get("ghost_count")),
+        "reject_count": _safe_int(mh.get("reject_count")),
+        "setup_count": _safe_int(mh.get("setup_count")),
+        "entry_count": _safe_int(mh.get("entry_count")),
+        "fresh_count": _safe_int(mh.get("fresh_count")),
+        "late_count": _safe_int(mh.get("late_count")),
+        "trap_high_count": _safe_int(mh.get("trap_high_count")),
+    }
+
+
+def format_movement_hunter_status() -> str:
+    m = get_movement_hunter_summary()
+    last = m.get("last_decision", {}) if isinstance(m.get("last_decision"), dict) else {}
+    last_line = "آخرین شکار: -"
+    if last:
+        last_line = f"آخرین شکار: {last.get('symbol','?')} {last.get('direction','?')} | {last.get('decision','?')} | فاز:{last.get('move_phase','?')}"
+    return (
+        "🎯 AI Movement Hunter\n"
+        f"فعال: {'بله' if m.get('enabled') else 'خیر'}\n"
+        f"رویدادها: {m.get('total_events', 0)} | اخیر: {m.get('recent_events', 0)}\n"
+        f"Fresh اخیر: {m.get('recent_fresh', 0)} ({m.get('recent_fresh_pct', 0)}٪) | Late/Exhaustion اخیر: {m.get('recent_late', 0)}\n"
+        f"REAL/GHOST/REJECT اخیر: {m.get('recent_real', 0)}/{m.get('recent_ghost', 0)}/{m.get('recent_reject', 0)}\n"
+        f"{last_line}"
+    )
+
 def save_rotation_summary(summary: Optional[Dict[str, Any]] = None, best: Optional[List[Dict[str, Any]]] = None, worst: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     s = _state()
     row = {
@@ -509,11 +773,14 @@ def update_daily_report_memory(date: str = None, report: Optional[Dict[str, Any]
 def _refresh_health_in_state(s: Dict[str, Any]) -> Dict[str, Any]:
     counts = get_ai_summary_counts()
     h = s.setdefault("health", {})
+    movement = get_movement_hunter_summary() if "get_movement_hunter_summary" in globals() else {}
     h.update({
         "confidence": counts.get("confidence", "LOW_DATA"),
         "learned_coin_directions": counts.get("learned_coin_directions", 0),
         "learned_coins": counts.get("learned_coins", 0),
         "closed_results": counts.get("closed_results", 0),
+        "movement_events": movement.get("total_events", 0),
+        "movement_recent_fresh_pct": movement.get("recent_fresh_pct", 0),
         "last_update": _now(),
     })
     return h
@@ -550,6 +817,22 @@ def _format_rotation_short() -> str:
     return f"Rotation بهتر: {names(best)}\nRotation ضعیف: {names(worst)}"
 
 
+
+def _format_movement_short() -> str:
+    try:
+        m = get_movement_hunter_summary()
+        last = m.get("last_decision", {}) if isinstance(m.get("last_decision"), dict) else {}
+        last_txt = "-"
+        if last:
+            last_txt = f"{last.get('symbol','?')} {last.get('direction','?')} {last.get('decision','?')} فاز:{last.get('move_phase','?')}"
+        return (
+            f"Movement Hunter: رویداد {m.get('total_events', 0)} | Fresh اخیر {m.get('recent_fresh', 0)} "
+            f"({m.get('recent_fresh_pct', 0)}٪) | Late اخیر {m.get('recent_late', 0)}\n"
+            f"آخرین: {last_txt}"
+        )
+    except Exception:
+        return "Movement Hunter: نامشخص"
+
 def format_ai_status() -> str:
     s = _state()
     st = s.get("settings", {})
@@ -565,7 +848,8 @@ def format_ai_status() -> str:
         f"کل TP/SL: TP:{sm.get('tp', 0)} SL:{sm.get('sl', 0)} | WR:{sm.get('win_rate', 0)}%\n"
         f"کوین‌های یادگرفته‌شده: {sm.get('learned_coins', 0)} | جهت‌های یادگرفته‌شده: {sm.get('learned_coin_directions', 0)}\n"
         f"رفتارها: خوب {sm.get('good_behaviors', 0)} | ضعیف {sm.get('weak_behaviors', 0)} | بد {sm.get('bad_behaviors', 0)}\n"
-        f"{_format_last_market()}"
+        f"{_format_last_market()}\n"
+        f"{_format_movement_short()}"
     )
 
 
@@ -610,3 +894,11 @@ def enable_ai_learning() -> Dict[str, Any]:
 
 def disable_ai_learning() -> Dict[str, Any]:
     return set_ai_learning_enabled(False)
+
+
+# Movement Hunter compatibility aliases
+def movement_hunter_status_text() -> str:
+    return format_movement_hunter_status()
+
+def ai_movement_status_text() -> str:
+    return format_movement_hunter_status()
