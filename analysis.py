@@ -1365,134 +1365,691 @@ def get_soft_market_context():
         _persist_market_context_to_ai_summary(data)
         return data
 
-def analyze_symbol(symbol: str) -> Dict:
-    symbol=str(symbol).upper().strip()
+
+# ---------------------------------------------------------------------------
+# AI Movement Hunter / Movement Prediction layer
+# ---------------------------------------------------------------------------
+# Classic indicators are sensors only.  They provide raw features, but they do
+# not score, approve, reject, or issue signals.  The final decision is produced
+# here by evaluating movement freshness, phase, trap/liquidity, current market
+# context, and adaptive AI learning/risk layers.
+AI_MOVEMENT_REAL_MIN_SCORE = int(os.getenv("AI_MOVEMENT_REAL_MIN_SCORE", str(AUTO_DIRECT_SCORE_MIN)) or str(AUTO_DIRECT_SCORE_MIN))
+AI_MOVEMENT_SETUP_MIN_SCORE = int(os.getenv("AI_MOVEMENT_SETUP_MIN_SCORE", "68") or "68")
+AI_MOVEMENT_EARLY_MAX_ATR = float(os.getenv("AI_MOVEMENT_EARLY_MAX_ATR", "1.85") or "1.85")
+AI_MOVEMENT_EXHAUSTION_ATR = float(os.getenv("AI_MOVEMENT_EXHAUSTION_ATR", "3.05") or "3.05")
+AI_MOVEMENT_RANGE_AFTER_MOVE_ATR = float(os.getenv("AI_MOVEMENT_RANGE_AFTER_MOVE_ATR", "2.65") or "2.65")
+
+
+def _crossed(prev_value: Any, current_value: Any, level: float, direction: str) -> bool:
     try:
-        df_4h=add_indicators(get_klines(symbol,'4h')); df_1h=add_indicators(get_klines(symbol,'1h')); df_30m=add_indicators(get_klines(symbol,'30m')); df_15m=add_indicators(get_klines(symbol,'15m')); df_5m=add_indicators(get_klines(symbol,'5m', include_current=USE_CURRENT_5M_FOR_ENTRY))
-        market_context=get_soft_market_context(); sp=simple_classic_score(symbol,df_4h,df_1h,df_30m,df_15m,df_5m,market_context); closed_15m_price=safe_float(df_15m.iloc[-1]['close']); atr=safe_float(df_15m.iloc[-1]['atr']); long_score=int(sp['long_score']); short_score=int(sp['short_score'])
-        if long_score>=short_score: direction='LONG'; final_score=long_score; confirmations=int(sp['confirmations_long']); reasons=list(sp['long_reasons']); valid=bool(sp['long_valid'])
-        else: direction='SHORT'; final_score=short_score; confirmations=int(sp['confirmations_short']); reasons=list(sp['short_reasons']); valid=bool(sp['short_valid'])
-        price=_live_entry_price(symbol,direction,df_5m,closed_15m_price)
-        snapshot=build_local_snapshot(symbol,direction,df_4h,df_1h,df_30m,df_15m,df_5m,sp,market_context)
-        snapshot['live_entry_price']=safe_float(price)
-        snapshot['closed_15m_price']=safe_float(closed_15m_price)
-        snapshot['entry']=safe_float(price)
-        snapshot['price']=safe_float(price)
-        # ------------------------------------------------------------------
-        # AI DECISION LAYER
-        # ------------------------------------------------------------------
-        # Classic analysis only creates a candidate.  The final permission to
-        # issue a signal is controlled here by AI memory/risk/rotation.
-        # This keeps learning directly connected to signal issuance instead of
-        # acting as a small cosmetic score change.
-        risk_state=get_coin_risk(symbol,direction)
-        strict=int(risk_state.get('strictness_level',0) or 0)
-        sl_count=int(risk_state.get('sl_count',0) or 0)
-        risk_score=safe_float(risk_state.get('risk_score',0),0)
+        p = safe_float(prev_value)
+        c = safe_float(current_value)
+        if str(direction).upper() == "UP":
+            return p <= level < c
+        return p >= level > c
+    except Exception:
+        return False
 
-        # Base threshold comes from config/env; default target stays 82 unless AI/risk raises it.
-        # AI can still add more strictness per coin+direction after losses.
-        base_min_score=max(int(MIN_DIRECT_SCORE), int(AUTO_DIRECT_SCORE_MIN))
-        base_conf=max(3, int(MIN_MANUAL_CONFIRMATIONS))
-        req_conf=base_conf
-        ai_penalty=0
-        ai_min_score_add=0
-        ai_block=False
 
-        # Per coin + direction risk learning:
-        # - After repeated SLs (real or ghost, depending on coin_risk data),
-        #   require stronger score and more confirmations.
-        # - Keep it gradual so signal frequency does not collapse.
+def _recent_range_context(df: pd.DataFrame, atr_ref: float, lookback: int = 12) -> Dict[str, Any]:
+    try:
+        recent = df.tail(max(lookback, 6))
+        last4 = df.tail(4)
+        price = safe_float(df.iloc[-1]["close"])
+        atr = max(safe_float(atr_ref), safe_float(df.iloc[-1].get("atr"), 0.0), price * 0.0015, 1e-12)
+        hi = safe_float(recent["high"].max())
+        lo = safe_float(recent["low"].min())
+        last4_hi = safe_float(last4["high"].max())
+        last4_lo = safe_float(last4["low"].min())
+        move_atr = (hi - lo) / atr
+        last4_range_atr = (last4_hi - last4_lo) / atr
+        pos = (price - lo) / max(hi - lo, 1e-12)
+        return {
+            "hi": safe_round(hi),
+            "lo": safe_round(lo),
+            "move_atr": round(move_atr, 3),
+            "last4_range_atr": round(last4_range_atr, 3),
+            "position_in_range": round(pos, 3),
+            "near_high": bool(pos >= 0.76),
+            "near_low": bool(pos <= 0.24),
+            "tight_recent_range": bool(last4_range_atr <= 0.90),
+        }
+    except Exception:
+        return {"move_atr": 0.0, "last4_range_atr": 0.0, "position_in_range": 0.5}
+
+
+def _raw_tf_features(df: pd.DataFrame, tf_name: str) -> Dict[str, Any]:
+    try:
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+        buy2, sell2 = buy_sell_power(df, 2)
+        buy3, sell3 = buy_sell_power(df, 3)
+        buy6, sell6 = buy_sell_power(df, 6)
+        candle = _candle_quality_pack(df, 6)
+        comp = _compression_expansion_pack(df, 24)
+        return {
+            "tf": tf_name,
+            "close": safe_round(last.get("close")),
+            "rsi": safe_round(last.get("rsi"), 3),
+            "rsi_prev": safe_round(prev.get("rsi"), 3),
+            "rsi_slope": safe_round(safe_float(last.get("rsi")) - safe_float(prev.get("rsi")), 4),
+            "rsi_cross_30_up": _crossed(prev.get("rsi"), last.get("rsi"), 30, "UP"),
+            "rsi_cross_50_up": _crossed(prev.get("rsi"), last.get("rsi"), 50, "UP"),
+            "rsi_cross_70_down": _crossed(prev.get("rsi"), last.get("rsi"), 70, "DOWN"),
+            "rsi_cross_50_down": _crossed(prev.get("rsi"), last.get("rsi"), 50, "DOWN"),
+            "macd": safe_round(last.get("macd"), 8),
+            "macd_signal": safe_round(last.get("macd_signal"), 8),
+            "macd_hist": safe_round(last.get("macd_hist"), 8),
+            "macd_hist_prev": safe_round(prev.get("macd_hist"), 8),
+            "macd_hist_slope": safe_round(safe_float(last.get("macd_hist")) - safe_float(prev.get("macd_hist")), 8),
+            "hist_cross_zero_up": safe_float(prev.get("macd_hist")) <= 0 < safe_float(last.get("macd_hist")),
+            "hist_cross_zero_down": safe_float(prev.get("macd_hist")) >= 0 > safe_float(last.get("macd_hist")),
+            "ema20": safe_round(last.get("ema20")),
+            "ema50": safe_round(last.get("ema50")),
+            "ema200": safe_round(last.get("ema200")),
+            "ema20_distance_atr": safe_round(distance_from_ema20_atr(df), 4),
+            "vwap": safe_round(last.get("vwap")),
+            "above_vwap": bool(safe_float(last.get("close")) > safe_float(last.get("vwap"))),
+            "below_vwap": bool(safe_float(last.get("close")) < safe_float(last.get("vwap"))),
+            "vwap_reclaim": bool(safe_float(last.get("close")) > safe_float(last.get("vwap")) and safe_float(prev.get("close")) <= safe_float(prev.get("vwap"))),
+            "vwap_loss": bool(safe_float(last.get("close")) < safe_float(last.get("vwap")) and safe_float(prev.get("close")) >= safe_float(prev.get("vwap"))),
+            "adx": safe_round(last.get("adx"), 3),
+            "adx_slope": safe_round(_slope(df["adx"], 3), 4),
+            "atr": safe_round(last.get("atr")),
+            "volume_ratio": safe_round(last.get("volume_ratio"), 3),
+            "buy2": buy2, "sell2": sell2, "buy3": buy3, "sell3": sell3, "buy6": buy6, "sell6": sell6,
+            "candle": candle,
+            "compression": comp,
+            "trend_hint": trend_direction(df),
+            "ema_hint": ema_direction(df),
+        }
+    except Exception as e:
+        return {"tf": tf_name, "error": str(e)[:120]}
+
+
+def build_technical_sensor_snapshot(symbol: str, df_4h: pd.DataFrame, df_1h: pd.DataFrame, df_30m: pd.DataFrame, df_15m: pd.DataFrame, df_5m: pd.DataFrame, market_context: Dict[str, Any]) -> Dict[str, Any]:
+    """Return raw technical sensor data.  No signal, no score, no gate."""
+    price = safe_float(df_5m.iloc[-1].get("close") if USE_CURRENT_5M_FOR_ENTRY else df_15m.iloc[-1].get("close"))
+    atr = max(safe_float(df_15m.iloc[-1].get("atr")), price * 0.0015, 1e-12)
+    return {
+        "sensor_mode": True,
+        "classic_signal_disabled": True,
+        "classic_score_disabled": True,
+        "symbol": str(symbol).upper(),
+        "price": safe_round(price),
+        "atr": safe_round(atr),
+        "timeframes": {
+            "5M": _raw_tf_features(df_5m, "5M"),
+            "15M": _raw_tf_features(df_15m, "15M"),
+            "30M": _raw_tf_features(df_30m, "30M"),
+            "1H": _raw_tf_features(df_1h, "1H"),
+            "4H": _raw_tf_features(df_4h, "4H"),
+        },
+        "range_5m": _recent_range_context(df_5m, atr, 12),
+        "range_15m": _recent_range_context(df_15m, atr, 12),
+        "market_context": market_context or {},
+        "learning_note": "technical indicators are raw AI sensors only; no classic scoring or signal issuance",
+    }
+
+
+def _direction_sensor_evidence(direction: str, sensors: Dict[str, Any], market_context: Dict[str, Any]) -> Dict[str, Any]:
+    direction = str(direction or "").upper().strip()
+    t5 = sensors.get("timeframes", {}).get("5M", {})
+    t15 = sensors.get("timeframes", {}).get("15M", {})
+    t1 = sensors.get("timeframes", {}).get("1H", {})
+    r5 = sensors.get("range_5m", {})
+    r15 = sensors.get("range_15m", {})
+    score = 50.0
+    evidence = []
+    warnings = []
+
+    if direction == "LONG":
+        if t5.get("rsi_cross_30_up"):
+            score += 12; evidence.append("5M RSI برگشت از 30")
+        if t5.get("rsi_cross_50_up") or t15.get("rsi_cross_50_up"):
+            score += 7; evidence.append("RSI عبور از 50")
+        if safe_float(t5.get("rsi_slope")) > 0 and safe_float(t15.get("rsi_slope")) >= -0.2:
+            score += 6; evidence.append("RSI slope مثبت")
+        if t5.get("hist_cross_zero_up") or t15.get("hist_cross_zero_up"):
+            score += 9; evidence.append("MACD hist عبور مثبت")
+        if safe_float(t5.get("macd_hist_slope")) > 0 and safe_float(t15.get("macd_hist_slope")) >= 0:
+            score += 9; evidence.append("MACD histogram acceleration مثبت")
+        if t5.get("vwap_reclaim") or t15.get("vwap_reclaim"):
+            score += 8; evidence.append("VWAP reclaim")
+        elif t5.get("above_vwap") and t15.get("above_vwap"):
+            score += 5; evidence.append("بالای VWAP")
+        if safe_float(t5.get("buy2")) >= 62 or safe_float(t5.get("buy3")) >= 58:
+            score += 9; evidence.append("Power Shift خرید")
+        if (t5.get("candle") or {}).get("strong_close_up"):
+            score += 7; evidence.append("کندل بسته‌شدن قوی لانگ")
+        if (t5.get("compression") or {}).get("compression") or (t15.get("compression") or {}).get("compression"):
+            score += 5; evidence.append("فشردگی قبل از حرکت")
+        if (t5.get("compression") or {}).get("expansion") or (t15.get("compression") or {}).get("expansion"):
+            score += 8; evidence.append("شروع expansion/volume")
+        if safe_float(t1.get("macd_hist_slope")) >= 0:
+            score += 2
+        if (t5.get("candle") or {}).get("upper_rejection") and r5.get("near_high"):
+            score -= 9; warnings.append("ریجکت سقف/احتمال تله لانگ")
+    else:
+        if t5.get("rsi_cross_70_down"):
+            score += 12; evidence.append("5M RSI برگشت از 70")
+        if t5.get("rsi_cross_50_down") or t15.get("rsi_cross_50_down"):
+            score += 7; evidence.append("RSI شکست 50 به پایین")
+        if safe_float(t5.get("rsi_slope")) < 0 and safe_float(t15.get("rsi_slope")) <= 0.2:
+            score += 6; evidence.append("RSI slope منفی")
+        if t5.get("hist_cross_zero_down") or t15.get("hist_cross_zero_down"):
+            score += 9; evidence.append("MACD hist عبور منفی")
+        if safe_float(t5.get("macd_hist_slope")) < 0 and safe_float(t15.get("macd_hist_slope")) <= 0:
+            score += 9; evidence.append("MACD histogram acceleration منفی")
+        if t5.get("vwap_loss") or t15.get("vwap_loss"):
+            score += 8; evidence.append("VWAP loss")
+        elif t5.get("below_vwap") and t15.get("below_vwap"):
+            score += 5; evidence.append("زیر VWAP")
+        if safe_float(t5.get("sell2")) >= 62 or safe_float(t5.get("sell3")) >= 58:
+            score += 9; evidence.append("Power Shift فروش")
+        if (t5.get("candle") or {}).get("strong_close_down"):
+            score += 7; evidence.append("کندل بسته‌شدن قوی شورت")
+        if (t5.get("compression") or {}).get("compression") or (t15.get("compression") or {}).get("compression"):
+            score += 5; evidence.append("فشردگی قبل از حرکت")
+        if (t5.get("compression") or {}).get("expansion") or (t15.get("compression") or {}).get("expansion"):
+            score += 8; evidence.append("شروع expansion/volume")
+        if safe_float(t1.get("macd_hist_slope")) <= 0:
+            score += 2
+        if (t5.get("candle") or {}).get("lower_rejection") and r5.get("near_low"):
+            score -= 9; warnings.append("ریجکت کف/احتمال تله شورت")
+
+    btc_bias = str(market_context.get("btc_bias", "NEUTRAL")).upper()
+    if direction == "LONG" and "BULLISH" in btc_bias:
+        score += 3; evidence.append("BTC/Market همسو لانگ")
+    if direction == "SHORT" and "BEARISH" in btc_bias:
+        score += 3; evidence.append("BTC/Market همسو شورت")
+    if direction == "LONG" and "BEARISH" in btc_bias:
+        score -= 3; warnings.append("BTC خلاف لانگ")
+    if direction == "SHORT" and "BULLISH" in btc_bias:
+        score -= 3; warnings.append("BTC خلاف شورت")
+
+    return {"score": cap_score(score), "evidence": evidence[:12], "warnings": warnings[:8]}
+
+
+def _movement_phase_for_direction(direction: str, sensors: Dict[str, Any], evidence_score: float) -> Dict[str, Any]:
+    direction = str(direction or "").upper().strip()
+    t5 = sensors.get("timeframes", {}).get("5M", {})
+    t15 = sensors.get("timeframes", {}).get("15M", {})
+    r5 = sensors.get("range_5m", {})
+    r15 = sensors.get("range_15m", {})
+    move_atr = max(safe_float(r5.get("move_atr")), safe_float(r15.get("move_atr")))
+    last_range = safe_float(r5.get("last4_range_atr"))
+    dist5 = safe_float(t5.get("ema20_distance_atr"))
+    dist15 = safe_float(t15.get("ema20_distance_atr"))
+    dist = max(dist5, dist15)
+    pos = safe_float(r5.get("position_in_range"), 0.5)
+
+    range_after_move = (
+        move_atr >= AI_MOVEMENT_RANGE_AFTER_MOVE_ATR
+        and last_range <= 0.95
+        and ((direction == "SHORT" and pos <= 0.38) or (direction == "LONG" and pos >= 0.62))
+    )
+    exhausted = (
+        move_atr >= AI_MOVEMENT_EXHAUSTION_ATR
+        and ((direction == "SHORT" and pos <= 0.30) or (direction == "LONG" and pos >= 0.70))
+        and dist >= 1.35
+    )
+    if range_after_move:
+        phase = "RANGE_AFTER_MOVE"
+    elif exhausted:
+        phase = "EXHAUSTION"
+    elif move_atr <= 1.15 and evidence_score >= 66:
+        phase = "START"
+    elif move_atr <= AI_MOVEMENT_EARLY_MAX_ATR and evidence_score >= 66:
+        phase = "EARLY"
+    elif evidence_score >= AI_MOVEMENT_SETUP_MIN_SCORE and move_atr <= 1.05:
+        phase = "SETUP"
+    else:
+        phase = "MID" if move_atr > AI_MOVEMENT_EARLY_MAX_ATR or dist >= 1.25 else "WATCH"
+
+    real_allowed = phase in {"START", "EARLY"}
+    setup_only = phase in {"SETUP", "WATCH", "MID"}
+    return {
+        "phase": phase,
+        "real_allowed": bool(real_allowed),
+        "setup_only": bool(setup_only),
+        "move_atr": round(move_atr, 3),
+        "last4_range_atr": round(last_range, 3),
+        "distance_ema20_atr": round(dist, 3),
+        "position_in_range": round(pos, 3),
+        "range_after_move": bool(range_after_move),
+        "exhausted": bool(exhausted),
+    }
+
+
+def _trap_liquidity_from_sensors(direction: str, sensors: Dict[str, Any]) -> Dict[str, Any]:
+    direction = str(direction or "").upper().strip()
+    t5 = sensors.get("timeframes", {}).get("5M", {})
+    r5 = sensors.get("range_5m", {})
+    candle = t5.get("candle") or {}
+    trap_score = 18
+    reasons = []
+    if direction == "LONG":
+        if candle.get("upper_rejection") and r5.get("near_high"):
+            trap_score += 42; reasons.append("upper wick near high")
+        if safe_float(t5.get("buy2")) < 45 and safe_float(t5.get("sell2")) > 55:
+            trap_score += 15; reasons.append("buy power weak")
+        if t5.get("below_vwap"):
+            trap_score += 8; reasons.append("below VWAP")
+    else:
+        if candle.get("lower_rejection") and r5.get("near_low"):
+            trap_score += 42; reasons.append("lower wick near low")
+        if safe_float(t5.get("sell2")) < 45 and safe_float(t5.get("buy2")) > 55:
+            trap_score += 15; reasons.append("sell power weak")
+        if t5.get("above_vwap"):
+            trap_score += 8; reasons.append("above VWAP")
+    level = "HIGH" if trap_score >= 60 else "MEDIUM" if trap_score >= 38 else "LOW"
+    return {"trap_score": cap_score(trap_score), "trap_risk": level, "reasons": reasons[:6]}
+
+
+def ai_movement_hunter_decision(symbol: str, sensors: Dict[str, Any], market_context: Dict[str, Any]) -> Dict[str, Any]:
+    """AI-first movement hunter.
+
+    This function is the only direction/score/decision source in analysis.py.
+    Classic functions may still be called for legacy telemetry, but their
+    scores are not used to approve or reject a trade.
+    """
+    long_ev = _direction_sensor_evidence("LONG", sensors, market_context)
+    short_ev = _direction_sensor_evidence("SHORT", sensors, market_context)
+    candidates = {}
+    for direction, ev in (("LONG", long_ev), ("SHORT", short_ev)):
+        phase = _movement_phase_for_direction(direction, sensors, ev.get("score", 50))
+        trap = _trap_liquidity_from_sensors(direction, sensors)
+        score = safe_float(ev.get("score"), 50)
+        if phase.get("phase") in {"START", "EARLY"}:
+            score += 7
+        elif phase.get("phase") == "SETUP":
+            score += 2
+        elif phase.get("phase") == "MID":
+            score -= 8
+        elif phase.get("phase") in {"EXHAUSTION", "RANGE_AFTER_MOVE"}:
+            score -= 22
+        if trap.get("trap_risk") == "HIGH":
+            score -= 16
+        elif trap.get("trap_risk") == "MEDIUM":
+            score -= 5
+        candidates[direction] = {
+            "direction": direction,
+            "score": cap_score(score),
+            "raw_evidence_score": ev.get("score"),
+            "evidence": ev.get("evidence", []),
+            "warnings": ev.get("warnings", []),
+            "phase": phase,
+            "trap": trap,
+        }
+
+    selected = candidates["LONG"] if candidates["LONG"]["score"] >= candidates["SHORT"]["score"] else candidates["SHORT"]
+    score = int(selected.get("score", 0))
+    phase_name = selected.get("phase", {}).get("phase", "UNKNOWN")
+    trap_risk = selected.get("trap", {}).get("trap_risk", "LOW")
+    evidence_count = len(selected.get("evidence") or [])
+
+    if score >= AI_MOVEMENT_REAL_MIN_SCORE and selected.get("phase", {}).get("real_allowed") and trap_risk != "HIGH" and evidence_count >= 3:
+        decision = "REAL"
+    elif score >= AI_MOVEMENT_SETUP_MIN_SCORE and phase_name not in {"EXHAUSTION", "RANGE_AFTER_MOVE"} and trap_risk != "HIGH":
+        decision = "GHOST"
+    else:
+        decision = "REJECT"
+
+    return {
+        "architecture": "AI_MOVEMENT_HUNTER",
+        "classic_signal_disabled": True,
+        "classic_score_disabled": True,
+        "symbol": str(symbol).upper(),
+        "decision": decision,
+        "direction": selected.get("direction", "NONE"),
+        "ai_score": cap_score(score),
+        "confidence": "HIGH" if score >= 88 else "MEDIUM" if score >= 76 else "LOW",
+        "evidence_count": evidence_count,
+        "required_evidence": 3,
+        "move_phase": phase_name,
+        "move_freshness": "HIGH" if phase_name == "START" else "MEDIUM" if phase_name == "EARLY" else "LOW",
+        "trap_risk": trap_risk,
+        "selected": selected,
+        "candidates": candidates,
+        "reasons": (selected.get("evidence") or []) + (selected.get("warnings") or []) + (selected.get("trap", {}).get("reasons") or []),
+    }
+
+def analyze_symbol(symbol: str) -> Dict:
+    symbol = str(symbol).upper().strip()
+    try:
+        # Data/indicator layer: still unchanged so every existing command, paper
+        # trade, real trade, TP/SL, risk, rotation, ghost, and statistics module
+        # can keep using the same output shape.
+        df_4h = add_indicators(get_klines(symbol, '4h'))
+        df_1h = add_indicators(get_klines(symbol, '1h'))
+        df_30m = add_indicators(get_klines(symbol, '30m'))
+        df_15m = add_indicators(get_klines(symbol, '15m'))
+        df_5m = add_indicators(get_klines(symbol, '5m', include_current=USE_CURRENT_5M_FOR_ENTRY))
+
+        market_context = get_soft_market_context()
+
+        # Legacy telemetry only.  simple_classic_score is no longer allowed to
+        # issue/approve/reject a signal.  It is kept so old UI fields and other
+        # files that expect trends/reasons/power values do not break.
+        sp = simple_classic_score(symbol, df_4h, df_1h, df_30m, df_15m, df_5m, market_context)
+
+        sensors = build_technical_sensor_snapshot(symbol, df_4h, df_1h, df_30m, df_15m, df_5m, market_context)
+        movement_decision = ai_movement_hunter_decision(symbol, sensors, market_context)
+
+        direction = str(movement_decision.get('direction') or 'NONE').upper()
+        ai_score = int(movement_decision.get('ai_score') or 0)
+        confirmations = int(movement_decision.get('evidence_count') or 0)
+        reasons = list(movement_decision.get('reasons') or [])
+        if not reasons:
+            reasons = ['AI Movement Hunter: نشانه کافی برای حرکت تازه پیدا نشد']
+
+        closed_15m_price = safe_float(df_15m.iloc[-1]['close'])
+        price = _live_entry_price(symbol, direction if direction in {'LONG', 'SHORT'} else 'LONG', df_5m, closed_15m_price)
+        atr = max(safe_float(df_15m.iloc[-1]['atr']), safe_float(price) * 0.0015)
+
+        # Build selected-direction snapshot for all learning/trade modules.
+        # This snapshot now clearly marks classic output as sensor-only.
+        snapshot = build_local_snapshot(
+            symbol,
+            direction if direction in {'LONG', 'SHORT'} else 'NONE',
+            df_4h, df_1h, df_30m, df_15m, df_5m, sp, market_context
+        )
+        snapshot['technical_sensors'] = sensors
+        snapshot['ai_movement_hunter'] = movement_decision
+        snapshot['classic_signal_disabled'] = True
+        snapshot['classic_score_disabled'] = True
+        snapshot['live_entry_price'] = safe_float(price)
+        snapshot['closed_15m_price'] = safe_float(closed_15m_price)
+        snapshot['entry'] = safe_float(price)
+        snapshot['price'] = safe_float(price)
+
+        risk_state = get_coin_risk(symbol, direction)
+        strict = int(risk_state.get('strictness_level', 0) or 0)
+        sl_count = int(risk_state.get('sl_count', 0) or 0)
+        risk_score = safe_float(risk_state.get('risk_score', 0), 0)
+
+        rotation = get_rotation_context(symbol)
+        rs = safe_float(rotation.get('rotation_score', 50), 50)
+
+        # AI score is the only score used for final permission.
+        final_score = ai_score
+        base_min_score = max(int(AI_MOVEMENT_REAL_MIN_SCORE), int(AUTO_DIRECT_SCORE_MIN))
+        base_conf = 3
+        req_conf = base_conf
+        ai_penalty = 0
+        ai_min_score_add = 0
+        ai_block = False
+
+        # Risk/rotation/learning are AI layers and remain active, but they
+        # adjust the AI Movement score instead of any classic score.
         if strict:
             ai_penalty += min(9, max(2, strict * 2))
             ai_min_score_add += min(7, max(1, strict * 1.5))
             req_conf += min(2, max(1, strict))
             reasons.append(f'AI Risk: سختگیری سطح {strict} | SL={sl_count}')
         elif sl_count >= 2:
-            # Safety fallback if coin_risk stores SL count but strictness_level
-            # is not being calculated correctly yet.
-            fallback_level=min(3, sl_count-1)
+            fallback_level = min(3, sl_count - 1)
             ai_penalty += min(9, fallback_level * 3)
             ai_min_score_add += min(6, fallback_level * 2)
             req_conf += min(2, fallback_level)
             reasons.append(f'AI Risk fallback: SLهای تکراری {sl_count}')
 
-        # Rotation controls priority and quality gate.
-        rotation=get_rotation_context(symbol)
-        rs=safe_float(rotation.get('rotation_score',50),50)
-        if rs>=80:
-            final_score+=2
+        if rs >= 80:
+            final_score += 2
             reasons.append('AI Rotation: اولویت مثبت')
-        elif rs<=20:
+        elif rs <= 20:
             ai_penalty += 4
             ai_min_score_add += 2
             req_conf += 1
             reasons.append('AI Rotation: کوین کم‌اولویت/پرریسک')
-        elif rs<=35:
+        elif rs <= 35:
             ai_penalty += 2
             ai_min_score_add += 1
             reasons.append('AI Rotation: اولویت ضعیف')
 
-        # Learning engine may request extra strength based on real/ghost history
-        # and similar historical snapshots.
-        extra=ai_extra_strength_required(symbol,direction,snapshot)
-        ai_min_score_add += int(extra.get('extra_score',0) or 0)
-        req_conf += int(extra.get('extra_confirmations',0) or 0)
+        extra = ai_extra_strength_required(symbol, direction, snapshot)
+        ai_min_score_add += int(extra.get('extra_score', 0) or 0)
+        req_conf += int(extra.get('extra_confirmations', 0) or 0)
         if extra.get('required'):
             reasons.append(extra.get('reason') or 'AI Learning: تایید بیشتر لازم است')
 
-        # Soft integrated prediction/context layers: these layers rank candidates and feed Ghost/AI learning.
-        # They are not hard blockers at startup, so the bot stays learnable and does not become dry.
-        prediction_pack = snapshot.get('prediction_layer', {}) if isinstance(snapshot, dict) else {}
-        prediction_score = safe_float(prediction_pack.get('prediction_score'), 50)
-        reversal_risk_score = safe_float(prediction_pack.get('reversal_risk_score'), 50)
-        trap_risk = str((prediction_pack.get('liquidity_trap') or {}).get('trap_risk', 'LOW')).upper()
-        move_state = str((prediction_pack.get('state') or {}).get('move_state', 'UNKNOWN')).upper()
-        if prediction_score >= 72 and reversal_risk_score <= 55:
-            final_score += 3
-            reasons.append('AI Prediction: شروع حرکت/مومنتوم مثبت')
-        elif prediction_score <= 42 or reversal_risk_score >= 78:
+        move_phase = str(movement_decision.get('move_phase', 'UNKNOWN')).upper()
+        trap_risk = str(movement_decision.get('trap_risk', 'LOW')).upper()
+        move_freshness = str(movement_decision.get('move_freshness', 'LOW')).upper()
+
+        # Fresh movement is the main gate. Direction alone is not enough.
+        if move_phase in {'EXHAUSTION', 'RANGE_AFTER_MOVE'}:
+            ai_block = True
+            reasons.append(f'AI State Block: حرکت تازه نیست ({move_phase})')
+        elif move_phase == 'MID':
+            ai_penalty += 8
+            ai_min_score_add += 3
+            reasons.append('AI State: حرکت در میانه راه است، فقط با قدرت خیلی بالا مجاز است')
+        elif move_phase == 'SETUP':
+            ai_penalty += 4
+            ai_min_score_add += 2
+            reasons.append('AI Setup: آماده حرکت است ولی ورود هنوز فعال نشده')
+
+        if trap_risk == 'HIGH':
+            ai_block = True
+            reasons.append('AI Trap Block: ریسک تله/لیکوییدیتی بالا')
+        elif trap_risk == 'MEDIUM':
             ai_penalty += 3
             ai_min_score_add += 1
-            reasons.append('AI Prediction: ریسک برگشت یا ضعف مومنتوم')
-        if trap_risk == 'HIGH':
-            ai_penalty += 4
-            ai_min_score_add += 2
-            reasons.append('AI Trap: احتمال فیک‌بریک/تله بالا')
-        if move_state == 'LATE_OR_EXHAUSTION':
-            ai_penalty += 4
-            ai_min_score_add += 2
-            reasons.append('AI State: احتمال ورود دیر یا خستگی حرکت')
+            reasons.append('AI Trap: ریسک متوسط')
 
-        # If the coin/direction is extremely risky, AI can block borderline
-        # candidates.  Strong candidates can still pass only with strict gates.
         if risk_score >= 92 and final_score < 95:
-            ai_block=True
+            ai_block = True
             reasons.append('AI Block: ریسک کوین/جهت خیلی بالا و امتیاز کافی نیست')
 
         final_score -= ai_penalty
-        min_score=min(96, base_min_score + ai_min_score_add)
-        effective_req_conf=min(8, max(base_conf, req_conf))
+        min_score = min(96, base_min_score + ai_min_score_add)
+        effective_req_conf = min(8, max(base_conf, req_conf))
 
-        level_pack=get_strong_levels(df_5m,df_15m,df_30m,price,atr); support=level_pack.get('nearest_support'); resistance=level_pack.get('nearest_resistance')
-        entry_confirmed=(not ai_block) and valid and final_score>=min_score and confirmations>=effective_req_conf
-        common={'symbol':symbol,'score':cap_score(final_score),'long_score':long_score,'short_score':short_score,'price':safe_round(price),'closed_15m_price':safe_round(closed_15m_price),'entry_price_source':'5M_CURRENT' if USE_CURRENT_5M_FOR_ENTRY else '15M_CLOSED','atr':safe_round(atr),'market_regime':market_context.get('market_regime','NEUTRAL'),'btc_bias':market_context.get('btc_bias','NEUTRAL'),'btc_lead':market_context.get('btc_lead',{}),'market_regime_legacy':market_context.get('market_regime_legacy','neutral'),'btc_bias_legacy':market_context.get('btc_bias_legacy','neutral'),'confirmations':confirmations,'required_confirmations':effective_req_conf,'rsi':safe_round(df_15m.iloc[-1]['rsi'],2),'macd':safe_round(df_15m.iloc[-1]['macd'],6),'macd_signal':safe_round(df_15m.iloc[-1]['macd_signal'],6),'macd_hist':safe_round(df_15m.iloc[-1]['macd_hist'],6),'adx':safe_round(df_15m.iloc[-1]['adx'],2),'vwap_status':vwap_status(df_15m),'support':safe_round(support),'resistance':safe_round(resistance),'trends':sp.get('trends',{}),'distance_ema20_atr':sp.get('distance_ema20_atr'),'volume_status':sp.get('volume_status'),'volume_ratio':sp.get('volume_ratio'),'buy_power':sp.get('buy_power'),'sell_power':sp.get('sell_power'),'power2_buy':sp.get('power2_buy'),'power2_sell':sp.get('power2_sell'),'power3_buy':sp.get('power3_buy'),'power3_sell':sp.get('power3_sell'),'snapshot':snapshot,'coin_risk':risk_state,'rotation':rotation,'ai_decision':{'base_min_score':base_min_score,'min_score':min_score,'ai_penalty':ai_penalty,'ai_min_score_add':ai_min_score_add,'ai_block':ai_block,'strictness_level':strict,'sl_count':sl_count,'risk_score':risk_score,'rotation_score':rs,'prediction_score':safe_round(prediction_score,2),'reversal_risk_score':safe_round(reversal_risk_score,2),'trap_risk':trap_risk,'move_state':move_state},'prediction_layer':prediction_pack,'reasons':reasons[:20],'signal_timeframe':'AI 15M Scalp Candidate'}
+        level_pack = get_strong_levels(df_5m, df_15m, df_30m, price, atr)
+        support = level_pack.get('nearest_support')
+        resistance = level_pack.get('nearest_resistance')
+
+        ai_decision_kind = str(movement_decision.get('decision', 'REJECT')).upper()
+        entry_confirmed = (
+            direction in {'LONG', 'SHORT'}
+            and not ai_block
+            and ai_decision_kind == 'REAL'
+            and final_score >= min_score
+            and confirmations >= effective_req_conf
+        )
+
+        # For backward compatibility, long_score/short_score are now AI movement
+        # candidate scores, not classic scores.
+        candidates = movement_decision.get('candidates', {}) if isinstance(movement_decision, dict) else {}
+        long_score = int((candidates.get('LONG') or {}).get('score', 0) or 0)
+        short_score = int((candidates.get('SHORT') or {}).get('score', 0) or 0)
+
+        prediction_pack = snapshot.get('prediction_layer', {}) if isinstance(snapshot, dict) else {}
+        common = {
+            'symbol': symbol,
+            'score': cap_score(final_score),
+            'long_score': long_score,
+            'short_score': short_score,
+            'classic_long_score': sp.get('long_score', 0),
+            'classic_short_score': sp.get('short_score', 0),
+            'price': safe_round(price),
+            'closed_15m_price': safe_round(closed_15m_price),
+            'entry_price_source': '5M_CURRENT' if USE_CURRENT_5M_FOR_ENTRY else '15M_CLOSED',
+            'atr': safe_round(atr),
+            'market_regime': market_context.get('market_regime', 'NEUTRAL'),
+            'btc_bias': market_context.get('btc_bias', 'NEUTRAL'),
+            'btc_lead': market_context.get('btc_lead', {}),
+            'market_regime_legacy': market_context.get('market_regime_legacy', 'neutral'),
+            'btc_bias_legacy': market_context.get('btc_bias_legacy', 'neutral'),
+            'confirmations': confirmations,
+            'required_confirmations': effective_req_conf,
+            'rsi': safe_round(df_15m.iloc[-1]['rsi'], 2),
+            'macd': safe_round(df_15m.iloc[-1]['macd'], 6),
+            'macd_signal': safe_round(df_15m.iloc[-1]['macd_signal'], 6),
+            'macd_hist': safe_round(df_15m.iloc[-1]['macd_hist'], 6),
+            'adx': safe_round(df_15m.iloc[-1]['adx'], 2),
+            'vwap_status': vwap_status(df_15m),
+            'support': safe_round(support),
+            'resistance': safe_round(resistance),
+            'trends': sp.get('trends', {}),
+            'distance_ema20_atr': max(
+                safe_float((sensors.get('timeframes', {}).get('5M') or {}).get('ema20_distance_atr')),
+                safe_float((sensors.get('timeframes', {}).get('15M') or {}).get('ema20_distance_atr')),
+            ),
+            'volume_status': sp.get('volume_status'),
+            'volume_ratio': sp.get('volume_ratio'),
+            'buy_power': sp.get('buy_power'),
+            'sell_power': sp.get('sell_power'),
+            'power2_buy': sp.get('power2_buy'),
+            'power2_sell': sp.get('power2_sell'),
+            'power3_buy': sp.get('power3_buy'),
+            'power3_sell': sp.get('power3_sell'),
+            'snapshot': snapshot,
+            'technical_sensors': sensors,
+            'coin_risk': risk_state,
+            'rotation': rotation,
+            'ai_decision': {
+                'architecture': 'AI_MOVEMENT_HUNTER',
+                'classic_signal_disabled': True,
+                'classic_score_disabled': True,
+                'base_min_score': base_min_score,
+                'min_score': min_score,
+                'ai_penalty': ai_penalty,
+                'ai_min_score_add': ai_min_score_add,
+                'ai_block': ai_block,
+                'decision': ai_decision_kind,
+                'strictness_level': strict,
+                'sl_count': sl_count,
+                'risk_score': risk_score,
+                'rotation_score': rs,
+                'ai_movement_score': cap_score(final_score),
+                'move_phase': move_phase,
+                'move_freshness': move_freshness,
+                'trap_risk': trap_risk,
+                'selected': movement_decision.get('selected', {}),
+            },
+            'ai_movement_hunter': movement_decision,
+            'prediction_layer': prediction_pack,
+            'reasons': reasons[:24],
+            'signal_timeframe': 'AI Movement Hunter 5M/15M',
+        }
+
         if not entry_confirmed:
-            return {**common,'direction':'NO TRADE','status':'NO_TRADE','entry_confirmed':False,'entry_mode':'NO_ENTRY','entry':None,'stop_loss':None,'tp1':None,'tp2':None,'risk_reward':0,'risk_level':'UNKNOWN','freshness':'LOW','tp_meta':{},'validity':'سیگنال معتبر نیست','valid_gate':valid,'min_score':min_score}
-        sl,tp1,tp2,rr,tp_meta=build_trade_levels(direction,price,atr,df_5m,df_15m,df_30m,snapshot,symbol)
+            entry_mode = 'AI_GHOST_SETUP' if ai_decision_kind == 'GHOST' else 'AI_NO_ENTRY'
+            return {
+                **common,
+                'direction': 'NO TRADE',
+                'candidate_direction': direction if direction in {'LONG', 'SHORT'} else None,
+                'status': 'NO_TRADE',
+                'entry_confirmed': False,
+                'entry_mode': entry_mode,
+                'entry': None,
+                'stop_loss': None,
+                'tp1': None,
+                'tp2': None,
+                'risk_reward': 0,
+                'risk_level': 'UNKNOWN',
+                'freshness': move_freshness,
+                'tp_meta': {},
+                'validity': 'سیگنال معتبر نیست',
+                'valid_gate': False,
+                'min_score': min_score,
+            }
+
+        sl, tp1, tp2, rr, tp_meta = build_trade_levels(direction, price, atr, df_5m, df_15m, df_30m, snapshot, symbol)
         if safe_float(rr, 0.0) < MIN_REAL_RISK_REWARD:
             rr_reason = f"رد R/R: نسبت سود به ضرر {rr} کمتر از حداقل {MIN_REAL_RISK_REWARD}"
             reasons.append(rr_reason)
-            common["reasons"] = reasons[:20]
-            return {**common,'direction':'NO TRADE','status':'NO_TRADE','entry_confirmed':False,'entry_mode':'RR_FILTER','entry':None,'stop_loss':sl,'tp1':tp1,'tp2':tp2,'risk_reward':rr,'risk_level':'UNKNOWN','freshness':'LOW','tp_meta':tp_meta,'validity':'سیگنال معتبر نیست','valid_gate':valid,'min_score':min_score}
-        risk_level='LOW' if final_score>=92 and confirmations>=6 else 'MEDIUM' if final_score>=86 and confirmations>=5 else 'HIGH'; freshness='HIGH' if confirmations>=6 else 'MEDIUM' if confirmations>=5 else 'LOW'
+            common["reasons"] = reasons[:24]
+            return {
+                **common,
+                'direction': 'NO TRADE',
+                'candidate_direction': direction,
+                'status': 'NO_TRADE',
+                'entry_confirmed': False,
+                'entry_mode': 'RR_FILTER',
+                'entry': None,
+                'stop_loss': sl,
+                'tp1': tp1,
+                'tp2': tp2,
+                'risk_reward': rr,
+                'risk_level': 'UNKNOWN',
+                'freshness': move_freshness,
+                'tp_meta': tp_meta,
+                'validity': 'سیگنال معتبر نیست',
+                'valid_gate': False,
+                'min_score': min_score,
+            }
+
+        risk_level = 'LOW' if final_score >= 92 and move_freshness == 'HIGH' else 'MEDIUM' if final_score >= 86 else 'HIGH'
+        freshness = move_freshness
         if update_ai_summary:
             try:
                 update_ai_summary(total_signals=1, market_regime=market_context.get('market_regime'), btc_bias=market_context.get('btc_bias'), btc_lead=market_context.get('btc_lead'), market_context=market_context)
             except TypeError:
-                try: update_ai_summary(total_signals=1)
-                except Exception: pass
-            except Exception: pass
-        return {**common,'direction':direction,'status':'ACTIVE','entry_confirmed':True,'entry_mode':'AI_15M_SCALP_DIRECT','entry':safe_round(price),'stop_loss':sl,'tp1':tp1,'tp2':tp2,'risk_reward':rr,'risk_level':risk_level,'freshness':freshness,'tp_meta':tp_meta,'validity':'15 تا 45 دقیقه'}
+                try:
+                    update_ai_summary(total_signals=1)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        return {
+            **common,
+            'direction': direction,
+            'status': 'ACTIVE',
+            'entry_confirmed': True,
+            'entry_mode': 'AI_MOVEMENT_HUNTER',
+            'entry': safe_round(price),
+            'stop_loss': sl,
+            'tp1': tp1,
+            'tp2': tp2,
+            'risk_reward': rr,
+            'risk_level': risk_level,
+            'freshness': freshness,
+            'tp_meta': tp_meta,
+            'validity': '15 تا 45 دقیقه',
+        }
     except Exception as e:
-        return {'symbol':symbol,'direction':'NO TRADE','status':'NO_TRADE','entry_confirmed':False,'entry_mode':'ERROR','score':0,'long_score':0,'short_score':0,'price':None,'entry':None,'stop_loss':None,'tp1':None,'tp2':None,'atr':None,'risk_reward':0,'risk_level':'UNKNOWN','market_regime':'unknown','btc_bias':'unknown','freshness':'LOW','confirmations':0,'required_confirmations':0,'rsi':None,'macd':None,'macd_signal':None,'macd_hist':None,'adx':None,'vwap_status':None,'support':None,'resistance':None,'trends':{},'snapshot':{},'coin_risk':{},'rotation':{},'tp_meta':{},'reasons':[f'Analysis Error: {str(e)[:200]}'],'signal_timeframe':'AI 15M Scalp Candidate','validity':'سیگنال معتبر نیست'}
+        return {
+            'symbol': symbol,
+            'direction': 'NO TRADE',
+            'status': 'NO_TRADE',
+            'entry_confirmed': False,
+            'entry_mode': 'ERROR',
+            'score': 0,
+            'long_score': 0,
+            'short_score': 0,
+            'price': None,
+            'entry': None,
+            'stop_loss': None,
+            'tp1': None,
+            'tp2': None,
+            'atr': None,
+            'risk_reward': 0,
+            'risk_level': 'UNKNOWN',
+            'market_regime': 'unknown',
+            'btc_bias': 'unknown',
+            'freshness': 'LOW',
+            'confirmations': 0,
+            'required_confirmations': 0,
+            'rsi': None,
+            'macd': None,
+            'macd_signal': None,
+            'macd_hist': None,
+            'adx': None,
+            'vwap_status': None,
+            'support': None,
+            'resistance': None,
+            'trends': {},
+            'snapshot': {},
+            'coin_risk': {},
+            'rotation': {},
+            'tp_meta': {},
+            'ai_decision': {'architecture': 'AI_MOVEMENT_HUNTER', 'classic_signal_disabled': True, 'classic_score_disabled': True},
+            'reasons': [f'Analysis Error: {str(e)[:200]}'],
+            'signal_timeframe': 'AI Movement Hunter 5M/15M',
+            'validity': 'سیگنال معتبر نیست',
+        }
