@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""AI Classic Direct Analysis Engine - complete integrated version."""
+"""AI Classic Direct Analysis Engine - complete integrated version. Soft Movement Hunter harmonized."""
 import math
 import time
 import os
@@ -1373,7 +1373,7 @@ def get_soft_market_context():
 # not score, approve, reject, or issue signals.  The final decision is produced
 # here by evaluating movement freshness, phase, trap/liquidity, current market
 # context, and adaptive AI learning/risk layers.
-AI_MOVEMENT_REAL_MIN_SCORE = int(os.getenv("AI_MOVEMENT_REAL_MIN_SCORE", "72") or "72")
+AI_MOVEMENT_REAL_MIN_SCORE = int(os.getenv("AI_MOVEMENT_REAL_MIN_SCORE", "68") or "68")
 AI_MOVEMENT_SETUP_MIN_SCORE = int(os.getenv("AI_MOVEMENT_SETUP_MIN_SCORE", "55") or "55")
 AI_MOVEMENT_EARLY_MAX_ATR = float(os.getenv("AI_MOVEMENT_EARLY_MAX_ATR", "1.85") or "1.85")
 AI_MOVEMENT_EXHAUSTION_ATR = float(os.getenv("AI_MOVEMENT_EXHAUSTION_ATR", "3.05") or "3.05")
@@ -1594,10 +1594,10 @@ def _movement_phase_for_direction(direction: str, sensors: Dict[str, Any], evide
         and ((direction == "SHORT" and pos <= 0.30) or (direction == "LONG" and pos >= 0.70))
         and dist >= 1.35
     )
-    if range_after_move:
-        phase = "RANGE_AFTER_MOVE"
-    elif exhausted:
+    if exhausted:
         phase = "EXHAUSTION"
+    elif range_after_move and evidence_score < 72:
+        phase = "RANGE_AFTER_MOVE"
     elif move_atr <= 1.15 and evidence_score >= 66:
         phase = "START"
     elif move_atr <= AI_MOVEMENT_EARLY_MAX_ATR and evidence_score >= 66:
@@ -1666,9 +1666,13 @@ def ai_movement_hunter_decision(symbol: str, sensors: Dict[str, Any], market_con
         elif phase.get("phase") == "SETUP":
             score += 2
         elif phase.get("phase") == "MID":
+            # MID is still valid for 5M/15M scalping when evidence is strong.
+            score -= 4
+        elif phase.get("phase") == "RANGE_AFTER_MOVE":
+            # Do not kill all range-after-move candidates; keep them as cautious setups.
             score -= 8
-        elif phase.get("phase") in {"EXHAUSTION", "RANGE_AFTER_MOVE"}:
-            score -= 22
+        elif phase.get("phase") == "EXHAUSTION":
+            score -= 28
         if trap.get("trap_risk") == "HIGH":
             score -= 16
         elif trap.get("trap_risk") == "MEDIUM":
@@ -1704,13 +1708,22 @@ def ai_movement_hunter_decision(symbol: str, sensors: Dict[str, Any], market_con
     ):
         decision = "REAL"
     elif (
-        score >= AI_MOVEMENT_REAL_MIN_SCORE + 8
+        score >= AI_MOVEMENT_REAL_MIN_SCORE + 2
         and phase_name == "MID"
         and trap_risk == "LOW"
         and evidence_count >= 3
     ):
         decision = "REAL"
-    elif score >= AI_MOVEMENT_SETUP_MIN_SCORE and phase_name not in {"EXHAUSTION", "RANGE_AFTER_MOVE"} and trap_risk != "HIGH":
+    elif (
+        score >= AI_MOVEMENT_REAL_MIN_SCORE + 6
+        and phase_name == "RANGE_AFTER_MOVE"
+        and trap_risk == "LOW"
+        and evidence_count >= 4
+    ):
+        # Rare case: strong evidence after a range pause can still be tradable,
+        # but only with LOW trap and many confirmations.
+        decision = "REAL"
+    elif score >= AI_MOVEMENT_SETUP_MIN_SCORE and phase_name != "EXHAUSTION" and trap_risk != "HIGH":
         decision = "GHOST"
     else:
         decision = "REJECT"
@@ -1838,9 +1851,15 @@ def analyze_symbol(symbol: str) -> Dict:
         move_freshness = str(movement_decision.get('move_freshness', 'LOW')).upper()
 
         # Fresh movement is the main gate. Direction alone is not enough.
-        if move_phase in {'EXHAUSTION', 'RANGE_AFTER_MOVE'}:
+        if move_phase == 'EXHAUSTION':
             ai_block = True
-            reasons.append(f'AI State Block: حرکت تازه نیست ({move_phase})')
+            reasons.append(f'AI State Block: حرکت کاملاً تمام/فرسوده است ({move_phase})')
+        elif move_phase == 'RANGE_AFTER_MOVE':
+            # Range-after-move is no longer a hard reject. For scalping it can be
+            # a valid continuation/restart setup when evidence is strong.
+            ai_penalty += 5
+            ai_min_score_add += 1
+            reasons.append('AI State: بعد از حرکت وارد رنج شده؛ فقط با شواهد قوی مجاز است')
         elif move_phase == 'MID':
             # Softer Movement Hunter mode: MID is not automatically dead.
             # It is still penalized, but strong fresh momentum can pass as REAL.
@@ -1906,14 +1925,26 @@ def analyze_symbol(symbol: str) -> Dict:
             and ai_decision_kind in {'GHOST', 'SETUP', 'WATCH', 'REAL'}
             and move_phase == 'MID'
             and trap_risk == 'LOW'
-            and final_score >= int(AI_MOVEMENT_REAL_MIN_SCORE) + 6
+            and final_score >= int(AI_MOVEMENT_REAL_MIN_SCORE) + 2
             and confirmations >= max(1, effective_req_conf - 1)
             and selected_evidence_count >= 3
         )
 
-        entry_confirmed = bool(real_confirmed or soft_setup_confirmed or soft_mid_confirmed)
+        # Controlled continuation after range: not dry, but still protected.
+        soft_range_confirmed = (
+            direction in {'LONG', 'SHORT'}
+            and not ai_block
+            and ai_decision_kind in {'GHOST', 'SETUP', 'WATCH', 'REAL'}
+            and move_phase == 'RANGE_AFTER_MOVE'
+            and trap_risk == 'LOW'
+            and final_score >= int(AI_MOVEMENT_REAL_MIN_SCORE) + 6
+            and confirmations >= max(2, effective_req_conf)
+            and selected_evidence_count >= 4
+        )
+
+        entry_confirmed = bool(real_confirmed or soft_setup_confirmed or soft_mid_confirmed or soft_range_confirmed)
         effective_ai_decision_kind = 'REAL' if entry_confirmed else ai_decision_kind
-        soft_activation = bool((soft_setup_confirmed or soft_mid_confirmed) and not real_confirmed)
+        soft_activation = bool((soft_setup_confirmed or soft_mid_confirmed or soft_range_confirmed) and not real_confirmed)
         if soft_activation:
             reasons.append('AI Soft Activation: ستاپ قوی به ورود فعال تبدیل شد')
 
@@ -2016,7 +2047,7 @@ def analyze_symbol(symbol: str) -> Dict:
                 and final_score >= int(AI_MOVEMENT_SETUP_MIN_SCORE)
                 and ghost_sl is not None
                 and ghost_tp1 is not None
-                and move_phase not in {'EXHAUSTION', 'RANGE_AFTER_MOVE'}
+                and move_phase != 'EXHAUSTION'
                 and trap_risk != 'HIGH'
             )
             return {
