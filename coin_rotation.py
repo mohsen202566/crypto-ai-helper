@@ -112,11 +112,11 @@ def _coin_archive(symbol: str) -> Dict[str, Any]:
 
 # -------------------- risk + learning models --------------------
 
-def _direction_risk(symbol: str, direction: str) -> Dict[str, Any]:
+def _direction_risk(symbol: str, direction: str, snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     if not get_direction_risk_state:
         return {}
     try:
-        r = get_direction_risk_state(_norm_symbol(symbol), direction)
+        r = get_direction_risk_state(_norm_symbol(symbol), direction, snapshot=snapshot) if snapshot is not None else get_direction_risk_state(_norm_symbol(symbol), direction)
         return r if isinstance(r, dict) else {}
     except Exception:
         return {}
@@ -234,6 +234,76 @@ def _sl_pattern_adjustment(bucket: Dict[str, Any], snapshot: Optional[Dict[str, 
         if score >= 3:
             hits += 1
     return -min(10, hits * 3)
+
+
+def _movement_hunter_adjustment(snapshot: Optional[Dict[str, Any]]) -> tuple[int, List[str]]:
+    """Soft priority boost/reduction from AI Movement Hunter metadata.
+
+    This does not decide REAL/GHOST/REJECT and never touches real trading.
+    It only helps scanner/rotation prefer coins where the move is fresh.
+    """
+    if not isinstance(snapshot, dict):
+        return 0, []
+
+    phase = str(snapshot.get("move_phase") or snapshot.get("move_state") or "").upper()
+    movement_type = str(snapshot.get("movement_type") or "").upper()
+    freshness = _safe_float(snapshot.get("freshness_score"), None)
+    done = _safe_float(snapshot.get("move_done_pct"), None)
+    ai_score = _safe_float(snapshot.get("ai_score"), None)
+    trap = str(snapshot.get("trap_risk") or "").upper()
+
+    adj = 0
+    reasons: List[str] = []
+
+    if phase in {"PRE_START", "START"}:
+        adj += 8
+        reasons.append("fresh phase +8")
+    elif phase == "EARLY":
+        adj += 5
+        reasons.append("early phase +5")
+    elif phase == "MID":
+        adj -= 6
+        reasons.append("mid phase -6")
+    elif phase in {"EXHAUSTION", "RANGE_AFTER_MOVE"}:
+        adj -= 14
+        reasons.append("late/range phase -14")
+
+    if freshness is not None:
+        if freshness >= 78:
+            adj += 5
+            reasons.append("freshness +5")
+        elif freshness < 45:
+            adj -= 6
+            reasons.append("low freshness -6")
+
+    if done is not None:
+        if done <= 35:
+            adj += 4
+            reasons.append("move not consumed +4")
+        elif done >= 75:
+            adj -= 10
+            reasons.append("move consumed -10")
+
+    if ai_score is not None:
+        if ai_score >= 82:
+            adj += 4
+            reasons.append("AI score +4")
+        elif ai_score < 55:
+            adj -= 4
+            reasons.append("AI score weak -4")
+
+    if trap == "HIGH":
+        adj -= 8
+        reasons.append("trap risk -8")
+    elif trap == "MEDIUM":
+        adj -= 3
+        reasons.append("trap risk -3")
+
+    if movement_type in {"PUMP_START", "DUMP_START", "PUMP_SETUP", "DUMP_SETUP"}:
+        adj += 3
+        reasons.append("movement candidate +3")
+
+    return max(-20, min(16, int(round(adj)))), reasons[:6]
 
 
 def _weighted_avg(bucket: Dict[str, Any], sum_key: str, weight_key: str, default: float = 0.0) -> float:
@@ -370,6 +440,12 @@ def _direction_learning_score(symbol: str, direction: str, snapshot: Optional[Di
         reasons.append(f"TP/SL v2 {tp_sl_adj:+d}")
         reasons.extend(tp_sl_reasons)
 
+    movement_adj, movement_reasons = _movement_hunter_adjustment(snapshot)
+    if movement_adj:
+        adj += movement_adj
+        reasons.append(f"Movement {movement_adj:+d}")
+        reasons.extend(movement_reasons)
+
     confidence = _safe_int(b.get("confidence"), 0)
     if total_w < 2:
         # With very low data, keep adjustment small so new coins are not buried.
@@ -389,14 +465,20 @@ def _direction_learning_score(symbol: str, direction: str, snapshot: Optional[Di
         "behavior": b.get("behavior", "UNKNOWN"),
         "personality": b.get("personality", "UNKNOWN"),
         "tp_sl_v2": b.get("tp_sl_v2", {}),
+        "movement_hunter": {
+            "phase": (snapshot or {}).get("move_phase") if isinstance(snapshot, dict) else None,
+            "freshness_score": (snapshot or {}).get("freshness_score") if isinstance(snapshot, dict) else None,
+            "move_done_pct": (snapshot or {}).get("move_done_pct") if isinstance(snapshot, dict) else None,
+            "movement_type": (snapshot or {}).get("movement_type") if isinstance(snapshot, dict) else None,
+        },
         "confidence": confidence,
         "adjustment": max(-40, min(40, int(round(adj)))),
         "reasons": reasons[:8],
     }
 
 
-def _direction_daily_risk(symbol: str, direction: str) -> Dict[str, Any]:
-    r = _direction_risk(symbol, direction)
+def _direction_daily_risk(symbol: str, direction: str, snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    r = _direction_risk(symbol, direction, snapshot=snapshot)
     sl_count = _safe_int(r.get("sl_count", r.get("sl")))
     tp_count = _safe_int(r.get("tp_count", r.get("tp")))
     risk_score = _safe_float(r.get("risk_score"), 0.0)
@@ -444,8 +526,8 @@ def get_coin_rotation_score(symbol: str, snapshot: Optional[Dict[str, Any]] = No
     symbol = _norm_symbol(symbol)
     archive = _coin_archive(symbol)
 
-    long_risk = _direction_daily_risk(symbol, "LONG")
-    short_risk = _direction_daily_risk(symbol, "SHORT")
+    long_risk = _direction_daily_risk(symbol, "LONG", snapshot=snapshot)
+    short_risk = _direction_daily_risk(symbol, "SHORT", snapshot=snapshot)
     long_learn = _direction_learning_score(symbol, "LONG", snapshot=snapshot)
     short_learn = _direction_learning_score(symbol, "SHORT", snapshot=snapshot)
 
@@ -522,7 +604,7 @@ def format_rotation_report() -> str:
     rows.sort(key=lambda x: x.get("rotation_score", 0), reverse=True)
     best = rows[:5]
     worst = rows[-5:]
-    lines = ["🔄 Coin Rotation", "بهترین‌ها:"]
+    lines = ["🔄 Coin Rotation / Movement Hunter", "بهترین‌ها:"]
     for r in best:
         lines.append(
             f"{r['symbol']} | {r['rotation_score']} | بهتر: {r.get('best_direction')} | وضعیت: {r.get('status')}"
