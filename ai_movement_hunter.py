@@ -1,1035 +1,670 @@
-# -*- coding: utf-8 -*-
-"""
-ai_movement_hunter.py
-
-AI Movement Hunter / Movement Prediction brain for the crypto futures bot.
-
-Architecture:
-- Classic technical engine must NOT issue final signals or final scores.
-- Technical indicators are treated as raw sensors/features only.
-- This module decides:
-    SETUP / ENTRY
-    direction LONG / SHORT / NONE
-    move freshness and move phase
-    trap/liquidity/reversal risk
-    REAL / GHOST / REJECT
-    TP/SL levels when caller has not already supplied safe levels
-
-Design goals:
-- Hunt fresh pump/dump movements before the main move or in the first candle.
-- Reject late entries after the main move is already done.
-- Keep compatibility with existing bot/scanner/tracker/real-trade code.
-- Never place real orders directly. It only returns a decision dictionary.
-"""
-
 from __future__ import annotations
+
+"""
+AI Movement Hunter.
+
+This is the top decision layer of the bot.
+
+Important:
+- Classic indicators are only raw sensors.
+- This module does not fetch candles directly.
+- This module does not send Telegram messages.
+- This module does not place trades.
+- It decides SETUP / WAIT / ENTRY_ACTIVATION / REAL / GHOST / REJECT.
+- It prepares smart TP/SL suggestions, confidence, module scores, and metadata.
+- It records decisions into ai_memory when requested.
+
+Expected input:
+candidate = {
+    "symbol": "BTCUSDT",
+    "price": 100.0,
+    "features": multi_timeframe_features output from analysis.py,
+    "structure": multi_timeframe_structure output from market_structure.py,
+    "market_context": context from market_sentiment.py,
+    "existing_setup_id": optional,
+    "slot_state": {"free_slots": 1, "max_positions": 10, ...},
+}
+
+Output:
+{
+    "decision": "REAL|GHOST|SETUP|WAIT|ENTRY_ACTIVATION|REJECT",
+    "direction": "LONG|SHORT|NEUTRAL",
+    "confidence": 0..1,
+    "priority": 0..1,
+    "entry": price,
+    "tp1": price,
+    "tp2": price,
+    "sl": price,
+    "reason": short internal reason,
+    "modules": {...},
+    "metadata": {...}
+}
+"""
 
 import math
 import time
+from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional, Tuple
 
+from diagnostics import safe, record_error
+from config import ISOLATED_MARGIN_ONLY
+import ai_memory
+import coin_learning
+import coin_risk
+import coin_rotation
+import sr_learning
+import trend_analysis
 
-VERSION = "1.0.1-soft-range-safe"
 
 DECISION_REAL = "REAL"
 DECISION_GHOST = "GHOST"
+DECISION_SETUP = "SETUP"
+DECISION_WAIT = "WAIT"
+DECISION_ENTRY = "ENTRY_ACTIVATION"
 DECISION_REJECT = "REJECT"
 
-PHASE_PRE_START = "PRE_START"
-PHASE_START = "START"
-PHASE_EARLY = "EARLY"
-PHASE_MID = "MID"
-PHASE_EXHAUSTION = "EXHAUSTION"
-PHASE_RANGE_AFTER_MOVE = "RANGE_AFTER_MOVE"
-PHASE_RANGE = "RANGE"
-PHASE_UNKNOWN = "UNKNOWN"
-
-MOVE_PUMP_START = "PUMP_START"
-MOVE_DUMP_START = "DUMP_START"
-MOVE_PUMP_SETUP = "PUMP_SETUP"
-MOVE_DUMP_SETUP = "DUMP_SETUP"
-MOVE_NONE = "NONE"
-
-DEFAULT_AI_REAL_THRESHOLD = 72.0
-DEFAULT_AI_GHOST_THRESHOLD = 55.0
-
-# Soft activation rules:
-# - Keep obvious danger blocked.
-# - Do not hard-reject RANGE_AFTER_MOVE by itself when evidence is strong and trap is LOW.
-# - Let strong MID/RANGE_AFTER_MOVE candidates become SETUP/ENTRY so scanner can learn and send real signals selectively.
-SOFT_RANGE_REAL_THRESHOLD = 66.0
-SOFT_RANGE_GHOST_THRESHOLD = 52.0
-SOFT_MID_REAL_THRESHOLD = 64.0
-MIN_SOFT_EVIDENCE = 3
-MIN_SOFT_STRENGTH = 3.0
+LONG = "LONG"
+SHORT = "SHORT"
+NEUTRAL = "NEUTRAL"
 
 
-# ---------------------------------------------------------------------------
-# Safe readers
-# ---------------------------------------------------------------------------
-
-def _now() -> int:
+def _ts() -> int:
     return int(time.time())
 
 
-def _safe_float(value: Any, default: float = 0.0) -> float:
+def _safe_float(v: Any, default: float = 0.0) -> float:
     try:
-        if value is None:
-            return float(default)
-        if isinstance(value, str) and not value.strip():
-            return float(default)
-        return float(value)
-    except Exception:
-        return float(default)
-
-
-def _safe_int(value: Any, default: int = 0) -> int:
-    try:
-        return int(float(value))
-    except Exception:
-        return int(default)
-
-
-def _safe_bool(value: Any, default: bool = False) -> bool:
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return default
-    text = str(value).strip().lower()
-    if text in {"1", "true", "yes", "on", "y", "bullish", "bearish", "long", "short"}:
-        return True
-    if text in {"0", "false", "no", "off", "n", "none", "neutral"}:
-        return False
-    return default
-
-
-def _upper(value: Any, default: str = "") -> str:
-    try:
-        text = str(value or default).upper().strip()
-        return text or default
+        if v is None:
+            return default
+        f = float(v)
+        if math.isnan(f) or math.isinf(f):
+            return default
+        return f
     except Exception:
         return default
 
 
-def _first_number(snapshot: Dict[str, Any], keys: List[str], default: float = 0.0) -> float:
-    if not isinstance(snapshot, dict):
-        return float(default)
-    for key in keys:
-        if snapshot.get(key) is not None:
-            return _safe_float(snapshot.get(key), default)
-    for nest_key in (
-        "sensor_snapshot",
-        "technical_features",
-        "features",
-        "ai_layers",
-        "movement",
-        "state_awareness",
-        "prediction_layer",
-        "liquidity_trap",
-    ):
-        obj = snapshot.get(nest_key)
-        if isinstance(obj, dict):
-            for key in keys:
-                if obj.get(key) is not None:
-                    return _safe_float(obj.get(key), default)
-    return float(default)
+def _clamp(v: float, lo: float = 0.0, hi: float = 1.0) -> float:
+    return max(lo, min(hi, v))
 
 
-def _first_text(snapshot: Dict[str, Any], keys: List[str], default: str = "") -> str:
-    if not isinstance(snapshot, dict):
-        return default
-    for key in keys:
-        if snapshot.get(key) not in (None, ""):
-            return str(snapshot.get(key))
-    for nest_key in (
-        "sensor_snapshot",
-        "technical_features",
-        "features",
-        "ai_layers",
-        "movement",
-        "state_awareness",
-        "prediction_layer",
-        "liquidity_trap",
-    ):
-        obj = snapshot.get(nest_key)
-        if isinstance(obj, dict):
-            for key in keys:
-                if obj.get(key) not in (None, ""):
-                    return str(obj.get(key))
-    return default
-
-
-def normalize_symbol(symbol: Any) -> str:
-    s = str(symbol or "").upper().strip().replace("/", "").replace("-", "")
-    if not s:
-        return ""
-    if s.endswith("USDT") or s.endswith("USDC"):
-        return s
-    return f"{s}USDT"
-
-
-# ---------------------------------------------------------------------------
-# Optional learning/context hooks
-# ---------------------------------------------------------------------------
-
-def _try_coin_learning(symbol: str, direction: str, snapshot: Dict[str, Any]) -> Dict[str, Any]:
-    try:
-        from coin_learning import get_similarity_adjustment  # type: ignore
-    except Exception:
-        return {}
-    try:
-        try:
-            res = get_similarity_adjustment(symbol, direction, snapshot=snapshot, mode="movement_hunter")
-        except TypeError:
-            res = get_similarity_adjustment(symbol, direction, snapshot)
-        return res if isinstance(res, dict) else {}
-    except Exception:
-        return {}
-
-
-def _try_coin_risk(symbol: str, direction: str, snapshot: Dict[str, Any]) -> Dict[str, Any]:
-    try:
-        from coin_risk import get_direction_risk_state  # type: ignore
-    except Exception:
-        return {}
-    try:
-        try:
-            res = get_direction_risk_state(symbol, direction, snapshot=snapshot)
-        except TypeError:
-            res = get_direction_risk_state(symbol, direction)
-        return res if isinstance(res, dict) else {}
-    except Exception:
-        return {}
-
-
-def _try_market_breadth() -> Dict[str, Any]:
-    try:
-        from market_scanner import get_market_breadth_profile  # type: ignore
-    except Exception:
-        return {}
-    try:
-        res = get_market_breadth_profile()
-        return res if isinstance(res, dict) else {}
-    except Exception:
-        return {}
-
-
-def _try_smart_tp(symbol: str, direction: str, snapshot: Dict[str, Any]) -> Dict[str, Any]:
-    try:
-        from coin_learning import get_smart_tp_suggestion  # type: ignore
-    except Exception:
-        return {}
-    try:
-        try:
-            res = get_smart_tp_suggestion(symbol, direction, snapshot=snapshot)
-        except TypeError:
-            res = get_smart_tp_suggestion(symbol, direction, snapshot)
-        return res if isinstance(res, dict) else {}
-    except Exception:
-        return {}
-
-
-def _update_ai_movement_memory(decision: Dict[str, Any]) -> None:
-    try:
-        from ai_memory import update_movement_hunter_memory  # type: ignore
-    except Exception:
-        update_movement_hunter_memory = None
-    if callable(update_movement_hunter_memory):
-        try:
-            update_movement_hunter_memory(decision)
-        except Exception:
-            pass
-            return
-    # Backward compatible market memory update only.
-    try:
-        from ai_memory import update_ai_summary  # type: ignore
-        snap = decision.get("snapshot") if isinstance(decision.get("snapshot"), dict) else {}
-        update_ai_summary(
-            market_mode=snap.get("market_mode") or snap.get("market_regime"),
-            btc_bias=snap.get("btc_bias"),
-            source="ai_movement_hunter",
-            snapshot=snap,
-        )
-    except Exception:
-        pass
-
-
-# ---------------------------------------------------------------------------
-# Feature extraction
-# ---------------------------------------------------------------------------
-
-def build_feature_snapshot(raw: Dict[str, Any]) -> Dict[str, Any]:
-    """Normalize any analysis/scanner result into a sensor snapshot.
-
-    This function deliberately keeps classic fields like score/long_score only
-    as metadata. They are not used as final authority.
-    """
-    raw = raw if isinstance(raw, dict) else {}
-    snap = raw.get("snapshot") if isinstance(raw.get("snapshot"), dict) else {}
-    out = dict(snap)
-
-    for key in [
-        "symbol", "direction_hint", "direction", "entry", "price", "close",
-        "high", "low", "open", "volume", "rsi", "rsi_5m", "rsi_15m",
-        "rsi_slope", "rsi_slope_5m", "rsi_slope_15m", "macd", "macd_signal",
-        "macd_hist", "macd_hist_5m", "macd_hist_15m", "macd_hist_slope",
-        "macd_hist_slope_5m", "macd_hist_slope_15m", "macd_hist_accel",
-        "macd_hist_accel_5m", "macd_hist_accel_15m", "adx", "adx_5m",
-        "adx_15m", "adx_slope", "adx_slope_5m", "adx_slope_15m",
-        "ema20", "ema50", "ema200", "ema20_distance_pct",
-        "ema50_distance_pct", "vwap", "vwap_status", "vwap_distance_pct",
-        "atr", "atr_pct", "atr_expansion", "atr_compression",
-        "volume_ratio", "volume_spike", "buy_power", "sell_power",
-        "power2_buy", "power2_sell", "power3_buy", "power3_sell",
-        "power6_buy", "power6_sell", "support", "resistance",
-        "support_distance_pct", "resistance_distance_pct",
-        "range_high", "range_low", "range_position_pct", "range_breakout",
-        "range_breakdown", "candle_body_pct", "upper_wick_pct",
-        "lower_wick_pct", "btc_bias", "market_mode", "market_regime",
-        "coin_behavior", "relative_status", "score", "long_score",
-        "short_score", "risk_reward", "risk_level", "confirmations",
-        "freshness", "move_state", "move_phase", "trap_risk",
-        "liquidity_risk_score", "reversal_risk_score",
-        "expected_move_pct", "prediction_score",
-    ]:
-        if key not in out and raw.get(key) is not None:
-            out[key] = raw.get(key)
-
-    symbol = normalize_symbol(out.get("symbol") or raw.get("symbol"))
-    if symbol:
-        out["symbol"] = symbol
-
-    # Normalize useful booleans/texts.
-    if "price" not in out:
-        out["price"] = out.get("close") or out.get("entry")
-    if "entry" not in out:
-        out["entry"] = out.get("price") or out.get("close")
-
-    out["created_at"] = out.get("created_at") or out.get("snapshot_at") or _now()
-    out["feature_version"] = VERSION
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Direction detection
-# ---------------------------------------------------------------------------
-
-def _power_delta(snapshot: Dict[str, Any], window: str = "3") -> float:
-    b = _first_number(snapshot, [f"power{window}_buy", f"buy_power_{window}", f"buy_power{window}"], 0.0)
-    s = _first_number(snapshot, [f"power{window}_sell", f"sell_power_{window}", f"sell_power{window}"], 0.0)
-    if b == 0 and s == 0 and window in {"3", "6"}:
-        b = _first_number(snapshot, ["buy_power"], 0.0)
-        s = _first_number(snapshot, ["sell_power"], 0.0)
-    return b - s
-
-
-def detect_direction(snapshot: Dict[str, Any]) -> Dict[str, Any]:
-    """Predict likely near-term movement direction from raw sensors."""
-    long_points = 0.0
-    short_points = 0.0
-    reasons: List[str] = []
-
-    direction_hint = _upper(_first_text(snapshot, ["direction_hint", "raw_direction", "sensor_direction", "direction"], ""))
-    if direction_hint == "LONG":
-        long_points += 1.5
-        reasons.append("direction_hint LONG")
-    elif direction_hint == "SHORT":
-        short_points += 1.5
-        reasons.append("direction_hint SHORT")
-
-    rsi = _first_number(snapshot, ["rsi_5m", "rsi", "rsi_15m"], 50.0)
-    rsi_slope = _first_number(snapshot, ["rsi_slope_5m", "rsi_slope", "rsi_slope_15m"], 0.0)
-    if rsi_slope > 0.25:
-        long_points += min(6.0, 1.2 + abs(rsi_slope) * 0.45)
-        reasons.append("RSI slope up")
-    elif rsi_slope < -0.25:
-        short_points += min(6.0, 1.2 + abs(rsi_slope) * 0.45)
-        reasons.append("RSI slope down")
-
-    # RSI crosses are early sensors, not final signals.
-    if 28 <= rsi <= 42 and rsi_slope > 0:
-        long_points += 3.2
-        reasons.append("RSI rebound zone")
-    if 58 <= rsi <= 72 and rsi_slope < 0:
-        short_points += 3.2
-        reasons.append("RSI rejection zone")
-    if rsi > 50 and rsi_slope > 0:
-        long_points += 1.6
-    if rsi < 50 and rsi_slope < 0:
-        short_points += 1.6
-
-    hist = _first_number(snapshot, ["macd_hist_5m", "macd_hist", "macd_hist_15m"], 0.0)
-    hist_slope = _first_number(snapshot, ["macd_hist_slope_5m", "macd_hist_slope", "macd_hist_slope_15m"], 0.0)
-    hist_accel = _first_number(snapshot, ["macd_hist_accel_5m", "macd_hist_accel", "macd_hist_accel_15m"], 0.0)
-    if hist > 0:
-        long_points += 1.6
-    elif hist < 0:
-        short_points += 1.6
-    if hist_slope > 0:
-        long_points += min(5.0, 1.5 + abs(hist_slope) * 500.0)
-        reasons.append("MACD histogram rising")
-    elif hist_slope < 0:
-        short_points += min(5.0, 1.5 + abs(hist_slope) * 500.0)
-        reasons.append("MACD histogram falling")
-    if hist_accel > 0:
-        long_points += min(4.0, 1.0 + abs(hist_accel) * 700.0)
-    elif hist_accel < 0:
-        short_points += min(4.0, 1.0 + abs(hist_accel) * 700.0)
-
-    p2 = _power_delta(snapshot, "2")
-    p3 = _power_delta(snapshot, "3")
-    p6 = _power_delta(snapshot, "6")
-    power_score = p2 * 0.12 + p3 * 0.09 + p6 * 0.045
-    if power_score > 0:
-        long_points += min(8.5, power_score)
-        reasons.append("Buy power shift")
-    elif power_score < 0:
-        short_points += min(8.5, abs(power_score))
-        reasons.append("Sell power shift")
-
-    vwap_status = _upper(_first_text(snapshot, ["vwap_status"], ""))
-    vwap_dist = _first_number(snapshot, ["vwap_distance_pct"], 0.0)
-    if vwap_status in {"ABOVE", "BULLISH", "RECLAIM", "PRICE_ABOVE"} or vwap_dist > 0.03:
-        long_points += 2.2
-    elif vwap_status in {"BELOW", "BEARISH", "LOSS", "PRICE_BELOW"} or vwap_dist < -0.03:
-        short_points += 2.2
-
-    # Range break sensors.
-    if _safe_bool(snapshot.get("range_breakout")):
-        long_points += 4.0
-        reasons.append("range breakout")
-    if _safe_bool(snapshot.get("range_breakdown")):
-        short_points += 4.0
-        reasons.append("range breakdown")
-
-    # Candle pressure.
-    body = _first_number(snapshot, ["candle_body_pct", "body_pct"], 0.0)
-    upper_wick = _first_number(snapshot, ["upper_wick_pct"], 0.0)
-    lower_wick = _first_number(snapshot, ["lower_wick_pct"], 0.0)
-    if body > 0:
-        close_pos = _first_number(snapshot, ["candle_close_position", "range_position_pct"], 50.0)
-        if close_pos >= 65 and lower_wick >= upper_wick * 0.8:
-            long_points += min(3.0, body * 20.0)
-        elif close_pos <= 35 and upper_wick >= lower_wick * 0.8:
-            short_points += min(3.0, body * 20.0)
-
-    market = _upper(_first_text(snapshot, ["market_mode", "market_regime"], ""))
-    btc = _upper(_first_text(snapshot, ["btc_bias"], ""))
-    if "BULL" in market:
-        long_points += 1.0
-    elif "BEAR" in market:
-        short_points += 1.0
-    if "BULL" in btc:
-        long_points += 1.0
-    elif "BEAR" in btc:
-        short_points += 1.0
-
-    if long_points > short_points + 1.2:
-        direction = "LONG"
-        strength = long_points - short_points
-    elif short_points > long_points + 1.2:
-        direction = "SHORT"
-        strength = short_points - long_points
-    else:
-        direction = "NONE"
-        strength = abs(long_points - short_points)
-
-    return {
-        "direction": direction,
-        "long_points": round(long_points, 4),
-        "short_points": round(short_points, 4),
-        "direction_strength": round(strength, 4),
-        "reasons": reasons[:8],
-    }
-
-
-# ---------------------------------------------------------------------------
-# Movement freshness / phase
-# ---------------------------------------------------------------------------
-
-def _impulse_done_pct(snapshot: Dict[str, Any], direction: str) -> float:
-    """Estimate how much of the recent move is already consumed.
-
-    Uses range position, distance from recent high/low, ATR extension and
-    expected_move if available. Conservative: higher means later.
-    """
-    range_pos = _first_number(snapshot, ["range_position_pct"], 50.0)
-    atr_pct = abs(_first_number(snapshot, ["atr_pct"], 0.0))
-    price = _first_number(snapshot, ["price", "entry", "close"], 0.0)
-    support = _first_number(snapshot, ["support", "range_low"], 0.0)
-    resistance = _first_number(snapshot, ["resistance", "range_high"], 0.0)
-
-    done = 50.0
-    if direction == "LONG":
-        done = range_pos
-        if price > 0 and resistance > 0 and support > 0 and resistance > support:
-            done = max(done, (price - support) / (resistance - support) * 100.0)
-    elif direction == "SHORT":
-        done = 100.0 - range_pos
-        if price > 0 and resistance > 0 and support > 0 and resistance > support:
-            done = max(done, (resistance - price) / (resistance - support) * 100.0)
-
-    entry_move_pct = abs(_first_number(snapshot, ["move_from_recent_low_pct", "move_from_recent_high_pct", "impulse_move_pct"], 0.0))
-    expected = abs(_first_number(snapshot, ["expected_move_pct"], 0.0))
-    if expected > 0 and entry_move_pct > 0:
-        done = max(done, min(100.0, entry_move_pct / max(expected, 0.0001) * 100.0))
-
-    # ATR extension proxy. If price has already travelled several ATRs, it is late.
-    atr_extension = abs(_first_number(snapshot, ["atr_extension", "atr_extension_pct"], 0.0))
-    if atr_extension > 0:
-        done = max(done, min(100.0, atr_extension * 35.0))
-    elif atr_pct > 0:
-        recent_move = abs(_first_number(snapshot, ["recent_move_pct", "impulse_move_pct"], 0.0))
-        if recent_move > 0:
-            done = max(done, min(100.0, recent_move / max(atr_pct, 0.0001) * 32.0))
-
-    return round(max(0.0, min(100.0, done)), 4)
-
-
-def detect_move_phase(snapshot: Dict[str, Any], direction: str, direction_strength: float = 0.0) -> Dict[str, Any]:
-    phase_hint = _upper(_first_text(snapshot, ["move_phase", "move_state"], ""))
-    if phase_hint in {PHASE_PRE_START, PHASE_START, PHASE_EARLY, PHASE_MID, PHASE_EXHAUSTION, PHASE_RANGE_AFTER_MOVE, PHASE_RANGE}:
-        return {
-            "phase": phase_hint,
-            "freshness_score": {
-                PHASE_PRE_START: 88,
-                PHASE_START: 84,
-                PHASE_EARLY: 76,
-                PHASE_MID: 48,
-                PHASE_EXHAUSTION: 18,
-                PHASE_RANGE_AFTER_MOVE: 12,
-                PHASE_RANGE: 35,
-            }.get(phase_hint, 40),
-            "move_done_pct": 0 if phase_hint in {PHASE_PRE_START, PHASE_START} else 60,
-            "reason": "phase_hint",
-        }
-
-    if direction not in {"LONG", "SHORT"}:
-        return {"phase": PHASE_UNKNOWN, "freshness_score": 0.0, "move_done_pct": 100.0, "reason": "no_direction"}
-
-    done = _impulse_done_pct(snapshot, direction)
-    atr_compression = _safe_bool(snapshot.get("atr_compression")) or _first_number(snapshot, ["atr_compression_score"], 0.0) >= 55
-    atr_expansion = _safe_bool(snapshot.get("atr_expansion")) or _first_number(snapshot, ["atr_expansion_score"], 0.0) >= 55
-    volume_ratio = _first_number(snapshot, ["volume_ratio"], 1.0)
-    volume_spike = _safe_bool(snapshot.get("volume_spike")) or volume_ratio >= 1.35
-    hist_slope = _first_number(snapshot, ["macd_hist_slope_5m", "macd_hist_slope"], 0.0)
-    rsi_slope = _first_number(snapshot, ["rsi_slope_5m", "rsi_slope"], 0.0)
-    adx_slope = _first_number(snapshot, ["adx_slope_5m", "adx_slope"], 0.0)
-
-    slope_ok = (direction == "LONG" and (hist_slope > 0 or rsi_slope > 0)) or (direction == "SHORT" and (hist_slope < 0 or rsi_slope < 0))
-    momentum_accel = abs(hist_slope) > 0 or abs(rsi_slope) > 0.25 or abs(adx_slope) > 0.05
-
-    # Pre-start: compression + early power/RSI/MACD without large range travel.
-    if done <= 25 and atr_compression and slope_ok:
-        phase = PHASE_PRE_START
-        fresh = 88.0
-        reason = "compression before move"
-    elif done <= 35 and (slope_ok or volume_spike) and direction_strength >= 3:
-        phase = PHASE_START
-        fresh = 84.0
-        reason = "first movement signs"
-    elif done <= 52 and (momentum_accel or volume_spike):
-        phase = PHASE_EARLY
-        fresh = 74.0
-        reason = "early movement"
-    elif done <= 72:
-        phase = PHASE_MID
-        fresh = 48.0
-        reason = "movement already mid"
-    else:
-        # Distinguish exhaustion from range-after-move.
-        range_bias = _upper(_first_text(snapshot, ["market_mode", "market_regime"], ""))
-        if "RANGE" in range_bias or not atr_expansion:
-            phase = PHASE_RANGE_AFTER_MOVE
-            fresh = 14.0
-            reason = "range after impulse"
-        else:
-            phase = PHASE_EXHAUSTION
-            fresh = 18.0
-            reason = "late/exhausted move"
-
-    return {
-        "phase": phase,
-        "freshness_score": round(fresh, 4),
-        "move_done_pct": done,
-        "reason": reason,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Trap / reversal / risk
-# ---------------------------------------------------------------------------
-
-def detect_trap_risk(snapshot: Dict[str, Any], direction: str) -> Dict[str, Any]:
-    risk = 0.0
-    reasons: List[str] = []
-
-    explicit = _upper(_first_text(snapshot, ["trap_risk"], ""))
-    if explicit == "HIGH":
-        risk += 55
-        reasons.append("explicit trap risk high")
-    elif explicit == "MEDIUM":
-        risk += 30
-        reasons.append("explicit trap risk medium")
-
-    liq = _first_number(snapshot, ["liquidity_risk_score", "trap_risk_score"], 0.0)
-    risk += min(45.0, liq * 0.55)
-
-    range_pos = _first_number(snapshot, ["range_position_pct"], 50.0)
-    upper_wick = _first_number(snapshot, ["upper_wick_pct"], 0.0)
-    lower_wick = _first_number(snapshot, ["lower_wick_pct"], 0.0)
-    body = _first_number(snapshot, ["candle_body_pct", "body_pct"], 0.0)
-
-    # Buying high into upper wick or shorting low into lower wick is often late/trap.
-    if direction == "LONG" and range_pos >= 82 and upper_wick > max(body, lower_wick) * 1.3:
-        risk += 28
-        reasons.append("long near range high with upper wick")
-    if direction == "SHORT" and range_pos <= 18 and lower_wick > max(body, upper_wick) * 1.3:
-        risk += 28
-        reasons.append("short near range low with lower wick")
-
-    # Failed breakout/breakdown flags if provided by sensors.
-    if direction == "LONG" and _safe_bool(snapshot.get("failed_breakout")):
-        risk += 35
-        reasons.append("failed breakout")
-    if direction == "SHORT" and _safe_bool(snapshot.get("failed_breakdown")):
-        risk += 35
-        reasons.append("failed breakdown")
-
-    level = "LOW"
-    if risk >= 65:
-        level = "HIGH"
-    elif risk >= 35:
-        level = "MEDIUM"
-
-    return {"trap_risk": level, "trap_risk_score": round(min(100.0, risk), 4), "reasons": reasons[:6]}
-
-
-def detect_reversal_risk(snapshot: Dict[str, Any], direction: str, phase: str) -> Dict[str, Any]:
-    explicit = _first_number(snapshot, ["reversal_risk_score", "reversal_risk"], 0.0)
-    risk = explicit if explicit > 0 else 0.0
-    reasons: List[str] = []
-
-    rsi = _first_number(snapshot, ["rsi_5m", "rsi"], 50.0)
-    rsi_slope = _first_number(snapshot, ["rsi_slope_5m", "rsi_slope"], 0.0)
-    hist_slope = _first_number(snapshot, ["macd_hist_slope_5m", "macd_hist_slope"], 0.0)
-
-    if direction == "LONG":
-        if rsi >= 72 and rsi_slope < 0:
-            risk += 28
-            reasons.append("RSI overbought turning down")
-        if hist_slope < 0:
-            risk += 12
-    elif direction == "SHORT":
-        if rsi <= 28 and rsi_slope > 0:
-            risk += 28
-            reasons.append("RSI oversold turning up")
-        if hist_slope > 0:
-            risk += 12
-
-    if phase in {PHASE_EXHAUSTION, PHASE_RANGE_AFTER_MOVE}:
-        risk += 35
-        reasons.append("late move phase")
-    elif phase == PHASE_MID:
-        risk += 12
-
-    level = "LOW"
-    if risk >= 65:
-        level = "HIGH"
-    elif risk >= 38:
-        level = "MEDIUM"
-
-    return {"reversal_risk": level, "reversal_risk_score": round(min(100.0, risk), 4), "reasons": reasons[:6]}
-
-
-# ---------------------------------------------------------------------------
-# TP/SL construction
-# ---------------------------------------------------------------------------
-
-def _round_price_like(price: float) -> float:
-    price = float(price or 0.0)
-    if price <= 0:
-        return 0.0
-    if price >= 1000:
-        return round(price, 2)
-    if price >= 100:
-        return round(price, 3)
-    if price >= 10:
-        return round(price, 4)
-    if price >= 1:
-        return round(price, 5)
-    if price >= 0.01:
-        return round(price, 6)
-    return round(price, 8)
-
-
-def build_trade_levels(snapshot: Dict[str, Any], direction: str) -> Dict[str, Any]:
-    entry = _first_number(snapshot, ["entry", "price", "close"], 0.0)
-    existing_sl = _first_number(snapshot, ["stop_loss", "sl"], 0.0)
-    existing_tp1 = _first_number(snapshot, ["tp1"], 0.0)
-    existing_tp2 = _first_number(snapshot, ["tp2"], 0.0)
-    if entry <= 0:
-        return {"entry": None, "stop_loss": None, "tp1": None, "tp2": None, "risk_reward": None}
-
-    if existing_sl > 0 and existing_tp1 > 0:
-        rr = abs(existing_tp1 - entry) / max(abs(entry - existing_sl), 1e-12)
-        return {
-            "entry": _round_price_like(entry),
-            "stop_loss": _round_price_like(existing_sl),
-            "tp1": _round_price_like(existing_tp1),
-            "tp2": _round_price_like(existing_tp2) if existing_tp2 > 0 else None,
-            "risk_reward": round(rr, 3),
-        }
-
-    smart = _try_smart_tp(normalize_symbol(snapshot.get("symbol")), direction, snapshot)
-    atr = _first_number(snapshot, ["atr"], 0.0)
-    atr_pct = _first_number(snapshot, ["atr_pct"], 0.0)
-
-    if atr <= 0 and atr_pct > 0:
-        atr = entry * atr_pct / 100.0
-    if atr <= 0:
-        atr = max(entry * 0.004, 1e-12)
-
-    # Movement hunter scalping: cautious TP, not long forecasting.
-    tp1_mult = _safe_float(smart.get("tp1_atr_mult"), 0.75)
-    tp2_mult = _safe_float(smart.get("tp2_atr_mult"), 1.25)
-    sl_mult = _safe_float(smart.get("sl_atr_mult"), 1.05)
-
-    # Protect against nonsense.
-    tp1_mult = max(0.45, min(tp1_mult, 1.20))
-    tp2_mult = max(tp1_mult + 0.15, min(tp2_mult, 1.90))
-    sl_mult = max(0.75, min(sl_mult, 1.45))
-
-    if direction == "LONG":
-        sl = entry - atr * sl_mult
-        tp1 = entry + atr * tp1_mult
-        tp2 = entry + atr * tp2_mult
-    elif direction == "SHORT":
-        sl = entry + atr * sl_mult
-        tp1 = entry - atr * tp1_mult
-        tp2 = entry - atr * tp2_mult
-    else:
-        return {"entry": _round_price_like(entry), "stop_loss": None, "tp1": None, "tp2": None, "risk_reward": None}
-
-    rr = abs(tp1 - entry) / max(abs(entry - sl), 1e-12)
-    return {
-        "entry": _round_price_like(entry),
-        "stop_loss": _round_price_like(sl),
-        "tp1": _round_price_like(tp1),
-        "tp2": _round_price_like(tp2),
-        "risk_reward": round(rr, 3),
-        "smart_tp": smart,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Final decision
-# ---------------------------------------------------------------------------
-
-def decide_movement(raw: Dict[str, Any], *, mode: str = "auto") -> Dict[str, Any]:
-    """Main AI Movement Hunter decision.
-
-    Returns a result compatible with scanner.py and bot.py.
-    """
-    snapshot = build_feature_snapshot(raw)
-    symbol = normalize_symbol(snapshot.get("symbol"))
-    market = _try_market_breadth()
-    if market:
-        snapshot.setdefault("market_breadth", market)
-        snapshot.setdefault("market_mode", market.get("market_breadth_bias") or snapshot.get("market_mode"))
-
-    direction_info = detect_direction(snapshot)
-    direction = direction_info.get("direction", "NONE")
-    strength = _safe_float(direction_info.get("direction_strength"), 0.0)
-
-    phase_info = detect_move_phase(snapshot, direction, strength)
-    phase = phase_info.get("phase", PHASE_UNKNOWN)
-    freshness = _safe_float(phase_info.get("freshness_score"), 0.0)
-
-    trap = detect_trap_risk(snapshot, direction)
-    reversal = detect_reversal_risk(snapshot, direction, phase)
-
-    learning = _try_coin_learning(symbol, direction, snapshot) if direction in {"LONG", "SHORT"} else {}
-    risk_state = _try_coin_risk(symbol, direction, snapshot) if direction in {"LONG", "SHORT"} else {}
-
-    # Base AI score prioritizes freshness first, then direction.
-    ai_score = 0.0
-    ai_score += freshness * 0.42
-    ai_score += min(100.0, strength * 8.0) * 0.24
-
-    # Early acceleration sensors.
-    volume_ratio = _first_number(snapshot, ["volume_ratio"], 1.0)
-    adx = _first_number(snapshot, ["adx_5m", "adx"], 0.0)
-    adx_slope = abs(_first_number(snapshot, ["adx_slope_5m", "adx_slope"], 0.0))
-    expected_move = abs(_first_number(snapshot, ["expected_move_pct"], 0.0))
-
-    if volume_ratio >= 1.25:
-        ai_score += min(8.0, (volume_ratio - 1.0) * 5.0)
-    if adx >= 18 and adx_slope >= 0:
-        ai_score += min(7.0, (adx - 18.0) * 0.4 + adx_slope * 0.4)
-    if expected_move > 0:
-        ai_score += min(7.0, expected_move * 2.2)
-
-    # Phase authority.
-    if phase in {PHASE_PRE_START, PHASE_START}:
-        ai_score += 14.0
-    elif phase == PHASE_EARLY:
-        ai_score += 7.0
-    elif phase == PHASE_MID:
-        # MID is not ideal, but for 5M/15M scalping it can still be a valid continuation entry.
-        ai_score -= 10.0
-    elif phase == PHASE_RANGE_AFTER_MOVE:
-        # Previously this was a near-hard rejection (-45). That made the bot too dry:
-        # many strong candidates with LOW trap were forced to REJECT. Keep caution, not a kill-switch.
-        ai_score -= 16.0
-    elif phase == PHASE_EXHAUSTION:
-        # True exhaustion remains dangerous.
-        ai_score -= 42.0
-    elif phase == PHASE_RANGE:
-        ai_score -= 8.0
-
-    trap_score = _safe_float(trap.get("trap_risk_score"), 0.0)
-    reversal_score = _safe_float(reversal.get("reversal_risk_score"), 0.0)
-    ai_score -= trap_score * 0.18
-    ai_score -= reversal_score * 0.16
-
-    # Historical learning is a soft adviser, not ruler.
-    sim_adj = 0.0
-    if isinstance(learning, dict):
-        for key in ("rank_adjustment", "score_adjustment", "adjustment", "ai_adjustment"):
-            if learning.get(key) is not None:
-                sim_adj = _safe_float(learning.get(key), 0.0)
-                break
-        if sim_adj == 0.0 and learning.get("win_rate") is not None:
-            matches = _safe_int(learning.get("matches") or learning.get("samples") or learning.get("similar_count"), 0)
-            wr = _safe_float(learning.get("win_rate"), 50.0)
-            sim_adj = (wr - 52.0) / 8.0 * min(1.0, matches / 20.0)
-    ai_score += max(-7.0, min(7.0, sim_adj))
-
-    # Daily/condition risk is a soft-but-meaningful penalty.
-    if isinstance(risk_state, dict):
-        strict = _safe_int(risk_state.get("strictness_level"), 0)
-        risk_score = _safe_float(risk_state.get("risk_score"), 0.0)
-        sl_count = _safe_int(risk_state.get("sl_count"), 0)
-        ai_score -= min(18.0, strict * 3.0 + risk_score * 0.06 + max(0, sl_count - 1) * 2.0)
-
-    ai_score = round(max(0.0, min(100.0, ai_score)), 4)
-
-    evidence_count = len(direction_info.get("reasons", []) or [])
-    trap_level = str(trap.get("trap_risk") or "LOW").upper()
-    reversal_level = str(reversal.get("reversal_risk") or "LOW").upper()
-    trap_score_value = _safe_float(trap.get("trap_risk_score"), 0.0)
-    reversal_score_value = _safe_float(reversal.get("reversal_risk_score"), 0.0)
-
-    strong_evidence = (
-        direction in {"LONG", "SHORT"}
-        and evidence_count >= MIN_SOFT_EVIDENCE
-        and strength >= MIN_SOFT_STRENGTH
-        and trap_level != "HIGH"
-    )
-    low_risk_context = trap_level == "LOW" and reversal_level != "HIGH"
-
-    early_phase = phase in {PHASE_PRE_START, PHASE_START, PHASE_EARLY}
-    mid_phase = phase == PHASE_MID
-    soft_range_phase = phase == PHASE_RANGE_AFTER_MOVE and low_risk_context and strong_evidence
-
-    setup_detected = (
-        direction in {"LONG", "SHORT"}
-        and (
-            (early_phase and (freshness >= 52 or ai_score >= DEFAULT_AI_GHOST_THRESHOLD))
-            or (mid_phase and ai_score >= SOFT_RANGE_GHOST_THRESHOLD and strong_evidence)
-            or (soft_range_phase and ai_score >= SOFT_RANGE_GHOST_THRESHOLD)
-            or ai_score >= DEFAULT_AI_GHOST_THRESHOLD
-        )
+def _get_tf(features: Dict[str, Any], tf: str) -> Dict[str, Any]:
+    tfs = features.get("timeframes", features or {})
+    return tfs.get(tf) or tfs.get(tf.lower()) or tfs.get(tf.upper()) or {}
+
+
+def _ind(tf_snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    return tf_snapshot.get("indicators", tf_snapshot or {})
+
+
+def _struct_tf(structure: Dict[str, Any], tf: str) -> Dict[str, Any]:
+    tfs = structure.get("timeframes", structure or {})
+    snap = tfs.get(tf) or tfs.get(tf.lower()) or tfs.get(tf.upper()) or {}
+    return snap.get("structure", snap or {})
+
+
+def _direction_sign(direction: str) -> int:
+    if direction == LONG:
+        return 1
+    if direction == SHORT:
+        return -1
+    return 0
+
+
+def _opposite(direction: str) -> str:
+    return SHORT if direction == LONG else LONG if direction == SHORT else NEUTRAL
+
+
+@dataclass
+class ModuleScore:
+    score: float
+    weight: float
+    reason: str = ""
+    risk: str = ""
+
+    def weighted(self) -> float:
+        return self.score * self.weight
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class AIDecision:
+    decision: str
+    symbol: str
+    direction: str
+    confidence: float
+    priority: float
+    entry: float
+    tp1: float
+    tp2: float
+    sl: float
+    reason: str
+    modules: Dict[str, Any]
+    metadata: Dict[str, Any]
+    record_id: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+# -----------------------------
+# Core direction and module scoring
+# -----------------------------
+
+@safe(default={})
+def decide(candidate: Dict[str, Any], record: bool = False) -> Dict[str, Any]:
+    symbol = str(candidate.get("symbol", "")).upper()
+    features = candidate.get("features", {}) or {}
+    structure = candidate.get("structure", {}) or {}
+    market_context = candidate.get("market_context", {}) or {}
+    slot_state = candidate.get("slot_state", {}) or {}
+
+    price = _safe_float(candidate.get("price") or _latest_price(features))
+    if not symbol or price <= 0:
+        return _reject(symbol, "NEUTRAL", "missing_symbol_or_price", candidate)
+
+    trend = trend_analysis.analyze_trend(features)
+    direction = _select_direction(features, trend, market_context)
+    if direction == NEUTRAL:
+        return _reject(symbol, direction, "direction_neutral", candidate)
+
+    modules = _score_modules(symbol, direction, price, features, structure, market_context, candidate)
+    confidence = _confidence_from_modules(modules)
+    priority = _priority_from_modules(modules, confidence, slot_state)
+
+    tp_sl = smart_tp_sl(symbol, direction, price, features, structure, market_context, confidence)
+
+    decision, reason = _final_decision(symbol, direction, confidence, priority, modules, slot_state, candidate)
+
+    metadata = _build_metadata(symbol, direction, features, structure, market_context, trend, candidate, tp_sl)
+    out = AIDecision(
+        decision=decision,
+        symbol=symbol,
+        direction=direction,
+        confidence=round(confidence, 4),
+        priority=round(priority, 4),
+        entry=round(price, 8),
+        tp1=tp_sl["tp1"],
+        tp2=tp_sl["tp2"],
+        sl=tp_sl["sl"],
+        reason=reason,
+        modules={k: v.to_dict() if isinstance(v, ModuleScore) else v for k, v in modules.items()},
+        metadata=metadata,
     )
 
-    entry_confirmed = (
-        direction in {"LONG", "SHORT"}
-        and (
-            (phase in {PHASE_START, PHASE_EARLY} and ai_score >= DEFAULT_AI_REAL_THRESHOLD)
-            or (mid_phase and strong_evidence and low_risk_context and ai_score >= SOFT_MID_REAL_THRESHOLD)
-            or (soft_range_phase and ai_score >= SOFT_RANGE_REAL_THRESHOLD)
+    result = out.to_dict()
+    if record and decision in {DECISION_SETUP, DECISION_REAL, DECISION_GHOST, DECISION_ENTRY}:
+        rid = ai_memory.create_record(
+            symbol=symbol,
+            direction=direction,
+            decision=decision if decision != DECISION_ENTRY else DECISION_REAL,
+            setup_snapshot=metadata,
+            entry_price=price,
+            tp1=tp_sl["tp1"],
+            tp2=tp_sl["tp2"],
+            sl=tp_sl["sl"],
+            ai_confidence=confidence,
+            ai_reason=reason,
+            modules=result["modules"],
+            telegram_message_id=candidate.get("telegram_message_id"),
+            reply_chat_id=candidate.get("reply_chat_id"),
+            record_id=candidate.get("record_id"),
         )
-    )
-    if phase == PHASE_PRE_START:
-        entry_confirmed = False
-
-    hard_reject_reasons: List[str] = []
-    if direction not in {"LONG", "SHORT"}:
-        hard_reject_reasons.append("NO_CLEAR_DIRECTION")
-    # Keep true exhaustion as hard reject, but do not kill RANGE_AFTER_MOVE by label alone.
-    if phase == PHASE_EXHAUSTION and not (ai_score >= 88 and trap_level == "LOW" and reversal_level != "HIGH"):
-        hard_reject_reasons.append("MOVE_EXHAUSTION")
-    if phase == PHASE_RANGE_AFTER_MOVE and not soft_range_phase and ai_score < SOFT_RANGE_GHOST_THRESHOLD:
-        hard_reject_reasons.append("RANGE_AFTER_MOVE_WEAK")
-    if trap_level == "HIGH" and ai_score < 86:
-        hard_reject_reasons.append("HIGH_TRAP_RISK")
-    if reversal_level == "HIGH" and ai_score < 86:
-        hard_reject_reasons.append("HIGH_REVERSAL_RISK")
-    if trap_score_value >= 85 and ai_score < 90:
-        hard_reject_reasons.append("EXTREME_TRAP_SCORE")
-    if reversal_score_value >= 88 and ai_score < 90:
-        hard_reject_reasons.append("EXTREME_REVERSAL_SCORE")
-
-    if hard_reject_reasons:
-        decision = DECISION_REJECT
-    elif entry_confirmed:
-        decision = DECISION_REAL
-    elif setup_detected or ai_score >= DEFAULT_AI_GHOST_THRESHOLD:
-        decision = DECISION_GHOST
-    else:
-        decision = DECISION_REJECT
-
-    movement_type = MOVE_NONE
-    if direction == "LONG":
-        movement_type = MOVE_PUMP_START if entry_confirmed else MOVE_PUMP_SETUP
-    elif direction == "SHORT":
-        movement_type = MOVE_DUMP_START if entry_confirmed else MOVE_DUMP_SETUP
-
-    levels = build_trade_levels(snapshot, direction)
-
-    result = {
-        "ok": True,
-        "version": VERSION,
-        "symbol": symbol,
-        "status": "ACTIVE" if decision == DECISION_REAL else ("SETUP" if decision == DECISION_GHOST else "NO_SIGNAL"),
-        "decision": decision,
-        "ai_decision_type": decision,
-        "ai_score": ai_score,
-        "score": ai_score,  # compatibility: display only; not classic score
-        "classic_score_disabled": True,
-        "direction": direction if direction in {"LONG", "SHORT"} else None,
-        "direction_strength": direction_info.get("direction_strength"),
-        "long_points": direction_info.get("long_points"),
-        "short_points": direction_info.get("short_points"),
-        "movement_type": movement_type,
-        "move_phase": phase,
-        "move_state": phase,
-        "freshness_score": freshness,
-        "freshness": "HIGH" if freshness >= 75 else ("MEDIUM" if freshness >= 55 else "LOW"),
-        "move_done_pct": phase_info.get("move_done_pct"),
-        "setup_detected": bool(setup_detected),
-        "entry_confirmed": bool(entry_confirmed),
-        "trap_risk": trap.get("trap_risk"),
-        "trap_risk_score": trap.get("trap_risk_score"),
-        "reversal_risk": reversal.get("reversal_risk"),
-        "reversal_risk_score": reversal.get("reversal_risk_score"),
-        "entry": levels.get("entry"),
-        "price": levels.get("entry") or _first_number(snapshot, ["price", "entry", "close"], 0.0),
-        "stop_loss": levels.get("stop_loss"),
-        "tp1": levels.get("tp1"),
-        "tp2": levels.get("tp2"),
-        "risk_reward": levels.get("risk_reward"),
-        "risk_level": "LOW" if ai_score >= 82 and trap.get("trap_risk") == "LOW" else ("MEDIUM" if ai_score >= 65 else "HIGH"),
-        "validity": "15 تا 45 دقیقه",
-        "entry_mode": "AI_MOVEMENT_HUNTER",
-        "movement_hunter": {
-            "decision": decision,
-            "ai_score": ai_score,
-            "phase": phase,
-            "freshness_score": freshness,
-            "move_done_pct": phase_info.get("move_done_pct"),
-            "movement_type": movement_type,
-            "setup_detected": bool(setup_detected),
-            "entry_confirmed": bool(entry_confirmed),
-            "classic_engine_role": "SENSOR_ONLY",
-            "evidence_count": evidence_count,
-            "strong_evidence": bool(strong_evidence),
-            "soft_range_phase": bool(soft_range_phase),
-        },
-        "ai_layers": {
-            "direction": direction_info,
-            "phase": phase_info,
-            "trap": trap,
-            "reversal": reversal,
-            "learning": learning,
-            "coin_risk": risk_state,
-            "market_breadth": market,
-            "trade_levels": levels,
-        },
-        "snapshot": {
-            **snapshot,
-            "ai_movement_hunter": {
-                "decision": decision,
-                "ai_score": ai_score,
-                "direction": direction,
-                "phase": phase,
-                "freshness_score": freshness,
-                "move_done_pct": phase_info.get("move_done_pct"),
-                "trap_risk": trap.get("trap_risk"),
-                "reversal_risk": reversal.get("reversal_risk"),
-                "movement_type": movement_type,
-                "classic_score_disabled": True,
-            },
-            "move_phase": phase,
-            "move_state": phase,
-            "freshness_score": freshness,
-            "trap_risk": trap.get("trap_risk"),
-            "reversal_risk": reversal.get("reversal_risk"),
-            "result_source": "AI_MOVEMENT_HUNTER",
-            "evidence_count": evidence_count,
-            "strong_evidence": bool(strong_evidence),
-            "soft_range_phase": bool(soft_range_phase),
-        },
-        "reasons": (
-            direction_info.get("reasons", [])
-            + [phase_info.get("reason")]
-            + trap.get("reasons", [])
-            + reversal.get("reasons", [])
-            + hard_reject_reasons
-        )[:12],
-        "created_at": _now(),
-    }
-
-    _update_ai_movement_memory(result)
+        result["record_id"] = rid
     return result
 
 
-# ---------------------------------------------------------------------------
-# Compatibility aliases expected by different files
-# ---------------------------------------------------------------------------
-
-def ai_movement_decision(raw: Dict[str, Any], **kwargs) -> Dict[str, Any]:
-    return decide_movement(raw, **kwargs)
-
-
-def decide(raw: Dict[str, Any], **kwargs) -> Dict[str, Any]:
-    return decide_movement(raw, **kwargs)
+def _latest_price(features: Dict[str, Any]) -> float:
+    for tf in ["5m", "5M", "15m", "15M"]:
+        snap = _get_tf(features, tf)
+        ind = _ind(snap)
+        if ind.get("close"):
+            return _safe_float(ind.get("close"))
+    return 0.0
 
 
-def analyze_movement(raw: Dict[str, Any], **kwargs) -> Dict[str, Any]:
-    return decide_movement(raw, **kwargs)
+def _select_direction(features: Dict[str, Any], trend: Dict[str, Any], market_context: Dict[str, Any]) -> str:
+    scores = {LONG: 0.0, SHORT: 0.0}
+    tdir = str(trend.get("direction", NEUTRAL)).upper()
+    tscore = _safe_float(trend.get("trend_score"))
+    if tdir == LONG:
+        scores[LONG] += abs(tscore) * 0.9
+    elif tdir == SHORT:
+        scores[SHORT] += abs(tscore) * 0.9
+
+    for tf, weight in [("5m", 1.20), ("15m", 0.90), ("30m", 0.55), ("1h", 0.35), ("4h", 0.20), ("5M", 1.20), ("15M", 0.90), ("30M", 0.55), ("1H", 0.35), ("4H", 0.20)]:
+        snap = _get_tf(features, tf)
+        if not snap:
+            continue
+        ind = _ind(snap)
+        hint = str(ind.get("direction_hint", NEUTRAL)).upper()
+        if hint == LONG:
+            scores[LONG] += weight
+        elif hint == SHORT:
+            scores[SHORT] += weight
+
+        fm = _safe_float(ind.get("fresh_momentum"))
+        p2 = _safe_float(ind.get("power_2"))
+        hist = _safe_float(ind.get("macd_hist"))
+        micro = fm + p2 / 100 + (1 if hist > 0 else -1 if hist < 0 else 0) * 0.15
+        if micro > 0.18:
+            scores[LONG] += weight * min(0.5, micro)
+        elif micro < -0.18:
+            scores[SHORT] += weight * min(0.5, abs(micro))
+
+    market_mode = str(market_context.get("market_mode", "RANGE")).upper()
+    btc_bias = str(market_context.get("btc_bias", "NEUTRAL")).upper()
+    if market_mode == "BULLISH":
+        scores[LONG] += 0.25
+    elif market_mode == "BEARISH":
+        scores[SHORT] += 0.25
+    if "BULLISH" in btc_bias:
+        scores[LONG] += 0.20
+    elif "BEARISH" in btc_bias:
+        scores[SHORT] += 0.20
+
+    diff = scores[LONG] - scores[SHORT]
+    if diff > 0.35:
+        return LONG
+    if diff < -0.35:
+        return SHORT
+    return NEUTRAL
 
 
-def evaluate_candidate(raw: Dict[str, Any], **kwargs) -> Dict[str, Any]:
-    return decide_movement(raw, **kwargs)
+def _score_modules(symbol: str, direction: str, price: float, features: Dict[str, Any], structure: Dict[str, Any], market_context: Dict[str, Any], candidate: Dict[str, Any]) -> Dict[str, ModuleScore]:
+    weights = ai_memory.get_adaptive_weights()
+    modules: Dict[str, ModuleScore] = {}
+
+    modules["fresh_momentum"] = _score_fresh_momentum(direction, features, weights.get("fresh_momentum", 1.0))
+    modules["entry_quality"] = _score_entry_quality(direction, features, weights.get("entry_quality", 1.0))
+    modules["trend_context"] = _score_trend_context(direction, features, weights.get("trend_context", 1.0))
+    modules["trap_filter"] = _score_trap(direction, structure, weights.get("trap_filter", 1.0))
+    modules["liquidity_filter"] = _score_liquidity(direction, structure, weights.get("liquidity_filter", 1.0))
+    modules["reversal_filter"] = _score_reversal(direction, structure, weights.get("reversal_filter", 1.0))
+    modules["btc_leader"] = _score_btc_leader(direction, market_context, weights.get("btc_leader", 1.0))
+    modules["confidence_boundary"] = _score_confidence_boundary(features, structure, market_context, weights.get("confidence_boundary", 1.0))
+
+    # Learning modules
+    learning = coin_learning.guidance_for_snapshot(symbol, direction, _merge_snapshot(features, structure, market_context))
+    modules["coin_behavior"] = ModuleScore(_clamp(0.5 + _safe_float(learning.get("soft_score")), 0, 1), weights.get("coin_behavior", 1.0), "coin_learning", ",".join(learning.get("risk_notes", [])[:3]))
+
+    risk = coin_risk.evaluate(symbol, direction, _merge_snapshot(features, structure, market_context))
+    modules["coin_risk"] = ModuleScore(_clamp(1.0 - _safe_float(risk.get("risk_score")), 0, 1), 1.0, "coin_risk", ",".join(risk.get("warnings", [])[:3]))
+
+    st5 = _struct_tf(structure, "5m") or _struct_tf(structure, "5M")
+    sr = sr_learning.guidance(symbol, direction, st5)
+    modules["sr_behavior"] = ModuleScore(_clamp(0.5 + _safe_float(sr.get("soft_score")), 0, 1), weights.get("sr_behavior", 1.0), "sr_learning", ",".join(sr.get("risks", [])[:3]))
+
+    state_profile = ai_memory.state_profile_from_snapshot(_merge_snapshot(features, structure, market_context), symbol, direction)
+    modules["state_memory"] = _score_state_memory(state_profile, weights.get("state_memory", 1.0))
+
+    modules["time_risk"] = _score_time_risk(symbol, direction, weights.get("time_risk", 1.0))
+    modules["correlation_exposure"] = _score_correlation_exposure(symbol, candidate.get("slot_state", {}), weights.get("correlation_exposure", 1.0))
+
+    return modules
 
 
-def should_send_real_signal(raw: Dict[str, Any]) -> bool:
-    return decide_movement(raw).get("decision") == DECISION_REAL
+def _score_fresh_momentum(direction: str, features: Dict[str, Any], weight: float) -> ModuleScore:
+    vals = []
+    for tf, mult in [("5m", 1.0), ("5M", 1.0), ("15m", 0.75), ("15M", 0.75)]:
+        ind = _ind(_get_tf(features, tf))
+        if not ind:
+            continue
+        fm = _safe_float(ind.get("fresh_momentum"))
+        em = _safe_float(ind.get("early_momentum"))
+        p2 = _safe_float(ind.get("power_2")) / 100
+        signed = (fm * 0.45 + em * 0.35 + p2 * 0.20) * _direction_sign(direction)
+        vals.append(signed * mult)
+    raw = sum(vals) / max(1, len(vals))
+    score = _clamp(0.5 + raw * 0.75)
+    return ModuleScore(score, weight, "fresh_momentum")
 
 
-__all__ = [
-    "VERSION",
-    "DECISION_REAL",
-    "DECISION_GHOST",
-    "DECISION_REJECT",
-    "PHASE_PRE_START",
-    "PHASE_START",
-    "PHASE_EARLY",
-    "PHASE_MID",
-    "PHASE_EXHAUSTION",
-    "PHASE_RANGE_AFTER_MOVE",
-    "build_feature_snapshot",
-    "detect_direction",
-    "detect_move_phase",
-    "detect_trap_risk",
-    "detect_reversal_risk",
-    "build_trade_levels",
-    "decide_movement",
-    "ai_movement_decision",
-    "decide",
-    "analyze_movement",
-    "evaluate_candidate",
-    "should_send_real_signal",
-]
+def _score_entry_quality(direction: str, features: Dict[str, Any], weight: float) -> ModuleScore:
+    readiness = trend_analysis.entry_readiness(features, direction)
+    base = _safe_float(readiness.get("entry_readiness"))
+    ind5 = _ind(_get_tf(features, "5m") or _get_tf(features, "5M"))
+    candle_q = _safe_float(ind5.get("candle_quality"))
+    adx = _safe_float(ind5.get("adx"))
+    adx_bonus = 0.10 if adx >= 20 else -0.10
+    score = _clamp(0.5 + base * 0.5 + (candle_q - 0.5) * 0.25 + adx_bonus)
+    risk = ",".join(readiness.get("risks", [])[:3])
+    return ModuleScore(score, weight, "entry_readiness", risk)
+
+
+def _score_trend_context(direction: str, features: Dict[str, Any], weight: float) -> ModuleScore:
+    trend = trend_analysis.analyze_trend(features)
+    tscore = _safe_float(trend.get("trend_score"))
+    aligned = tscore * _direction_sign(direction)
+    conflict = _safe_float(trend.get("conflict"))
+    score = _clamp(0.5 + aligned * 0.55 - conflict * 0.25)
+    return ModuleScore(score, weight, "multi_tf_trend", "conflict" if conflict > 0.35 else "")
+
+
+def _score_trap(direction: str, structure: Dict[str, Any], weight: float) -> ModuleScore:
+    risks = []
+    vals = []
+    for tf, mult in [("5m", 1.0), ("5M", 1.0), ("15m", 0.75), ("15M", 0.75)]:
+        st = _struct_tf(structure, tf)
+        if not st:
+            continue
+        trap = _safe_float(st.get("trap_risk"))
+        fake = _safe_float(st.get("fake_breakout_risk"))
+        vals.append(max(trap, fake) * mult)
+        if max(trap, fake) > 0.65:
+            risks.append(f"{tf}_trap")
+    risk = sum(vals) / max(1, len(vals))
+    return ModuleScore(_clamp(1 - risk), weight, "trap_detection", ",".join(risks[:3]))
+
+
+def _score_liquidity(direction: str, structure: Dict[str, Any], weight: float) -> ModuleScore:
+    vals = []
+    for tf, mult in [("5m", 1.0), ("15m", 0.75), ("5M", 1.0), ("15M", 0.75)]:
+        st = _struct_tf(structure, tf)
+        if st:
+            vals.append(_safe_float(st.get("liquidity_risk")) * mult)
+    risk = sum(vals) / max(1, len(vals))
+    return ModuleScore(_clamp(1 - risk * 0.85), weight, "liquidity_risk")
+
+
+def _score_reversal(direction: str, structure: Dict[str, Any], weight: float) -> ModuleScore:
+    vals = []
+    reasons = []
+    for tf, mult in [("5m", 1.0), ("15m", 0.80), ("30m", 0.55), ("5M", 1.0), ("15M", 0.80), ("30M", 0.55)]:
+        st = _struct_tf(structure, tf)
+        if not st:
+            continue
+        rev = _safe_float(st.get("reversal_probability"))
+        phase = str(st.get("movement_phase", ""))
+        if phase == "EXHAUSTION":
+            rev = max(rev, 0.75)
+            reasons.append(f"{tf}_exhaustion")
+        vals.append(rev * mult)
+    risk = sum(vals) / max(1, len(vals))
+    return ModuleScore(_clamp(1 - risk), weight, "reversal_probability", ",".join(reasons[:3]))
+
+
+def _score_btc_leader(direction: str, market_context: Dict[str, Any], weight: float) -> ModuleScore:
+    btc_score = _safe_float(market_context.get("btc_score"))
+    leader = _safe_float(market_context.get("leader_influence"))
+    market_score = _safe_float(market_context.get("market_score"))
+    aligned = (btc_score * 0.45 + leader * 0.35 + market_score * 0.20) * _direction_sign(direction)
+    score = _clamp(0.5 + aligned * 0.65)
+    return ModuleScore(score, weight, "btc_leader_market")
+
+
+def _score_confidence_boundary(features: Dict[str, Any], structure: Dict[str, Any], market_context: Dict[str, Any], weight: float) -> ModuleScore:
+    """
+    Known vs unknown market state.
+    Lower score means AI should prefer GHOST/WAIT instead of REAL.
+    """
+    missing = 0
+    total = 0
+    for tf in ["5m", "15m", "30m", "1h", "4h", "5M", "15M", "30M", "1H", "4H"]:
+        snap = _get_tf(features, tf)
+        if snap:
+            total += 1
+            if not snap.get("ok", True):
+                missing += 1
+    total = max(1, total)
+    data_quality = 1 - missing / total
+
+    market_known = 0.0 if market_context.get("market_mode") in {None, "", "UNKNOWN"} else 1.0
+    st5 = _struct_tf(structure, "5m") or _struct_tf(structure, "5M")
+    phase_known = 0.0 if st5.get("movement_phase") in {None, "", "UNKNOWN"} else 1.0
+    score = data_quality * 0.55 + market_known * 0.20 + phase_known * 0.25
+    return ModuleScore(_clamp(score), weight, "confidence_boundary", "unknown_state" if score < 0.6 else "")
+
+
+def _score_state_memory(state_profile: Dict[str, Any], weight: float) -> ModuleScore:
+    prof = state_profile.get("profile", {}) if isinstance(state_profile, dict) else {}
+    samples = int(prof.get("samples", 0) or 0)
+    if samples < 3:
+        return ModuleScore(0.5, weight, "state_memory_insufficient")
+    tp = int(prof.get("tp", 0) or 0)
+    sl = int(prof.get("sl", 0) or 0)
+    wr = tp / max(1, tp + sl)
+    return ModuleScore(_clamp(wr), weight, "state_memory")
+
+
+def _score_time_risk(symbol: str, direction: str, weight: float) -> ModuleScore:
+    # Detailed time memory is stored inside ai_memory; public access is intentionally compact.
+    # Return neutral now. Later can query a public ai_memory time profile.
+    return ModuleScore(0.5, weight, "time_risk_neutral")
+
+
+def _score_correlation_exposure(symbol: str, slot_state: Dict[str, Any], weight: float) -> ModuleScore:
+    open_positions = slot_state.get("open_positions", []) if isinstance(slot_state, dict) else []
+    ranked = coin_rotation.rank_candidates([{"symbol": symbol, "direction": LONG, "priority": 0.5}], open_positions=open_positions, limit=1)
+    penalty = _safe_float(ranked[0].get("exposure_penalty")) if ranked else 0.0
+    score = _clamp(1 - penalty / 30)
+    return ModuleScore(score, weight, "correlation_exposure", "exposure" if penalty > 0 else "")
+
+
+def _confidence_from_modules(modules: Dict[str, ModuleScore]) -> float:
+    total_w = 0.0
+    total = 0.0
+    for name, m in modules.items():
+        if not isinstance(m, ModuleScore):
+            continue
+        w = max(0.01, _safe_float(m.weight, 1.0))
+        total_w += w
+        total += _safe_float(m.score) * w
+    return _clamp(total / max(0.01, total_w))
+
+
+def _priority_from_modules(modules: Dict[str, ModuleScore], confidence: float, slot_state: Dict[str, Any]) -> float:
+    momentum = _safe_float(modules.get("fresh_momentum", ModuleScore(0.5,1)).score)
+    entry = _safe_float(modules.get("entry_quality", ModuleScore(0.5,1)).score)
+    trap = _safe_float(modules.get("trap_filter", ModuleScore(0.5,1)).score)
+    priority = confidence * 0.50 + momentum * 0.25 + entry * 0.20 + trap * 0.05
+    return _clamp(priority)
+
+
+# -----------------------------
+# Decision and TP/SL
+# -----------------------------
+
+def _final_decision(symbol: str, direction: str, confidence: float, priority: float, modules: Dict[str, ModuleScore], slot_state: Dict[str, Any], candidate: Dict[str, Any]) -> Tuple[str, str]:
+    free_slots = int(slot_state.get("free_slots", 0) or 0) if isinstance(slot_state, dict) else 0
+    ai_enabled = bool(candidate.get("ai_enabled", True))
+    learning_only = bool(candidate.get("learning_only", False))
+    existing_setup_id = candidate.get("existing_setup_id")
+
+    if not ai_enabled:
+        return DECISION_REJECT, "ai_disabled"
+
+    hard_risks = []
+    for name in ["trap_filter", "liquidity_filter", "reversal_filter", "confidence_boundary"]:
+        m = modules.get(name)
+        if isinstance(m, ModuleScore) and m.score < 0.25:
+            hard_risks.append(name)
+
+    if len(hard_risks) >= 2 and confidence < 0.62:
+        return DECISION_REJECT, "multiple_high_risks:" + ",".join(hard_risks)
+
+    entry_score = modules.get("entry_quality", ModuleScore(0.5, 1)).score
+    momentum = modules.get("fresh_momentum", ModuleScore(0.5, 1)).score
+
+    # Existing setup becomes entry activation when entry quality and momentum are ready.
+    if existing_setup_id and confidence >= 0.58 and entry_score >= 0.58 and momentum >= 0.57:
+        if free_slots > 0 and confidence >= 0.66 and not learning_only:
+            return DECISION_ENTRY, "setup_entry_activated_real"
+        return DECISION_GHOST, "setup_entry_activated_ghost_no_slot_or_learning"
+
+    # Fresh movement forming but entry not complete -> SETUP.
+    if confidence >= 0.54 and (momentum >= 0.56 or entry_score >= 0.55) and confidence < 0.68:
+        return DECISION_SETUP, "movement_forming_setup"
+
+    if confidence >= 0.68 and entry_score >= 0.58 and momentum >= 0.56:
+        if free_slots > 0 and not learning_only:
+            return DECISION_REAL, "real_allowed_high_confidence"
+        return DECISION_GHOST, "ghost_slot_full_or_learning"
+
+    if confidence >= 0.50:
+        return DECISION_WAIT, "wait_for_entry_confirmation"
+
+    return DECISION_REJECT, "low_confidence"
+
+
+@safe(default={})
+def smart_tp_sl(symbol: str, direction: str, entry: float, features: Dict[str, Any], structure: Dict[str, Any], market_context: Dict[str, Any], confidence: float = 0.5) -> Dict[str, Any]:
+    ind5 = _ind(_get_tf(features, "5m") or _get_tf(features, "5M"))
+    atr = _safe_float(ind5.get("atr"))
+    if atr <= 0:
+        atr = max(entry * 0.0035, 1e-8)
+
+    mem = ai_memory.recommend_tp_sl_context(symbol, direction)
+    avg_reach = _safe_float(mem.get("avg_reachable_profit_pct"))
+    median_profit = _safe_float(mem.get("median_profit_pct"))
+
+    # Scalp default: TP1 close, TP2 moderate, SL controlled.
+    tp1_atr = 0.85
+    tp2_atr = 1.55
+    sl_atr = 1.05
+
+    if confidence > 0.78:
+        tp1_atr += 0.10
+        tp2_atr += 0.20
+    if confidence < 0.62:
+        tp1_atr -= 0.10
+        tp2_atr -= 0.20
+        sl_atr += 0.05
+
+    if avg_reach > 0:
+        # If learned reachable movement is smaller, bring TP closer softly.
+        learned_move = entry * (avg_reach / 100)
+        if learned_move > 0:
+            tp1_atr = max(0.55, min(tp1_atr, learned_move / atr * 0.85))
+            tp2_atr = max(tp1_atr + 0.25, min(tp2_atr, learned_move / atr * 1.25))
+
+    st5 = _struct_tf(structure, "5m") or _struct_tf(structure, "5M")
+    reversal = _safe_float(st5.get("reversal_probability"))
+    trap = _safe_float(st5.get("trap_risk"))
+    if reversal > 0.65 or trap > 0.65:
+        tp1_atr *= 0.85
+        tp2_atr *= 0.80
+        sl_atr *= 0.95
+
+    sign = _direction_sign(direction)
+    tp1 = entry + sign * atr * tp1_atr
+    tp2 = entry + sign * atr * tp2_atr
+    sl = entry - sign * atr * sl_atr
+
+    return {
+        "entry": round(entry, 8),
+        "tp1": round(tp1, 8),
+        "tp2": round(tp2, 8),
+        "sl": round(sl, 8),
+        "atr": round(atr, 8),
+        "tp1_atr": round(tp1_atr, 4),
+        "tp2_atr": round(tp2_atr, 4),
+        "sl_atr": round(sl_atr, 4),
+        "source": "ai_smart_scalp_memory",
+    }
+
+
+# -----------------------------
+# Metadata and batch selection
+# -----------------------------
+
+def _merge_snapshot(features: Dict[str, Any], structure: Dict[str, Any], market_context: Dict[str, Any]) -> Dict[str, Any]:
+    ind5 = _ind(_get_tf(features, "5m") or _get_tf(features, "5M"))
+    st5 = _struct_tf(structure, "5m") or _struct_tf(structure, "5M")
+    return {
+        "indicators": ind5,
+        "structure": st5,
+        "context": market_context,
+        "timeframes": features.get("timeframes", {}),
+        "structure_timeframes": structure.get("timeframes", {}),
+    }
+
+
+def _build_metadata(symbol: str, direction: str, features: Dict[str, Any], structure: Dict[str, Any], market_context: Dict[str, Any], trend: Dict[str, Any], candidate: Dict[str, Any], tp_sl: Dict[str, Any]) -> Dict[str, Any]:
+    merged = _merge_snapshot(features, structure, market_context)
+    merged.update({
+        "symbol": symbol,
+        "direction": direction,
+        "trend": trend,
+        "tp_sl": tp_sl,
+        "slot_state": candidate.get("slot_state", {}),
+        "created_at": _ts(),
+        "ai_architecture": "AI_MOVEMENT_HUNTER",
+        "market_maker_layer": "NOT_USED",
+    })
+    return merged
+
+
+def _reject(symbol: str, direction: str, reason: str, candidate: Dict[str, Any]) -> Dict[str, Any]:
+    return AIDecision(
+        decision=DECISION_REJECT,
+        symbol=str(symbol).upper(),
+        direction=direction,
+        confidence=0.0,
+        priority=0.0,
+        entry=_safe_float(candidate.get("price")),
+        tp1=0.0,
+        tp2=0.0,
+        sl=0.0,
+        reason=reason,
+        modules={},
+        metadata={"candidate": candidate, "created_at": _ts()},
+    ).to_dict()
+
+
+@safe(default=[])
+def rank_decisions(decisions: List[Dict[str, Any]], open_positions: Optional[List[Dict[str, Any]]] = None, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    candidates = []
+    for d in decisions:
+        if d.get("decision") in {DECISION_REAL, DECISION_GHOST, DECISION_ENTRY, DECISION_SETUP}:
+            candidates.append({
+                "symbol": d.get("symbol"),
+                "direction": d.get("direction"),
+                "priority": d.get("priority", d.get("confidence", 0)),
+                "_decision": d,
+            })
+    ranked = coin_rotation.rank_candidates(candidates, open_positions=open_positions or [], limit=limit)
+    return [r["_decision"] | {"final_priority": r.get("final_priority"), "correlation_group": r.get("correlation_group"), "exposure_penalty": r.get("exposure_penalty")} for r in ranked]
+
+
+@safe(default={})
+def choose_best_candidate(candidates: List[Dict[str, Any]], slot_state: Optional[Dict[str, Any]] = None, record: bool = False) -> Dict[str, Any]:
+    slot_state = slot_state or {}
+    decisions = []
+    for c in candidates:
+        cc = dict(c)
+        cc.setdefault("slot_state", slot_state)
+        decisions.append(decide(cc, record=record))
+    ranked = rank_decisions(decisions, open_positions=slot_state.get("open_positions", []), limit=1)
+    if ranked:
+        return ranked[0]
+    return {"decision": DECISION_WAIT, "reason": "no_rankable_candidate"}
+
+
+@safe(default="")
+def format_decision_fa(decision: Dict[str, Any]) -> str:
+    """
+    Short Persian internal-friendly summary. Final Telegram formatting can be done in bot.py.
+    """
+    d = decision.get("decision", "")
+    symbol = decision.get("symbol", "")
+    direction = "لانگ" if decision.get("direction") == LONG else "شورت" if decision.get("direction") == SHORT else "خنثی"
+    conf = round(_safe_float(decision.get("confidence")) * 100, 1)
+    entry = decision.get("entry", 0)
+    tp1 = decision.get("tp1", 0)
+    tp2 = decision.get("tp2", 0)
+    sl = decision.get("sl", 0)
+
+    if d == DECISION_REJECT:
+        return f"❌ رد شد\nارز: {symbol}\nدلیل: {decision.get('reason','')}"
+    if d == DECISION_WAIT:
+        return f"⏳ منتظر تایید ورود\nارز: {symbol}\nجهت: {direction}\nاعتماد: {conf}%"
+    if d == DECISION_SETUP:
+        return f"🟡 ستاپ در حال شکل‌گیری\nارز: {symbol}\nجهت احتمالی: {direction}\nاعتماد: {conf}%"
+    if d in {DECISION_REAL, DECISION_ENTRY}:
+        return f"✅ سیگنال فعال\nارز: {symbol}\nجهت: {direction}\nورود: {entry}\nTP1: {tp1}\nTP2: {tp2}\nSL: {sl}\nاعتماد: {conf}%"
+    if d == DECISION_GHOST:
+        return f"👻 سیگنال مخفی\nارز: {symbol}\nجهت: {direction}\nورود فرضی: {entry}\nاعتماد: {conf}%"
+    return f"{symbol} {direction} {conf}%"
