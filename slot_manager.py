@@ -197,6 +197,13 @@ def add_position(signal_id: str, symbol: str, direction: str, score=None, status
         "score": score,
         "ai_final_rank": kwargs.get("ai_final_rank"),
         "ai_final_score": kwargs.get("ai_final_score"),
+        "ai_score": kwargs.get("ai_score"),
+        "move_phase": kwargs.get("move_phase"),
+        "freshness_score": kwargs.get("freshness_score"),
+        "move_done_pct": kwargs.get("move_done_pct"),
+        "movement_type": kwargs.get("movement_type"),
+        "trap_risk": kwargs.get("trap_risk"),
+        "reversal_risk": kwargs.get("reversal_risk"),
         "status": str(status or "ACTIVE").upper(),
         "opened_at": _now(),
         **kwargs,
@@ -352,11 +359,11 @@ def _rotation_context(symbol: str, direction: str, snapshot: Optional[Dict[str, 
     return out
 
 
-def _risk_context(symbol: str, direction: str) -> Dict[str, Any]:
+def _risk_context(symbol: str, direction: str, snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     if not get_direction_risk_state:
         return {"risk_score": 0.0, "strictness_level": 0, "sl_count": 0, "recommend_reduce": False}
     try:
-        r = get_direction_risk_state(symbol, direction) or {}
+        r = get_direction_risk_state(symbol, direction, snapshot=snapshot) if snapshot is not None else get_direction_risk_state(symbol, direction) or {}
         return r if isinstance(r, dict) else {}
     except Exception:
         return {"risk_score": 0.0, "strictness_level": 0, "sl_count": 0, "recommend_reduce": False}
@@ -365,7 +372,7 @@ def _risk_context(symbol: str, direction: str) -> Dict[str, Any]:
 def _candidate_snapshot(x: Dict[str, Any]) -> Dict[str, Any]:
     snap = x.get("snapshot") if isinstance(x.get("snapshot"), dict) else {}
     out = dict(snap)
-    for key in ["symbol", "direction", "entry", "price", "score", "ai_final_score", "ai_final_rank", "risk_level", "risk_reward", "confirmations", "freshness", "market_mode", "market_regime", "btc_bias", "similarity_score", "similarity_winrate", "similarity_samples", "similarity_adjustment"]:
+    for key in ["symbol", "direction", "entry", "price", "score", "ai_final_score", "ai_final_rank", "risk_level", "risk_reward", "confirmations", "freshness", "market_mode", "market_regime", "btc_bias", "similarity_score", "similarity_winrate", "similarity_samples", "similarity_adjustment", "ai_score", "move_phase", "move_state", "freshness_score", "move_done_pct", "movement_type", "trap_risk", "reversal_risk"]:
         if key not in out and x.get(key) is not None:
             out[key] = x.get(key)
     # Preserve Historical Similarity Engine metadata from scanner/coin_learning.
@@ -392,6 +399,78 @@ def _candidate_snapshot(x: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _movement_hunter_rank_adjustment(snapshot: Optional[Dict[str, Any]]) -> float:
+    """Soft slot-priority adjustment from AI Movement Hunter metadata.
+
+    This does not open/close trades and does not bypass REAL trade safety.
+    It only makes slot selection prefer fresh START/EARLY moves over late/range moves.
+    """
+    if not isinstance(snapshot, dict):
+        return 0.0
+
+    phase = str(snapshot.get("move_phase") or snapshot.get("move_state") or "").upper()
+    movement_type = str(snapshot.get("movement_type") or "").upper()
+    trap = str(snapshot.get("trap_risk") or "").upper()
+    reversal = str(snapshot.get("reversal_risk") or "").upper()
+    freshness = _safe_float(snapshot.get("freshness_score"), None)
+    done = _safe_float(snapshot.get("move_done_pct"), None)
+    ai_score = _safe_float(snapshot.get("ai_score"), None)
+
+    adj = 0.0
+
+    if phase in {"PRE_START", "START"}:
+        adj += 10.0
+    elif phase == "EARLY":
+        adj += 7.0
+    elif phase == "MID":
+        adj -= 7.0
+    elif phase in {"EXHAUSTION", "RANGE_AFTER_MOVE"}:
+        adj -= 18.0
+    elif phase == "RANGE":
+        adj -= 5.0
+
+    if freshness is not None:
+        if freshness >= 80:
+            adj += 6.0
+        elif freshness >= 65:
+            adj += 3.0
+        elif freshness < 45:
+            adj -= 7.0
+
+    if done is not None:
+        if done <= 30:
+            adj += 5.0
+        elif done <= 50:
+            adj += 2.0
+        elif done >= 75:
+            adj -= 12.0
+
+    if ai_score is not None:
+        if ai_score >= 82:
+            adj += 5.0
+        elif ai_score >= 72:
+            adj += 2.0
+        elif ai_score < 55:
+            adj -= 6.0
+
+    if trap == "HIGH":
+        adj -= 10.0
+    elif trap == "MEDIUM":
+        adj -= 4.0
+
+    if reversal == "HIGH":
+        adj -= 9.0
+    elif reversal == "MEDIUM":
+        adj -= 3.0
+
+    if movement_type in {"PUMP_START", "DUMP_START"}:
+        adj += 4.0
+    elif movement_type in {"PUMP_SETUP", "DUMP_SETUP"}:
+        adj += 2.0
+
+    return max(-24.0, min(20.0, adj))
+
+
 def candidate_rank_value(x: Dict[str, Any]) -> float:
     """Final slot selection rank.
 
@@ -413,9 +492,10 @@ def candidate_rank_value(x: Dict[str, Any]) -> float:
     rr = _safe_float(x.get("risk_reward"), 0.0)
     risk_level_bonus = {"LOW": 4.0, "MEDIUM": 2.0}.get(str(x.get("risk_level") or "").upper(), 0.0)
     fresh_bonus = {"HIGH": 3.0, "MEDIUM": 1.0}.get(str(x.get("freshness") or "").upper(), 0.0)
+    movement_bonus = _movement_hunter_rank_adjustment(snapshot)
 
     rot = _rotation_context(symbol, direction, snapshot)
-    risk = _risk_context(symbol, direction)
+    risk = _risk_context(symbol, direction, snapshot=snapshot)
     learned = _learning_context(symbol, direction)
 
     rotation_bonus = (_safe_float(rot.get("direction_score"), 70.0) - 70.0) * 0.35
@@ -443,7 +523,7 @@ def candidate_rank_value(x: Dict[str, Any]) -> float:
     if risk.get("recommend_reduce"):
         risk_penalty += 3.0
 
-    return base_score + confirmations * 1.5 + rr * 2.0 + risk_level_bonus + fresh_bonus + rotation_bonus + learning_bonus - risk_penalty
+    return base_score + confirmations * 1.5 + rr * 2.0 + risk_level_bonus + fresh_bonus + movement_bonus + rotation_bonus + learning_bonus - risk_penalty
 
 
 def _good_for_ghost(x: Dict[str, Any]) -> bool:
@@ -458,6 +538,7 @@ def save_candidate_as_ghost(x: Dict[str, Any], reason: str = "SLOT_MANAGER_UNUSE
     try:
         snap = _candidate_snapshot(x)
         snap["slot_rank"] = candidate_rank_value(x)
+        snap["movement_slot_rank_adjustment"] = _movement_hunter_rank_adjustment(snap)
         if isinstance(x.get("ai_scanner"), dict):
             snap["ai_scanner"] = x.get("ai_scanner")
         if isinstance(x.get("similarity_learning"), dict):
@@ -578,5 +659,8 @@ def format_slot_report() -> str:
             left = max(0, exp - _now()) if exp else 0
             extra = f" | pending:{left}s"
         rank = p.get("ai_final_rank") if p.get("ai_final_rank") is not None else p.get("slot_rank")
-        lines.append(f"{p.get('symbol')} {p.get('direction')} | {p.get('score')} | {status} | rank:{rank}{extra}")
+        phase = p.get("move_phase") or p.get("move_state") or "-"
+        fresh = p.get("freshness_score")
+        fresh_txt = f" | fresh:{fresh}" if fresh is not None else ""
+        lines.append(f"{p.get('symbol')} {p.get('direction')} | {p.get('score')} | {status} | rank:{rank} | phase:{phase}{fresh_txt}{extra}")
     return "\n".join(lines)
