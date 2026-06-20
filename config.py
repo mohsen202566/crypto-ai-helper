@@ -41,7 +41,7 @@ if OWNER_ID and OWNER_ID not in ALLOWED_USER_IDS:
 
 # Auto signal: medium-balanced, not over-strict.
 AUTO_SIGNAL_ENABLED = env_bool('AUTO_SIGNAL_ENABLED', True)
-AUTO_SCAN_INTERVAL_MINUTES = env_int('AUTO_SCAN_INTERVAL_MINUTES', 3, min_value=1, max_value=1440)
+AUTO_SCAN_INTERVAL_MINUTES = env_int('AUTO_SCAN_INTERVAL_MINUTES', 4, min_value=1, max_value=1440)
 AUTO_DIRECT_SCORE_MIN = env_int('AUTO_DIRECT_SCORE_MIN', 82, min_value=1, max_value=100)
 AUTO_SIGNAL_SCORE = AUTO_DIRECT_SCORE_MIN  # backward-compatible alias
 AUTO_SIGNAL_COOLDOWN_MINUTES = env_int('AUTO_SIGNAL_COOLDOWN_MINUTES', 30, min_value=0, max_value=1440)
