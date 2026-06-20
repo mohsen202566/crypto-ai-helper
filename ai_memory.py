@@ -256,19 +256,65 @@ def _norm_result(result: Any) -> str:
 
 
 def _norm_type(item: Dict[str, Any]) -> str:
-    """Normalize stored signal source.
+    """Normalize stored signal source consistently with coin_learning.py.
 
-    Prefer explicit result_source/source fields so Ghost and Real stats do not
-    mix when older records use different key names.
+    Important:
+    Older Ghost rows were sometimes saved with source="auto_signal_gate" or
+    reason="SLOT_FULL/AI_SETUP_GHOST" while signal_type/result_source was
+    missing.  The previous status report treated those rows as REAL, which
+    made the top AI report disagree with the learning summary.  This function
+    now checks all known Ghost markers before falling back to REAL.
     """
-    t = str(
-        item.get("result_source")
-        or item.get("signal_type")
-        or item.get("type")
-        or item.get("source")
-        or "REAL"
-    ).upper()
-    return "GHOST" if "GHOST" in t or "SHADOW" in t else "REAL"
+    if not isinstance(item, dict):
+        return "REAL"
+
+    fields = [
+        item.get("result_source"),
+        item.get("signal_type"),
+        item.get("type"),
+        item.get("source"),
+        item.get("reason"),
+        item.get("ghost_reason"),
+        item.get("candidate_source"),
+        item.get("status"),
+        item.get("ai_decision"),
+        item.get("decision"),
+        item.get("signal_id"),
+        item.get("id"),
+    ]
+
+    snap = item.get("snapshot") if isinstance(item.get("snapshot"), dict) else {}
+    if isinstance(snap, dict):
+        fields.extend([
+            snap.get("result_source"),
+            snap.get("signal_type"),
+            snap.get("source"),
+            snap.get("reason"),
+            snap.get("ghost_reason"),
+            snap.get("candidate_source"),
+            snap.get("ai_decision"),
+            snap.get("decision"),
+            snap.get("auto_gate_reason"),
+        ])
+
+    joined = " ".join(str(x or "") for x in fields).upper()
+
+    ghost_markers = (
+        "GHOST",
+        "SHADOW",
+        "PAPER_GHOST",
+        "AUTO_SIGNAL_GATE",
+        "SLOT_FULL",
+        "SETUP_ONLY",
+        "AI_SETUP",
+        "SIGNAL_NOT_ACTIVE",
+        "MOVE_NOT_FRESH",
+        "AI_NOT_REAL",
+    )
+    if any(marker in joined for marker in ghost_markers):
+        return "GHOST"
+
+    return "REAL"
 
 
 # -------------------- counters / summaries --------------------
@@ -847,14 +893,24 @@ def format_ai_status() -> str:
     s = _state()
     st = s.get("settings", {})
     sm = get_ai_summary_counts()
+
+    real_total = int(sm.get("total_signals", 0) or 0)
+    real_closed = int(sm.get("real_tp", 0) or 0) + int(sm.get("real_sl", 0) or 0)
+    real_open = max(0, real_total - real_closed)
+
+    ghost_total = int(sm.get("total_ghost_signals", 0) or 0)
+    ghost_open = int(sm.get("ghost_open", 0) or 0)
+    ghost_closed = int(sm.get("ghost_closed", 0) or 0)
+
     return (
         "🤖 وضعیت AI\n"
         f"فعال: {'بله' if st.get('enabled') else 'خیر'}\n"
         f"یادگیری: {'بله' if st.get('learning_enabled') else 'خیر'}\n"
         f"گزارش روزانه: {'بله' if st.get('daily_report_enabled') else 'خیر'}\n"
         f"اعتماد AI: {sm.get('confidence')}\n"
-        f"سیگنال واقعی ثبت‌شده: {sm.get('total_signals', 0)} | TP:{sm.get('real_tp', 0)} SL:{sm.get('real_sl', 0)} | WR:{sm.get('real_win_rate', 0)}%\n"
-        f"Ghost: {sm.get('total_ghost_signals', 0)} | باز:{sm.get('ghost_open', 0)} بسته:{sm.get('ghost_closed', 0)} | TP:{sm.get('ghost_tp', 0)} SL:{sm.get('ghost_sl', 0)}\n"
+        f"Real ثبت‌شده: {real_total} | بسته‌شده:{real_closed} | بی‌نتیجه/باز:{real_open}\n"
+        f"Real TP/SL: TP:{sm.get('real_tp', 0)} SL:{sm.get('real_sl', 0)} | WR:{sm.get('real_win_rate', 0)}%\n"
+        f"Ghost: {ghost_total} | باز:{ghost_open} بسته:{ghost_closed} | TP:{sm.get('ghost_tp', 0)} SL:{sm.get('ghost_sl', 0)}\n"
         f"کل TP/SL: TP:{sm.get('tp', 0)} SL:{sm.get('sl', 0)} | WR:{sm.get('win_rate', 0)}%\n"
         f"کوین‌های یادگرفته‌شده: {sm.get('learned_coins', 0)} | جهت‌های یادگرفته‌شده: {sm.get('learned_coin_directions', 0)}\n"
         f"رفتارها: خوب {sm.get('good_behaviors', 0)} | ضعیف {sm.get('weak_behaviors', 0)} | بد {sm.get('bad_behaviors', 0)}\n"
