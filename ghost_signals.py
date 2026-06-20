@@ -22,10 +22,10 @@ from data_store import load_json, save_json
 try:
     from config import MAX_GHOST_SIGNALS, GHOST_LEARNING_ENABLED
 except Exception:
-    MAX_GHOST_SIGNALS = 20000
+    MAX_GHOST_SIGNALS = 1200
     GHOST_LEARNING_ENABLED = True
 
-MIN_GHOST_MEMORY_STORED = 20000
+MIN_GHOST_MEMORY_STORED = 300
 
 def _ghost_memory_limit() -> int:
     """Keep enough Ghost history for the agreed 20k learning memory.
@@ -35,7 +35,7 @@ def _ghost_memory_limit() -> int:
     agreed learning floor so updates do not silently erase Ghost evidence.
     """
     try:
-        return max(MIN_GHOST_MEMORY_STORED, int(MAX_GHOST_SIGNALS or 0))
+        return max(100, min(int(MAX_GHOST_SIGNALS or 1200), 1200))
     except Exception:
         return MIN_GHOST_MEMORY_STORED
 
@@ -59,6 +59,81 @@ except Exception:
     register_result = None
 
 GHOST_FILE = "ghost_signals.json"
+MAX_OPEN_GHOSTS = 300
+MAX_CLOSED_GHOSTS = 700
+MAX_GHOST_AGE_SECONDS = 6 * 60 * 60
+
+def _sort_key(row):
+    if isinstance(row, tuple):
+        row = row[1]
+    if not isinstance(row, dict):
+        return 0
+    return int(row.get("created_at") or row.get("closed_at") or row.get("timestamp") or 0)
+
+def _compact_snapshot(snapshot):
+    if not isinstance(snapshot, dict):
+        return {}
+    keep = [
+        "symbol", "direction", "price", "entry", "score", "ai_score", "movement_score",
+        "move_phase", "move_state", "move_freshness", "freshness", "freshness_score",
+        "trap_risk", "reversal_risk", "prediction_score", "expected_move_atr",
+        "rsi", "adx", "macd", "macd_signal", "macd_hist", "atr",
+        "power2_buy", "power2_sell", "power3_buy", "power3_sell",
+        "buy_power", "sell_power", "market_mode", "btc_bias",
+        "support", "resistance", "vwap_status", "entry_mode",
+        "entry_confirmed", "setup_detected", "candidate_direction",
+    ]
+    out = {k: snapshot.get(k) for k in keep if snapshot.get(k) is not None}
+    for nested in ("ai_movement_hunter", "ai_decision", "prediction_layer"):
+        v = snapshot.get(nested)
+        if isinstance(v, dict):
+            out[nested] = {k: v.get(k) for k in keep if v.get(k) is not None}
+    return out
+
+def _compact_ghost(g):
+    if not isinstance(g, dict):
+        return g
+    x = dict(g)
+    x["snapshot"] = _compact_snapshot(x.get("snapshot"))
+    return x
+
+def _trim_state(s, save=False):
+    if not isinstance(s, dict):
+        s = {"open": {}, "closed": []}
+    open_map = s.get("open") if isinstance(s.get("open"), dict) else {}
+    closed = s.get("closed") if isinstance(s.get("closed"), list) else []
+    now = _now()
+
+    # Close very old open Ghosts as EXPIRED so they do not stay open forever.
+    still_open = {}
+    expired = []
+    for gid, g in open_map.items():
+        if not isinstance(g, dict):
+            continue
+        created = int(g.get("created_at") or now)
+        if now - created > MAX_GHOST_AGE_SECONDS:
+            gg = _compact_ghost(g)
+            gg.update({"status": "CLOSED", "result": "EXPIRED", "closed_at": now, "movement_outcome": "GHOST_EXPIRED"})
+            expired.append(gg)
+        else:
+            still_open[gid] = _compact_ghost(g)
+
+    if len(still_open) > MAX_OPEN_GHOSTS:
+        items = sorted(still_open.items(), key=_sort_key)
+        for gid, g in items[:-MAX_OPEN_GHOSTS]:
+            gg = _compact_ghost(g)
+            gg.update({"status": "CLOSED", "result": "EXPIRED", "closed_at": now, "movement_outcome": "GHOST_TRIMMED"})
+            expired.append(gg)
+        still_open = dict(items[-MAX_OPEN_GHOSTS:])
+
+    closed = [_compact_ghost(x) for x in closed if isinstance(x, dict)] + expired
+    closed = sorted(closed, key=_sort_key)[-MAX_CLOSED_GHOSTS:]
+    s["open"] = still_open
+    s["closed"] = closed
+    if save:
+        save_json(GHOST_FILE, s)
+    return s
+
 _GHOST_PRICE_CACHE = {"ts": 0, "prices": {}}
 _GHOST_PRICE_TTL_SECONDS = 20
 
@@ -85,7 +160,7 @@ def _state() -> Dict[str, Any]:
         s["open"] = {}
     if not isinstance(s.get("closed"), list):
         s["closed"] = []
-    return s
+    return _trim_state(s, save=False)
 
 
 def _to_okx_symbol(symbol: str) -> str:
@@ -358,7 +433,7 @@ def create_ghost_signal(
         return {}
     s = _state()
     gid = f"ghost_{symbol}_{direction}_{_now()}_{uuid.uuid4().hex[:6]}"
-    snap = snapshot if isinstance(snapshot, dict) else {}
+    snap = _compact_snapshot(snapshot if isinstance(snapshot, dict) else {})
     movement_context = _extract_movement_context(snap, {"source": source, "reason": reason, "decision": "GHOST"})
     g = {
         "signal_id": gid,
@@ -391,11 +466,8 @@ def create_ghost_signal(
         "created_at": _now(),
         "status": "OPEN",
     }
-    s["open"][gid] = g
-    limit = _ghost_memory_limit()
-    while len(s["open"]) > limit:
-        first = sorted(s["open"].keys())[0]
-        del s["open"][first]
+    s["open"][gid] = _compact_ghost(g)
+    s = _trim_state(s, save=False)
     save_json(GHOST_FILE, s)
 
     if record_signal:
@@ -438,8 +510,8 @@ def close_ghost_signal(signal_id: str, result: str, exit_price: float, move_perc
         "closed_at": _now(),
         "movement_outcome": "GHOST_TP" if result in {"TP", "TP1", "TP2"} else "GHOST_SL" if result == "SL" else "GHOST_CLOSED",
     })
-    s["closed"].append(g)
-    s["closed"] = s["closed"][-_ghost_memory_limit():]
+    s["closed"].append(_compact_ghost(g))
+    s = _trim_state(s, save=False)
     save_json(GHOST_FILE, s)
 
     _record_ghost_outcome_to_ai(g, result, exit_price, move_percent)
@@ -490,6 +562,7 @@ def check_open_ghost_signals(max_checks: int = 120) -> Dict[str, Any]:
     errors = 0
 
     changed_open = False
+    closed_ids = set()
     for gid, g in open_items:
         try:
             symbol = str(g.get("symbol", "")).upper()
@@ -508,6 +581,9 @@ def check_open_ghost_signals(max_checks: int = 120) -> Dict[str, Any]:
                 continue
             pct = _move_percent(g.get("direction"), g.get("entry"), exit_price)
             if close_ghost_signal(gid, result, exit_price, pct):
+                closed_ids.add(gid)
+                if gid in s.get("open", {}):
+                    s["open"].pop(gid, None)
                 closed_count += 1
                 if str(result).upper() == "SL":
                     sl_count += 1
@@ -516,8 +592,9 @@ def check_open_ghost_signals(max_checks: int = 120) -> Dict[str, Any]:
         except Exception:
             errors += 1
             continue
-    if changed_open:
+    if changed_open and not closed_ids:
         try:
+            s = _trim_state(s, save=False)
             save_json(GHOST_FILE, s)
         except Exception:
             pass
