@@ -2,19 +2,19 @@
 """
 scanner.py
 
-AI-controlled market scanner for the crypto futures bot.
+AI Movement Hunter scanner for the crypto futures bot.
 
 Purpose:
 - Scan configured symbols using analysis.analyze_symbol.
-- Accept only technically valid ACTIVE signals.
-- Apply AI Decision Layer before final selection:
-    coin_risk.py       -> daily/long-term risk and strictness
-    coin_learning.py   -> coin personality, SL/TP patterns, extra strength
-    coin_rotation.py   -> symbol priority/penalty when available
-    sr_learning.py     -> liquidity/trap/stop-hunt soft risk when available
-    meta learning      -> adaptive layer weights when coin_learning exposes it
-- Rank final candidates by ai_final_rank, not raw classic score only.
-- Save good but unused/rejected candidates as Ghost signals when appropriate.
+- analysis.py is now treated as an AI Movement Hunter result provider:
+    classic technical indicators are sensor data only.
+    classic score/signal authority is disabled.
+- Scanner never creates a classic signal and never approves by EMA/MACD/ADX score.
+- Scanner only accepts AI-approved movement entries:
+    AI direction, movement freshness, move phase, trap/liquidity, risk, learning,
+    rotation, and slot context decide REAL / GHOST / REJECT.
+- Preserve all public function names used by bot.py and real-trade modules.
+- Save unused/rejected movement candidates as Ghost signals when safe.
 
 This keeps the public function names used by bot.py:
     scan_market
@@ -122,21 +122,34 @@ def get_scan_symbols():
 
 
 def _base_reject_reason(r: Dict[str, Any]) -> str:
-    """Explain why a raw analysis result is not allowed to become a real auto signal.
+    """Final real-trade safety gate for AI Movement Hunter results.
 
-    This keeps the real-order path safe, but prevents silent scanner behavior.
-    The bot.py auto_signal_gate still performs the final real-trading checks.
+    Important:
+    - scanner.py does NOT validate a classic technical score anymore.
+    - score, when present, is treated as AI movement score from analysis.py.
+    - this gate only protects the real-order path from incomplete/non-real data.
     """
     if not isinstance(r, dict):
         return "ANALYSIS_NOT_DICT"
+
+    ai_decision = r.get("ai_decision") if isinstance(r.get("ai_decision"), dict) else {}
+    hunter = r.get("ai_movement_hunter") if isinstance(r.get("ai_movement_hunter"), dict) else {}
+
     if r.get("status") != "ACTIVE":
-        return f"SIGNAL_NOT_ACTIVE:{r.get('status')}"
+        return f"AI_NOT_REAL:{r.get('status')}:{r.get('entry_mode')}"
     if not bool(r.get("entry_confirmed")):
-        return "ENTRY_NOT_CONFIRMED"
+        return "AI_ENTRY_NOT_CONFIRMED"
     if r.get("direction") not in ["LONG", "SHORT"]:
         return f"BAD_DIRECTION:{r.get('direction')}"
-    if _safe_int(r.get("score"), 0) < MIN_SCANNER_SCORE:
-        return f"LOW_SCORE:{_safe_int(r.get('score'), 0)}<{MIN_SCANNER_SCORE}"
+
+    # Only AI REAL decisions are allowed to reach real-trade selection.
+    decision = str(ai_decision.get("decision") or hunter.get("decision") or "REAL").upper()
+    if decision not in {"REAL", "ACTIVE", "ENTRY"}:
+        return f"AI_DECISION_NOT_REAL:{decision}"
+
+    if bool(ai_decision.get("classic_signal_disabled") is False):
+        return "CLASSIC_SIGNAL_AUTHORITY_NOT_DISABLED"
+
     if r.get("entry") is None:
         return "NO_ENTRY"
     if r.get("stop_loss") is None:
@@ -151,18 +164,28 @@ def _base_valid_signal(r: Dict[str, Any]) -> bool:
 
 
 def _can_store_rejected_as_ghost(r: Dict[str, Any]) -> bool:
-    """Store useful rejected candidates as Ghost for learning/diagnostics only.
+    """Store safe AI movement candidates as Ghost for learning only.
 
-    This does not send Telegram signals and does not open real trades.
-    It only helps us see why auto signals are not reaching the final gate.
+    Ghost storage is allowed only when TP/SL/entry are complete. It never opens
+    real trades and never sends a real auto-signal.
     """
     if not isinstance(r, dict):
         return False
-    if r.get("direction") not in ["LONG", "SHORT"]:
+
+    direction = r.get("direction") if r.get("direction") in ["LONG", "SHORT"] else r.get("candidate_direction")
+    if direction not in ["LONG", "SHORT"]:
         return False
     if r.get("entry") is None or r.get("stop_loss") is None or r.get("tp1") is None:
         return False
-    return _safe_int(r.get("score"), 0) >= max(65, MIN_SCANNER_SCORE - 12)
+
+    ai_decision = r.get("ai_decision") if isinstance(r.get("ai_decision"), dict) else {}
+    hunter = r.get("ai_movement_hunter") if isinstance(r.get("ai_movement_hunter"), dict) else {}
+    decision = str(ai_decision.get("decision") or hunter.get("decision") or "").upper()
+    if decision in {"GHOST", "SETUP", "WATCH"}:
+        return True
+
+    # score is AI movement score, not classic score.
+    return _safe_int(r.get("score"), 0) >= max(60, MIN_SCANNER_SCORE - 18)
 
 
 def _build_scanner_snapshot(r: Dict[str, Any]) -> Dict[str, Any]:
@@ -179,6 +202,8 @@ def _build_scanner_snapshot(r: Dict[str, Any]) -> Dict[str, Any]:
         "macd_hist_accel_15m", "macd_hist_slope_15m", "prediction_score",
         "reversal_risk_score", "expected_move_pct", "trap_risk", "time_risk",
         "time_risk_score", "liquidity_risk_score", "relative_status", "move_state",
+        "ai_decision", "ai_movement_hunter", "technical_sensors", "candidate_direction",
+        "classic_signal_disabled", "classic_score_disabled",
     ]:
         if key not in out and r.get(key) is not None:
             out[key] = r.get(key)
@@ -268,13 +293,41 @@ def _learning_adjustment(symbol: str, direction: str, snapshot: Dict[str, Any]) 
     return extra, min(18.0, max(0.0, extra_score)), min(3, max(0, extra_conf)), reasons
 
 
-def _classic_rank_value(r: Dict[str, Any]) -> float:
+def _movement_rank_value(r: Dict[str, Any]) -> float:
+    """Rank by AI movement quality, not classic technical score.
+
+    r['score'] is expected to be AI Movement Hunter score from analysis.py.
+    """
     score = _safe_float(r.get("score"), 0.0)
     conf = _safe_float(r.get("confirmations"), 0.0)
     rr = _safe_float(r.get("risk_reward"), 0.0)
-    risk = {"LOW": 4.0, "MEDIUM": 2.0}.get(str(r.get("risk_level") or "").upper(), 0.0)
-    fresh = {"HIGH": 3.0, "MEDIUM": 1.0}.get(str(r.get("freshness") or "").upper(), 0.0)
-    return score + conf * 1.5 + rr * 2.0 + risk + fresh
+
+    ai = r.get("ai_decision") if isinstance(r.get("ai_decision"), dict) else {}
+    hunter = r.get("ai_movement_hunter") if isinstance(r.get("ai_movement_hunter"), dict) else {}
+    phase = str(ai.get("move_phase") or hunter.get("move_phase") or r.get("move_state") or "").upper()
+    trap = str(ai.get("trap_risk") or hunter.get("trap_risk") or r.get("trap_risk") or "").upper()
+    fresh_label = str(ai.get("move_freshness") or hunter.get("move_freshness") or r.get("freshness") or "").upper()
+
+    phase_bonus = {
+        "START": 10.0,
+        "EARLY": 8.0,
+        "ENTRY": 8.0,
+        "SETUP": 2.0,
+        "MID": -6.0,
+        "EXHAUSTION": -30.0,
+        "RANGE_AFTER_MOVE": -35.0,
+        "RANGE": -20.0,
+    }.get(phase, 0.0)
+    trap_penalty = {"HIGH": 25.0, "MEDIUM": 7.0, "LOW": 0.0}.get(trap, 0.0)
+    fresh_bonus = {"HIGH": 7.0, "MEDIUM": 2.0, "LOW": -8.0}.get(fresh_label, 0.0)
+    risk_bonus = {"LOW": 4.0, "MEDIUM": 1.0, "HIGH": -5.0}.get(str(r.get("risk_level") or "").upper(), 0.0)
+
+    return score + conf * 1.2 + rr * 2.0 + phase_bonus + fresh_bonus + risk_bonus - trap_penalty
+
+
+# Backward-compatible alias for older helper references inside this file.
+def _classic_rank_value(r: Dict[str, Any]) -> float:
+    return _movement_rank_value(r)
 
 
 def _extract_nested_number(snapshot: Dict[str, Any], *keys: str, default: float = 0.0) -> float:
@@ -456,11 +509,11 @@ def _meta_weights(symbol: str, direction: str, snapshot: Dict[str, Any]) -> Dict
 
 
 def apply_ai_scanner_decision(r: Dict[str, Any]) -> Dict[str, Any]:
-    """Attach AI-controlled ranking/approval fields to a signal.
+    """Attach final scanner selection fields to an AI Movement Hunter result.
 
-    analysis.py already applies the primary AI decision. Scanner adds the final
-    portfolio/selection layer so weak learned coin-directions are deprioritized
-    or ghosted instead of being chosen only by raw score.
+    analysis.py already decides setup/entry/direction/freshness/trap. Scanner
+    only adds portfolio layers: risk, learning, similarity, rotation, slots.
+    It never converts a classic technical condition into a real signal.
     """
     r = dict(r)
     symbol = normalize_symbol(r.get("symbol"))
@@ -499,6 +552,23 @@ def apply_ai_scanner_decision(r: Dict[str, Any]) -> Dict[str, Any]:
 
     approved = True
     reject_reasons: List[str] = []
+
+    ai_decision = r.get("ai_decision") if isinstance(r.get("ai_decision"), dict) else {}
+    hunter = r.get("ai_movement_hunter") if isinstance(r.get("ai_movement_hunter"), dict) else {}
+    decision_kind = str(ai_decision.get("decision") or hunter.get("decision") or "REAL").upper()
+    move_phase = str(ai_decision.get("move_phase") or hunter.get("move_phase") or snapshot.get("move_state") or "").upper()
+    trap_risk = str(ai_decision.get("trap_risk") or hunter.get("trap_risk") or snapshot.get("trap_risk") or "").upper()
+
+    if decision_kind not in {"REAL", "ACTIVE", "ENTRY"}:
+        approved = False
+        reject_reasons.append(f"AI Movement decision is not REAL: {decision_kind}")
+    if move_phase in {"EXHAUSTION", "RANGE_AFTER_MOVE", "RANGE"}:
+        approved = False
+        reject_reasons.append(f"AI Movement phase blocks real entry: {move_phase}")
+    if trap_risk == "HIGH":
+        approved = False
+        reject_reasons.append("AI Movement trap risk HIGH: ghost/reject")
+
     if final_score < required_score:
         approved = False
         reject_reasons.append(f"AI final score {round(final_score,1)} < required {round(required_score,1)}")
@@ -525,7 +595,7 @@ def apply_ai_scanner_decision(r: Dict[str, Any]) -> Dict[str, Any]:
     # final_score already includes rotation/prediction/similarity and penalties.
     # Do not add those positive layers a second time here; otherwise AI rank
     # can over-prioritize noisy boosts and ignore risk/liquidity penalties.
-    ai_rank = base_rank + (final_score - base_score)
+    ai_rank = _movement_rank_value(r) + (final_score - base_score)
 
     r["symbol"] = symbol
     r["snapshot"] = snapshot
@@ -579,9 +649,9 @@ def is_valid_signal(r):
 
 def signal_rank_value(r):
     try:
-        return _safe_float(r.get("ai_final_rank"), _classic_rank_value(r))
+        return _safe_float(r.get("ai_final_rank"), _movement_rank_value(r))
     except Exception:
-        return _classic_rank_value(r)
+        return _movement_rank_value(r)
 
 
 def should_skip_duplicate(r):
