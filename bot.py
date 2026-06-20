@@ -260,6 +260,28 @@ def save_json(path: str, data: Any) -> None:
 
 
 # ============================================================
+# Async / responsiveness helpers
+# ============================================================
+
+async def run_blocking(fn: Callable, *args, timeout: int = 30, **kwargs):
+    """Run heavy sync bot work outside Telegram's event loop.
+
+    Scanner, AI reports and JSON-heavy trade status functions can take seconds.
+    If they run directly inside async handlers/loops, urgent commands like
+    `ترید خاموش` or `توقف اضطراری` wait behind them.
+    """
+    return await asyncio.wait_for(asyncio.to_thread(fn, *args, **kwargs), timeout=timeout)
+
+
+async def safe_reply_text(update: Update, text: str) -> None:
+    try:
+        if update.message:
+            await update.message.reply_text(text)
+    except Exception as e:
+        logger.error(f"reply_text error: {e}")
+
+
+# ============================================================
 # AI Similarity / Pattern Memory display helpers
 # ============================================================
 
@@ -795,8 +817,13 @@ def format_trade_status() -> str:
     return _real_status_or_unavailable()
 
 async def trade_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(format_trade_status())
-
+    try:
+        text = await run_blocking(format_trade_status, timeout=12)
+        await update.message.reply_text(text)
+    except asyncio.TimeoutError:
+        await update.message.reply_text("⏱️ وضعیت ترید کند شد؛ اما ربات فعال است. برای خاموشی فوری: ترید خاموش")
+    except Exception as e:
+        await update.message.reply_text(f"❌ خطا در وضعیت ترید:\n{str(e)[:250]}")
 
 
 async def set_capital_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1046,21 +1073,50 @@ async def enable_real_trade_command(update: Update, context: ContextTypes.DEFAUL
     if not enable_real_trading:
         await update.message.reply_text("ماژول ترید واقعی فعال نیست.")
         return
-    await update.message.reply_text(enable_real_trading() + "\n\n" + get_real_trade_status_text())
+    try:
+        msg = await run_blocking(enable_real_trading, timeout=10)
+        await update.message.reply_text(msg or "✅ ترید فعال شد.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ خطا در فعال کردن ترید:\n{str(e)[:250]}")
 
 
 async def disable_real_trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # High-priority safety command: never wait for heavy status/AI/scan work.
     if not disable_real_trading:
         await update.message.reply_text("ماژول ترید واقعی فعال نیست.")
         return
-    await update.message.reply_text(disable_real_trading() + "\n\n" + get_real_trade_status_text())
+    try:
+        msg = await run_blocking(disable_real_trading, timeout=10)
+        # Also stop auto-signal delivery at bot-settings level immediately.
+        try:
+            st = load_bot_settings()
+            st["trading_enabled"] = False
+            st["auto_signal_enabled"] = False
+            save_bot_settings(st)
+        except Exception:
+            pass
+        await update.message.reply_text((msg or "✅ ترید خاموش شد.") + "\n✅ Auto Signal هم خاموش شد.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ خطا در خاموش کردن ترید:\n{str(e)[:250]}")
 
 
 async def real_emergency_stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Highest-priority safety command. Keep response short and do not build slow status report.
     if not activate_real_emergency_stop:
         await update.message.reply_text("ماژول ترید واقعی فعال نیست.")
         return
-    await update.message.reply_text(activate_real_emergency_stop() + "\n\n" + get_real_trade_status_text())
+    try:
+        msg = await run_blocking(activate_real_emergency_stop, timeout=10)
+        try:
+            st = load_bot_settings()
+            st["trading_enabled"] = False
+            st["auto_signal_enabled"] = False
+            save_bot_settings(st)
+        except Exception:
+            pass
+        await update.message.reply_text((msg or "🛑 توقف اضطراری فعال شد.") + "\n✅ Auto Signal خاموش شد.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ خطا در توقف اضطراری:\n{str(e)[:250]}")
 
 
 async def reset_real_trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1461,7 +1517,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def analyze_request(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol: str) -> None:
     waiting = await update.message.reply_text("⏳ در حال تحلیل...")
     try:
-        result = analyze_symbol(symbol)
+        result = await run_blocking(analyze_symbol, symbol, timeout=60)
         await waiting.edit_text(format_manual_analysis(result))
     except Exception as e:
         await waiting.edit_text(f"❌ خطا در تحلیل:\n{str(e)[:300]}")
@@ -1474,7 +1530,7 @@ async def best_signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     waiting = await update.message.reply_text("⏳ در حال بررسی بازار...")
     try:
-        signals = get_top_signals(limit=5)
+        signals = await run_blocking(get_top_signals, limit=5, timeout=90)
         await waiting.edit_text(format_top_signals(signals))
     except Exception as e:
         await waiting.edit_text(f"❌ خطا:\n{str(e)[:300]}")
@@ -1487,7 +1543,7 @@ async def market_overview_command(update: Update, context: ContextTypes.DEFAULT_
 
     waiting = await update.message.reply_text("⏳ در حال بررسی بازار...")
     try:
-        overview = scan_market_overview()
+        overview = await run_blocking(scan_market_overview, timeout=90)
         await waiting.edit_text(format_market_overview_text(overview))
     except Exception as e:
         await waiting.edit_text(f"❌ خطا:\n{str(e)[:300]}")
@@ -1587,16 +1643,32 @@ async def ai_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await reject_unauthorized(update)
         return
 
+    waiting = None
+    try:
+        waiting = await update.message.reply_text("⏳ در حال آماده‌سازی وضعیت AI...")
+    except Exception:
+        pass
+
     parts = []
     for fn in [format_ai_status, format_learning_summary, format_similarity_status, format_rotation_report, format_ghost_report, format_slot_report]:
         if not fn:
             continue
         try:
-            parts.append(fn())
+            parts.append(await run_blocking(fn, timeout=20))
+        except Exception as e:
+            logger.warning(f"ai_status part failed: {getattr(fn, '__name__', fn)} {e}")
+
+    text = "\n\n".join(parts) if parts else "AI Status در دسترس نیست."
+    if waiting:
+        try:
+            await waiting.edit_text(text[:3900])
+            if len(text) > 3900:
+                for i in range(3900, min(len(text), 12000), 3900):
+                    await update.message.reply_text(text[i:i+3900])
+            return
         except Exception:
             pass
-
-    await send_long_text(update, "\n\n".join(parts) if parts else "AI Status در دسترس نیست.")
+    await send_long_text(update, text)
 
 
 async def learning_memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1901,7 +1973,7 @@ async def auto_signal_loop(app: Application) -> None:
 
     while True:
         try:
-            result = scan_for_auto_signals(max_results=3, allow_ghost=True)
+            result = await run_blocking(scan_for_auto_signals, max_results=3, allow_ghost=True, timeout=120)
             signals = result.get("signals") or result.get("all_valid_signals") or []
             logger.info(
                 f"auto_signal_loop candidates: signals={len(signals)} "
@@ -1950,7 +2022,7 @@ async def dynamic_profit_protection_loop(app: Application) -> None:
 
     while True:
         try:
-            result = check_dynamic_profit_protection()
+            result = await run_blocking(check_dynamic_profit_protection, timeout=45)
             if isinstance(result, dict) and result.get("ok"):
                 closed_rows = [r for r in (result.get("results") or []) if isinstance(r, dict) and r.get("closed")]
                 for r in closed_rows[:10]:
@@ -2015,7 +2087,7 @@ async def signal_tracking_loop(app: Application) -> None:
             events: List[Dict[str, Any]] = []
 
             if check_active_signals:
-                tracker_events = check_active_signals() or []
+                tracker_events = await run_blocking(check_active_signals, timeout=45) or []
                 if isinstance(tracker_events, dict):
                     tracker_events = [tracker_events]
                 events.extend([e for e in tracker_events if isinstance(e, dict)])
@@ -2024,7 +2096,7 @@ async def signal_tracking_loop(app: Application) -> None:
             # Kept behind a switch and deduplicated to prevent duplicate Telegram messages.
             if REAL_SYNC_LOOP_ENABLED and check_real_position_events_for_tracker:
                 try:
-                    sync_events = check_real_position_events_for_tracker() or []
+                    sync_events = await run_blocking(check_real_position_events_for_tracker, timeout=45) or []
                     if isinstance(sync_events, dict):
                         sync_events = [sync_events]
                     events.extend([e for e in sync_events if isinstance(e, dict)])
@@ -2072,6 +2144,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     low = text.lower().strip()
+
+    # High-priority safety commands first. They must never wait behind AI/scan/status work.
+    if low in ["ترید خاموش", "خاموش ترید", "غیرفعال ترید", "ترید غیرفعال", "ترید واقعی خاموش", "خاموش ترید واقعی", "غیرفعال ترید واقعی", "ترید واقعی غیرفعال"]:
+        await disable_real_trade_command(update, context)
+        return
+
+    if low in ["توقف اضطراری", "استاپ اضطراری", "خاموش اضطراری", "توقف اضطراری واقعی", "استاپ اضطراری واقعی", "خاموش اضطراری واقعی"]:
+        await real_emergency_stop_command(update, context)
+        return
+
+    if low in ["ترید فعال", "فعال ترید", "فعال سازی ترید", "فعال‌سازی ترید", "ترید واقعی فعال", "فعال ترید واقعی", "فعال سازی ترید واقعی", "فعال‌سازی ترید واقعی"]:
+        await enable_real_trade_command(update, context)
+        return
 
     # Removed manual tracking commands
     if low in ["زیر نظر", "زیرنظر", "زیر نظر بگیر", "نظر"]:
@@ -2294,7 +2379,7 @@ def build_application() -> Application:
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is not set")
 
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).concurrent_updates(True).build()
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
