@@ -1155,7 +1155,10 @@ MOVEMENT_REAL_DECISIONS = {"REAL", "REAL_SIGNAL", "ENTRY", "ACTIVE", "OPEN_REAL"
 MOVEMENT_GHOST_DECISIONS = {"GHOST", "GHOST_ONLY", "SHADOW"}
 MOVEMENT_REJECT_DECISIONS = {"REJECT", "NO_TRADE", "BLOCK", "WAIT", "SETUP_ONLY"}
 MOVEMENT_EARLY_PHASES = {"START", "EARLY", "PRE_START", "SETUP", "ENTRY_START"}
-MOVEMENT_LATE_PHASES = {"MID", "LATE", "EXHAUSTION", "RANGE", "RANGE_AFTER_MOVE", "DONE", "FINISHED"}
+# MID is no longer treated as a hard-late/blocking phase for auto signals.
+# Scanner/analysis may legitimately mark a confirmed Movement Hunter entry as MID.
+# Hard-late phases below are still blocked to avoid exhaustion/range-after-move entries.
+MOVEMENT_LATE_PHASES = {"LATE", "EXHAUSTION", "RANGE", "RANGE_AFTER_MOVE", "DONE", "FINISHED"}
 
 
 def _read_nested(data: Dict[str, Any], *keys: str, default: Any = None) -> Any:
@@ -1243,13 +1246,19 @@ def movement_type(signal: Dict[str, Any]) -> str:
 def is_ai_real_signal(signal: Dict[str, Any]) -> bool:
     decision = movement_decision(signal)
     phase = movement_phase(signal)
+
     if decision in MOVEMENT_REJECT_DECISIONS or decision in MOVEMENT_GHOST_DECISIONS:
         return False
+
     if decision in MOVEMENT_REAL_DECISIONS:
-        return True
-    # Compatibility fallback for older scanner outputs.
-    if signal.get("status") == "ACTIVE" and phase not in MOVEMENT_LATE_PHASES:
-        return True
+        return phase not in MOVEMENT_LATE_PHASES
+
+    # Compatibility fallback for scanner outputs that already passed AI gates.
+    # In the current Movement Hunter scanner, status=ACTIVE means the analysis/scanner
+    # has accepted the candidate for auto signal selection. Do not block MID here.
+    if signal.get("status") == "ACTIVE":
+        return phase not in MOVEMENT_LATE_PHASES
+
     return False
 
 
@@ -1810,6 +1819,9 @@ def auto_signal_gate(signal: Dict[str, Any]) -> tuple[bool, str, bool]:
             return False, f"AI_NOT_REAL:{movement_decision(signal)}:{movement_phase(signal)}", True
 
         phase = movement_phase(signal)
+        # Keep only truly late/exhausted/range-after-move states blocked.
+        # MID is intentionally allowed because scanner.py can already return
+        # valid ACTIVE Movement Hunter signals with phase=MID.
         if phase in MOVEMENT_LATE_PHASES:
             return False, f"MOVE_NOT_FRESH:{phase}", True
 
@@ -1819,13 +1831,12 @@ def auto_signal_gate(signal: Dict[str, Any]) -> tuple[bool, str, bool]:
         if now - last < AUTO_SIGNAL_COOLDOWN_SECONDS:
             return False, "COOLDOWN", False
 
-        if not is_real_trade_ready:
-            return False, "REAL_TRADE_MODULE_UNAVAILABLE", True
-
-        ready, reason = is_real_trade_ready()
-        if not ready:
-            return False, f"REAL_NOT_READY: {reason}", True
-
+        # Telegram auto-signal delivery must not be blocked by the real-order
+        # readiness check. Real trading safety is enforced later inside
+        # register_sent_signal() -> open_real_position_from_signal(), where
+        # leverage/margin/isolated/TP/SL/order checks can safely block the order.
+        # This fixes the case where scanner finds ACTIVE_SIGNALS but no Telegram
+        # signal is sent because the auto gate saves them as Ghost.
         return True, "OK", False
 
     except Exception as e:
@@ -1891,10 +1902,19 @@ async def auto_signal_loop(app: Application) -> None:
     while True:
         try:
             result = scan_for_auto_signals(max_results=3, allow_ghost=True)
-            signals = result.get("signals", [])
+            signals = result.get("signals") or result.get("all_valid_signals") or []
+            logger.info(
+                f"auto_signal_loop candidates: signals={len(signals)} "
+                f"mode={result.get('mode')} free_slots={result.get('free_slots')}"
+            )
 
             for signal in signals:
                 can_send, reason, should_ghost = auto_signal_gate(signal)
+                logger.info(
+                    f"auto_signal_gate: {signal.get('symbol')} {signal.get('direction')} "
+                    f"status={signal.get('status')} phase={movement_phase(signal)} "
+                    f"decision={movement_decision(signal)} can_send={can_send} reason={reason}"
+                )
                 if not can_send:
                     if should_ghost:
                         save_auto_signal_as_ghost(signal, reason)
