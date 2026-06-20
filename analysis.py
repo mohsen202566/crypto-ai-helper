@@ -1373,8 +1373,8 @@ def get_soft_market_context():
 # not score, approve, reject, or issue signals.  The final decision is produced
 # here by evaluating movement freshness, phase, trap/liquidity, current market
 # context, and adaptive AI learning/risk layers.
-AI_MOVEMENT_REAL_MIN_SCORE = int(os.getenv("AI_MOVEMENT_REAL_MIN_SCORE", str(AUTO_DIRECT_SCORE_MIN)) or str(AUTO_DIRECT_SCORE_MIN))
-AI_MOVEMENT_SETUP_MIN_SCORE = int(os.getenv("AI_MOVEMENT_SETUP_MIN_SCORE", "68") or "68")
+AI_MOVEMENT_REAL_MIN_SCORE = int(os.getenv("AI_MOVEMENT_REAL_MIN_SCORE", "72") or "72")
+AI_MOVEMENT_SETUP_MIN_SCORE = int(os.getenv("AI_MOVEMENT_SETUP_MIN_SCORE", "55") or "55")
 AI_MOVEMENT_EARLY_MAX_ATR = float(os.getenv("AI_MOVEMENT_EARLY_MAX_ATR", "1.85") or "1.85")
 AI_MOVEMENT_EXHAUSTION_ATR = float(os.getenv("AI_MOVEMENT_EXHAUSTION_ATR", "3.05") or "3.05")
 AI_MOVEMENT_RANGE_AFTER_MOVE_ATR = float(os.getenv("AI_MOVEMENT_RANGE_AFTER_MOVE_ATR", "2.65") or "2.65")
@@ -1689,7 +1689,7 @@ def ai_movement_hunter_decision(symbol: str, sensors: Dict[str, Any], market_con
     trap_risk = selected.get("trap", {}).get("trap_risk", "LOW")
     evidence_count = len(selected.get("evidence") or [])
 
-    if score >= AI_MOVEMENT_REAL_MIN_SCORE and selected.get("phase", {}).get("real_allowed") and trap_risk != "HIGH" and evidence_count >= 3:
+    if score >= AI_MOVEMENT_REAL_MIN_SCORE and selected.get("phase", {}).get("real_allowed") and trap_risk != "HIGH" and evidence_count >= 2:
         decision = "REAL"
     elif score >= AI_MOVEMENT_SETUP_MIN_SCORE and phase_name not in {"EXHAUSTION", "RANGE_AFTER_MOVE"} and trap_risk != "HIGH":
         decision = "GHOST"
@@ -1706,7 +1706,7 @@ def ai_movement_hunter_decision(symbol: str, sensors: Dict[str, Any], market_con
         "ai_score": cap_score(score),
         "confidence": "HIGH" if score >= 88 else "MEDIUM" if score >= 76 else "LOW",
         "evidence_count": evidence_count,
-        "required_evidence": 3,
+        "required_evidence": 2,
         "move_phase": phase_name,
         "move_freshness": "HIGH" if phase_name == "START" else "MEDIUM" if phase_name == "EARLY" else "LOW",
         "trap_risk": trap_risk,
@@ -1758,16 +1758,6 @@ def analyze_symbol(symbol: str) -> Dict:
         snapshot['technical_sensors'] = sensors
         snapshot['ai_movement_hunter'] = movement_decision
         snapshot['classic_signal_disabled'] = True
-        # Movement Hunter fields must be available at top snapshot level too.
-        # scanner/ghost/learning modules read these flat keys.
-        snapshot['ai_score'] = cap_score(movement_decision.get('ai_score') or 0)
-        snapshot['move_phase'] = movement_decision.get('move_phase')
-        snapshot['move_state'] = movement_decision.get('move_phase')
-        snapshot['movement_type'] = movement_decision.get('movement_type') or (
-            'PUMP_SETUP' if direction == 'LONG' else 'DUMP_SETUP' if direction == 'SHORT' else 'NONE'
-        )
-        snapshot['trap_risk'] = movement_decision.get('trap_risk')
-        snapshot['move_freshness'] = movement_decision.get('move_freshness')
         snapshot['classic_score_disabled'] = True
         snapshot['live_entry_price'] = safe_float(price)
         snapshot['closed_15m_price'] = safe_float(closed_15m_price)
@@ -1784,8 +1774,8 @@ def analyze_symbol(symbol: str) -> Dict:
 
         # AI score is the only score used for final permission.
         final_score = ai_score
-        base_min_score = max(int(AI_MOVEMENT_REAL_MIN_SCORE), int(AUTO_DIRECT_SCORE_MIN))
-        base_conf = 3
+        base_min_score = int(AI_MOVEMENT_REAL_MIN_SCORE)
+        base_conf = 2
         req_conf = base_conf
         ai_penalty = 0
         ai_min_score_add = 0
@@ -1880,17 +1870,6 @@ def analyze_symbol(symbol: str) -> Dict:
         common = {
             'symbol': symbol,
             'score': cap_score(final_score),
-            'ai_score': cap_score(final_score),
-            'movement_score': cap_score(final_score),
-            'move_phase': move_phase,
-            'move_state': move_phase,
-            'movement_type': movement_decision.get('movement_type') or (
-                'PUMP_START' if direction == 'LONG' and ai_decision_kind == 'REAL' else
-                'DUMP_START' if direction == 'SHORT' and ai_decision_kind == 'REAL' else
-                'PUMP_SETUP' if direction == 'LONG' else
-                'DUMP_SETUP' if direction == 'SHORT' else 'NONE'
-            ),
-            'trap_risk': trap_risk,
             'long_score': long_score,
             'short_score': short_score,
             'classic_long_score': sp.get('long_score', 0),
@@ -1958,7 +1937,7 @@ def analyze_symbol(symbol: str) -> Dict:
         }
 
         # Build TP/SL before the final REAL gate too.
-        # If AI says GHOST/SETUP, scanner can store it as a Ghost Signal for learning.
+        # If AI says GHOST/SETUP, scanner can store it as a Ghost signal for learning.
         ghost_sl = ghost_tp1 = ghost_tp2 = ghost_rr = None
         ghost_tp_meta = {}
         if direction in {'LONG', 'SHORT'}:
@@ -1970,12 +1949,16 @@ def analyze_symbol(symbol: str) -> Dict:
                 reasons.append(f'TP/SL build error: {str(_level_err)[:120]}')
 
         if not entry_confirmed:
-            entry_mode = 'AI_GHOST_SETUP' if ai_decision_kind == 'GHOST' else 'AI_NO_ENTRY'
+            entry_mode = 'AI_GHOST_SETUP' if ai_decision_kind in {'GHOST', 'SETUP', 'WATCH'} else 'AI_NO_ENTRY'
             can_ghost = (
-                ai_decision_kind in {'GHOST', 'SETUP', 'WATCH'}
-                and direction in {'LONG', 'SHORT'}
+                direction in {'LONG', 'SHORT'}
+                and not ai_block
+                and ai_decision_kind in {'GHOST', 'SETUP', 'WATCH'}
+                and final_score >= int(AI_MOVEMENT_SETUP_MIN_SCORE)
                 and ghost_sl is not None
                 and ghost_tp1 is not None
+                and move_phase not in {'EXHAUSTION', 'RANGE_AFTER_MOVE'}
+                and trap_risk != 'HIGH'
             )
             return {
                 **common,
@@ -1992,12 +1975,12 @@ def analyze_symbol(symbol: str) -> Dict:
                 'risk_level': 'GHOST' if can_ghost else 'UNKNOWN',
                 'freshness': move_freshness,
                 'tp_meta': ghost_tp_meta if can_ghost else {},
-                'validity': 'Ghost/Setup برای یادگیری - سفارش واقعی نیست' if can_ghost else 'سیگنال معتبر نیست',
+                'validity': 'برای یادگیری - سفارش واقعی نیست' if can_ghost else 'سیگنال معتبر نیست',
                 'valid_gate': False,
                 'min_score': min_score,
             }
 
-        sl, tp1, tp2, rr, tp_meta = ghost_sl, ghost_tp1, ghost_tp2, ghost_rr, ghost_tp_meta
+        sl, tp1, tp2, rr, tp_meta = build_trade_levels(direction, price, atr, df_5m, df_15m, df_30m, snapshot, symbol)
         if safe_float(rr, 0.0) < MIN_REAL_RISK_REWARD:
             rr_reason = f"رد R/R: نسبت سود به ضرر {rr} کمتر از حداقل {MIN_REAL_RISK_REWARD}"
             reasons.append(rr_reason)
@@ -2009,7 +1992,7 @@ def analyze_symbol(symbol: str) -> Dict:
                 'status': 'NO_TRADE',
                 'entry_confirmed': False,
                 'entry_mode': 'RR_FILTER',
-                'entry': safe_round(price),
+                'entry': None,
                 'stop_loss': sl,
                 'tp1': tp1,
                 'tp2': tp2,
