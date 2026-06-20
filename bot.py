@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Crypto AI Telegram Bot - Real Trade Command Version
+Crypto AI Telegram Bot - AI Movement Hunter Real Trade Version
 
-این نسخه برای معماری فعلی ربات نوشته شده:
+این نسخه برای معماری AI Movement Hunter نوشته شده:
+- AI Movement Hunter تصمیم نهایی REAL/GHOST/REJECT را می‌گیرد؛ کلاسیک فقط سنسور است.
 - سیگنال‌ها خودکار Track می‌شوند؛ دستور دستی «زیر نظر» حذف شده.
 - دستورهای ترید واقعی/سرمایه/لوریج/حجم پوزیشن اضافه شده.
 - آمار، حذف آمار، بررسی بازار، بهترین سیگنال، وضعیت AI، Ghost/Slot/Coin reports حفظ شده.
@@ -1145,78 +1146,226 @@ async def close_symbol_position_command(update: Update, context: ContextTypes.DE
         await update.message.reply_text(f"❌ خطا در بستن {symbol}:\n{str(e)[:250]}")
 
 
+
+# ============================================================
+# Movement Hunter helpers
+# ============================================================
+
+MOVEMENT_REAL_DECISIONS = {"REAL", "REAL_SIGNAL", "ENTRY", "ACTIVE", "OPEN_REAL"}
+MOVEMENT_GHOST_DECISIONS = {"GHOST", "GHOST_ONLY", "SHADOW"}
+MOVEMENT_REJECT_DECISIONS = {"REJECT", "NO_TRADE", "BLOCK", "WAIT", "SETUP_ONLY"}
+MOVEMENT_EARLY_PHASES = {"START", "EARLY", "PRE_START", "SETUP", "ENTRY_START"}
+MOVEMENT_LATE_PHASES = {"MID", "LATE", "EXHAUSTION", "RANGE", "RANGE_AFTER_MOVE", "DONE", "FINISHED"}
+
+
+def _read_nested(data: Dict[str, Any], *keys: str, default: Any = None) -> Any:
+    if not isinstance(data, dict):
+        return default
+    for key in keys:
+        if data.get(key) is not None:
+            return data.get(key)
+    for parent in [
+        "ai_movement", "movement_hunter", "movement", "ai_decision",
+        "ai_scanner", "snapshot", "ai_layers", "state_awareness",
+        "move_state", "movement_state",
+    ]:
+        obj = data.get(parent)
+        if isinstance(obj, dict):
+            for key in keys:
+                if obj.get(key) is not None:
+                    return obj.get(key)
+            nested = _read_nested(obj, *keys, default=None)
+            if nested is not None:
+                return nested
+    return default
+
+
+def movement_decision(signal: Dict[str, Any]) -> str:
+    val = _read_nested(
+        signal,
+        "decision", "ai_decision", "final_decision", "movement_decision",
+        "signal_decision", "trade_decision", "status_decision",
+        default=None,
+    )
+    # Backward compatibility: scanner already returns ACTIVE only for accepted signals.
+    if val is None and signal.get("status") == "ACTIVE":
+        val = "REAL"
+    return str(val or "UNKNOWN").upper().strip()
+
+
+def movement_phase(signal: Dict[str, Any]) -> str:
+    val = _read_nested(
+        signal,
+        "move_phase", "movement_phase", "phase", "state", "move_state",
+        "freshness_phase", default="UNKNOWN",
+    )
+    return str(val or "UNKNOWN").upper().strip()
+
+
+def movement_freshness(signal: Dict[str, Any]) -> str:
+    val = _read_nested(
+        signal,
+        "move_freshness", "freshness", "fresh_momentum", "momentum_freshness",
+        default="UNKNOWN",
+    )
+    return str(val or "UNKNOWN").upper().strip()
+
+
+def movement_trap_risk(signal: Dict[str, Any]) -> str:
+    val = _read_nested(
+        signal,
+        "trap_risk", "liquidity_trap_risk", "liquidity_risk", "fakeout_risk",
+        default="UNKNOWN",
+    )
+    return str(val or "UNKNOWN").upper().strip()
+
+
+def movement_confidence(signal: Dict[str, Any]) -> str:
+    val = _read_nested(
+        signal,
+        "confidence", "ai_confidence", "movement_confidence", "decision_confidence",
+        default="UNKNOWN",
+    )
+    if isinstance(val, (int, float)):
+        return str(round(float(val), 1))
+    return str(val or "UNKNOWN").upper().strip()
+
+
+def movement_type(signal: Dict[str, Any]) -> str:
+    val = _read_nested(
+        signal,
+        "movement_type", "move_type", "hunt_type", "setup_type", "pattern_type",
+        default="MOVEMENT",
+    )
+    return str(val or "MOVEMENT").upper().strip()
+
+
+def is_ai_real_signal(signal: Dict[str, Any]) -> bool:
+    decision = movement_decision(signal)
+    phase = movement_phase(signal)
+    if decision in MOVEMENT_REJECT_DECISIONS or decision in MOVEMENT_GHOST_DECISIONS:
+        return False
+    if decision in MOVEMENT_REAL_DECISIONS:
+        return True
+    # Compatibility fallback for older scanner outputs.
+    if signal.get("status") == "ACTIVE" and phase not in MOVEMENT_LATE_PHASES:
+        return True
+    return False
+
+
+def movement_metadata(signal: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "ai_architecture": "AI_MOVEMENT_HUNTER",
+        "movement_decision": movement_decision(signal),
+        "movement_type": movement_type(signal),
+        "move_phase": movement_phase(signal),
+        "move_freshness": movement_freshness(signal),
+        "trap_risk": movement_trap_risk(signal),
+        "movement_confidence": movement_confidence(signal),
+        "classic_score_role": "display_only_not_decision",
+    }
+
+
+def _movement_line(signal: Dict[str, Any]) -> str:
+    return (
+        f"AI Hunter: {movement_type(signal)} | فاز: {movement_phase(signal)} | "
+        f"تازگی: {movement_freshness(signal)} | تله: {movement_trap_risk(signal)} | "
+        f"اعتماد: {movement_confidence(signal)}"
+    )
+
 # ============================================================
 # Formatting analysis output
 # ============================================================
 
 def format_signal_message(result: Dict[str, Any]) -> str:
+    """Telegram REAL signal text for AI Movement Hunter architecture.
+
+    The old classic score is kept only as display/diagnostic metadata. The
+    actual decision must already be made by AI Movement Hunter in scanner.py.
+    """
     if result.get("status") != "ACTIVE":
         return format_manual_analysis(result)
 
+    score_line = ""
+    if result.get("score") is not None:
+        score_line = f"\nامتیاز کلاسیک: {result.get('score')} (فقط اطلاعاتی)"
+
     return (
-        "🚨 سیگنال خودکار\n"
+        "🚨 سیگنال خودکار AI Movement Hunter\n"
         f"نماد: {result.get('symbol')}\n"
         f"جهت: {fa_direction(result.get('direction'))}\n"
-        "وضعیت: ✅ ورود فعال\n\n"
+        "وضعیت: ✅ ورود فعال\n"
+        f"{_movement_line(result)}\n\n"
         f"ورود: {result.get('entry')}\n"
         f"حد ضرر: {result.get('stop_loss')}\n"
         f"حد سود ۱: {result.get('tp1')}\n"
-        f"حد سود ۲: {result.get('tp2')}\n\n"
-        f"امتیاز: {result.get('score')}\n"
+        f"حد سود ۲: {result.get('tp2')}\n"
+        f"{score_line}\n"
         f"ریسک: {result.get('risk_level')}\n"
         f"R/R: {result.get('risk_reward')}\n"
         f"اعتبار: {result.get('validity', '15 تا 45 دقیقه')}"
     )
 
-
 def format_manual_analysis(result: Dict[str, Any]) -> str:
+    """Manual analysis output.
+
+    In Movement Hunter mode, manual analysis should explain what the AI sees:
+    fresh setup, entry, ghost/reject, phase and trap risk. Classic indicator
+    scores are shown only as raw sensor info for compatibility.
+    """
     if result.get("status") != "ACTIVE":
-        reasons = "\n".join([f"• {x}" for x in result.get("reasons", [])[:8]]) or "شرایط ورود کامل نیست."
+        reasons = "\n".join([f"• {x}" for x in result.get("reasons", [])[:8]]) or "AI هنوز ورود واقعی را تایید نکرده."
         return (
             f"📊 تحلیل {result.get('symbol')}\n\n"
-            "وضعیت: ❌ بدون سیگنال معتبر\n"
-            f"امتیاز: {result.get('score', 0)}\n"
-            f"لانگ: {result.get('long_score', 0)} | شورت: {result.get('short_score', 0)}\n"
+            "وضعیت: ❌ بدون ورود واقعی\n"
+            f"تصمیم AI: {movement_decision(result)}\n"
+            f"{_movement_line(result)}\n\n"
+            "داده‌های سنسوری:\n"
             f"RSI: {result.get('rsi')}\n"
             f"ADX: {result.get('adx')}\n"
-            f"VWAP: {result.get('vwap_status')}\n\n"
+            f"VWAP: {result.get('vwap_status')}\n"
+            f"Histogram: {result.get('macd_hist')}\n\n"
             f"دلایل:\n{reasons}"
         )
 
+    score_line = ""
+    if result.get("score") is not None:
+        score_line = f"\nامتیاز کلاسیک: {result.get('score')} (فقط اطلاعاتی)"
+
     return (
         f"📊 تحلیل {result.get('symbol')}\n\n"
-        "وضعیت: ✅ سیگنال فعال\n"
-        f"جهت: {fa_direction(result.get('direction'))}\n\n"
+        "وضعیت: ✅ ورود AI تایید شده\n"
+        f"جهت: {fa_direction(result.get('direction'))}\n"
+        f"{_movement_line(result)}\n\n"
         f"ورود: {result.get('entry')}\n"
         f"حد ضرر: {result.get('stop_loss')}\n"
         f"حد سود ۱: {result.get('tp1')}\n"
-        f"حد سود ۲: {result.get('tp2')}\n\n"
-        f"امتیاز: {result.get('score')}\n"
-        f"لانگ: {result.get('long_score')} | شورت: {result.get('short_score')}\n"
+        f"حد سود ۲: {result.get('tp2')}\n"
+        f"{score_line}\n"
         f"ریسک: {result.get('risk_level')}\n"
         f"R/R: {result.get('risk_reward')}\n\n"
+        "سنسورها:\n"
         f"RSI: {result.get('rsi')}\n"
         f"ADX: {result.get('adx')}\n"
         f"VWAP: {result.get('vwap_status')}\n"
-        f"روند بازار: {result.get('market_regime')}\n\n"
+        f"روند بازار: {result.get('market_regime') or result.get('market_mode')}\n\n"
         f"اعتبار: {result.get('validity', '15 تا 45 دقیقه')}"
     )
 
-
 def format_top_signals(signals: List[Dict[str, Any]]) -> str:
     if not signals:
-        return "فعلاً سیگنال مناسبی پیدا نشد."
+        return "فعلاً حرکت تازه مناسبی پیدا نشد."
 
-    lines = ["🏆 بهترین سیگنال‌های فعلی:"]
+    lines = ["🏆 بهترین شکارهای فعلی AI Movement Hunter:"]
     for i, sig in enumerate(signals, 1):
+        score_text = f" | امتیاز کلاسیک:{sig.get('score')}" if sig.get("score") is not None else ""
         lines.append(
             f"\n{i}) {sig.get('symbol')} | {fa_direction(sig.get('direction'))}\n"
-            f"امتیاز: {sig.get('score')} | ریسک: {sig.get('risk_level')}\n"
+            f"{_movement_line(sig)}{score_text}\n"
             f"ورود: {sig.get('entry')}\n"
             f"SL: {sig.get('stop_loss')} | TP1: {sig.get('tp1')}"
         )
     return "\n".join(lines)
-
 
 def format_market_overview_text(result: Dict[str, Any]) -> str:
     return (
@@ -1236,8 +1385,15 @@ def attach_signal_metadata(signal: Dict[str, Any], message_id: int, chat_id: int
     s["chat_id"] = chat_id
     s["user_id"] = OWNER_ID or chat_id
     s["source"] = source
+    # Preserve Movement Hunter metadata everywhere: tracker, real trade,
+    # learning, Ghost, and result messages.
+    mh = movement_metadata(s)
+    s.update({k: v for k, v in mh.items() if s.get(k) is None})
+    snap = s.get("snapshot") if isinstance(s.get("snapshot"), dict) else {}
+    snap = dict(snap)
+    snap.update({k: v for k, v in mh.items() if snap.get(k) is None})
+    s["snapshot"] = snap
     return s
-
 
 # ============================================================
 # Core commands
@@ -1625,11 +1781,10 @@ def auto_signal_gate(signal: Dict[str, Any]) -> tuple[bool, str, bool]:
     """
     Returns: (can_send_to_telegram, reason, save_as_ghost)
 
-    REAL-only safety rule:
-    Auto signals are sent only when REAL trading is fully ready.
-    If trading is off, emergency stop is active, daily lock is active,
-    Toobit usable balance is not enough, or slots are full, the signal
-    must stay silent and be stored as Ghost for learning.
+    Movement Hunter rule:
+    - Classic score / classic entry_confirmed are NOT decision makers anymore.
+    - AI Movement Hunter must decide REAL/ENTRY/ACTIVE.
+    - Real-trade safety checks still remain fully active.
     """
     try:
         st = load_bot_settings()
@@ -1643,11 +1798,20 @@ def auto_signal_gate(signal: Dict[str, Any]) -> tuple[bool, str, bool]:
         if signal.get("status") != "ACTIVE":
             return False, "SIGNAL_NOT_ACTIVE", True
 
-        if not signal.get("entry_confirmed", False):
-            return False, "ENTRY_NOT_CONFIRMED", True
+        if signal.get("direction") not in ["LONG", "SHORT"]:
+            return False, "BAD_DIRECTION", True
 
-        if int(signal.get("score", 0) or 0) < int(AUTO_DIRECT_SCORE_MIN):
-            return False, "LOW_SCORE", True
+        # Required for real order placement, but not a classic-score gate.
+        if signal.get("entry") is None or (signal.get("stop_loss") is None and signal.get("sl") is None) or signal.get("tp1") is None:
+            return False, "MISSING_TRADE_LEVELS", True
+
+        # AI is the only signal authority.
+        if not is_ai_real_signal(signal):
+            return False, f"AI_NOT_REAL:{movement_decision(signal)}:{movement_phase(signal)}", True
+
+        phase = movement_phase(signal)
+        if phase in MOVEMENT_LATE_PHASES:
+            return False, f"MOVE_NOT_FRESH:{phase}", True
 
         key = auto_signal_key(signal)
         now = int(time.time())
@@ -1667,7 +1831,6 @@ def auto_signal_gate(signal: Dict[str, Any]) -> tuple[bool, str, bool]:
     except Exception as e:
         return False, f"GATE_ERROR: {str(e)[:120]}", True
 
-
 def can_send_auto_signal(signal: Dict[str, Any]) -> bool:
     ok, _reason, _ghost = auto_signal_gate(signal)
     return ok
@@ -1678,6 +1841,10 @@ def save_auto_signal_as_ghost(signal: Dict[str, Any], reason: str) -> None:
         return
 
     try:
+        snap = signal.get("snapshot") if isinstance(signal.get("snapshot"), dict) else {}
+        snap = dict(snap)
+        snap.update(movement_metadata(signal))
+        snap["auto_gate_reason"] = reason
         create_ghost_signal(
             symbol=signal.get("symbol"),
             direction=signal.get("direction"),
@@ -1686,11 +1853,11 @@ def save_auto_signal_as_ghost(signal: Dict[str, Any], reason: str) -> None:
             tp1=signal.get("tp1"),
             tp2=signal.get("tp2"),
             score=signal.get("score"),
-            snapshot=signal.get("snapshot", {}),
+            snapshot=snap,
             source="auto_signal_gate",
             reason=reason,
         )
-        logger.info(f"auto signal saved as ghost: {signal.get('symbol')} {signal.get('direction')} | {reason}")
+        logger.info(f"auto Movement Hunter candidate saved as ghost: {signal.get('symbol')} {signal.get('direction')} | {reason}")
     except TypeError:
         try:
             create_ghost_signal(
@@ -1701,7 +1868,7 @@ def save_auto_signal_as_ghost(signal: Dict[str, Any], reason: str) -> None:
                 signal.get("tp1"),
                 signal.get("tp2"),
                 signal.get("score"),
-                signal.get("snapshot", {}),
+                {**(signal.get("snapshot", {}) if isinstance(signal.get("snapshot"), dict) else {}), **movement_metadata(signal), "auto_gate_reason": reason},
                 "auto_signal_gate",
                 reason,
             )
@@ -1709,7 +1876,6 @@ def save_auto_signal_as_ghost(signal: Dict[str, Any], reason: str) -> None:
             logger.error(f"save_auto_signal_as_ghost fallback error: {e}")
     except Exception as e:
         logger.error(f"save_auto_signal_as_ghost error: {e}")
-
 
 def mark_auto_signal_sent(signal: Dict[str, Any]) -> None:
     LAST_AUTO_SIGNAL_TIME[auto_signal_key(signal)] = int(time.time())
