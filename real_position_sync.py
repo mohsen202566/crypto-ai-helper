@@ -1,603 +1,128 @@
-# -*- coding: utf-8 -*-
-"""
-real_position_sync.py
-
-Dedicated Toobit real-position synchronization layer for the crypto futures bot.
-
-Purpose
--------
-This module keeps the bot's internal real-trade slots aligned with actual
-Toobit Futures positions. It is intentionally separated from the order-opening
-logic so the bot can safely monitor real capital after an order has been sent.
-
-Architecture
-------------
-Telegram signal/order flow:
-    bot.py -> real_trade_manager.py -> tobit_client.py -> Toobit
-
-Real position sync flow:
-    real_position_sync.py
-        - reads real open positions from Toobit
-        - confirms pending positions
-        - repairs missing TP/SL when possible
-        - detects closed/missing positions
-        - calculates real PnL from Toobit wallet balance via real_trade_manager
-        - returns Telegram reply events for signal_tracker/bot
-
-Important safety rule
----------------------
-This module never opens a new entry order and never changes signal logic.
-It only syncs, verifies, repairs TP/SL, and reports real position events.
-"""
-
 from __future__ import annotations
 
+"""
+Real position synchronization.
+
+Responsibilities:
+- After real order, poll Toobit for 60-70 seconds to confirm actual position.
+- Confirm slot only when position is seen.
+- Release pending slot only after timeout if no real position exists.
+- Resolve closed real PnL/history after close with waiting window.
+"""
+
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, List
+
+from config import REAL_CONFIRM_TIMEOUT_SECONDS, REAL_CLOSED_PNL_WAIT_SECONDS
+from diagnostics import safe
+import tobit_client
+import slot_manager
+import signal_tracker
+import real_trade_manager
 
 
-DEFAULT_FAST_SYNC_SECONDS = 2
-DEFAULT_FAST_SYNC_WINDOW_SECONDS = 30
-DEFAULT_SLOW_SYNC_SECONDS = 10
-DEFAULT_PENDING_TIMEOUT_SECONDS = 75
-
-
-# ---------------------------------------------------------------------------
-# Generic helpers
-# ---------------------------------------------------------------------------
-
-def _now() -> int:
+def _ts() -> int:
     return int(time.time())
 
 
-def _safe_float(value: Any, default: float = 0.0) -> float:
+def _safe_float(v: Any, default: float = 0.0) -> float:
     try:
-        if value is None or str(value).strip() == "":
-            return float(default)
-        return float(value)
+        if v is None:
+            return default
+        return float(v)
     except Exception:
-        return float(default)
+        return default
 
 
-def _safe_int(value: Any, default: int = 0) -> int:
-    try:
-        if value is None or str(value).strip() == "":
-            return int(default)
-        return int(float(value))
-    except Exception:
-        return int(default)
+@safe(default={})
+def confirm_pending_position(signal_id: str, slot_id: str, symbol: str, timeout_seconds: int = REAL_CONFIRM_TIMEOUT_SECONDS, poll_interval: float = 3.0) -> Dict[str, Any]:
+    c = tobit_client.client()
+    deadline = time.time() + timeout_seconds
+    last = {}
+    while time.time() <= deadline:
+        pos = c.get_position(symbol)
+        last = pos
+        if pos.get("ok") and abs(_safe_float(pos.get("position_amt"))) > 0:
+            slot_manager.confirm_slot(slot_id, exchange_position_id=str(pos.get("raw", {}).get("positionId", "")), metadata={"confirmed_by": "real_position_sync"})
+            return {"ok": True, "signal_id": signal_id, "slot_id": slot_id, "symbol": symbol.upper(), "position": pos}
+        time.sleep(max(0.5, poll_interval))
+    slot_manager.release_slot(slot_id, reason="real_position_not_confirmed")
+    return {"ok": False, "signal_id": signal_id, "slot_id": slot_id, "symbol": symbol.upper(), "reason": "timeout_no_position", "last": last}
 
 
-def _round_usd(value: Any, digits: int = 6) -> float:
-    try:
-        return round(float(value), digits)
-    except Exception:
-        return 0.0
+@safe(default={})
+def resolve_closed_pnl(signal_id: str, symbol: str, start_time_ms: Optional[int] = None, timeout_seconds: int = REAL_CLOSED_PNL_WAIT_SECONDS, poll_interval: float = 4.0) -> Dict[str, Any]:
+    c = tobit_client.client()
+    deadline = time.time() + timeout_seconds
+    rows: List[Dict[str, Any]] = []
+    while time.time() <= deadline:
+        rows = c.closed_pnl_history(symbol, start_time=start_time_ms, limit=20)
+        if rows:
+            pnl = 0.0
+            for r in rows:
+                income_type = str(r.get("incomeType", r.get("type", ""))).upper()
+                if income_type in {"REALIZED_PNL", "REALIZEDPNL", "PNL", ""}:
+                    pnl += _safe_float(r.get("income", r.get("pnl", r.get("realizedPnl", 0))))
+            return {"ok": True, "signal_id": signal_id, "symbol": symbol.upper(), "pnl": round(pnl, 6), "rows": rows}
+        time.sleep(max(0.5, poll_interval))
+    return {"ok": False, "signal_id": signal_id, "symbol": symbol.upper(), "reason": "pnl_history_timeout", "rows": rows}
 
 
-def _norm_symbol(symbol: Any) -> str:
-    raw = str(symbol or "").upper().strip()
-    if not raw:
-        return ""
-    raw = raw.replace("/", "").replace("_", "-")
-    if "-SWAP-USDT" in raw:
-        return raw.replace("-SWAP-USDT", "USDT")
-    if "-SWAP-USDC" in raw:
-        return raw.replace("-SWAP-USDC", "USDC")
-    return raw.replace("-", "")
+@safe(default={})
+def mark_real_closed(signal_id: str, result: str, exit_price: float, symbol: str, start_time_ms: Optional[int] = None) -> Dict[str, Any]:
+    pnl_res = resolve_closed_pnl(signal_id, symbol, start_time_ms=start_time_ms)
+    pnl = _safe_float(pnl_res.get("pnl")) if pnl_res.get("ok") else 0.0
+    signal_tracker.close_signal(signal_id, result=result, exit_price=exit_price, pnl=pnl, snapshot={"real_pnl_resolution": pnl_res})
+    return {"ok": True, "signal_id": signal_id, "result": result, "pnl": pnl, "pnl_resolution": pnl_res}
 
 
-def _norm_direction(direction: Any) -> str:
-    text = str(direction or "").upper().strip()
-    if text in {"LONG", "BUY", "BUY_OPEN", "OPEN_LONG", "POSITION_LONG"}:
-        return "LONG"
-    if text in {"SHORT", "SELL", "SELL_OPEN", "OPEN_SHORT", "POSITION_SHORT"}:
-        return "SHORT"
-    # Toobit/ccxt-style fallbacks sometimes expose side/positionSide as "BOTH",
-    # "NET", or empty. Keep unknown values unchanged rather than guessing.
-    return text
-
-
-def _extract_exchange_direction(ex: Dict[str, Any], fallback: Any = None) -> str:
-    """Read direction from the common normalized/Toobit/ccxt position fields."""
-    if not isinstance(ex, dict):
-        return _norm_direction(fallback)
-    for key in ("direction", "position_side", "positionSide", "holdSide", "side", "posSide"):
-        val = ex.get(key)
-        norm = _norm_direction(val)
-        if norm in {"LONG", "SHORT"}:
-            return norm
-    return _norm_direction(fallback)
-
-
-def _position_key(symbol: Any, direction: Any) -> str:
-    return f"{_norm_symbol(symbol)}:{_norm_direction(direction)}"
-
-
-def _positions_match(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
-    return _position_key(a.get("symbol"), a.get("direction")) == _position_key(b.get("symbol"), _extract_exchange_direction(b, fallback=b.get("direction")))
-
-
-# ---------------------------------------------------------------------------
-# Lazy imports so this file can compile even while other files are being edited
-# ---------------------------------------------------------------------------
-
-def _rtm():
-    import real_trade_manager as rtm  # type: ignore
-    return rtm
-
-
-def _client():
-    from tobit_client import toobit_client  # type: ignore
-    return toobit_client
-
-
-# ---------------------------------------------------------------------------
-# Exchange/state fetchers
-# ---------------------------------------------------------------------------
-
-def load_state() -> Dict[str, Any]:
-    return _rtm().load_real_trade_state()
-
-
-def save_state(state: Dict[str, Any]) -> None:
-    _rtm().save_real_trade_state(state)
-
-
-def get_exchange_positions(symbol: Optional[str] = None) -> Dict[str, Any]:
-    """Return normalized open Toobit positions using the strongest available helper."""
-    try:
-        client = _client()
-        if hasattr(client, "get_open_positions_full"):
-            res = client.get_open_positions_full(symbol=symbol)
-            if isinstance(res, dict) and res.get("ok"):
-                return {"ok": True, "positions": res.get("positions") or [], "raw": res}
-        if hasattr(client, "get_open_positions_normalized"):
-            res = client.get_open_positions_normalized(symbol=symbol)
-            if isinstance(res, dict):
-                return res
-        return _rtm().get_toobit_open_positions_normalized(symbol=symbol)
-    except Exception as exc:
-        return {"ok": False, "error": str(exc)[:300], "positions": []}
-
-
-def get_exchange_balance() -> Dict[str, Any]:
-    """Read current Toobit Futures wallet balance through real_trade_manager."""
-    try:
-        rtm = _rtm()
-        if hasattr(rtm, "get_exchange_balance_info"):
-            return rtm.get_exchange_balance_info()
-        # Fallback to private helper if available.
-        if hasattr(rtm, "_extract_toobit_usdt_balance"):
-            return rtm._extract_toobit_usdt_balance(_client().get_account_balance())
-    except Exception as exc:
-        return {"ok": False, "error": str(exc)[:300]}
-    return {"ok": False, "error": "balance helper unavailable"}
-
-
-# ---------------------------------------------------------------------------
-# Verification and TP/SL repair
-# ---------------------------------------------------------------------------
-
-def verify_position_integrity(position: Dict[str, Any], exchange_position: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+@safe(default=0)
+def cleanup_pending_slots() -> int:
     """
-    Verify an internal position against Toobit data.
-
-    Checks:
-    - symbol/direction match
-    - configured leverage vs exchange leverage when exchange reports it
-    - configured margin vs exchange margin when exchange reports it
-    - TP/SL existence using tobit_client when supported
+    Release expired pending real slots and cancel their tracker signal.
+    This preserves the 60-70s pending window and avoids orphan ACTIVE real signals.
     """
-    ex = exchange_position or {}
-    client = _client()
-
-    expected_symbol = _norm_symbol(position.get("symbol"))
-    expected_direction = _norm_direction(position.get("direction"))
-    actual_symbol = _norm_symbol(ex.get("symbol") or position.get("symbol"))
-    actual_direction = _extract_exchange_direction(ex, fallback=position.get("direction"))
-
-    expected_leverage = _safe_float(position.get("leverage") or position.get("configured_leverage"), 0)
-    actual_leverage = _safe_float(ex.get("leverage") or position.get("exchange_leverage"), 0)
-
-    expected_margin = _safe_float(position.get("position_size_usd") or position.get("margin_usd"), 0)
-    actual_margin = _safe_float(ex.get("margin") or position.get("exchange_margin"), 0)
-
-    problems: List[str] = []
-    if expected_symbol and actual_symbol and expected_symbol != actual_symbol:
-        problems.append(f"SYMBOL_MISMATCH expected={expected_symbol} actual={actual_symbol}")
-    if expected_direction and actual_direction and expected_direction != actual_direction:
-        problems.append(f"DIRECTION_MISMATCH expected={expected_direction} actual={actual_direction}")
-    if expected_leverage > 0 and actual_leverage > 0 and abs(expected_leverage - actual_leverage) > 0.01:
-        problems.append(f"LEVERAGE_MISMATCH expected={expected_leverage} actual={actual_leverage}")
-    # Margin from exchanges can differ slightly because of fees/rounding/contract rules.
-    if expected_margin > 0 and actual_margin > 0:
-        tolerance = max(0.25, expected_margin * 0.20)
-        if abs(expected_margin - actual_margin) > tolerance:
-            problems.append(f"MARGIN_MISMATCH expected≈{expected_margin} actual={actual_margin}")
-
-    tpsl = {"ok": False, "verified": False, "error": "verify_position_has_tpsl unavailable"}
-    try:
-        if hasattr(client, "verify_position_has_tpsl"):
-            tpsl = client.verify_position_has_tpsl(expected_symbol, expected_direction)
-        elif hasattr(client, "verify_tpsl"):
-            tpsl = client.verify_tpsl(expected_symbol, expected_direction)
-    except Exception as exc:
-        tpsl = {"ok": False, "verified": False, "error": str(exc)[:250]}
-
-    if isinstance(tpsl, dict):
-        if tpsl.get("ok") and not tpsl.get("verified"):
-            problems.append("TPSL_NOT_VERIFIED")
-        elif not tpsl.get("ok"):
-            problems.append("TPSL_VERIFY_FAILED")
-
-    return {
-        "ok": len(problems) == 0,
-        "problems": problems,
-        "symbol": expected_symbol,
-        "direction": expected_direction,
-        "expected_leverage": expected_leverage,
-        "actual_leverage": actual_leverage,
-        "expected_margin": expected_margin,
-        "actual_margin": actual_margin,
-        "tpsl": tpsl,
-    }
+    now = _ts()
+    count = 0
+    # Read timeout from slot manager state.
+    state = slot_manager.load_slots()
+    timeout = int(state.get("settings", {}).get("pending_confirm_timeout", REAL_CONFIRM_TIMEOUT_SECONDS))
+    for p in slot_manager.pending_slots():
+        pending_since = int(p.get("pending_since", p.get("created_at", now)) or now)
+        if now - pending_since < timeout:
+            continue
+        sid = p.get("signal_id", "")
+        slot_id = p.get("slot_id", "")
+        if slot_id:
+            slot_manager.release_slot(slot_id, reason="real_position_not_confirmed")
+        if sid:
+            signal_tracker.cancel_signal(sid, "real_position_not_confirmed")
+        count += 1
+    return count
 
 
-def repair_position_tpsl(position: Dict[str, Any], exchange_position: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Repair TP/SL for an existing position. Never opens a new entry."""
-    symbol = _norm_symbol(position.get("symbol"))
-    direction = _norm_direction(position.get("direction"))
-    tp = position.get("tp1") or position.get("take_profit")
-    sl = position.get("sl") or position.get("stop_loss")
-    quantity = _safe_float((exchange_position or {}).get("quantity") or position.get("quantity"), 0)
-
-    if not symbol or direction not in {"LONG", "SHORT"}:
-        return {"ok": False, "error": "symbol/direction missing"}
-    if not tp or not sl:
-        return {"ok": False, "error": "TP/SL missing on internal position"}
-
-    client = _client()
-    try:
-        if hasattr(client, "repair_tpsl"):
-            return client.repair_tpsl(symbol, direction, take_profit=tp, stop_loss=sl, quantity=quantity)
-        if hasattr(client, "place_position_tpsl"):
-            return client.place_position_tpsl(symbol, direction, take_profit=tp, stop_loss=sl, quantity=quantity)
-    except Exception as exc:
-        return {"ok": False, "error": str(exc)[:300]}
-    return {"ok": False, "error": "TP/SL repair helper unavailable"}
-
-
-# ---------------------------------------------------------------------------
-# Core sync logic
-# ---------------------------------------------------------------------------
-
-def choose_next_sync_interval(position: Optional[Dict[str, Any]] = None) -> int:
-    """2s during fresh/pending window, slower after position is stable."""
-    if not position:
-        return DEFAULT_SLOW_SYNC_SECONDS
-    opened_at = _safe_int(position.get("opened_at"), _now())
-    status = str(position.get("real_status") or position.get("status") or "").upper()
-    age = _now() - opened_at
-    if status in {"PENDING_REAL_CONFIRM", "PENDING", "ACCEPTED", "NEW", ""}:
-        return DEFAULT_FAST_SYNC_SECONDS
-    if age <= DEFAULT_FAST_SYNC_WINDOW_SECONDS:
-        return DEFAULT_FAST_SYNC_SECONDS
-    return DEFAULT_SLOW_SYNC_SECONDS
-
-
-def sync_once(*, repair_tpsl: bool = True, save: bool = True) -> Dict[str, Any]:
+@safe(default=0)
+def confirm_all_pending_slots(max_items: int = 3) -> int:
     """
-    Run one real-position sync cycle.
-
-    Safety fix:
-    real_trade_manager.sync_real_positions_with_toobit can remove a position
-    from open_positions when Toobit no longer reports it, but older/current
-    manager versions may not return a POSITION_CLOSED_OR_MISSING event.
-    Without that event, bot.py has nothing to send to Telegram.
-
-    This function now compares open_positions before/after sync and generates
-    the missing close/missing event exactly once for positions that disappeared.
+    Non-blocking background helper.
+    It checks a few pending real slots once per loop and confirms them if a real
+    position exists. It does NOT release slots early; cleanup_pending_slots()
+    handles release only after the full configured timeout.
     """
-    rtm = _rtm()
-    state_before = rtm.load_real_trade_state()
-
-    before_open = {}
-    if isinstance(state_before, dict) and isinstance(state_before.get("open_positions"), dict):
-        before_open = {
-            str(k): dict(v)
-            for k, v in state_before.get("open_positions", {}).items()
-            if isinstance(v, dict)
-        }
-
-    # Primary source of truth and accounting.
-    sync = rtm.sync_real_positions_with_toobit(state_before, save=save)
-    if not isinstance(sync, dict) or not sync.get("ok"):
-        return {
-            "ok": False,
-            "error": str((sync or {}).get("error") or "sync failed")[:300],
-            "events": [],
-            "messages": [],
-            "state": state_before,
-        }
-
-    state = sync.get("state") or state_before
-    exchange_positions = sync.get("exchange_positions") or []
-    events = list(sync.get("events") or [])
-    integrity_reports: List[Dict[str, Any]] = []
-
-    # ------------------------------------------------------------------
-    # Critical Telegram-result fix:
-    # If the manager removed a position but did not create a close/missing
-    # event, create it here so bot.py can send a result message.
-    # ------------------------------------------------------------------
-    after_open = {}
-    if isinstance(state, dict) and isinstance(state.get("open_positions"), dict):
-        after_open = state.get("open_positions", {})
-
-    existing_close_keys = set()
-    for ev in events:
-        if not isinstance(ev, dict):
+    c = tobit_client.client()
+    pending = slot_manager.pending_slots()[:max_items]
+    done = 0
+    for p in pending:
+        symbol = p.get("symbol", "")
+        if not symbol:
             continue
-        if str(ev.get("type") or "") == "POSITION_CLOSED_OR_MISSING":
-            existing_close_keys.add(str(ev.get("signal_id") or ""))
-
-    removed_ids = [sid for sid in before_open.keys() if sid not in after_open]
-    for sid in removed_ids:
-        if sid in existing_close_keys:
-            continue
-        pos = before_open.get(sid) or {}
-        # Do not announce very fresh pending/unfilled records as trade results.
-        age = _now() - _safe_int(pos.get("opened_at"), _now())
-        real_status = str(pos.get("real_status") or pos.get("status") or "").upper()
-        if real_status in {"PENDING_REAL_CONFIRM", "PENDING", "NEW", "ACCEPTED", "CREATED"} and age < DEFAULT_PENDING_TIMEOUT_SECONDS:
-            continue
-
-        pos["signal_id"] = pos.get("signal_id") or sid
-        pos["closed_or_missing_at"] = _now()
-        snap = pos.get("snapshot") if isinstance(pos.get("snapshot"), dict) else {}
-        if snap:
-            for mk in ("move_phase", "freshness_score", "move_done_pct", "movement_type", "ai_score", "trap_risk", "reversal_risk"):
-                if pos.get(mk) is None and snap.get(mk) is not None:
-                    pos[mk] = snap.get(mk)
-                mh = snap.get("ai_movement_hunter") if isinstance(snap.get("ai_movement_hunter"), dict) else {}
-                if pos.get(mk) is None and mh.get(mk) is not None:
-                    pos[mk] = mh.get(mk)
-        pos.setdefault("accounting", {
-            "ok": False,
-            "pnl_usd": None,
-            "balance": None,
-            "error": "position removed by sync but no accounting event was returned by real_trade_manager",
-        })
-
-        events.append({
-            "type": "POSITION_CLOSED_OR_MISSING",
-            "signal_id": sid,
-            "position": pos,
-            "accounting": pos.get("accounting"),
-            "source": "real_position_sync_missing_event_repair",
-        })
-        existing_close_keys.add(sid)
-
-    # Verify/repair every active internal position.
-    open_positions = state.get("open_positions", {}) if isinstance(state.get("open_positions"), dict) else {}
-    changed = False
-    for sid, pos in list(open_positions.items()):
-        if not isinstance(pos, dict):
-            continue
-        ex_match = None
-        for ex in exchange_positions:
-            if isinstance(ex, dict) and _positions_match(pos, ex):
-                ex_match = ex
-                break
-        if not ex_match:
-            continue
-
-        report = verify_position_integrity(pos, ex_match)
-        report["signal_id"] = sid
-        integrity_reports.append(report)
-        pos["last_integrity_check_at"] = _now()
-        pos["last_integrity_report"] = report
-        changed = True
-
-        tpsl = report.get("tpsl") if isinstance(report, dict) else None
-        tpsl_needs_repair = isinstance(tpsl, dict) and (not tpsl.get("ok") or not tpsl.get("verified"))
-        if repair_tpsl and tpsl_needs_repair:
-            repair = repair_position_tpsl(pos, ex_match)
-            pos["last_real_position_sync_tpsl_repair"] = repair
-            pos["last_real_position_sync_tpsl_repair_at"] = _now()
-            changed = True
-
-            # Telegram anti-spam:
-            # TP/SL verification/repair may fail on every sync cycle while the
-            # position remains open. Send the warning only once per internal
-            # position; keep later repair attempts in state/logs only.
-            if not bool(pos.get("tpsl_repair_warning_sent")):
-                pos["tpsl_repair_warning_sent"] = True
-                pos["tpsl_repair_warning_sent_at"] = _now()
-                events.append({
-                    "type": "TPSL_REPAIR_ATTEMPTED",
-                    "signal_id": sid,
-                    "position": pos,
-                    "repair": repair,
-                })
-
-    if changed and save:
-        rtm.save_real_trade_state(state)
-
-    messages = build_tracker_messages(events)
-
-    return {
-        "ok": True,
-        "added": sync.get("added", 0),
-        "removed": sync.get("removed", 0),
-        "updated": sync.get("updated", 0),
-        "state": state,
-        "exchange_positions": exchange_positions,
-        "balance": sync.get("balance"),
-        "events": events,
-        "messages": messages,
-        "integrity_reports": integrity_reports,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Telegram tracker messages
-# ---------------------------------------------------------------------------
-
-def _fa_direction(direction: Any) -> str:
-    d = _norm_direction(direction)
-    if d == "LONG":
-        return "لانگ"
-    if d == "SHORT":
-        return "شورت"
-    return str(direction or "")
-
-
-def _closed_result_text(pnl: float) -> Tuple[str, str]:
-    if pnl > 0:
-        return "✅", "سود / احتمالاً TP"
-    if pnl < 0:
-        return "❌", "ضرر / احتمالاً SL"
-    return "ℹ️", "بسته شد"
-
-
-def build_tracker_messages(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Convert sync events into bot/signal_tracker sendable message dicts."""
-    messages: List[Dict[str, Any]] = []
-    for event in events or []:
-        if not isinstance(event, dict):
-            continue
-        etype = str(event.get("type") or event.get("event_type") or "")
-        pos = event.get("position") or {}
-        if not isinstance(pos, dict):
-            pos = {}
-
-        if etype == "POSITION_CLOSED_OR_MISSING":
-            acc = event.get("accounting") or pos.get("accounting") or {}
-            pnl_raw = acc.get("pnl_usd") if isinstance(acc, dict) else None
-            has_real_pnl = pnl_raw is not None and str(pnl_raw).strip() != ""
-            pnl = _safe_float(pnl_raw, 0)
-            icon, result_fa = _closed_result_text(pnl) if has_real_pnl else ("ℹ️", "پوزیشن بسته/ناپدید شد")
-            sign = "+" if pnl > 0 else ""
-
-            text = (
-                f"{icon} نتیجه پوزیشن واقعی {pos.get('symbol')}\n"
-                f"جهت: {_fa_direction(pos.get('direction'))}\n"
-                f"نتیجه: {result_fa}"
+        pos = c.get_position(symbol)
+        if pos.get("ok") and abs(_safe_float(pos.get("position_amt"))) > 0:
+            slot_manager.confirm_slot(
+                p.get("slot_id", ""),
+                exchange_position_id=str(pos.get("raw", {}).get("positionId", "")),
+                metadata={"confirmed_by": "real_position_sync.background"},
             )
-            phase = pos.get("move_phase") or pos.get("move_state")
-            fresh = pos.get("freshness_score")
-            if phase or fresh is not None:
-                text += f"\nفاز حرکت: {phase or '-'}" + (f" | تازگی: {fresh}" if fresh is not None else "")
-            if has_real_pnl:
-                text += (
-                    f"\nسود/ضرر واقعی از بالانس توبیت: {sign}{round(pnl, 6)}$"
-                    f"\nبالانس بعد: {acc.get('balance')}$"
-                )
-            else:
-                text += "\n⚠️ پوزیشن از توبیت/Sync بسته یا ناپدید شده، اما PnL واقعی هنوز از توبیت خوانده/ثبت نشده است."
-            if isinstance(acc, dict) and acc.get("daily_locked"):
-                text += "\n🚨 قفل ضرر روزانه فعال شد."
-            messages.append({
-                "chat_id": pos.get("chat_id"),
-                "message": text,
-                "reply_to_message_id": pos.get("message_id") or pos.get("reply_to_message_id"),
-                "signal_id": pos.get("signal_id") or event.get("signal_id"),
-                "event_type": etype,
-            })
-
-        elif etype == "POSITION_CONFIRMED":
-            # Keep this event quiet by default. It is useful for logs/state, not Telegram spam.
-            continue
-
-        elif etype == "POSITION_RECOVERED":
-            text = (
-                f"⚠️ پوزیشن واقعی از توبیت Sync شد\n"
-                f"ارز: {pos.get('symbol')}\n"
-                f"جهت: {_fa_direction(pos.get('direction'))}\n"
-                "این پوزیشن در صرافی باز بود ولی داخل اسلات ربات نبود."
-            )
-            messages.append({
-                "chat_id": pos.get("chat_id"),
-                "message": text,
-                "reply_to_message_id": pos.get("message_id") or pos.get("reply_to_message_id"),
-                "signal_id": pos.get("signal_id") or event.get("signal_id"),
-                "event_type": etype,
-            })
-
-        elif etype == "TPSL_REPAIR_ATTEMPTED":
-            repair = event.get("repair") or {}
-            # Send only failures. Successful repairs are kept in state/logs to avoid noise.
-            if isinstance(repair, dict) and repair.get("ok"):
-                continue
-            text = (
-                f"⚠️ هشدار TP/SL برای {pos.get('symbol')}\n"
-                f"جهت: {_fa_direction(pos.get('direction'))}\n"
-                "ربات تلاش کرد TP/SL را بررسی/ترمیم کند، اما تأیید کامل نگرفت.\n"
-                f"جزئیات: {str((repair or {}).get('error') or repair)[:180]}"
-            )
-            messages.append({
-                "chat_id": pos.get("chat_id"),
-                "message": text,
-                "reply_to_message_id": pos.get("message_id") or pos.get("reply_to_message_id"),
-                "signal_id": pos.get("signal_id") or event.get("signal_id"),
-                "event_type": etype,
-            })
-
-    return messages
-
-
-def check_real_position_events_for_tracker() -> List[Dict[str, Any]]:
-    """Small helper for signal_tracker.py / bot.py loops."""
-    result = sync_once(repair_tpsl=True, save=True)
-    if not result.get("ok"):
-        return []
-    return result.get("messages") or []
-
-
-# Backward-compatible alias names for easy integration.
-check_events_for_tracker = check_real_position_events_for_tracker
-sync_real_positions_once = sync_once
-
-
-# ---------------------------------------------------------------------------
-# Human-readable status
-# ---------------------------------------------------------------------------
-
-def format_sync_status() -> str:
-    result = sync_once(repair_tpsl=True, save=True)
-    if not result.get("ok"):
-        return f"❌ خطا در Sync پوزیشن‌های واقعی:\n{result.get('error')}"
-
-    state = result.get("state") or {}
-    open_positions = state.get("open_positions", {}) if isinstance(state.get("open_positions"), dict) else {}
-    lines = [
-        "🔁 Sync پوزیشن‌های واقعی Toobit",
-        f"پوزیشن واقعی در توبیت: {len(result.get('exchange_positions') or [])}",
-        f"اسلات داخلی باز: {len(open_positions)}",
-        f"اضافه‌شده: {result.get('added', 0)}",
-        f"حذف/بسته‌شده: {result.get('removed', 0)}",
-        f"آپدیت‌شده: {result.get('updated', 0)}",
-    ]
-
-    reports = result.get("integrity_reports") or []
-    if reports:
-        lines.append("\nچک امنیت پوزیشن‌ها:")
-        for rep in reports[:10]:
-            ok = "✅" if rep.get("ok") else "⚠️"
-            problems = ", ".join(rep.get("problems") or []) or "OK"
-            lines.append(f"{ok} {rep.get('symbol')} {rep.get('direction')} | {problems}")
-
-    events = result.get("events") or []
-    if events:
-        lines.append("\nرویدادها:")
-        for event in events[:10]:
-            p = event.get("position") or {}
-            lines.append(f"• {event.get('type')} | {p.get('symbol')} {p.get('direction')}")
-
-    return "\n".join(lines)
-
-
-if __name__ == "__main__":
-    print(format_sync_status())
+            done += 1
+    cleanup_pending_slots()
+    return done
