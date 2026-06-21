@@ -189,7 +189,7 @@ class ToobitClient:
         self.session = requests.Session()
 
     def _headers(self) -> Dict[str, str]:
-        h = {"Content-Type": "application/json"}
+        h = {"Content-Type": "application/x-www-form-urlencoded"}
         if self.api_key:
             h["X-BB-APIKEY"] = self.api_key
         return h
@@ -391,13 +391,15 @@ class ToobitClient:
 
     @safe(default={})
     def set_leverage(self, symbol: str, leverage: int) -> Dict[str, Any]:
+        """Set Toobit USDT-M leverage using the official v2 futures endpoint."""
         symbol_bot = symbol.upper()
         tb_symbol = _toobit_symbol(symbol_bot)
         lev = max(1, min(125, int(leverage or 1)))
-        res = self._request("POST", "/api/v1/futures/leverage", params={"symbol": tb_symbol, "leverage": lev}, signed=True)
+        params = {"symbol": tb_symbol, "leverage": str(lev), "category": "USDT"}
+        res = self._request("POST", "/api/v2/futures/leverage", params=params, signed=True)
         if res.get("ok"):
-            return {"ok": True, "symbol": symbol_bot, "exchange_symbol": tb_symbol, "leverage": lev, "raw": res.get("data")}
-        return {"ok": False, "symbol": symbol_bot, "exchange_symbol": tb_symbol, "leverage": lev, "error": "set_leverage_failed", "raw": res}
+            return {"ok": True, "symbol": symbol_bot, "exchange_symbol": tb_symbol, "leverage": lev, "raw": res.get("data"), "params": params}
+        return {"ok": False, "symbol": symbol_bot, "exchange_symbol": tb_symbol, "leverage": lev, "error": "set_leverage_failed", "raw": res, "params": params}
 
     @safe(default={})
     def get_position(self, symbol: str, side: Optional[str] = None) -> Dict[str, Any]:
@@ -422,6 +424,27 @@ class ToobitClient:
             return {"ok": True, "symbol": symbol_bot, "exchange_symbol": tb_symbol, "position_amt": amt, "side": p.get("side"), "margin_type": p.get("marginType"), "leverage": p.get("leverage"), "raw": p}
         return {"ok": False, "symbol": symbol_bot, "exchange_symbol": tb_symbol, "position_amt": 0.0, "raw": rows}
 
+    def _resolve_v2_order_side(self, side: str, reduce_only: bool = False) -> Dict[str, str]:
+        """
+        Convert internal side names to Toobit v2 order fields.
+        v2 requires side=BUY/SELL and positionSide=LONG/SHORT.
+        """
+        side_u = str(side or "").upper()
+        if side_u in {"BUY_OPEN", "LONG", "BUY"} and not reduce_only:
+            return {"side": "BUY", "positionSide": "LONG"}
+        if side_u in {"SELL_OPEN", "SHORT", "SELL"} and not reduce_only:
+            return {"side": "SELL", "positionSide": "SHORT"}
+        if side_u in {"SELL_CLOSE", "CLOSE_LONG"}:
+            return {"side": "SELL", "positionSide": "LONG"}
+        if side_u in {"BUY_CLOSE", "CLOSE_SHORT"}:
+            return {"side": "BUY", "positionSide": "SHORT"}
+        # Safe fallback: preserve previous BUY/SELL behavior for opens.
+        if side_u == "BUY":
+            return {"side": "BUY", "positionSide": "LONG"}
+        if side_u == "SELL":
+            return {"side": "SELL", "positionSide": "SHORT"}
+        return {"side": side_u, "positionSide": ""}
+
     @safe(default={})
     def create_order(
         self,
@@ -433,84 +456,139 @@ class ToobitClient:
         reduce_only: bool = False,
         extra: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        """
+        Place a Toobit USDT-M futures order using official v2 fields.
+
+        Important:
+        - v2 order endpoint is /api/v2/futures/order.
+        - side must be BUY/SELL, not BUY_OPEN/SELL_OPEN.
+        - positionSide must be LONG/SHORT.
+        - type supports MARKET directly; do NOT send priceType.
+        - takeProfit/stopLoss are supported on the same order request.
+        """
         symbol_bot = symbol.upper()
         tb_symbol = _toobit_symbol(symbol_bot)
-        side = side.upper()
-
-        # Toobit v1 futures uses combined sides. Accept either bot/Binance sides or native Toobit sides.
-        if side == "BUY":
-            side = "BUY_OPEN"
-        elif side == "SELL":
-            side = "SELL_OPEN"
+        resolved = self._resolve_v2_order_side(side, reduce_only=reduce_only)
+        v2_side = resolved.get("side", "")
+        position_side = resolved.get("positionSide", "")
+        typ = str(order_type or "MARKET").upper()
+        if typ not in {"MARKET", "LIMIT"}:
+            typ = "MARKET"
 
         params: Dict[str, Any] = {
             "symbol": tb_symbol,
-            "side": side,
+            "side": v2_side,
+            "positionSide": position_side,
+            "type": typ,
             "quantity": str(quantity),
+            "category": "USDT",
             "newClientOrderId": f"ai_{int(time.time()*1000)}",
         }
+        if typ == "LIMIT":
+            if price is None:
+                return {"ok": False, "symbol": symbol_bot, "exchange_symbol": tb_symbol, "side": v2_side, "positionSide": position_side, "error": "limit_order_requires_price", "params": params}
+            params["price"] = str(price)
+            params["timeInForce"] = "GTC"
 
-        if order_type.upper() == "MARKET":
-            # Toobit v1 futures market order: type=LIMIT + priceType=MARKET.
-            params["type"] = "LIMIT"
-            params["priceType"] = "MARKET"
-        else:
-            params["type"] = order_type.upper()
-            params["priceType"] = "INPUT"
-            if price is not None:
-                params["price"] = str(price)
-                params["timeInForce"] = "GTC"
-
-        if reduce_only:
-            params["reduceOnly"] = "true"
         if extra:
-            # Supports takeProfit, stopLoss, tpTriggerBy, slTriggerBy, tpOrderType, slOrderType, etc.
-            params.update({k: v for k, v in extra.items() if v is not None and v != ""})
+            # Official v2 order supports attached TP/SL on the same request.
+            allowed_extra = {
+                "takeProfit", "tpTriggerBy", "tpLimitPrice", "tpOrderType",
+                "stopLoss", "slTriggerBy", "slLimitPrice", "slOrderType",
+                "valueQuantity", "recvWindow",
+            }
+            for k, v in extra.items():
+                if k in allowed_extra and v is not None and v != "":
+                    params[k] = str(v)
 
-        res = self._request("POST", "/api/v1/futures/order", params=params, signed=True)
+        # For market TP/SL we should not send limit prices.
+        if params.get("tpOrderType") == "MARKET":
+            params.pop("tpLimitPrice", None)
+        if params.get("slOrderType") == "MARKET":
+            params.pop("slLimitPrice", None)
+
+        res = self._request("POST", "/api/v2/futures/order", params=params, signed=True)
         if res.get("ok"):
-            return {"ok": True, "symbol": symbol_bot, "exchange_symbol": tb_symbol, "side": side, "raw": res.get("data"), "params": params}
+            return {
+                "ok": True,
+                "symbol": symbol_bot,
+                "exchange_symbol": tb_symbol,
+                "side": v2_side,
+                "positionSide": position_side,
+                "raw": res.get("data"),
+                "params": params,
+            }
         err = str(res.get("error", ""))
         if "-1202" in err or "quantity too small" in err.lower():
-            return {"ok": False, "symbol": symbol_bot, "exchange_symbol": tb_symbol, "side": side, "error_code": -1202, "error": err, "raw": res, "params": params}
-        return {"ok": False, "symbol": symbol_bot, "exchange_symbol": tb_symbol, "side": side, "error": "create_order_failed", "raw": res, "params": params}
+            return {"ok": False, "symbol": symbol_bot, "exchange_symbol": tb_symbol, "side": v2_side, "positionSide": position_side, "error_code": -1202, "error": err, "raw": res, "params": params}
+        return {"ok": False, "symbol": symbol_bot, "exchange_symbol": tb_symbol, "side": v2_side, "positionSide": position_side, "error": "create_order_failed", "raw": res, "params": params}
 
     @safe(default={})
     def set_trading_stop(self, symbol: str, direction: str, take_profit: Optional[float] = None, stop_loss: Optional[float] = None, quantity: Optional[float] = None) -> Dict[str, Any]:
-        """Set/replace TP/SL on an existing futures position."""
+        """
+        Fallback only: create separate v2 STOP_PROFIT_LOSS orders.
+        Primary protection should be attached in create_order().
+        """
         symbol_bot = symbol.upper()
         tb_symbol = _toobit_symbol(symbol_bot)
         direction = str(direction).upper()
-        params: Dict[str, Any] = {
+        if direction == "LONG":
+            close_side = "SELL"
+            position_side = "LONG"
+        elif direction == "SHORT":
+            close_side = "BUY"
+            position_side = "SHORT"
+        else:
+            return {"ok": False, "symbol": symbol_bot, "error": "invalid_direction"}
+
+        results = []
+        ok = True
+        base = {
             "symbol": tb_symbol,
-            "side": direction,
-            "stopType": "FIXED_STOP",
+            "side": close_side,
+            "positionSide": position_side,
+            "category": "USDT",
+            "quantity": str(quantity) if quantity else "",
+            "triggerBy": "CONTRACT_PRICE",
         }
         if take_profit:
-            params["takeProfit"] = str(take_profit)
-            params["tpTriggerBy"] = "CONTRACT_PRICE"
-            params["tpOrderType"] = "MARKET"
-            if quantity:
-                params["tpSize"] = str(quantity)
+            p = dict(base)
+            p.update({
+                "type": "STOP_PROFIT_LOSS_MARKET",
+                "stopPrice": str(take_profit),
+                "stopOrderType": "TAKE_PROFIT",
+                "stopType": "FIXED_STOP",
+                "newClientOrderId": f"tp_{int(time.time()*1000)}",
+            })
+            if not quantity:
+                p.pop("quantity", None)
+            r = self._request("POST", "/api/v2/futures/algo-order", params=p, signed=True)
+            results.append({"kind": "TP", "ok": r.get("ok"), "raw": r, "params": p})
+            ok = ok and bool(r.get("ok"))
         if stop_loss:
-            params["stopLoss"] = str(stop_loss)
-            params["slTriggerBy"] = "CONTRACT_PRICE"
-            params["slOrderType"] = "MARKET"
-            if quantity:
-                params["slSize"] = str(quantity)
-        res = self._request("POST", "/api/v1/futures/position/trading-stop", params=params, signed=True)
-        if res.get("ok"):
-            return {"ok": True, "symbol": symbol_bot, "exchange_symbol": tb_symbol, "direction": direction, "raw": res.get("data"), "params": params}
-        return {"ok": False, "symbol": symbol_bot, "exchange_symbol": tb_symbol, "direction": direction, "error": "set_trading_stop_failed", "raw": res, "params": params}
+            p = dict(base)
+            p.update({
+                "type": "STOP_PROFIT_LOSS_MARKET",
+                "stopPrice": str(stop_loss),
+                "stopOrderType": "STOP_LOSS",
+                "stopType": "FIXED_STOP",
+                "newClientOrderId": f"sl_{int(time.time()*1000)}",
+            })
+            if not quantity:
+                p.pop("quantity", None)
+            r = self._request("POST", "/api/v2/futures/algo-order", params=p, signed=True)
+            results.append({"kind": "SL", "ok": r.get("ok"), "raw": r, "params": p})
+            ok = ok and bool(r.get("ok"))
+        return {"ok": ok, "symbol": symbol_bot, "exchange_symbol": tb_symbol, "direction": direction, "results": results}
 
 
     @safe(default={})
     def cancel_order(self, symbol: str, order_id: str) -> Dict[str, Any]:
-        return self._request("DELETE", "/fapi/v1/order", params={"symbol": symbol.upper(), "orderId": order_id}, signed=True)
+        return self._request("DELETE", "/api/v2/futures/order", params={"orderId": order_id, "category": "USDT"}, signed=True)
 
     @safe(default=[])
     def closed_pnl_history(self, symbol: str, start_time: Optional[int] = None, limit: int = 20) -> List[Dict[str, Any]]:
-        params = {"symbol": symbol.upper(), "limit": limit}
+        params = {"symbol": _toobit_symbol(symbol), "limit": limit, "category": "USDT"}
         if start_time:
             params["startTime"] = start_time
         for path in ["/api/v1/futures/historyPositions", "/fapi/v1/income", "/api/v1/income"]:
