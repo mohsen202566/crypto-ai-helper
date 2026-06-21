@@ -221,19 +221,84 @@ def update_active_from_market(symbols: Optional[List[str]] = None) -> int:
     return signal_tracker.update_many(price_map)
 
 
+def _short_error_reason(err: Any) -> str:
+    if isinstance(err, dict):
+        return str(err.get("reason") or err.get("error") or err.get("errors") or "unknown")
+    return str(err or "unknown")
+
+
+def _format_decision_rows(decisions: List[Dict[str, Any]], limit: int = 8) -> str:
+    if not decisions:
+        return ""
+    rows = []
+    for d in decisions[:limit]:
+        symbol = str(d.get("symbol", ""))
+        direction = str(d.get("direction", ""))
+        decision = str(d.get("decision", ""))
+        conf = d.get("confidence", d.get("score", ""))
+        try:
+            conf_txt = f"{float(conf) * 100:.0f}%" if float(conf) <= 1 else f"{float(conf):.0f}"
+        except Exception:
+            conf_txt = str(conf) if conf != "" else "-"
+        rows.append(f"• {symbol} {direction} → {decision} | {conf_txt}")
+    return "\n".join(rows)
+
+
+def _format_error_rows(errors: Dict[str, Any], limit: int = 6) -> str:
+    if not errors:
+        return ""
+    rows = []
+    for symbol, err in list(errors.items())[:limit]:
+        rows.append(f"• {symbol}: {_short_error_reason(err)}")
+    return "\n".join(rows)
+
+
 @safe(default="")
 def scan_report_fa(symbols: Optional[List[str]] = None) -> str:
-    scan = market_scanner.scan_market(symbols=symbols or DEFAULT_SYMBOLS[:AUTO_SCAN_MAX_SYMBOLS_PER_CYCLE], use_cache=False)
-    decisions = evaluate_market_scan(scan, record=False)
+    requested_symbols = symbols or DEFAULT_SYMBOLS[:AUTO_SCAN_MAX_SYMBOLS_PER_CYCLE]
+    scan = market_scanner.scan_market(symbols=requested_symbols, use_cache=False)
+    decisions = evaluate_market_scan(scan, record=False) if scan.get("snapshots") else []
+
+    requested = int(scan.get("symbols_requested", len(requested_symbols)) or 0)
+    ok_count = int(scan.get("symbols_ok", len(scan.get("snapshots", {}))) or 0)
+    errors = scan.get("errors", {}) or {}
+
     real = sum(1 for d in decisions if d.get("decision") in {"REAL", "ENTRY_ACTIVATION"})
     setup = sum(1 for d in decisions if d.get("decision") == "SETUP")
     ghost = sum(1 for d in decisions if d.get("decision") == "GHOST")
     wait = sum(1 for d in decisions if d.get("decision") == "WAIT")
     reject = sum(1 for d in decisions if d.get("decision") == "REJECT")
+    no_trade = max(0, requested - ok_count)
+
+    market_status = market_scanner.market_status_fa()
+    top_rows = _format_decision_rows(decisions)
+    error_rows = _format_error_rows(errors)
+
+    # If the live/manual scan has no candle data, do not show a misleading empty report.
+    # Show the real data-health problem and, when possible, also show the latest cached market status.
+    if ok_count == 0:
+        cached = market_scanner.get_cached_market_status()
+        cached_txt = ""
+        if cached and cached.get("symbols_ok"):
+            cached_txt = (
+                "\n\nآخرین وضعیت ذخیره‌شده:\n"
+                f"بررسی‌شده قبلی: {cached.get('symbols_ok')}/{cached.get('symbols_requested')}\n"
+                f"Market: {cached.get('market_mode')} | BTC: {cached.get('btc_bias')}"
+            )
+        return (
+            "🔎 گزارش اسکن بازار\n"
+            f"بررسی‌شده: 0/{requested}\n"
+            f"خطا/دیتای ناقص: {len(errors)}\n"
+            "نتیجه: در اسکن لحظه‌ای کندل معتبر دریافت نشد.\n"
+            + (f"\nنمونه خطاها:\n{error_rows}" if error_rows else "")
+            + cached_txt
+        )
+
     return (
         "🔎 گزارش اسکن بازار\n"
-        f"بررسی‌شده: {scan.get('symbols_ok')}/{scan.get('symbols_requested')}\n"
+        f"بررسی‌شده: {ok_count}/{requested} | خطا: {len(errors)}\n"
         f"Real/Entry: {real} | Setup: {setup} | Ghost: {ghost}\n"
-        f"Wait: {wait} | Reject: {reject}\n"
-        f"{market_scanner.market_status_fa()}"
+        f"Wait: {wait} | Reject: {reject} | NoData/NoTrade: {no_trade}\n"
+        + (f"\nکاندیدهای AI:\n{top_rows}\n" if top_rows else "\nکاندید AI پیدا نشد.\n")
+        + f"\n{market_status}"
     )
