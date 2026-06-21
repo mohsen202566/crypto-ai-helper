@@ -82,6 +82,47 @@ def _okx_inst_id(symbol: str) -> str:
     return s
 
 
+
+def _is_success_payload(data: Any) -> bool:
+    """Toobit often returns HTTP 200 with a business code field."""
+    if not isinstance(data, dict):
+        return True
+    code = data.get("code")
+    if code is None:
+        return True
+    try:
+        return int(code) == 200
+    except Exception:
+        return str(code).lower() in {"200", "success", "0"}
+
+def _toobit_symbol(symbol: str) -> str:
+    """Convert bot symbol BTCUSDT / BTC-USDT to Toobit USDT-M futures symbol BTC-SWAP-USDT."""
+    s = str(symbol or "").upper().replace("/", "-").replace("_", "-")
+    if "-SWAP-" in s:
+        return s
+    if s.endswith("-SWAP"):
+        # OKX style BTC-USDT-SWAP -> Toobit style BTC-SWAP-USDT
+        parts = s.split("-")
+        if len(parts) >= 3:
+            return f"{parts[0]}-SWAP-{parts[1]}"
+    if "-" in s:
+        parts = [x for x in s.split("-") if x]
+        if len(parts) >= 2:
+            return f"{parts[0]}-SWAP-{parts[1]}"
+    for quote in ("USDT", "USDC", "USD"):
+        if s.endswith(quote) and len(s) > len(quote):
+            return f"{s[:-len(quote)]}-SWAP-{quote}"
+    return s
+
+def _bot_symbol(symbol: str) -> str:
+    """Convert Toobit futures symbol BTC-SWAP-USDT back to bot symbol BTCUSDT."""
+    s = str(symbol or "").upper()
+    if "-SWAP-" in s:
+        base, quote = s.split("-SWAP-", 1)
+        return f"{base}{quote}"
+    return s.replace("-", "")
+
+
 def _parse_okx_candles(raw: Any) -> List[Dict[str, Any]]:
     rows = []
     if isinstance(raw, dict):
@@ -170,7 +211,9 @@ class ToobitClient:
             if method.upper() == "GET":
                 r = self.session.get(url, params=params, headers=self._headers(), timeout=self.timeout)
             elif method.upper() == "POST":
-                r = self.session.post(url, params=params, headers=self._headers(), timeout=self.timeout)
+                # Toobit signed examples use form body (-d). Query string also works for some endpoints,
+                # but body is more compatible for futures trade endpoints.
+                r = self.session.post(url, data=params, headers=self._headers(), timeout=self.timeout)
             elif method.upper() == "DELETE":
                 r = self.session.delete(url, params=params, headers=self._headers(), timeout=self.timeout)
             else:
@@ -180,6 +223,8 @@ class ToobitClient:
             except Exception:
                 data = {"raw": r.text}
             if r.status_code >= 400:
+                return {"ok": False, "status_code": r.status_code, "error": data, "path": path}
+            if not _is_success_payload(data):
                 return {"ok": False, "status_code": r.status_code, "error": data, "path": path}
             return {"ok": True, "data": data, "status_code": r.status_code}
         except Exception as e:
@@ -308,62 +353,156 @@ class ToobitClient:
     # Private endpoints
 
     @safe(default={})
+    def account_leverage(self, symbol: Optional[str] = None) -> Dict[str, Any]:
+        """Read leverage/margin mode from Toobit accountLeverage endpoint."""
+        params: Dict[str, Any] = {}
+        if symbol:
+            params["symbol"] = _toobit_symbol(symbol)
+        res = self._request("GET", "/api/v1/futures/accountLeverage", params=params, signed=True)
+        if not res.get("ok"):
+            return {"ok": False, "symbol": symbol.upper() if symbol else "", "error": res}
+        data = res.get("data", [])
+        rows = data if isinstance(data, list) else data.get("data", data if isinstance(data, dict) else [])
+        if isinstance(rows, dict):
+            rows = [rows]
+        target = None
+        if symbol:
+            tb = _toobit_symbol(symbol)
+            for r in rows or []:
+                if str(r.get("symbolId", r.get("symbol", ""))).upper() == tb:
+                    target = r
+                    break
+        return {"ok": True, "symbol": symbol.upper() if symbol else "", "raw": target if target is not None else rows}
+
+    @safe(default={})
     def set_margin_type(self, symbol: str, margin_type: str = "ISOLATED") -> Dict[str, Any]:
-        symbol = symbol.upper()
+        symbol_bot = symbol.upper()
+        tb_symbol = _toobit_symbol(symbol_bot)
         margin_type = margin_type.upper()
-        params = {"symbol": symbol, "marginType": margin_type}
-        for path in ["/fapi/v1/marginType", "/api/v1/marginType"]:
-            res = self._request("POST", path, params=params, signed=True)
-            if res.get("ok"):
-                return {"ok": True, "symbol": symbol, "margin_type": margin_type, "raw": res.get("data")}
-            # Binance-like: already set can return error but is acceptable
-            err = str(res.get("error", "")).lower()
-            if "no need to change" in err or "already" in err:
-                return {"ok": True, "symbol": symbol, "margin_type": margin_type, "raw": res.get("error")}
-        return {"ok": False, "symbol": symbol, "margin_type": margin_type, "error": "set_margin_type_failed"}
+        params = {"symbol": tb_symbol, "marginType": margin_type}
+        res = self._request("POST", "/api/v1/futures/marginType", params=params, signed=True)
+        if res.get("ok"):
+            return {"ok": True, "symbol": symbol_bot, "exchange_symbol": tb_symbol, "margin_type": margin_type, "raw": res.get("data")}
+        # Some exchanges return an error when already set. Treat clearly matching messages as OK.
+        err = str(res.get("error", "")).lower()
+        if "no need to change" in err or "already" in err:
+            return {"ok": True, "symbol": symbol_bot, "exchange_symbol": tb_symbol, "margin_type": margin_type, "raw": res.get("error")}
+        return {"ok": False, "symbol": symbol_bot, "exchange_symbol": tb_symbol, "margin_type": margin_type, "error": "set_margin_type_failed", "raw": res}
 
     @safe(default={})
-    def get_position(self, symbol: str) -> Dict[str, Any]:
-        symbol = symbol.upper()
-        for path in ["/fapi/v2/positionRisk", "/fapi/v1/positionRisk", "/api/v1/positionRisk"]:
-            res = self._request("GET", path, params={"symbol": symbol}, signed=True)
-            if not res.get("ok"):
+    def set_leverage(self, symbol: str, leverage: int) -> Dict[str, Any]:
+        symbol_bot = symbol.upper()
+        tb_symbol = _toobit_symbol(symbol_bot)
+        lev = max(1, min(125, int(leverage or 1)))
+        res = self._request("POST", "/api/v1/futures/leverage", params={"symbol": tb_symbol, "leverage": lev}, signed=True)
+        if res.get("ok"):
+            return {"ok": True, "symbol": symbol_bot, "exchange_symbol": tb_symbol, "leverage": lev, "raw": res.get("data")}
+        return {"ok": False, "symbol": symbol_bot, "exchange_symbol": tb_symbol, "leverage": lev, "error": "set_leverage_failed", "raw": res}
+
+    @safe(default={})
+    def get_position(self, symbol: str, side: Optional[str] = None) -> Dict[str, Any]:
+        symbol_bot = symbol.upper()
+        tb_symbol = _toobit_symbol(symbol_bot)
+        params: Dict[str, Any] = {"symbol": tb_symbol}
+        if side:
+            params["side"] = side.upper()
+        res = self._request("GET", "/api/v1/futures/positions", params=params, signed=True)
+        if not res.get("ok"):
+            return {"ok": False, "symbol": symbol_bot, "exchange_symbol": tb_symbol, "position_amt": 0.0, "raw": res}
+        data = res.get("data", [])
+        rows = data if isinstance(data, list) else data.get("data", data if isinstance(data, dict) else [])
+        if isinstance(rows, dict):
+            rows = [rows]
+        for p in rows or []:
+            if str(p.get("symbol", "")).upper() != tb_symbol:
                 continue
-            data = res.get("data", [])
-            rows = data if isinstance(data, list) else data.get("data", data if isinstance(data, dict) else [])
-            if isinstance(rows, dict):
-                rows = [rows]
-            for p in rows:
-                if str(p.get("symbol", "")).upper() == symbol:
-                    amt = _safe_float(p.get("positionAmt", p.get("positionAmount", p.get("size", 0))))
-                    return {"ok": True, "symbol": symbol, "position_amt": amt, "raw": p}
-        return {"ok": False, "symbol": symbol, "position_amt": 0.0}
+            if side and str(p.get("side", "")).upper() != side.upper():
+                continue
+            amt = _safe_float(p.get("position", p.get("available", p.get("positionAmt", p.get("size", 0)))))
+            return {"ok": True, "symbol": symbol_bot, "exchange_symbol": tb_symbol, "position_amt": amt, "side": p.get("side"), "margin_type": p.get("marginType"), "leverage": p.get("leverage"), "raw": p}
+        return {"ok": False, "symbol": symbol_bot, "exchange_symbol": tb_symbol, "position_amt": 0.0, "raw": rows}
 
     @safe(default={})
-    def create_order(self, symbol: str, side: str, quantity: float, order_type: str = "MARKET", price: Optional[float] = None, reduce_only: bool = False, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        symbol = symbol.upper()
+    def create_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float,
+        order_type: str = "MARKET",
+        price: Optional[float] = None,
+        reduce_only: bool = False,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        symbol_bot = symbol.upper()
+        tb_symbol = _toobit_symbol(symbol_bot)
         side = side.upper()
-        params = {
-            "symbol": symbol,
+
+        # Toobit v1 futures uses combined sides. Accept either bot/Binance sides or native Toobit sides.
+        if side == "BUY":
+            side = "BUY_OPEN"
+        elif side == "SELL":
+            side = "SELL_OPEN"
+
+        params: Dict[str, Any] = {
+            "symbol": tb_symbol,
             "side": side,
-            "type": order_type.upper(),
-            "quantity": quantity,
+            "quantity": str(quantity),
+            "newClientOrderId": f"ai_{int(time.time()*1000)}",
         }
-        if price is not None and order_type.upper() != "MARKET":
-            params["price"] = price
-            params["timeInForce"] = "GTC"
+
+        if order_type.upper() == "MARKET":
+            # Toobit v1 futures market order: type=LIMIT + priceType=MARKET.
+            params["type"] = "LIMIT"
+            params["priceType"] = "MARKET"
+        else:
+            params["type"] = order_type.upper()
+            params["priceType"] = "INPUT"
+            if price is not None:
+                params["price"] = str(price)
+                params["timeInForce"] = "GTC"
+
         if reduce_only:
             params["reduceOnly"] = "true"
         if extra:
-            params.update(extra)
-        for path in ["/fapi/v1/order", "/api/v1/order"]:
-            res = self._request("POST", path, params=params, signed=True)
-            if res.get("ok"):
-                return {"ok": True, "symbol": symbol, "side": side, "raw": res.get("data")}
-            err = str(res.get("error", ""))
-            if "-1202" in err or "quantity too small" in err.lower():
-                return {"ok": False, "symbol": symbol, "side": side, "error_code": -1202, "error": err}
-        return {"ok": False, "symbol": symbol, "side": side, "error": "create_order_failed"}
+            # Supports takeProfit, stopLoss, tpTriggerBy, slTriggerBy, tpOrderType, slOrderType, etc.
+            params.update({k: v for k, v in extra.items() if v is not None and v != ""})
+
+        res = self._request("POST", "/api/v1/futures/order", params=params, signed=True)
+        if res.get("ok"):
+            return {"ok": True, "symbol": symbol_bot, "exchange_symbol": tb_symbol, "side": side, "raw": res.get("data"), "params": params}
+        err = str(res.get("error", ""))
+        if "-1202" in err or "quantity too small" in err.lower():
+            return {"ok": False, "symbol": symbol_bot, "exchange_symbol": tb_symbol, "side": side, "error_code": -1202, "error": err, "raw": res, "params": params}
+        return {"ok": False, "symbol": symbol_bot, "exchange_symbol": tb_symbol, "side": side, "error": "create_order_failed", "raw": res, "params": params}
+
+    @safe(default={})
+    def set_trading_stop(self, symbol: str, direction: str, take_profit: Optional[float] = None, stop_loss: Optional[float] = None, quantity: Optional[float] = None) -> Dict[str, Any]:
+        """Set/replace TP/SL on an existing futures position."""
+        symbol_bot = symbol.upper()
+        tb_symbol = _toobit_symbol(symbol_bot)
+        direction = str(direction).upper()
+        params: Dict[str, Any] = {
+            "symbol": tb_symbol,
+            "side": direction,
+            "stopType": "FIXED_STOP",
+        }
+        if take_profit:
+            params["takeProfit"] = str(take_profit)
+            params["tpTriggerBy"] = "CONTRACT_PRICE"
+            params["tpOrderType"] = "MARKET"
+            if quantity:
+                params["tpSize"] = str(quantity)
+        if stop_loss:
+            params["stopLoss"] = str(stop_loss)
+            params["slTriggerBy"] = "CONTRACT_PRICE"
+            params["slOrderType"] = "MARKET"
+            if quantity:
+                params["slSize"] = str(quantity)
+        res = self._request("POST", "/api/v1/futures/position/trading-stop", params=params, signed=True)
+        if res.get("ok"):
+            return {"ok": True, "symbol": symbol_bot, "exchange_symbol": tb_symbol, "direction": direction, "raw": res.get("data"), "params": params}
+        return {"ok": False, "symbol": symbol_bot, "exchange_symbol": tb_symbol, "direction": direction, "error": "set_trading_stop_failed", "raw": res, "params": params}
+
 
     @safe(default={})
     def cancel_order(self, symbol: str, order_id: str) -> Dict[str, Any]:
@@ -374,7 +513,7 @@ class ToobitClient:
         params = {"symbol": symbol.upper(), "limit": limit}
         if start_time:
             params["startTime"] = start_time
-        for path in ["/fapi/v1/income", "/api/v1/income"]:
+        for path in ["/api/v1/futures/historyPositions", "/fapi/v1/income", "/api/v1/income"]:
             res = self._request("GET", path, params=params, signed=True)
             if not res.get("ok"):
                 continue
