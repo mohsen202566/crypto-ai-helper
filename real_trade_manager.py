@@ -75,16 +75,24 @@ def _sync_runtime_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
     for k, v in defaults.items():
         settings.setdefault(k, v)
 
-    # Root fix: env mode/safety always wins at startup.
-    settings.update(_env_runtime_overrides())
-
-    # Consistency rules.
+    # IMPORTANT:
+    # Do NOT blindly re-apply environment trade_mode/real_trading_enabled on every load.
+    # Telegram commands like "ترید خاموش" persist into data/trade_state.json.
+    # If env overrides are applied on every load, the bot immediately flips back to REAL.
+    #
+    # Env/default values are only used when the keys do not exist yet, through setdefault()
+    # above. After that, runtime/user commands are the source of truth until changed again.
     settings["trade_mode"] = _normalize_trade_mode(settings.get("trade_mode"))
     settings["real_trading_enabled"] = bool(settings.get("real_trading_enabled", False))
 
+    # Consistency rules.
     if settings["trade_mode"] == "REAL" and not settings["real_trading_enabled"]:
         # Never silently attempt real orders when the safety flag is off.
         settings["trade_mode"] = "PAPER"
+
+    if settings["trade_mode"] == "PAPER":
+        # PAPER mode must not still display real trading as enabled.
+        settings["real_trading_enabled"] = False
 
     return settings
 
@@ -196,14 +204,30 @@ def set_trade_setting(name: str, value: Any) -> Dict[str, Any]:
 
     settings[name] = value
 
+    # Runtime command source marker. Env must not overwrite these on later loads.
+    if name in {"trade_mode", "real_trading_enabled"}:
+        settings["trade_mode_updated_by"] = "telegram_command"
+        settings["trade_mode_updated_at"] = _ts()
+
     # If user/runtime asks REAL, safety must also be on and keys must exist.
     if name == "trade_mode" and value == "REAL":
+        settings["real_trading_enabled"] = True
         ready = real_trade_ready()
         if not ready.get("ok"):
             settings["trade_mode"] = "PAPER"
+            settings["real_trading_enabled"] = False
             settings["last_trade_mode_error"] = ", ".join(ready.get("issues", []))
-    if name == "real_trading_enabled" and not value and settings.get("trade_mode") == "REAL":
+        else:
+            settings["last_trade_mode_error"] = ""
+    if name == "trade_mode" and value == "PAPER":
+        settings["real_trading_enabled"] = False
+        settings["last_trade_mode_error"] = ""
+    if name == "real_trading_enabled" and not value:
         settings["trade_mode"] = "PAPER"
+        settings["last_trade_mode_error"] = ""
+    if name == "real_trading_enabled" and value and settings.get("trade_mode") != "REAL":
+        # Keep enabling safety alone non-dangerous; actual real mode is set by trade_mode=REAL.
+        settings.setdefault("trade_mode", "PAPER")
 
     if name == "max_positions":
         slot_manager.set_max_positions(int(value))
