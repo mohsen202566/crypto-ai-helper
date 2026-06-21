@@ -323,7 +323,8 @@ def open_real_trade(decision: Dict[str, Any]) -> Dict[str, Any]:
     desired_qty = (_safe_float(settings.get("position_size_usd")) * int(settings.get("leverage", 1))) / entry
 
     c = tobit_client.client()
-    pre = toobit_safety.preflight_real_order(symbol, sides["open_side"], desired_qty, entry, c)
+    leverage = int(settings.get("leverage", 1) or 1)
+    pre = toobit_safety.preflight_real_order(symbol, sides["open_side"], desired_qty, entry, c, leverage=leverage)
     if not pre.get("ok"):
         _log(f"open_real_trade preflight_failed: {symbol} {direction} preflight={pre}")
         return {"ok": False, "reason": "preflight_failed", "preflight": pre}
@@ -338,7 +339,18 @@ def open_real_trade(decision: Dict[str, Any]) -> Dict[str, Any]:
         _log(f"open_real_trade no_free_slot: {symbol} {direction}")
         return {"ok": False, "reason": "no_free_slot"}
 
-    order = c.create_order(symbol, sides["open_side"], pre["quantity"], order_type="MARKET")
+    # Attach TP/SL to the opening order when Toobit accepts inline TP/SL fields.
+    # If inline attachment is not accepted by the exchange, the order result will
+    # expose the raw error and the bot will not silently open an unprotected trade.
+    order_extra = {
+        "takeProfit": decision.get("tp1"),
+        "stopLoss": decision.get("sl"),
+        "tpTriggerBy": "CONTRACT_PRICE",
+        "slTriggerBy": "CONTRACT_PRICE",
+        "tpOrderType": "MARKET",
+        "slOrderType": "MARKET",
+    }
+    order = c.create_order(symbol, sides["open_side"], pre["quantity"], order_type="MARKET", extra=order_extra)
     if not order.get("ok"):
         # Keep slot briefly? If order was not accepted at all, release now.
         slot_manager.release_slot(slot_id, reason="real_order_failed")
@@ -346,6 +358,24 @@ def open_real_trade(decision: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": False, "reason": "order_failed", "order": order}
 
     sid = signal_tracker.register_active_signal({**decision, "slot_id": slot_id}, mode=signal_tracker.TYPE_REAL, slot_id=slot_id)
+    # Extra safety: try to set TP/SL again at position level after opening.
+    # This is kept as a fallback because Toobit supports both inline TP/SL fields
+    # on new orders and the separate trading-stop endpoint.
+    trading_stop = {}
+    try:
+        trading_stop = c.set_trading_stop(
+            symbol,
+            sides.get("position_side", direction),
+            take_profit=decision.get("tp1"),
+            stop_loss=decision.get("sl"),
+            quantity=pre["quantity"],
+        )
+        if not trading_stop.get("ok"):
+            _log(f"open_real_trade trading_stop_warning: {symbol} {direction} trading_stop={trading_stop}")
+    except Exception as e:
+        trading_stop = {"ok": False, "error": str(e)}
+        _log(f"open_real_trade trading_stop_exception: {symbol} {direction} error={e}")
+
     st.setdefault("real_positions", {})[sid] = {
         "id": sid,
         "slot_id": slot_id,
@@ -354,6 +384,7 @@ def open_real_trade(decision: Dict[str, Any]) -> Dict[str, Any]:
         "entry": entry,
         "quantity": pre["quantity"],
         "order": order,
+        "trading_stop": trading_stop,
         "opened_at": _ts(),
         "status": "PENDING_CONFIRM",
     }
