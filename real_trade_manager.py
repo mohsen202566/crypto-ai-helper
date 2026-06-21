@@ -41,6 +41,13 @@ def _ts() -> int:
     return int(time.time())
 
 
+def _log(msg: str) -> None:
+    try:
+        print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} | real_trade_manager | {msg}", flush=True)
+    except Exception:
+        pass
+
+
 def _safe_float(v: Any, default: float = 0.0) -> float:
     try:
         if v is None:
@@ -98,9 +105,14 @@ def _sync_runtime_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def real_trade_ready() -> Dict[str, Any]:
+    """
+    Checks whether real trading can place orders.
+
+    Telegram runtime command "ترید روشن" is allowed to enable real_trading_enabled
+    when API keys exist. DEFAULT_REAL_TRADING_ENABLED is only an initial default,
+    not a permanent blocker after runtime/user settings are saved.
+    """
     issues = []
-    if not DEFAULT_REAL_TRADING_ENABLED:
-        issues.append("REAL_TRADING_ENABLED=false")
     if not TOOBIT_API_KEY:
         issues.append("TOOBIT_API_KEY missing")
     if not TOOBIT_API_SECRET:
@@ -249,8 +261,11 @@ def open_trade(decision: Dict[str, Any], mode: Optional[str] = None) -> Dict[str
     if mode == "REAL":
         ready = real_trade_ready()
         if not ready.get("ok"):
+            _log(f"open_trade blocked: real_trade_not_ready issues={ready.get('issues', [])}")
             return {"ok": False, "reason": "real_trade_not_ready", "issues": ready.get("issues", [])}
+        _log(f"open_trade REAL requested: {decision.get('symbol')} {decision.get('direction')}")
         return open_real_trade(decision)
+    _log(f"open_trade PAPER requested: {decision.get('symbol')} {decision.get('direction')}")
     return open_paper_trade(decision)
 
 
@@ -266,6 +281,7 @@ def open_paper_trade(decision: Dict[str, Any]) -> Dict[str, Any]:
 
     slot_id = slot_manager.reserve_slot(symbol, direction, mode="PAPER", status=slot_manager.STATUS_OPEN, ai_record_id=decision.get("record_id", ""), signal_id=decision.get("signal_id", ""), telegram_message_id=decision.get("telegram_message_id"))
     if not slot_id:
+        _log(f"open_trade no_free_slot: {symbol} {direction}")
         return {"ok": False, "reason": "no_free_slot"}
 
     sid = signal_tracker.register_active_signal({**decision, "slot_id": slot_id}, mode=signal_tracker.TYPE_PAPER, slot_id=slot_id)
@@ -285,6 +301,7 @@ def open_paper_trade(decision: Dict[str, Any]) -> Dict[str, Any]:
     }
     st.setdefault("paper_positions", {})[sid] = pos
     save_trade_state(st)
+    _log(f"open_paper_trade ok: {symbol} {direction} signal_id={sid} slot_id={slot_id}")
     return {"ok": True, "mode": "PAPER", "signal_id": sid, "slot_id": slot_id, "position": pos}
 
 
@@ -308,6 +325,7 @@ def open_real_trade(decision: Dict[str, Any]) -> Dict[str, Any]:
     c = tobit_client.client()
     pre = toobit_safety.preflight_real_order(symbol, sides["open_side"], desired_qty, entry, c)
     if not pre.get("ok"):
+        _log(f"open_real_trade preflight_failed: {symbol} {direction} preflight={pre}")
         return {"ok": False, "reason": "preflight_failed", "preflight": pre}
 
     slot_id = slot_manager.reserve_slot(
@@ -317,12 +335,14 @@ def open_real_trade(decision: Dict[str, Any]) -> Dict[str, Any]:
         metadata={"pending_confirm_timeout": REAL_CONFIRM_TIMEOUT_SECONDS},
     )
     if not slot_id:
+        _log(f"open_real_trade no_free_slot: {symbol} {direction}")
         return {"ok": False, "reason": "no_free_slot"}
 
     order = c.create_order(symbol, sides["open_side"], pre["quantity"], order_type="MARKET")
     if not order.get("ok"):
         # Keep slot briefly? If order was not accepted at all, release now.
         slot_manager.release_slot(slot_id, reason="real_order_failed")
+        _log(f"open_real_trade order_failed: {symbol} {direction} order={order}")
         return {"ok": False, "reason": "order_failed", "order": order}
 
     sid = signal_tracker.register_active_signal({**decision, "slot_id": slot_id}, mode=signal_tracker.TYPE_REAL, slot_id=slot_id)
@@ -338,6 +358,7 @@ def open_real_trade(decision: Dict[str, Any]) -> Dict[str, Any]:
         "status": "PENDING_CONFIRM",
     }
     save_trade_state(st, make_backup=True)
+    _log(f"open_real_trade ok: {symbol} {direction} signal_id={sid} slot_id={slot_id} qty={pre['quantity']}")
     return {"ok": True, "mode": "REAL", "signal_id": sid, "slot_id": slot_id, "order": order, "quantity": pre["quantity"]}
 
 
