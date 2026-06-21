@@ -52,6 +52,14 @@ AUTO_TASK_NAME = "auto_scan_loop"
 TRACKER_TASK_NAME = "tracker_loop"
 
 
+def _log(msg: str) -> None:
+    """Small stdout logger captured by systemd/journalctl."""
+    try:
+        print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} | bot | {msg}", flush=True)
+    except Exception:
+        pass
+
+
 def _ts() -> int:
     return int(time.time())
 
@@ -367,36 +375,49 @@ async def send_routed_results(app: Application, routed: List[Dict[str, Any]]) ->
 
 
 async def auto_scan_loop(app: Application) -> None:
+    _log("auto_scan_loop started")
     while True:
         try:
             if AUTO_SIGNAL_ENABLED:
                 # Heavy work in thread so event loop stays responsive.
                 routed = await asyncio.to_thread(scanner.auto_scan_and_route)
+                real_count = sum(1 for r in (routed or []) if str(r.get("type", "")).upper() in {"REAL", "PAPER"})
+                ghost_count = sum(1 for r in (routed or []) if "GHOST" in str(r.get("type", "")).upper())
+                _log(f"auto_scan_loop tick: routed={len(routed or [])} real_or_paper={real_count} ghost={ghost_count}")
                 await send_routed_results(app, routed)
+            else:
+                _log("auto_scan_loop skipped: AUTO_SIGNAL_ENABLED=false")
         except Exception as e:
             record_error(e, module="bot", function="auto_scan_loop")
+            _log(f"auto_scan_loop error: {e}")
         await asyncio.sleep(max(30, int(AUTO_SCAN_INTERVAL_SECONDS)))
 
 
 async def tracker_loop(app: Application) -> None:
+    _log("tracker_loop started")
     while True:
         try:
-            await asyncio.to_thread(scanner.update_active_from_market)
+            updated = await asyncio.to_thread(scanner.update_active_from_market)
             # SETUP/WATCHING activation flow removed from final architecture.
             await asyncio.to_thread(real_position_sync.confirm_all_pending_slots)
             await asyncio.to_thread(reply_manager.queue_recent_results_once)
             await asyncio.to_thread(market_scanner.scan_market, DEFAULT_SYMBOLS[:20], None, 120, None, True)
+            _log(f"tracker_loop tick: updated_active={updated}")
         except Exception as e:
             record_error(e, module="bot", function="tracker_loop")
+            _log(f"tracker_loop error: {e}")
         await asyncio.sleep(20)
 
 
 async def post_init(app: Application) -> None:
     recovery_manager.startup_recovery()
-    app.create_task(auto_scan_loop(app), name=AUTO_TASK_NAME)
-    app.create_task(tracker_loop(app), name=TRACKER_TASK_NAME)
-    app.create_task(reply_sender_loop(app), name="reply_sender_loop")
-    app.create_task(daily_report_loop(app), name="daily_report_loop")
+    # PTB warns when Application.create_task is used before the app is fully running.
+    # Plain asyncio tasks start on the active event loop and are captured by journalctl.
+    asyncio.create_task(auto_scan_loop(app), name=AUTO_TASK_NAME)
+    asyncio.create_task(tracker_loop(app), name=TRACKER_TASK_NAME)
+    asyncio.create_task(reply_sender_loop(app), name="reply_sender_loop")
+    asyncio.create_task(daily_report_loop(app), name="daily_report_loop")
+    _log("background loops scheduled")
 
 
 
@@ -457,6 +478,7 @@ def build_app() -> Application:
 
 
 def main() -> None:
+    initialize_all()
     app = build_app()
     app.run_polling(close_loop=False)
 
