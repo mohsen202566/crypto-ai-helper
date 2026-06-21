@@ -26,6 +26,10 @@ def _env(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
 
 
+def _env_present(name: str) -> bool:
+    return name in os.environ and os.getenv(name, "").strip() != ""
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = _env(name, "true" if default else "false").lower()
     return raw in {"1", "true", "yes", "on", "enable", "enabled"}
@@ -52,8 +56,36 @@ TOOBIT_API_KEY = _env("TOOBIT_API_KEY")
 TOOBIT_API_SECRET = _env("TOOBIT_API_SECRET")
 TOOBIT_BASE_URL = _env("TOOBIT_BASE_URL", "https://api.toobit.com")
 
-# Defaults. Runtime settings can override these through auto_trade_config/trade_state.
-DEFAULT_TRADE_MODE = _env("TRADE_MODE", "PAPER").upper()
+# Defaults. Runtime settings can override these through trade_state, but
+# environment values must never be silently ignored after restart.
+#
+# Root fix:
+# - REAL_TRADING_ENABLED is the master safety flag.
+# - TRADE_MODE controls execution mode when provided.
+# - If TRADE_MODE is missing, mode is derived from REAL_TRADING_ENABLED.
+# - Existing data/trade_state.json must not permanently trap the bot in PAPER
+#   after systemd/env changes; real_trade_manager syncs these values on startup.
+def _resolve_real_trading_enabled() -> bool:
+    if _env_present("REAL_TRADING_ENABLED"):
+        return _env_bool("REAL_TRADING_ENABLED", False)
+    if _env_present("TRADE_MODE"):
+        return _env("TRADE_MODE", "PAPER").upper() == "REAL"
+    # This bot's production architecture is real-trade-first.
+    # Keep systemd safety explicit: set REAL_TRADING_ENABLED=false for PAPER-only.
+    return True
+
+
+DEFAULT_REAL_TRADING_ENABLED = _resolve_real_trading_enabled()
+
+
+def _resolve_trade_mode() -> str:
+    mode = _env("TRADE_MODE", "").upper()
+    if mode in {"PAPER", "REAL"}:
+        return mode
+    return "REAL" if DEFAULT_REAL_TRADING_ENABLED else "PAPER"
+
+
+DEFAULT_TRADE_MODE = _resolve_trade_mode()
 DEFAULT_AI_ENABLED = _env_bool("AI_ENABLED", True)
 DEFAULT_LEARNING_ENABLED = _env_bool("LEARNING_ENABLED", True)
 DEFAULT_DAILY_REPORT_ENABLED = _env_bool("DAILY_REPORT_ENABLED", True)
@@ -106,6 +138,7 @@ DEFAULT_SYMBOLS: List[str] = [
 @dataclass
 class RuntimeDefaults:
     trade_mode: str = DEFAULT_TRADE_MODE
+    real_trading_enabled: bool = DEFAULT_REAL_TRADING_ENABLED
     ai_enabled: bool = DEFAULT_AI_ENABLED
     learning_enabled: bool = DEFAULT_LEARNING_ENABLED
     daily_report_enabled: bool = DEFAULT_DAILY_REPORT_ENABLED
@@ -144,6 +177,10 @@ def validate_static_config() -> Dict[str, Any]:
         issues.append("OWNER_ID is missing or invalid; owner-only alerts may not work.")
     if DEFAULT_TRADE_MODE not in {"PAPER", "REAL"}:
         issues.append(f"Invalid TRADE_MODE={DEFAULT_TRADE_MODE}; expected PAPER or REAL.")
+    if DEFAULT_TRADE_MODE == "REAL" and not DEFAULT_REAL_TRADING_ENABLED:
+        issues.append("TRADE_MODE=REAL but REAL_TRADING_ENABLED=false; real orders are blocked.")
+    if DEFAULT_TRADE_MODE == "REAL" and (not TOOBIT_API_KEY or not TOOBIT_API_SECRET):
+        issues.append("TRADE_MODE=REAL requires TOOBIT_API_KEY and TOOBIT_API_SECRET.")
     if DEFAULT_LEVERAGE < 1 or DEFAULT_LEVERAGE > 50:
         issues.append("DEFAULT_LEVERAGE must be between 1 and 50.")
     if DEFAULT_MAX_POSITIONS < 1:
@@ -154,4 +191,6 @@ def validate_static_config() -> Dict[str, Any]:
         "data_dir": str(DATA_DIR),
         "backup_dir": str(BACKUP_DIR),
         "log_dir": str(LOG_DIR),
+        "trade_mode": DEFAULT_TRADE_MODE,
+        "real_trading_enabled": DEFAULT_REAL_TRADING_ENABLED,
     }
