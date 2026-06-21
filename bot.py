@@ -352,7 +352,7 @@ async def send_routed_results(app: Application, routed: List[Dict[str, Any]]) ->
         if "GHOST" in typ:
             continue
         if typ == "SETUP":
-            # SETUP messages are removed from final Movement Hunter architecture.
+            # SETUP is removed from final architecture; never send waiting setup messages.
             continue
         text = reply_manager.active_signal_message_fa(decision)
         msg = await app.bot.send_message(chat_id=OWNER_ID, text=text)
@@ -382,8 +382,7 @@ async def tracker_loop(app: Application) -> None:
     while True:
         try:
             await asyncio.to_thread(scanner.update_active_from_market)
-            routed = await asyncio.to_thread(scanner.process_watching_setups)
-            await send_routed_results(app, routed)
+            # SETUP/WATCHING activation flow removed from final architecture.
             await asyncio.to_thread(real_position_sync.confirm_all_pending_slots)
             await asyncio.to_thread(reply_manager.queue_recent_results_once)
             await asyncio.to_thread(market_scanner.scan_market, DEFAULT_SYMBOLS[:20], None, 120, None, True)
