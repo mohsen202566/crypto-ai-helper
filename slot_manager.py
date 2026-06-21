@@ -1,666 +1,305 @@
-# -*- coding: utf-8 -*-
+from __future__ import annotations
+
 """
-slot_manager.py
+Slot Manager.
 
-AI-aware slot/position manager for the crypto futures bot.
+Responsibilities:
+- Track open/pending slots for Paper/Real/Ghost-aware flow.
+- Prevent real slot from being released too early.
+- Hold PENDING_REAL_CONFIRM for 60-70 seconds unless real position is confirmed/failed.
+- Pick best candidate for free slot via AI/rotation priority.
+- Track correlation exposure state.
 
-Purpose:
-- Enforce max concurrent positions from live trade settings.
-- Prevent duplicate symbol/direction positions and per-symbol overexposure.
-- Rank candidates by AI final rank first, then learning/risk/rotation fallback.
-- Convert good but unused candidates to Ghost signals when slots are full or
-  candidate was not selected.
-- Support REAL trade pending confirmation state so slots do not free too early
-  while Toobit position visibility is delayed.
-- Keep a small AI candidate queue for best-signal refill after a slot is freed.
-
-Compatibility:
-- Keeps old public functions used by bot.py/scanner.py:
-    get_active_positions, get_max_active_positions, get_free_slots,
-    is_symbol_direction_active, can_open_new_position, add_position,
-    close_position, select_best_candidates, format_slot_report
-- Adds optional helpers for real-trade sync:
-    add_pending_real_position, confirm_pending_real_position,
-    fail_pending_real_position, cleanup_expired_pending_positions,
-    queue_candidates, pop_best_queued_candidates
+This module does not call Toobit and does not send Telegram messages.
+real_position_sync / real_trade_manager will update slot states.
 """
 
 import time
-from typing import Dict, List, Any, Tuple, Optional
+import uuid
+from typing import Any, Dict, List, Optional
 
-from data_store import load_json, save_json
-from config import MAX_ACTIVE_POSITIONS, MAX_POSITIONS_PER_SYMBOL
-
-try:
-    from coin_rotation import get_coin_rotation_score, get_symbol_rotation_score
-except Exception:
-    get_coin_rotation_score = None
-    get_symbol_rotation_score = None
-
-try:
-    from coin_risk import get_direction_risk_state
-except Exception:
-    get_direction_risk_state = None
-
-try:
-    from ghost_signals import create_ghost_signal
-except Exception:
-    create_ghost_signal = None
-
-SLOT_FILE = "slot_state.json"
-TRADE_SETTINGS_FILE = "trade_settings.json"
-DEFAULT_PENDING_CONFIRM_SECONDS = 75
-MAX_QUEUE_SIZE = 80
-MIN_GHOST_SCORE = 80
+from config import CORE_DATA_FILES, DEFAULT_MAX_POSITIONS, REAL_CONFIRM_TIMEOUT_SECONDS
+from data_store import load_dict, save_json
+from diagnostics import safe
+import coin_rotation
 
 
-def _now() -> int:
+SLOT_FILE = CORE_DATA_FILES.get("active_signals")
+
+
+STATUS_OPEN = "OPEN"
+STATUS_PENDING_REAL_CONFIRM = "PENDING_REAL_CONFIRM"
+STATUS_CLOSING = "CLOSING"
+STATUS_CLOSED = "CLOSED"
+STATUS_FAILED = "FAILED"
+
+
+def _ts() -> int:
     return int(time.time())
 
 
-def _state() -> Dict[str, Any]:
-    s = load_json(SLOT_FILE, {"positions": {}, "queue": [], "history": []})
-    if not isinstance(s, dict):
-        s = {"positions": {}, "queue": [], "history": []}
-    if not isinstance(s.get("positions"), dict):
-        s["positions"] = {}
-    if not isinstance(s.get("queue"), list):
-        s["queue"] = []
-    if not isinstance(s.get("history"), list):
-        s["history"] = []
-    return s
-
-
-def _save_state(s: Dict[str, Any]) -> None:
-    s["updated_at"] = _now()
-    save_json(SLOT_FILE, s)
-
-
-def _safe_float(value, default: float = 0.0) -> float:
+def _safe_float(v: Any, default: float = 0.0) -> float:
     try:
-        if value is None:
-            return float(default)
-        return float(value)
+        if v is None:
+            return default
+        return float(v)
     except Exception:
-        return float(default)
+        return default
 
 
-def _safe_int(value, default: int = 0) -> int:
-    try:
-        return int(float(value or 0))
-    except Exception:
-        return int(default)
-
-
-def _norm_symbol(symbol: str) -> str:
-    s = str(symbol or "").upper().strip()
-    return s if s.endswith("USDT") else f"{s}USDT" if s else ""
-
-
-def _norm_direction(direction: str) -> str:
-    return str(direction or "").upper().strip()
-
-
-def _position_is_active(p: Dict[str, Any]) -> bool:
-    status = str(p.get("status") or "ACTIVE").upper()
-    # PENDING_REAL_CONFIRM must reserve a slot too.
-    return status in {"ACTIVE", "OPEN", "PENDING", "PENDING_REAL_CONFIRM", "PENDING_REAL_CLOSE"}
-
-
-def get_active_positions() -> List[Dict[str, Any]]:
-    return [p for p in _state().get("positions", {}).values() if isinstance(p, dict) and _position_is_active(p)]
-
-
-def get_all_positions() -> List[Dict[str, Any]]:
-    return [p for p in _state().get("positions", {}).values() if isinstance(p, dict)]
-
-
-def get_max_active_positions() -> int:
-    """Use real trade state first, then legacy trade settings, then config default.
-
-    real_trade_manager.py stores the user's live REAL max_positions in
-    real_trade_state.json. This must be the first source so slot capacity matches
-    actual Toobit/real-trade settings. trade_settings.json is kept only as a
-    legacy fallback for older paper-mode flows.
-    """
-    try:
-        real_state = load_json("real_trade_state.json", {})
-        if isinstance(real_state, dict):
-            value = _safe_int(real_state.get("max_positions"), 0)
-            if value > 0:
-                return max(1, value)
-    except Exception:
-        pass
-
-    try:
-        settings = load_json(TRADE_SETTINGS_FILE, {})
-        if isinstance(settings, dict):
-            value = _safe_int(settings.get("max_positions"), 0)
-            if value > 0:
-                return max(1, value)
-    except Exception:
-        pass
-
-    try:
-        return max(1, int(MAX_ACTIVE_POSITIONS))
-    except Exception:
-        return 1
-
-
-def get_free_slots() -> int:
-    cleanup_expired_pending_positions(save=True)
-    return max(0, get_max_active_positions() - len(get_active_positions()))
-
-
-def is_symbol_direction_active(symbol: str, direction: str = None) -> bool:
-    ns = _norm_symbol(symbol)
-    nd = _norm_direction(direction) if direction is not None else None
-    for p in get_active_positions():
-        if p.get("symbol") == ns and (nd is None or p.get("direction") == nd):
-            return True
-    return False
-
-
-def can_open_new_position(symbol: str = None, direction: str = None) -> Tuple[bool, str]:
-    cleanup_expired_pending_positions(save=True)
-    if get_free_slots() <= 0:
-        return False, "slot_full"
-    if symbol:
-        ns = _norm_symbol(symbol)
-        count = sum(1 for p in get_active_positions() if p.get("symbol") == ns)
-        if count >= int(MAX_POSITIONS_PER_SYMBOL):
-            return False, "symbol_limit"
-        if direction and is_symbol_direction_active(ns, direction):
-            return False, "duplicate"
-    return True, "ok"
-
-
-def _append_history(s: Dict[str, Any], event: Dict[str, Any]) -> None:
-    h = s.setdefault("history", [])
-    if isinstance(h, list):
-        row = dict(event)
-        row.setdefault("ts", _now())
-        h.append(row)
-        s["history"] = h[-300:]
-
-
-def add_position(signal_id: str, symbol: str, direction: str, score=None, status: str = "ACTIVE", **kwargs):
-    ok, reason = can_open_new_position(symbol, direction)
-    if not ok:
-        return False, reason
-    s = _state()
-    sid = str(signal_id or f"slot_{_norm_symbol(symbol)}_{_norm_direction(direction)}_{_now()}")
-    p = {
-        "signal_id": sid,
-        "symbol": _norm_symbol(symbol),
-        "direction": _norm_direction(direction),
-        "score": score,
-        "ai_final_rank": kwargs.get("ai_final_rank"),
-        "ai_final_score": kwargs.get("ai_final_score"),
-        "ai_score": kwargs.get("ai_score"),
-        "move_phase": kwargs.get("move_phase"),
-        "freshness_score": kwargs.get("freshness_score"),
-        "move_done_pct": kwargs.get("move_done_pct"),
-        "movement_type": kwargs.get("movement_type"),
-        "trap_risk": kwargs.get("trap_risk"),
-        "reversal_risk": kwargs.get("reversal_risk"),
-        "status": str(status or "ACTIVE").upper(),
-        "opened_at": _now(),
-        **kwargs,
+def _empty_state() -> Dict[str, Any]:
+    return {
+        "version": 1,
+        "created_at": _ts(),
+        "updated_at": _ts(),
+        "max_positions": DEFAULT_MAX_POSITIONS,
+        "slots": {},
+        "history": [],
+        "settings": {
+            "pending_confirm_timeout": REAL_CONFIRM_TIMEOUT_SECONDS,
+            "release_failed_after": REAL_CONFIRM_TIMEOUT_SECONDS,
+        },
     }
-    s["positions"][sid] = p
-    _append_history(s, {"event": "ADD_POSITION", "signal_id": sid, "symbol": p["symbol"], "direction": p["direction"], "status": p["status"]})
-    _save_state(s)
-    return True, "ok"
 
 
-def add_pending_real_position(signal_id: str, symbol: str, direction: str, score=None, confirm_timeout_seconds: int = DEFAULT_PENDING_CONFIRM_SECONDS, **kwargs):
-    """Reserve a slot while waiting for Toobit real position confirmation.
+@safe(default={})
+def load_slots() -> Dict[str, Any]:
+    st = load_dict(SLOT_FILE)
+    if not st:
+        st = _empty_state()
+        save_json(SLOT_FILE, st)
+    for k, v in _empty_state().items():
+        st.setdefault(k, v)
+    st.setdefault("settings", {}).setdefault("pending_confirm_timeout", REAL_CONFIRM_TIMEOUT_SECONDS)
+    return st
 
-    This fixes the issue where a real order is accepted but exchange position
-    visibility is delayed; the slot remains occupied until confirmed or expired.
+
+@safe(default=False)
+def save_slots(st: Dict[str, Any], make_backup: bool = False) -> bool:
+    st["updated_at"] = _ts()
+    if isinstance(st.get("history"), list):
+        st["history"] = st["history"][-1000:]
+    return save_json(SLOT_FILE, st, make_backup=make_backup)
+
+
+@safe(default=True)
+def set_max_positions(n: int) -> bool:
+    st = load_slots()
+    n = max(1, int(n))
+    st["max_positions"] = n
+    save_slots(st)
+    return True
+
+
+@safe(default={})
+def slot_state() -> Dict[str, Any]:
+    cleanup_expired_pending()
+    st = load_slots()
+    slots = st.get("slots", {})
+    active = [s for s in slots.values() if s.get("status") in {STATUS_OPEN, STATUS_PENDING_REAL_CONFIRM, STATUS_CLOSING}]
+    pending = [s for s in active if s.get("status") == STATUS_PENDING_REAL_CONFIRM]
+    open_pos = [s for s in active if s.get("status") == STATUS_OPEN]
+    max_pos = int(st.get("max_positions", DEFAULT_MAX_POSITIONS))
+    used = len(active)
+    free = max(0, max_pos - used)
+    return {
+        "max_positions": max_pos,
+        "used_slots": used,
+        "free_slots": free,
+        "open_count": len(open_pos),
+        "pending_count": len(pending),
+        "open_positions": open_pos,
+        "pending_positions": pending,
+        "can_open": free > 0,
+        "updated_at": st.get("updated_at"),
+    }
+
+
+@safe(default="")
+def reserve_slot(
+    symbol: str,
+    direction: str,
+    mode: str = "PAPER",
+    status: str = STATUS_OPEN,
+    ai_record_id: str = "",
+    signal_id: str = "",
+    telegram_message_id: Optional[int] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> str:
     """
-    expires_at = _now() + max(10, int(confirm_timeout_seconds or DEFAULT_PENDING_CONFIRM_SECONDS))
-    return add_position(
-        signal_id,
-        symbol,
-        direction,
-        score=score,
-        status="PENDING_REAL_CONFIRM",
-        pending_real_confirm=True,
-        pending_expires_at=expires_at,
-        **kwargs,
+    Reserve a slot before/after order request.
+    For real orders use status=PENDING_REAL_CONFIRM first.
+    """
+    st = load_slots()
+    state = slot_state()
+    if state.get("free_slots", 0) <= 0:
+        return ""
+
+    sid = signal_id or f"slot_{int(time.time())}_{str(symbol).upper()}_{uuid.uuid4().hex[:8]}"
+    rec = {
+        "slot_id": sid,
+        "signal_id": signal_id or sid,
+        "ai_record_id": ai_record_id,
+        "symbol": str(symbol).upper(),
+        "direction": str(direction).upper(),
+        "mode": str(mode).upper(),
+        "status": status,
+        "created_at": _ts(),
+        "updated_at": _ts(),
+        "pending_since": _ts() if status == STATUS_PENDING_REAL_CONFIRM else 0,
+        "telegram_message_id": telegram_message_id,
+        "metadata": metadata or {},
+    }
+    st["slots"][sid] = rec
+    _history(st, "RESERVE", rec)
+    save_slots(st)
+    return sid
+
+
+@safe(default=False)
+def confirm_slot(slot_id: str, exchange_position_id: str = "", metadata: Optional[Dict[str, Any]] = None) -> bool:
+    st = load_slots()
+    rec = st.get("slots", {}).get(slot_id)
+    if not rec:
+        return False
+    rec["status"] = STATUS_OPEN
+    rec["exchange_position_id"] = exchange_position_id
+    rec["confirmed_at"] = _ts()
+    rec["updated_at"] = _ts()
+    if metadata:
+        rec.setdefault("metadata", {}).update(metadata)
+    st["slots"][slot_id] = rec
+    _history(st, "CONFIRM", rec)
+    save_slots(st)
+    return True
+
+
+@safe(default=False)
+def mark_closing(slot_id: str, reason: str = "") -> bool:
+    st = load_slots()
+    rec = st.get("slots", {}).get(slot_id)
+    if not rec:
+        return False
+    rec["status"] = STATUS_CLOSING
+    rec["closing_since"] = _ts()
+    rec["closing_reason"] = reason
+    rec["updated_at"] = _ts()
+    st["slots"][slot_id] = rec
+    _history(st, "CLOSING", rec)
+    save_slots(st)
+    return True
+
+
+@safe(default=False)
+def release_slot(slot_id: str, reason: str = "", result: str = "") -> bool:
+    st = load_slots()
+    rec = st.get("slots", {}).pop(slot_id, None)
+    if not rec:
+        return False
+    rec["status"] = STATUS_CLOSED if result else STATUS_FAILED if reason else STATUS_CLOSED
+    rec["released_at"] = _ts()
+    rec["release_reason"] = reason
+    rec["result"] = result
+    rec["updated_at"] = _ts()
+    _history(st, "RELEASE", rec)
+    save_slots(st, make_backup=True)
+    return True
+
+
+@safe(default=0)
+def cleanup_expired_pending() -> int:
+    """
+    Release only pending slots that exceeded timeout and were not confirmed.
+    This prevents the old bug: slot becomes free immediately after order send.
+    """
+    st = load_slots()
+    timeout = int(st.get("settings", {}).get("pending_confirm_timeout", REAL_CONFIRM_TIMEOUT_SECONDS))
+    now = _ts()
+    to_release = []
+    for sid, rec in list(st.get("slots", {}).items()):
+        if rec.get("status") != STATUS_PENDING_REAL_CONFIRM:
+            continue
+        pending_since = int(rec.get("pending_since", rec.get("created_at", now)) or now)
+        if now - pending_since >= timeout:
+            to_release.append(sid)
+
+    for sid in to_release:
+        rec = st["slots"].pop(sid)
+        rec["status"] = STATUS_FAILED
+        rec["released_at"] = now
+        rec["release_reason"] = "pending_confirm_timeout"
+        rec["updated_at"] = now
+        _history(st, "PENDING_TIMEOUT_RELEASE", rec)
+
+    if to_release:
+        save_slots(st, make_backup=True)
+    return len(to_release)
+
+
+def _history(st: Dict[str, Any], event: str, rec: Dict[str, Any]) -> None:
+    st.setdefault("history", []).append({
+        "ts": _ts(),
+        "event": event,
+        "slot_id": rec.get("slot_id"),
+        "symbol": rec.get("symbol"),
+        "direction": rec.get("direction"),
+        "mode": rec.get("mode"),
+        "status": rec.get("status"),
+        "reason": rec.get("release_reason") or rec.get("closing_reason") or "",
+    })
+    st["history"] = st["history"][-1000:]
+
+
+@safe(default=[])
+def open_slots() -> List[Dict[str, Any]]:
+    st = load_slots()
+    return sorted(st.get("slots", {}).values(), key=lambda r: r.get("created_at", 0), reverse=True)
+
+
+@safe(default=[])
+def pending_slots() -> List[Dict[str, Any]]:
+    return [s for s in open_slots() if s.get("status") == STATUS_PENDING_REAL_CONFIRM]
+
+
+@safe(default={})
+def find_slot_by_signal(signal_id: str) -> Dict[str, Any]:
+    for s in open_slots():
+        if s.get("signal_id") == signal_id or s.get("ai_record_id") == signal_id:
+            return s
+    return {}
+
+
+@safe(default=[])
+def choose_for_free_slots(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Choose best candidates for currently free slots.
+    Candidate fields: symbol, direction, priority/confidence.
+    """
+    state = slot_state()
+    free = int(state.get("free_slots", 0))
+    if free <= 0:
+        return []
+    ranked = coin_rotation.rank_candidates(
+        candidates,
+        open_positions=state.get("open_positions", []),
+        limit=free,
+    )
+    return ranked
+
+
+@safe(default="")
+def summary_fa() -> str:
+    s = slot_state()
+    return (
+        "📌 اسلات‌ها\n"
+        f"باز/درگیر: {s.get('used_slots',0)}/{s.get('max_positions',0)}\n"
+        f"باز: {s.get('open_count',0)} | در انتظار تایید: {s.get('pending_count',0)}\n"
+        f"خالی: {s.get('free_slots',0)}"
     )
 
 
-def confirm_pending_real_position(signal_id: str, exchange_position: Optional[Dict[str, Any]] = None) -> bool:
-    s = _state()
-    sid = str(signal_id)
-    p = s.get("positions", {}).get(sid)
-    if not isinstance(p, dict):
-        return False
-    p["status"] = "ACTIVE"
-    p["pending_real_confirm"] = False
-    p["confirmed_at"] = _now()
-    if isinstance(exchange_position, dict):
-        p["exchange_position"] = exchange_position
-    _append_history(s, {"event": "CONFIRM_REAL", "signal_id": sid, "symbol": p.get("symbol"), "direction": p.get("direction")})
-    _save_state(s)
+@safe(default=True)
+def initialize() -> bool:
+    st = load_slots()
+    save_slots(st)
     return True
-
-
-def fail_pending_real_position(signal_id: str, reason: str = "real_confirm_failed") -> bool:
-    s = _state()
-    sid = str(signal_id)
-    p = s.get("positions", {}).pop(sid, None)
-    if not isinstance(p, dict):
-        return False
-    _append_history(s, {"event": "FAIL_PENDING_REAL", "signal_id": sid, "symbol": p.get("symbol"), "direction": p.get("direction"), "reason": reason})
-    _save_state(s)
-    return True
-
-
-def cleanup_expired_pending_positions(save: bool = True) -> int:
-    s = _state()
-    now = _now()
-    removed = 0
-    for sid, p in list(s.get("positions", {}).items()):
-        if not isinstance(p, dict):
-            continue
-        status = str(p.get("status") or "").upper()
-        exp = _safe_int(p.get("pending_expires_at"), 0)
-        if status == "PENDING_REAL_CONFIRM" and exp and now > exp:
-            s["positions"].pop(sid, None)
-            removed += 1
-            _append_history(s, {"event": "EXPIRE_PENDING_REAL", "signal_id": sid, "symbol": p.get("symbol"), "direction": p.get("direction")})
-    if removed and save:
-        _save_state(s)
-    return removed
-
-
-def close_position(signal_id: str, result: str = None, **kwargs):
-    s = _state()
-    sid = str(signal_id)
-    p = s.get("positions", {}).pop(sid, None)
-    if isinstance(p, dict):
-        _append_history(s, {"event": "CLOSE_POSITION", "signal_id": sid, "symbol": p.get("symbol"), "direction": p.get("direction"), "result": result, **kwargs})
-        _save_state(s)
-        return True
-    return False
-
-
-def _learning_context(symbol: str, direction: str) -> Dict[str, Any]:
-    """Read learned per-coin/per-direction results without changing learning storage."""
-    try:
-        data = load_json("coin_learning.json", {"by_coin_direction": {}})
-        rows = data.get("by_coin_direction", {}) if isinstance(data, dict) else {}
-        key = f"{_norm_symbol(symbol)}:{_norm_direction(direction)}"
-        row = rows.get(key, {}) if isinstance(rows, dict) else {}
-        tp = _safe_int(row.get("tp1")) + _safe_int(row.get("tp2"))
-        sl = _safe_int(row.get("sl"))
-        real_tp = _safe_int(row.get("real_tp"))
-        real_sl = _safe_int(row.get("real_sl"))
-        ghost_tp = _safe_int(row.get("ghost_tp"))
-        ghost_sl = _safe_int(row.get("ghost_sl"))
-        weighted_tp = _safe_float(row.get("weighted_tp"), real_tp + ghost_tp * 0.45)
-        weighted_sl = _safe_float(row.get("weighted_sl"), real_sl + ghost_sl * 0.45)
-        total_w = weighted_tp + weighted_sl
-        winrate = (weighted_tp / total_w * 100.0) if total_w > 0 else 50.0
-        return {
-            "tp": tp,
-            "sl": sl,
-            "real_tp": real_tp,
-            "real_sl": real_sl,
-            "ghost_tp": ghost_tp,
-            "ghost_sl": ghost_sl,
-            "weighted_tp": weighted_tp,
-            "weighted_sl": weighted_sl,
-            "total": tp + sl,
-            "weighted_total": total_w,
-            "winrate": winrate,
-            "behavior": row.get("behavior", "UNKNOWN"),
-            "personality": row.get("personality", "UNKNOWN"),
-            "confidence": _safe_int(row.get("confidence"), 0),
-        }
-    except Exception:
-        return {"tp": 0, "sl": 0, "total": 0, "weighted_total": 0.0, "winrate": 50.0, "confidence": 0}
-
-
-def _rotation_context(symbol: str, direction: str, snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    out = {"rotation_score": 70.0, "direction_score": 70.0, "risk_score": 0.0, "status": "UNKNOWN"}
-    if get_coin_rotation_score:
-        try:
-            rot = get_coin_rotation_score(symbol, snapshot=snapshot) or {}
-            out["rotation_score"] = _safe_float(rot.get("rotation_score"), 70.0)
-            out["risk_score"] = _safe_float(rot.get("risk_score"), 0.0)
-            out["status"] = rot.get("status", "UNKNOWN")
-            ds = rot.get("direction_scores", {}) if isinstance(rot.get("direction_scores"), dict) else {}
-            out["direction_score"] = _safe_float(ds.get(_norm_direction(direction)), out["rotation_score"])
-        except TypeError:
-            try:
-                rot = get_coin_rotation_score(symbol) or {}
-                out["rotation_score"] = _safe_float(rot.get("rotation_score"), 70.0)
-                out["risk_score"] = _safe_float(rot.get("risk_score"), 0.0)
-                out["status"] = rot.get("status", "UNKNOWN")
-            except Exception:
-                pass
-        except Exception:
-            pass
-    if get_symbol_rotation_score:
-        try:
-            out["direction_score"] = _safe_float(get_symbol_rotation_score(symbol, direction=direction, snapshot=snapshot), out["direction_score"])
-        except TypeError:
-            try:
-                out["direction_score"] = _safe_float(get_symbol_rotation_score(symbol), out["direction_score"])
-            except Exception:
-                pass
-        except Exception:
-            pass
-    return out
-
-
-def _risk_context(symbol: str, direction: str, snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    if not get_direction_risk_state:
-        return {"risk_score": 0.0, "strictness_level": 0, "sl_count": 0, "recommend_reduce": False}
-    try:
-        r = get_direction_risk_state(symbol, direction, snapshot=snapshot) if snapshot is not None else get_direction_risk_state(symbol, direction) or {}
-        return r if isinstance(r, dict) else {}
-    except Exception:
-        return {"risk_score": 0.0, "strictness_level": 0, "sl_count": 0, "recommend_reduce": False}
-
-
-def _candidate_snapshot(x: Dict[str, Any]) -> Dict[str, Any]:
-    snap = x.get("snapshot") if isinstance(x.get("snapshot"), dict) else {}
-    out = dict(snap)
-    for key in ["symbol", "direction", "entry", "price", "score", "ai_final_score", "ai_final_rank", "risk_level", "risk_reward", "confirmations", "freshness", "market_mode", "market_regime", "btc_bias", "similarity_score", "similarity_winrate", "similarity_samples", "similarity_adjustment", "ai_score", "move_phase", "move_state", "freshness_score", "move_done_pct", "movement_type", "trap_risk", "reversal_risk"]:
-        if key not in out and x.get(key) is not None:
-            out[key] = x.get(key)
-    # Preserve Historical Similarity Engine metadata from scanner/coin_learning.
-    # This is intentionally storage-only here: scanner.py already applies the
-    # similarity adjustment to ai_final_rank, so slot_manager must not score it
-    # a second time.
-    if isinstance(x.get("similarity_learning"), dict):
-        out["similarity_learning"] = x.get("similarity_learning")
-    elif isinstance(x.get("ai_scanner"), dict) and isinstance(x["ai_scanner"].get("similarity_learning"), dict):
-        out["similarity_learning"] = x["ai_scanner"].get("similarity_learning")
-    if isinstance(out.get("similarity_learning"), dict):
-        sim = out["similarity_learning"]
-        for src_key, dst_key in [
-            ("similarity_score", "similarity_score"),
-            ("win_rate", "similarity_winrate"),
-            ("similar_win_rate", "similarity_winrate"),
-            ("samples", "similarity_samples"),
-            ("similar_samples", "similarity_samples"),
-            ("rank_adjustment", "similarity_adjustment"),
-            ("adjustment", "similarity_adjustment"),
-        ]:
-            if out.get(dst_key) is None and sim.get(src_key) is not None:
-                out[dst_key] = sim.get(src_key)
-    return out
-
-
-def _movement_hunter_rank_adjustment(snapshot: Optional[Dict[str, Any]]) -> float:
-    """Soft slot-priority adjustment from AI Movement Hunter metadata.
-
-    This does not open/close trades and does not bypass REAL trade safety.
-    It only makes slot selection prefer fresh START/EARLY moves over late/range moves.
-    """
-    if not isinstance(snapshot, dict):
-        return 0.0
-
-    phase = str(snapshot.get("move_phase") or snapshot.get("move_state") or "").upper()
-    movement_type = str(snapshot.get("movement_type") or "").upper()
-    trap = str(snapshot.get("trap_risk") or "").upper()
-    reversal = str(snapshot.get("reversal_risk") or "").upper()
-    freshness = _safe_float(snapshot.get("freshness_score"), None)
-    done = _safe_float(snapshot.get("move_done_pct"), None)
-    ai_score = _safe_float(snapshot.get("ai_score"), None)
-
-    adj = 0.0
-
-    if phase in {"PRE_START", "START"}:
-        adj += 10.0
-    elif phase == "EARLY":
-        adj += 7.0
-    elif phase == "MID":
-        adj -= 7.0
-    elif phase in {"EXHAUSTION", "RANGE_AFTER_MOVE"}:
-        adj -= 18.0
-    elif phase == "RANGE":
-        adj -= 5.0
-
-    if freshness is not None:
-        if freshness >= 80:
-            adj += 6.0
-        elif freshness >= 65:
-            adj += 3.0
-        elif freshness < 45:
-            adj -= 7.0
-
-    if done is not None:
-        if done <= 30:
-            adj += 5.0
-        elif done <= 50:
-            adj += 2.0
-        elif done >= 75:
-            adj -= 12.0
-
-    if ai_score is not None:
-        if ai_score >= 82:
-            adj += 5.0
-        elif ai_score >= 72:
-            adj += 2.0
-        elif ai_score < 55:
-            adj -= 6.0
-
-    if trap == "HIGH":
-        adj -= 10.0
-    elif trap == "MEDIUM":
-        adj -= 4.0
-
-    if reversal == "HIGH":
-        adj -= 9.0
-    elif reversal == "MEDIUM":
-        adj -= 3.0
-
-    if movement_type in {"PUMP_START", "DUMP_START"}:
-        adj += 4.0
-    elif movement_type in {"PUMP_SETUP", "DUMP_SETUP"}:
-        adj += 2.0
-
-    return max(-24.0, min(20.0, adj))
-
-
-def candidate_rank_value(x: Dict[str, Any]) -> float:
-    """Final slot selection rank.
-
-    Priority order:
-    1) scanner.py ai_final_rank if present
-    2) classic score + AI risk/learning/rotation fallback
-    """
-    if x.get("ai_final_rank") is not None:
-        return _safe_float(x.get("ai_final_rank"), 0.0)
-    if isinstance(x.get("ai_scanner"), dict) and x["ai_scanner"].get("ai_final_rank") is not None:
-        return _safe_float(x["ai_scanner"].get("ai_final_rank"), 0.0)
-
-    symbol = _norm_symbol(x.get("symbol"))
-    direction = _norm_direction(x.get("direction"))
-    snapshot = _candidate_snapshot(x)
-
-    base_score = _safe_float(x.get("score"), 0.0)
-    confirmations = _safe_float(x.get("confirmations"), 0.0)
-    rr = _safe_float(x.get("risk_reward"), 0.0)
-    risk_level_bonus = {"LOW": 4.0, "MEDIUM": 2.0}.get(str(x.get("risk_level") or "").upper(), 0.0)
-    fresh_bonus = {"HIGH": 3.0, "MEDIUM": 1.0}.get(str(x.get("freshness") or "").upper(), 0.0)
-    movement_bonus = _movement_hunter_rank_adjustment(snapshot)
-
-    rot = _rotation_context(symbol, direction, snapshot)
-    risk = _risk_context(symbol, direction, snapshot=snapshot)
-    learned = _learning_context(symbol, direction)
-
-    rotation_bonus = (_safe_float(rot.get("direction_score"), 70.0) - 70.0) * 0.35
-
-    learned_total = _safe_float(learned.get("weighted_total"), 0.0)
-    learned_wr = _safe_float(learned.get("winrate"), 50.0)
-    learning_bonus = 0.0
-    if learned_total >= 2.5:
-        learning_bonus = max(-10.0, min(10.0, (learned_wr - 50.0) * 0.18))
-    if str(learned.get("behavior", "")).upper() == "GOOD":
-        learning_bonus += 3.0
-    elif str(learned.get("behavior", "")).upper() in {"BAD", "WEAK"}:
-        learning_bonus -= 4.0
-    if str(learned.get("personality", "")).upper() == "RISKY_DIRECTION":
-        learning_bonus -= 4.0
-
-    risk_score = max(_safe_float(rot.get("risk_score"), 0.0), _safe_float(risk.get("risk_score"), 0.0))
-    strictness = _safe_float(risk.get("strictness_level"), 0.0)
-    sl_count = max(_safe_int(risk.get("sl_count"), 0), _safe_int(learned.get("sl"), 0))
-
-    after_two_sl_penalty = 0.0
-    if sl_count >= 2:
-        after_two_sl_penalty = min(14.0, (sl_count - 1) * 4.5)
-    risk_penalty = min(16.0, risk_score * 0.12) + strictness * 2.2 + after_two_sl_penalty
-    if risk.get("recommend_reduce"):
-        risk_penalty += 3.0
-
-    return base_score + confirmations * 1.5 + rr * 2.0 + risk_level_bonus + fresh_bonus + movement_bonus + rotation_bonus + learning_bonus - risk_penalty
-
-
-def _good_for_ghost(x: Dict[str, Any]) -> bool:
-    score = max(_safe_float(x.get("score"), 0.0), _safe_float(x.get("ai_final_score"), 0.0))
-    rank = candidate_rank_value(x)
-    return bool(x.get("symbol") and x.get("direction") and x.get("entry") is not None and x.get("stop_loss") is not None and x.get("tp1") is not None and (score >= MIN_GHOST_SCORE or rank >= MIN_GHOST_SCORE))
-
-
-def save_candidate_as_ghost(x: Dict[str, Any], reason: str = "SLOT_MANAGER_UNUSED") -> bool:
-    if not create_ghost_signal or not _good_for_ghost(x):
-        return False
-    try:
-        snap = _candidate_snapshot(x)
-        snap["slot_rank"] = candidate_rank_value(x)
-        snap["movement_slot_rank_adjustment"] = _movement_hunter_rank_adjustment(snap)
-        if isinstance(x.get("ai_scanner"), dict):
-            snap["ai_scanner"] = x.get("ai_scanner")
-        if isinstance(x.get("similarity_learning"), dict):
-            snap["similarity_learning"] = x.get("similarity_learning")
-        elif isinstance(snap.get("similarity_learning"), dict):
-            pass
-        create_ghost_signal(
-            _norm_symbol(x.get("symbol")),
-            _norm_direction(x.get("direction")),
-            x.get("entry"),
-            x.get("stop_loss"),
-            x.get("tp1"),
-            x.get("tp2"),
-            x.get("score"),
-            snap,
-            "slot_manager",
-            reason,
-        )
-        return True
-    except Exception:
-        return False
-
-
-def queue_candidates(candidates: List[Dict[str, Any]], reason: str = "QUEUE") -> int:
-    if not candidates:
-        return 0
-    s = _state()
-    q = s.setdefault("queue", [])
-    now = _now()
-    existing = {str(x.get("signal_id") or x.get("id") or "") for x in q if isinstance(x, dict)}
-    added = 0
-    for c in candidates:
-        if not isinstance(c, dict):
-            continue
-        sid = str(c.get("signal_id") or c.get("id") or f"queued_{_norm_symbol(c.get('symbol'))}_{_norm_direction(c.get('direction'))}_{now}_{added}")
-        if sid in existing:
-            continue
-        item = dict(c)
-        item["signal_id"] = sid
-        item["queued_at"] = now
-        item["queue_reason"] = reason
-        item["slot_rank"] = candidate_rank_value(item)
-        q.append(item)
-        existing.add(sid)
-        added += 1
-    q.sort(key=candidate_rank_value, reverse=True)
-    s["queue"] = q[:MAX_QUEUE_SIZE]
-    if added:
-        _append_history(s, {"event": "QUEUE_CANDIDATES", "count": added, "reason": reason})
-        _save_state(s)
-    return added
-
-
-def pop_best_queued_candidates(limit: int = 1, max_age_seconds: int = 900) -> List[Dict[str, Any]]:
-    s = _state()
-    now = _now()
-    q = [x for x in s.get("queue", []) if isinstance(x, dict) and now - _safe_int(x.get("queued_at"), now) <= max_age_seconds]
-    q.sort(key=candidate_rank_value, reverse=True)
-    selected: List[Dict[str, Any]] = []
-    remaining: List[Dict[str, Any]] = []
-    for item in q:
-        if len(selected) < max(0, int(limit)):
-            ok, _ = can_open_new_position(item.get("symbol"), item.get("direction"))
-            if ok and not is_symbol_direction_active(item.get("symbol"), item.get("direction")):
-                selected.append(item)
-                continue
-        remaining.append(item)
-    s["queue"] = remaining[:MAX_QUEUE_SIZE]
-    if selected:
-        _append_history(s, {"event": "POP_QUEUE", "count": len(selected)})
-    _save_state(s)
-    return selected
-
-
-def select_best_candidates(candidates: List[Dict], limit: int = 1, ghost_unused: bool = True) -> List[Dict]:
-    cleanup_expired_pending_positions(save=True)
-    candidates = [c for c in (candidates or []) if isinstance(c, dict)]
-    if not candidates:
-        return []
-    ranked = sorted(candidates, key=candidate_rank_value, reverse=True)
-    selected: List[Dict[str, Any]] = []
-    for c in ranked:
-        if len(selected) >= max(0, int(limit)):
-            break
-        ok, _ = can_open_new_position(c.get("symbol"), c.get("direction"))
-        if ok and not is_symbol_direction_active(c.get("symbol"), c.get("direction")):
-            cc = dict(c)
-            cc["slot_rank"] = candidate_rank_value(cc)
-            selected.append(cc)
-
-    selected_ids = {str(x.get("signal_id") or x.get("id") or "") for x in selected}
-    unused = []
-    for c in ranked:
-        sid = str(c.get("signal_id") or c.get("id") or "")
-        if sid and sid in selected_ids:
-            continue
-        unused.append(c)
-
-    if unused:
-        queue_candidates(unused, reason="NOT_SELECTED")
-        if ghost_unused:
-            for c in unused[:20]:
-                save_candidate_as_ghost(c, "SLOT_MANAGER_NOT_SELECTED")
-    return selected[:limit]
-
-
-def format_slot_report() -> str:
-    cleanup_expired_pending_positions(save=True)
-    ps = get_active_positions()
-    s = _state()
-    q = s.get("queue", []) if isinstance(s.get("queue"), list) else []
-    lines = [f"📌 Slot ها: {len(ps)}/{get_max_active_positions()} | خالی: {get_free_slots()} | صف AI: {len(q)}"]
-    for p in ps:
-        status = p.get("status", "ACTIVE")
-        extra = ""
-        if str(status).upper() == "PENDING_REAL_CONFIRM":
-            exp = _safe_int(p.get("pending_expires_at"), 0)
-            left = max(0, exp - _now()) if exp else 0
-            extra = f" | pending:{left}s"
-        rank = p.get("ai_final_rank") if p.get("ai_final_rank") is not None else p.get("slot_rank")
-        phase = p.get("move_phase") or p.get("move_state") or "-"
-        fresh = p.get("freshness_score")
-        fresh_txt = f" | fresh:{fresh}" if fresh is not None else ""
-        lines.append(f"{p.get('symbol')} {p.get('direction')} | {p.get('score')} | {status} | rank:{rank} | phase:{phase}{fresh_txt}{extra}")
-    return "\n".join(lines)
