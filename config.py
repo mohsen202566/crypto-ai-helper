@@ -52,9 +52,13 @@ def _env_float(name: str, default: float) -> float:
 BOT_TOKEN = _env("BOT_TOKEN")
 OWNER_ID = _env_int("OWNER_ID", 0)
 
-TOOBIT_API_KEY = _env("TOOBIT_API_KEY")
-TOOBIT_API_SECRET = _env("TOOBIT_API_SECRET")
-TOOBIT_BASE_URL = _env("TOOBIT_BASE_URL", "https://api.toobit.com")
+# Toobit credentials.
+# Root compatibility fix:
+# Older VPS/service versions used TOBIT_* names, while the new code uses TOOBIT_*.
+# Read both so real trading does not break after updates.
+TOOBIT_API_KEY = _env("TOOBIT_API_KEY") or _env("TOBIT_API_KEY")
+TOOBIT_API_SECRET = _env("TOOBIT_API_SECRET") or _env("TOBIT_SECRET_KEY") or _env("TOOBIT_SECRET_KEY")
+TOOBIT_BASE_URL = _env("TOOBIT_BASE_URL", _env("TOBIT_BASE_URL", "https://api.toobit.com"))
 
 # Defaults. Runtime settings can override these through trade_state, but
 # environment values must never be silently ignored after restart.
