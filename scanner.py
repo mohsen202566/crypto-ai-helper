@@ -33,6 +33,13 @@ def _ts() -> int:
     return int(time.time())
 
 
+def _log(msg: str) -> None:
+    try:
+        print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} | scanner | {msg}", flush=True)
+    except Exception:
+        pass
+
+
 def _safe_float(v: Any, default: float = 0.0) -> float:
     try:
         if v is None:
@@ -99,6 +106,15 @@ def auto_scan_and_route(symbols: Optional[List[str]] = None, trade_mode: Optiona
 
     state = slot_manager.slot_state()
     free = int(state.get("free_slots", 0))
+    real_n = sum(1 for d in decisions if d.get("decision") in {"REAL", "ENTRY_ACTIVATION"})
+    ghost_n = sum(1 for d in decisions if d.get("decision") == "GHOST")
+    wait_n = sum(1 for d in decisions if d.get("decision") == "WAIT")
+    reject_n = sum(1 for d in decisions if d.get("decision") == "REJECT")
+    setup_n = sum(1 for d in decisions if d.get("decision") == "SETUP")
+    _log(
+        f"scan complete: scanned={scan.get('symbols_requested', 0)} valid={scan.get('symbols_ok', 0)} "
+        f"real={real_n} ghost={ghost_n} wait={wait_n} reject={reject_n} legacy_setup={setup_n} free_slots={free}"
+    )
 
     # Final architecture: no SETUP routing. Only REAL/ENTRY candidates open trades.
     real_candidates = [d for d in decisions if d.get("decision") in {"REAL", "ENTRY_ACTIVATION"}]
@@ -121,6 +137,9 @@ def auto_scan_and_route(symbols: Optional[List[str]] = None, trade_mode: Optiona
         routed.append(res)
 
     real_position_sync.cleanup_pending_slots()
+    routed_real = sum(1 for r in routed if str(r.get("type", "")).upper() in {"REAL", "PAPER"})
+    routed_ghost = sum(1 for r in routed if "GHOST" in str(r.get("type", "")).upper())
+    _log(f"route complete: routed={len(routed)} real_or_paper={routed_real} ghost={routed_ghost}")
     return routed
 
 
@@ -146,6 +165,10 @@ def route_decision(decision: Dict[str, Any], trade_mode: Optional[str] = None, r
     if d in {"REAL", "ENTRY_ACTIVATION"}:
         mode = (trade_mode or real_trade_manager.trade_status().get("mode") or "PAPER").upper()
         res = real_trade_manager.open_trade(decision, mode=mode)
+        if res.get("ok"):
+            _log(f"open_trade ok: {decision.get('symbol')} {decision.get('direction')} mode={mode} signal_id={res.get('signal_id')}")
+        else:
+            _log(f"open_trade failed: {decision.get('symbol')} {decision.get('direction')} mode={mode} reason={res.get('reason')}")
         # Do not block scanner for 60-70s. Bot/background sync confirms pending real positions.
         if res.get("ok") and mode == "REAL":
             res["needs_real_confirmation"] = True
