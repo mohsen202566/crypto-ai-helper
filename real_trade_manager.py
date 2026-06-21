@@ -16,7 +16,15 @@ import time
 import math
 from typing import Any, Dict, Optional
 
-from config import CORE_DATA_FILES, runtime_defaults_dict, REAL_CONFIRM_TIMEOUT_SECONDS
+from config import (
+    CORE_DATA_FILES,
+    runtime_defaults_dict,
+    REAL_CONFIRM_TIMEOUT_SECONDS,
+    DEFAULT_TRADE_MODE,
+    DEFAULT_REAL_TRADING_ENABLED,
+    TOOBIT_API_KEY,
+    TOOBIT_API_SECRET,
+)
 from data_store import load_dict, save_json
 from diagnostics import safe, record_error, warning
 import slot_manager
@@ -43,6 +51,53 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
         return f
     except Exception:
         return default
+
+
+def _normalize_trade_mode(value: Any) -> str:
+    mode = str(value or "").strip().upper()
+    return mode if mode in {"PAPER", "REAL"} else "PAPER"
+
+
+def _env_runtime_overrides() -> Dict[str, Any]:
+    """
+    Environment-controlled runtime fields that should be re-applied on restart.
+    This prevents old data/trade_state.json from keeping the bot in PAPER after
+    systemd/env was changed to REAL.
+    """
+    return {
+        "trade_mode": _normalize_trade_mode(DEFAULT_TRADE_MODE),
+        "real_trading_enabled": bool(DEFAULT_REAL_TRADING_ENABLED),
+    }
+
+
+def _sync_runtime_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
+    defaults = runtime_defaults_dict()
+    for k, v in defaults.items():
+        settings.setdefault(k, v)
+
+    # Root fix: env mode/safety always wins at startup.
+    settings.update(_env_runtime_overrides())
+
+    # Consistency rules.
+    settings["trade_mode"] = _normalize_trade_mode(settings.get("trade_mode"))
+    settings["real_trading_enabled"] = bool(settings.get("real_trading_enabled", False))
+
+    if settings["trade_mode"] == "REAL" and not settings["real_trading_enabled"]:
+        # Never silently attempt real orders when the safety flag is off.
+        settings["trade_mode"] = "PAPER"
+
+    return settings
+
+
+def real_trade_ready() -> Dict[str, Any]:
+    issues = []
+    if not DEFAULT_REAL_TRADING_ENABLED:
+        issues.append("REAL_TRADING_ENABLED=false")
+    if not TOOBIT_API_KEY:
+        issues.append("TOOBIT_API_KEY missing")
+    if not TOOBIT_API_SECRET:
+        issues.append("TOOBIT_API_SECRET missing")
+    return {"ok": len(issues) == 0, "issues": issues}
 
 
 def _empty_state() -> Dict[str, Any]:
@@ -76,7 +131,7 @@ def load_trade_state() -> Dict[str, Any]:
         save_json(TRADE_STATE_FILE, st)
     for k, v in _empty_state().items():
         st.setdefault(k, v)
-    st.setdefault("settings", {}).update({k: st.get("settings", {}).get(k, v) for k, v in runtime_defaults_dict().items()})
+    st["settings"] = _sync_runtime_settings(st.setdefault("settings", {}))
     _roll_day_if_needed(st)
     return st
 
@@ -102,6 +157,9 @@ def trade_status() -> Dict[str, Any]:
     slots = slot_manager.slot_state()
     return {
         "mode": settings.get("trade_mode", "PAPER"),
+        "real_trading_enabled": settings.get("real_trading_enabled", False),
+        "real_trade_ready": real_trade_ready(),
+        "last_trade_mode_error": settings.get("last_trade_mode_error", ""),
         "emergency_stop": settings.get("emergency_stop", False),
         "balance": settings.get("balance"),
         "protected_balance": settings.get("protected_balance"),
@@ -126,13 +184,27 @@ def is_daily_locked(st: Optional[Dict[str, Any]] = None) -> bool:
 def set_trade_setting(name: str, value: Any) -> Dict[str, Any]:
     st = load_trade_state()
     settings = st.setdefault("settings", {})
-    if name in {"leverage", "max_positions"}:
+
+    if name == "trade_mode":
+        value = _normalize_trade_mode(value)
+    elif name in {"leverage", "max_positions"}:
         value = int(value)
     elif name in {"position_size_usd", "initial_capital", "daily_loss_lock_amount", "daily_lock_hours", "balance", "protected_balance"}:
         value = float(value)
-    elif name in {"emergency_stop", "daily_loss_lock_enabled", "ai_enabled", "learning_enabled"}:
+    elif name in {"emergency_stop", "daily_loss_lock_enabled", "ai_enabled", "learning_enabled", "real_trading_enabled", "conservative_mode"}:
         value = bool(value)
+
     settings[name] = value
+
+    # If user/runtime asks REAL, safety must also be on and keys must exist.
+    if name == "trade_mode" and value == "REAL":
+        ready = real_trade_ready()
+        if not ready.get("ok"):
+            settings["trade_mode"] = "PAPER"
+            settings["last_trade_mode_error"] = ", ".join(ready.get("issues", []))
+    if name == "real_trading_enabled" and not value and settings.get("trade_mode") == "REAL":
+        settings["trade_mode"] = "PAPER"
+
     if name == "max_positions":
         slot_manager.set_max_positions(int(value))
     save_trade_state(st, make_backup=True)
@@ -151,6 +223,9 @@ def open_trade(decision: Dict[str, Any], mode: Optional[str] = None) -> Dict[str
         return {"ok": False, "reason": "daily_loss_locked", "locked_until": st.get("daily", {}).get("locked_until")}
 
     if mode == "REAL":
+        ready = real_trade_ready()
+        if not ready.get("ok"):
+            return {"ok": False, "reason": "real_trade_not_ready", "issues": ready.get("issues", [])}
         return open_real_trade(decision)
     return open_paper_trade(decision)
 
@@ -198,6 +273,10 @@ def open_real_trade(decision: Dict[str, Any]) -> Dict[str, Any]:
     entry = _safe_float(decision.get("entry"))
     if not symbol or direction not in {"LONG", "SHORT"} or entry <= 0:
         return {"ok": False, "reason": "invalid_decision"}
+
+    ready = real_trade_ready()
+    if not ready.get("ok"):
+        return {"ok": False, "reason": "real_trade_not_ready", "issues": ready.get("issues", [])}
 
     sides = toobit_safety.side_from_direction(direction)
     desired_qty = (_safe_float(settings.get("position_size_usd")) * int(settings.get("leverage", 1))) / entry
@@ -311,12 +390,13 @@ def status_fa() -> str:
     em = "روشن" if s.get("emergency_stop") else "خاموش"
     return (
         "💼 وضعیت ترید\n"
-        f"حالت: {s.get('mode')}\n"
+        f"حالت: {s.get('mode')} | ترید واقعی: {'روشن' if s.get('real_trading_enabled') else 'خاموش'}\n"
         f"بالانس: {s.get('balance')}$ | محافظت‌شده: {s.get('protected_balance')}$\n"
         f"حجم هر پوزیشن: {s.get('position_size_usd')}$ | لوریج: {s.get('leverage')}x\n"
         f"پوزیشن‌ها: {s.get('used_slots')}/{s.get('max_positions')} | خالی: {s.get('free_slots')}\n"
         f"سود/ضرر امروز: {s.get('daily',{}).get('realized_pnl',0)}$\n"
         f"قفل ضرر روزانه: {locked} | توقف اضطراری: {em}"
+        + (f"\n⚠️ آماده نبودن ترید واقعی: {', '.join(s.get('real_trade_ready', {}).get('issues', []))}" if not s.get('real_trade_ready', {}).get('ok', True) else "")
     )
 
 
