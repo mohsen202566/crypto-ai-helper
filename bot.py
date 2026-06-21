@@ -186,6 +186,17 @@ async def dispatch_text(update: Update, context: ContextTypes.DEFAULT_TYPE, txt:
         return
 
     # Settings commands
+    if t in {"ترید روشن", "ترید فعال", "ترید واقعی روشن", "ترید واقعی فعال"}:
+        real_trade_manager.set_trade_setting("real_trading_enabled", True)
+        real_trade_manager.set_trade_setting("trade_mode", "REAL")
+        await _reply(update, "✅ ترید واقعی روشن شد. حالت: REAL")
+        return
+    if t in {"ترید خاموش", "ترید غیرفعال", "ترید واقعی خاموش", "ترید واقعی غیرفعال"}:
+        real_trade_manager.set_trade_setting("real_trading_enabled", False)
+        real_trade_manager.set_trade_setting("trade_mode", "PAPER")
+        await _reply(update, "✅ ترید واقعی خاموش شد. حالت: PAPER")
+        return
+
     if t == "AI روشن" or t == "هوش مصنوعی روشن":
         real_trade_manager.set_trade_setting("ai_enabled", True)
         await _reply(update, "✅ هوش مصنوعی روشن شد.")
