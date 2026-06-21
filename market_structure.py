@@ -1,236 +1,247 @@
-# -*- coding: utf-8 -*-
-"""
-market_structure.py
-
-Lightweight market-structure helper for the crypto futures bot.
-
-Purpose:
-- Detect HH/HL, LH/LL, range, compression and possible structure shift.
-- Return simple backward-compatible values for old analysis/scanner calls.
-- Keep this as a SOFT layer: it only gives bias/score/context and never blocks signals.
-
-Backward-compatible public functions kept:
-    find_swings(df, lookback=3)
-    detect_market_structure(df)
-    structure_score(structure)
-
-New optional helper:
-    get_market_structure_profile(df, lookback=3)
-"""
-
 from __future__ import annotations
 
+"""
+Market structure sensor.
+
+Provides:
+- swing high/low
+- support/resistance proximity
+- range/trend state
+- breakout/fake breakout risk
+- trap/liquidity risk
+- volatility compression/expansion
+- movement phase
+- reversal probability
+
+No final trading decision is made here.
+"""
+
 import math
-from typing import Any, Dict, List, Tuple
+import time
+from typing import Any, Dict, List, Sequence, Optional
+
+from diagnostics import safe
 
 
-def _safe_float(value: Any, default: float = 0.0) -> float:
+Candle = Dict[str, Any]
+
+
+def _safe_float(v: Any, default: float = 0.0) -> float:
     try:
-        if value is None:
-            return float(default)
-        v = float(value)
-        if math.isnan(v) or math.isinf(v):
-            return float(default)
-        return v
+        f = float(v)
+        if math.isnan(f) or math.isinf(f):
+            return default
+        return f
     except Exception:
-        return float(default)
+        return default
 
 
-def _has_columns(df: Any, cols: Tuple[str, ...]) -> bool:
-    try:
-        return df is not None and all(c in df.columns for c in cols) and len(df) > 0
-    except Exception:
-        return False
+def _highs(candles: Sequence[Candle]) -> List[float]:
+    return [_safe_float(c.get("high")) for c in candles]
 
 
-def find_swings(df, lookback: int = 3):
-    """Return last 5 swing highs and lows as plain float lists.
-
-    This function intentionally preserves the old return shape:
-        highs, lows
-    """
-    if not _has_columns(df, ("high", "low")):
-        return [], []
-
-    try:
-        lookback = max(1, int(lookback))
-        if len(df) < lookback * 2 + 3:
-            return [], []
-    except Exception:
-        lookback = 3
-
-    highs: List[float] = []
-    lows: List[float] = []
-
-    for i in range(lookback, len(df) - lookback):
-        current_high = _safe_float(df["high"].iloc[i])
-        current_low = _safe_float(df["low"].iloc[i])
-        if current_high <= 0 or current_low <= 0:
-            continue
-
-        is_high = True
-        is_low = True
-        for j in range(1, lookback + 1):
-            if current_high <= _safe_float(df["high"].iloc[i - j]) or current_high <= _safe_float(df["high"].iloc[i + j]):
-                is_high = False
-            if current_low >= _safe_float(df["low"].iloc[i - j]) or current_low >= _safe_float(df["low"].iloc[i + j]):
-                is_low = False
-            if not is_high and not is_low:
-                break
-
-        if is_high:
-            highs.append(current_high)
-        if is_low:
-            lows.append(current_low)
-
-    return highs[-5:], lows[-5:]
+def _lows(candles: Sequence[Candle]) -> List[float]:
+    return [_safe_float(c.get("low")) for c in candles]
 
 
-def _recent_close(df) -> float:
-    if not _has_columns(df, ("close",)):
+def _closes(candles: Sequence[Candle]) -> List[float]:
+    return [_safe_float(c.get("close")) for c in candles]
+
+
+def _volumes(candles: Sequence[Candle]) -> List[float]:
+    return [_safe_float(c.get("volume")) for c in candles]
+
+
+def _atr_like(candles: Sequence[Candle], period: int = 14) -> float:
+    if len(candles) < 2:
         return 0.0
-    return _safe_float(df["close"].iloc[-1])
+    trs = []
+    for i in range(1, len(candles)):
+        h = _safe_float(candles[i].get("high"))
+        l = _safe_float(candles[i].get("low"))
+        pc = _safe_float(candles[i-1].get("close"))
+        trs.append(max(h-l, abs(h-pc), abs(l-pc)))
+    recent = trs[-period:]
+    return sum(recent) / max(1, len(recent))
 
 
-def _range_width_pct(highs: List[float], lows: List[float], close: float) -> float:
-    if not highs or not lows or close <= 0:
+def swing_high(candles: Sequence[Candle], lookback: int = 20) -> float:
+    highs = _highs(candles)[-lookback:]
+    return max(highs) if highs else 0.0
+
+
+def swing_low(candles: Sequence[Candle], lookback: int = 20) -> float:
+    lows = _lows(candles)[-lookback:]
+    return min(lows) if lows else 0.0
+
+
+def detect_compression(candles: Sequence[Candle]) -> Dict[str, float]:
+    if len(candles) < 30:
+        return {"compression": 0.0, "expansion": 0.0}
+    atr_short = _atr_like(candles[-10:], 10)
+    atr_long = _atr_like(candles[-30:], 30)
+    if atr_long <= 0:
+        return {"compression": 0.0, "expansion": 0.0}
+    ratio = atr_short / atr_long
+    compression = max(0.0, min(1.0, 1 - ratio)) if ratio < 1 else 0.0
+    expansion = max(0.0, min(1.0, ratio - 1)) if ratio > 1 else 0.0
+    return {"compression": round(compression, 4), "expansion": round(expansion, 4)}
+
+
+def fake_breakout_risk(candles: Sequence[Candle], sh: float, sl: float) -> float:
+    if len(candles) < 3:
         return 0.0
-    hi = max(highs[-3:])
-    lo = min(lows[-3:])
-    if hi <= 0 or lo <= 0 or hi <= lo:
+    last = candles[-1]
+    prev_close = _safe_float(candles[-2].get("close"))
+    o = _safe_float(last.get("open"))
+    h = _safe_float(last.get("high"))
+    l = _safe_float(last.get("low"))
+    c = _safe_float(last.get("close"))
+    rng = max(h-l, 1e-12)
+    risk = 0.0
+    # sweep above resistance then close back below
+    if h > sh and c < sh:
+        risk += 0.55
+    # sweep below support then close back above
+    if l < sl and c > sl:
+        risk += 0.55
+    wick_top = (h - max(o, c)) / rng
+    wick_bottom = (min(o, c) - l) / rng
+    if wick_top > 0.45 or wick_bottom > 0.45:
+        risk += 0.25
+    if abs(c - o) / rng < 0.25:
+        risk += 0.15
+    return round(max(0.0, min(1.0, risk)), 4)
+
+
+def breakout_state(candles: Sequence[Candle], sh: float, sl: float) -> str:
+    if not candles:
+        return "UNKNOWN"
+    c = _safe_float(candles[-1].get("close"))
+    h = _safe_float(candles[-1].get("high"))
+    l = _safe_float(candles[-1].get("low"))
+    atr = _atr_like(candles)
+    buffer = atr * 0.15
+    if c > sh + buffer:
+        return "CLEAN_BREAK_UP"
+    if c < sl - buffer:
+        return "CLEAN_BREAK_DOWN"
+    if h > sh and c < sh:
+        return "FAKE_BREAK_UP"
+    if l < sl and c > sl:
+        return "FAKE_BREAK_DOWN"
+    if abs(c - sh) <= buffer or abs(c - sl) <= buffer:
+        return "AT_LEVEL"
+    return "INSIDE_RANGE"
+
+
+def liquidity_risk(candles: Sequence[Candle], sh: float, sl: float) -> float:
+    if len(candles) < 10:
         return 0.0
-    return round((hi - lo) / close * 100.0, 4)
+    close = _safe_float(candles[-1].get("close"))
+    atr = max(_atr_like(candles), 1e-12)
+    dist_res = abs(sh - close) / atr
+    dist_sup = abs(close - sl) / atr
+    near_level = min(dist_res, dist_sup)
+    risk = max(0.0, min(1.0, 1 - near_level / 2.5))
+    return round(risk, 4)
 
 
-def _breakout_bias(df, highs: List[float], lows: List[float]) -> str:
-    """Detect if recent close is breaking the latest local structure.
-
-    This does not replace signal direction; it only gives context.
-    """
-    close = _recent_close(df)
-    if close <= 0 or not highs or not lows:
-        return "NONE"
-    recent_resistance = max(highs[-3:])
-    recent_support = min(lows[-3:])
-    if recent_resistance > 0 and close > recent_resistance:
-        return "BULLISH_BREAKOUT"
-    if recent_support > 0 and close < recent_support:
-        return "BEARISH_BREAKDOWN"
-    return "NONE"
-
-
-def _structure_from_swings(highs: List[float], lows: List[float]) -> str:
-    if len(highs) < 2 or len(lows) < 2:
-        return "unknown"
-
-    higher_high = highs[-1] > highs[-2]
-    higher_low = lows[-1] > lows[-2]
-    lower_high = highs[-1] < highs[-2]
-    lower_low = lows[-1] < lows[-2]
-
-    if higher_high and higher_low:
-        return "bullish_structure"
-    if lower_high and lower_low:
-        return "bearish_structure"
-    if higher_high and lower_low:
-        return "expansion_structure"
-    if lower_high and higher_low:
-        return "compression_structure"
-    return "range_structure"
+def movement_phase(candles: Sequence[Candle]) -> str:
+    if len(candles) < 15:
+        return "UNKNOWN"
+    closes = _closes(candles)
+    recent_move = closes[-1] - closes[-5]
+    larger_move = closes[-1] - closes[-15]
+    atr = max(_atr_like(candles), 1e-12)
+    r1 = abs(recent_move) / atr
+    r2 = abs(larger_move) / atr
+    if r1 < 0.35 and r2 < 0.8:
+        return "COMPRESSION_OR_RANGE"
+    if r1 >= 0.5 and r2 < 1.2:
+        return "EARLY_MOVE"
+    if r2 >= 1.2 and r1 >= 0.35:
+        return "MID_MOVE"
+    if r2 >= 1.5 and r1 < 0.25:
+        return "EXHAUSTION"
+    return "MIXED"
 
 
-def detect_market_structure(df):
-    """Backward-compatible simple structure label.
+def reversal_probability(candles: Sequence[Candle]) -> float:
+    if len(candles) < 10:
+        return 0.0
+    closes = _closes(candles)
+    vols = _volumes(candles)
+    atr = max(_atr_like(candles), 1e-12)
+    move = abs(closes[-1] - closes[-8]) / atr
+    last_body = abs(_safe_float(candles[-1].get("close")) - _safe_float(candles[-1].get("open")))
+    last_range = max(_safe_float(candles[-1].get("high")) - _safe_float(candles[-1].get("low")), 1e-12)
+    wick_ratio = 1 - min(1.0, last_body / last_range)
+    vol_spike = 0.0
+    if len(vols) > 8:
+        avg_vol = sum(vols[-8:-1]) / 7
+        if avg_vol > 0:
+            vol_spike = max(0.0, min(1.0, (vols[-1] / avg_vol - 1) / 2))
+    prob = 0.0
+    if move > 1.5:
+        prob += 0.25
+    prob += wick_ratio * 0.35
+    prob += vol_spike * 0.25
+    if movement_phase(candles) == "EXHAUSTION":
+        prob += 0.25
+    return round(max(0.0, min(1.0, prob)), 4)
 
-    Old callers expect one of:
-        bullish_structure / bearish_structure / range_structure / unknown
-    We keep those names and only add safe extra labels where useful.
-    """
-    highs, lows = find_swings(df)
-    structure = _structure_from_swings(highs, lows)
 
-    # For old code, avoid making compression/expansion act like a hard direction.
-    if structure in {"compression_structure", "expansion_structure"}:
-        return "range_structure"
-    return structure
+@safe(default={})
+def analyze_structure(candles: Sequence[Candle], symbol: str = "", timeframe: str = "") -> Dict[str, Any]:
+    if not candles or len(candles) < 5:
+        return {"ok": False, "symbol": str(symbol).upper(), "timeframe": timeframe, "error": "not_enough_candles"}
 
+    sh = swing_high(candles[:-1] if len(candles) > 1 else candles)
+    sl = swing_low(candles[:-1] if len(candles) > 1 else candles)
+    close = _safe_float(candles[-1].get("close"))
+    atr = max(_atr_like(candles), 1e-12)
+    comp = detect_compression(candles)
+    fb = fake_breakout_risk(candles, sh, sl)
+    liq = liquidity_risk(candles, sh, sl)
+    bs = breakout_state(candles, sh, sl)
+    phase = movement_phase(candles)
 
-def get_market_structure_profile(df, lookback: int = 3) -> Dict[str, Any]:
-    """Return a richer soft market-structure profile for AI/scanner use.
-
-    The profile is intentionally conservative:
-    - Strong directional score only when both highs/lows agree.
-    - Compression/range are returned as caution/context, not rejection.
-    - Breakout/breakdown is soft context and can be learned by AI layers.
-    """
-    highs, lows = find_swings(df, lookback=lookback)
-    raw_structure = _structure_from_swings(highs, lows)
-    close = _recent_close(df)
-    width_pct = _range_width_pct(highs, lows, close)
-    breakout = _breakout_bias(df, highs, lows)
-
-    bullish_score, bearish_score = structure_score(raw_structure)
-
-    # Compression often precedes a move; do not force direction, just mark readiness.
-    compression = raw_structure == "compression_structure"
-    expansion = raw_structure == "expansion_structure"
-
-    if breakout == "BULLISH_BREAKOUT":
-        bullish_score += 4
-    elif breakout == "BEARISH_BREAKDOWN":
-        bearish_score += 4
-
-    if raw_structure == "range_structure":
-        state = "RANGE"
-    elif compression:
-        state = "COMPRESSION"
-    elif expansion:
-        state = "EXPANSION"
-    elif raw_structure == "bullish_structure":
-        state = "BULLISH"
-    elif raw_structure == "bearish_structure":
-        state = "BEARISH"
-    else:
-        state = "UNKNOWN"
-
-    if bullish_score > bearish_score:
-        bias = "BULLISH"
-    elif bearish_score > bullish_score:
-        bias = "BEARISH"
-    else:
-        bias = "NEUTRAL"
+    support_dist = (close - sl) / close * 100 if close else 0.0
+    resistance_dist = (sh - close) / close * 100 if close else 0.0
 
     return {
-        "available": bool(highs and lows),
-        "structure": detect_market_structure(df),
-        "raw_structure": raw_structure,
-        "state": state,
-        "bias": bias,
-        "bullish_score": int(max(0, min(20, bullish_score))),
-        "bearish_score": int(max(0, min(20, bearish_score))),
-        "recent_swing_highs": highs,
-        "recent_swing_lows": lows,
-        "range_width_pct": width_pct,
-        "breakout_bias": breakout,
-        "compression": compression,
-        "expansion": expansion,
-        "soft_layer": True,
-        "source": "market_structure_v2",
+        "ok": True,
+        "symbol": str(symbol).upper(),
+        "timeframe": timeframe,
+        "structure": {
+            "swing_high": round(sh, 8),
+            "swing_low": round(sl, 8),
+            "support_near": round(sl, 8),
+            "resistance_near": round(sh, 8),
+            "support_distance_pct": round(support_dist, 6),
+            "resistance_distance_pct": round(resistance_dist, 6),
+            "sr_distance": round(min(abs(close-sh), abs(close-sl)) / atr, 6),
+            "breakout_state": bs,
+            "fake_breakout_risk": fb,
+            "trap_risk": round(max(fb, liq * 0.75), 4),
+            "liquidity_risk": liq,
+            "compression": comp["compression"],
+            "expansion": comp["expansion"],
+            "movement_phase": phase,
+            "reversal_probability": reversal_probability(candles),
+            "supply_zone_distance": round(resistance_dist, 6),
+            "demand_zone_distance": round(support_dist, 6),
+        },
+        "created_at": int(time.time()),
     }
 
 
-def structure_score(structure):
-    """Backward-compatible score tuple: (long_score, short_score).
-
-    Keep this moderate. Market structure is a context layer, not a hard signal.
-    """
-    structure = str(structure or "").lower().strip()
-    if structure == "bullish_structure":
-        return 12, 0
-    if structure == "bearish_structure":
-        return 0, 12
-    if structure == "compression_structure":
-        return 3, 3
-    if structure == "expansion_structure":
-        return 2, 2
-    return 0, 0
+@safe(default={})
+def multi_timeframe_structure(candle_map: Dict[str, Sequence[Candle]], symbol: str = "") -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "symbol": str(symbol).upper(),
+        "timeframes": {tf: analyze_structure(c, symbol, tf) for tf, c in candle_map.items()},
+        "created_at": int(time.time()),
+    }
