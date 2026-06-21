@@ -86,49 +86,107 @@ def ensure_isolated(symbol: str, client: Optional[tobit_client.ToobitClient] = N
     """
     Enforce user rule: real orders are allowed only when ISOLATED is confirmed.
 
-    Flow:
-    1) Try to set ISOLATED.
-    2) If set fails, read current margin mode.
-    3) Allow only if current mode is confirmed ISOLATED.
+    Safe Toobit flow:
+    1) Read current margin mode first.
+       If the user already set the pair to ISOLATED inside Toobit, do not send a
+       margin-change request. This avoids false failures on pairs that are already
+       isolated.
+    2) If current mode is not confirmed ISOLATED, try to set ISOLATED.
+    3) Re-read current margin mode after setting.
+    4) Allow the order only when ISOLATED is confirmed.
     """
     c = client or tobit_client.client()
     symbol = symbol.upper()
     if not ISOLATED_MARGIN_ONLY:
         return {"ok": True, "symbol": symbol, "isolated_required": False}
 
+    before = verify_isolated(symbol, c)
+    if before.get("ok"):
+        return {
+            "ok": True,
+            "symbol": symbol,
+            "margin_type": "ISOLATED",
+            "source": "already_isolated",
+            "verify": before,
+        }
+
     set_res = c.set_margin_type(symbol, "ISOLATED")
-    if set_res.get("ok"):
-        return {"ok": True, "symbol": symbol, "margin_type": "ISOLATED", "source": "set_margin_type", "raw": set_res}
+    after = verify_isolated(symbol, c)
+    if after.get("ok"):
+        return {
+            "ok": True,
+            "symbol": symbol,
+            "margin_type": "ISOLATED",
+            "source": "set_then_verified" if set_res.get("ok") else "verified_after_set_failed",
+            "before": before,
+            "set_raw": set_res,
+            "verify": after,
+        }
 
-    verify = verify_isolated(symbol, c)
-    if verify.get("ok"):
-        return {"ok": True, "symbol": symbol, "margin_type": "ISOLATED", "source": "verify_after_set_failed", "set_raw": set_res, "verify": verify}
-
-    return {"ok": False, "symbol": symbol, "reason": "cannot_set_or_verify_isolated", "set_raw": set_res, "verify": verify}
+    return {
+        "ok": False,
+        "symbol": symbol,
+        "reason": "isolated_not_confirmed_after_read_set_read",
+        "before": before,
+        "set_raw": set_res,
+        "after": after,
+    }
 
 
 @safe(default={})
 def ensure_leverage(symbol: str, leverage: int, client: Optional[tobit_client.ToobitClient] = None) -> Dict[str, Any]:
     """
-    Try to set leverage. If setting fails, verify current leverage. If current leverage
-    matches requested leverage, allow. Otherwise block real order.
+    Safe leverage flow:
+    1) Read current leverage first.
+    2) If it already matches the bot setting, do not send set_leverage.
+    3) Otherwise set leverage and verify again.
+    4) Allow only when the requested leverage is confirmed.
     """
     c = client or tobit_client.client()
     symbol = symbol.upper()
     target = max(1, min(125, int(leverage or 1)))
 
-    set_res = c.set_leverage(symbol, target) if hasattr(c, "set_leverage") else {"ok": False, "error": "client_has_no_set_leverage"}
-    if set_res.get("ok"):
-        return {"ok": True, "symbol": symbol, "leverage": target, "source": "set_leverage", "raw": set_res}
-
-    lev = c.account_leverage(symbol) if hasattr(c, "account_leverage") else {}
-    if lev.get("ok"):
-        current = _extract_leverage(lev.get("raw", {}))
+    before = c.account_leverage(symbol) if hasattr(c, "account_leverage") else {}
+    if before.get("ok"):
+        current = _extract_leverage(before.get("raw", {}))
         if current == target:
-            return {"ok": True, "symbol": symbol, "leverage": current, "source": "verify_after_set_failed", "set_raw": set_res, "verify": lev}
-        return {"ok": False, "symbol": symbol, "reason": "leverage_mismatch", "target": target, "current": current, "set_raw": set_res, "verify": lev}
+            return {"ok": True, "symbol": symbol, "leverage": current, "source": "already_target_leverage", "verify": before}
 
-    return {"ok": False, "symbol": symbol, "reason": "cannot_set_or_verify_leverage", "target": target, "set_raw": set_res, "verify": lev}
+    set_res = c.set_leverage(symbol, target) if hasattr(c, "set_leverage") else {"ok": False, "error": "client_has_no_set_leverage"}
+
+    after = c.account_leverage(symbol) if hasattr(c, "account_leverage") else {}
+    if after.get("ok"):
+        current = _extract_leverage(after.get("raw", {}))
+        if current == target:
+            return {
+                "ok": True,
+                "symbol": symbol,
+                "leverage": current,
+                "source": "set_then_verified" if set_res.get("ok") else "verified_after_set_failed",
+                "before": before,
+                "set_raw": set_res,
+                "verify": after,
+            }
+        return {
+            "ok": False,
+            "symbol": symbol,
+            "reason": "leverage_mismatch_after_read_set_read",
+            "target": target,
+            "current": current,
+            "before": before,
+            "set_raw": set_res,
+            "after": after,
+        }
+
+    return {
+        "ok": False,
+        "symbol": symbol,
+        "reason": "cannot_confirm_leverage_after_read_set_read",
+        "target": target,
+        "before": before,
+        "set_raw": set_res,
+        "after": after,
+    }
 
 
 @safe(default={})
