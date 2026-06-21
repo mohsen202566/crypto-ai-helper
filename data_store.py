@@ -1,162 +1,177 @@
-# -*- coding: utf-8 -*-
-"""Persistent JSON storage helpers for the crypto futures bot.
+from __future__ import annotations
 
-This module is intentionally small and dependency-free because almost every AI
-memory layer depends on it.  Design goals:
+"""
+Safe persistence layer.
 
-- Store all relative JSON files under BOT_DATA_DIR (default: data/).
-- Avoid accidental data/data/... paths when old modules pass "data/file.json".
-- Save atomically with a temporary file + os.replace().
-- Keep timestamped backups before overwriting existing files.
-- Recover from the latest valid backup if the main JSON file is corrupted.
-- Never delete learned data during code updates.
+Responsibilities:
+- atomic JSON writes
+- safe JSON reads with defaults
+- automatic directory creation
+- timestamped backups
+- corruption recovery attempts
+- lightweight cache helpers
+
+Rules:
+- Do not import high-level bot modules here.
+- This module can be used by AI memory, ghost, tracker, trade manager, etc.
 """
 
 import json
 import os
 import shutil
+import tempfile
 import time
-from typing import Any, Optional
+from pathlib import Path
+from typing import Any, Dict, Optional, List, Callable
+
+from config import DATA_DIR, BACKUP_DIR, ensure_directories
 
 
-DATA_DIR = os.getenv("BOT_DATA_DIR", "data")
-BACKUP_DIR = os.path.join(DATA_DIR, "backups")
-MAX_BACKUPS_PER_FILE = int(os.getenv("BOT_DATA_MAX_BACKUPS_PER_FILE", "20") or "20")
+def now_ts() -> int:
+    return int(time.time())
 
 
-def _ensure_dirs() -> None:
-    os.makedirs(DATA_DIR, exist_ok=True)
-    os.makedirs(BACKUP_DIR, exist_ok=True)
+def utc_ms() -> int:
+    return int(time.time() * 1000)
 
 
-_ensure_dirs()
+def _path(path_or_name: str | Path) -> Path:
+    ensure_directories()
+    p = Path(path_or_name)
+    if p.suffix:
+        return p
+    return DATA_DIR / f"{p.name}.json"
 
 
-def _path(name: str) -> str:
-    """Return the on-disk path for a JSON data file.
-
-    Compatibility note:
-    Older files sometimes pass "data/real_trade_state.json" while newer files
-    pass "real_trade_state.json".  If BOT_DATA_DIR is "data", blindly joining
-    would create "data/data/real_trade_state.json".  This helper prevents that.
-    """
-    raw = str(name or "").strip()
-    if not raw:
-        raw = "data.json"
-
-    if os.path.isabs(raw):
-        return raw
-
-    norm_raw = os.path.normpath(raw)
-    norm_data = os.path.normpath(DATA_DIR)
-
-    if norm_raw == norm_data or norm_raw.startswith(norm_data + os.sep):
-        return norm_raw
-
-    return os.path.join(DATA_DIR, norm_raw)
+def json_default(obj: Any) -> Any:
+    if hasattr(obj, "to_dict"):
+        return obj.to_dict()
+    if hasattr(obj, "__dict__"):
+        return obj.__dict__
+    return str(obj)
 
 
-def _backup_glob_prefix(path: str) -> str:
-    return os.path.basename(path) + "."
-
-
-def _list_backups_for(path: str) -> list[str]:
-    _ensure_dirs()
-    prefix = _backup_glob_prefix(path)
-    try:
-        rows = [
-            os.path.join(BACKUP_DIR, fn)
-            for fn in os.listdir(BACKUP_DIR)
-            if fn.startswith(prefix) and fn.endswith(".bak")
-        ]
-    except Exception:
-        return []
-    rows.sort(key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0, reverse=True)
-    return rows
-
-
-def _load_json_file(path: str) -> Any:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def _latest_valid_backup(path: str) -> Optional[Any]:
-    for backup_path in _list_backups_for(path):
-        try:
-            return _load_json_file(backup_path)
-        except Exception:
-            continue
-    return None
-
-
-def _cleanup_old_backups(path: str) -> None:
-    if MAX_BACKUPS_PER_FILE <= 0:
-        return
-    backups = _list_backups_for(path)
-    for old in backups[MAX_BACKUPS_PER_FILE:]:
-        try:
-            os.remove(old)
-        except Exception:
-            pass
-
-
-def load_json(name: str, default: Any = None) -> Any:
-    """Load JSON safely.
-
-    If the main file is missing or unreadable, returns default.  If the main
-    file is corrupted but a valid backup exists, returns the newest valid backup
-    instead of silently losing the AI memory.
-    """
-    path = _path(name)
+def load_json(path_or_name: str | Path, default: Any = None) -> Any:
+    p = _path(path_or_name)
     if default is None:
         default = {}
-
+    if not p.exists():
+        return default
     try:
-        if not os.path.exists(path):
-            return default
-        return _load_json_file(path)
+        with p.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except json.JSONDecodeError:
+        # Corrupted file: backup it and return default.
+        backup_file(p, suffix="corrupt")
+        return default
     except Exception:
-        recovered = _latest_valid_backup(path)
-        if recovered is not None:
-            return recovered
         return default
 
 
-def save_json(name: str, data: Any, backup: bool = True) -> bool:
-    """Atomically save JSON with optional backup.
+def save_json(path_or_name: str | Path, data: Any, make_backup: bool = False) -> bool:
+    p = _path(path_or_name)
+    ensure_directories()
+    p.parent.mkdir(parents=True, exist_ok=True)
 
-    Returns True on success.  Exceptions during the final write are not hidden;
-    that is intentional so the caller/logs can reveal disk permission or space
-    problems instead of pretending the AI memory was saved.
-    """
-    path = _path(name)
-    _ensure_dirs()
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    if make_backup and p.exists():
+        backup_file(p)
 
-    if backup and os.path.exists(path):
+    fd, tmp_name = tempfile.mkstemp(prefix=p.name + ".", suffix=".tmp", dir=str(p.parent))
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2, default=json_default)
+            f.write("\n")
+        os.replace(str(tmp), str(p))
+        return True
+    except Exception:
         try:
-            base = os.path.basename(path)
-            backup_name = f"{base}.{int(time.time())}.bak"
-            backup_path = os.path.join(BACKUP_DIR, backup_name)
-            shutil.copy2(path, backup_path)
-            _cleanup_old_backups(path)
-        except Exception:
-            # Backup failure should not stop the main atomic save.
-            pass
-
-    tmp = f"{path}.{os.getpid()}.{int(time.time() * 1000)}.tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-        f.flush()
-        try:
-            os.fsync(f.fileno())
+            tmp.unlink(missing_ok=True)
         except Exception:
             pass
-
-    os.replace(tmp, path)
-    return True
+        return False
 
 
-# Backward-compatible aliases some modules may import.
-read_json = load_json
-write_json = save_json
+def backup_file(path_or_name: str | Path, suffix: str = "bak") -> str:
+    p = _path(path_or_name)
+    ensure_directories()
+    if not p.exists():
+        return ""
+    ts = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
+    backup_name = f"{p.stem}.{ts}.{suffix}{p.suffix}"
+    dst = BACKUP_DIR / backup_name
+    try:
+        shutil.copy2(str(p), str(dst))
+        return str(dst)
+    except Exception:
+        return ""
+
+
+def append_jsonl(path_or_name: str | Path, row: Dict[str, Any]) -> bool:
+    p = _path(path_or_name)
+    if p.suffix != ".jsonl":
+        p = p.with_suffix(".jsonl")
+    ensure_directories()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with p.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False, default=json_default) + "\n")
+        return True
+    except Exception:
+        return False
+
+
+def load_list(path_or_name: str | Path) -> List[Any]:
+    data = load_json(path_or_name, default=[])
+    return data if isinstance(data, list) else []
+
+
+def load_dict(path_or_name: str | Path) -> Dict[str, Any]:
+    data = load_json(path_or_name, default={})
+    return data if isinstance(data, dict) else {}
+
+
+def update_json(path_or_name: str | Path, updater: Callable[[Any], Any], default: Any = None, make_backup: bool = True) -> Any:
+    data = load_json(path_or_name, default=default if default is not None else {})
+    new_data = updater(data)
+    save_json(path_or_name, new_data, make_backup=make_backup)
+    return new_data
+
+
+def ensure_json_file(path_or_name: str | Path, default: Any) -> Path:
+    p = _path(path_or_name)
+    if not p.exists():
+        save_json(p, default)
+    return p
+
+
+def prune_records(records: List[Dict[str, Any]], max_records: int = 10000) -> List[Dict[str, Any]]:
+    if len(records) <= max_records:
+        return records
+    return records[-max_records:]
+
+
+def cache_get(cache_name: str, key: str, ttl_seconds: int, default: Any = None) -> Any:
+    cache = load_dict(cache_name)
+    item = cache.get(key)
+    if not isinstance(item, dict):
+        return default
+    if now_ts() - int(item.get("ts", 0)) > ttl_seconds:
+        return default
+    return item.get("value", default)
+
+
+def cache_set(cache_name: str, key: str, value: Any) -> bool:
+    cache = load_dict(cache_name)
+    cache[key] = {"ts": now_ts(), "value": value}
+    return save_json(cache_name, cache)
+
+
+def initialize_data_files(defaults: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    ensure_directories()
+    defaults = defaults or {}
+    created = []
+    for name, default in defaults.items():
+        p = ensure_json_file(name, default)
+        created.append(str(p))
+    return {"ok": True, "created_or_existing": created}
