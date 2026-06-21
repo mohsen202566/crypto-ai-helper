@@ -1,95 +1,157 @@
-# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+"""
+Central configuration for the AI Movement Hunter bot.
+
+Rules:
+- This file must stay dependency-light.
+- Do not import bot.py or high-level modules here.
+- Runtime/user-editable settings are stored in data/trade_state.json,
+  not hardcoded here.
+"""
+
 import os
+from pathlib import Path
+from dataclasses import dataclass, asdict
+from typing import Dict, Any, List
 
 
-def env_bool(name, default=False):
-    value = os.getenv(name)
-    if value is None:
-        return bool(default)
-    return str(value).strip().lower() in ('1', 'true', 'yes', 'on', 'enabled')
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+BACKUP_DIR = DATA_DIR / "backups"
+LOG_DIR = DATA_DIR / "logs"
 
 
-def env_int(name, default=0, min_value=None, max_value=None):
+def _env(name: str, default: str = "") -> str:
+    return os.getenv(name, default).strip()
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = _env(name, "true" if default else "false").lower()
+    return raw in {"1", "true", "yes", "on", "enable", "enabled"}
+
+
+def _env_int(name: str, default: int) -> int:
     try:
-        value = int(float(os.getenv(name, str(default)) or default))
+        return int(_env(name, str(default)))
     except Exception:
-        value = int(default)
-    if min_value is not None:
-        value = max(int(min_value), value)
-    if max_value is not None:
-        value = min(int(max_value), value)
-    return value
+        return default
 
 
-def env_float(name, default=0.0, min_value=None, max_value=None):
+def _env_float(name: str, default: float) -> float:
     try:
-        value = float(os.getenv(name, str(default)) or default)
+        return float(_env(name, str(default)))
     except Exception:
-        value = float(default)
-    if min_value is not None:
-        value = max(float(min_value), value)
-    if max_value is not None:
-        value = min(float(max_value), value)
-    return value
+        return default
 
 
-BOT_TOKEN = os.getenv('BOT_TOKEN', '')
-OWNER_ID = env_int('OWNER_ID', 0, min_value=0)
-ALLOWED_USER_IDS = [int(x.strip()) for x in os.getenv('ALLOWED_USER_IDS', '').split(',') if x.strip().isdigit()]
-if OWNER_ID and OWNER_ID not in ALLOWED_USER_IDS:
-    ALLOWED_USER_IDS.append(OWNER_ID)
+BOT_TOKEN = _env("BOT_TOKEN")
+OWNER_ID = _env_int("OWNER_ID", 0)
 
-# Auto signal: medium-balanced, not over-strict.
-AUTO_SIGNAL_ENABLED = env_bool('AUTO_SIGNAL_ENABLED', True)
-AUTO_SCAN_INTERVAL_MINUTES = env_int('AUTO_SCAN_INTERVAL_MINUTES', 4, min_value=1, max_value=1440)
-AUTO_DIRECT_SCORE_MIN = env_int('AUTO_DIRECT_SCORE_MIN', 82, min_value=1, max_value=100)
-AUTO_SIGNAL_SCORE = AUTO_DIRECT_SCORE_MIN  # backward-compatible alias
-AUTO_SIGNAL_COOLDOWN_MINUTES = env_int('AUTO_SIGNAL_COOLDOWN_MINUTES', 30, min_value=0, max_value=1440)
+TOOBIT_API_KEY = _env("TOOBIT_API_KEY")
+TOOBIT_API_SECRET = _env("TOOBIT_API_SECRET")
+TOOBIT_BASE_URL = _env("TOOBIT_BASE_URL", "https://api.toobit.com")
 
-MIN_DIRECT_SCORE = env_int('MIN_DIRECT_SCORE', 82, min_value=1, max_value=100)
-MIN_MANUAL_CONFIRMATIONS = env_int('MIN_MANUAL_CONFIRMATIONS', 4, min_value=0, max_value=20)
-MIN_ADX_FOR_TREND = env_float('MIN_ADX_FOR_TREND', 20, min_value=0, max_value=100)
+# Defaults. Runtime settings can override these through auto_trade_config/trade_state.
+DEFAULT_TRADE_MODE = _env("TRADE_MODE", "PAPER").upper()
+DEFAULT_AI_ENABLED = _env_bool("AI_ENABLED", True)
+DEFAULT_LEARNING_ENABLED = _env_bool("LEARNING_ENABLED", True)
+DEFAULT_DAILY_REPORT_ENABLED = _env_bool("DAILY_REPORT_ENABLED", True)
 
-# Real trading / Toobit controls. Paper mode stays disabled in Telegram controls.
-REAL_TRADING_ENABLED = env_bool('REAL_TRADING_ENABLED', False)
-TOBIT_REAL_TRADING_ENABLED = env_bool('TOBIT_REAL_TRADING_ENABLED', REAL_TRADING_ENABLED)
-PAPER_TRADING_ENABLED = False
+DEFAULT_INITIAL_CAPITAL = _env_float("INITIAL_CAPITAL", 50.0)
+DEFAULT_POSITION_SIZE_USD = _env_float("POSITION_SIZE_USD", 5.0)
+DEFAULT_LEVERAGE = _env_int("LEVERAGE", 15)
+DEFAULT_MAX_POSITIONS = _env_int("MAX_POSITIONS", 10)
 
-MAX_ACTIVE_POSITIONS = env_int('MAX_ACTIVE_POSITIONS', 10, min_value=1, max_value=100)
-MAX_POSITIONS_PER_SYMBOL = env_int('MAX_POSITIONS_PER_SYMBOL', 1, min_value=1, max_value=20)
-MAX_LEVERAGE = env_int('MAX_LEVERAGE', 50, min_value=1, max_value=50)
-DEFAULT_LEVERAGE = env_int('DEFAULT_LEVERAGE', 15, min_value=1, max_value=MAX_LEVERAGE)
-MIN_TRADE_MARGIN_USD = env_float('MIN_TRADE_MARGIN_USD', 1, min_value=0)
-MAX_TRADE_MARGIN_USD = env_float('MAX_TRADE_MARGIN_USD', 1000000, min_value=1)
-DEFAULT_TRADE_MARGIN_USD = env_float('DEFAULT_TRADE_MARGIN_USD', 5, min_value=MIN_TRADE_MARGIN_USD, max_value=MAX_TRADE_MARGIN_USD)
+DEFAULT_DAILY_LOSS_LOCK_AMOUNT = _env_float("DAILY_LOSS_LOCK_AMOUNT", 5.0)
+DEFAULT_DAILY_LOCK_HOURS = _env_float("DAILY_LOCK_HOURS", 1.0)
 
-# Tracker / position sync. 75s matches slot_manager and real_position_sync pending window.
-TRACKER_CHECK_INTERVAL_SECONDS = env_int('TRACKER_CHECK_INTERVAL_SECONDS', 20, min_value=2, max_value=300)
-PENDING_REAL_CONFIRM_TIMEOUT_SECONDS = env_int('PENDING_REAL_CONFIRM_TIMEOUT_SECONDS', 75, min_value=20, max_value=300)
-REAL_POSITION_SYNC_FAST_SECONDS = env_int('REAL_POSITION_SYNC_FAST_SECONDS', 2, min_value=1, max_value=30)
-REAL_POSITION_SYNC_SLOW_SECONDS = env_int('REAL_POSITION_SYNC_SLOW_SECONDS', 10, min_value=2, max_value=300)
+AUTO_SIGNAL_ENABLED = _env_bool("AUTO_SIGNAL_ENABLED", True)
+AUTO_SCAN_INTERVAL_SECONDS = _env_int("AUTO_SCAN_INTERVAL_SECONDS", 180)
+AUTO_SCAN_MAX_SYMBOLS_PER_CYCLE = _env_int("AUTO_SCAN_MAX_SYMBOLS_PER_CYCLE", 40)
 
-# AI / learning memory. 20000 aligns with coin_learning, coin_risk, ghost_signals and sr_learning.
-AI_ENABLED = env_bool('AI_ENABLED', True)
-AI_LEARNING_ENABLED = env_bool('AI_LEARNING_ENABLED', True)
-GHOST_LEARNING_ENABLED = env_bool('GHOST_LEARNING_ENABLED', True)
-MAX_GHOST_SIGNALS = env_int('MAX_GHOST_SIGNALS', 20000, min_value=1000, max_value=200000)
-MAX_SIGNALS_STORED = env_int('MAX_SIGNALS_STORED', 20000, min_value=1000, max_value=200000)
-MAX_RECENT_EVENTS = env_int('MAX_RECENT_EVENTS', 20000, min_value=1000, max_value=200000)
+REAL_CONFIRM_TIMEOUT_SECONDS = _env_int("REAL_CONFIRM_TIMEOUT_SECONDS", 70)
+REAL_CLOSED_PNL_WAIT_SECONDS = _env_int("REAL_CLOSED_PNL_WAIT_SECONDS", 70)
 
-# Daily adaptive strictness starts from the 3rd SL per coin+direction.
-DAILY_SL_STRICTNESS_START = env_int('DAILY_SL_STRICTNESS_START', 3, min_value=1, max_value=20)
-MAX_DAILY_STRICTNESS_LEVEL = env_int('MAX_DAILY_STRICTNESS_LEVEL', 5, min_value=1, max_value=10)
+COMMAND_CACHE_TTL_SECONDS = _env_int("COMMAND_CACHE_TTL_SECONDS", 20)
+MARKET_CACHE_TTL_SECONDS = _env_int("MARKET_CACHE_TTL_SECONDS", 60)
 
-# Daily loss lock defaults: protected-balance logic belongs to real_trade_manager.
-DAILY_LOSS_LOCK_ENABLED = env_bool('DAILY_LOSS_LOCK_ENABLED', True)
-DAILY_LOSS_LIMIT_USD = env_float('DAILY_LOSS_LIMIT_USD', 5.0, min_value=0)
-DAILY_LOCK_HOURS = env_float('DAILY_LOCK_HOURS', 1.0, min_value=0.1, max_value=168)
+ISOLATED_MARGIN_ONLY = True
 
-SCAN_SYMBOLS = [
-    'BTCUSDT','ETHUSDT','SOLUSDT','BNBUSDT','XRPUSDT','DOGEUSDT','ADAUSDT','AVAXUSDT',
-    'LINKUSDT','TONUSDT','TRXUSDT','DOTUSDT','LTCUSDT','BCHUSDT','UNIUSDT','APTUSDT',
-    'ARBUSDT','OPUSDT','NEARUSDT','FILUSDT','INJUSDT','ATOMUSDT','SUIUSDT','SEIUSDT',
-    'ETCUSDT','AAVEUSDT','ICPUSDT','TIAUSDT','ORDIUSDT','WIFUSDT','PEPEUSDT','SHIBUSDT',
-    'FLOKIUSDT','BONKUSDT','JUPUSDT','FTMUSDT','GALAUSDT','LDOUSDT','RUNEUSDT','MKRUSDT'
+CORE_DATA_FILES = {
+    "ai_memory": DATA_DIR / "ai_memory.json",
+    "ai_weights": DATA_DIR / "ai_weights.json",
+    "ghost_signals": DATA_DIR / "ghost_signals.json",
+    "active_signals": DATA_DIR / "active_signals.json",
+    "trade_state": DATA_DIR / "trade_state.json",
+    "stats": DATA_DIR / "stats.json",
+    "coin_learning": DATA_DIR / "coin_learning.json",
+    "coin_risk": DATA_DIR / "coin_risk.json",
+    "coin_rotation": DATA_DIR / "coin_rotation.json",
+    "sr_learning": DATA_DIR / "sr_learning.json",
+    "market_cache": DATA_DIR / "market_cache.json",
+    "diagnostics": LOG_DIR / "diagnostics.log",
+}
+
+DEFAULT_SYMBOLS: List[str] = [
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
+    "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "TRXUSDT",
+    "DOTUSDT", "MATICUSDT", "LTCUSDT", "BCHUSDT", "ATOMUSDT",
+    "NEARUSDT", "INJUSDT", "APTUSDT", "ARBUSDT", "OPUSDT",
+    "SUIUSDT", "FILUSDT", "ETCUSDT", "UNIUSDT", "AAVEUSDT",
+    "PEPEUSDT", "SHIBUSDT", "WIFUSDT", "TIAUSDT", "SEIUSDT",
 ]
+
+
+@dataclass
+class RuntimeDefaults:
+    trade_mode: str = DEFAULT_TRADE_MODE
+    ai_enabled: bool = DEFAULT_AI_ENABLED
+    learning_enabled: bool = DEFAULT_LEARNING_ENABLED
+    daily_report_enabled: bool = DEFAULT_DAILY_REPORT_ENABLED
+    initial_capital: float = DEFAULT_INITIAL_CAPITAL
+    protected_balance: float = DEFAULT_INITIAL_CAPITAL
+    balance: float = DEFAULT_INITIAL_CAPITAL
+    position_size_usd: float = DEFAULT_POSITION_SIZE_USD
+    leverage: int = DEFAULT_LEVERAGE
+    max_positions: int = DEFAULT_MAX_POSITIONS
+    emergency_stop: bool = False
+    daily_loss_lock_enabled: bool = True
+    daily_loss_lock_amount: float = DEFAULT_DAILY_LOSS_LOCK_AMOUNT
+    daily_lock_hours: float = DEFAULT_DAILY_LOCK_HOURS
+    conservative_mode: bool = False
+    auto_signal_enabled: bool = AUTO_SIGNAL_ENABLED
+    isolated_margin_only: bool = ISOLATED_MARGIN_ONLY
+
+
+def ensure_directories() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def runtime_defaults_dict() -> Dict[str, Any]:
+    return asdict(RuntimeDefaults())
+
+
+def validate_static_config() -> Dict[str, Any]:
+    """Return config health without raising. Used by diagnostics/validate_source."""
+    ensure_directories()
+    issues = []
+    if not BOT_TOKEN:
+        issues.append("BOT_TOKEN is missing; Telegram bot cannot start.")
+    if OWNER_ID == 0:
+        issues.append("OWNER_ID is missing or invalid; owner-only alerts may not work.")
+    if DEFAULT_TRADE_MODE not in {"PAPER", "REAL"}:
+        issues.append(f"Invalid TRADE_MODE={DEFAULT_TRADE_MODE}; expected PAPER or REAL.")
+    if DEFAULT_LEVERAGE < 1 or DEFAULT_LEVERAGE > 50:
+        issues.append("DEFAULT_LEVERAGE must be between 1 and 50.")
+    if DEFAULT_MAX_POSITIONS < 1:
+        issues.append("DEFAULT_MAX_POSITIONS must be at least 1.")
+    return {
+        "ok": len(issues) == 0,
+        "issues": issues,
+        "data_dir": str(DATA_DIR),
+        "backup_dir": str(BACKUP_DIR),
+        "log_dir": str(LOG_DIR),
+    }
