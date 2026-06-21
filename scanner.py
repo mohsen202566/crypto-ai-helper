@@ -6,9 +6,8 @@ Scanner / Candidate Orchestrator.
 Responsibilities:
 - Convert market snapshots to AI candidates.
 - Ask ai_movement_hunter for decisions.
-- Route SETUP to signal_tracker.
 - Route REAL/PAPER to real_trade_manager.
-- Route GHOST to ghost_signals/signal_tracker.
+- Route GHOST to ghost_signals/signal_tracker silently for learning.
 - Connect real confirmation after REAL order through real_position_sync.
 - Provide best-signal and auto-scan functions.
 
@@ -159,37 +158,10 @@ def route_decision(decision: Dict[str, Any], trade_mode: Optional[str] = None, r
 @safe(default=[])
 def process_watching_setups(limit: int = 20, trade_mode: Optional[str] = None) -> List[Dict[str, Any]]:
     """
-    Re-check SETUP/WATCHING signals and activate them when AI confirms entry.
-    This completes the SETUP -> ENTRY_ACTIVATION flow.
+    Final architecture has no SETUP/WATCHING activation flow.
+    Kept only as a compatibility no-op so old callers do not crash.
     """
-    setups = [s for s in signal_tracker.active_signals() if s.get("status") == signal_tracker.STATUS_WATCHING][:limit]
-    routed: List[Dict[str, Any]] = []
-    if not setups:
-        return routed
-
-    state = slot_manager.slot_state()
-    for s in setups:
-        symbol = s.get("symbol")
-        if not symbol:
-            continue
-        snap = market_scanner.build_symbol_snapshot(symbol, timeframes=["5m", "15m", "30m", "1h", "4h"], limit=140)
-        if not snap.get("ok"):
-            continue
-        market_status = market_scanner.scan_market(symbols=[symbol, "BTCUSDT"], use_cache=True).get("market_context", {})
-        cand = build_candidate_from_snapshot(snap, market_status, state)
-        cand["existing_setup_id"] = s.get("signal_id")
-        d = ai_movement_hunter.decide(cand, record=False)
-        if d.get("decision") in {"ENTRY_ACTIVATION", "REAL", "GHOST"}:
-            # activate existing setup rather than creating a duplicate setup
-            mode = (trade_mode or real_trade_manager.trade_status().get("mode") or "PAPER").upper()
-            if d.get("decision") == "GHOST":
-                signal_tracker.activate_signal(s.get("signal_id"), d, mode=signal_tracker.TYPE_GHOST, reserve_slot=False)
-                routed.append({"ok": True, "routed": True, "type": "GHOST_ACTIVATED", "signal_id": s.get("signal_id"), "decision": d})
-            else:
-                # Let trade manager open/register a real active trade from this decision.
-                res = real_trade_manager.open_trade({**d, "signal_id": s.get("signal_id"), "record_id": s.get("ai_record_id")}, mode=mode)
-                routed.append({"ok": res.get("ok", False), "routed": res.get("ok", False), "type": mode, "trade": res, "signal_id": s.get("signal_id"), "decision": d})
-    return routed
+    return []
 
 
 @safe(default=0)
