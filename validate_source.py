@@ -1,32 +1,25 @@
-# -*- coding: utf-8 -*-
-"""Local validation helper: compile all Python files and check important imports."""
-import compileall
-import importlib
-import os
-import sys
+from __future__ import annotations
 
-ok = compileall.compile_dir('.', quiet=1, maxlevels=1)
-if not ok:
-    print('COMPILE_FAILED')
-    sys.exit(1)
+import py_compile
+from pathlib import Path
 
-modules = [
-    'config','data_store','ai_memory','coin_learning','coin_risk','coin_rotation',
-    'slot_manager','ghost_signals','sr_learning','paper_trader','analysis','scanner',
-    'signal_tracker','bot'
-]
-failed = []
-for name in modules:
-    try:
-        importlib.import_module(name)
-    except Exception as exc:
-        failed.append((name, repr(exc)))
+ROOT = Path(__file__).resolve().parent
 
-if failed:
-    print('IMPORT_WARNINGS_OR_FAILURES:')
-    for name, exc in failed:
-        print(f'- {name}: {exc}')
-    # Some imports can fail when optional runtime deps/env/network libraries are missing.
-    sys.exit(2)
+def main() -> int:
+    py_files = sorted(p for p in ROOT.glob("*.py") if p.name != "__init__.py")
+    failed = []
+    for p in py_files:
+        try:
+            py_compile.compile(str(p), doraise=True)
+            print(f"OK {p.name}")
+        except Exception as e:
+            failed.append((p.name, str(e)))
+            print(f"FAIL {p.name}: {e}")
+    if failed:
+        print("FAILED", failed)
+        return 1
+    print("OK all python files compile")
+    return 0
 
-print('OK: compile and imports passed')
+if __name__ == "__main__":
+    raise SystemExit(main())
