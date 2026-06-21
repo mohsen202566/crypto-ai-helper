@@ -1,268 +1,137 @@
-# -*- coding: utf-8 -*-
+from __future__ import annotations
+
 """
-trend_analysis.py
+Multi-timeframe trend context.
 
-Soft trend / breakout helper layer for the crypto futures bot.
+This module is a sensor/context module.
+It does not create signals. It tells AI how timeframes align.
 
-Goals:
-- Preserve old public functions:
-    detect_trendline
-    detect_breakout
-    trendline_score
-    breakout_score
-- Avoid crashes on short/dirty DataFrames.
-- Keep this module as a SOFT signal helper, not a hard filter.
-- Support better near-term direction detection for 5M-15M scalping by adding
-  compact profile data usable by analysis.py / scanner.py.
+Hierarchy for user's scalp architecture:
+5M = primary entry trigger
+15M = entry readiness
+30M = setup quality
+1H = direction confirmation
+4H = macro context
 """
 
 import math
-from typing import Any, Dict, Tuple
+import time
+from typing import Any, Dict, List, Optional
+
+from diagnostics import safe
 
 
-REQUIRED_COLUMNS = ("high", "low", "close")
-OPTIONAL_VOLUME_COLUMN = "volume"
+TF_WEIGHTS = {
+    "5m": 0.34,
+    "15m": 0.26,
+    "30m": 0.18,
+    "1h": 0.14,
+    "4h": 0.08,
+    "5M": 0.34,
+    "15M": 0.26,
+    "30M": 0.18,
+    "1H": 0.14,
+    "4H": 0.08,
+}
 
 
-def _safe_float(value: Any, default: float = 0.0) -> float:
+def _safe_float(v: Any, default: float = 0.0) -> float:
     try:
-        if value is None:
-            return float(default)
-        v = float(value)
-        if math.isnan(v) or math.isinf(v):
-            return float(default)
-        return v
+        f = float(v)
+        if math.isnan(f) or math.isinf(f):
+            return default
+        return f
     except Exception:
-        return float(default)
+        return default
 
 
-def _has_columns(df, columns) -> bool:
-    try:
-        return df is not None and all(c in df.columns for c in columns)
-    except Exception:
-        return False
+def _tf_score(tf_snapshot: Dict[str, Any]) -> float:
+    ind = tf_snapshot.get("indicators", tf_snapshot or {})
+    score = 0.0
+    ema_state = str(ind.get("ema_state", "MIXED"))
+    if ema_state == "STRONG_BULLISH":
+        score += 1.0
+    elif ema_state == "BULLISH":
+        score += 0.55
+    elif ema_state == "STRONG_BEARISH":
+        score -= 1.0
+    elif ema_state == "BEARISH":
+        score -= 0.55
+
+    macd_hist = _safe_float(ind.get("macd_hist"))
+    score += 0.35 if macd_hist > 0 else -0.35 if macd_hist < 0 else 0.0
+
+    rsi = _safe_float(ind.get("rsi"), 50)
+    if rsi > 55:
+        score += min(0.35, (rsi - 55) / 45)
+    elif rsi < 45:
+        score -= min(0.35, (45 - rsi) / 45)
+
+    power = _safe_float(ind.get("power_3"))
+    score += max(-0.35, min(0.35, power / 100))
+
+    fresh = _safe_float(ind.get("fresh_momentum"))
+    score += max(-0.35, min(0.35, fresh * 0.35))
+
+    return round(max(-1.0, min(1.0, score)), 4)
 
 
-def _clean_df(df):
-    """Return a compact numeric dataframe slice-safe view."""
-    if not _has_columns(df, REQUIRED_COLUMNS):
-        return None
-    try:
-        out = df.copy()
-        for col in set(REQUIRED_COLUMNS + (OPTIONAL_VOLUME_COLUMN,)):
-            if col in out.columns:
-                out[col] = out[col].astype(float)
-        out = out.dropna(subset=list(REQUIRED_COLUMNS))
-        if len(out) < 5:
-            return None
-        return out
-    except Exception:
-        return None
+@safe(default={})
+def analyze_trend(mtf_features: Dict[str, Any]) -> Dict[str, Any]:
+    tfs = mtf_features.get("timeframes", mtf_features or {})
+    tf_scores = {}
+    weighted = 0.0
+    total_w = 0.0
+    for tf, snap in tfs.items():
+        if not isinstance(snap, dict) or not snap.get("ok", True):
+            continue
+        s = _tf_score(snap)
+        w = TF_WEIGHTS.get(tf, TF_WEIGHTS.get(str(tf).lower(), 0.1))
+        tf_scores[tf] = {"score": s, "weight": w, "direction": "LONG" if s > 0.2 else "SHORT" if s < -0.2 else "NEUTRAL"}
+        weighted += s * w
+        total_w += w
+    final = weighted / total_w if total_w > 0 else 0.0
 
-
-def _ema(values, period: int):
-    try:
-        return values.ewm(span=period, adjust=False).mean()
-    except Exception:
-        return None
-
-
-def detect_trendline(df, lookback=80):
-    """
-    Detect broad trend direction.
-
-    Return values kept backward-compatible:
-    - uptrend
-    - downtrend
-    - sideways
-    - unknown
-    """
-    d = _clean_df(df)
-    if d is None:
-        return "unknown"
-
-    lookback = max(12, int(lookback or 80))
-    if len(d) < max(12, lookback // 2):
-        return "unknown"
-
-    recent = d.tail(min(lookback, len(d)))
-    if len(recent) < 12:
-        return "unknown"
-
-    mid = max(1, len(recent) // 2)
-    first = recent.iloc[:mid]
-    second = recent.iloc[mid:]
-
-    first_low = _safe_float(first["low"].min())
-    second_low = _safe_float(second["low"].min())
-    first_high = _safe_float(first["high"].max())
-    second_high = _safe_float(second["high"].max())
-    first_close = _safe_float(first["close"].iloc[-1])
-    second_close = _safe_float(second["close"].iloc[-1])
-
-    # ATR-like tolerance prevents tiny noise from flipping the trend.
-    avg_range = _safe_float((recent["high"] - recent["low"]).tail(20).mean())
-    last_close = max(_safe_float(recent["close"].iloc[-1]), 1e-12)
-    tolerance = max(avg_range * 0.15, last_close * 0.0008)
-
-    higher_lows = second_low > first_low + tolerance
-    higher_highs = second_high > first_high + tolerance
-    lower_lows = second_low < first_low - tolerance
-    lower_highs = second_high < first_high - tolerance
-
-    if higher_lows and higher_highs and second_close >= first_close - tolerance:
-        return "uptrend"
-
-    if lower_lows and lower_highs and second_close <= first_close + tolerance:
-        return "downtrend"
-
-    return "sideways"
-
-
-def detect_breakout(df, lookback=30):
-    """
-    Detect fresh breakout or fake breakout.
-
-    Return values kept backward-compatible:
-    - bullish_breakout
-    - bearish_breakout
-    - fake_bullish_breakout
-    - fake_bearish_breakout
-    - no_breakout
-    - unknown
-    """
-    d = _clean_df(df)
-    if d is None:
-        return "unknown"
-
-    lookback = max(10, int(lookback or 30))
-    if len(d) < lookback + 1:
-        return "unknown"
-
-    recent = d.tail(lookback + 1)
-    last = recent.iloc[-1]
-    previous = recent.iloc[:-1]
-
-    resistance = _safe_float(previous["high"].max())
-    support = _safe_float(previous["low"].min())
-    close = _safe_float(last["close"])
-    high = _safe_float(last["high"])
-    low = _safe_float(last["low"])
-
-    last_volume = _safe_float(last.get("volume", 0.0), 0.0)
-    if "volume" in previous.columns:
-        avg_volume = _safe_float(previous["volume"].mean(), 0.0)
-    else:
-        avg_volume = 0.0
-
-    # If volume is unavailable, do not block detection; just require a cleaner close.
-    volume_ok = True if avg_volume <= 0 else last_volume > avg_volume * 1.25
-
-    range_avg = _safe_float((previous["high"] - previous["low"]).tail(20).mean())
-    tolerance = max(range_avg * 0.08, max(close, 1e-12) * 0.0005)
-
-    bullish_close_break = close > resistance + tolerance
-    bearish_close_break = close < support - tolerance
-
-    if bullish_close_break and volume_ok:
-        return "bullish_breakout"
-
-    if bearish_close_break and volume_ok:
-        return "bearish_breakout"
-
-    # Fake breakout / liquidity sweep style reactions.
-    if high > resistance + tolerance and close < resistance:
-        return "fake_bullish_breakout"
-
-    if low < support - tolerance and close > support:
-        return "fake_bearish_breakout"
-
-    return "no_breakout"
-
-
-def trendline_score(trendline):
-    """
-    Soft scoring only. Keep weights moderate so this helper does not dominate AI.
-    Returns: (long_score, short_score)
-    """
-    if trendline == "uptrend":
-        return 8, 0
-
-    if trendline == "downtrend":
-        return 0, 8
-
-    return 0, 0
-
-
-def breakout_score(breakout):
-    """
-    Soft scoring only. Fake bullish breakout favors SHORT; fake bearish favors LONG.
-    Returns: (long_score, short_score)
-    """
-    if breakout == "bullish_breakout":
-        return 10, 0
-
-    if breakout == "bearish_breakout":
-        return 0, 10
-
-    if breakout == "fake_bullish_breakout":
-        return 0, 7
-
-    if breakout == "fake_bearish_breakout":
-        return 7, 0
-
-    return 0, 0
-
-
-def get_trend_profile(df, trend_lookback: int = 80, breakout_lookback: int = 30) -> Dict[str, Any]:
-    """
-    New non-breaking helper for analysis/scanner.
-
-    This provides a compact profile for AI coordination:
-    - trendline
-    - breakout
-    - long/short soft scores
-    - directional_bias
-    - confidence
-    """
-    trendline = detect_trendline(df, trend_lookback)
-    breakout = detect_breakout(df, breakout_lookback)
-
-    tl_long, tl_short = trendline_score(trendline)
-    bo_long, bo_short = breakout_score(breakout)
-
-    long_score = tl_long + bo_long
-    short_score = tl_short + bo_short
-
-    if long_score > short_score:
-        bias = "BULLISH"
-    elif short_score > long_score:
-        bias = "BEARISH"
-    else:
-        bias = "NEUTRAL"
-
-    strength = abs(long_score - short_score)
-    if trendline == "unknown" or breakout == "unknown":
-        confidence = "LOW_DATA"
-    elif strength >= 14:
-        confidence = "HIGH"
-    elif strength >= 7:
-        confidence = "MEDIUM"
-    else:
-        confidence = "LOW"
+    direction = "LONG" if final > 0.18 else "SHORT" if final < -0.18 else "NEUTRAL"
+    alignment = abs(final)
+    conflict = _conflict_score(tf_scores)
 
     return {
-        "trendline": trendline,
-        "breakout": breakout,
-        "long_score": int(long_score),
-        "short_score": int(short_score),
-        "directional_bias": bias,
-        "confidence": confidence,
-        "soft_layer": True,
-        "source": "trend_analysis",
+        "ok": True,
+        "trend_score": round(final, 4),
+        "direction": direction,
+        "alignment": round(alignment, 4),
+        "conflict": conflict,
+        "timeframes": tf_scores,
+        "scalp_hierarchy": "5M>15M>30M>1H>4H",
+        "created_at": int(time.time()),
     }
 
 
-# Backward-compatible alias names that future files may import.
-trend_profile = get_trend_profile
-detect_trend_profile = get_trend_profile
+def _conflict_score(tf_scores: Dict[str, Dict[str, Any]]) -> float:
+    longs = sum(1 for x in tf_scores.values() if x.get("direction") == "LONG")
+    shorts = sum(1 for x in tf_scores.values() if x.get("direction") == "SHORT")
+    total = max(1, longs + shorts)
+    return round(min(longs, shorts) / total, 4)
+
+
+@safe(default={})
+def entry_readiness(mtf_features: Dict[str, Any], direction: str) -> Dict[str, Any]:
+    tfs = mtf_features.get("timeframes", mtf_features or {})
+    direction = str(direction).upper()
+    score = 0.0
+    notes = []
+    risks = []
+    for tf, weight in [("5m", 0.55), ("5M", 0.55), ("15m", 0.35), ("15M", 0.35), ("30m", 0.10), ("30M", 0.10)]:
+        snap = tfs.get(tf)
+        if not snap:
+            continue
+        s = _tf_score(snap)
+        aligned = s > 0.15 if direction == "LONG" else s < -0.15
+        if aligned:
+            score += abs(s) * weight
+            notes.append(f"{tf}_aligned")
+        else:
+            score -= abs(s) * weight * 0.55
+            risks.append(f"{tf}_not_aligned")
+    return {"direction": direction, "entry_readiness": round(max(-1, min(1, score)), 4), "notes": notes, "risks": risks}
