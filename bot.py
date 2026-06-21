@@ -352,9 +352,9 @@ async def send_routed_results(app: Application, routed: List[Dict[str, Any]]) ->
         if "GHOST" in typ:
             continue
         if typ == "SETUP":
-            text = reply_manager.setup_message_fa(decision)
-        else:
-            text = reply_manager.active_signal_message_fa(decision)
+            # SETUP messages are removed from final Movement Hunter architecture.
+            continue
+        text = reply_manager.active_signal_message_fa(decision)
         msg = await app.bot.send_message(chat_id=OWNER_ID, text=text)
         reply_manager.register_signal_message(
             signal_id=str(signal_id),
