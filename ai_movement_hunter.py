@@ -10,7 +10,7 @@ Important:
 - This module does not fetch candles directly.
 - This module does not send Telegram messages.
 - This module does not place trades.
-- It decides SETUP / WAIT / ENTRY_ACTIVATION / REAL / GHOST / REJECT.
+- It decides REAL / GHOST / WAIT / REJECT. SETUP/ENTRY_ACTIVATION are kept only as legacy constants for compatibility and are not produced by this module.
 - It prepares smart TP/SL suggestions, confidence, module scores, and metadata.
 - It records decisions into ai_memory when requested.
 
@@ -488,23 +488,28 @@ def _final_decision(symbol: str, direction: str, confidence: float, priority: fl
     entry_score = modules.get("entry_quality", ModuleScore(0.5, 1)).score
     momentum = modules.get("fresh_momentum", ModuleScore(0.5, 1)).score
 
-    # Existing setup becomes entry activation when entry quality and momentum are ready.
-    if existing_setup_id and confidence >= 0.58 and entry_score >= 0.58 and momentum >= 0.57:
-        if free_slots > 0 and confidence >= 0.66 and not learning_only:
-            return DECISION_ENTRY, "setup_entry_activated_real"
-        return DECISION_GHOST, "setup_entry_activated_ghost_no_slot_or_learning"
+    # Final architecture: no SETUP / no waiting activation.
+    # AI Movement Hunter must directly route candidates to REAL, GHOST, WAIT, or REJECT.
+    # REAL = strong enough now and slot available.
+    # GHOST = good/learnable but not safe enough for real, slot is full, learning-only mode, or uncertainty is high.
+    if existing_setup_id and confidence >= 0.58 and entry_score >= 0.56 and momentum >= 0.55:
+        if free_slots > 0 and confidence >= 0.64 and not learning_only:
+            return DECISION_REAL, "legacy_setup_converted_to_real"
+        return DECISION_GHOST, "legacy_setup_converted_to_ghost"
 
-    # Fresh movement forming but entry not complete -> SETUP.
-    if confidence >= 0.54 and (momentum >= 0.56 or entry_score >= 0.55) and confidence < 0.68:
-        return DECISION_SETUP, "movement_forming_setup"
+    strong_now = confidence >= 0.64 and entry_score >= 0.55 and momentum >= 0.54
+    decent_learnable = confidence >= 0.54 and (entry_score >= 0.52 or momentum >= 0.52)
 
-    if confidence >= 0.68 and entry_score >= 0.58 and momentum >= 0.56:
+    if strong_now:
         if free_slots > 0 and not learning_only:
-            return DECISION_REAL, "real_allowed_high_confidence"
+            return DECISION_REAL, "real_allowed_ai_movement_ready"
         return DECISION_GHOST, "ghost_slot_full_or_learning"
 
-    if confidence >= 0.50:
-        return DECISION_WAIT, "wait_for_entry_confirmation"
+    if decent_learnable:
+        return DECISION_GHOST, "ghost_ai_not_strong_enough_for_real"
+
+    if confidence >= 0.48:
+        return DECISION_WAIT, "wait_low_edge"
 
     return DECISION_REJECT, "low_confidence"
 
@@ -662,7 +667,7 @@ def format_decision_fa(decision: Dict[str, Any]) -> str:
     if d == DECISION_WAIT:
         return f"⏳ منتظر تایید ورود\nارز: {symbol}\nجهت: {direction}\nاعتماد: {conf}%"
     if d == DECISION_SETUP:
-        return f"🟡 ستاپ در حال شکل‌گیری\nارز: {symbol}\nجهت احتمالی: {direction}\nاعتماد: {conf}%"
+        return f"👻 سیگنال مخفی / ستاپ قدیمی حذف شد\nارز: {symbol}\nجهت: {direction}\nاعتماد: {conf}%"
     if d in {DECISION_REAL, DECISION_ENTRY}:
         return f"✅ سیگنال فعال\nارز: {symbol}\nجهت: {direction}\nورود: {entry}\nTP1: {tp1}\nTP2: {tp2}\nSL: {sl}\nاعتماد: {conf}%"
     if d == DECISION_GHOST:
