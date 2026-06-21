@@ -101,7 +101,7 @@ def auto_scan_and_route(symbols: Optional[List[str]] = None, trade_mode: Optiona
     state = slot_manager.slot_state()
     free = int(state.get("free_slots", 0))
 
-    # First route high priority REAL/ENTRY candidates limited by free slots.
+    # Final architecture: no SETUP routing. Only REAL/ENTRY candidates open trades.
     real_candidates = [d for d in decisions if d.get("decision") in {"REAL", "ENTRY_ACTIVATION"}]
     real_candidates = ai_movement_hunter.rank_decisions(real_candidates, open_positions=state.get("open_positions", []), limit=free)
 
@@ -109,14 +109,14 @@ def auto_scan_and_route(symbols: Optional[List[str]] = None, trade_mode: Optiona
         res = route_decision(d, trade_mode=trade_mode, record=record)
         routed.append(res)
 
-    # SETUPs are stored/watchlisted even if not active.
-    setup_candidates = [d for d in decisions if d.get("decision") == "SETUP"]
-    for d in setup_candidates[:20]:
-        res = route_decision(d, trade_mode=trade_mode, record=record)
-        routed.append(res)
-
-    # Ghosts for learning when slots are full or AI selected GHOST.
-    ghost_candidates = [d for d in decisions if d.get("decision") == "GHOST"]
+    # Ghosts are stored silently for learning. Legacy SETUP decisions are downgraded to GHOST
+    # so no user-visible waiting setup is created.
+    ghost_candidates = []
+    for d in decisions:
+        if d.get("decision") == "GHOST":
+            ghost_candidates.append(d)
+        elif d.get("decision") == "SETUP":
+            ghost_candidates.append({**d, "decision": "GHOST", "reason": d.get("reason") or "legacy_setup_to_ghost"})
     for d in ghost_candidates[:20]:
         res = route_decision(d, trade_mode=trade_mode, record=record)
         routed.append(res)
@@ -132,8 +132,9 @@ def route_decision(decision: Dict[str, Any], trade_mode: Optional[str] = None, r
         return {"ok": True, "routed": False, "decision": d, "reason": decision.get("reason")}
 
     if d == "SETUP":
-        sid = signal_tracker.create_setup(decision)
-        return {"ok": bool(sid), "routed": bool(sid), "type": "SETUP", "signal_id": sid, "decision": decision}
+        # SETUP is removed from final architecture. Downgrade legacy setup to silent GHOST.
+        decision = {**decision, "decision": "GHOST", "reason": decision.get("reason") or "legacy_setup_to_ghost"}
+        d = "GHOST"
 
     if d == "GHOST":
         gid = ghost_signals.create_ghost(decision, reason=decision.get("reason", "ai_ghost"))
@@ -264,7 +265,7 @@ def scan_report_fa(symbols: Optional[List[str]] = None) -> str:
     errors = scan.get("errors", {}) or {}
 
     real = sum(1 for d in decisions if d.get("decision") in {"REAL", "ENTRY_ACTIVATION"})
-    setup = sum(1 for d in decisions if d.get("decision") == "SETUP")
+    setup = 0  # SETUP removed from final architecture
     ghost = sum(1 for d in decisions if d.get("decision") == "GHOST")
     wait = sum(1 for d in decisions if d.get("decision") == "WAIT")
     reject = sum(1 for d in decisions if d.get("decision") == "REJECT")
@@ -297,7 +298,7 @@ def scan_report_fa(symbols: Optional[List[str]] = None) -> str:
     return (
         "🔎 گزارش اسکن بازار\n"
         f"بررسی‌شده: {ok_count}/{requested} | خطا: {len(errors)}\n"
-        f"Real/Entry: {real} | Setup: {setup} | Ghost: {ghost}\n"
+        f"Real/Entry: {real} | Ghost: {ghost}\n"
         f"Wait: {wait} | Reject: {reject} | NoData/NoTrade: {no_trade}\n"
         + (f"\nکاندیدهای AI:\n{top_rows}\n" if top_rows else "\nکاندید AI پیدا نشد.\n")
         + f"\n{market_status}"
