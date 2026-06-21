@@ -54,6 +54,85 @@ def _round_step(value: float, step: float) -> float:
     return float((d_value / d_step).to_integral_value(rounding=ROUND_DOWN) * d_step)
 
 
+def _okx_bar(interval: str) -> str:
+    """Convert bot/Binance-style interval to OKX candle bar."""
+    tf = str(interval or "5m").strip()
+    mapping = {
+        "1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m",
+        "1h": "1H", "2h": "2H", "4h": "4H", "6h": "6H", "12h": "12H",
+        "1d": "1D",
+        "1H": "1H", "2H": "2H", "4H": "4H", "6H": "6H", "12H": "12H", "1D": "1D",
+    }
+    return mapping.get(tf, tf)
+
+
+def _okx_inst_id(symbol: str) -> str:
+    """Convert BTCUSDT / BTC-USDT to OKX perpetual swap instId: BTC-USDT-SWAP."""
+    s = str(symbol or "").upper().replace("/", "-").replace("_", "-")
+    if s.endswith("-SWAP"):
+        return s
+    if "-" in s:
+        parts = [x for x in s.split("-") if x]
+        if len(parts) >= 2:
+            return f"{parts[0]}-{parts[1]}-SWAP"
+    for quote in ("USDT", "USDC", "USD"):
+        if s.endswith(quote) and len(s) > len(quote):
+            base = s[:-len(quote)]
+            return f"{base}-{quote}-SWAP"
+    return s
+
+
+def _parse_okx_candles(raw: Any) -> List[Dict[str, Any]]:
+    rows = []
+    if isinstance(raw, dict):
+        rows = raw.get("data", [])
+    elif isinstance(raw, list):
+        rows = raw
+    candles: List[Dict[str, Any]] = []
+    for row in rows or []:
+        if not isinstance(row, list) or len(row) < 6:
+            continue
+        candles.append({
+            "timestamp": int(_safe_float(row[0])),
+            "open": _safe_float(row[1]),
+            "high": _safe_float(row[2]),
+            "low": _safe_float(row[3]),
+            "close": _safe_float(row[4]),
+            "volume": _safe_float(row[5]),
+        })
+    # OKX returns newest first; scanner/analysis expect oldest -> newest.
+    candles.sort(key=lambda x: x.get("timestamp", 0))
+    return candles
+
+
+def _parse_binance_like_candles(raw: Any) -> List[Dict[str, Any]]:
+    if isinstance(raw, dict):
+        raw = raw.get("data", raw.get("rows", raw.get("result", [])))
+    candles: List[Dict[str, Any]] = []
+    for row in raw or []:
+        if isinstance(row, list) and len(row) >= 6:
+            candles.append({
+                "timestamp": int(_safe_float(row[0])),
+                "open": _safe_float(row[1]),
+                "high": _safe_float(row[2]),
+                "low": _safe_float(row[3]),
+                "close": _safe_float(row[4]),
+                "volume": _safe_float(row[5]),
+            })
+        elif isinstance(row, dict):
+            candles.append({
+                "timestamp": int(_safe_float(row.get("openTime", row.get("timestamp", row.get("time", 0))))),
+                "open": _safe_float(row.get("open")),
+                "high": _safe_float(row.get("high")),
+                "low": _safe_float(row.get("low")),
+                "close": _safe_float(row.get("close")),
+                "volume": _safe_float(row.get("volume")),
+            })
+    candles = [c for c in candles if c.get("timestamp") and c.get("close")]
+    candles.sort(key=lambda x: x.get("timestamp", 0))
+    return candles
+
+
 class ToobitClient:
     def __init__(
         self,
@@ -134,36 +213,39 @@ class ToobitClient:
 
     @safe(default=[])
     def klines(self, symbol: str, interval: str = "5m", limit: int = 120) -> List[Dict[str, Any]]:
-        symbol = symbol.upper()
+        """
+        Return candles in the bot's standard format, sorted oldest -> newest.
+
+        Market analysis previously used OKX data, while this client is also used for
+        Toobit real trading/private endpoints. To keep the rest of the bot unchanged,
+        public candles are fetched from OKX first and Toobit is kept only as fallback.
+        """
+        symbol = str(symbol or "").upper()
+        limit = max(1, min(int(limit or 120), 300))
+
+        # Primary public data source: OKX perpetual swap candles.
+        try:
+            okx_res = self.session.get(
+                "https://www.okx.com/api/v5/market/candles",
+                params={"instId": _okx_inst_id(symbol), "bar": _okx_bar(interval), "limit": limit},
+                timeout=self.timeout,
+            )
+            okx_data = okx_res.json()
+            if okx_res.status_code < 400 and str(okx_data.get("code", "0")) == "0":
+                candles = _parse_okx_candles(okx_data)
+                if candles:
+                    return candles[-limit:]
+        except Exception as e:
+            record_error(e, module="tobit_client", function="klines_okx", context={"symbol": symbol, "interval": interval})
+
+        # Fallback: Toobit/Binance-compatible public endpoints.
         for path in ["/api/v1/klines", "/fapi/v1/klines"]:
             res = self._request("GET", path, params={"symbol": symbol, "interval": interval, "limit": limit})
             if not res.get("ok"):
                 continue
-            raw = res.get("data", [])
-            if isinstance(raw, dict):
-                raw = raw.get("data", raw.get("rows", []))
-            candles = []
-            for row in raw:
-                if isinstance(row, list) and len(row) >= 6:
-                    candles.append({
-                        "timestamp": int(_safe_float(row[0])),
-                        "open": _safe_float(row[1]),
-                        "high": _safe_float(row[2]),
-                        "low": _safe_float(row[3]),
-                        "close": _safe_float(row[4]),
-                        "volume": _safe_float(row[5]),
-                    })
-                elif isinstance(row, dict):
-                    candles.append({
-                        "timestamp": int(_safe_float(row.get("openTime", row.get("timestamp", row.get("time", 0))))),
-                        "open": _safe_float(row.get("open")),
-                        "high": _safe_float(row.get("high")),
-                        "low": _safe_float(row.get("low")),
-                        "close": _safe_float(row.get("close")),
-                        "volume": _safe_float(row.get("volume")),
-                    })
+            candles = _parse_binance_like_candles(res.get("data", []))
             if candles:
-                return candles
+                return candles[-limit:]
         return []
 
     # Symbol filters
