@@ -310,11 +310,16 @@ class PredictionLearningAdjustmentEngine:
         elif prediction.predicted_phase == "START":
             tp2 += 0.10
             reasons.append("START_PHASE_TP2_OK")
-        elif prediction.predicted_phase in {"LATE", "RANGE"}:
+        elif prediction.predicted_phase == "LATE":
+            tp1 -= 0.18
+            tp2 -= 0.45
+            sl += 0.12
+            reasons.append("LATE_CONSERVATIVE_TP_STRONGER")
+        elif prediction.predicted_phase == "RANGE":
             tp1 -= 0.12
             tp2 -= 0.35
             sl += 0.10
-            reasons.append("LATE_OR_RANGE_CONSERVATIVE_TP")
+            reasons.append("RANGE_CONSERVATIVE_TP")
 
         if prediction.expected_move_percent > 0:
             # Convert expected percent into soft ATR estimate when enough memory exists.
@@ -372,7 +377,7 @@ class TPModeEngine:
             return TP_MODE_TP1_ONLY, reasons
 
         strong = (
-            decision.ai_score >= 72
+            decision.ai_score >= 70
             and movement.continuation_probability >= 60
             and confidence.confidence_score >= 60
             and prediction.movement_probability >= 60
