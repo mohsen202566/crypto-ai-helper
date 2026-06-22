@@ -1280,11 +1280,35 @@ async def auto_scan_loop(app: Any) -> None:
             await asyncio.sleep(30)
 
 
+def build_position_monitor_analysis(pos: Any) -> Tuple[Any, MovementHunterResult, TrapResult, StateResult]:
+    """
+    Build fresh AI context for an already-open REAL position.
+
+    Critical for AI Profit Exit:
+    position_monitor.py can only close a profitable position on weakness/reversal
+    when it receives fresh movement/trap/state data. Passing None disables that
+    logic and leaves the bot waiting only for TP/SL.
+    """
+    symbol = str(getattr(pos, "symbol", "") or getattr(pos, "exchange_symbol", "") or "")
+    orch = orchestrator()
+    candidate = orch.build_candidate(symbol, timeframe="5m")
+    movement = analyze_movement(candidate)
+    trap = analyze_trap(candidate, movement=movement)
+    state = analyze_state(candidate, movement=movement, trap=trap)
+    snapshot = (
+        getattr(candidate, "snapshot", None)
+        or getattr(candidate, "sensor_snapshot", None)
+        or getattr(candidate, "sensors", None)
+        or candidate
+    )
+    return snapshot, movement, trap, state
+
+
 async def position_monitor_loop(app: Any) -> None:
     client = get_client()
     while True:
         try:
-            events = await asyncio.to_thread(monitor_all_positions, client, None)
+            events = await asyncio.to_thread(monitor_all_positions, client, build_position_monitor_analysis)
             for event in events:
                 try:
                     record_position_event(event)
