@@ -425,6 +425,10 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "ترید لوریج 10\n"
         "حداکثر پوزیشن 3\n"
         "قفل ضرر خاموش\n"
+        "موجودی / بالانس\n"
+        "پوزیشن‌ها\n"
+        "توبیت / وضعیت توبیت\n"
+        "بستن پوزیشن BTCUSDT\n"
         "آمار / آمار 7 روز / آمار کل\n"
         "آمار هوشمند\n"
         "حذف آمار"
@@ -438,21 +442,171 @@ async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def trade_status(update: Update) -> None:
-    settings = get_runtime_settings()
-    lock_enabled = bool(settings.get("daily_loss_lock_enabled", True))
-    locked_until = safe_int(settings.get("daily_loss_locked_until", 0), 0)
-    lock_state = "خاموش" if not lock_enabled else ("فعال" if locked_until > now_ts() else "آماده")
-    text = (
-        "⚙️ وضعیت ترید\n"
-        f"ترید واقعی: {'روشن ✅' if real_trading_enabled() else 'خاموش ❌'}\n"
-        f"سیگنال خودکار: {'روشن ✅' if auto_signal_enabled() else 'خاموش ❌'}\n"
-        f"قفل ضرر: {lock_state}\n"
-        f"اسکن: {settings.get('scan_interval_seconds', 180)} ثانیه\n"
-        f"سرمایه هر ترید: {runtime_margin_usdt():.2f}$\n"
-        f"لوریج: {runtime_leverage()}x\n"
-        f"حداکثر پوزیشن: {runtime_max_positions()}"
-    )
+    await send_toobit_status(update)
+
+
+
+def format_usdt(value: Any) -> str:
+    return f"{safe_float(value):,.4f}$"
+
+
+def toobit_summary() -> Dict[str, Any]:
+    c = get_client()
+    if hasattr(c, "account_summary") and callable(c.account_summary):
+        return c.account_summary()
+
+    balance = {"ok": False, "error": "account_summary_missing"}
+    if hasattr(c, "get_account_balance") and callable(c.get_account_balance):
+        balance = c.get_account_balance("USDT")
+    positions = c.get_open_positions() if hasattr(c, "get_open_positions") else []
+    return {
+        "ok": bool(balance.get("ok", False)) if isinstance(balance, dict) else False,
+        "balance": balance if isinstance(balance, dict) else {"ok": False, "error": "invalid_balance"},
+        "open_positions_count": len(positions) if isinstance(positions, list) else 0,
+        "open_positions": positions if isinstance(positions, list) else [],
+        "total_unrealized_pnl": sum(safe_float(p.get("unrealized_pnl", 0.0)) for p in positions) if isinstance(positions, list) else 0.0,
+        "has_credentials": True,
+    }
+
+
+def format_positions(positions: List[Dict[str, Any]], max_rows: int = 10) -> str:
+    if not positions:
+        return "پوزیشن باز واقعی: 0"
+
+    lines = [f"پوزیشن‌های واقعی باز: {len(positions)}"]
+    for p in positions[:max_rows]:
+        symbol = str(p.get("symbol", "-"))
+        direction = str(p.get("direction", "-"))
+        qty = safe_float(p.get("quantity", 0.0))
+        entry = safe_float(p.get("entry_price", 0.0))
+        mark = safe_float(p.get("mark_price", 0.0))
+        pnl = safe_float(p.get("unrealized_pnl", 0.0))
+        lev = safe_int(p.get("leverage", 0))
+        lines.append(
+            f"• {symbol} {direction} | qty:{qty:g} | entry:{entry:g} | mark:{mark:g} | PnL:{pnl:+.4f}$ | lev:{lev}x"
+        )
+    if len(positions) > max_rows:
+        lines.append(f"... و {len(positions) - max_rows} پوزیشن دیگر")
+    return "\n".join(lines)
+
+
+def format_toobit_status(include_positions: bool = True) -> str:
+    try:
+        summary = toobit_summary()
+        balance = summary.get("balance", {}) if isinstance(summary, dict) else {}
+        positions = summary.get("open_positions", []) if isinstance(summary, dict) else []
+        if not isinstance(positions, list):
+            positions = []
+
+        if balance.get("ok"):
+            balance_text = (
+                f"موجودی کیف پول: {format_usdt(balance.get('wallet_balance'))}\n"
+                f"قابل استفاده: {format_usdt(balance.get('available_balance'))}\n"
+                f"PnL باز: {safe_float(summary.get('total_unrealized_pnl', 0.0)):+.4f}$"
+            )
+            api_line = "اتصال Toobit: وصل ✅"
+        else:
+            balance_text = f"موجودی واقعی خوانده نشد: {balance.get('error', 'unknown')}"
+            api_line = "اتصال Toobit: خطا ⚠️"
+
+        text = (
+            "⚙️ وضعیت ترید و Toobit\n"
+            f"{api_line}\n"
+            f"ترید واقعی: {'روشن ✅' if real_trading_enabled() else 'خاموش ❌'}\n"
+            f"سیگنال خودکار: {'روشن ✅' if auto_signal_enabled() else 'خاموش ❌'}\n"
+            f"سرمایه هر ترید: {runtime_margin_usdt():.2f}$ | لوریج: {runtime_leverage()}x | حداکثر پوزیشن: {runtime_max_positions()}\n"
+            f"{balance_text}\n"
+        )
+        if include_positions:
+            text += "\n" + format_positions(positions)
+        return text
+    except Exception as exc:
+        save_error("toobit_status", str(exc), {})
+        return (
+            "⚠️ خطا در خواندن وضعیت Toobit\n"
+            f"{exc}\n"
+            f"ترید واقعی: {'روشن ✅' if real_trading_enabled() else 'خاموش ❌'}\n"
+            f"سرمایه هر ترید: {runtime_margin_usdt():.2f}$ | لوریج: {runtime_leverage()}x | حداکثر پوزیشن: {runtime_max_positions()}"
+        )
+
+
+async def send_toobit_status(update: Update) -> None:
+    text = await asyncio.to_thread(format_toobit_status, True)
     await send_text(update, text)
+
+
+async def send_toobit_balance(update: Update) -> None:
+    def build() -> str:
+        summary = toobit_summary()
+        balance = summary.get("balance", {}) if isinstance(summary, dict) else {}
+        if not balance.get("ok"):
+            return f"⚠️ موجودی واقعی Toobit خوانده نشد: {balance.get('error', 'unknown')}"
+        return (
+            "💰 موجودی واقعی Toobit\n"
+            f"کیف پول: {format_usdt(balance.get('wallet_balance'))}\n"
+            f"قابل استفاده: {format_usdt(balance.get('available_balance'))}\n"
+            f"مارجین/Equity: {format_usdt(balance.get('margin_balance'))}\n"
+            f"PnL باز: {safe_float(summary.get('total_unrealized_pnl', 0.0)):+.4f}$"
+        )
+
+    await send_text(update, await asyncio.to_thread(build))
+
+
+async def send_toobit_positions(update: Update) -> None:
+    def build() -> str:
+        summary = toobit_summary()
+        positions = summary.get("open_positions", []) if isinstance(summary, dict) else []
+        if not isinstance(positions, list):
+            positions = []
+        return "📌 " + format_positions(positions)
+
+    await send_text(update, await asyncio.to_thread(build))
+
+
+async def close_toobit_position_command(update: Update, text: str) -> bool:
+    compact = str(text or "").strip().replace("‌", " ")
+    if not (compact.startswith("بستن پوزیشن") or compact.startswith("بستن همه پوزیشن")):
+        return False
+
+    if not real_trading_enabled():
+        await send_text(update, "❌ ترید واقعی خاموش است؛ برای بستن واقعی اول «ترید فعال» را بزن.")
+        return True
+
+    def run_close() -> str:
+        c = get_client()
+        positions = c.get_open_positions()
+        if not positions:
+            return "پوزیشن باز واقعی وجود ندارد."
+
+        close_all = compact.startswith("بستن همه پوزیشن")
+        if not close_all:
+            target_symbol = extract_symbol(compact)
+            positions_to_close = [p for p in positions if str(p.get("symbol", "")).upper() == target_symbol.upper()]
+        else:
+            target_symbol = "ALL"
+            positions_to_close = positions
+
+        if not positions_to_close:
+            return f"پوزیشن باز برای {target_symbol} پیدا نشد."
+
+        results = []
+        for p in positions_to_close:
+            sym = str(p.get("symbol", ""))
+            direction = str(p.get("direction", ""))
+            qty = safe_float(p.get("quantity", 0.0))
+            if not sym or not direction or qty <= 0:
+                results.append(f"{sym or '-'}: اطلاعات پوزیشن ناقص بود")
+                continue
+            try:
+                res = c.close_position(sym, direction, qty)
+                results.append(f"✅ {sym} {direction} بسته شد | order:{res.get('order_id', '-')}")
+            except Exception as exc:
+                results.append(f"❌ {sym} {direction} خطا: {exc}")
+        return "\n".join(results)
+
+    await send_text(update, await asyncio.to_thread(run_close))
+    return True
+
 
 
 
@@ -570,29 +724,29 @@ def build_ai_status_text() -> str:
     all_wins = all_summary.tp1_count + all_summary.tp2_count + all_summary.ai_exit_count
 
     return (
-        "🤖 وضعیت هوش مصنوعی\\n\\n"
-        "📊 REAL\\n"
-        f"کل: {real.total_events} | بسته: {real.closed_count}\\n"
-        f"TP1: {real.tp1_count} | TP2: {real.tp2_count} | AI Exit: {real.ai_exit_count} | SL: {real.sl_count}\\n"
-        f"WinRate: {real.win_rate:.2f}% | بردها: {real_wins}\\n"
-        f"PnL واقعی تاییدشده: {real.confirmed_pnl_usdt:+.4f}$\\n\\n"
-        "👻 GHOST\\n"
-        f"کل: {ghost_total} | باز: {ghost_open} | بسته: {ghost_closed}\\n"
-        f"TP1: {ghost_tp1} | TP2: {ghost_tp2} | AI Exit: {ghost_ai_exit} | SL: {ghost_sl}\\n"
-        f"WinRate: {ghost_wr:.2f}% | بردها: {ghost_wins}\\n\\n"
-        "🎯 TP/SL کلی\\n"
-        f"TP1: {all_summary.tp1_count} | TP2: {all_summary.tp2_count} | AI Exit: {all_summary.ai_exit_count} | SL: {all_summary.sl_count}\\n"
-        f"WinRate کل: {all_summary.win_rate:.2f}% | Long WR: {all_summary.long_win_rate:.2f}% | Short WR: {all_summary.short_win_rate:.2f}%\\n\\n"
-        "🧠 Movement Hunter\\n"
-        f"تشخیص پامپ درست: {pump_ok}/{pump_total} ({percent(pump_ok, pump_total):.1f}%)\\n"
-        f"تشخیص دامپ درست: {dump_ok}/{dump_total} ({percent(dump_ok, dump_total):.1f}%)\\n"
-        f"Fresh/Early: {fresh_count} | Late/Exhaustion: {late_count}\\n\\n"
-        "🧬 Metadata / Learning\\n"
-        f"Learning samples: {learning_samples}\\n"
-        f"Movement memory: {movement_samples}\\n"
-        f"Ghost records: {len(ghosts_section)}\\n"
-        f"Meta records: {meta_samples}\\n"
-        f"لایه‌های قوی: {', '.join(map(str, strong_layers[:4])) if strong_layers else '-'}\\n"
+        "🤖 وضعیت هوش مصنوعی\n\n"
+        "📊 REAL\n"
+        f"کل: {real.total_events} | بسته: {real.closed_count}\n"
+        f"TP1: {real.tp1_count} | TP2: {real.tp2_count} | AI Exit: {real.ai_exit_count} | SL: {real.sl_count}\n"
+        f"WinRate: {real.win_rate:.2f}% | بردها: {real_wins}\n"
+        f"PnL واقعی تاییدشده: {real.confirmed_pnl_usdt:+.4f}$\n\n"
+        "👻 GHOST\n"
+        f"کل: {ghost_total} | باز: {ghost_open} | بسته: {ghost_closed}\n"
+        f"TP1: {ghost_tp1} | TP2: {ghost_tp2} | AI Exit: {ghost_ai_exit} | SL: {ghost_sl}\n"
+        f"WinRate: {ghost_wr:.2f}% | بردها: {ghost_wins}\n\n"
+        "🎯 TP/SL کلی\n"
+        f"TP1: {all_summary.tp1_count} | TP2: {all_summary.tp2_count} | AI Exit: {all_summary.ai_exit_count} | SL: {all_summary.sl_count}\n"
+        f"WinRate کل: {all_summary.win_rate:.2f}% | Long WR: {all_summary.long_win_rate:.2f}% | Short WR: {all_summary.short_win_rate:.2f}%\n\n"
+        "🧠 Movement Hunter\n"
+        f"تشخیص پامپ درست: {pump_ok}/{pump_total} ({percent(pump_ok, pump_total):.1f}%)\n"
+        f"تشخیص دامپ درست: {dump_ok}/{dump_total} ({percent(dump_ok, dump_total):.1f}%)\n"
+        f"Fresh/Early: {fresh_count} | Late/Exhaustion: {late_count}\n\n"
+        "🧬 Metadata / Learning\n"
+        f"Learning samples: {learning_samples}\n"
+        f"Movement memory: {movement_samples}\n"
+        f"Ghost records: {len(ghosts_section)}\n"
+        f"Meta records: {meta_samples}\n"
+        f"لایه‌های قوی: {', '.join(map(str, strong_layers[:4])) if strong_layers else '-'}\n"
         f"لایه‌های ضعیف: {', '.join(map(str, weak_layers[:4])) if weak_layers else '-'}"
     )
 
@@ -775,6 +929,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     message = getattr(update, "effective_message", None)
     text = str(getattr(message, "text", "") or "").strip()
     if not text:
+        return
+
+    compact_text = text.strip().replace("‌", " ")
+
+    if compact_text.startswith(("موجودی", "بالانس", "سرمایه حساب")):
+        await send_toobit_balance(update)
+        return
+
+    if compact_text.startswith(("پوزیشن‌ها", "پوزیشن ها", "پوزیشنهای باز", "پوزیشن‌های باز")):
+        await send_toobit_positions(update)
+        return
+
+    if compact_text.startswith(("توبیت", "وضعیت توبیت")):
+        await send_toobit_status(update)
+        return
+
+    if await close_toobit_position_command(update, text):
         return
 
     if await handle_trade_toggle(update, text):
