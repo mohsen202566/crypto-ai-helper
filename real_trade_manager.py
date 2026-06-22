@@ -196,17 +196,33 @@ def round_step(value: float, step: float, precision: int = 8) -> float:
 
 
 def _call_optional(obj: Any, names: List[str], *args, **kwargs) -> Any:
+    """Call the first available compatible client method.
+
+    Important safety fix:
+    When a method raises TypeError because keyword arguments are incompatible,
+    do NOT retry it with an empty positional argument list. That produced the
+    misleading runtime error:
+        missing required positional arguments: symbol, side, direction, quantity
+
+    For methods that are intentionally called with positional args, this helper
+    still works exactly as before. For keyword-based order execution, the caller
+    must pass a payload compatible with the target client method.
+    """
     last_error: Optional[Exception] = None
     for name in names:
         fn = getattr(obj, name, None)
         if callable(fn):
             try:
                 return fn(*args, **kwargs)
-            except TypeError:
+            except TypeError as exc:
+                last_error = exc
+                # Only try a positional-only fallback when kwargs were not used.
+                if kwargs:
+                    continue
                 try:
                     return fn(*args)
-                except Exception as exc:
-                    last_error = exc
+                except Exception as exc2:
+                    last_error = exc2
             except Exception as exc:
                 last_error = exc
     if last_error:
@@ -655,38 +671,56 @@ class RealOrderExecutor:
 
         side = "BUY" if preflight.direction == DIRECTION_LONG else "SELL"
         client_order_id = f"mh_{preflight.decision_id[-18:]}_{int(time.time())}"
-
         open_side = "BUY_OPEN" if preflight.direction == DIRECTION_LONG else "SELL_OPEN"
 
-        payload = {
-            "symbol": preflight.exchange_symbol,
-            # Modern/internal clients can use BUY/SELL + direction.
-            "side": side,
-            "direction": preflight.direction,
-            # Older Toobit clients can prefer BUY_OPEN/SELL_OPEN.
-            "open_side": open_side,
-            "toobit_side": open_side,
-            "quantity": preflight.size_plan.quantity,
-            "price": 0,
-            "order_type": "MARKET",
-            "type": "LIMIT",
-            "priceType": "MARKET",
-            "margin_mode": MARGIN_ISOLATED,
-            "leverage": preflight.leverage,
-            "take_profit": preflight.tp1,
-            "takeProfit": preflight.tp1,
-            "take_profit_2": preflight.tp2,
-            "stop_loss": preflight.sl,
-            "stopLoss": preflight.sl,
-            "client_order_id": client_order_id,
-            "newClientOrderId": client_order_id,
-        }
-
-        result = _call_optional(
-            client,
-            ["open_futures_position", "create_futures_order", "place_order"],
-            **payload,
-        )
+        # Primary path: current tobit_client.py expects this exact signature:
+        # open_futures_position(symbol, side, direction, quantity, price=...,
+        #                       order_type=..., margin_mode=..., leverage=...,
+        #                       take_profit=..., take_profit_2=...,
+        #                       stop_loss=..., client_order_id=...)
+        # Do not send extra legacy keyword names to this method, otherwise Python
+        # raises TypeError and the order never reaches Toobit.
+        open_fn = getattr(client, "open_futures_position", None)
+        if callable(open_fn):
+            result = open_fn(
+                symbol=preflight.exchange_symbol,
+                side=side,
+                direction=preflight.direction,
+                quantity=preflight.size_plan.quantity,
+                price=0.0,
+                order_type="MARKET",
+                margin_mode=MARGIN_ISOLATED,
+                leverage=preflight.leverage,
+                take_profit=preflight.tp1,
+                take_profit_2=preflight.tp2,
+                stop_loss=preflight.sl,
+                client_order_id=client_order_id,
+            )
+        else:
+            # Compatibility fallback for older client names. These methods may
+            # accept legacy Toobit field names, so keep the broader payload here.
+            payload = {
+                "symbol": preflight.exchange_symbol,
+                "side": side,
+                "direction": preflight.direction,
+                "open_side": open_side,
+                "toobit_side": open_side,
+                "quantity": preflight.size_plan.quantity,
+                "price": 0.0,
+                "order_type": "MARKET",
+                "type": "LIMIT",
+                "priceType": "MARKET",
+                "margin_mode": MARGIN_ISOLATED,
+                "leverage": preflight.leverage,
+                "take_profit": preflight.tp1,
+                "takeProfit": preflight.tp1,
+                "take_profit_2": preflight.tp2,
+                "stop_loss": preflight.sl,
+                "stopLoss": preflight.sl,
+                "client_order_id": client_order_id,
+                "newClientOrderId": client_order_id,
+            }
+            result = _call_optional(client, ["create_futures_order", "place_order"], **payload)
 
         if hasattr(result, "to_dict") and callable(result.to_dict):
             result = result.to_dict()
