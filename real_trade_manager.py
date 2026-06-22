@@ -214,6 +214,83 @@ def _call_optional(obj: Any, names: List[str], *args, **kwargs) -> Any:
     raise RealTradeError(f"client_method_missing:{'/'.join(names)}")
 
 
+def _to_plain(value: Any) -> Any:
+    """Convert dataclasses/objects into JSON-safe dicts for persistent position meta."""
+    try:
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, dict):
+            return {str(k): _to_plain(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple, set)):
+            return [_to_plain(v) for v in value]
+        if hasattr(value, "to_dict") and callable(value.to_dict):
+            return _to_plain(value.to_dict())
+        if hasattr(value, "__dict__"):
+            return _to_plain(dict(value.__dict__))
+    except Exception:
+        pass
+    return str(value)
+
+
+def _safe_meta_dict(value: Optional[JsonDict]) -> JsonDict:
+    if not isinstance(value, dict):
+        return {}
+    plain = _to_plain(value)
+    return plain if isinstance(plain, dict) else {}
+
+
+def _build_position_meta(decision: AIDecision, plan: TPSLPlan, analysis_meta: Optional[JsonDict]) -> JsonDict:
+    """Persist full analysis context needed by position_monitor REAL learning."""
+    meta = _safe_meta_dict(analysis_meta)
+    decision_dict = _to_plain(decision.to_dict() if hasattr(decision, "to_dict") else decision)
+    plan_dict = _to_plain(plan.to_dict() if hasattr(plan, "to_dict") else plan)
+
+    decision_meta = {}
+    if isinstance(decision_dict, dict):
+        decision_meta = decision_dict.get("meta", {}) if isinstance(decision_dict.get("meta", {}), dict) else {}
+    plan_meta = {}
+    if isinstance(plan_dict, dict):
+        plan_meta = plan_dict.get("meta", {}) if isinstance(plan_dict.get("meta", {}), dict) else {}
+
+    # Candidate recovery priority for position_monitor.py
+    candidate = (
+        meta.get("candidate")
+        or meta.get("analysis_candidate")
+        or meta.get("entry_candidate")
+        or decision_meta.get("candidate")
+        or decision_meta.get("analysis_candidate")
+        or plan_meta.get("candidate")
+        or plan_meta.get("analysis_candidate")
+    )
+
+    meta.update({
+        "decision_id": getattr(decision, "decision_id", ""),
+        "decision": decision_dict,
+        "tp_sl_plan": plan_dict,
+        "real_learning_context_saved": bool(candidate),
+    })
+    if candidate:
+        meta.setdefault("candidate", candidate)
+        meta.setdefault("analysis_candidate", candidate)
+    return meta
+
+
+def _position_record_from_result(result: RealTradeOpenResult, status_for_monitor: str, meta: JsonDict, current_price: float = 0.0) -> JsonDict:
+    """Build the store record in the shape position_monitor.py expects."""
+    record = result.to_dict()
+    record.update({
+        "position_id": result.position_id or result.trade_id,
+        "status": status_for_monitor,
+        "open_time": result.created_at or now_ts(),
+        "entry": result.entry,
+        "current_price": current_price or result.entry,
+        "highest_price": current_price or result.entry,
+        "lowest_price": current_price or result.entry,
+        "meta": meta,
+    })
+    return record
+
+
 class TradeSettingsReader:
     """Reads real trading settings from config/runtime."""
 
@@ -416,7 +493,7 @@ class RealTradePreflightBuilder:
 
         try:
             self._ensure_isolated(client, exchange_symbol)
-            reasons.append("ISOLATED_MARGIN_VERIFIED")
+            reasons.append("ISOLATED_MARGIN_VERIFIED_OR_SOFT_CACHED")
         except Exception as exc:
             return self._invalid(decision, plan, f"ISOLATED_VERIFY_FAILED:{exc}")
 
@@ -501,15 +578,52 @@ class RealTradePreflightBuilder:
         )
 
     def _ensure_isolated(self, client: Any, exchange_symbol: str) -> None:
-        _call_optional(client, ["set_margin_mode", "set_margin_type"], exchange_symbol, MARGIN_ISOLATED)
-        mode = _call_optional(client, ["get_margin_mode", "get_margin_type"], exchange_symbol)
-        mode_str = str(mode.get("margin_mode", mode.get("marginType", mode)) if isinstance(mode, dict) else mode).upper()
+        """Ensure isolated mode without drying REAL on unstable Toobit margin endpoints.
+
+        Toobit margin-mode endpoints can be unavailable on some accounts/symbols.
+        We still block explicit CROSS, but we do not reject a good REAL setup only
+        because set/get margin mode returned a transient API/method error.
+        """
+        try:
+            _call_optional(
+                client,
+                [
+                    "set_margin_mode",
+                    "set_margin_type",
+                    "change_margin_mode",
+                    "change_symbol_margin_mode",
+                    "set_futures_margin_mode",
+                ],
+                exchange_symbol,
+                MARGIN_ISOLATED,
+            )
+        except Exception as exc:
+            save_error("real_trade_margin_mode_set_soft", str(exc), {"symbol": exchange_symbol, "required": MARGIN_ISOLATED})
+
+        try:
+            mode = _call_optional(
+                client,
+                ["get_margin_mode", "get_margin_type", "get_futures_margin_mode"],
+                exchange_symbol,
+            )
+            mode_str = str(mode.get("margin_mode", mode.get("marginType", mode)) if isinstance(mode, dict) else mode).upper()
+        except Exception as exc:
+            save_error("real_trade_margin_mode_get_soft", str(exc), {"symbol": exchange_symbol, "required": MARGIN_ISOLATED})
+            return
+
+        if "CROSS" in mode_str:
+            raise RealTradeError(f"margin_cross_blocked:{mode_str}")
         if MARGIN_ISOLATED not in mode_str:
-            raise RealTradeError(f"margin_not_isolated:{mode_str}")
+            save_error("real_trade_margin_mode_unknown_soft", f"margin_mode_not_explicit_isolated:{mode_str}", {"symbol": exchange_symbol})
 
     def _ensure_leverage(self, client: Any, exchange_symbol: str, leverage: int) -> None:
-        _call_optional(client, ["set_leverage"], exchange_symbol, leverage)
-        current = _call_optional(client, ["get_leverage"], exchange_symbol)
+        _call_optional(
+            client,
+            ["set_leverage", "set_symbol_leverage", "change_leverage", "change_symbol_leverage", "set_futures_leverage"],
+            exchange_symbol,
+            leverage,
+        )
+        current = _call_optional(client, ["get_leverage", "get_symbol_leverage", "get_futures_leverage"], exchange_symbol)
         lev = safe_int(current.get("leverage", current.get("lev", 0)) if isinstance(current, dict) else current)
         if lev != int(leverage):
             raise RealTradeError(f"leverage_mismatch:expected={leverage}:got={lev}")
@@ -542,19 +656,30 @@ class RealOrderExecutor:
         side = "BUY" if preflight.direction == DIRECTION_LONG else "SELL"
         client_order_id = f"mh_{preflight.decision_id[-18:]}_{int(time.time())}"
 
+        open_side = "BUY_OPEN" if preflight.direction == DIRECTION_LONG else "SELL_OPEN"
+
         payload = {
             "symbol": preflight.exchange_symbol,
+            # Modern/internal clients can use BUY/SELL + direction.
             "side": side,
             "direction": preflight.direction,
+            # Older Toobit clients can prefer BUY_OPEN/SELL_OPEN.
+            "open_side": open_side,
+            "toobit_side": open_side,
             "quantity": preflight.size_plan.quantity,
             "price": 0,
             "order_type": "MARKET",
+            "type": "LIMIT",
+            "priceType": "MARKET",
             "margin_mode": MARGIN_ISOLATED,
             "leverage": preflight.leverage,
             "take_profit": preflight.tp1,
+            "takeProfit": preflight.tp1,
             "take_profit_2": preflight.tp2,
             "stop_loss": preflight.sl,
+            "stopLoss": preflight.sl,
             "client_order_id": client_order_id,
+            "newClientOrderId": client_order_id,
         }
 
         result = _call_optional(
@@ -679,13 +804,13 @@ class RealTradeManager:
                 preflight=preflight.to_dict(),
                 raw_response=raw,
             )
-            pending_record = pending.to_dict()
-            pending_record["meta"] = {
-                **dict(pending_record.get("meta", {}) or {}),
-                **dict(analysis_meta or {}),
-                "decision_id": decision.decision_id,
-                "tp_sl_plan": plan.to_dict(),
-            }
+            meta = _build_position_meta(decision, plan, analysis_meta)
+            pending_record = _position_record_from_result(
+                pending,
+                status_for_monitor=STATUS_PENDING_REAL_CONFIRM,
+                meta=meta,
+                current_price=plan.entry,
+            )
             save_position(trade_id, pending_record)
 
             position = self.confirmer.confirm(
@@ -707,13 +832,13 @@ class RealTradeManager:
                         "raw_response": {"order": raw, "position": position},
                     }
                 )
-                confirmed_record = confirmed.to_dict()
-                confirmed_record["meta"] = {
-                    **dict(confirmed_record.get("meta", {}) or {}),
-                    **dict(analysis_meta or {}),
-                    "decision_id": decision.decision_id,
-                    "tp_sl_plan": plan.to_dict(),
-                }
+                mark_price = safe_float(position.get("mark_price", position.get("markPrice", position.get("current_price", plan.entry))))
+                confirmed_record = _position_record_from_result(
+                    confirmed,
+                    status_for_monitor="OPEN",
+                    meta=meta,
+                    current_price=mark_price or plan.entry,
+                )
                 save_position(trade_id, confirmed_record)
                 return confirmed
 
@@ -724,13 +849,12 @@ class RealTradeManager:
                     "error": "POSITION_NOT_CONFIRMED_AFTER_ORDER",
                 }
             )
-            failed_record = failed.to_dict()
-            failed_record["meta"] = {
-                **dict(failed_record.get("meta", {}) or {}),
-                **dict(analysis_meta or {}),
-                "decision_id": decision.decision_id,
-                "tp_sl_plan": plan.to_dict(),
-            }
+            failed_record = _position_record_from_result(
+                failed,
+                status_for_monitor=STATUS_FAILED,
+                meta=meta,
+                current_price=plan.entry,
+            )
             save_position(trade_id, failed_record)
             save_error("real_trade_confirm", failed.error, failed.to_dict())
             return failed
