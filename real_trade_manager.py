@@ -1,483 +1,758 @@
 from __future__ import annotations
 
 """
-Real/Paper trade manager.
+21 - real_trade_manager.py
+
+Real Toobit futures trade manager for the locked Movement Hunter architecture.
 
 Responsibilities:
-- Open Paper and Real trades.
-- Enforce daily loss lock and emergency stop.
-- Protected balance increases after realized profit.
-- For real trades, reserve slot as PENDING_REAL_CONFIRM before order.
-- Real orders are isolated-only through toobit_safety.
-- Register active signals with signal_tracker.
+- Receive only final AIDecision + TPSLPlan.
+- Open REAL positions only when decision_type == REAL and trading is enabled.
+- Use Toobit v2 client only through tobit_client.py.
+- Enforce safety preflight:
+  symbol mapping
+  isolated margin
+  leverage set/read/verify
+  margin/notional/quantity calculation
+  min quantity / min notional / step precision
+  TP/SL attached at opening whenever supported
+- Keep a PENDING_REAL_CONFIRM state for 20-30 seconds after order submission.
+- Do not free slot instantly after order submit.
+- Verify actual Toobit position after order.
+- Repair missing TP/SL after position confirmation if needed.
+
+Strictly forbidden:
+- No Paper mode.
+- No Setup flow.
+- No fake success.
+- No arbitrary leverage/size.
+- No cross margin.
+- No Telegram sending.
+- No AI analysis.
 """
 
-import time
+from dataclasses import asdict, dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
+from uuid import uuid4
 import math
-from typing import Any, Dict, Optional
+import time
 
-from config import (
-    CORE_DATA_FILES,
-    runtime_defaults_dict,
-    REAL_CONFIRM_TIMEOUT_SECONDS,
-    DEFAULT_TRADE_MODE,
-    DEFAULT_REAL_TRADING_ENABLED,
-    TOOBIT_API_KEY,
-    TOOBIT_API_SECRET,
-)
-from data_store import load_dict, save_json
-from diagnostics import safe, record_error, warning
-import slot_manager
-import signal_tracker
-import ai_memory
-import tobit_client
-import toobit_safety
+from ai_decision_engine import AIDecision, DECISION_REAL
+from tp_sl_engine import TPSLPlan
+from symbol_mapper import toobit_symbol, normalize_symbol
+from data_store import save_position, save_error, store
+from config import SETTINGS
 
 
-TRADE_STATE_FILE = CORE_DATA_FILES.get("trade_state")
+JsonDict = Dict[str, Any]
+
+DIRECTION_LONG = "LONG"
+DIRECTION_SHORT = "SHORT"
+
+STATUS_REJECTED = "REJECTED"
+STATUS_PENDING_REAL_CONFIRM = "PENDING_REAL_CONFIRM"
+STATUS_CONFIRMED = "CONFIRMED"
+STATUS_FAILED = "FAILED"
+
+MARGIN_ISOLATED = "ISOLATED"
 
 
-def _ts() -> int:
+class RealTradeError(RuntimeError):
+    """Raised for real trade safety failures."""
+
+
+@dataclass(frozen=True)
+class TradeSettings:
+    trading_enabled: bool
+    margin_usdt: float
+    leverage: int
+    max_positions: int
+    isolated_only: bool = True
+
+    def to_dict(self) -> JsonDict:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class ExchangeSymbolRules:
+    symbol: str
+    min_qty: float = 0.0
+    qty_step: float = 0.0
+    min_notional: float = 0.0
+    price_tick: float = 0.0
+    quantity_precision: int = 6
+    price_precision: int = 6
+
+    def to_dict(self) -> JsonDict:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class OrderSizePlan:
+    symbol: str
+    margin_usdt: float
+    leverage: int
+    notional_usdt: float
+    price: float
+    quantity: float
+    quantity_raw: float
+    valid: bool
+    reason: str = ""
+
+    def to_dict(self) -> JsonDict:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class RealTradePreflight:
+    preflight_id: str
+    decision_id: str
+    symbol: str
+    exchange_symbol: str
+    direction: str
+    margin_mode: str
+    leverage: int
+    size_plan: OrderSizePlan
+    tp1: float
+    tp2: float
+    sl: float
+    valid: bool
+    reason_codes: Tuple[str, ...] = field(default_factory=tuple)
+    warnings: Tuple[str, ...] = field(default_factory=tuple)
+
+    def to_dict(self) -> JsonDict:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class RealTradeOpenResult:
+    trade_id: str
+    decision_id: str
+    symbol: str
+    exchange_symbol: str
+    direction: str
+    status: str
+    order_id: str = ""
+    client_order_id: str = ""
+    position_id: str = ""
+    entry: float = 0.0
+    quantity: float = 0.0
+    margin_usdt: float = 0.0
+    leverage: int = 0
+    tp1: float = 0.0
+    tp2: float = 0.0
+    sl: float = 0.0
+    created_at: int = 0
+    confirmed_at: int = 0
+    error: str = ""
+    preflight: JsonDict = field(default_factory=dict)
+    raw_response: JsonDict = field(default_factory=dict)
+
+    def to_dict(self) -> JsonDict:
+        return asdict(self)
+
+
+def now_ts() -> int:
     return int(time.time())
 
 
-def _log(msg: str) -> None:
+def safe_float(value: Any, default: float = 0.0) -> float:
     try:
-        print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} | real_trade_manager | {msg}", flush=True)
-    except Exception:
-        pass
-
-
-def _safe_float(v: Any, default: float = 0.0) -> float:
-    try:
-        if v is None:
+        if value is None:
             return default
-        f = float(v)
-        if math.isnan(f) or math.isinf(f):
+        v = float(value)
+        if math.isnan(v) or math.isinf(v):
             return default
-        return f
+        return v
     except Exception:
         return default
 
 
-def _normalize_trade_mode(value: Any) -> str:
-    mode = str(value or "").strip().upper()
-    return mode if mode in {"PAPER", "REAL"} else "PAPER"
-
-
-def _env_runtime_overrides() -> Dict[str, Any]:
-    """
-    Environment-controlled runtime fields that should be re-applied on restart.
-    This prevents old data/trade_state.json from keeping the bot in PAPER after
-    systemd/env was changed to REAL.
-    """
-    return {
-        "trade_mode": _normalize_trade_mode(DEFAULT_TRADE_MODE),
-        "real_trading_enabled": bool(DEFAULT_REAL_TRADING_ENABLED),
-    }
-
-
-def _sync_runtime_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
-    defaults = runtime_defaults_dict()
-    for k, v in defaults.items():
-        settings.setdefault(k, v)
-
-    # IMPORTANT:
-    # Do NOT blindly re-apply environment trade_mode/real_trading_enabled on every load.
-    # Telegram commands like "ترید خاموش" persist into data/trade_state.json.
-    # If env overrides are applied on every load, the bot immediately flips back to REAL.
-    #
-    # Env/default values are only used when the keys do not exist yet, through setdefault()
-    # above. After that, runtime/user commands are the source of truth until changed again.
-    settings["trade_mode"] = _normalize_trade_mode(settings.get("trade_mode"))
-    settings["real_trading_enabled"] = bool(settings.get("real_trading_enabled", False))
-
-    # Consistency rules.
-    if settings["trade_mode"] == "REAL" and not settings["real_trading_enabled"]:
-        # Never silently attempt real orders when the safety flag is off.
-        settings["trade_mode"] = "PAPER"
-
-    if settings["trade_mode"] == "PAPER":
-        # PAPER mode must not still display real trading as enabled.
-        settings["real_trading_enabled"] = False
-
-    return settings
-
-
-def real_trade_ready() -> Dict[str, Any]:
-    """
-    Checks whether real trading can place orders.
-
-    Telegram runtime command "ترید روشن" is allowed to enable real_trading_enabled
-    when API keys exist. DEFAULT_REAL_TRADING_ENABLED is only an initial default,
-    not a permanent blocker after runtime/user settings are saved.
-    """
-    issues = []
-    if not TOOBIT_API_KEY:
-        issues.append("TOOBIT_API_KEY missing")
-    if not TOOBIT_API_SECRET:
-        issues.append("TOOBIT_API_SECRET missing")
-    return {"ok": len(issues) == 0, "issues": issues}
-
-
-def _empty_state() -> Dict[str, Any]:
-    d = runtime_defaults_dict()
-    return {
-        "version": 1,
-        "updated_at": _ts(),
-        "settings": d,
-        "paper_positions": {},
-        "real_positions": {},
-        "daily": {
-            "day": time.strftime("%Y-%m-%d"),
-            "realized_pnl": 0.0,
-            "tp": 0,
-            "sl": 0,
-            "locked_until": 0,
-        },
-        "totals": {
-            "realized_pnl": 0.0,
-            "tp": 0,
-            "sl": 0,
-        },
-    }
-
-
-@safe(default={})
-def load_trade_state() -> Dict[str, Any]:
-    st = load_dict(TRADE_STATE_FILE)
-    if not st:
-        st = _empty_state()
-        save_json(TRADE_STATE_FILE, st)
-    for k, v in _empty_state().items():
-        st.setdefault(k, v)
-    st["settings"] = _sync_runtime_settings(st.setdefault("settings", {}))
-    _roll_day_if_needed(st)
-    return st
-
-
-@safe(default=False)
-def save_trade_state(st: Dict[str, Any], make_backup: bool = False) -> bool:
-    st["updated_at"] = _ts()
-    return save_json(TRADE_STATE_FILE, st, make_backup=make_backup)
-
-
-def _roll_day_if_needed(st: Dict[str, Any]) -> None:
-    today = time.strftime("%Y-%m-%d")
-    daily = st.setdefault("daily", {})
-    if daily.get("day") != today:
-        daily.clear()
-        daily.update({"day": today, "realized_pnl": 0.0, "tp": 0, "sl": 0, "locked_until": 0})
-
-
-@safe(default={})
-def trade_status() -> Dict[str, Any]:
-    st = load_trade_state()
-    settings = st.get("settings", {})
-    slots = slot_manager.slot_state()
-    return {
-        "mode": settings.get("trade_mode", "PAPER"),
-        "real_trading_enabled": settings.get("real_trading_enabled", False),
-        "real_trade_ready": real_trade_ready(),
-        "last_trade_mode_error": settings.get("last_trade_mode_error", ""),
-        "emergency_stop": settings.get("emergency_stop", False),
-        "balance": settings.get("balance"),
-        "protected_balance": settings.get("protected_balance"),
-        "initial_capital": settings.get("initial_capital"),
-        "position_size_usd": settings.get("position_size_usd"),
-        "leverage": settings.get("leverage"),
-        "max_positions": slots.get("max_positions"),
-        "used_slots": slots.get("used_slots"),
-        "free_slots": slots.get("free_slots"),
-        "daily": st.get("daily", {}),
-        "totals": st.get("totals", {}),
-        "locked": is_daily_locked(st),
-    }
-
-
-def is_daily_locked(st: Optional[Dict[str, Any]] = None) -> bool:
-    st = st or load_trade_state()
-    return int(st.get("daily", {}).get("locked_until", 0)) > _ts()
-
-
-@safe(default={})
-def set_trade_setting(name: str, value: Any) -> Dict[str, Any]:
-    st = load_trade_state()
-    settings = st.setdefault("settings", {})
-
-    if name == "trade_mode":
-        value = _normalize_trade_mode(value)
-    elif name in {"leverage", "max_positions"}:
-        value = int(value)
-    elif name in {"position_size_usd", "initial_capital", "daily_loss_lock_amount", "daily_lock_hours", "balance", "protected_balance"}:
-        value = float(value)
-    elif name in {"emergency_stop", "daily_loss_lock_enabled", "ai_enabled", "learning_enabled", "real_trading_enabled", "conservative_mode"}:
-        value = bool(value)
-
-    settings[name] = value
-
-    # Runtime command source marker. Env must not overwrite these on later loads.
-    if name in {"trade_mode", "real_trading_enabled"}:
-        settings["trade_mode_updated_by"] = "telegram_command"
-        settings["trade_mode_updated_at"] = _ts()
-
-    # If user/runtime asks REAL, safety must also be on and keys must exist.
-    if name == "trade_mode" and value == "REAL":
-        settings["real_trading_enabled"] = True
-        ready = real_trade_ready()
-        if not ready.get("ok"):
-            settings["trade_mode"] = "PAPER"
-            settings["real_trading_enabled"] = False
-            settings["last_trade_mode_error"] = ", ".join(ready.get("issues", []))
-        else:
-            settings["last_trade_mode_error"] = ""
-    if name == "trade_mode" and value == "PAPER":
-        settings["real_trading_enabled"] = False
-        settings["last_trade_mode_error"] = ""
-    if name == "real_trading_enabled" and not value:
-        settings["trade_mode"] = "PAPER"
-        settings["last_trade_mode_error"] = ""
-    if name == "real_trading_enabled" and value and settings.get("trade_mode") != "REAL":
-        # Keep enabling safety alone non-dangerous; actual real mode is set by trade_mode=REAL.
-        settings.setdefault("trade_mode", "PAPER")
-
-    if name == "max_positions":
-        slot_manager.set_max_positions(int(value))
-    save_trade_state(st, make_backup=True)
-    return trade_status()
-
-
-@safe(default={})
-def open_trade(decision: Dict[str, Any], mode: Optional[str] = None) -> Dict[str, Any]:
-    st = load_trade_state()
-    settings = st.get("settings", {})
-    mode = (mode or settings.get("trade_mode", "PAPER")).upper()
-
-    if settings.get("emergency_stop"):
-        return {"ok": False, "reason": "emergency_stop"}
-    if is_daily_locked(st):
-        return {"ok": False, "reason": "daily_loss_locked", "locked_until": st.get("daily", {}).get("locked_until")}
-
-    if mode == "REAL":
-        ready = real_trade_ready()
-        if not ready.get("ok"):
-            _log(f"open_trade blocked: real_trade_not_ready issues={ready.get('issues', [])}")
-            return {"ok": False, "reason": "real_trade_not_ready", "issues": ready.get("issues", [])}
-        _log(f"open_trade REAL requested: {decision.get('symbol')} {decision.get('direction')}")
-        return open_real_trade(decision)
-    _log(f"open_trade PAPER requested: {decision.get('symbol')} {decision.get('direction')}")
-    return open_paper_trade(decision)
-
-
-@safe(default={})
-def open_paper_trade(decision: Dict[str, Any]) -> Dict[str, Any]:
-    st = load_trade_state()
-    settings = st.get("settings", {})
-    symbol = str(decision.get("symbol", "")).upper()
-    direction = str(decision.get("direction", "")).upper()
-    entry = _safe_float(decision.get("entry"))
-    if not symbol or direction not in {"LONG", "SHORT"} or entry <= 0:
-        return {"ok": False, "reason": "invalid_decision"}
-
-    slot_id = slot_manager.reserve_slot(symbol, direction, mode="PAPER", status=slot_manager.STATUS_OPEN, ai_record_id=decision.get("record_id", ""), signal_id=decision.get("signal_id", ""), telegram_message_id=decision.get("telegram_message_id"))
-    if not slot_id:
-        _log(f"open_trade no_free_slot: {symbol} {direction}")
-        return {"ok": False, "reason": "no_free_slot"}
-
-    sid = signal_tracker.register_active_signal({**decision, "slot_id": slot_id}, mode=signal_tracker.TYPE_PAPER, slot_id=slot_id)
-    pos = {
-        "id": sid,
-        "slot_id": slot_id,
-        "symbol": symbol,
-        "direction": direction,
-        "entry": entry,
-        "tp1": decision.get("tp1"),
-        "tp2": decision.get("tp2"),
-        "sl": decision.get("sl"),
-        "position_size_usd": settings.get("position_size_usd"),
-        "leverage": settings.get("leverage"),
-        "opened_at": _ts(),
-        "status": "OPEN",
-    }
-    st.setdefault("paper_positions", {})[sid] = pos
-    save_trade_state(st)
-    _log(f"open_paper_trade ok: {symbol} {direction} signal_id={sid} slot_id={slot_id}")
-    return {"ok": True, "mode": "PAPER", "signal_id": sid, "slot_id": slot_id, "position": pos}
-
-
-@safe(default={})
-def open_real_trade(decision: Dict[str, Any]) -> Dict[str, Any]:
-    st = load_trade_state()
-    settings = st.get("settings", {})
-    symbol = str(decision.get("symbol", "")).upper()
-    direction = str(decision.get("direction", "")).upper()
-    entry = _safe_float(decision.get("entry"))
-    if not symbol or direction not in {"LONG", "SHORT"} or entry <= 0:
-        return {"ok": False, "reason": "invalid_decision"}
-
-    ready = real_trade_ready()
-    if not ready.get("ok"):
-        return {"ok": False, "reason": "real_trade_not_ready", "issues": ready.get("issues", [])}
-
-    sides = toobit_safety.side_from_direction(direction)
-    desired_qty = (_safe_float(settings.get("position_size_usd")) * int(settings.get("leverage", 1))) / entry
-
-    c = tobit_client.client()
-    leverage = int(settings.get("leverage", 1) or 1)
-    pre = toobit_safety.preflight_real_order(symbol, sides["open_side"], desired_qty, entry, c, leverage=leverage)
-    if not pre.get("ok"):
-        _log(f"open_real_trade preflight_failed: {symbol} {direction} preflight={pre}")
-        return {"ok": False, "reason": "preflight_failed", "preflight": pre}
-
-    slot_id = slot_manager.reserve_slot(
-        symbol, direction, mode="REAL", status=slot_manager.STATUS_PENDING_REAL_CONFIRM,
-        ai_record_id=decision.get("record_id", ""), signal_id=decision.get("signal_id", ""),
-        telegram_message_id=decision.get("telegram_message_id"),
-        metadata={"pending_confirm_timeout": REAL_CONFIRM_TIMEOUT_SECONDS},
-    )
-    if not slot_id:
-        _log(f"open_real_trade no_free_slot: {symbol} {direction}")
-        return {"ok": False, "reason": "no_free_slot"}
-
-    # Attach TP/SL to the opening order when Toobit accepts inline TP/SL fields.
-    # If inline attachment is not accepted by the exchange, the order result will
-    # expose the raw error and the bot will not silently open an unprotected trade.
-    order_extra = {
-        "takeProfit": decision.get("tp1"),
-        "stopLoss": decision.get("sl"),
-        "tpTriggerBy": "CONTRACT_PRICE",
-        "slTriggerBy": "CONTRACT_PRICE",
-        "tpOrderType": "MARKET",
-        "slOrderType": "MARKET",
-    }
-    order = c.create_order(symbol, sides["open_side"], pre["quantity"], order_type="MARKET", extra=order_extra)
-    if not order.get("ok"):
-        # Keep slot briefly? If order was not accepted at all, release now.
-        slot_manager.release_slot(slot_id, reason="real_order_failed")
-        _log(f"open_real_trade order_failed: {symbol} {direction} order={order}")
-        return {"ok": False, "reason": "order_failed", "order": order}
-
-    sid = signal_tracker.register_active_signal({**decision, "slot_id": slot_id}, mode=signal_tracker.TYPE_REAL, slot_id=slot_id)
-    # Extra safety: try to set TP/SL again at position level after opening.
-    # This is kept as a fallback because Toobit supports both inline TP/SL fields
-    # on new orders and the separate trading-stop endpoint.
-    trading_stop = {}
+def safe_int(value: Any, default: int = 0) -> int:
     try:
-        trading_stop = c.set_trading_stop(
-            symbol,
-            sides.get("position_side", direction),
-            take_profit=decision.get("tp1"),
-            stop_loss=decision.get("sl"),
-            quantity=pre["quantity"],
-        )
-        if not trading_stop.get("ok"):
-            _log(f"open_real_trade trading_stop_warning: {symbol} {direction} trading_stop={trading_stop}")
-    except Exception as e:
-        trading_stop = {"ok": False, "error": str(e)}
-        _log(f"open_real_trade trading_stop_exception: {symbol} {direction} error={e}")
-
-    st.setdefault("real_positions", {})[sid] = {
-        "id": sid,
-        "slot_id": slot_id,
-        "symbol": symbol,
-        "direction": direction,
-        "entry": entry,
-        "quantity": pre["quantity"],
-        "order": order,
-        "trading_stop": trading_stop,
-        "opened_at": _ts(),
-        "status": "PENDING_CONFIRM",
-    }
-    save_trade_state(st, make_backup=True)
-    _log(f"open_real_trade ok: {symbol} {direction} signal_id={sid} slot_id={slot_id} qty={pre['quantity']}")
-    return {"ok": True, "mode": "REAL", "signal_id": sid, "slot_id": slot_id, "order": order, "quantity": pre["quantity"]}
+        return int(float(value))
+    except Exception:
+        return default
 
 
-@safe(default=False)
-def close_paper_trade(signal_id: str, result: str, exit_price: float, pnl: Optional[float] = None) -> bool:
-    st = load_trade_state()
-    pos = st.get("paper_positions", {}).pop(signal_id, None)
-    if not pos:
-        return False
-    if pnl is None:
-        pnl = calculate_paper_pnl(pos, exit_price)
-    _apply_realized_pnl(st, float(pnl), result)
-    signal_tracker.close_signal(signal_id, result=result, exit_price=exit_price, pnl=float(pnl))
-    save_trade_state(st, make_backup=True)
-    return True
+def normalize_direction(direction: str) -> str:
+    d = str(direction or "").upper().strip()
+    if d in {"LONG", "BUY"}:
+        return DIRECTION_LONG
+    if d in {"SHORT", "SELL"}:
+        return DIRECTION_SHORT
+    return d
 
 
-def calculate_paper_pnl(pos: Dict[str, Any], exit_price: float) -> float:
-    entry = _safe_float(pos.get("entry"))
-    if entry <= 0:
+def round_step(value: float, step: float, precision: int = 8) -> float:
+    value = safe_float(value)
+    step = safe_float(step)
+    if value <= 0:
         return 0.0
-    size = _safe_float(pos.get("position_size_usd"))
-    lev = _safe_float(pos.get("leverage"), 1)
-    notional = size * lev
-    direction = str(pos.get("direction")).upper()
-    pct = (exit_price - entry) / entry
-    if direction == "SHORT":
-        pct *= -1
-    return round(notional * pct, 4)
+    if step <= 0:
+        return round(value, precision)
+    units = math.floor(value / step)
+    return round(units * step, precision)
 
 
-def _apply_realized_pnl(st: Dict[str, Any], pnl: float, result: str) -> None:
-    settings = st.setdefault("settings", {})
-    daily = st.setdefault("daily", {})
-    totals = st.setdefault("totals", {})
-
-    settings["balance"] = round(_safe_float(settings.get("balance")) + pnl, 4)
-    daily["realized_pnl"] = round(_safe_float(daily.get("realized_pnl")) + pnl, 4)
-    totals["realized_pnl"] = round(_safe_float(totals.get("realized_pnl")) + pnl, 4)
-
-    if pnl > 0:
-        # User rule: realized profit increases protected balance; near $1 can count as $1.
-        protected_add = round(pnl)
-        if protected_add <= 0 and pnl >= 0.99:
-            protected_add = 1
-        settings["protected_balance"] = round(_safe_float(settings.get("protected_balance")) + max(0, protected_add), 4)
-
-    if str(result).upper().startswith("TP"):
-        daily["tp"] = int(daily.get("tp", 0)) + 1
-        totals["tp"] = int(totals.get("tp", 0)) + 1
-    elif str(result).upper() == "SL":
-        daily["sl"] = int(daily.get("sl", 0)) + 1
-        totals["sl"] = int(totals.get("sl", 0)) + 1
-
-    _update_daily_lock(st)
+def _call_optional(obj: Any, names: List[str], *args, **kwargs) -> Any:
+    last_error: Optional[Exception] = None
+    for name in names:
+        fn = getattr(obj, name, None)
+        if callable(fn):
+            try:
+                return fn(*args, **kwargs)
+            except TypeError:
+                try:
+                    return fn(*args)
+                except Exception as exc:
+                    last_error = exc
+            except Exception as exc:
+                last_error = exc
+    if last_error:
+        raise last_error
+    raise RealTradeError(f"client_method_missing:{'/'.join(names)}")
 
 
-def _update_daily_lock(st: Dict[str, Any]) -> None:
-    settings = st.get("settings", {})
-    if not settings.get("daily_loss_lock_enabled", True):
-        return
-    protected = _safe_float(settings.get("protected_balance"))
-    balance = _safe_float(settings.get("balance"))
-    threshold = _safe_float(settings.get("daily_loss_lock_amount"), 5)
-    if protected - balance >= threshold:
-        hours = _safe_float(settings.get("daily_lock_hours"), 1)
-        st.setdefault("daily", {})["locked_until"] = int(_ts() + hours * 3600)
+class TradeSettingsReader:
+    """Reads real trading settings from config/runtime."""
+
+    def read(self) -> TradeSettings:
+        try:
+            runtime = store().section("runtime_settings")
+        except Exception:
+            runtime = {}
+
+        trading_enabled = bool(runtime.get("real_trading_enabled", getattr(SETTINGS.trading, "real_trading_enabled", False)))
+        margin_usdt = safe_float(runtime.get("margin_usdt", getattr(SETTINGS.trading, "margin_usdt", 0.0)))
+        leverage = safe_int(runtime.get("leverage", getattr(SETTINGS.trading, "leverage", 1)), 1)
+        max_positions = safe_int(runtime.get("max_positions", getattr(SETTINGS.trading, "max_positions", 1)), 1)
+
+        return TradeSettings(
+            trading_enabled=trading_enabled,
+            margin_usdt=margin_usdt,
+            leverage=leverage,
+            max_positions=max_positions,
+            isolated_only=True,
+        )
 
 
-@safe(default="")
-def status_fa() -> str:
-    s = trade_status()
-    locked = "فعال" if s.get("locked") else "غیرفعال"
-    em = "روشن" if s.get("emergency_stop") else "خاموش"
-    return (
-        "💼 وضعیت ترید\n"
-        f"حالت: {s.get('mode')} | ترید واقعی: {'روشن' if s.get('real_trading_enabled') else 'خاموش'}\n"
-        f"بالانس: {s.get('balance')}$ | محافظت‌شده: {s.get('protected_balance')}$\n"
-        f"حجم هر پوزیشن: {s.get('position_size_usd')}$ | لوریج: {s.get('leverage')}x\n"
-        f"پوزیشن‌ها: {s.get('used_slots')}/{s.get('max_positions')} | خالی: {s.get('free_slots')}\n"
-        f"سود/ضرر امروز: {s.get('daily',{}).get('realized_pnl',0)}$\n"
-        f"قفل ضرر روزانه: {locked} | توقف اضطراری: {em}"
-        + (f"\n⚠️ آماده نبودن ترید واقعی: {', '.join(s.get('real_trade_ready', {}).get('issues', []))}" if not s.get('real_trade_ready', {}).get('ok', True) else "")
-    )
+class SymbolRulesReader:
+    """Reads Toobit symbol rules through tobit_client.py."""
+
+    def read(self, client: Any, exchange_symbol: str) -> ExchangeSymbolRules:
+        try:
+            raw = _call_optional(
+                client,
+                ["get_symbol_rules", "get_contract_rules", "get_instrument_rules"],
+                exchange_symbol,
+            )
+        except Exception:
+            raw = {}
+
+        if hasattr(raw, "to_dict") and callable(raw.to_dict):
+            raw = raw.to_dict()
+        if not isinstance(raw, dict):
+            raw = {}
+
+        return ExchangeSymbolRules(
+            symbol=exchange_symbol,
+            min_qty=safe_float(raw.get("min_qty", raw.get("minQty", raw.get("min_quantity", 0.0)))),
+            qty_step=safe_float(raw.get("qty_step", raw.get("stepSize", raw.get("quantity_step", 0.0)))),
+            min_notional=safe_float(raw.get("min_notional", raw.get("minNotional", 0.0))),
+            price_tick=safe_float(raw.get("price_tick", raw.get("tickSize", 0.0))),
+            quantity_precision=safe_int(raw.get("quantity_precision", raw.get("qtyPrecision", 6)), 6),
+            price_precision=safe_int(raw.get("price_precision", raw.get("pricePrecision", 6)), 6),
+        )
 
 
-@safe(default=True)
-def initialize() -> bool:
-    st = load_trade_state()
-    save_trade_state(st)
-    return True
+
+
+class RealTradeSafetyGuard:
+    """
+    Final safety guard before any real order.
+
+    Blocks:
+    - emergency_stop
+    - real trading disabled in runtime_settings
+    - duplicate open exchange position for same symbol/direction
+    - duplicate pending internal position for same symbol/direction
+    - max positions already reached
+    """
+
+    CLOSED_STATUSES = {"CLOSED", "TP2", "AI_EXIT", "SL", "FAILED", "REJECTED"}
+
+    def check_runtime(self) -> None:
+        try:
+            runtime = store().section("runtime_settings")
+            legacy_runtime = store().section("runtime")
+
+            emergency_stop = bool(runtime.get("emergency_stop", legacy_runtime.get("emergency_stop", False)))
+            if emergency_stop:
+                reason = str(runtime.get("emergency_reason", legacy_runtime.get("emergency_reason", "")))
+                raise RealTradeError(f"emergency_stop_active:{reason}")
+
+            enabled = bool(runtime.get("real_trading_enabled", getattr(SETTINGS.trading, "real_trading_enabled", False)))
+            if not enabled:
+                raise RealTradeError("real_trading_disabled_runtime")
+        except RealTradeError:
+            raise
+        except Exception as exc:
+            raise RealTradeError(f"runtime_safety_check_failed:{exc}")
+
+    def check_internal_duplicates(self, symbol: str, exchange_symbol: str, direction: str, max_positions: int) -> None:
+        try:
+            positions = store().section("positions")
+        except Exception as exc:
+            raise RealTradeError(f"position_store_check_failed:{exc}")
+
+        active_count = 0
+        for item in positions.values():
+            if not isinstance(item, dict):
+                continue
+
+            status = str(item.get("status", "")).upper()
+            if status in self.CLOSED_STATUSES:
+                continue
+
+            active_count += 1
+
+            item_symbol = str(item.get("exchange_symbol", item.get("symbol", ""))).upper()
+            item_direction = normalize_direction(str(item.get("direction", "")))
+
+            if item_symbol in {symbol.upper(), exchange_symbol.upper()} and item_direction == direction:
+                raise RealTradeError(f"duplicate_internal_position:{exchange_symbol}:{direction}:{status}")
+
+        if max_positions > 0 and active_count >= max_positions:
+            raise RealTradeError(f"max_positions_reached_internal:{active_count}/{max_positions}")
+
+    def check_exchange_duplicates(self, client: Any, exchange_symbol: str, direction: str, max_positions: int) -> None:
+        try:
+            positions = _call_optional(client, ["get_open_positions", "fetch_open_positions"])
+        except Exception as exc:
+            raise RealTradeError(f"exchange_position_check_failed:{exc}")
+
+        if hasattr(positions, "to_dict") and callable(positions.to_dict):
+            positions = positions.to_dict()
+        if isinstance(positions, dict):
+            positions = positions.get("positions", positions.get("data", []))
+        if not isinstance(positions, list):
+            positions = []
+
+        active_count = 0
+        for pos in positions:
+            if not isinstance(pos, dict):
+                continue
+
+            qty = safe_float(pos.get("quantity", pos.get("qty", pos.get("positionAmt", pos.get("size", 0.0)))))
+            if qty <= 0:
+                continue
+
+            active_count += 1
+
+            sym = str(pos.get("symbol", pos.get("contract", ""))).upper()
+            side = normalize_direction(str(pos.get("direction", pos.get("side", pos.get("positionSide", "")))))
+
+            if sym == exchange_symbol.upper() and side == direction:
+                raise RealTradeError(f"duplicate_exchange_position:{exchange_symbol}:{direction}")
+
+        if max_positions > 0 and active_count >= max_positions:
+            raise RealTradeError(f"max_positions_reached_exchange:{active_count}/{max_positions}")
+
+    def run(self, client: Any, symbol: str, exchange_symbol: str, direction: str, max_positions: int) -> None:
+        self.check_runtime()
+        self.check_internal_duplicates(symbol, exchange_symbol, direction, max_positions)
+        self.check_exchange_duplicates(client, exchange_symbol, direction, max_positions)
+
+
+class RealTradePreflightBuilder:
+    """Builds and verifies preflight before sending any real order."""
+
+    def __init__(self):
+        self.settings_reader = TradeSettingsReader()
+        self.rules_reader = SymbolRulesReader()
+        self.safety_guard = RealTradeSafetyGuard()
+
+    def build(self, client: Any, decision: AIDecision, plan: TPSLPlan) -> RealTradePreflight:
+        reasons: List[str] = []
+        warnings: List[str] = []
+
+        settings = self.settings_reader.read()
+
+        if decision.decision_type != DECISION_REAL or not decision.should_trade_real:
+            return self._invalid(decision, plan, "DECISION_NOT_REAL")
+
+        if not settings.trading_enabled:
+            return self._invalid(decision, plan, "REAL_TRADING_DISABLED")
+
+        symbol = normalize_symbol(decision.symbol)
+        exchange_symbol = toobit_symbol(symbol)
+        direction = normalize_direction(decision.direction)
+
+        if direction not in {DIRECTION_LONG, DIRECTION_SHORT}:
+            return self._invalid(decision, plan, "INVALID_DIRECTION")
+
+        try:
+            self.safety_guard.run(
+                client=client,
+                symbol=symbol,
+                exchange_symbol=exchange_symbol,
+                direction=direction,
+                max_positions=settings.max_positions,
+            )
+            reasons.append("RUNTIME_AND_DUPLICATE_GUARDS_PASSED")
+        except Exception as exc:
+            return self._invalid(decision, plan, f"SAFETY_GUARD_FAILED:{exc}")
+
+        if settings.margin_usdt <= 0:
+            return self._invalid(decision, plan, "INVALID_MARGIN_USDT")
+
+        if settings.leverage <= 0:
+            return self._invalid(decision, plan, "INVALID_LEVERAGE")
+
+        entry = safe_float(plan.entry or decision.entry)
+        if entry <= 0:
+            return self._invalid(decision, plan, "INVALID_ENTRY_PRICE")
+
+        try:
+            self._ensure_isolated(client, exchange_symbol)
+            reasons.append("ISOLATED_MARGIN_VERIFIED")
+        except Exception as exc:
+            return self._invalid(decision, plan, f"ISOLATED_VERIFY_FAILED:{exc}")
+
+        try:
+            self._ensure_leverage(client, exchange_symbol, settings.leverage)
+            reasons.append("LEVERAGE_VERIFIED")
+        except Exception as exc:
+            return self._invalid(decision, plan, f"LEVERAGE_VERIFY_FAILED:{exc}")
+
+        rules = self.rules_reader.read(client, exchange_symbol)
+        size_plan = self._build_size_plan(
+            symbol=exchange_symbol,
+            margin_usdt=settings.margin_usdt,
+            leverage=settings.leverage,
+            price=entry,
+            rules=rules,
+        )
+
+        if not size_plan.valid:
+            return RealTradePreflight(
+                preflight_id=f"pre_{uuid4().hex}",
+                decision_id=decision.decision_id,
+                symbol=symbol,
+                exchange_symbol=exchange_symbol,
+                direction=direction,
+                margin_mode=MARGIN_ISOLATED,
+                leverage=settings.leverage,
+                size_plan=size_plan,
+                tp1=plan.tp1,
+                tp2=plan.tp2,
+                sl=plan.sl,
+                valid=False,
+                reason_codes=tuple(reasons + [size_plan.reason]),
+                warnings=tuple(warnings),
+            )
+
+        if plan.tp1 <= 0 or plan.sl <= 0:
+            return self._invalid(decision, plan, "TP_SL_MISSING")
+
+        reasons.append("SIZE_PLAN_VALID")
+        reasons.append("TP_SL_PRESENT")
+
+        return RealTradePreflight(
+            preflight_id=f"pre_{uuid4().hex}",
+            decision_id=decision.decision_id,
+            symbol=symbol,
+            exchange_symbol=exchange_symbol,
+            direction=direction,
+            margin_mode=MARGIN_ISOLATED,
+            leverage=settings.leverage,
+            size_plan=size_plan,
+            tp1=plan.tp1,
+            tp2=plan.tp2,
+            sl=plan.sl,
+            valid=True,
+            reason_codes=tuple(reasons),
+            warnings=tuple(warnings),
+        )
+
+    def _invalid(self, decision: AIDecision, plan: TPSLPlan, reason: str) -> RealTradePreflight:
+        symbol = normalize_symbol(getattr(decision, "symbol", ""))
+        try:
+            exchange_symbol = toobit_symbol(symbol)
+        except Exception:
+            exchange_symbol = symbol
+
+        return RealTradePreflight(
+            preflight_id=f"pre_{uuid4().hex}",
+            decision_id=getattr(decision, "decision_id", ""),
+            symbol=symbol,
+            exchange_symbol=exchange_symbol,
+            direction=normalize_direction(getattr(decision, "direction", "")),
+            margin_mode=MARGIN_ISOLATED,
+            leverage=safe_int(getattr(SETTINGS.trading, "leverage", 1), 1),
+            size_plan=OrderSizePlan(symbol=exchange_symbol, margin_usdt=0, leverage=0, notional_usdt=0, price=0, quantity=0, quantity_raw=0, valid=False, reason=reason),
+            tp1=safe_float(getattr(plan, "tp1", 0.0)),
+            tp2=safe_float(getattr(plan, "tp2", 0.0)),
+            sl=safe_float(getattr(plan, "sl", 0.0)),
+            valid=False,
+            reason_codes=(reason,),
+            warnings=(),
+        )
+
+    def _ensure_isolated(self, client: Any, exchange_symbol: str) -> None:
+        _call_optional(client, ["set_margin_mode", "set_margin_type"], exchange_symbol, MARGIN_ISOLATED)
+        mode = _call_optional(client, ["get_margin_mode", "get_margin_type"], exchange_symbol)
+        mode_str = str(mode.get("margin_mode", mode.get("marginType", mode)) if isinstance(mode, dict) else mode).upper()
+        if MARGIN_ISOLATED not in mode_str:
+            raise RealTradeError(f"margin_not_isolated:{mode_str}")
+
+    def _ensure_leverage(self, client: Any, exchange_symbol: str, leverage: int) -> None:
+        _call_optional(client, ["set_leverage"], exchange_symbol, leverage)
+        current = _call_optional(client, ["get_leverage"], exchange_symbol)
+        lev = safe_int(current.get("leverage", current.get("lev", 0)) if isinstance(current, dict) else current)
+        if lev != int(leverage):
+            raise RealTradeError(f"leverage_mismatch:expected={leverage}:got={lev}")
+
+    def _build_size_plan(self, symbol: str, margin_usdt: float, leverage: int, price: float, rules: ExchangeSymbolRules) -> OrderSizePlan:
+        notional = margin_usdt * leverage
+        qty_raw = notional / price if price > 0 else 0.0
+        qty = round_step(qty_raw, rules.qty_step, rules.quantity_precision)
+
+        if qty <= 0:
+            return OrderSizePlan(symbol, margin_usdt, leverage, notional, price, 0.0, qty_raw, False, "QUANTITY_ZERO")
+
+        if rules.min_qty > 0 and qty < rules.min_qty:
+            return OrderSizePlan(symbol, margin_usdt, leverage, notional, price, qty, qty_raw, False, "QUANTITY_BELOW_MIN")
+
+        actual_notional = qty * price
+        if rules.min_notional > 0 and actual_notional < rules.min_notional:
+            return OrderSizePlan(symbol, margin_usdt, leverage, notional, price, qty, qty_raw, False, "NOTIONAL_BELOW_MIN")
+
+        return OrderSizePlan(symbol, margin_usdt, leverage, notional, price, qty, qty_raw, True, "OK")
+
+
+class RealOrderExecutor:
+    """Sends the real order through tobit_client.py after preflight."""
+
+    def open_order(self, client: Any, preflight: RealTradePreflight, plan: TPSLPlan) -> JsonDict:
+        if not preflight.valid:
+            raise RealTradeError("preflight_invalid")
+
+        side = "BUY" if preflight.direction == DIRECTION_LONG else "SELL"
+        client_order_id = f"mh_{preflight.decision_id[-18:]}_{int(time.time())}"
+
+        payload = {
+            "symbol": preflight.exchange_symbol,
+            "side": side,
+            "direction": preflight.direction,
+            "quantity": preflight.size_plan.quantity,
+            "price": 0,
+            "order_type": "MARKET",
+            "margin_mode": MARGIN_ISOLATED,
+            "leverage": preflight.leverage,
+            "take_profit": preflight.tp1,
+            "take_profit_2": preflight.tp2,
+            "stop_loss": preflight.sl,
+            "client_order_id": client_order_id,
+        }
+
+        result = _call_optional(
+            client,
+            ["open_futures_position", "create_futures_order", "place_order"],
+            **payload,
+        )
+
+        if hasattr(result, "to_dict") and callable(result.to_dict):
+            result = result.to_dict()
+        if not isinstance(result, dict):
+            result = {"raw": result}
+
+        result.setdefault("client_order_id", client_order_id)
+        return result
+
+
+class RealPositionConfirmer:
+    """Polls Toobit after order submission to confirm actual futures position."""
+
+    def confirm(self, client: Any, exchange_symbol: str, direction: str, timeout_seconds: int = 30, interval_seconds: float = 2.0) -> Optional[JsonDict]:
+        deadline = time.time() + max(5, timeout_seconds)
+        direction = normalize_direction(direction)
+
+        while time.time() < deadline:
+            try:
+                positions = _call_optional(client, ["get_open_positions", "fetch_open_positions"])
+                if hasattr(positions, "to_dict") and callable(positions.to_dict):
+                    positions = positions.to_dict()
+                if isinstance(positions, dict):
+                    positions = positions.get("positions", positions.get("data", []))
+                if not isinstance(positions, list):
+                    positions = []
+
+                for pos in positions:
+                    if not isinstance(pos, dict):
+                        continue
+                    sym = str(pos.get("symbol", pos.get("contract", "")))
+                    side = normalize_direction(str(pos.get("direction", pos.get("side", ""))))
+                    qty = safe_float(pos.get("quantity", pos.get("qty", pos.get("positionAmt", 0.0))))
+                    if sym == exchange_symbol and side == direction and qty > 0:
+                        return pos
+            except Exception:
+                pass
+            time.sleep(interval_seconds)
+        return None
+
+    def repair_tp_sl_if_missing(self, client: Any, exchange_symbol: str, direction: str, plan: TPSLPlan) -> None:
+        try:
+            _call_optional(
+                client,
+                ["ensure_tp_sl", "set_position_tp_sl", "repair_tp_sl"],
+                exchange_symbol,
+                direction,
+                plan.tp1,
+                plan.tp2,
+                plan.sl,
+            )
+        except Exception:
+            return
+
+
+class RealTradeManager:
+    """Main real trade manager with safety-first Toobit order flow."""
+
+    def __init__(self, client: Any):
+        self.client = client
+        self.preflight_builder = RealTradePreflightBuilder()
+        self.executor = RealOrderExecutor()
+        self.confirmer = RealPositionConfirmer()
+
+    def open_real_position(self, decision: AIDecision, plan: TPSLPlan, analysis_meta: Optional[JsonDict] = None) -> RealTradeOpenResult:
+        trade_id = f"real_{uuid4().hex}"
+        created = now_ts()
+
+        try:
+            preflight = self.preflight_builder.build(self.client, decision, plan)
+
+            if not preflight.valid:
+                result = RealTradeOpenResult(
+                    trade_id=trade_id,
+                    decision_id=decision.decision_id,
+                    symbol=decision.symbol,
+                    exchange_symbol=preflight.exchange_symbol,
+                    direction=decision.direction,
+                    status=STATUS_REJECTED,
+                    entry=plan.entry,
+                    quantity=preflight.size_plan.quantity,
+                    margin_usdt=preflight.size_plan.margin_usdt,
+                    leverage=preflight.leverage,
+                    tp1=plan.tp1,
+                    tp2=plan.tp2,
+                    sl=plan.sl,
+                    created_at=created,
+                    error=";".join(preflight.reason_codes),
+                    preflight=preflight.to_dict(),
+                )
+                save_error("real_trade_preflight", result.error, result.to_dict())
+                return result
+
+            raw = self.executor.open_order(self.client, preflight, plan)
+            order_id = str(raw.get("order_id", raw.get("orderId", raw.get("id", ""))))
+            client_order_id = str(raw.get("client_order_id", ""))
+
+            pending = RealTradeOpenResult(
+                trade_id=trade_id,
+                decision_id=decision.decision_id,
+                symbol=preflight.symbol,
+                exchange_symbol=preflight.exchange_symbol,
+                direction=preflight.direction,
+                status=STATUS_PENDING_REAL_CONFIRM,
+                order_id=order_id,
+                client_order_id=client_order_id,
+                entry=plan.entry,
+                quantity=preflight.size_plan.quantity,
+                margin_usdt=preflight.size_plan.margin_usdt,
+                leverage=preflight.leverage,
+                tp1=plan.tp1,
+                tp2=plan.tp2,
+                sl=plan.sl,
+                created_at=created,
+                preflight=preflight.to_dict(),
+                raw_response=raw,
+            )
+            pending_record = pending.to_dict()
+            pending_record["meta"] = {
+                **dict(pending_record.get("meta", {}) or {}),
+                **dict(analysis_meta or {}),
+                "decision_id": decision.decision_id,
+                "tp_sl_plan": plan.to_dict(),
+            }
+            save_position(trade_id, pending_record)
+
+            position = self.confirmer.confirm(
+                self.client,
+                exchange_symbol=preflight.exchange_symbol,
+                direction=preflight.direction,
+                timeout_seconds=30,
+                interval_seconds=2.0,
+            )
+
+            if position:
+                self.confirmer.repair_tp_sl_if_missing(self.client, preflight.exchange_symbol, preflight.direction, plan)
+                confirmed = RealTradeOpenResult(
+                    **{
+                        **pending.to_dict(),
+                        "status": STATUS_CONFIRMED,
+                        "position_id": str(position.get("position_id", position.get("id", trade_id))),
+                        "confirmed_at": now_ts(),
+                        "raw_response": {"order": raw, "position": position},
+                    }
+                )
+                confirmed_record = confirmed.to_dict()
+                confirmed_record["meta"] = {
+                    **dict(confirmed_record.get("meta", {}) or {}),
+                    **dict(analysis_meta or {}),
+                    "decision_id": decision.decision_id,
+                    "tp_sl_plan": plan.to_dict(),
+                }
+                save_position(trade_id, confirmed_record)
+                return confirmed
+
+            failed = RealTradeOpenResult(
+                **{
+                    **pending.to_dict(),
+                    "status": STATUS_FAILED,
+                    "error": "POSITION_NOT_CONFIRMED_AFTER_ORDER",
+                }
+            )
+            failed_record = failed.to_dict()
+            failed_record["meta"] = {
+                **dict(failed_record.get("meta", {}) or {}),
+                **dict(analysis_meta or {}),
+                "decision_id": decision.decision_id,
+                "tp_sl_plan": plan.to_dict(),
+            }
+            save_position(trade_id, failed_record)
+            save_error("real_trade_confirm", failed.error, failed.to_dict())
+            return failed
+
+        except Exception as exc:
+            result = RealTradeOpenResult(
+                trade_id=trade_id,
+                decision_id=getattr(decision, "decision_id", ""),
+                symbol=getattr(decision, "symbol", ""),
+                exchange_symbol="",
+                direction=getattr(decision, "direction", ""),
+                status=STATUS_FAILED,
+                created_at=created,
+                error=str(exc),
+            )
+            save_error("real_trade_open_exception", str(exc), result.to_dict())
+            return result
+
+
+def create_manager(client: Any) -> RealTradeManager:
+    return RealTradeManager(client)
+
+
+def open_real_position(client: Any, decision: AIDecision, plan: TPSLPlan, analysis_meta: Optional[JsonDict] = None) -> RealTradeOpenResult:
+    return RealTradeManager(client).open_real_position(decision, plan, analysis_meta=analysis_meta)
