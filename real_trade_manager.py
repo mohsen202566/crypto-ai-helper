@@ -700,32 +700,70 @@ class RealOrderExecutor:
 class RealPositionConfirmer:
     """Polls Toobit after order submission to confirm actual futures position."""
 
-    def confirm(self, client: Any, exchange_symbol: str, direction: str, timeout_seconds: int = 30, interval_seconds: float = 2.0) -> Optional[JsonDict]:
-        deadline = time.time() + max(5, timeout_seconds)
-        direction = normalize_direction(direction)
+    def _symbol_matches(self, client: Any, raw_symbol: str, exchange_symbol: str) -> bool:
+        """Use Toobit client's symbol matcher when available, else safe normalized compare."""
+        try:
+            matcher = getattr(client, "_position_symbol_matches", None)
+            if callable(matcher):
+                return bool(matcher({"symbol": raw_symbol}, exchange_symbol))
+        except Exception:
+            pass
+        try:
+            candidates = getattr(client, "_symbol_candidates", None)
+            if callable(candidates):
+                return bool(set(candidates(raw_symbol)) & set(candidates(exchange_symbol)))
+        except Exception:
+            pass
+        return str(raw_symbol or "").upper() == str(exchange_symbol or "").upper()
+
+    def _find_matching_position(self, client: Any, exchange_symbol: str, direction: str) -> Optional[JsonDict]:
+        positions = _call_optional(client, ["get_open_positions", "fetch_open_positions"], exchange_symbol)
+        if hasattr(positions, "to_dict") and callable(positions.to_dict):
+            positions = positions.to_dict()
+        if isinstance(positions, dict):
+            positions = positions.get("positions", positions.get("data", []))
+        if not isinstance(positions, list):
+            positions = []
+
+        wanted_direction = normalize_direction(direction)
+        for pos in positions:
+            if not isinstance(pos, dict):
+                continue
+            sym = str(pos.get("symbol", pos.get("contract", pos.get("exchange_symbol", ""))))
+            side = normalize_direction(str(pos.get("direction", pos.get("side", pos.get("positionSide", "")))))
+            qty = safe_float(pos.get("quantity", pos.get("qty", pos.get("positionAmt", pos.get("size", 0.0)))))
+            if self._symbol_matches(client, sym, exchange_symbol) and side == wanted_direction and qty > 0:
+                return pos
+        return None
+
+    def confirm(self, client: Any, exchange_symbol: str, direction: str, timeout_seconds: int = 70) -> Optional[JsonDict]:
+        """Confirm actual exchange position with the required 60-70s window.
+
+        0-30s: fast polling every ~2s.
+        30-70s: slower polling every ~5s.
+        A final exchange recheck is performed before returning None.
+        """
+        timeout_seconds = max(5, int(timeout_seconds or 70))
+        started = time.time()
+        deadline = started + timeout_seconds
 
         while time.time() < deadline:
             try:
-                positions = _call_optional(client, ["get_open_positions", "fetch_open_positions"])
-                if hasattr(positions, "to_dict") and callable(positions.to_dict):
-                    positions = positions.to_dict()
-                if isinstance(positions, dict):
-                    positions = positions.get("positions", positions.get("data", []))
-                if not isinstance(positions, list):
-                    positions = []
-
-                for pos in positions:
-                    if not isinstance(pos, dict):
-                        continue
-                    sym = str(pos.get("symbol", pos.get("contract", "")))
-                    side = normalize_direction(str(pos.get("direction", pos.get("side", ""))))
-                    qty = safe_float(pos.get("quantity", pos.get("qty", pos.get("positionAmt", 0.0))))
-                    if sym == exchange_symbol and side == direction and qty > 0:
-                        return pos
+                found = self._find_matching_position(client, exchange_symbol, direction)
+                if found:
+                    return found
             except Exception:
                 pass
-            time.sleep(interval_seconds)
-        return None
+
+            elapsed = time.time() - started
+            sleep_seconds = 2.0 if elapsed < 30.0 else 5.0
+            time.sleep(min(sleep_seconds, max(0.0, deadline - time.time())))
+
+        # One last Toobit sync before marking the pending slot as failed.
+        try:
+            return self._find_matching_position(client, exchange_symbol, direction)
+        except Exception:
+            return None
 
     def repair_tp_sl_if_missing(self, client: Any, exchange_symbol: str, direction: str, plan: TPSLPlan) -> None:
         try:
@@ -783,6 +821,7 @@ class RealTradeManager:
             raw = self.executor.open_order(self.client, preflight, plan)
             order_id = str(raw.get("order_id", raw.get("orderId", raw.get("id", ""))))
             client_order_id = str(raw.get("client_order_id", ""))
+            recovered_position = raw.get("position") if isinstance(raw.get("position"), dict) else None
 
             pending = RealTradeOpenResult(
                 trade_id=trade_id,
@@ -813,13 +852,14 @@ class RealTradeManager:
             )
             save_position(trade_id, pending_record)
 
-            position = self.confirmer.confirm(
-                self.client,
-                exchange_symbol=preflight.exchange_symbol,
-                direction=preflight.direction,
-                timeout_seconds=30,
-                interval_seconds=2.0,
-            )
+            position = recovered_position
+            if position is None:
+                position = self.confirmer.confirm(
+                    self.client,
+                    exchange_symbol=preflight.exchange_symbol,
+                    direction=preflight.direction,
+                    timeout_seconds=70,
+                )
 
             if position:
                 self.confirmer.repair_tp_sl_if_missing(self.client, preflight.exchange_symbol, preflight.direction, plan)
