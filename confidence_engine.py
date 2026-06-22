@@ -358,12 +358,28 @@ class ConfidenceEngine:
             + unknown_penalty * 0.35
         )
 
-        # Low-data setups should usually downgrade to GHOST, not become zero-confidence.
-        low_data_floor = 18.0 if sample_count <= 0 else 0.0
-        if candidate.valid and movement.valid and trap.valid and state.valid:
-            total = clamp(max(low_data_floor, positive_confidence - risk_deduction))
-        else:
+        # Low-data / cautious states should downgrade to GHOST, not become zero-confidence.
+        # Only truly broken input data is allowed to collapse confidence toward 0.
+        low_data_floor = 18.0 if sample_count <= 0 else 8.0
+
+        sensor = getattr(candidate, "sensor_snapshot", None)
+        try:
+            sensor_price = float(getattr(sensor, "price", 0.0) or 0.0)
+        except Exception:
+            sensor_price = 0.0
+
+        has_real_invalid_data = (
+            not bool(candidate.valid)
+            or sensor is None
+            or getattr(sensor, "valid", True) is False
+            or sensor_price <= 0.0
+        )
+
+        if has_real_invalid_data:
+            reasons.append("CONFIDENCE_ZERO_ALLOWED_INVALID_DATA")
             total = clamp(positive_confidence - risk_deduction)
+        else:
+            total = clamp(max(low_data_floor, positive_confidence - risk_deduction))
 
         if conflict_penalty >= 40:
             boundary = BOUNDARY_CONFLICTED
