@@ -66,7 +66,7 @@ from real_trade_manager import open_real_position, RealTradeOpenResult
 from tobit_client import get_client
 from position_monitor import monitor_all_positions
 from result_reporter import reporter, ReportPayload, format_error_report
-from stats_manager import record_decision, record_position_event, record_ghost_result, stats_report, detailed_stats_report, clear_stats
+from stats_manager import record_decision, record_position_event, record_ghost_result, stats_report, detailed_stats_report, clear_stats, manager as stats_manager_instance
 
 
 LOGGER = logging.getLogger("movement_hunter_bot")
@@ -134,18 +134,50 @@ def safe_int(value: Any, default: int = 0) -> int:
 
 
 def get_runtime_settings() -> Dict[str, Any]:
+    """
+    Persistent runtime settings.
+
+    These values are command-controlled and must not be only visual.
+    real_trade_manager reads the same runtime_settings section, so changing
+    margin/leverage/max_positions here changes real order sizing and safety.
+    """
     section = store().section("runtime_settings")
-    section.setdefault("real_trading_enabled", bool(getattr(SETTINGS.trading, "real_trading_enabled", False)))
-    section.setdefault("auto_signal_enabled", bool(getattr(SETTINGS.scanner, "auto_signal_enabled", True)))
-    section.setdefault("scan_interval_seconds", safe_int(getattr(SETTINGS.scanner, "scan_interval_seconds", 240), 240))
-    section.setdefault("last_scan_ts", 0)
+
+    defaults = {
+        "real_trading_enabled": bool(getattr(SETTINGS.trading, "enabled", False)),
+        "auto_signal_enabled": bool(os.getenv("AUTO_SIGNAL_ENABLED", "true").lower() in {"1", "true", "yes", "on"}),
+        "scan_interval_seconds": safe_int(getattr(SETTINGS.monitor, "scan_interval_seconds", 180), 180),
+        "margin_usdt": safe_float(getattr(SETTINGS.trading, "margin_usdt", 5.0), 5.0),
+        "trade_margin_usdt": safe_float(getattr(SETTINGS.trading, "margin_usdt", 5.0), 5.0),
+        "leverage": safe_int(getattr(SETTINGS.trading, "leverage", 10), 10),
+        "max_positions": safe_int(getattr(SETTINGS.trading, "max_positions", 5), 5),
+        "daily_loss_lock_enabled": True,
+        "daily_loss_locked_until": 0,
+        "last_scan_ts": 0,
+    }
+    changed = False
+    for key, value in defaults.items():
+        if key not in section:
+            section[key] = value
+            changed = True
+    if changed:
+        save_runtime_settings(section)
     return section
 
 
 def save_runtime_settings(values: Dict[str, Any]) -> None:
-    section = store().section("runtime_settings")
-    section.update(values)
-    store().save()
+    def mutate(section: Dict[str, Any]) -> Dict[str, Any]:
+        section.update(values)
+        section["updated_at"] = now_ts()
+        return section
+
+    try:
+        store().update_section("runtime_settings", mutate, save=True)
+    except AttributeError:
+        section = store().section_ref("runtime_settings")  # type: ignore[attr-defined]
+        section.update(values)
+        section["updated_at"] = now_ts()
+        store().save()
 
 
 def real_trading_enabled() -> bool:
@@ -154,6 +186,18 @@ def real_trading_enabled() -> bool:
 
 def auto_signal_enabled() -> bool:
     return bool(get_runtime_settings().get("auto_signal_enabled", True))
+
+
+def runtime_margin_usdt() -> float:
+    return safe_float(get_runtime_settings().get("margin_usdt", getattr(SETTINGS.trading, "margin_usdt", 0)), 0.0)
+
+
+def runtime_leverage() -> int:
+    return safe_int(get_runtime_settings().get("leverage", getattr(SETTINGS.trading, "leverage", 1)), 1)
+
+
+def runtime_max_positions() -> int:
+    return safe_int(get_runtime_settings().get("max_positions", getattr(SETTINGS.trading, "max_positions", 1)), 1)
 
 
 def owner_id() -> int:
@@ -375,8 +419,12 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "تحلیل BTC\n"
         "سیگنال BTC\n"
         "بررسی بازار\n"
-        "وضعیت ترید\n"
-        "ترید روشن / ترید خاموش\n"
+        "وضعیت / وضعیت ترید\n"
+        "ترید فعال / ترید خاموش\n"
+        "ترید دلار 10 / سرمایه ترید 10\n"
+        "ترید لوریج 10\n"
+        "حداکثر پوزیشن 3\n"
+        "قفل ضرر خاموش\n"
         "آمار / آمار 7 روز / آمار کل\n"
         "آمار هوشمند\n"
         "حذف آمار"
@@ -391,37 +439,245 @@ async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def trade_status(update: Update) -> None:
     settings = get_runtime_settings()
+    lock_enabled = bool(settings.get("daily_loss_lock_enabled", True))
+    locked_until = safe_int(settings.get("daily_loss_locked_until", 0), 0)
+    lock_state = "خاموش" if not lock_enabled else ("فعال" if locked_until > now_ts() else "آماده")
     text = (
         "⚙️ وضعیت ترید\n"
         f"ترید واقعی: {'روشن ✅' if real_trading_enabled() else 'خاموش ❌'}\n"
         f"سیگنال خودکار: {'روشن ✅' if auto_signal_enabled() else 'خاموش ❌'}\n"
-        f"اسکن: {settings.get('scan_interval_seconds', 240)} ثانیه\n"
-        f"مارجین: {getattr(SETTINGS.trading, 'margin_usdt', 0)}$ | لوریج: {getattr(SETTINGS.trading, 'leverage', 1)}x\n"
-        f"حداکثر پوزیشن: {getattr(SETTINGS.trading, 'max_positions', 1)}"
+        f"قفل ضرر: {lock_state}\n"
+        f"اسکن: {settings.get('scan_interval_seconds', 180)} ثانیه\n"
+        f"سرمایه هر ترید: {runtime_margin_usdt():.2f}$\n"
+        f"لوریج: {runtime_leverage()}x\n"
+        f"حداکثر پوزیشن: {runtime_max_positions()}"
     )
     await send_text(update, text)
 
 
+
+def parse_first_number(text: str, default: Optional[float] = None) -> Optional[float]:
+    m = re.search(r"(\d+(?:[\\.,]\d+)?)", str(text or ""))
+    if not m:
+        return default
+    try:
+        return float(m.group(1).replace(",", "."))
+    except Exception:
+        return default
+
+
+def percent(part: float, total: float) -> float:
+    return (part / total * 100.0) if total else 0.0
+
+
+def build_ai_status_text() -> str:
+    """
+    Full AI report for command: هوش مصنوعی
+
+    Includes REAL/GHOST TP1/TP2/SL/AI_EXIT, metadata counts, Movement Hunter
+    pump/dump outcome counts, and meta-learning status.
+    """
+    sm = stats_manager_instance()
+    real = sm.summary(days=None, source_type="REAL")
+    ghost = sm.summary(days=None, source_type="GHOST")
+    all_summary = sm.summary(days=None, source_type="ALL")
+
+    try:
+        gs = ghost_stats()
+        ghost_total = safe_int(getattr(gs, "total", 0), 0)
+        ghost_open = safe_int(getattr(gs, "open_count", 0), 0)
+        ghost_closed = safe_int(getattr(gs, "closed_count", 0), 0)
+        ghost_tp1 = safe_int(getattr(gs, "tp1_count", 0), 0)
+        ghost_tp2 = safe_int(getattr(gs, "tp2_count", 0), 0)
+        ghost_ai_exit = safe_int(getattr(gs, "ai_exit_count", 0), 0)
+        ghost_sl = safe_int(getattr(gs, "sl_count", 0), 0)
+        ghost_wr = safe_float(getattr(gs, "win_rate", 0), 0)
+    except Exception:
+        ghost_total = ghost.total_events
+        ghost_open = 0
+        ghost_closed = ghost.closed_count
+        ghost_tp1 = ghost.tp1_count
+        ghost_tp2 = ghost.tp2_count
+        ghost_ai_exit = ghost.ai_exit_count
+        ghost_sl = ghost.sl_count
+        ghost_wr = ghost.win_rate
+
+    learning_section = store().section("learning")
+    movement_section = store().section("movement_memory")
+    meta_section = store().section("meta_learning")
+    ghosts_section = store().section("ghosts")
+
+    movement_items = [v for v in movement_section.values() if isinstance(v, dict)]
+    pump_total = pump_ok = dump_total = dump_ok = 0
+    fresh_count = late_count = 0
+
+    for rec in movement_items:
+        direction = str(
+            rec.get("direction")
+            or rec.get("predicted_direction")
+            or rec.get("side")
+            or rec.get("signal_direction")
+            or ""
+        ).upper()
+        result = str(
+            rec.get("result")
+            or rec.get("outcome")
+            or rec.get("final_result")
+            or rec.get("movement_result")
+            or ""
+        ).upper()
+        freshness = str(rec.get("freshness") or rec.get("move_freshness") or rec.get("phase") or "").upper()
+
+        win = result in {"TP1", "TP2", "AI_EXIT", "SUCCESS", "WIN", "MOVE_SUCCESS", "CORRECT"}
+        if direction == "LONG":
+            pump_total += 1
+            if win:
+                pump_ok += 1
+        elif direction == "SHORT":
+            dump_total += 1
+            if win:
+                dump_ok += 1
+
+        if "FRESH" in freshness or "START" in freshness or "EARLY" in freshness:
+            fresh_count += 1
+        if "LATE" in freshness or "EXHAUST" in freshness:
+            late_count += 1
+
+    meta_samples = len(meta_section)
+    learning_samples = len(learning_section)
+    movement_samples = len(movement_items)
+
+    try:
+        meta = get_meta_learning_summary()
+        if hasattr(meta, "to_dict") and callable(meta.to_dict):
+            meta_dict = meta.to_dict()
+        elif isinstance(meta, dict):
+            meta_dict = meta
+        else:
+            meta_dict = {}
+    except Exception:
+        meta_dict = {}
+
+    strong_layers = meta_dict.get("strong_layers") or meta_dict.get("best_layers") or []
+    weak_layers = meta_dict.get("weak_layers") or meta_dict.get("worst_layers") or []
+    if isinstance(strong_layers, dict):
+        strong_layers = list(strong_layers.keys())
+    if isinstance(weak_layers, dict):
+        weak_layers = list(weak_layers.keys())
+
+    real_wins = real.tp1_count + real.tp2_count + real.ai_exit_count
+    ghost_wins = ghost_tp1 + ghost_tp2 + ghost_ai_exit
+    all_wins = all_summary.tp1_count + all_summary.tp2_count + all_summary.ai_exit_count
+
+    return (
+        "🤖 وضعیت هوش مصنوعی\\n\\n"
+        "📊 REAL\\n"
+        f"کل: {real.total_events} | بسته: {real.closed_count}\\n"
+        f"TP1: {real.tp1_count} | TP2: {real.tp2_count} | AI Exit: {real.ai_exit_count} | SL: {real.sl_count}\\n"
+        f"WinRate: {real.win_rate:.2f}% | بردها: {real_wins}\\n"
+        f"PnL واقعی تاییدشده: {real.confirmed_pnl_usdt:+.4f}$\\n\\n"
+        "👻 GHOST\\n"
+        f"کل: {ghost_total} | باز: {ghost_open} | بسته: {ghost_closed}\\n"
+        f"TP1: {ghost_tp1} | TP2: {ghost_tp2} | AI Exit: {ghost_ai_exit} | SL: {ghost_sl}\\n"
+        f"WinRate: {ghost_wr:.2f}% | بردها: {ghost_wins}\\n\\n"
+        "🎯 TP/SL کلی\\n"
+        f"TP1: {all_summary.tp1_count} | TP2: {all_summary.tp2_count} | AI Exit: {all_summary.ai_exit_count} | SL: {all_summary.sl_count}\\n"
+        f"WinRate کل: {all_summary.win_rate:.2f}% | Long WR: {all_summary.long_win_rate:.2f}% | Short WR: {all_summary.short_win_rate:.2f}%\\n\\n"
+        "🧠 Movement Hunter\\n"
+        f"تشخیص پامپ درست: {pump_ok}/{pump_total} ({percent(pump_ok, pump_total):.1f}%)\\n"
+        f"تشخیص دامپ درست: {dump_ok}/{dump_total} ({percent(dump_ok, dump_total):.1f}%)\\n"
+        f"Fresh/Early: {fresh_count} | Late/Exhaustion: {late_count}\\n\\n"
+        "🧬 Metadata / Learning\\n"
+        f"Learning samples: {learning_samples}\\n"
+        f"Movement memory: {movement_samples}\\n"
+        f"Ghost records: {len(ghosts_section)}\\n"
+        f"Meta records: {meta_samples}\\n"
+        f"لایه‌های قوی: {', '.join(map(str, strong_layers[:4])) if strong_layers else '-'}\\n"
+        f"لایه‌های ضعیف: {', '.join(map(str, weak_layers[:4])) if weak_layers else '-'}"
+    )
+
+
 async def handle_trade_toggle(update: Update, text: str) -> bool:
     normalized = str(text or "").strip().lower()
-    if "ترید روشن" in normalized or "trade on" in normalized:
-        save_runtime_settings({"real_trading_enabled": True})
-        await send_text(update, "✅ ترید واقعی روشن شد.")
+    compact = normalized.replace("‌", " ").replace("\u200c", " ")
+    settings_update: Dict[str, Any] = {}
+
+    if compact in {"ترید", "وضعیت", "وضعیت ترید", "trade", "trade status"}:
+        await trade_status(update)
         return True
-    if "ترید خاموش" in normalized or "trade off" in normalized:
-        save_runtime_settings({"real_trading_enabled": False})
-        await send_text(update, "❌ ترید واقعی خاموش شد.")
+
+    if "ترید فعال" in compact or "ترید روشن" in compact or "trade on" in compact:
+        settings_update.update({"real_trading_enabled": True})
+        save_runtime_settings(settings_update)
+        await send_text(update, "✅ ترید واقعی فعال شد. این تغییر واقعی و ذخیره شد.")
         return True
-    if "سیگنال خودکار روشن" in normalized:
+
+    if "ترید خاموش" in compact or "ترید غیرفعال" in compact or "trade off" in compact:
+        settings_update.update({"real_trading_enabled": False})
+        save_runtime_settings(settings_update)
+        await send_text(update, "❌ ترید واقعی خاموش شد. این تغییر واقعی و ذخیره شد.")
+        return True
+
+    if "قفل ضرر خاموش" in compact:
+        settings_update.update({
+            "daily_loss_lock_enabled": False,
+            "daily_loss_locked_until": 0,
+            "daily_loss_unlocked_at": now_ts(),
+        })
+        save_runtime_settings(settings_update)
+        await send_text(update, "🔓 قفل ضرر خاموش و آزاد شد.")
+        return True
+
+    if "قفل ضرر روشن" in compact:
+        settings_update.update({"daily_loss_lock_enabled": True})
+        save_runtime_settings(settings_update)
+        await send_text(update, "🔒 قفل ضرر روشن شد.")
+        return True
+
+    if compact.startswith("ترید دلار") or compact.startswith("سرمایه ترید"):
+        value = parse_first_number(compact)
+        if value is None or value <= 0:
+            await send_text(update, "❌ مقدار سرمایه ترید نامعتبر است. مثال: سرمایه ترید 10")
+            return True
+        value = max(1.0, min(float(value), 1_000_000.0))
+        settings_update.update({"margin_usdt": value, "trade_margin_usdt": value})
+        save_runtime_settings(settings_update)
+        await send_text(update, f"✅ سرمایه هر ترید روی {value:.2f}$ تنظیم و ذخیره شد.")
+        return True
+
+    if compact.startswith("ترید لوریج") or compact.startswith("لوریج ترید") or compact.startswith("لوریج"):
+        value = parse_first_number(compact)
+        if value is None or value <= 0:
+            await send_text(update, "❌ مقدار لوریج نامعتبر است. مثال: ترید لوریج 10")
+            return True
+        lev = max(1, min(int(value), 125))
+        settings_update.update({"leverage": lev})
+        save_runtime_settings(settings_update)
+        await send_text(update, f"✅ لوریج روی {lev}x تنظیم و ذخیره شد.")
+        return True
+
+    if compact.startswith("حداکثر پوزیشن") or compact.startswith("ماکس پوزیشن") or compact.startswith("max positions"):
+        value = parse_first_number(compact)
+        if value is None or value <= 0:
+            await send_text(update, "❌ مقدار حداکثر پوزیشن نامعتبر است. مثال: حداکثر پوزیشن 3")
+            return True
+        max_pos = max(1, min(int(value), 100))
+        settings_update.update({"max_positions": max_pos})
+        save_runtime_settings(settings_update)
+        await send_text(update, f"✅ حداکثر پوزیشن روی {max_pos} تنظیم و ذخیره شد.")
+        return True
+
+    if "سیگنال خودکار روشن" in compact:
         save_runtime_settings({"auto_signal_enabled": True})
         await send_text(update, "✅ سیگنال خودکار روشن شد.")
         return True
-    if "سیگنال خودکار خاموش" in normalized:
+
+    if "سیگنال خودکار خاموش" in compact:
         save_runtime_settings({"auto_signal_enabled": False})
         await send_text(update, "❌ سیگنال خودکار خاموش شد.")
         return True
-    return False
 
+    return False
 
 async def handle_stats(update: Update, text: str) -> bool:
     t = str(text or "").strip()
@@ -538,8 +794,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     if text.startswith("هوش مصنوعی"):
-        meta = get_meta_learning_summary()
-        await send_payload(update, reporter().meta_status_report(meta))
+        await send_text(update, build_ai_status_text())
         return
 
     await send_text(update, "دستور شناخته نشد.")
