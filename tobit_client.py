@@ -52,6 +52,7 @@ SIDE_SELL = "SELL"
 
 DIRECTION_LONG = "LONG"
 DIRECTION_SHORT = "SHORT"
+DIRECTION_NEUTRAL = "NEUTRAL"
 
 MARGIN_ISOLATED = "ISOLATED"
 MARGIN_CROSS = "CROSS"
@@ -125,6 +126,8 @@ def normalize_direction(direction: str) -> str:
         return DIRECTION_LONG
     if d in {"SHORT", "SELL"}:
         return DIRECTION_SHORT
+    if d in {"", "BOTH", "NONE", "FLAT", "NEUTRAL", "0"}:
+        return DIRECTION_NEUTRAL
     return d
 
 
@@ -403,6 +406,147 @@ class ToobitClient:
                 return {"symbol": symbol, "leverage": safe_int(data.get("leverage", 0))}
         return {"symbol": symbol, "leverage": 0}
 
+
+    def ping_private(self) -> JsonDict:
+        """
+        Verify that Toobit API credentials can access private futures endpoints.
+        """
+        info = self.get_account_info()
+        return {
+            "ok": True,
+            "has_credentials": self.credentials.valid(),
+            "account_type": info.get("account_type", "FUTURES"),
+            "raw": info.get("raw", info),
+        }
+
+    def _request_first_ok(self, method: str, paths: List[str], params: Optional[JsonDict] = None, signed: bool = True) -> ToobitResponse:
+        last: Optional[ToobitResponse] = None
+        for path in paths:
+            res = self._request(method, path, params=params, signed=signed)
+            if res.ok:
+                return res
+            last = res
+        return last or ToobitResponse(ok=False, status_code=0, data={}, error="no_endpoint_attempted", raw_text="")
+
+    def get_account_info(self) -> JsonDict:
+        """
+        Read raw futures account data from Toobit with several v2/v1 fallbacks.
+        """
+        res = self._request_first_ok(
+            "GET",
+            [
+                "/api/v2/futures/account",
+                "/api/v1/futures/account",
+                "/api/v2/futures/balance",
+                "/api/v1/futures/balance",
+                "/api/v2/account",
+                "/api/v1/account",
+            ],
+            signed=True,
+        )
+        data = self._unwrap(res, "get_account_info")
+        return {"account_type": "FUTURES", "raw": data}
+
+    def _extract_assets(self, data: Any) -> List[JsonDict]:
+        payload = data.get("data", data) if isinstance(data, dict) else data
+        if isinstance(payload, dict):
+            for key in ("assets", "balances", "balance", "wallets", "list", "rows"):
+                value = payload.get(key)
+                if isinstance(value, list):
+                    return [x for x in value if isinstance(x, dict)]
+            if any(k in payload for k in ("asset", "coin", "currency", "walletBalance", "availableBalance", "balance")):
+                return [payload]
+        if isinstance(payload, list):
+            return [x for x in payload if isinstance(x, dict)]
+        return []
+
+    def _first_number(self, row: JsonDict, keys: List[str], default: float = 0.0) -> float:
+        for key in keys:
+            if key in row and row.get(key) is not None:
+                return safe_float(row.get(key), default)
+        return default
+
+    def _normalize_balance_row(self, row: JsonDict) -> JsonDict:
+        asset = str(row.get("asset", row.get("coin", row.get("currency", row.get("token", "USDT"))))).upper()
+        wallet = self._first_number(
+            row,
+            ["walletBalance", "wallet_balance", "balance", "total", "equity", "accountEquity"],
+            0.0,
+        )
+        available = self._first_number(
+            row,
+            ["availableBalance", "available_balance", "available", "free", "withdrawAvailable"],
+            wallet,
+        )
+        unrealized = self._first_number(
+            row,
+            ["unrealizedProfit", "unRealizedProfit", "unrealized_pnl"],
+            0.0,
+        )
+        margin = self._first_number(
+            row,
+            ["marginBalance", "margin_balance", "usedMargin", "positionMargin"],
+            0.0,
+        )
+        return {
+            "asset": asset,
+            "wallet_balance": wallet,
+            "available_balance": available,
+            "unrealized_pnl": unrealized,
+            "margin_balance": margin,
+            "raw": row,
+        }
+
+    def get_account_balance(self, asset: str = "USDT") -> JsonDict:
+        """
+        Return normalized real Toobit futures balance.
+
+        The bot must never invent account balance. If Toobit does not return a
+        balance row, ok=False is returned with raw response for diagnostics.
+        """
+        target = str(asset or "USDT").upper()
+        info = self.get_account_info()
+        raw = info.get("raw", {})
+        rows = self._extract_assets(raw)
+        normalized = [self._normalize_balance_row(r) for r in rows]
+
+        selected = None
+        for row in normalized:
+            if row.get("asset") == target:
+                selected = row
+                break
+        if selected is None and normalized:
+            selected = normalized[0]
+        if selected is None:
+            return {
+                "ok": False,
+                "asset": target,
+                "wallet_balance": 0.0,
+                "available_balance": 0.0,
+                "unrealized_pnl": 0.0,
+                "margin_balance": 0.0,
+                "error": "balance_row_not_found",
+                "raw": raw,
+            }
+        return {"ok": True, **selected}
+
+    def account_summary(self) -> JsonDict:
+        """
+        High-level Toobit summary for Telegram status commands.
+        """
+        balance = self.get_account_balance("USDT")
+        positions = self.get_open_positions()
+        total_unrealized = sum(safe_float(p.get("unrealized_pnl", 0.0)) for p in positions)
+        return {
+            "ok": bool(balance.get("ok", False)),
+            "balance": balance,
+            "open_positions_count": len(positions),
+            "open_positions": positions,
+            "total_unrealized_pnl": total_unrealized,
+            "has_credentials": self.credentials.valid(),
+        }
+
+
     # -------------------------------------------------------------------------
     # Orders
     # -------------------------------------------------------------------------
@@ -523,8 +667,8 @@ class ToobitClient:
                     "direction": direction,
                     "quantity": abs(qty),
                     "entry_price": safe_float(p.get("entryPrice", p.get("entry_price", p.get("avgPrice", 0.0)))),
-                    "mark_price": safe_float(p.get("markPrice", p.get("mark_price", 0.0))),
-                    "unrealized_pnl": safe_float(p.get("unRealizedProfit", p.get("unrealizedPnl", 0.0))),
+                    "mark_price": safe_float(p.get("markPrice", p.get("mark_price", p.get("lastPrice", 0.0)))),
+                    "unrealized_pnl": safe_float(p.get("unRealizedProfit", p.get("unrealizedPnl", p.get("unrealizedProfit", 0.0)))),
                     "leverage": safe_int(p.get("leverage", p.get("lev", 0))),
                     "marginType": str(p.get("marginType", p.get("margin_mode", ""))).upper(),
                     "raw": p,
