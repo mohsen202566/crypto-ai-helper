@@ -412,10 +412,33 @@ class PositionMonitor:
         return base_margin * safe_float(pos.leverage, 1.0) * pct / 100.0
 
     def _tp1_protected_sl(self, pos: RealPositionState) -> float:
-        # Save profit at TP1 for runner. For LONG, SL around TP1; for SHORT, SL around TP1.
-        if pos.tp1 > 0:
-            return pos.tp1
-        return pos.entry
+        """
+        Protect the TP2 runner after TP1 without choking it.
+
+        Old behavior moved SL exactly to TP1, which can close the runner on a
+        normal retest/liquidity wick. This keeps profit protected, but gives the
+        remaining 25% runner a little breathing room toward TP2.
+        """
+        entry = safe_float(pos.entry)
+        tp1 = safe_float(pos.tp1)
+        tp2 = safe_float(pos.tp2)
+        direction = normalize_direction(pos.direction)
+
+        if entry <= 0:
+            return 0.0
+        if tp1 <= 0:
+            return entry
+
+        # If TP2 exists, protect slightly behind TP1 by 15% of TP1→TP2 distance.
+        # Never move protection beyond entry in the wrong direction.
+        if tp2 > 0 and abs(tp2 - tp1) > 0:
+            buffer_dist = abs(tp2 - tp1) * 0.15
+            if direction == DIRECTION_LONG:
+                return max(entry, tp1 - buffer_dist)
+            if direction == DIRECTION_SHORT:
+                return min(entry, tp1 + buffer_dist)
+
+        return tp1
 
 
     def monitor_position(
@@ -549,6 +572,71 @@ class PositionMonitor:
         return events
 
 
+    def _coerce_saved_candidate(self, pos: RealPositionState, snapshot: Optional[SensorSnapshot]) -> Any:
+        """
+        Recover the original AnalysisCandidate for REAL learning.
+
+        Priority:
+        1) pos.meta["candidate"] saved at entry time
+        2) nested common meta locations
+        3) candidate object already embedded in meta
+
+        If the exact candidate is not available, returns None and records an
+        error instead of silently skipping learning.
+        """
+        meta = pos.meta if isinstance(pos.meta, dict) else {}
+        candidates = [
+            meta.get("candidate"),
+            meta.get("analysis_candidate"),
+            meta.get("entry_candidate"),
+        ]
+
+        decision_meta = meta.get("decision") if isinstance(meta.get("decision"), dict) else {}
+        candidates.extend([
+            decision_meta.get("candidate"),
+            decision_meta.get("analysis_candidate"),
+        ])
+
+        tp_plan = meta.get("tp_sl_plan") if isinstance(meta.get("tp_sl_plan"), dict) else {}
+        plan_meta = tp_plan.get("meta") if isinstance(tp_plan.get("meta"), dict) else {}
+        candidates.extend([
+            plan_meta.get("candidate"),
+            plan_meta.get("analysis_candidate"),
+        ])
+
+        for saved_candidate in candidates:
+            if not saved_candidate:
+                continue
+            try:
+                from analysis_engine import AnalysisCandidate
+                if isinstance(saved_candidate, AnalysisCandidate):
+                    return saved_candidate
+                if hasattr(AnalysisCandidate, "from_dict") and callable(getattr(AnalysisCandidate, "from_dict")):
+                    return AnalysisCandidate.from_dict(saved_candidate)
+                if isinstance(saved_candidate, dict):
+                    return AnalysisCandidate(**saved_candidate)
+            except Exception as exc:
+                try:
+                    save_error("position_monitor_candidate_recover", str(exc), {
+                        "position_id": pos.position_id,
+                        "symbol": pos.symbol,
+                        "candidate_keys": list(saved_candidate.keys()) if isinstance(saved_candidate, dict) else str(type(saved_candidate)),
+                    })
+                except Exception:
+                    pass
+
+        try:
+            save_error("position_monitor_missing_candidate_for_learning", "candidate_not_found_in_position_meta", {
+                "position_id": pos.position_id,
+                "symbol": pos.symbol,
+                "meta_keys": list(meta.keys()),
+                "has_snapshot": snapshot is not None,
+            })
+        except Exception:
+            pass
+        return None
+
+
     def _learn_real_outcome(
         self,
         pos: RealPositionState,
@@ -572,18 +660,11 @@ class PositionMonitor:
         if snapshot is None or movement is None or trap is None or state is None:
             return
 
-        candidate = None
-        try:
-            # Build a minimal candidate-like object only if the saved meta has one.
-            saved_candidate = pos.meta.get("candidate") if isinstance(pos.meta, dict) else None
-            if saved_candidate:
-                from analysis_engine import AnalysisCandidate
-                candidate = AnalysisCandidate(**saved_candidate)
-        except Exception:
-            candidate = None
+        candidate = self._coerce_saved_candidate(pos, snapshot)
 
         if candidate is None:
-            # Without the exact candidate snapshot, do not invent one.
+            # Learning requires the original candidate context. Do not create fake
+            # learning data, but do record why REAL learning was skipped.
             return
 
         result = event_type
@@ -695,7 +776,13 @@ class PositionMonitor:
 
     def _resolve_closed_pnl(self, pos: RealPositionState) -> Tuple[float, str, JsonDict]:
         start_ms = pos.open_time * 1000 if pos.open_time and pos.open_time < 10_000_000_000 else pos.open_time
-        return self.pnl_resolver.resolve(pos.exchange_symbol, start_time_ms=start_ms, attempts=10, sleep_seconds=5.0)
+        return self.pnl_resolver.resolve(
+            self.client,
+            pos.exchange_symbol,
+            start_time_ms=start_ms,
+            attempts=10,
+            sleep_seconds=5.0,
+        )
 
     def _event(
         self,
