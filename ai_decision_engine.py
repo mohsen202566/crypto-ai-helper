@@ -282,14 +282,19 @@ class AIScoreComposer:
             + state_score * 0.14 * w_state
         )
 
+        # Keep penalties meaningful but not dominant.
+        # The previous weights could crush otherwise valid Movement Hunter setups
+        # into near-zero scores, causing continuous REJECT decisions.
         penalty = (
-            trap_penalty * 0.28
-            + correlation_penalty * 0.15
-            + range_penalty * 0.22
-            + late_penalty * 0.25
+            trap_penalty * 0.18
+            + correlation_penalty * 0.08
+            + range_penalty * 0.12
+            + late_penalty * 0.15
         )
 
-        final = clamp(positive - penalty)
+        # Slightly normalize positive evidence so balanced conditions can reach
+        # GHOST/REAL thresholds without removing risk protection.
+        final = clamp((positive * 1.15) - penalty)
 
         return DecisionScore(
             analysis_score=clamp(analysis_score),
