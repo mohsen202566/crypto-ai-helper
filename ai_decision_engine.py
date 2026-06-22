@@ -385,7 +385,7 @@ class DecisionTypeClassifier:
         configured_min_ghost = safe_float(getattr(SETTINGS.ai, "min_ghost_confidence", 45.0), 45.0)
 
         # Keep REAL strict enough for safety.
-        min_real = clamp(configured_min_real, 68.0, 76.0)
+        min_real = clamp(configured_min_real, 66.0, 72.0)
 
         # GHOST must be softer because it is the learning path.
         min_ghost = clamp(configured_min_ghost, 22.0, 38.0)
@@ -423,11 +423,11 @@ class DecisionTypeClassifier:
         real_allowed = (
             score.final_score >= min_real
             and confidence.confidence_score >= real_conf_floor
-            and (prediction.movement_probability >= 56 or movement.readiness_score >= 66)
+            and (prediction.movement_probability >= 52 or movement.readiness_score >= 62)
             and movement.freshness in {"FRESH", "MID"}
             and state.market_state not in {"RANGE", "EXHAUSTION", "LATE"}
             and prediction.predicted_phase not in {"RANGE", "UNKNOWN"}
-            and trap.trap_risk <= max_real_risk + 18
+            and trap.trap_risk <= max_real_risk + 22
             and correlation.exposure_risk < 75
             and not must_ghost
         )
