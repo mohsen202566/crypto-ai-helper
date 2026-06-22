@@ -23,13 +23,14 @@ Strictly forbidden:
 This file manages ghost records only after AI decides GHOST.
 """
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from uuid import uuid4
 import time
 import math
 
-from analysis_engine import AnalysisCandidate
+from analysis_engine import AnalysisCandidate, DirectionScore, RiskProfile, QualityProfile
+from analysis_layers import SensorSnapshot
 from movement_hunter import MovementHunterResult
 from trap_engine import TrapResult
 from state_engine import StateResult
@@ -37,7 +38,7 @@ from confidence_engine import ConfidenceResult
 from coin_learning import SOURCE_GHOST, learn_outcome
 from meta_learning import audit_outcome
 from movement_memory import record_movement_memory
-from data_store import save_ghost, prune_section, store
+from data_store import save_ghost, prune_section, store, save_error
 from config import SETTINGS
 
 
@@ -189,6 +190,152 @@ def _get_attr(obj: Any, key: str, default: Any = None) -> Any:
     return getattr(obj, key, default)
 
 
+def _as_dict(obj: Any) -> JsonDict:
+    if obj is None:
+        return {}
+    if isinstance(obj, dict):
+        return dict(obj)
+    if hasattr(obj, "to_dict") and callable(obj.to_dict):
+        try:
+            data = obj.to_dict()
+            return dict(data) if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+    try:
+        return dict(getattr(obj, "__dict__", {}))
+    except Exception:
+        return {}
+
+
+def _dataclass_kwargs(cls: Any, data: JsonDict) -> JsonDict:
+    try:
+        allowed = {f.name for f in fields(cls)}
+        return {k: v for k, v in dict(data or {}).items() if k in allowed}
+    except Exception:
+        return {}
+
+
+def _coerce_direction_score(data: Any, fallback_direction: str = "") -> DirectionScore:
+    d = _as_dict(data)
+    direction = normalize_direction(d.get("direction_hint") or fallback_direction)
+    if direction not in {DIRECTION_LONG, DIRECTION_SHORT}:
+        direction = normalize_direction(fallback_direction)
+    long_score = safe_float(d.get("long_score"), 55.0 if direction == DIRECTION_LONG else 45.0)
+    short_score = safe_float(d.get("short_score"), 55.0 if direction == DIRECTION_SHORT else 45.0)
+    bias = str(d.get("bias") or ("BULLISH" if direction == DIRECTION_LONG else "BEARISH" if direction == DIRECTION_SHORT else "NEUTRAL"))
+    return DirectionScore(
+        long_score=long_score,
+        short_score=short_score,
+        direction_hint=direction or "NEUTRAL",
+        bias=bias,
+        gap=safe_float(d.get("gap"), abs(long_score - short_score)),
+    )
+
+
+def _coerce_quality_profile(data: Any) -> QualityProfile:
+    d = _as_dict(data)
+    total = safe_float(d.get("total_quality"), 50.0)
+    level = str(d.get("quality_level") or ("HIGH" if total >= 70 else "MEDIUM" if total >= 45 else "LOW"))
+    return QualityProfile(
+        trend_quality=safe_float(d.get("trend_quality"), total),
+        momentum_quality=safe_float(d.get("momentum_quality"), total),
+        volatility_quality=safe_float(d.get("volatility_quality"), total),
+        volume_quality=safe_float(d.get("volume_quality"), total),
+        power_quality=safe_float(d.get("power_quality"), total),
+        candle_quality=safe_float(d.get("candle_quality"), total),
+        total_quality=total,
+        quality_level=level,
+    )
+
+
+def _coerce_risk_profile(data: Any) -> RiskProfile:
+    d = _as_dict(data)
+    total = safe_float(d.get("total_risk"), 50.0)
+    level = str(d.get("risk_level") or ("HIGH" if total >= 65 else "MEDIUM" if total >= 35 else "LOW"))
+    return RiskProfile(
+        range_risk=safe_float(d.get("range_risk"), total),
+        trap_risk=safe_float(d.get("trap_risk"), total),
+        exhaustion_risk=safe_float(d.get("exhaustion_risk"), total),
+        late_move_risk=safe_float(d.get("late_move_risk"), total),
+        liquidity_risk=safe_float(d.get("liquidity_risk"), total),
+        total_risk=total,
+        risk_level=level,
+    )
+
+
+def _coerce_sensor_snapshot(data: Any, ghost: Optional["GhostRecord"] = None) -> SensorSnapshot:
+    d = _as_dict(data)
+    if ghost is not None:
+        d.setdefault("symbol", ghost.symbol)
+        d.setdefault("timeframe", "5m")
+        d.setdefault("timestamp", ghost.created_at or now_ts())
+        d.setdefault("price", ghost.entry)
+        d.setdefault("previous_close", ghost.entry)
+    try:
+        return SensorSnapshot(**_dataclass_kwargs(SensorSnapshot, d))
+    except Exception:
+        return SensorSnapshot(
+            symbol=str(d.get("symbol", ghost.symbol if ghost else "")),
+            timeframe=str(d.get("timeframe", "5m")),
+            timestamp=int(d.get("timestamp", ghost.created_at if ghost else now_ts()) or now_ts()),
+            price=safe_float(d.get("price", ghost.entry if ghost else 0.0)),
+            previous_close=safe_float(d.get("previous_close", ghost.entry if ghost else 0.0)),
+        )
+
+
+def _coerce_candidate_from_dict(data: Any, ghost: Optional["GhostRecord"] = None) -> Optional[AnalysisCandidate]:
+    d = _as_dict(data)
+    if not d and ghost is None:
+        return None
+    symbol = str(d.get("symbol") or (ghost.symbol if ghost else ""))
+    direction = normalize_direction(d.get("direction_hint") or (ghost.direction if ghost else ""))
+    sensor = _coerce_sensor_snapshot(d.get("sensor_snapshot", {}), ghost=ghost)
+    direction_score = _coerce_direction_score(d.get("direction_score", {}), fallback_direction=direction)
+    quality = _coerce_quality_profile(d.get("quality", {}))
+    risk = _coerce_risk_profile(d.get("risk", {}))
+    return AnalysisCandidate(
+        candidate_id=str(d.get("candidate_id") or (ghost.candidate_id if ghost else f"cand_ghost_{uuid4().hex}")),
+        symbol=symbol,
+        timeframe=str(d.get("timeframe") or sensor.timeframe or "5m"),
+        timestamp=int(d.get("timestamp") or sensor.timestamp or (ghost.created_at if ghost else now_ts())),
+        direction_hint=direction,
+        bias=str(d.get("bias") or direction_score.bias),
+        direction_score=direction_score,
+        quality=quality,
+        risk=risk,
+        sensor_snapshot=sensor,
+        market_context=dict(d.get("market_context", {}) if isinstance(d.get("market_context", {}), dict) else {}),
+        reason_codes=tuple(d.get("reason_codes", ()) or ("GHOST_RESTORED_CANDIDATE",)),
+        warnings=tuple(d.get("warnings", ()) or ()),
+        valid=bool(d.get("valid", True)),
+    )
+
+
+def restore_candidate_from_ghost(ghost: "GhostRecord") -> Optional[AnalysisCandidate]:
+    """Restore enough candidate context for learning after process restart.
+
+    Runtime caches are lost on restart, so every Ghost must carry/rebuild
+    candidate data from persisted metadata. If no full snapshot exists, create
+    a minimal candidate from the ghost itself so TP/SL outcomes still teach
+    coin_learning and movement_memory.
+    """
+    meta = ghost.meta if isinstance(ghost.meta, dict) else {}
+    for key in ("candidate", "analysis_candidate", "candidate_snapshot"):
+        restored = _coerce_candidate_from_dict(meta.get(key), ghost=ghost)
+        if restored is not None:
+            return restored
+
+    decision = meta.get("decision", {}) if isinstance(meta.get("decision", {}), dict) else {}
+    decision_candidate = decision.get("candidate") if isinstance(decision.get("candidate"), dict) else None
+    if decision_candidate:
+        restored = _coerce_candidate_from_dict(decision_candidate, ghost=ghost)
+        if restored is not None:
+            return restored
+
+    # Last-resort fallback for older persisted ghosts that only contain entry/TP/SL.
+    return _coerce_candidate_from_dict({}, ghost=ghost)
+
+
 class GhostFactory:
     """Creates GhostRecord objects from AI GHOST decisions or candidate metadata."""
 
@@ -223,6 +370,18 @@ class GhostFactory:
         if confidence:
             reasons.extend(list(confidence.reason_codes))
 
+        full_meta: JsonDict = dict(meta or {})
+        # Persist context snapshots so Ghost learning survives bot restarts.
+        full_meta.setdefault("candidate", candidate.to_dict() if hasattr(candidate, "to_dict") else _as_dict(candidate))
+        if movement is not None:
+            full_meta.setdefault("movement", movement.to_dict() if hasattr(movement, "to_dict") else _as_dict(movement))
+        if trap is not None:
+            full_meta.setdefault("trap", trap.to_dict() if hasattr(trap, "to_dict") else _as_dict(trap))
+        if state is not None:
+            full_meta.setdefault("state", state.to_dict() if hasattr(state, "to_dict") else _as_dict(state))
+        if confidence is not None:
+            full_meta.setdefault("confidence", confidence.to_dict() if hasattr(confidence, "to_dict") else _as_dict(confidence))
+
         record = GhostRecord(
             ghost_id=f"ghost_{uuid4().hex}",
             decision_id=str(decision_id),
@@ -241,7 +400,7 @@ class GhostFactory:
             min_price=safe_float(entry or candidate.sensor_snapshot.price),
             last_price=safe_float(entry or candidate.sensor_snapshot.price),
             reason_codes=tuple(dict.fromkeys(reasons)),
-            meta=dict(meta or {}),
+            meta=full_meta,
         )
         return record
 
@@ -520,16 +679,39 @@ class GhostManager:
             state = state or cached.get("state")
             confidence = confidence or cached.get("confidence")
 
+            if candidate is None:
+                candidate = restore_candidate_from_ghost(updated)
+
             if candidate is not None:
-                learning_id = self.learning.learn(
-                    ghost=updated,
-                    candidate=candidate,
-                    movement=movement,
-                    trap=trap,
-                    state=state,
-                    confidence=confidence,
-                    persist=persist,
-                )
+                try:
+                    learning_id = self.learning.learn(
+                        ghost=updated,
+                        candidate=candidate,
+                        movement=movement,
+                        trap=trap,
+                        state=state,
+                        confidence=confidence,
+                        persist=persist,
+                    )
+                except Exception as exc:
+                    try:
+                        save_error("ghost_learning", str(exc), {"ghost": updated.to_dict()})
+                    except Exception:
+                        pass
+
+        if learning_id:
+            updated_meta = dict(updated.meta or {})
+            updated_meta["learning_record_id"] = learning_id
+            updated = GhostRecord(
+                ghost_id=updated.ghost_id, decision_id=updated.decision_id, candidate_id=updated.candidate_id,
+                symbol=updated.symbol, direction=updated.direction, entry=updated.entry, tp1=updated.tp1,
+                tp2=updated.tp2, sl=updated.sl, created_at=updated.created_at, expires_at=updated.expires_at,
+                status=updated.status, result=updated.result, closed_at=updated.closed_at, tp1_hit=updated.tp1_hit,
+                tp2_hit=updated.tp2_hit, ai_exit_hit=updated.ai_exit_hit, sl_hit=updated.sl_hit,
+                mfe_percent=updated.mfe_percent, mae_percent=updated.mae_percent, max_price=updated.max_price,
+                min_price=updated.min_price, last_price=updated.last_price, monitor_count=updated.monitor_count,
+                reason_codes=updated.reason_codes, meta=updated_meta,
+            )
 
         if persist:
             save_ghost(updated.ghost_id, updated.to_dict())
