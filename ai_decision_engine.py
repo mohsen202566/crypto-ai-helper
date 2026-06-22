@@ -432,8 +432,119 @@ class DecisionTypeClassifier:
             and not must_ghost
         )
 
-        if real_allowed:
+        # Strong Ghost -> REAL bridge.
+        #
+        # The main REAL gate above stays conservative, but the bot must not
+        # keep profitable, fast Movement-Hunter candidates trapped as GHOST
+        # forever. This bridge promotes only strong GHOST-quality candidates
+        # to REAL when risk is acceptable. It intentionally does NOT touch:
+        # - hard invalid-input rejects
+        # - TP/SL logic
+        # - Toobit execution
+        # - GHOST creation/learning for weaker candidates
+        #
+        # This keeps the current high-WR Ghost logic intact while allowing
+        # the best of those Ghost candidates to become real trades.
+        learning_sample_count = 0
+        learning_win_rate = 0.0
+        learning_risk_label = ""
+        learning_confidence_hint = ""
+        if learning is not None:
+            learning_sample_count = int(max(0, safe_float(getattr(learning, "sample_count", 0), 0)))
+            learning_win_rate = clamp(safe_float(getattr(learning, "similar_win_rate", 0.0), 0.0))
+            learning_risk_label = str(getattr(learning, "risk_label", "") or "").upper()
+            learning_confidence_hint = str(getattr(learning, "confidence_hint", "") or "").upper()
+
+        strong_learning = (
+            learning_sample_count >= 2
+            and learning_win_rate >= 62.0
+            and learning_risk_label != "RISKY_CONDITION"
+        )
+
+        very_strong_learning = (
+            learning_sample_count >= 5
+            and learning_win_rate >= 68.0
+            and learning_risk_label != "RISKY_CONDITION"
+        )
+
+        live_or_early_move = (
+            movement.freshness in {"FRESH", "MID"}
+            or prediction.predicted_phase in {"PRE_START", "START", "MID"}
+            or movement.readiness_score >= 55.0
+            or prediction.movement_probability >= 50.0
+        )
+
+        severe_risk_block = (
+            trap.trap_risk >= 78.0
+            or trap.liquidity_risk >= 85.0
+            or correlation.exposure_risk >= 85.0
+            or movement.freshness == "DEAD"
+            or (
+                state.market_state == "RANGE"
+                and state.range_probability >= 82.0
+                and movement.readiness_score < 65.0
+                and not very_strong_learning
+            )
+            or (
+                state.market_state == "EXHAUSTION"
+                and state.exhaustion_risk >= 78.0
+                and movement.continuation_probability < 55.0
+                and not very_strong_learning
+            )
+            or (
+                prediction.predicted_phase == "RANGE"
+                and prediction.movement_probability < 55.0
+                and not very_strong_learning
+            )
+        )
+
+        strong_ghost_to_real = (
+            not severe_risk_block
+            and live_or_early_move
+            and confidence.confidence_score >= 12.0
+            and trap.trap_risk <= max_real_risk + 32.0
+            and correlation.exposure_risk < 82.0
+            and (
+                # Good current AI evidence.
+                (
+                    score.final_score >= 50.0
+                    and (
+                        prediction.movement_probability >= 38.0
+                        or movement.readiness_score >= 42.0
+                        or score.analysis_score >= 52.0
+                    )
+                )
+                # Proven similar conditions can promote earlier, so we do not
+                # miss the same pump/dump pattern again.
+                or (
+                    strong_learning
+                    and score.final_score >= 38.0
+                    and (
+                        prediction.movement_probability >= 28.0
+                        or movement.readiness_score >= 35.0
+                        or score.analysis_score >= 45.0
+                    )
+                )
+                # Very strong immediate movement can go REAL even before
+                # enough learning exists.
+                or (
+                    score.final_score >= 44.0
+                    and movement.readiness_score >= 58.0
+                    and prediction.movement_probability >= 32.0
+                )
+            )
+        )
+
+        if real_allowed or strong_ghost_to_real:
             reasons.append("AI_DECISION_REAL_ALLOWED")
+            if strong_ghost_to_real and not real_allowed:
+                reasons.append("STRONG_GHOST_TO_REAL_BRIDGE")
+                if must_ghost:
+                    warnings.append("GHOST_DOWNGRADE_OVERRIDDEN_BY_STRONG_EVIDENCE")
+                if strong_learning:
+                    reasons.append("LEARNING_SUPPORTS_REAL_PROMOTION")
+                if learning_confidence_hint == "LOW_DATA":
+                    warnings.append("LOW_DATA_ALLOWED_FOR_STRONG_REAL")
             return DECISION_REAL, reasons, warnings
 
         ghost_allowed = (
