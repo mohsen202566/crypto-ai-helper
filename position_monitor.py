@@ -154,6 +154,61 @@ def normalize_direction(direction: str) -> str:
     return d
 
 
+def normalize_symbol_key(symbol: str) -> str:
+    """
+    Normalize bot/Toobit symbol formats to the same comparison key.
+
+    Examples:
+    - SOLUSDT
+    - SOL-SWAP-USDT
+    - SOL_SWAP_USDT
+    all become SOLUSDT.
+
+    This is intentionally local to the monitor so TP/SL tracking does not
+    depend on tobit_client internals.
+    """
+    raw = str(symbol or "").upper().strip()
+    if not raw:
+        return ""
+    raw = raw.replace("/", "").replace("_", "-")
+    if raw.endswith("-SWAP-USDT"):
+        return raw.replace("-SWAP-USDT", "USDT").replace("-", "")
+    if raw.endswith("-SWAP-USDC"):
+        return raw.replace("-SWAP-USDC", "USDC").replace("-", "")
+    return raw.replace("-", "").replace("SWAP", "")
+
+
+def symbol_match(a: str, b: str) -> bool:
+    ka = normalize_symbol_key(a)
+    kb = normalize_symbol_key(b)
+    return bool(ka and kb and ka == kb)
+
+
+def position_symbol_keys(pos: Any) -> set[str]:
+    keys: set[str] = set()
+    if isinstance(pos, RealPositionState):
+        values = [pos.symbol, pos.exchange_symbol]
+    elif isinstance(pos, dict):
+        values = [
+            pos.get("symbol"),
+            pos.get("exchange_symbol"),
+            pos.get("base_symbol"),
+            pos.get("contract"),
+            pos.get("contractCode"),
+            pos.get("instId"),
+        ]
+    else:
+        values = []
+    for value in values:
+        key = normalize_symbol_key(str(value or ""))
+        if key:
+            keys.add(key)
+        raw = str(value or "").upper().strip()
+        if raw:
+            keys.add(raw)
+    return keys
+
+
 def pnl_percent(direction: str, entry: float, price: float) -> float:
     entry = safe_float(entry)
     price = safe_float(price)
@@ -372,23 +427,75 @@ class PositionMonitor:
 
     def sync_once(self) -> List[PositionMonitorEvent]:
         events: List[PositionMonitorEvent] = []
-        stored = {p.exchange_symbol: p for p in self.load_stored_positions()}
+        stored_positions = self.load_stored_positions()
+
+        # Old bug:
+        #   stored = {p.exchange_symbol: p}
+        # and exchange returned e.g. SOL-SWAP-USDT while stored records could be
+        # SOLUSDT. That made old=None, so TP1/SL/message_id were lost and no
+        # result could be reported. Build a normalized multi-key index instead.
+        stored_by_key: Dict[str, RealPositionState] = {}
+        for pos in stored_positions:
+            for key in position_symbol_keys(pos):
+                stored_by_key.setdefault(key, pos)
+
         exchange_positions = self.fetch_exchange_positions()
-        seen: set[str] = set()
+        seen_keys: set[str] = set()
+        seen_position_ids: set[str] = set()
 
         for raw in exchange_positions:
-            exchange_symbol = str(raw.get("symbol", raw.get("contract", "")))
-            old = stored.get(exchange_symbol)
+            exchange_symbol = str(raw.get("symbol", raw.get("contract", raw.get("contractCode", raw.get("instId", "")))))
+            raw_keys = position_symbol_keys(raw)
+            if exchange_symbol:
+                raw_keys.add(exchange_symbol.upper().strip())
+                raw_keys.add(normalize_symbol_key(exchange_symbol))
+
+            old: Optional[RealPositionState] = None
+            for key in raw_keys:
+                if key in stored_by_key:
+                    old = stored_by_key[key]
+                    break
+
             pos = self.mapper.from_exchange(raw, stored=old)
-            seen.add(exchange_symbol)
+
+            # Preserve all entry-time tracking data if a stored position was found.
+            # Mapper already falls back to stored tp1/sl/message_id, but this extra
+            # protection keeps the monitor safe when Toobit returns partial fields.
+            if old is not None:
+                pos = RealPositionState(**{
+                    **pos.to_dict(),
+                    "position_id": old.position_id,
+                    "symbol": old.symbol or pos.symbol,
+                    "exchange_symbol": pos.exchange_symbol or old.exchange_symbol,
+                    "tp1": old.tp1 if old.tp1 > 0 else pos.tp1,
+                    "tp2": old.tp2 if old.tp2 > 0 else pos.tp2,
+                    "sl": old.sl if old.sl > 0 else pos.sl,
+                    "signal_message_id": old.signal_message_id or pos.signal_message_id,
+                    "decision_id": old.decision_id or pos.decision_id,
+                    "meta": old.meta if old.meta else pos.meta,
+                    "tp1_hit": old.tp1_hit,
+                    "tp2_hit": old.tp2_hit,
+                    "ai_exit_hit": old.ai_exit_hit,
+                    "sl_hit": old.sl_hit,
+                })
+
+            for key in position_symbol_keys(pos) | raw_keys:
+                if key:
+                    seen_keys.add(key)
+            seen_position_ids.add(pos.position_id)
+
             save_position(pos.position_id, pos.to_dict())
 
             if old is None:
                 events.append(self._event(pos, EVENT_SYNC_OPEN, pos.current_price, reason_codes=("EXCHANGE_POSITION_IMPORTED",), should_report=False))
 
         # Anything stored but not on exchange may have closed.
-        for exchange_symbol, pos in stored.items():
-            if exchange_symbol not in seen and pos.status == POSITION_OPEN:
+        # Use normalized symbol keys and position_id, not raw exchange_symbol only.
+        for pos in stored_positions:
+            keys = position_symbol_keys(pos)
+            matched_by_symbol = bool(keys & seen_keys)
+            matched_by_id = bool(pos.position_id and pos.position_id in seen_position_ids)
+            if not matched_by_symbol and not matched_by_id and pos.status == POSITION_OPEN:
                 closed = RealPositionState(**{**pos.to_dict(), "status": POSITION_CLOSED, "close_time": now_ts()})
                 pnl, pnl_status, pnl_raw = self._resolve_closed_pnl(closed)
                 closed = RealPositionState(**{
@@ -408,7 +515,7 @@ class PositionMonitor:
                     pnl,
                     closed.realized_pnl_percent,
                     pnl_status,
-                    reason_codes=("POSITION_MISSING_ON_EXCHANGE", "UNKNOWN_CLOSE_PNL_RESOLVED"),
+                    reason_codes=("POSITION_MISSING_ON_EXCHANGE", "UNKNOWN_CLOSE_PNL_RESOLVED", "SYMBOL_MATCH_NORMALIZED"),
                     raw={"pnl": pnl_raw},
                     should_report=True,
                 ))
