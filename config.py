@@ -100,11 +100,53 @@ def _get_bool(name: str, default: bool = False) -> bool:
     return raw in {"1", "true", "yes", "on", "enable", "enabled", "y", "بله", "روشن", "فعال"}
 
 
+
+def _get_int_list(name: str, default: Optional[List[int]] = None) -> List[int]:
+    raw = _get_str(name, "")
+    if not raw:
+        return list(default or [])
+    values: List[int] = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            v = int(float(item))
+            if v > 0:
+                values.append(v)
+        except Exception:
+            continue
+    return values
+
 def _get_list(name: str, default: Optional[List[str]] = None) -> List[str]:
     raw = _get_str(name, "")
     if not raw:
         return list(default or [])
     return [item.strip().upper() for item in raw.split(",") if item.strip()]
+
+
+
+@dataclass(frozen=True)
+class TelegramConfig:
+    """
+    Backward-compatible Telegram section.
+
+    New architecture uses SETTINGS.bot, but some router code still expects:
+    SETTINGS.telegram.bot_token
+    SETTINGS.telegram.owner_id
+    SETTINGS.telegram.allowed_user_ids
+    """
+    bot_token: str
+    owner_id: int
+    allowed_user_ids: List[int]
+
+    def validate(self) -> List[str]:
+        errors: List[str] = []
+        if not self.bot_token:
+            errors.append("BOT_TOKEN is required")
+        if self.owner_id <= 0:
+            errors.append("OWNER_ID must be a positive integer")
+        return errors
 
 
 @dataclass(frozen=True)
@@ -412,6 +454,19 @@ class AppConfig:
     storage: StorageConfig
     logging: LoggingConfig
 
+
+    @property
+    def telegram(self) -> TelegramConfig:
+        allowed = _get_int_list("ALLOWED_USER_IDS", [])
+        if self.bot.owner_id > 0 and self.bot.owner_id not in allowed:
+            allowed.insert(0, self.bot.owner_id)
+        return TelegramConfig(
+            bot_token=self.bot.token,
+            owner_id=self.bot.owner_id,
+            allowed_user_ids=allowed,
+        )
+
+
     def validate(self) -> List[str]:
         errors: List[str] = []
         for section in (
@@ -432,6 +487,7 @@ class AppConfig:
         """Safe diagnostic view without secrets."""
         return {
             "bot": {"owner_id": self.bot.owner_id, "timezone": self.bot.timezone, "admin_only": self.bot.admin_only},
+            "telegram": {"owner_id": self.telegram.owner_id, "allowed_user_count": len(self.telegram.allowed_user_ids)},
             "toobit": {
                 "base_url": self.toobit.base_url,
                 "api_version": self.toobit.api_version,
