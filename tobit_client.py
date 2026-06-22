@@ -697,6 +697,127 @@ class ToobitClient:
         }
 
 
+
+    def _is_symbol_match(self, raw_symbol: str, target_symbol: str) -> bool:
+        return bool(set(self._symbol_candidates(raw_symbol)) & set(self._symbol_candidates(target_symbol)))
+
+    def _validate_order_size_or_raise(self, symbol: str, quantity: float, ref_price: float = 0.0) -> JsonDict:
+        """
+        Validate Toobit minQty/step/minNotional before sending a real order.
+
+        Safety rule:
+        - Never auto-increase user size.
+        - If quantity/notional is below exchange minimum, block before sending.
+        """
+        normalized_symbol = self.normalize_futures_symbol(symbol)
+        rules = self.get_symbol_rules(normalized_symbol)
+        qty = safe_float(quantity)
+
+        min_qty = safe_float(rules.get("min_qty", 0.0))
+        qty_step = safe_float(rules.get("qty_step", 0.0))
+        min_notional = safe_float(rules.get("min_notional", 0.0))
+        precision = safe_int(rules.get("quantity_precision", 6), 6)
+
+        rounded_qty = round_step(qty, qty_step, precision) if qty_step > 0 else round(qty, precision)
+
+        if rounded_qty <= 0:
+            raise ToobitAPIError(f"quantity_invalid_after_rounding:{normalized_symbol}:qty={qty}:step={qty_step}")
+
+        if min_qty > 0 and rounded_qty < min_qty:
+            raise ToobitAPIError(
+                f"quantity_below_min_qty:{normalized_symbol}:qty={rounded_qty}:min_qty={min_qty}:step={qty_step}"
+            )
+
+        price_for_notional = safe_float(ref_price)
+        if min_notional > 0 and price_for_notional <= 0:
+            try:
+                price_for_notional = self.get_latest_price(normalized_symbol)
+            except Exception:
+                price_for_notional = 0.0
+
+        notional = rounded_qty * price_for_notional if price_for_notional > 0 else 0.0
+        if min_notional > 0 and notional > 0 and notional < min_notional:
+            raise ToobitAPIError(
+                f"notional_below_min_notional:{normalized_symbol}:notional={notional}:min_notional={min_notional}:qty={rounded_qty}:price={price_for_notional}"
+            )
+
+        return {
+            "symbol": normalized_symbol,
+            "input_quantity": qty,
+            "quantity": rounded_qty,
+            "ref_price": price_for_notional,
+            "notional": notional,
+            "rules": rules,
+        }
+
+    def _recover_open_position_after_order_error(
+        self,
+        symbol: str,
+        direction: str,
+        original_error: str,
+        client_order_id: str = "",
+        timeout_seconds: float = 70.0,
+    ) -> Optional[JsonDict]:
+        """
+        Toobit may return an order error while the futures position appears later.
+
+        Recovery policy required by the bot architecture:
+        - Keep checking up to ~60-70 seconds.
+        - First 30 seconds: fast sync every ~2 seconds.
+        - Remaining time: slower sync every ~5 seconds.
+        - If the real position appears, return recovered success instead of failing slots.
+        """
+        normalized_symbol = self.normalize_futures_symbol(symbol)
+        wanted_direction = normalize_direction(direction)
+        deadline = time.time() + max(5.0, timeout_seconds)
+        attempt = 0
+        last_positions: List[JsonDict] = []
+
+        while time.time() < deadline:
+            attempt += 1
+            elapsed = max(0.0, timeout_seconds - (deadline - time.time()))
+            sleep_seconds = 2.0 if elapsed < 30.0 else 5.0
+
+            try:
+                positions = self.get_open_positions(symbol=normalized_symbol)
+                last_positions = positions
+                for pos in positions:
+                    if not isinstance(pos, dict):
+                        continue
+                    if not self._position_symbol_matches(pos.get("raw", pos), normalized_symbol):
+                        continue
+                    pos_direction = normalize_direction(str(pos.get("direction", "")))
+                    if pos_direction != wanted_direction:
+                        continue
+                    if safe_float(pos.get("quantity", 0.0)) <= 0:
+                        continue
+                    return {
+                        "order_id": "",
+                        "client_order_id": client_order_id,
+                        "symbol": normalized_symbol,
+                        "side": "BUY_OPEN" if wanted_direction == DIRECTION_LONG else "SELL_OPEN",
+                        "status": "RECOVERED_POSITION_AFTER_ORDER_ERROR",
+                        "recovered": True,
+                        "recovery_attempts": attempt,
+                        "original_error": original_error,
+                        "position": pos,
+                        "raw": {"positions": positions},
+                    }
+            except Exception as exc:
+                last_positions = [{"error": str(exc)}]
+
+            time.sleep(sleep_seconds)
+
+        return {
+            "recovered": False,
+            "symbol": normalized_symbol,
+            "direction": wanted_direction,
+            "original_error": original_error,
+            "last_positions": last_positions,
+            "recovery_timeout_seconds": timeout_seconds,
+        }
+
+
     # -------------------------------------------------------------------------
     # Orders
     # -------------------------------------------------------------------------
@@ -732,6 +853,11 @@ class ToobitClient:
             raise ToobitAPIError("invalid_direction")
 
         normalized_symbol = self.normalize_futures_symbol(symbol)
+
+        # Hard safety before order: block below-min quantity/notional locally.
+        size_check = self._validate_order_size_or_raise(normalized_symbol, qty, ref_price=price)
+        qty = safe_float(size_check.get("quantity", qty), qty)
+
         params: JsonDict = {
             "symbol": normalized_symbol,
             "side": toobit_side,
@@ -750,11 +876,30 @@ class ToobitClient:
         # TP2 is managed later by monitor/repair if supported.
 
         res = self._request("POST", "/api/v1/futures/order", params=params, signed=True)
+
+        if not res.ok:
+            original_error = f"{res.error}"
+            recovered = self._recover_open_position_after_order_error(
+                symbol=normalized_symbol,
+                direction=normalized_direction,
+                original_error=original_error,
+                client_order_id=str(params.get("newClientOrderId", "")),
+                timeout_seconds=70.0,
+            )
+            if isinstance(recovered, dict) and recovered.get("recovered"):
+                recovered["normalized_params"] = params
+                recovered["size_check"] = size_check
+                return recovered
+            raise ToobitAPIError(
+                f"open_futures_position_failed_after_70s_recovery:{original_error}:recovery={json.dumps(recovered, ensure_ascii=False, default=str)}"
+            )
+
         data = self._unwrap(res, "open_futures_position")
         normalized = self._normalize_order_response(data)
         normalized.setdefault("symbol", normalized_symbol)
         normalized.setdefault("side", toobit_side)
         normalized["normalized_params"] = params
+        normalized["size_check"] = size_check
         return normalized
 
     def _normalize_order_response(self, data: JsonDict) -> JsonDict:
