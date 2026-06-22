@@ -192,7 +192,7 @@ def _clean_params(params: Optional[JsonDict]) -> JsonDict:
 
 
 class ToobitSigner:
-    """HMAC SHA256 signer compatible with Binance-like futures APIs."""
+    """HMAC SHA256 signer for Toobit signed endpoints."""
 
     def __init__(self, credentials: ToobitCredentials):
         self.credentials = credentials
@@ -202,6 +202,7 @@ class ToobitSigner:
             raise ToobitAPIError("missing_toobit_credentials")
 
         signed = dict(params)
+        signed.setdefault("recvWindow", 5000)
         signed.setdefault("timestamp", now_ms())
         query = urlencode(signed, doseq=True)
         signature = hmac.new(
@@ -244,7 +245,16 @@ class ToobitClient:
         self.signer = ToobitSigner(self.credentials)
         self.session = requests.Session()
         if self.credentials.api_key:
-            self.session.headers.update({"X-MBX-APIKEY": self.credentials.api_key})
+            # Official Toobit REST docs require X-BB-APIKEY.
+            # Keep legacy aliases only as compatibility fallbacks for older gateways.
+            self.session.headers.update(
+                {
+                    "X-BB-APIKEY": self.credentials.api_key,
+                    "X-MBX-APIKEY": self.credentials.api_key,
+                    "accessKey": self.credentials.api_key,
+                    "AccessKey": self.credentials.api_key,
+                }
+            )
 
     def _request(
         self,
@@ -311,7 +321,7 @@ class ToobitClient:
     def get_exchange_info(self) -> JsonDict:
         res = self._request("GET", "/api/v2/futures/exchangeInfo", signed=False)
         if not res.ok:
-            # fallback for Binance-like path
+            # v1 fallback kept for older Toobit deployments.
             res = self._request("GET", "/api/v1/futures/exchangeInfo", signed=False)
         return self._unwrap(res, "exchange_info")
 
@@ -606,25 +616,33 @@ class ToobitClient:
         side = normalize_side(side, direction)
         order_type = str(order_type or "MARKET").upper()
 
+        position_side = "LONG" if normalize_direction(direction) == DIRECTION_LONG else "SHORT"
+
         params: JsonDict = {
             "symbol": symbol,
             "side": side,
+            "positionSide": position_side,
             "type": order_type,
             "quantity": qty,
             "newClientOrderId": client_order_id or f"mh_{int(time.time())}",
+            "category": "USDT",
         }
 
         if order_type != "MARKET" and safe_float(price) > 0:
             params["price"] = safe_float(price)
             params["timeInForce"] = "GTC"
 
-        # Attach TP/SL if endpoint supports these parameters.
+        # Toobit v2 futures order supports attached TP/SL fields.
         if take_profit > 0:
             params["takeProfit"] = take_profit
+            params["tpTriggerBy"] = "MARK_PRICE"
+            params["tpOrderType"] = "MARKET"
         if stop_loss > 0:
             params["stopLoss"] = stop_loss
-        if take_profit_2 > 0:
-            params["takeProfit2"] = take_profit_2
+            params["slTriggerBy"] = "MARK_PRICE"
+            params["slOrderType"] = "MARKET"
+        # TP2 is not part of the regular-order endpoint; it is repaired/managed
+        # later by set_position_tp_sl when the position is confirmed.
 
         res = self._request("POST", "/api/v2/futures/order", params=params, signed=True)
         if not res.ok:
@@ -650,14 +668,18 @@ class ToobitClient:
         }
 
     def close_position(self, symbol: str, direction: str, quantity: float, client_order_id: str = "") -> JsonDict:
-        side = SIDE_SELL if normalize_direction(direction) == DIRECTION_LONG else SIDE_BUY
+        normalized_direction = normalize_direction(direction)
+        side = SIDE_SELL if normalized_direction == DIRECTION_LONG else SIDE_BUY
+        position_side = "LONG" if normalized_direction == DIRECTION_LONG else "SHORT"
         params = {
             "symbol": symbol,
             "side": side,
+            "positionSide": position_side,
             "type": "MARKET",
             "quantity": safe_float(quantity),
             "reduceOnly": "true",
             "newClientOrderId": client_order_id or f"mh_close_{int(time.time())}",
+            "category": "USDT",
         }
         res = self._request("POST", "/api/v2/futures/order", params=params, signed=True)
         if not res.ok:
@@ -710,19 +732,47 @@ class ToobitClient:
         return self.set_position_tp_sl(symbol, direction, tp1, tp2, sl)
 
     def set_position_tp_sl(self, symbol: str, direction: str, tp1: float, tp2: float, sl: float) -> JsonDict:
-        params = {
-            "symbol": symbol,
-            "positionSide": "LONG" if normalize_direction(direction) == DIRECTION_LONG else "SHORT",
-            "takeProfit": safe_float(tp1),
-            "stopLoss": safe_float(sl),
-        }
-        if tp2 > 0:
-            params["takeProfit2"] = safe_float(tp2)
+        normalized_direction = normalize_direction(direction)
+        position_side = "LONG" if normalized_direction == DIRECTION_LONG else "SHORT"
+        close_side = SIDE_SELL if normalized_direction == DIRECTION_LONG else SIDE_BUY
+        results: List[JsonDict] = []
 
-        res = self._request("POST", "/api/v2/futures/position/tpsl", params=params, signed=True)
-        if not res.ok:
-            res = self._request("POST", "/api/v1/futures/position/tpsl", params=params, signed=True)
-        return self._unwrap(res, "set_position_tp_sl")
+        def place_stop(stop_price: float, stop_order_type: str, suffix: str) -> None:
+            if safe_float(stop_price) <= 0:
+                return
+            params = {
+                "symbol": symbol,
+                "side": close_side,
+                "positionSide": position_side,
+                "type": "STOP_PROFIT_LOSS_MARKET",
+                "stopPrice": safe_float(stop_price),
+                "triggerBy": "MARK_PRICE",
+                "stopOrderType": stop_order_type,
+                "stopType": "FIXED_STOP",
+                "newClientOrderId": f"mh_{suffix}_{int(time.time() * 1000)}",
+                "category": "USDT",
+            }
+            res = self._request("POST", "/api/v2/futures/algo-order", params=params, signed=True)
+            if not res.ok:
+                # Older deployments may expose a position-level TP/SL endpoint.
+                legacy_params = {
+                    "symbol": symbol,
+                    "positionSide": position_side,
+                    "takeProfit": safe_float(tp1),
+                    "stopLoss": safe_float(sl),
+                    "category": "USDT",
+                }
+                legacy = self._request("POST", "/api/v2/futures/position/tpsl", params=legacy_params, signed=True)
+                results.append(self._unwrap(legacy, f"set_position_tp_sl_{suffix}"))
+                return
+            results.append(self._unwrap(res, f"set_position_tp_sl_{suffix}"))
+
+        place_stop(tp1, "TAKE_PROFIT", "tp1")
+        # Optional TP2 is managed as an extra take-profit row if Toobit accepts it.
+        place_stop(tp2, "TAKE_PROFIT", "tp2")
+        place_stop(sl, "STOP_LOSS", "sl")
+
+        return {"ok": True, "symbol": symbol, "direction": position_side, "rows": results}
 
     repair_tp_sl = set_position_tp_sl
 
