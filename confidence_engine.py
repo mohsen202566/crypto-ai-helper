@@ -342,15 +342,28 @@ class ConfidenceEngine:
         unknown_penalty, boundary, r = self.unknown.score(candidate, movement, trap, state, learning_summary)
         reasons.extend(r)
 
-        total = clamp(
-            data_score * 0.25
-            + signal_confidence * 0.30
-            + state_confidence * 0.15
-            + movement_confidence * 0.20
-            - trap_penalty
-            - conflict_penalty
-            - unknown_penalty * 0.65
+        # Balanced confidence:
+        # Keep uncertainty/trap/conflict as real risk controls, but do not let
+        # low-data or normal caution crush confidence to 0 and silence auto signals.
+        positive_confidence = (
+            data_score * 0.22
+            + signal_confidence * 0.34
+            + state_confidence * 0.18
+            + movement_confidence * 0.26
         )
+
+        risk_deduction = (
+            trap_penalty * 0.42
+            + conflict_penalty * 0.50
+            + unknown_penalty * 0.35
+        )
+
+        # Low-data setups should usually downgrade to GHOST, not become zero-confidence.
+        low_data_floor = 18.0 if sample_count <= 0 else 0.0
+        if candidate.valid and movement.valid and trap.valid and state.valid:
+            total = clamp(max(low_data_floor, positive_confidence - risk_deduction))
+        else:
+            total = clamp(positive_confidence - risk_deduction)
 
         if conflict_penalty >= 40:
             boundary = BOUNDARY_CONFLICTED
