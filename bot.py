@@ -868,7 +868,7 @@ async def handle_analysis(update: Update, text: str) -> bool:
         if result.signal_report and result.decision.decision_type == DECISION_REAL:
             await send_payload(update, result.signal_report)
         elif result.decision.decision_type == DECISION_GHOST:
-            await send_text(update, f"👻 {symbol} فقط برای یادگیری Ghost ثبت شد؛ سیگنال واقعی ارسال نشد.")
+            await send_text(update, f"{symbol}: سیگنال واقعی صادر نشد؛ فقط در یادگیری داخلی ثبت شد.")
         else:
             decision = result.decision
             reject_line = " | ".join(decision.reject_reasons[:4]) if decision.reject_reasons else "شرایط کافی نبود"
@@ -1055,6 +1055,7 @@ async def ghost_monitor_loop(app: Any) -> None:
     Ghosts must stay hidden from Telegram, but their outcomes must be stored so
     coin_learning, movement_memory, meta_learning and stats can improve later.
     """
+    LOGGER.info("ghost_monitor_loop started")
     while True:
         try:
             interval = safe_int(
@@ -1092,6 +1093,7 @@ async def ghost_monitor_loop(app: Any) -> None:
 
 
 async def post_init(app: Any) -> None:
+    LOGGER.info("starting background loops: auto_scan, position_monitor, ghost_monitor")
     app.create_task(auto_scan_loop(app))
     app.create_task(position_monitor_loop(app))
     app.create_task(ghost_monitor_loop(app))
