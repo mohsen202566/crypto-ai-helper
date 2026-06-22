@@ -100,8 +100,6 @@ DEFAULT_GROUPS: Dict[str, str] = {
 
     "FILUSDT": GROUP_STORAGE,
     "ARUSDT": GROUP_STORAGE,
-
-    "BNBUSDT": GROUP_EXCHANGE,
 }
 
 
@@ -458,20 +456,28 @@ class CorrelationEngine:
         reduce_priority = False
         block_if_high = False
 
-        if risk >= 65:
+        # Soft exposure policy for Movement Hunter:
+        # Correlation should reduce priority before it blocks. The final
+        # REAL/GHOST/REJECT decision remains in ai_decision_engine.py.
+        if risk >= 75:
             reduce_priority = True
-            warnings.append("HIGH_CORRELATION_EXPOSURE")
-        if risk >= 85:
+            warnings.append("HIGH_CORRELATION_EXPOSURE_SOFT")
+        if risk >= 92:
             block_if_high = True
             warnings.append("EXTREME_CORRELATION_EXPOSURE")
 
         if counts["group_open_count"] >= counts["max_group_allowed"]:
             reduce_priority = True
-            block_if_high = True
-            warnings.append("GROUP_EXPOSURE_LIMIT")
+            warnings.append("GROUP_EXPOSURE_LIMIT_SOFT")
+            # Do not block only because the group limit is reached; allow AI
+            # to route strong fresh movement to REAL or weak ones to GHOST.
+            if risk >= 92:
+                block_if_high = True
         if counts["same_direction_count"] >= counts["max_direction_allowed"]:
             reduce_priority = True
-            warnings.append("SAME_DIRECTION_EXPOSURE_LIMIT")
+            warnings.append("SAME_DIRECTION_EXPOSURE_LIMIT_SOFT")
+            if risk >= 92:
+                block_if_high = True
 
         if not candidate.valid:
             warnings.append("INVALID_CANDIDATE")
