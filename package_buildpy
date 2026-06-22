@@ -1,0 +1,254 @@
+from __future__ import annotations
+
+"""
+35 - package_build.py
+
+Final package builder / audit helper for the locked Movement Hunter architecture.
+
+Responsibilities:
+- Verify all required bot files exist.
+- Compile all Python files.
+- Check missing files.
+- Check forbidden architecture keywords:
+  Paper mode
+  Setup flow
+  Toobit v1-style obvious unsafe terms
+- Build a clean deployment zip.
+- Produce a final package report.
+
+Strictly forbidden:
+- No trading.
+- No Toobit calls.
+- No Telegram sending.
+- No AI decisions.
+"""
+
+from dataclasses import dataclass, asdict, field
+from typing import Any, Dict, List, Tuple
+from pathlib import Path
+from zipfile import ZipFile, ZIP_DEFLATED
+import py_compile
+import time
+import os
+
+
+JsonDict = Dict[str, Any]
+
+PACKAGE_OK = "OK"
+PACKAGE_WARN = "WARN"
+PACKAGE_FAIL = "FAIL"
+
+
+REQUIRED_FILES = (
+    "schemas.py",
+    "config.py",
+    "data_store.py",
+    "symbol_mapper.py",
+    "market_data.py",
+    "market_context.py",
+    "analysis_layers.py",
+    "analysis_engine.py",
+    "movement_hunter.py",
+    "trap_engine.py",
+    "state_engine.py",
+    "confidence_engine.py",
+    "correlation_engine.py",
+    "coin_learning.py",
+    "ghost_manager.py",
+    "movement_memory.py",
+    "movement_predictor.py",
+    "meta_learning.py",
+    "ai_decision_engine.py",
+    "tp_sl_engine.py",
+    "exit_engine.py",
+    "real_trade_manager.py",
+    "tobit_client.py",
+    "position_monitor.py",
+    "result_reporter.py",
+    "stats_manager.py",
+    "bot.py",
+    "requirements.txt",
+    "logger.py",
+    "error_handler.py",
+    "scheduler.py",
+    "startup_checks.py",
+    "health_monitor.py",
+    "migration.py",
+    "system_report.py",
+    "package_build.py",
+)
+
+
+FORBIDDEN_PATTERNS = (
+    "paper_trading",
+    "paper mode",
+    "setup flow",
+    "SETUP" + "_CREATED",
+    "BUY" + "_OPEN",
+    "SELL" + "_OPEN",
+)
+
+
+@dataclass(frozen=True)
+class PackageCheck:
+    name: str
+    status: str
+    message: str
+    details: JsonDict = field(default_factory=dict)
+
+    def to_dict(self) -> JsonDict:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class PackageReport:
+    timestamp: int
+    status: str
+    zip_path: str
+    checks: Tuple[PackageCheck, ...] = field(default_factory=tuple)
+
+    def to_dict(self) -> JsonDict:
+        return asdict(self)
+
+    def short_text(self) -> str:
+        ok = sum(1 for c in self.checks if c.status == PACKAGE_OK)
+        warn = sum(1 for c in self.checks if c.status == PACKAGE_WARN)
+        fail = sum(1 for c in self.checks if c.status == PACKAGE_FAIL)
+        icon = "✅" if fail == 0 else "❌"
+        return f"{icon} Package {self.status}\nOK:{ok} WARN:{warn} FAIL:{fail}\nZIP: {self.zip_path}"
+
+
+def now_ts() -> int:
+    return int(time.time())
+
+
+def _check(name: str, status: str, message: str, details: JsonDict | None = None) -> PackageCheck:
+    return PackageCheck(name=name, status=status, message=message, details=details or {})
+
+
+class PackageAuditor:
+    def __init__(self, root: str = "."):
+        self.root = Path(root)
+
+    def check_files(self) -> PackageCheck:
+        missing = [f for f in REQUIRED_FILES if not (self.root / f).exists()]
+        if missing:
+            return _check("files", PACKAGE_FAIL, "missing required files", {"missing": missing})
+        return _check("files", PACKAGE_OK, "all required files exist")
+
+    def compile_python(self) -> PackageCheck:
+        failed: Dict[str, str] = {}
+        for file in REQUIRED_FILES:
+            if not file.endswith(".py"):
+                continue
+            path = self.root / file
+            if not path.exists():
+                continue
+            try:
+                py_compile.compile(str(path), doraise=True)
+            except Exception as exc:
+                failed[file] = str(exc)
+
+        if failed:
+            return _check("compile", PACKAGE_FAIL, "compile errors", failed)
+        return _check("compile", PACKAGE_OK, "all python files compiled")
+
+    def check_forbidden_patterns(self) -> PackageCheck:
+        hits: Dict[str, List[str]] = {}
+        for file in REQUIRED_FILES:
+            if not file.endswith(".py"):
+                continue
+            path = self.root / file
+            if not path.exists():
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="ignore").lower()
+            except Exception:
+                continue
+
+            file_hits = []
+            for pattern in FORBIDDEN_PATTERNS:
+                if pattern.lower() in text:
+                    # package_build.py itself documents forbidden patterns.
+                    if file == "package_build.py":
+                        continue
+                    file_hits.append(pattern)
+            if file_hits:
+                hits[file] = file_hits
+
+        if hits:
+            return _check("forbidden_patterns", PACKAGE_WARN, "forbidden-looking patterns found", hits)
+        return _check("forbidden_patterns", PACKAGE_OK, "no forbidden patterns found")
+
+    def audit(self) -> List[PackageCheck]:
+        return [
+            self.check_files(),
+            self.compile_python(),
+            self.check_forbidden_patterns(),
+        ]
+
+
+class PackageBuilder:
+    def __init__(self, root: str = ".", output_dir: str = "dist"):
+        self.root = Path(root)
+        self.output_dir = Path(output_dir)
+
+    def build_zip(self, zip_name: str = "movement_hunter_bot_final.zip") -> str:
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        zip_path = self.output_dir / zip_name
+
+        if zip_path.exists():
+            zip_path.unlink()
+
+        with ZipFile(zip_path, "w", ZIP_DEFLATED) as zf:
+            for file in REQUIRED_FILES:
+                path = self.root / file
+                if path.exists():
+                    zf.write(path, arcname=file)
+
+            # keep data/log directories empty but present
+            for dirname in ("data", "data/backups", "logs"):
+                placeholder = self.root / dirname / ".gitkeep"
+                placeholder.parent.mkdir(parents=True, exist_ok=True)
+                placeholder.write_text("", encoding="utf-8")
+                zf.write(placeholder, arcname=f"{dirname}/.gitkeep")
+
+        return str(zip_path)
+
+
+class PackageBuildRunner:
+    def __init__(self, root: str = ".", output_dir: str = "dist"):
+        self.root = root
+        self.output_dir = output_dir
+        self.auditor = PackageAuditor(root=root)
+        self.builder = PackageBuilder(root=root, output_dir=output_dir)
+
+    def run(self) -> PackageReport:
+        checks = self.auditor.audit()
+        failed = any(c.status == PACKAGE_FAIL for c in checks)
+        status = PACKAGE_FAIL if failed else PACKAGE_OK
+
+        zip_path = ""
+        if not failed:
+            try:
+                zip_path = self.builder.build_zip()
+                checks.append(_check("zip", PACKAGE_OK, "zip created", {"path": zip_path}))
+            except Exception as exc:
+                checks.append(_check("zip", PACKAGE_FAIL, str(exc)))
+                status = PACKAGE_FAIL
+
+        return PackageReport(
+            timestamp=now_ts(),
+            status=status,
+            zip_path=zip_path,
+            checks=tuple(checks),
+        )
+
+
+def build_package(root: str = ".", output_dir: str = "dist") -> PackageReport:
+    return PackageBuildRunner(root=root, output_dir=output_dir).run()
+
+
+if __name__ == "__main__":
+    report = build_package()
+    print(report.short_text())
