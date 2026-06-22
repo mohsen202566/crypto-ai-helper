@@ -149,6 +149,36 @@ def round_step(value: float, step: float, precision: int = 8) -> float:
     return round(math.floor(value / step) * step, precision)
 
 
+
+
+def _first_non_empty(*values: Any) -> str:
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return ""
+
+
+def get_toobit_api_key(default: str = "") -> str:
+    return _first_non_empty(
+        os.getenv("TOOBIT_API_KEY"),
+        os.getenv("TOBIT_API_KEY"),
+        default,
+    )
+
+
+def get_toobit_api_secret(default: str = "") -> str:
+    return _first_non_empty(
+        os.getenv("TOOBIT_API_SECRET"),
+        os.getenv("TOOBIT_SECRET_KEY"),
+        os.getenv("TOBIT_API_SECRET"),
+        os.getenv("TOBIT_SECRET_KEY"),
+        default,
+    )
+
+
 def _clean_params(params: Optional[JsonDict]) -> JsonDict:
     cleaned: JsonDict = {}
     for k, v in (params or {}).items():
@@ -208,8 +238,8 @@ class ToobitClient:
         self.base_url = (base_url or getattr(SETTINGS.toobit, "base_url", "https://api.toobit.com")).rstrip("/")
         self.timeout = int(timeout or getattr(SETTINGS.toobit, "timeout_seconds", 10))
         self.credentials = ToobitCredentials(
-            api_key=api_key or os.getenv("TOOBIT_API_KEY", getattr(SETTINGS.toobit, "api_key", "")),
-            api_secret=api_secret or os.getenv("TOOBIT_API_SECRET", getattr(SETTINGS.toobit, "api_secret", "")),
+            api_key=api_key or get_toobit_api_key(getattr(SETTINGS.toobit, "api_key", "")),
+            api_secret=api_secret or get_toobit_api_secret(getattr(SETTINGS.toobit, "api_secret", "")),
         )
         self.signer = ToobitSigner(self.credentials)
         self.session = requests.Session()
