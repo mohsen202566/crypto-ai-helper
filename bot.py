@@ -61,7 +61,7 @@ from movement_predictor import predict_movement, MovementPredictionResult
 from meta_learning import get_meta_learning_summary
 from ai_decision_engine import decide, AIDecision, DECISION_REAL, DECISION_GHOST, DECISION_REJECT
 from tp_sl_engine import build_tp_sl_plan, apply_tp_sl_to_decision, TPSLPlan
-from ghost_manager import create_ghost, monitor_ghost, ghost_stats
+from ghost_manager import create_ghost, monitor_ghost, ghost_stats, manager as ghost_manager_instance
 from real_trade_manager import open_real_position, RealTradeOpenResult
 from tobit_client import get_client
 from position_monitor import monitor_all_positions
@@ -865,8 +865,10 @@ async def handle_analysis(update: Update, text: str) -> bool:
     await send_text(update, f"🔎 در حال بررسی {symbol} ...")
     try:
         result = await asyncio.to_thread(orchestrator().run_pipeline, symbol, "5m", None, True)
-        if result.signal_report:
+        if result.signal_report and result.decision.decision_type == DECISION_REAL:
             await send_payload(update, result.signal_report)
+        elif result.decision.decision_type == DECISION_GHOST:
+            await send_text(update, f"👻 {symbol} فقط برای یادگیری Ghost ثبت شد؛ سیگنال واقعی ارسال نشد.")
         else:
             decision = result.decision
             reject_line = " | ".join(decision.reject_reasons[:4]) if decision.reject_reasons else "شرایط کافی نبود"
@@ -1028,9 +1030,71 @@ async def position_monitor_loop(app: Any) -> None:
             await asyncio.sleep(10)
 
 
+def latest_price_value(raw: Any) -> float:
+    """Extract a numeric latest price from market_data.get_latest_price output."""
+    if isinstance(raw, (int, float)):
+        return safe_float(raw)
+    if isinstance(raw, dict):
+        for key in ("price", "last_price", "last", "close", "mark_price", "value"):
+            if key in raw:
+                price = safe_float(raw.get(key), 0.0)
+                if price > 0:
+                    return price
+    for key in ("price", "last_price", "last", "close", "mark_price", "value"):
+        if hasattr(raw, key):
+            price = safe_float(getattr(raw, key), 0.0)
+            if price > 0:
+                return price
+    return 0.0
+
+
+async def ghost_monitor_loop(app: Any) -> None:
+    """
+    Monitors hidden GHOST signals for TP/SL outcomes and learning.
+
+    Ghosts must stay hidden from Telegram, but their outcomes must be stored so
+    coin_learning, movement_memory, meta_learning and stats can improve later.
+    """
+    while True:
+        try:
+            interval = safe_int(
+                getattr(SETTINGS.monitor, "ghost_monitor_interval_seconds", 10),
+                10,
+            )
+            interval = max(3, interval)
+
+            ghosts = await asyncio.to_thread(ghost_manager_instance().open_ghosts)
+            for ghost in ghosts:
+                try:
+                    raw_price = await asyncio.to_thread(get_latest_price, ghost.symbol)
+                    price = latest_price_value(raw_price)
+                    if price <= 0:
+                        continue
+
+                    result = await asyncio.to_thread(monitor_ghost, ghost, price)
+                    if getattr(result, "closed", False):
+                        try:
+                            record_ghost_result(result)
+                        except TypeError:
+                            record_ghost_result(result.to_dict())
+                        except Exception as exc:
+                            save_error("ghost_result_record", str(exc), result.to_dict())
+                except Exception as exc:
+                    payload = ghost.to_dict() if hasattr(ghost, "to_dict") else {"ghost": str(ghost)}
+                    save_error("ghost_monitor_symbol", str(exc), payload)
+
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            save_error("ghost_monitor_loop", str(exc), {})
+            await asyncio.sleep(10)
+
+
 async def post_init(app: Any) -> None:
     app.create_task(auto_scan_loop(app))
     app.create_task(position_monitor_loop(app))
+    app.create_task(ghost_monitor_loop(app))
 
 
 def build_application() -> Any:
