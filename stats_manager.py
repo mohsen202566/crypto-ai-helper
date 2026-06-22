@@ -162,14 +162,30 @@ def normalize_direction(direction: str) -> str:
 
 
 def is_win(result: str) -> bool:
-    return str(result).upper() in {RESULT_TP1, RESULT_TP2, RESULT_AI_EXIT}
+    """WinRate is intentionally based only on TP1 vs SL.
+
+    TP2 and AI_EXIT are valuable outcome/profit-protection metrics, but they
+    must not inflate win rate because they can occur after TP1 on the same
+    position.
+    """
+    return str(result).upper() == RESULT_TP1
 
 
 def is_loss(result: str) -> bool:
     return str(result).upper() == RESULT_SL
 
 
+def is_winrate_result(result: str) -> bool:
+    """Only results that participate in WR denominator."""
+    return str(result).upper() in {RESULT_TP1, RESULT_SL}
+
+
 def is_closed_result(result: str) -> bool:
+    """All final/monitorable result events stored for statistics.
+
+    This remains broader than win-rate results so TP2 and AI_EXIT still show in
+    reports and learning metadata, without affecting WR.
+    """
     return str(result).upper() in {RESULT_TP1, RESULT_TP2, RESULT_AI_EXIT, RESULT_SL}
 
 
@@ -374,7 +390,9 @@ class StatsAggregator:
         ai_exit = sum(1 for e in filtered if e.result == RESULT_AI_EXIT)
         sl = sum(1 for e in filtered if e.result == RESULT_SL)
         reject = sum(1 for e in filtered if e.result == RESULT_REJECT)
-        wins = tp1 + tp2 + ai_exit
+        # WinRate must be based only on TP1 vs SL.
+        # TP2 and AI_EXIT are tracked separately and must not double-count wins.
+        wins = tp1
         losses = sl
         closed = wins + losses
         wr = wins / closed * 100.0 if closed else 0.0
@@ -415,7 +433,7 @@ class StatsAggregator:
         )
 
     def _direction_wr(self, events: Sequence[StatEvent], direction: str) -> float:
-        items = [e for e in events if e.direction == direction and is_closed_result(e.result)]
+        items = [e for e in events if e.direction == direction and is_winrate_result(e.result)]
         if not items:
             return 0.0
         wins = sum(1 for e in items if is_win(e.result))
@@ -424,7 +442,7 @@ class StatsAggregator:
     def _best_worst_symbol(self, events: Sequence[StatEvent]) -> Tuple[str, str]:
         by_symbol: Dict[str, List[StatEvent]] = {}
         for e in events:
-            if is_closed_result(e.result):
+            if is_winrate_result(e.result):
                 by_symbol.setdefault(e.symbol, []).append(e)
 
         scored: List[Tuple[str, float, int]] = []
