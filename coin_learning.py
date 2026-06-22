@@ -341,7 +341,18 @@ def bucket_percent(value: float, prefix: str) -> str:
 
 
 def result_is_win(result: str) -> bool:
-    return str(result).upper() in {RESULT_TP1, RESULT_TP2, RESULT_AI_EXIT}
+    """WinRate is based only on TP1 vs SL.
+
+    TP2 and AI_EXIT are tracked as separate learning achievements/exits,
+    but they must not inflate conditional win rate because TP2 can happen
+    after TP1 on the same position and AI_EXIT is a trade-management event.
+    """
+    return str(result).upper() == RESULT_TP1
+
+
+def result_is_winrate_result(result: str) -> bool:
+    """Only results that enter the WR denominator."""
+    return str(result).upper() in {RESULT_TP1, RESULT_SL}
 
 
 class ConditionKeyBuilder:
@@ -580,8 +591,11 @@ def summarize_records(condition_key: str, coin: str, direction: str, records: Se
     ai_exit = sum(1 for r in records if r.result == RESULT_AI_EXIT)
     sl = sum(1 for r in records if r.result == RESULT_SL)
 
-    wins = tp1 + tp2 + ai_exit
-    closed = wins + sl
+    # Conditional WinRate must stay TP1-vs-SL only.
+    # TP2 and AI_EXIT remain separate learning metrics and must not double-count
+    # a position that already hit TP1.
+    wins = tp1
+    closed = tp1 + sl
     wr = (wins / closed * 100.0) if closed else 50.0
 
     avg_mfe = sum(r.mfe_percent for r in records) / total if total else 0.0
