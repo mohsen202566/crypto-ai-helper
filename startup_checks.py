@@ -104,6 +104,36 @@ class StartupReport:
         )
 
 
+
+
+def _first_non_empty(*values: Any) -> str:
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return ""
+
+
+def _toobit_api_key() -> str:
+    return _first_non_empty(
+        os.getenv("TOOBIT_API_KEY"),
+        os.getenv("TOBIT_API_KEY"),
+        getattr(SETTINGS.toobit, "api_key", ""),
+    )
+
+
+def _toobit_api_secret() -> str:
+    return _first_non_empty(
+        os.getenv("TOOBIT_API_SECRET"),
+        os.getenv("TOOBIT_SECRET_KEY"),
+        os.getenv("TOBIT_API_SECRET"),
+        os.getenv("TOBIT_SECRET_KEY"),
+        getattr(SETTINGS.toobit, "api_secret", ""),
+    )
+
+
 def now_ts() -> int:
     return int(time.time())
 
@@ -158,13 +188,13 @@ class StartupChecker:
         else:
             self.results.append(_fail("env.BOT_TOKEN", "BOT_TOKEN missing"))
 
-        api_key = os.getenv("TOOBIT_API_KEY", getattr(SETTINGS.toobit, "api_key", ""))
-        api_secret = os.getenv("TOOBIT_API_SECRET", getattr(SETTINGS.toobit, "api_secret", ""))
+        api_key = _toobit_api_key()
+        api_secret = _toobit_api_secret()
 
         if api_key and api_secret:
             self.results.append(_ok("env.TOOBIT", "Toobit credentials exist"))
         else:
-            self.results.append(_fail("env.TOOBIT", "Toobit API key/secret missing"))
+            self.results.append(_fail("env.TOOBIT", "Toobit API key/secret missing", {"accepted_names": ["TOOBIT_API_KEY", "TOOBIT_API_SECRET", "TOOBIT_SECRET_KEY", "TOBIT_API_KEY", "TOBIT_API_SECRET", "TOBIT_SECRET_KEY"]}))
 
         owner_id = os.getenv("OWNER_ID", getattr(SETTINGS.telegram, "owner_id", ""))
         if owner_id:
