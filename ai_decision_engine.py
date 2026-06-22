@@ -498,55 +498,6 @@ class DecisionTypeClassifier:
             )
         )
 
-        strong_ghost_to_real = (
-            not severe_risk_block
-            and live_or_early_move
-            and confidence.confidence_score >= 12.0
-            and trap.trap_risk <= max_real_risk + 32.0
-            and correlation.exposure_risk < 82.0
-            and (
-                # Good current AI evidence.
-                (
-                    score.final_score >= 50.0
-                    and (
-                        prediction.movement_probability >= 38.0
-                        or movement.readiness_score >= 42.0
-                        or score.analysis_score >= 52.0
-                    )
-                )
-                # Proven similar conditions can promote earlier, so we do not
-                # miss the same pump/dump pattern again.
-                or (
-                    strong_learning
-                    and score.final_score >= 38.0
-                    and (
-                        prediction.movement_probability >= 28.0
-                        or movement.readiness_score >= 35.0
-                        or score.analysis_score >= 45.0
-                    )
-                )
-                # Very strong immediate movement can go REAL even before
-                # enough learning exists.
-                or (
-                    score.final_score >= 44.0
-                    and movement.readiness_score >= 58.0
-                    and prediction.movement_probability >= 32.0
-                )
-            )
-        )
-
-        if real_allowed or strong_ghost_to_real:
-            reasons.append("AI_DECISION_REAL_ALLOWED")
-            if strong_ghost_to_real and not real_allowed:
-                reasons.append("STRONG_GHOST_TO_REAL_BRIDGE")
-                if must_ghost:
-                    warnings.append("GHOST_DOWNGRADE_OVERRIDDEN_BY_STRONG_EVIDENCE")
-                if strong_learning:
-                    reasons.append("LEARNING_SUPPORTS_REAL_PROMOTION")
-                if learning_confidence_hint == "LOW_DATA":
-                    warnings.append("LOW_DATA_ALLOWED_FOR_STRONG_REAL")
-            return DECISION_REAL, reasons, warnings
-
         ghost_allowed = (
             score.final_score >= min_ghost
             or confidence.confidence_score >= 8.0
@@ -556,6 +507,42 @@ class DecisionTypeClassifier:
             or score.state_score >= 35.0
             or (learning is not None and learning.confidence_hint == "LOW_DATA")
         )
+
+        # Soft REAL mode:
+        #
+        # Current live stats showed the GHOST path was highly profitable while
+        # REAL stayed at zero. Therefore the safest coordinated fix is not to
+        # change TP/SL, Toobit, monitoring, or learning. Instead, promote the
+        # same candidates that were already good enough for GHOST into REAL
+        # unless there is an extreme risk block.
+        #
+        # This preserves the working Ghost logic, but prevents missing fast
+        # pump/dump moves. If future real SLs increase, coin_learning and
+        # meta_learning can tighten conditions again through risk labels and
+        # layer weights.
+        strong_ghost_to_real = (
+            ghost_allowed
+            and not severe_risk_block
+            and confidence.confidence_score >= 8.0
+            and trap.trap_risk < 82.0
+            and trap.liquidity_risk < 88.0
+            and correlation.exposure_risk < 82.0
+        )
+
+        if real_allowed or strong_ghost_to_real:
+            reasons.append("AI_DECISION_REAL_ALLOWED")
+            if strong_ghost_to_real and not real_allowed:
+                reasons.append("STRONG_GHOST_TO_REAL_BRIDGE")
+                reasons.append("GHOST_ALLOWED_TO_REAL_SOFT_MODE")
+                if must_ghost:
+                    warnings.append("GHOST_DOWNGRADE_OVERRIDDEN_BY_SOFT_REAL_MODE")
+                if strong_learning:
+                    reasons.append("LEARNING_SUPPORTS_REAL_PROMOTION")
+                if very_strong_learning:
+                    reasons.append("VERY_STRONG_LEARNING_SUPPORTS_REAL")
+                if learning_confidence_hint == "LOW_DATA":
+                    warnings.append("LOW_DATA_ALLOWED_FOR_STRONG_REAL")
+            return DECISION_REAL, reasons, warnings
 
         if ghost_allowed:
             reasons.append("AI_DECISION_GHOST_FOR_LEARNING")
