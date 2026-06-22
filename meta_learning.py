@@ -43,7 +43,7 @@ from state_engine import StateResult
 from confidence_engine import ConfidenceResult
 from correlation_engine import CorrelationResult
 from movement_predictor import MovementPredictionResult
-from data_store import save_meta_learning, store
+from data_store import save_meta_learning, store, append_bounded, save_error
 from config import SETTINGS
 
 
@@ -95,6 +95,16 @@ class ModuleAuditRecord:
     weight_before: float
     weight_after: float
     reason_codes: Tuple[str, ...] = field(default_factory=tuple)
+
+    # Extra self-audit context. These fields make the meta-learning layer able
+    # to remember exactly which coin/direction/technical conditions were present
+    # when a module was right or wrong. They are intentionally descriptive only;
+    # final trade decisions still belong to ai_decision_engine.py.
+    symbol: str = ""
+    direction: str = "UNKNOWN"
+    outcome_result: str = RESULT_UNKNOWN
+    condition_key: str = ""
+    technical_context: JsonDict = field(default_factory=dict)
 
     def to_dict(self) -> JsonDict:
         return asdict(self)
@@ -169,6 +179,186 @@ def source_weight(source_type: str) -> float:
         return safe_float(getattr(SETTINGS.learning, "real_weight", 1.0), 1.0)
     return safe_float(getattr(SETTINGS.learning, "ghost_weight", 0.7), 0.7)
 
+
+
+
+def normalize_symbol(symbol: str) -> str:
+    s = str(symbol or "").upper().replace("-", "").replace("/", "").replace("_", "").strip()
+    if s and not s.endswith("USDT") and len(s) <= 14:
+        s += "USDT"
+    return s
+
+
+def normalize_direction(direction: str) -> str:
+    d = str(direction or "").upper().strip()
+    if d in {"LONG", "BUY"}:
+        return "LONG"
+    if d in {"SHORT", "SELL"}:
+        return "SHORT"
+    return "UNKNOWN"
+
+
+def bucket_rsi(value: float) -> str:
+    v = safe_float(value, 50.0)
+    if v < 25:
+        return "RSI_EXTREME_LOW"
+    if v < 35:
+        return "RSI_LOW"
+    if v < 45:
+        return "RSI_LOW_MID"
+    if v < 55:
+        return "RSI_MID"
+    if v < 65:
+        return "RSI_HIGH_MID"
+    if v < 75:
+        return "RSI_HIGH"
+    return "RSI_EXTREME_HIGH"
+
+
+def bucket_adx(value: float) -> str:
+    v = safe_float(value)
+    if v < 14:
+        return "ADX_VERY_WEAK"
+    if v < 20:
+        return "ADX_WEAK"
+    if v < 28:
+        return "ADX_NORMAL"
+    if v < 40:
+        return "ADX_STRONG"
+    return "ADX_EXTREME"
+
+
+def bucket_signed(value: float, prefix: str, small: float = 0.0, medium: float = 0.0001) -> str:
+    v = safe_float(value)
+    if v > medium:
+        return f"{prefix}_STRONG_UP"
+    if v > small:
+        return f"{prefix}_UP"
+    if v < -medium:
+        return f"{prefix}_STRONG_DOWN"
+    if v < -small:
+        return f"{prefix}_DOWN"
+    return f"{prefix}_FLAT"
+
+
+def bucket_atr(value: float) -> str:
+    v = safe_float(value)
+    if v < 0.25:
+        return "ATR_TINY"
+    if v < 0.60:
+        return "ATR_NORMAL"
+    if v < 1.20:
+        return "ATR_HIGH"
+    if v < 2.50:
+        return "ATR_EXTREME"
+    return "ATR_DANGER"
+
+
+def bucket_volume(value: float) -> str:
+    v = safe_float(value)
+    if v < 0.7:
+        return "VOL_LOW"
+    if v < 1.2:
+        return "VOL_NORMAL"
+    if v < 2.0:
+        return "VOL_HIGH"
+    if v < 4.0:
+        return "VOL_SPIKE"
+    return "VOL_EXTREME"
+
+
+def bucket_power(value: float) -> str:
+    v = safe_float(value)
+    if v >= 35:
+        return "POWER_STRONG_BUY"
+    if v >= 12:
+        return "POWER_BUY"
+    if v <= -35:
+        return "POWER_STRONG_SELL"
+    if v <= -12:
+        return "POWER_SELL"
+    return "POWER_BALANCED"
+
+
+def build_condition_key(
+    candidate: AnalysisCandidate,
+    movement: Optional[MovementHunterResult] = None,
+    trap: Optional[TrapResult] = None,
+    state: Optional[StateResult] = None,
+) -> str:
+    """Stable coin+direction+technical-condition key for self-audit learning."""
+    s = candidate.sensor_snapshot
+    symbol = normalize_symbol(candidate.symbol)
+    direction = normalize_direction(candidate.direction_hint)
+    market_state = str(getattr(state, "market_state", getattr(s, "market_state", "UNKNOWN")))
+    freshness = str(getattr(movement, "freshness", "UNKNOWN"))
+    return "|".join([
+        symbol,
+        direction,
+        market_state,
+        freshness,
+        bucket_rsi(getattr(s, "rsi", 50.0)),
+        bucket_adx(getattr(s, "adx", 0.0)),
+        bucket_signed(getattr(s, "histogram_slope", 0.0), "HIST"),
+        bucket_atr(getattr(s, "atr_percent", 0.0)),
+        bucket_volume(getattr(s, "relative_volume", 0.0)),
+        bucket_power(getattr(s, "power_delta", 0.0)),
+        str(getattr(s, "vwap_state", "UNKNOWN")),
+        str(getattr(s, "ema_state", "UNKNOWN")),
+        str(getattr(state, "market_state", "UNKNOWN")),
+        str(getattr(trap, "trap_level", getattr(trap, "trap_risk", "UNKNOWN"))),
+    ])
+
+
+def build_technical_context(
+    candidate: AnalysisCandidate,
+    movement: Optional[MovementHunterResult] = None,
+    trap: Optional[TrapResult] = None,
+    state: Optional[StateResult] = None,
+    confidence: Optional[ConfidenceResult] = None,
+    correlation: Optional[CorrelationResult] = None,
+    prediction: Optional[MovementPredictionResult] = None,
+) -> JsonDict:
+    """Compact technical snapshot saved with every module audit."""
+    s = candidate.sensor_snapshot
+    return {
+        "symbol": normalize_symbol(candidate.symbol),
+        "direction": normalize_direction(candidate.direction_hint),
+        "timeframe": candidate.timeframe,
+        "price": safe_float(getattr(s, "price", 0.0)),
+        "rsi": safe_float(getattr(s, "rsi", 0.0)),
+        "rsi_slope": safe_float(getattr(s, "rsi_slope", 0.0)),
+        "macd": safe_float(getattr(s, "macd", 0.0)),
+        "macd_histogram": safe_float(getattr(s, "macd_histogram", 0.0)),
+        "histogram_slope": safe_float(getattr(s, "histogram_slope", 0.0)),
+        "histogram_acceleration": safe_float(getattr(s, "histogram_acceleration", 0.0)),
+        "adx": safe_float(getattr(s, "adx", 0.0)),
+        "atr_percent": safe_float(getattr(s, "atr_percent", 0.0)),
+        "relative_volume": safe_float(getattr(s, "relative_volume", 0.0)),
+        "buy_power": safe_float(getattr(s, "buy_power", 0.0)),
+        "sell_power": safe_float(getattr(s, "sell_power", 0.0)),
+        "power_delta": safe_float(getattr(s, "power_delta", 0.0)),
+        "vwap_state": str(getattr(s, "vwap_state", "UNKNOWN")),
+        "ema_state": str(getattr(s, "ema_state", "UNKNOWN")),
+        "range_probability": safe_float(getattr(s, "range_probability", 0.0)),
+        "quality_score": safe_float(getattr(candidate.quality, "total_quality", 0.0)),
+        "risk_score": safe_float(getattr(candidate.risk, "total_risk", 0.0)),
+        "movement_readiness": safe_float(getattr(movement, "readiness_score", 0.0)),
+        "movement_freshness": str(getattr(movement, "freshness", "UNKNOWN")),
+        "movement_phase": str(getattr(movement, "movement_phase", "UNKNOWN")),
+        "trap_risk": safe_float(getattr(trap, "trap_risk", 0.0)),
+        "liquidity_risk": safe_float(getattr(trap, "liquidity_risk", 0.0)),
+        "market_state": str(getattr(state, "market_state", "UNKNOWN")),
+        "state_confidence": safe_float(getattr(state, "state_confidence", 0.0)),
+        "late_entry_risk": safe_float(getattr(state, "late_entry_risk", 0.0)),
+        "confidence_score": safe_float(getattr(confidence, "confidence_score", 0.0)),
+        "similar_win_rate": safe_float(getattr(confidence, "similar_win_rate", 0.0)),
+        "known_sample_count": safe_int(getattr(confidence, "known_sample_count", 0)),
+        "exposure_risk": safe_float(getattr(correlation, "exposure_risk", 0.0)),
+        "prediction_probability": safe_float(getattr(prediction, "movement_probability", 0.0)),
+        "prediction_phase": str(getattr(prediction, "predicted_phase", "UNKNOWN")),
+        "prediction_sample_count": safe_int(getattr(prediction, "sample_count", 0)),
+    }
 
 class ModuleContributionExtractor:
     """
@@ -310,6 +500,11 @@ class MetaLearningState:
         outcome_positive: bool,
         contribution_score: float,
         reason_codes: Sequence[str],
+        symbol: str = "",
+        direction: str = "UNKNOWN",
+        outcome_result: str = RESULT_UNKNOWN,
+        condition_key: str = "",
+        technical_context: Optional[JsonDict] = None,
     ) -> ModuleAuditRecord:
         old = self.records.get(module_name) or MetaLearningRecord(
             module_name=module_name,
@@ -378,6 +573,11 @@ class MetaLearningState:
             weight_before=old.weight,
             weight_after=weight_after,
             reason_codes=tuple(reason_codes),
+            symbol=normalize_symbol(symbol),
+            direction=normalize_direction(direction),
+            outcome_result=str(outcome_result or RESULT_UNKNOWN).upper(),
+            condition_key=str(condition_key or ""),
+            technical_context=dict(technical_context or {}),
         )
         self.audits.append(audit)
 
@@ -444,7 +644,21 @@ class MetaLearningEngine:
         prediction: Optional[MovementPredictionResult] = None,
         persist: bool = True,
     ) -> List[ModuleAuditRecord]:
-        outcome_positive = result_positive(result)
+        outcome_result = str(result or RESULT_UNKNOWN).upper()
+        outcome_positive = result_positive(outcome_result)
+        condition_key = build_condition_key(candidate, movement=movement, trap=trap, state=state)
+        technical_context = build_technical_context(
+            candidate=candidate,
+            movement=movement,
+            trap=trap,
+            state=state,
+            confidence=confidence,
+            correlation=correlation,
+            prediction=prediction,
+        )
+        symbol = normalize_symbol(candidate.symbol)
+        direction = normalize_direction(candidate.direction_hint)
+
         contributions = self.extractor.extract(
             candidate=candidate,
             movement=movement,
@@ -464,10 +678,28 @@ class MetaLearningEngine:
                 outcome_positive=outcome_positive,
                 contribution_score=contribution_score,
                 reason_codes=reasons,
+                symbol=symbol,
+                direction=direction,
+                outcome_result=outcome_result,
+                condition_key=condition_key,
+                technical_context=technical_context,
             )
             audits.append(audit)
             if persist:
                 save_meta_learning(module_name, self.state.records[module_name].to_dict())
+                try:
+                    append_bounded(
+                        "meta_learning_audits",
+                        audit.audit_id,
+                        audit.to_dict(),
+                        max_items=max(500, int(getattr(SETTINGS.learning, "max_records", 20000))),
+                        sort_key="timestamp",
+                    )
+                except Exception as exc:
+                    try:
+                        save_error("meta_learning_audit_save", str(exc), {"module": module_name, "audit_id": audit.audit_id})
+                    except Exception:
+                        pass
 
         return audits
 
@@ -487,10 +719,24 @@ class MetaLearningEngine:
 _default_engine: Optional[MetaLearningEngine] = None
 
 
+def _load_persisted_meta_records() -> List[Any]:
+    try:
+        return list(store().section("meta_learning").values())
+    except Exception as exc:
+        try:
+            save_error("meta_learning_load", str(exc), {})
+        except Exception:
+            pass
+        return []
+
+
 def engine(records: Optional[Iterable[Any]] = None) -> MetaLearningEngine:
     global _default_engine
-    if _default_engine is None or records is not None:
-        _default_engine = MetaLearningEngine(records=records)
+    if _default_engine is None:
+        _default_engine = MetaLearningEngine(records=_load_persisted_meta_records())
+    elif records is not None:
+        merged = list(_default_engine.state.records.values()) + list(records)
+        _default_engine = MetaLearningEngine(records=merged)
     return _default_engine
 
 
