@@ -187,27 +187,33 @@ class DecisionInputValidator:
         warnings: List[str] = []
         reject_reasons: List[str] = []
 
+        # Only truly unusable raw input is a hard validation reject.
+        # Layer-level invalid states should remain learnable and go to GHOST.
         if not candidate.valid:
             reject_reasons.append("INVALID_ANALYSIS_CANDIDATE")
+
+        try:
+            if candidate.sensor_snapshot.price <= 0:
+                reject_reasons.append("INVALID_ENTRY_PRICE")
+        except Exception:
+            reject_reasons.append("INVALID_ENTRY_PRICE")
+
         if not movement.valid:
-            reject_reasons.append("INVALID_MOVEMENT_RESULT")
+            warnings.append("INVALID_MOVEMENT_RESULT_SOFT_GHOST")
         if not trap.valid:
-            reject_reasons.append("INVALID_TRAP_RESULT")
+            warnings.append("INVALID_TRAP_RESULT_SOFT_GHOST")
         if not state.valid:
-            reject_reasons.append("INVALID_STATE_RESULT")
+            warnings.append("INVALID_STATE_RESULT_SOFT_GHOST")
         if not confidence.valid:
-            reject_reasons.append("INVALID_CONFIDENCE_RESULT")
+            warnings.append("INVALID_CONFIDENCE_RESULT_SOFT_GHOST")
         if not correlation.valid:
-            reject_reasons.append("INVALID_CORRELATION_RESULT")
+            warnings.append("INVALID_CORRELATION_RESULT_SOFT_GHOST")
         if not prediction.valid:
-            reject_reasons.append("INVALID_MOVEMENT_PREDICTION")
+            warnings.append("INVALID_MOVEMENT_PREDICTION_SOFT_GHOST")
 
         direction = normalize_direction(candidate.direction_hint)
         if direction not in {DIRECTION_LONG, DIRECTION_SHORT}:
-            reject_reasons.append("NO_VALID_DIRECTION")
-
-        if candidate.sensor_snapshot.price <= 0:
-            reject_reasons.append("INVALID_ENTRY_PRICE")
+            warnings.append("NO_VALID_CANDIDATE_DIRECTION_SOFT_GHOST")
 
         if candidate.symbol != movement.symbol:
             warnings.append("SYMBOL_MISMATCH_MOVEMENT")
@@ -312,7 +318,13 @@ class AIScoreComposer:
 
 
 class HardRejectRules:
-    """Hard blocks for obvious danger cases only."""
+    """
+    Safety-only hard blocks.
+
+    Important architecture rule:
+    Market conditions such as RANGE / DEAD / LATE / LOW_DATA must NOT hard-reject.
+    They should be routed to GHOST so the AI can learn from them.
+    """
 
     def check(
         self,
@@ -327,44 +339,32 @@ class HardRejectRules:
     ) -> Tuple[bool, List[str]]:
         reasons: List[str] = []
 
-        if trap.trap_risk >= 88:
-            reasons.append(REJECT_REASON_HIGH_TRAP)
-
-        # Hard reject only obvious dead/no-quality cases. Borderline range/late cases
-        # should usually become GHOST so the bot can learn instead of going silent.
-        if (
-            state.market_state == "RANGE"
-            and movement.readiness_score < 42
-            and prediction.movement_probability < 48
-            and movement.freshness in {"DEAD", "UNKNOWN", "LATE"}
-        ):
-            reasons.append(REJECT_REASON_RANGE)
-
-        if (
-            state.market_state in {"EXHAUSTION", "LATE"}
-            and prediction.predicted_phase not in {"PRE_START", "START"}
-            and movement.freshness == "DEAD"
-            and prediction.movement_probability < 50
-        ):
-            reasons.append(REJECT_REASON_EXHAUSTED)
-
-        if confidence.confidence_score < 18 and prediction.movement_probability < 42 and movement.readiness_score < 38:
-            reasons.append(REJECT_REASON_LOW_CONFIDENCE)
-
-        if prediction.movement_probability < 25 and movement.readiness_score < 28:
-            reasons.append(REJECT_REASON_LOW_MOVEMENT)
-
-        if correlation.should_block_if_risk_high and correlation.exposure_risk >= 85:
-            reasons.append(REJECT_REASON_CORRELATION)
-
-        if not candidate.sensor_snapshot.valid:
+        # Only corrupted/unusable input remains a hard reject.
+        # Risky market states are handled by DecisionTypeClassifier as GHOST,
+        # not by blocking the learning pipeline.
+        try:
+            if not bool(candidate.valid):
+                reasons.append(REJECT_REASON_INVALID)
+            if getattr(candidate, "sensor_snapshot", None) is None:
+                reasons.append(REJECT_REASON_INVALID)
+            elif not bool(getattr(candidate.sensor_snapshot, "valid", True)):
+                reasons.append(REJECT_REASON_INVALID)
+            elif safe_float(getattr(candidate.sensor_snapshot, "price", 0.0), 0.0) <= 0.0:
+                reasons.append(REJECT_REASON_INVALID)
+        except Exception:
             reasons.append(REJECT_REASON_INVALID)
 
-        return len(reasons) > 0, reasons
+        return len(reasons) > 0, list(dict.fromkeys(reasons))
 
 
 class DecisionTypeClassifier:
-    """Converts score/context into REAL, GHOST or REJECT."""
+    """Converts score/context into REAL, GHOST or REJECT.
+
+    Soft-learning policy:
+    - REAL stays selective.
+    - Borderline/weak/range/late/low-data candidates become GHOST.
+    - REJECT is reserved for invalid input handled outside this classifier.
+    """
 
     def classify(
         self,
@@ -381,16 +381,19 @@ class DecisionTypeClassifier:
         reasons: List[str] = []
         warnings: List[str] = []
 
-        # Balanced thresholds for Movement Hunter scalping:
-        # REAL remains selective, while GHOST is allowed for learnable borderline setups.
         configured_min_real = safe_float(getattr(SETTINGS.ai, "min_real_confidence", 72.0), 72.0)
         configured_min_ghost = safe_float(getattr(SETTINGS.ai, "min_ghost_confidence", 45.0), 45.0)
+
+        # Keep REAL strict enough for safety.
         min_real = clamp(configured_min_real, 68.0, 76.0)
-        min_ghost = clamp(configured_min_ghost, 32.0, 45.0)
+
+        # GHOST must be softer because it is the learning path.
+        min_ghost = clamp(configured_min_ghost, 22.0, 38.0)
         max_real_risk = safe_float(getattr(SETTINGS.ai, "max_real_risk", 38.0), 38.0)
 
-        # Downgrade rules.
         must_ghost = False
+
+        # Downgrade conditions. These are NOT rejection reasons.
         if confidence.should_downgrade_to_ghost:
             must_ghost = True
             reasons.append("CONFIDENCE_REQUIRES_GHOST")
@@ -406,9 +409,15 @@ class DecisionTypeClassifier:
         if trap.trap_risk >= 65:
             must_ghost = True
             reasons.append("TRAP_RISK_GHOST_ONLY")
-        if state.market_state == "RANGE" and prediction.predicted_phase != "PRE_START":
+        if state.market_state in {"RANGE", "EXHAUSTION", "LATE"}:
             must_ghost = True
-            reasons.append("RANGE_GHOST_ONLY")
+            reasons.append(f"{state.market_state}_GHOST_ONLY")
+        if movement.freshness in {"DEAD", "UNKNOWN", "LATE"}:
+            must_ghost = True
+            reasons.append(f"FRESHNESS_{movement.freshness}_GHOST_ONLY")
+        if prediction.predicted_phase in {"RANGE", "UNKNOWN"}:
+            must_ghost = True
+            reasons.append(f"PREDICTED_PHASE_{prediction.predicted_phase}_GHOST_ONLY")
 
         real_conf_floor = max(52.0, min_real - 18.0)
         real_allowed = (
@@ -417,6 +426,7 @@ class DecisionTypeClassifier:
             and (prediction.movement_probability >= 56 or movement.readiness_score >= 66)
             and movement.freshness in {"FRESH", "MID"}
             and state.market_state not in {"RANGE", "EXHAUSTION", "LATE"}
+            and prediction.predicted_phase not in {"RANGE", "UNKNOWN"}
             and trap.trap_risk <= max_real_risk + 18
             and correlation.exposure_risk < 75
             and not must_ghost
@@ -428,13 +438,12 @@ class DecisionTypeClassifier:
 
         ghost_allowed = (
             score.final_score >= min_ghost
-            or prediction.movement_probability >= min_ghost
-            or movement.readiness_score >= min_ghost
-            or (
-                movement.freshness in {"FRESH", "MID", "LATE"}
-                and prediction.predicted_phase not in {"UNKNOWN"}
-                and score.final_score >= max(34.0, min_ghost - 8.0)
-            )
+            or confidence.confidence_score >= 8.0
+            or prediction.movement_probability >= 18.0
+            or movement.readiness_score >= 12.0
+            or score.analysis_score >= 45.0
+            or score.state_score >= 35.0
+            or (learning is not None and learning.confidence_hint == "LOW_DATA")
         )
 
         if ghost_allowed:
@@ -443,8 +452,11 @@ class DecisionTypeClassifier:
                 warnings.append("DOWNGRADED_TO_GHOST")
             return DECISION_GHOST, reasons, warnings
 
-        reasons.append("AI_DECISION_REJECT_LOW_SCORE")
-        return DECISION_REJECT, reasons, warnings
+        # Final soft fallback:
+        # If data is valid but weak, still create GHOST so AI can learn why it failed.
+        reasons.append("AI_DECISION_GHOST_SOFT_FALLBACK")
+        warnings.append("VERY_WEAK_CANDIDATE_GHOST_LEARNING")
+        return DECISION_GHOST, reasons, warnings
 
 
 class AIDecisionEngine:
@@ -555,10 +567,23 @@ class AIDecisionEngine:
         layer_reasons.extend(list(prediction.reason_codes)[:8])
         reasons.extend(layer_reasons)
 
+        # Prefer candidate direction, but do not hard-reject NEUTRAL immediately.
+        # For learning/GHOST, fall back to movement/trap/prediction direction when available.
         direction = normalize_direction(candidate.direction_hint)
         if direction == DIRECTION_NEUTRAL:
+            for fallback_direction in (
+                getattr(movement, "direction_hint", None),
+                getattr(trap, "direction_hint", None),
+                getattr(prediction, "direction_hint", None),
+            ):
+                direction = normalize_direction(fallback_direction)
+                if direction in {DIRECTION_LONG, DIRECTION_SHORT}:
+                    warnings.append("DIRECTION_FALLBACK_USED_FOR_LEARNING")
+                    break
+
+        if direction == DIRECTION_NEUTRAL:
             decision_type = DECISION_REJECT
-            reject_reasons.append("NEUTRAL_DIRECTION")
+            reject_reasons.append("NO_USABLE_DIRECTION")
 
         risk_score = clamp(
             trap.trap_risk * 0.30
