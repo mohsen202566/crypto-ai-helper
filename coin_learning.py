@@ -36,7 +36,7 @@ from movement_hunter import MovementHunterResult
 from trap_engine import TrapResult
 from state_engine import StateResult
 from confidence_engine import ConfidenceResult
-from data_store import save_learning_record, append_bounded, save_coin_behavior, new_id
+from data_store import save_learning_record, append_bounded, save_coin_behavior, new_id, store, save_error
 from config import SETTINGS
 
 
@@ -716,7 +716,7 @@ class CoinLearningEngine:
         self.memory.add(record)
 
         if persist:
-            append_bounded('learning', record.learning_id, record.to_dict(), max_items=MAX_LEARNING_RECORDS, sort_key='created_at')
+            append_bounded('learning', record.learning_id, record.to_dict(), max_items=MAX_LEARNING_RECORDS, sort_key='timestamp')
             summary = self.memory.summarize(record.condition_key, record.coin, record.direction)
             behavior = build_coin_behavior(summary)
             save_coin_behavior(f"{record.coin}|{record.direction}|{record.condition_key}", behavior.to_dict())
@@ -736,10 +736,25 @@ class CoinLearningEngine:
 _default_engine: Optional[CoinLearningEngine] = None
 
 
+def _load_persisted_learning_records() -> List[Any]:
+    """Load persisted learning records so summaries survive restarts."""
+    try:
+        return list(store().section("learning").values())
+    except Exception as exc:
+        try:
+            save_error("coin_learning_load", str(exc), {})
+        except Exception:
+            pass
+        return []
+
+
 def engine(records: Optional[Iterable[Any]] = None) -> CoinLearningEngine:
     global _default_engine
-    if _default_engine is None or records is not None:
-        _default_engine = CoinLearningEngine(records=records)
+    if _default_engine is None:
+        _default_engine = CoinLearningEngine(records=_load_persisted_learning_records())
+    elif records is not None:
+        existing = list(_default_engine.memory.records)
+        _default_engine = CoinLearningEngine(records=[*existing, *list(records)])
     return _default_engine
 
 
