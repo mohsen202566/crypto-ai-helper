@@ -722,7 +722,13 @@ market-close responses while still catching clear failures.
                 self._repair_protected_sl(updated, exit_decision.protected_sl)
                 events.append(self._event(updated, EVENT_PROTECT_SL, updated.current_price, reason_codes=exit_decision.reason_codes, warnings=exit_decision.warnings, should_report=False))
 
-            in_profit = safe_float(updated.unrealized_pnl_usdt) > 0 or pnl_percent(updated.direction, updated.entry, updated.current_price) > 0
+            # AI profit exit must not fire on tiny gross profit.
+            # User-approved minimum for current 7 USDT margin / 10x setup:
+            # close only when floating/estimated profit is at least 0.10 USDT.
+            min_ai_profit_exit_usdt = 0.10
+            estimated_profit_usdt = self._estimate_pnl_usdt(updated, updated.current_price, 1.0)
+            current_profit_usdt = max(safe_float(updated.unrealized_pnl_usdt), estimated_profit_usdt)
+            in_profit = current_profit_usdt >= min_ai_profit_exit_usdt
             ai_profit_exit, ai_profit_reasons, ai_profit_warnings = self._ai_weakness_or_reversal_seen(
                 updated,
                 snapshot=snapshot,
@@ -1025,22 +1031,24 @@ market-close responses while still catching clear failures.
         exit_decision: Optional[ExitDecision] = None,
     ) -> Tuple[bool, Tuple[str, ...], Tuple[str, ...]]:
         """
-        AI Profit Exit rule requested by user:
-        - Do NOT require a fixed profit-percent threshold.
-        - If the position is in profit by any amount and AI/current sensors show
-          continuation weakness, trend flip, reversal, trap, or market turn,
-          close the position to protect profit.
-
-        This is intentionally generic so it keeps working even when AI result
-        dataclasses evolve.
+        Strict AI Profit Exit rule:
+        - No percent threshold.
+        - Gross/floating profit threshold is handled in monitor_position
+          (currently >= 0.10 USDT).
+        - Do not close only because the market is NEUTRAL / RANGE / CHOP.
+        - Close only when a real reversal/continuation failure is confirmed:
+          either exit_engine explicitly says close, or at least two strong
+          AI/sensor confirmations are present.
         """
         reason_codes: List[str] = []
         warnings: List[str] = []
 
+        # Exit engine is considered a high-confidence dedicated exit signal.
         if exit_decision and exit_decision.should_close:
             reason_codes.extend(list(exit_decision.reason_codes or ()))
             warnings.extend(list(exit_decision.warnings or ()))
             reason_codes.append("EXIT_ENGINE_CLOSE_SIGNAL")
+            warnings.append("AI_PROFIT_EXIT_STRICT_CONFIRMED")
             return True, tuple(dict.fromkeys(reason_codes)), tuple(dict.fromkeys(warnings))
 
         if self._opposite_direction_seen(pos, movement, trap, state):
@@ -1053,27 +1061,69 @@ market-close responses while still catching clear failures.
             "snapshot": self._object_to_dict(snapshot),
         }))
 
-        weak_terms = (
-            "WEAK", "WEAKNESS", "MOMENTUM_WEAK", "CONTINUATION_WEAK",
-            "CONTINUATION_FAILED", "FAILED_CONTINUATION", "EXHAUST", "EXHAUSTION",
-            "REVERSAL", "REVERSE", "TURN", "TURNING", "FLIP", "CHANGED",
-            "RANGE", "RANGING", "CHOP", "NEUTRAL", "LOSS_OF_MOMENTUM",
-            "MOMENTUM_LOSS", "MARKET_REVERSED", "TREND_CHANGED",
+        # Strong weakness terms only. NEUTRAL/RANGE/CHOP are intentionally
+        # not included here because they made profit exit too loose.
+        strong_weak_terms = (
+            "WEAKNESS", "MOMENTUM_WEAK", "CONTINUATION_WEAK",
+            "CONTINUATION_FAILED", "FAILED_CONTINUATION",
+            "LOSS_OF_MOMENTUM", "MOMENTUM_LOSS",
+            "EXHAUST", "EXHAUSTION",
+            "MOMENTUM_FAILURE", "FAILED_MOVE",
+        )
+        reversal_terms = (
+            "REVERSAL", "REVERSE", "TURNING", "MARKET_REVERSED",
+            "TREND_CHANGED", "DIRECTION_CHANGED",
             "BEARISH_TO_BULLISH", "BULLISH_TO_BEARISH",
+            "VWAP_FLIP", "VWAP_RECLAIM", "VWAP_LOSS",
+            "STRUCTURE_BREAK", "BOS_AGAINST", "CHoCH", "CHOCH",
         )
         trap_terms = (
-            "TRAP_HIGH", "HIGH_TRAP", "TRAP_RISK_HIGH", "LIQUIDITY_GRAB",
-            "STOP_HUNT", "FAKE_BREAK", "FAILED_BREAKOUT", "FAILED_BREAKDOWN",
+            "TRAP_HIGH", "HIGH_TRAP", "TRAP_RISK_HIGH",
+            "LIQUIDITY_GRAB", "STOP_HUNT",
+            "FAKE_BREAK", "FAKE_BREAKOUT", "FAKE_BREAKDOWN",
+            "FAILED_BREAKOUT", "FAILED_BREAKDOWN",
+        )
+        opposite_power_terms = (
+            "BUY_POWER_SHIFT", "SELL_POWER_SHIFT",
+            "POWER_SHIFT_AGAINST", "BUYERS_RETURNED", "SELLERS_RETURNED",
+            "BUY_POWER_DOMINANT", "SELL_POWER_DOMINANT",
         )
 
-        if any(term in texts for term in weak_terms):
+        confirmations: List[str] = []
+
+        if any(term in texts for term in strong_weak_terms):
             reason_codes.append("AI_CONTINUATION_WEAKNESS_DETECTED")
+            confirmations.append("WEAKNESS")
+
+        if any(term in texts for term in reversal_terms):
+            reason_codes.append("AI_REVERSAL_OR_TREND_CHANGE_DETECTED")
+            confirmations.append("REVERSAL")
+
         if any(term in texts for term in trap_terms):
             reason_codes.append("AI_TRAP_OR_LIQUIDITY_RISK_DETECTED")
+            confirmations.append("TRAP_OR_LIQUIDITY")
 
-        should_close = bool(reason_codes)
+        if any(term in texts for term in opposite_power_terms):
+            reason_codes.append("AI_OPPOSITE_POWER_SHIFT_DETECTED")
+            confirmations.append("OPPOSITE_POWER")
+
+        if "AI_DIRECTION_FLIPPED_AGAINST_POSITION" in reason_codes:
+            confirmations.append("DIRECTION_FLIP")
+
+        # Strict mode:
+        # - Direction flip + one more real warning is enough.
+        # - Or any two independent serious confirmations.
+        # - Single NEUTRAL/RANGE/CHOP is ignored because those terms are not in
+        #   the strong confirmation lists.
+        unique_confirmations = list(dict.fromkeys(confirmations))
+        should_close = len(unique_confirmations) >= 2
+
         if should_close:
-            warnings.append("AI_PROFIT_EXIT_ANY_PROFIT_NO_PERCENT_THRESHOLD")
+            warnings.append("AI_PROFIT_EXIT_STRICT_CONFIRMED")
+            warnings.append("AI_PROFIT_EXIT_MIN_0_10_USDT_REQUIRED")
+        elif reason_codes:
+            warnings.append("AI_PROFIT_EXIT_SKIPPED_NEEDS_SECOND_CONFIRMATION")
+
         return should_close, tuple(dict.fromkeys(reason_codes)), tuple(dict.fromkeys(warnings))
 
     def _is_position_still_open(self, pos: RealPositionState) -> bool:
