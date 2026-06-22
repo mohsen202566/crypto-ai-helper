@@ -325,16 +325,28 @@ class HardRejectRules:
         if trap.trap_risk >= 88:
             reasons.append(REJECT_REASON_HIGH_TRAP)
 
-        if state.market_state == "RANGE" and movement.readiness_score < 68 and prediction.movement_probability < 70:
+        # Hard reject only obvious dead/no-quality cases. Borderline range/late cases
+        # should usually become GHOST so the bot can learn instead of going silent.
+        if (
+            state.market_state == "RANGE"
+            and movement.readiness_score < 42
+            and prediction.movement_probability < 48
+            and movement.freshness in {"DEAD", "UNKNOWN", "LATE"}
+        ):
             reasons.append(REJECT_REASON_RANGE)
 
-        if state.market_state in {"EXHAUSTION", "LATE"} and prediction.predicted_phase not in {"PRE_START", "START"}:
+        if (
+            state.market_state in {"EXHAUSTION", "LATE"}
+            and prediction.predicted_phase not in {"PRE_START", "START"}
+            and movement.freshness == "DEAD"
+            and prediction.movement_probability < 50
+        ):
             reasons.append(REJECT_REASON_EXHAUSTED)
 
-        if confidence.confidence_score < 28 and prediction.movement_probability < 55:
+        if confidence.confidence_score < 18 and prediction.movement_probability < 42 and movement.readiness_score < 38:
             reasons.append(REJECT_REASON_LOW_CONFIDENCE)
 
-        if prediction.movement_probability < 32 and movement.readiness_score < 35:
+        if prediction.movement_probability < 25 and movement.readiness_score < 28:
             reasons.append(REJECT_REASON_LOW_MOVEMENT)
 
         if correlation.should_block_if_risk_high and correlation.exposure_risk >= 85:
@@ -364,9 +376,13 @@ class DecisionTypeClassifier:
         reasons: List[str] = []
         warnings: List[str] = []
 
-        min_real = safe_float(getattr(SETTINGS.ai, "min_real_confidence", 78.0), 78.0)
-        min_ghost = safe_float(getattr(SETTINGS.ai, "min_ghost_confidence", 55.0), 55.0)
-        max_real_risk = safe_float(getattr(SETTINGS.ai, "max_real_risk", 35.0), 35.0)
+        # Balanced thresholds for Movement Hunter scalping:
+        # REAL remains selective, while GHOST is allowed for learnable borderline setups.
+        configured_min_real = safe_float(getattr(SETTINGS.ai, "min_real_confidence", 72.0), 72.0)
+        configured_min_ghost = safe_float(getattr(SETTINGS.ai, "min_ghost_confidence", 45.0), 45.0)
+        min_real = clamp(configured_min_real, 68.0, 76.0)
+        min_ghost = clamp(configured_min_ghost, 42.0, 55.0)
+        max_real_risk = safe_float(getattr(SETTINGS.ai, "max_real_risk", 38.0), 38.0)
 
         # Downgrade rules.
         must_ghost = False
@@ -389,13 +405,14 @@ class DecisionTypeClassifier:
             must_ghost = True
             reasons.append("RANGE_GHOST_ONLY")
 
+        real_conf_floor = max(52.0, min_real - 18.0)
         real_allowed = (
             score.final_score >= min_real
-            and confidence.confidence_score >= min_real
-            and prediction.movement_probability >= 62
+            and confidence.confidence_score >= real_conf_floor
+            and (prediction.movement_probability >= 56 or movement.readiness_score >= 66)
             and movement.freshness in {"FRESH", "MID"}
             and state.market_state not in {"RANGE", "EXHAUSTION", "LATE"}
-            and trap.trap_risk <= max_real_risk + 20
+            and trap.trap_risk <= max_real_risk + 18
             and correlation.exposure_risk < 75
             and not must_ghost
         )
@@ -408,6 +425,11 @@ class DecisionTypeClassifier:
             score.final_score >= min_ghost
             or prediction.movement_probability >= min_ghost
             or movement.readiness_score >= min_ghost
+            or (
+                movement.freshness in {"FRESH", "MID", "LATE"}
+                and prediction.predicted_phase not in {"UNKNOWN"}
+                and score.final_score >= max(34.0, min_ghost - 8.0)
+            )
         )
 
         if ghost_allowed:
