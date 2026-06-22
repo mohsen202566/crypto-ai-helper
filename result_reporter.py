@@ -249,16 +249,16 @@ class ResultReportFormatter:
 
         if event_type == EVENT_TP1:
             icon = GREEN_CHECK
-            title = "TP1 خورد"
+            title = "TP1 خورد ✅"
         elif event_type == EVENT_TP2:
             icon = GREEN_CHECK
-            title = "TP2 خورد"
+            title = "TP2 خورد ✅"
         elif event_type == EVENT_AI_EXIT:
             icon = GREEN_CHECK if event.realized_pnl_usdt >= 0 else WARNING
-            title = "خروج AI در سود" if event.realized_pnl_usdt >= 0 else "خروج AI"
+            title = "خروج AI در سود ✅" if event.realized_pnl_usdt >= 0 else "خروج AI ⚠️"
         elif event_type == EVENT_SL:
             icon = RED_CROSS
-            title = "Stop Loss خورد"
+            title = "Stop Loss خورد ❌"
         elif event_type == EVENT_CLOSED_UNKNOWN:
             icon = WARNING
             title = "پوزیشن بسته شد"
