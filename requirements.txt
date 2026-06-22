@@ -1,9 +1,15 @@
-python-telegram-bot==20.7
-ccxt
-pandas
-numpy
-ta
-requests
-python-dotenv
-python-dateutil
-pytz
+# 27 - requirements.txt
+# Movement Hunter crypto futures bot dependencies
+#
+# Runtime:
+# - Telegram bot
+# - HTTP API access
+# - numeric/data utilities
+# - timezone/date helpers
+
+python-telegram-bot==21.10
+requests==2.32.3
+pandas==2.2.3
+numpy==2.2.1
+python-dotenv==1.0.1
+aiohttp==3.11.11
