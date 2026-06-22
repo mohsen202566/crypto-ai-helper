@@ -169,6 +169,21 @@ def is_loss(result: str) -> bool:
     return str(result).upper() == RESULT_SL
 
 
+def is_closed_result(result: str) -> bool:
+    return str(result).upper() in {RESULT_TP1, RESULT_TP2, RESULT_AI_EXIT, RESULT_SL}
+
+
+def result_key(event: "StatEvent") -> str:
+    """Stable id used to avoid double-counting the same close event."""
+    if event.ghost_id and is_closed_result(event.result):
+        return f"GHOST:{event.ghost_id}:{event.result}"
+    if event.position_id and is_closed_result(event.result):
+        return f"REAL:{event.position_id}:{event.result}"
+    if event.decision_id and event.result in {RESULT_OPEN, RESULT_REJECT}:
+        return f"DECISION:{event.decision_id}:{event.result}"
+    return event.stat_id
+
+
 class StatEventBuilder:
     """Builds StatEvent records from decisions and monitor results."""
 
@@ -226,17 +241,34 @@ class StatEventBuilder:
         )
 
     def from_ghost_result(self, result: GhostMonitorResult) -> StatEvent:
+        result_dict = result.to_dict() if hasattr(result, "to_dict") and callable(result.to_dict) else {}
+        outcome = str(getattr(result, "result", "") or result_dict.get("result") or RESULT_UNKNOWN).upper()
+        direction = normalize_direction(getattr(result, "direction", "") or result_dict.get("direction", ""))
+        symbol = normalize_symbol(getattr(result, "symbol", "") or result_dict.get("symbol", ""))
+        ghost_id = str(getattr(result, "ghost_id", "") or result_dict.get("ghost_id", ""))
+
+        if outcome in {RESULT_TP1, RESULT_TP2, RESULT_AI_EXIT}:
+            pnl_percent = safe_float(getattr(result, "mfe_percent", result_dict.get("mfe_percent", 0.0)))
+        elif outcome == RESULT_SL:
+            pnl_percent = -abs(safe_float(getattr(result, "mae_percent", result_dict.get("mae_percent", 0.0))))
+        else:
+            pnl_percent = 0.0
+
         return StatEvent(
             stat_id=f"stat_{uuid4().hex}",
-            timestamp=now_ts(),
+            timestamp=safe_int(result_dict.get("closed_at", result_dict.get("timestamp", now_ts())), now_ts()),
             source_type=SOURCE_GHOST,
-            symbol=normalize_symbol(result.symbol),
-            direction=normalize_direction(result.direction),
-            result=str(result.result or RESULT_UNKNOWN).upper(),
-            ghost_id=result.ghost_id,
-            realized_pnl_percent=safe_float(result.mfe_percent if result.result in {RESULT_TP1, RESULT_TP2} else -result.mae_percent),
+            symbol=symbol,
+            direction=direction,
+            result=outcome,
+            ghost_id=ghost_id,
+            market_state=str(result_dict.get("market_state", result_dict.get("state", "UNKNOWN"))),
+            freshness=str(result_dict.get("freshness", "UNKNOWN")),
+            predicted_phase=str(result_dict.get("predicted_phase", result_dict.get("phase", "UNKNOWN"))),
+            trap_level=str(result_dict.get("trap_level", "UNKNOWN")),
+            realized_pnl_percent=pnl_percent,
             pnl_confirmed=False,
-            meta={"ghost_result": result.to_dict()},
+            meta={"ghost_result": result_dict},
         )
 
 
@@ -244,6 +276,19 @@ class StatsStore:
     """Persistence adapter around data_store.py."""
 
     def save(self, event: StatEvent) -> None:
+        # Avoid double-counting if a monitor loop reports the same TP/SL more than once.
+        key = result_key(event)
+        try:
+            section = store().section("stats")
+            for existing in section.values():
+                try:
+                    old_event = self._coerce(existing)
+                    if result_key(old_event) == key:
+                        return
+                except Exception:
+                    continue
+        except Exception:
+            pass
         save_stat_event(event.stat_id, event.to_dict())
 
     def load_all(self) -> List[StatEvent]:
@@ -277,27 +322,35 @@ class StatsStore:
         if not isinstance(item, dict):
             item = {}
 
+        meta = dict(item.get("meta", {}) if isinstance(item.get("meta", {}), dict) else {})
+        ghost_meta = meta.get("ghost_result", {}) if isinstance(meta.get("ghost_result", {}), dict) else {}
+        event_meta = meta.get("event", {}) if isinstance(meta.get("event", {}), dict) else {}
+
+        symbol = item.get("symbol") or ghost_meta.get("symbol") or event_meta.get("symbol") or ""
+        direction = item.get("direction") or ghost_meta.get("direction") or event_meta.get("direction") or ""
+        result = item.get("result") or ghost_meta.get("result") or event_meta.get("event_type") or RESULT_UNKNOWN
+
         return StatEvent(
             stat_id=str(item.get("stat_id", item.get("id", f"stat_{uuid4().hex}"))),
-            timestamp=safe_int(item.get("timestamp", now_ts())),
+            timestamp=safe_int(item.get("timestamp", ghost_meta.get("closed_at", now_ts()))),
             source_type=str(item.get("source_type", SOURCE_REAL)).upper(),
-            symbol=normalize_symbol(item.get("symbol", "")),
-            direction=normalize_direction(item.get("direction", "")),
-            result=str(item.get("result", RESULT_UNKNOWN)).upper(),
-            decision_id=str(item.get("decision_id", "")),
-            position_id=str(item.get("position_id", "")),
-            ghost_id=str(item.get("ghost_id", "")),
-            market_state=str(item.get("market_state", "UNKNOWN")),
-            freshness=str(item.get("freshness", "UNKNOWN")),
-            predicted_phase=str(item.get("predicted_phase", "UNKNOWN")),
-            trap_level=str(item.get("trap_level", "UNKNOWN")),
-            ai_score=safe_float(item.get("ai_score")),
-            confidence_score=safe_float(item.get("confidence_score")),
-            risk_score=safe_float(item.get("risk_score")),
+            symbol=normalize_symbol(symbol),
+            direction=normalize_direction(direction),
+            result=str(result).upper(),
+            decision_id=str(item.get("decision_id", ghost_meta.get("decision_id", ""))),
+            position_id=str(item.get("position_id", event_meta.get("position_id", ""))),
+            ghost_id=str(item.get("ghost_id", ghost_meta.get("ghost_id", ""))),
+            market_state=str(item.get("market_state", ghost_meta.get("market_state", "UNKNOWN"))),
+            freshness=str(item.get("freshness", ghost_meta.get("freshness", "UNKNOWN"))),
+            predicted_phase=str(item.get("predicted_phase", ghost_meta.get("predicted_phase", "UNKNOWN"))),
+            trap_level=str(item.get("trap_level", ghost_meta.get("trap_level", "UNKNOWN"))),
+            ai_score=safe_float(item.get("ai_score", ghost_meta.get("ai_score", 0.0))),
+            confidence_score=safe_float(item.get("confidence_score", ghost_meta.get("confidence_score", 0.0))),
+            risk_score=safe_float(item.get("risk_score", ghost_meta.get("risk_score", 0.0))),
             realized_pnl_usdt=safe_float(item.get("realized_pnl_usdt")),
             realized_pnl_percent=safe_float(item.get("realized_pnl_percent")),
             pnl_confirmed=bool(item.get("pnl_confirmed", False)),
-            meta=dict(item.get("meta", {}) if isinstance(item.get("meta", {}), dict) else {}),
+            meta=meta,
         )
 
 
@@ -327,7 +380,7 @@ class StatsAggregator:
         wr = wins / closed * 100.0 if closed else 0.0
 
         confirmed_pnl = sum(e.realized_pnl_usdt for e in filtered if e.pnl_confirmed)
-        pnl_events = [e.realized_pnl_percent for e in filtered if e.result in {RESULT_TP1, RESULT_TP2, RESULT_AI_EXIT, RESULT_SL}]
+        pnl_events = [e.realized_pnl_percent for e in filtered if is_closed_result(e.result)]
         avg_pnl = sum(pnl_events) / len(pnl_events) if pnl_events else 0.0
 
         best_symbol, worst_symbol = self._best_worst_symbol(filtered)
@@ -362,7 +415,7 @@ class StatsAggregator:
         )
 
     def _direction_wr(self, events: Sequence[StatEvent], direction: str) -> float:
-        items = [e for e in events if e.direction == direction and e.result in {RESULT_TP1, RESULT_TP2, RESULT_AI_EXIT, RESULT_SL}]
+        items = [e for e in events if e.direction == direction and is_closed_result(e.result)]
         if not items:
             return 0.0
         wins = sum(1 for e in items if is_win(e.result))
@@ -371,7 +424,7 @@ class StatsAggregator:
     def _best_worst_symbol(self, events: Sequence[StatEvent]) -> Tuple[str, str]:
         by_symbol: Dict[str, List[StatEvent]] = {}
         for e in events:
-            if e.result in {RESULT_TP1, RESULT_TP2, RESULT_AI_EXIT, RESULT_SL}:
+            if is_closed_result(e.result):
                 by_symbol.setdefault(e.symbol, []).append(e)
 
         scored: List[Tuple[str, float, int]] = []
