@@ -355,9 +355,15 @@ class PositionEventDetector:
 
 
 class RealPnLResolver:
-    """Waits/retries Toobit closed-position PnL; never treats 0 as confirmed by default."""
+    """Fast Toobit closed-position PnL check.
 
-    def resolve(self, client: Any, symbol: str, start_time_ms: Optional[int] = None, attempts: int = 10, sleep_seconds: float = 5.0) -> Tuple[float, str, JsonDict]:
+    Result messages must not wait several minutes for Toobit history to update.
+    This resolver tries only briefly. If Toobit does not return confirmed PnL
+    immediately, position_monitor.py sends the TP/SL/AI_EXIT panel right away
+    with an estimated PnL and PNL_UNAVAILABLE status.
+    """
+
+    def resolve(self, client: Any, symbol: str, start_time_ms: Optional[int] = None, attempts: int = 2, sleep_seconds: float = 0.25) -> Tuple[float, str, JsonDict]:
         last: JsonDict = {}
         for _ in range(max(1, attempts)):
             try:
@@ -379,7 +385,8 @@ class RealPnLResolver:
                     return pnl, PNL_CONFIRMED, result
             except Exception as exc:
                 last = {"error": str(exc)}
-            time.sleep(sleep_seconds)
+            if sleep_seconds > 0:
+                time.sleep(sleep_seconds)
         return 0.0, PNL_UNAVAILABLE, last
 
 
@@ -608,7 +615,7 @@ market-close responses while still catching clear failures.
                     original_qty = safe_float(updated.quantity)
                     close_qty = max(0.0, original_qty * TP1_STRONG_CLOSE_FRACTION)
                     runner_qty = max(0.0, original_qty - close_qty)
-                    close_raw = self._close_position(updated, quantity=close_qty)
+                    close_raw = self._close_position_verified(updated, quantity=close_qty)
                     if not self._close_order_ok(close_raw):
                         save_error("position_monitor_tp1_partial_close_failed", str(close_raw), updated.to_dict())
                         events.append(self._event(
@@ -656,7 +663,7 @@ market-close responses while still catching clear failures.
                         raw={"partial_close": close_raw, "closed_quantity": close_qty, "runner_quantity": runner_qty, "protected_sl": protected_sl},
                     ))
                 else:
-                    close_raw = self._close_position(updated, quantity=updated.quantity)
+                    close_raw = self._close_position_verified(updated, quantity=updated.quantity)
                     if not self._close_order_ok(close_raw):
                         save_error("position_monitor_tp1_full_close_failed", str(close_raw), updated.to_dict())
                         events.append(self._event(
@@ -714,27 +721,56 @@ market-close responses while still catching clear failures.
             if exit_decision.should_move_sl_to_protect and exit_decision.protected_sl > 0:
                 self._repair_protected_sl(updated, exit_decision.protected_sl)
                 events.append(self._event(updated, EVENT_PROTECT_SL, updated.current_price, reason_codes=exit_decision.reason_codes, warnings=exit_decision.warnings, should_report=False))
-            if exit_decision.should_close:
-                close_raw = self._close_position(updated)
-                if not self._close_order_ok(close_raw):
-                    save_error("position_monitor_ai_exit_close_failed", str(close_raw), updated.to_dict())
+
+            in_profit = safe_float(updated.unrealized_pnl_usdt) > 0 or pnl_percent(updated.direction, updated.entry, updated.current_price) > 0
+            ai_profit_exit, ai_profit_reasons, ai_profit_warnings = self._ai_weakness_or_reversal_seen(
+                updated,
+                snapshot=snapshot,
+                movement=movement,
+                trap=trap,
+                state=state,
+                exit_decision=exit_decision,
+            )
+
+            if in_profit and ai_profit_exit:
+                close_raw = self._close_position_verified(updated)
+                if not self._close_order_ok(close_raw) or close_raw.get("closed_confirmed") is False:
+                    save_error("position_monitor_ai_profit_exit_close_failed", str(close_raw), updated.to_dict())
                     events.append(self._event(
                         updated,
                         EVENT_AI_EXIT,
                         updated.current_price,
-                        reason_codes=exit_decision.reason_codes,
-                        warnings=tuple(list(exit_decision.warnings) + ["AI_EXIT_NOT_MARKED_BECAUSE_CLOSE_FAILED"]),
+                        reason_codes=ai_profit_reasons,
+                        warnings=tuple(list(ai_profit_warnings) + ["AI_PROFIT_EXIT_NOT_MARKED_BECAUSE_CLOSE_NOT_CONFIRMED"]),
                         raw={"close": close_raw},
                         should_report=False,
                     ))
                     save_position(updated.position_id, updated.to_dict())
                     return events
+
                 closed = RealPositionState(**{**updated.to_dict(), "ai_exit_hit": True, "status": POSITION_CLOSED, "close_time": now_ts()})
                 pnl, pnl_status, pnl_raw = self._resolve_closed_pnl(closed)
-                closed = RealPositionState(**{**closed.to_dict(), "realized_pnl_usdt": pnl, "realized_pnl_percent": pnl_percent(closed.direction, closed.entry, closed.current_price), "pnl_status": pnl_status})
+                if pnl_status != PNL_CONFIRMED:
+                    pnl = self._estimate_pnl_usdt(closed, closed.current_price, 1.0)
+                closed = RealPositionState(**{
+                    **closed.to_dict(),
+                    "realized_pnl_usdt": pnl,
+                    "realized_pnl_percent": pnl_percent(closed.direction, closed.entry, closed.current_price),
+                    "pnl_status": pnl_status,
+                })
                 self._learn_real_outcome(closed, EVENT_AI_EXIT, closed.current_price, snapshot, movement, trap, state, pnl, closed.realized_pnl_percent)
                 save_position(closed.position_id, closed.to_dict())
-                events.append(self._event(closed, EVENT_AI_EXIT, closed.current_price, pnl, closed.realized_pnl_percent, pnl_status, exit_decision.reason_codes, exit_decision.warnings, raw={"close": close_raw, "pnl": pnl_raw}))
+                events.append(self._event(
+                    closed,
+                    EVENT_AI_EXIT,
+                    closed.current_price,
+                    pnl,
+                    closed.realized_pnl_percent,
+                    pnl_status,
+                    tuple(list(ai_profit_reasons) + ["AI_PROFIT_EXIT_ANY_PROFIT"]),
+                    ai_profit_warnings,
+                    raw={"close": close_raw, "pnl": pnl_raw},
+                ))
 
         save_position(updated.position_id, updated.to_dict())
         return events
@@ -919,6 +955,235 @@ market-close responses while still catching clear failures.
             pass
 
 
+
+    def _object_to_dict(self, value: Any) -> JsonDict:
+        """Best-effort conversion for AI/analysis objects used by profit-exit checks."""
+        try:
+            if value is None:
+                return {}
+            if isinstance(value, dict):
+                return value
+            if hasattr(value, "to_dict") and callable(value.to_dict):
+                data = value.to_dict()
+                return data if isinstance(data, dict) else {"value": data}
+            if hasattr(value, "__dict__"):
+                return dict(value.__dict__)
+        except Exception:
+            pass
+        return {"value": str(value)}
+
+    def _flatten_text_values(self, value: Any) -> List[str]:
+        out: List[str] = []
+        try:
+            if value is None:
+                return out
+            if isinstance(value, dict):
+                for k, v in value.items():
+                    out.append(str(k).upper())
+                    out.extend(self._flatten_text_values(v))
+            elif isinstance(value, (list, tuple, set)):
+                for item in value:
+                    out.extend(self._flatten_text_values(item))
+            else:
+                out.append(str(value).upper())
+        except Exception:
+            pass
+        return out
+
+    def _opposite_direction_seen(self, pos: RealPositionState, *objects: Any) -> bool:
+        """Detect when current AI/context direction no longer agrees with the open position."""
+        wanted_opposite = DIRECTION_SHORT if normalize_direction(pos.direction) == DIRECTION_LONG else DIRECTION_LONG
+        direction_keys = {
+            "direction", "predicted_direction", "prediction_direction", "movement_direction",
+            "trend_direction", "state_direction", "recommended_direction", "signal_direction",
+            "final_direction", "bias", "side",
+        }
+        for obj in objects:
+            data = self._object_to_dict(obj)
+            stack: List[Any] = [data]
+            while stack:
+                item = stack.pop()
+                if isinstance(item, dict):
+                    for k, v in item.items():
+                        key = str(k).lower()
+                        if key in direction_keys or key.endswith("_direction"):
+                            if normalize_direction(str(v)) == wanted_opposite:
+                                return True
+                        if isinstance(v, (dict, list, tuple, set)):
+                            stack.append(v)
+                elif isinstance(item, (list, tuple, set)):
+                    stack.extend(list(item))
+        return False
+
+    def _ai_weakness_or_reversal_seen(
+        self,
+        pos: RealPositionState,
+        snapshot: Optional[SensorSnapshot],
+        movement: Optional[MovementHunterResult],
+        trap: Optional[TrapResult],
+        state: Optional[StateResult],
+        exit_decision: Optional[ExitDecision] = None,
+    ) -> Tuple[bool, Tuple[str, ...], Tuple[str, ...]]:
+        """
+        AI Profit Exit rule requested by user:
+        - Do NOT require a fixed profit-percent threshold.
+        - If the position is in profit by any amount and AI/current sensors show
+          continuation weakness, trend flip, reversal, trap, or market turn,
+          close the position to protect profit.
+
+        This is intentionally generic so it keeps working even when AI result
+        dataclasses evolve.
+        """
+        reason_codes: List[str] = []
+        warnings: List[str] = []
+
+        if exit_decision and exit_decision.should_close:
+            reason_codes.extend(list(exit_decision.reason_codes or ()))
+            warnings.extend(list(exit_decision.warnings or ()))
+            reason_codes.append("EXIT_ENGINE_CLOSE_SIGNAL")
+            return True, tuple(dict.fromkeys(reason_codes)), tuple(dict.fromkeys(warnings))
+
+        if self._opposite_direction_seen(pos, movement, trap, state):
+            reason_codes.append("AI_DIRECTION_FLIPPED_AGAINST_POSITION")
+
+        texts = " ".join(self._flatten_text_values({
+            "movement": self._object_to_dict(movement),
+            "trap": self._object_to_dict(trap),
+            "state": self._object_to_dict(state),
+            "snapshot": self._object_to_dict(snapshot),
+        }))
+
+        weak_terms = (
+            "WEAK", "WEAKNESS", "MOMENTUM_WEAK", "CONTINUATION_WEAK",
+            "CONTINUATION_FAILED", "FAILED_CONTINUATION", "EXHAUST", "EXHAUSTION",
+            "REVERSAL", "REVERSE", "TURN", "TURNING", "FLIP", "CHANGED",
+            "RANGE", "RANGING", "CHOP", "NEUTRAL", "LOSS_OF_MOMENTUM",
+            "MOMENTUM_LOSS", "MARKET_REVERSED", "TREND_CHANGED",
+            "BEARISH_TO_BULLISH", "BULLISH_TO_BEARISH",
+        )
+        trap_terms = (
+            "TRAP_HIGH", "HIGH_TRAP", "TRAP_RISK_HIGH", "LIQUIDITY_GRAB",
+            "STOP_HUNT", "FAKE_BREAK", "FAILED_BREAKOUT", "FAILED_BREAKDOWN",
+        )
+
+        if any(term in texts for term in weak_terms):
+            reason_codes.append("AI_CONTINUATION_WEAKNESS_DETECTED")
+        if any(term in texts for term in trap_terms):
+            reason_codes.append("AI_TRAP_OR_LIQUIDITY_RISK_DETECTED")
+
+        should_close = bool(reason_codes)
+        if should_close:
+            warnings.append("AI_PROFIT_EXIT_ANY_PROFIT_NO_PERCENT_THRESHOLD")
+        return should_close, tuple(dict.fromkeys(reason_codes)), tuple(dict.fromkeys(warnings))
+
+    def _is_position_still_open(self, pos: RealPositionState) -> bool:
+        """Verify whether the same symbol/direction is still open on Toobit.
+
+        This is the API equivalent of the app's final "Confirm" step after a
+        close request: after sending BUY_CLOSE/SELL_CLOSE, we read real open
+        positions again. Only when the same symbol + direction disappears do we
+        treat the close as confirmed.
+        """
+        try:
+            try:
+                # Prefer symbol-filtered read when the client supports it.
+                positions = _call_optional(self.client, ["get_open_positions", "fetch_open_positions"], pos.exchange_symbol)
+            except TypeError:
+                positions = _call_optional(self.client, ["get_open_positions", "fetch_open_positions"])
+            if hasattr(positions, "to_dict") and callable(positions.to_dict):
+                positions = positions.to_dict()
+            if isinstance(positions, dict):
+                positions = positions.get("positions", positions.get("data", []))
+            if not isinstance(positions, list):
+                # Unknown verification must not be treated as confirmed-closed.
+                return True
+
+            target_direction = normalize_direction(pos.direction)
+            for item in positions:
+                if not isinstance(item, dict):
+                    continue
+                qty = safe_float(item.get("quantity", item.get("qty", item.get("positionAmt", item.get("size", 0.0)))))
+                if qty <= 0:
+                    continue
+                item_symbol = str(item.get("symbol", item.get("exchange_symbol", item.get("contract", item.get("contractCode", item.get("instId", ""))))))
+                item_dir = normalize_direction(str(item.get("direction", item.get("side", item.get("positionSide", item.get("holdSide", ""))))))
+                if item_dir not in {DIRECTION_LONG, DIRECTION_SHORT}:
+                    raw_side = str(item.get("raw", item)).upper()
+                    if "SHORT" in raw_side or "SELL" in raw_side or "空" in raw_side:
+                        item_dir = DIRECTION_SHORT
+                    elif "LONG" in raw_side or "BUY" in raw_side or "多" in raw_side:
+                        item_dir = DIRECTION_LONG
+
+                if (
+                    (symbol_match(item_symbol, pos.exchange_symbol) or symbol_match(item_symbol, pos.symbol))
+                    and item_dir == target_direction
+                ):
+                    return True
+        except Exception as exc:
+            save_error("position_monitor_close_verify_failed", str(exc), pos.to_dict())
+            # Unknown verification should not be treated as confirmed-closed.
+            return True
+        return False
+
+    def _close_position_verified(self, pos: RealPositionState, quantity: Optional[float] = None, attempts: int = 5) -> JsonDict:
+        """
+        Send the close order, then confirm full-position closure.
+
+        There is no separate UI-style confirmation button in API trading. The
+        required confirmation is:
+        1) send BUY_CLOSE for SHORT or SELL_CLOSE for LONG,
+        2) wait briefly,
+        3) read real open positions from Toobit,
+        4) retry if the same symbol/direction is still open,
+        5) return closed_confirmed=True only after it disappears.
+
+        For partial TP1 closes, the position is expected to remain open, so full
+        disappearance confirmation is intentionally skipped.
+        """
+        qty = safe_float(quantity, pos.quantity)
+        if qty <= 0:
+            qty = safe_float(pos.quantity)
+        full_close = qty <= 0 or pos.quantity <= 0 or qty >= pos.quantity * 0.999
+        last: JsonDict = {}
+
+        for attempt in range(1, max(1, attempts) + 1):
+            raw = self._close_position(pos, quantity=qty)
+            last = raw if isinstance(raw, dict) else {"raw": raw}
+            last["close_attempt"] = attempt
+            last["requested_close_quantity"] = qty
+            last["full_close_requested"] = full_close
+
+            if not self._close_order_ok(last):
+                last["closed_confirmed"] = False
+                last["verification_reason"] = "close_order_api_rejected_or_failed"
+                time.sleep(1.2)
+                continue
+
+            if not full_close:
+                last["verified"] = False
+                last["closed_confirmed"] = None
+                last["verification_reason"] = "partial_close_no_full_position_disappearance_expected"
+                return last
+
+            # Give Toobit a moment to apply the market close before checking.
+            time.sleep(1.5)
+            if not self._is_position_still_open(pos):
+                last["verified"] = True
+                last["closed_confirmed"] = True
+                last["verification_reason"] = "position_disappeared_from_open_positions"
+                return last
+
+            last["verified"] = False
+            last["closed_confirmed"] = False
+            last["verification_reason"] = "position_still_open_after_close_order"
+            time.sleep(1.5)
+
+        # Never allow callers to mistake an unverified close for a confirmed one.
+        last.setdefault("closed_confirmed", False)
+        last.setdefault("verified", False)
+        return last
+
+
     def _to_exit_context(self, pos: RealPositionState) -> PositionContext:
         return PositionContext(
             position_id=pos.position_id,
@@ -959,13 +1224,19 @@ market-close responses while still catching clear failures.
             return {"error": str(exc)}
 
     def _resolve_closed_pnl(self, pos: RealPositionState) -> Tuple[float, str, JsonDict]:
+        """Resolve real PnL quickly so Telegram result panel is not delayed.
+
+        Toobit realized-PnL history can appear late. We intentionally avoid the
+        old 10 x 5s blocking wait here. If PnL is not ready, callers already
+        fall back to estimated PnL and mark pnl_status as UNAVAILABLE/PENDING.
+        """
         start_ms = pos.open_time * 1000 if pos.open_time and pos.open_time < 10_000_000_000 else pos.open_time
         return self.pnl_resolver.resolve(
             self.client,
             pos.exchange_symbol,
             start_time_ms=start_ms,
-            attempts=10,
-            sleep_seconds=5.0,
+            attempts=2,
+            sleep_seconds=0.25,
         )
 
     def _event(
