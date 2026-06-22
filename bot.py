@@ -84,29 +84,58 @@ PERSIAN_FALSE = {"خاموش", "غیرفعال", "off", "OFF", "false", "False"}
 # Persian / common aliases for direct asset commands.
 # Keep this local fallback even when symbol_mapper.py is limited on VPS.
 PERSIAN_SYMBOL_ALIASES = {
-    "بیتکوین": "BTCUSDT", "بیت کوین": "BTCUSDT", "بیت": "BTCUSDT", "btc": "BTCUSDT",
-    "اتریوم": "ETHUSDT", "اتر": "ETHUSDT", "eth": "ETHUSDT",
-    "سولانا": "SOLUSDT", "سول": "SOLUSDT", "sol": "SOLUSDT",
-    "دوج": "DOGEUSDT", "دوج کوین": "DOGEUSDT", "doge": "DOGEUSDT",
-    "ریپل": "XRPUSDT", "xrp": "XRPUSDT",
-    "کاردانو": "ADAUSDT", "ادا": "ADAUSDT", "ada": "ADAUSDT",
-    "بایننس": "BNBUSDT", "بی ان بی": "BNBUSDT", "bnb": "BNBUSDT",
-    "تون": "TONUSDT", "ton": "TONUSDT",
-    "ترون": "TRXUSDT", "trx": "TRXUSDT",
-    "لینک": "LINKUSDT", "چین لینک": "LINKUSDT", "link": "LINKUSDT",
-    "آوالانچ": "AVAXUSDT", "اواکس": "AVAXUSDT", "avax": "AVAXUSDT",
-    "پالیگان": "MATICUSDT", "متیک": "MATICUSDT", "matic": "MATICUSDT",
-    "شیبا": "SHIBUSDT", "shib": "SHIBUSDT",
-    "پپه": "PEPEUSDT", "pepe": "PEPEUSDT",
-    "بونک": "BONKUSDT", "bonk": "BONKUSDT",
-    "فلوکی": "FLOKIUSDT", "floki": "FLOKIUSDT",
-    "لایت کوین": "LTCUSDT", "لایت": "LTCUSDT", "ltc": "LTCUSDT",
-    "بیت کوین کش": "BCHUSDT", "bch": "BCHUSDT",
-    "اپتوس": "APTUSDT", "apt": "APTUSDT",
-    "آربیتروم": "ARBUSDT", "arb": "ARBUSDT",
-    "آپتیمیزم": "OPUSDT", "op": "OPUSDT",
-    "نیر": "NEARUSDT", "near": "NEARUSDT",
-    "فانتوم": "FTMUSDT", "ftm": "FTMUSDT",
+    # Majors
+    "بیتکوین": "BTCUSDT", "بیت کوین": "BTCUSDT", "بیتکوین کش نه": "BTCUSDT", "بیت": "BTCUSDT", "btc": "BTCUSDT", "bitcoin": "BTCUSDT",
+    "اتریوم": "ETHUSDT", "اتر": "ETHUSDT", "eth": "ETHUSDT", "ethereum": "ETHUSDT",
+    "سولانا": "SOLUSDT", "سول": "SOLUSDT", "sol": "SOLUSDT", "solana": "SOLUSDT",
+
+    # Meme / high-volume coins
+    "دوج": "DOGEUSDT", "دوج کوین": "DOGEUSDT", "داج": "DOGEUSDT", "داج کوین": "DOGEUSDT", "داگ": "DOGEUSDT", "dog": "DOGEUSDT", "doge": "DOGEUSDT", "dogecoin": "DOGEUSDT",
+    "شیبا": "SHIBUSDT", "شیب": "SHIBUSDT", "شیبا اینو": "SHIBUSDT", "shib": "SHIBUSDT", "shiba": "SHIBUSDT",
+    "پپه": "PEPEUSDT", "پپه کوین": "PEPEUSDT", "pepe": "PEPEUSDT",
+    "بونک": "BONKUSDT", "بونک کوین": "BONKUSDT", "bonk": "BONKUSDT",
+    "فلوکی": "FLOKIUSDT", "فلوکی کوین": "FLOKIUSDT", "floki": "FLOKIUSDT",
+
+    # Large caps / common Persian aliases
+    "ریپل": "XRPUSDT", "ایکس آر پی": "XRPUSDT", "ایکس ار پی": "XRPUSDT", "xrp": "XRPUSDT", "ripple": "XRPUSDT",
+    "کاردانو": "ADAUSDT", "ادا": "ADAUSDT", "آدا": "ADAUSDT", "ada": "ADAUSDT", "cardano": "ADAUSDT",
+    "بایننس": "BNBUSDT", "بایننس کوین": "BNBUSDT", "بی ان بی": "BNBUSDT", "بی‌ان‌بی": "BNBUSDT", "bnb": "BNBUSDT",
+    "تون": "TONUSDT", "تون کوین": "TONUSDT", "ton": "TONUSDT", "toncoin": "TONUSDT",
+    "ترون": "TRXUSDT", "ترونیکس": "TRXUSDT", "trx": "TRXUSDT", "tron": "TRXUSDT",
+    "لینک": "LINKUSDT", "چین لینک": "LINKUSDT", "چینلینک": "LINKUSDT", "link": "LINKUSDT", "chainlink": "LINKUSDT",
+    "آوالانچ": "AVAXUSDT", "اوالانچ": "AVAXUSDT", "اواکس": "AVAXUSDT", "آواکس": "AVAXUSDT", "avax": "AVAXUSDT", "avalanche": "AVAXUSDT",
+    "پالیگان": "MATICUSDT", "متیک": "MATICUSDT", "matic": "MATICUSDT", "polygon": "MATICUSDT",
+    "لایت کوین": "LTCUSDT", "لایت": "LTCUSDT", "ltc": "LTCUSDT", "litecoin": "LTCUSDT",
+    "بیت کوین کش": "BCHUSDT", "بیتکوین کش": "BCHUSDT", "bch": "BCHUSDT", "bitcoin cash": "BCHUSDT",
+    "اپتوس": "APTUSDT", "apt": "APTUSDT", "aptos": "APTUSDT",
+    "آربیتروم": "ARBUSDT", "ارب": "ARBUSDT", "آرب": "ARBUSDT", "arb": "ARBUSDT", "arbitrum": "ARBUSDT",
+    "آپتیمیزم": "OPUSDT", "اپتیمیزم": "OPUSDT", "اپتیمیسم": "OPUSDT", "op": "OPUSDT", "optimism": "OPUSDT",
+    "نیر": "NEARUSDT", "نیر پروتکل": "NEARUSDT", "near": "NEARUSDT",
+    "فانتوم": "FTMUSDT", "ftm": "FTMUSDT", "fantom": "FTMUSDT",
+
+    # Other common futures symbols
+    "پولکادات": "DOTUSDT", "دات": "DOTUSDT", "dot": "DOTUSDT",
+    "یونی": "UNIUSDT", "یونی سواپ": "UNIUSDT", "uni": "UNIUSDT",
+    "آوه": "AAVEUSDT", "اوه": "AAVEUSDT", "aave": "AAVEUSDT",
+    "اتم": "ATOMUSDT", "کازموس": "ATOMUSDT", "atom": "ATOMUSDT", "cosmos": "ATOMUSDT",
+    "اینترنت کامپیوتر": "ICPUSDT", "آی سی پی": "ICPUSDT", "icp": "ICPUSDT",
+    "رندر": "RNDRUSDT", "render": "RNDRUSDT", "rndr": "RNDRUSDT",
+    "فایل کوین": "FILUSDT", "فایل": "FILUSDT", "fil": "FILUSDT",
+    "اینجکتیو": "INJUSDT", "inj": "INJUSDT",
+    "سویی": "SUIUSDT", "سوئی": "SUIUSDT", "sui": "SUIUSDT",
+    "سی": "SEIUSDT", "sei": "SEIUSDT",
+    "استکس": "STXUSDT", "stx": "STXUSDT",
+    "ایپ": "APEUSDT", "ape": "APEUSDT",
+    "گالا": "GALAUSDT", "gala": "GALAUSDT",
+    "سند": "SANDUSDT", "سندباکس": "SANDUSDT", "sand": "SANDUSDT",
+    "مانا": "MANAUSDT", "mana": "MANAUSDT",
+    "اکسی": "AXSUSDT", "axs": "AXSUSDT",
+    "چلیز": "CHZUSDT", "chz": "CHZUSDT",
+    "ایاس": "EOSUSDT", "eos": "EOSUSDT",
+    "نات کوین": "NOTUSDT", "نات": "NOTUSDT", "not": "NOTUSDT",
+    "ونوم": "VENOMUSDT", "venom": "VENOMUSDT",
+
+    # Metals / synthetic symbols if configured in market_data
     "طلا": "XAUUSDT", "گلد": "XAUUSDT", "gold": "XAUUSDT", "xau": "XAUUSDT",
 }
 
@@ -260,7 +289,8 @@ def _normalize_symbol_safe(symbol: str) -> str:
     if not raw:
         return ""
     try:
-        normalized = normalize_symbol(raw)
+        from symbol_mapper import normalize_symbol as _normalize_symbol  # type: ignore
+        normalized = _normalize_symbol(raw)
         if normalized:
             raw = str(normalized).upper().replace("/", "").replace("-", "")
     except Exception:
@@ -284,10 +314,21 @@ def extract_symbol(text: str, default: str = "BTCUSDT") -> str:
         if asset_part.startswith(prefix):
             asset_part = asset_part[len(prefix):].strip()
 
-    # Longest alias first so "بیت کوین" wins before "بیت".
+    asset_part = asset_part.strip()
+
+    # Exact alias first so short aliases like "بیت" do not accidentally
+    # override longer names such as "بیتکوین کش".
     for alias in sorted(PERSIAN_SYMBOL_ALIASES, key=len, reverse=True):
-        if asset_part == alias or alias in asset_part:
+        if asset_part == alias:
             return PERSIAN_SYMBOL_ALIASES[alias]
+
+    # Then allow contained aliases only when the user wrote a command phrase
+    # like "تحلیل دوج" or "سیگنال بیت کوین".
+    if original.lower().strip().startswith(ASSET_COMMAND_PREFIXES):
+        padded = f" {asset_part} "
+        for alias in sorted(PERSIAN_SYMBOL_ALIASES, key=len, reverse=True):
+            if f" {alias} " in padded or alias in asset_part:
+                return PERSIAN_SYMBOL_ALIASES[alias]
 
     # If symbol_mapper.py on VPS exposes a richer resolver, use it safely.
     try:
