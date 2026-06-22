@@ -263,12 +263,15 @@ class RangeSuppressionEngine:
         elif snapshot.range_probability >= 45:
             reasons.append("MEDIUM_RANGE_PROBABILITY")
 
-        if snapshot.compression_score >= 70 and not snapshot.atr_explosion:
-            penalty = max(penalty, 75.0)
+        # Keep range as a risk factor, but do not let normal compression kill every scalp setup.
+        # Only strong compression without any ATR expansion should create a heavy range penalty.
+        if snapshot.compression_score >= 78 and not snapshot.atr_explosion and snapshot.atr_expansion != "EXPANDING":
+            penalty = max(penalty, 72.0)
             reasons.append("COMPRESSION_WITHOUT_EXPLOSION")
 
-        if snapshot.adx < 16 and snapshot.relative_volume < 0.9:
-            penalty = max(penalty, 70.0)
+        # Low ADX + low volume is a warning, not an automatic signal killer.
+        if snapshot.adx < 14 and snapshot.relative_volume < 0.75:
+            penalty = max(penalty, 62.0)
             reasons.append("WEAK_ADX_LOW_VOLUME_RANGE")
 
         return clamp(penalty), reasons
@@ -311,27 +314,38 @@ class MovementPhaseClassifier:
         readiness = score.total_score
         reversal_pressure = clamp(score.exhaustion_penalty + snapshot.stop_hunt_probability * 0.35)
 
-        if snapshot.range_probability >= 72 and readiness < 70:
-            reasons.append("PHASE_RANGE")
+        # Severe range: only mark DEAD when the setup has very weak readiness and no ATR expansion.
+        # Moderate range should stay alive as LATE/MID so AI can still learn via GHOST.
+        if snapshot.range_probability >= 82 and readiness < 35 and not snapshot.atr_explosion and snapshot.atr_expansion != "EXPANDING":
+            reasons.append("PHASE_RANGE_SEVERE")
             return PHASE_RANGE, FRESH_DEAD, reversal_pressure, reasons
 
-        if score.exhaustion_penalty >= 65:
-            reasons.append("PHASE_EXHAUSTION")
+        if snapshot.range_probability >= 72 and readiness < 50:
+            reasons.append("PHASE_RANGE_MODERATE")
+            return PHASE_RANGE, FRESH_LATE, reversal_pressure, reasons
+
+        # Exhaustion should be DEAD only when very strong. Normal weakness is LATE, not a hard kill.
+        if score.exhaustion_penalty >= 82:
+            reasons.append("PHASE_EXHAUSTION_SEVERE")
             return PHASE_EXHAUSTION, FRESH_DEAD, reversal_pressure, reasons
 
-        if readiness >= 75 and score.early_momentum >= 55:
+        if score.exhaustion_penalty >= 65:
+            reasons.append("PHASE_EXHAUSTION_MODERATE")
+            return PHASE_EXHAUSTION, FRESH_LATE, reversal_pressure, reasons
+
+        if readiness >= 72 and score.early_momentum >= 52:
             reasons.append("PHASE_START_EARLY")
             return PHASE_EARLY, FRESH_FRESH, reversal_pressure, reasons
 
-        if readiness >= 60 and score.early_momentum >= 40:
+        if readiness >= 55 and score.early_momentum >= 35:
             reasons.append("PHASE_START")
             return PHASE_START, FRESH_FRESH, reversal_pressure, reasons
 
-        if readiness >= 45:
+        if readiness >= 40:
             reasons.append("PHASE_MIDDLE")
             return PHASE_MIDDLE, FRESH_MID, reversal_pressure, reasons
 
-        if readiness >= 30:
+        if readiness >= 25:
             reasons.append("PHASE_LATE_LOW_READINESS")
             return PHASE_LATE, FRESH_LATE, reversal_pressure, reasons
 
@@ -395,7 +409,9 @@ class MovementHunter:
             + breakout_score * 0.20
         )
 
-        penalty = range_penalty * 0.35 + exhaustion_penalty * 0.45
+        # Balanced suppression: range/exhaustion reduce quality, but should not silence
+        # every early-movement candidate before AI can classify REAL/GHOST/REJECT.
+        penalty = range_penalty * 0.25 + exhaustion_penalty * 0.35
         total = clamp(raw_total - penalty)
 
         movement_score = MovementScore(
