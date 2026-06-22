@@ -34,7 +34,7 @@ from movement_hunter import MovementHunterResult
 from trap_engine import TrapResult
 from state_engine import StateResult
 from confidence_engine import ConfidenceResult
-from data_store import save_movement_memory, append_bounded, store
+from data_store import save_movement_memory, append_bounded, store, save_error
 from config import SETTINGS
 
 
@@ -627,7 +627,7 @@ class MovementMemoryEngine:
         )
         self.index.add(record)
         if persist:
-            append_bounded('movement_memory', record.movement_id, record.to_dict(), max_items=MAX_MOVEMENT_MEMORY_RECORDS, sort_key='created_at')
+            append_bounded('movement_memory', record.movement_id, record.to_dict(), max_items=MAX_MOVEMENT_MEMORY_RECORDS, sort_key='timestamp')
         return record
 
     def summarize_candidate(
@@ -644,10 +644,25 @@ class MovementMemoryEngine:
 _default_engine: Optional[MovementMemoryEngine] = None
 
 
+def _load_persisted_movement_records() -> List[Any]:
+    """Load persisted movement-memory records so summaries survive restarts."""
+    try:
+        return list(store().section("movement_memory").values())
+    except Exception as exc:
+        try:
+            save_error("movement_memory_load", str(exc), {})
+        except Exception:
+            pass
+        return []
+
+
 def engine(records: Optional[Iterable[Any]] = None) -> MovementMemoryEngine:
     global _default_engine
-    if _default_engine is None or records is not None:
-        _default_engine = MovementMemoryEngine(records=records)
+    if _default_engine is None:
+        _default_engine = MovementMemoryEngine(records=_load_persisted_movement_records())
+    elif records is not None:
+        existing = list(_default_engine.index.records)
+        _default_engine = MovementMemoryEngine(records=[*existing, *list(records)])
     return _default_engine
 
 
