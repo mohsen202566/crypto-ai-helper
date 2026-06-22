@@ -386,7 +386,7 @@ class DecisionTypeClassifier:
         configured_min_real = safe_float(getattr(SETTINGS.ai, "min_real_confidence", 72.0), 72.0)
         configured_min_ghost = safe_float(getattr(SETTINGS.ai, "min_ghost_confidence", 45.0), 45.0)
         min_real = clamp(configured_min_real, 68.0, 76.0)
-        min_ghost = clamp(configured_min_ghost, 42.0, 55.0)
+        min_ghost = clamp(configured_min_ghost, 32.0, 45.0)
         max_real_risk = safe_float(getattr(SETTINGS.ai, "max_real_risk", 38.0), 38.0)
 
         # Downgrade rules.
