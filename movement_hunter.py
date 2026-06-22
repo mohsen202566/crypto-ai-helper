@@ -138,17 +138,19 @@ class EarlyMomentumEngine:
         reasons: List[str] = []
 
         if direction == DIRECTION_LONG:
-            if snapshot.rsi_slope > 0.25:
-                score += 14
-                reasons.append("EARLY_RSI_SLOPE_UP")
-            if snapshot.rsi_acceleration > 0.10:
-                score += 8
-                reasons.append("EARLY_RSI_ACCEL_UP")
+            # Softer ultra-early thresholds: the bot must detect the first
+            # ignition signs before the pump is fully visible.
+            if snapshot.rsi_slope > 0.15:
+                score += 16
+                reasons.append("EARLY_RSI_SLOPE_UP_SOFT")
+            if snapshot.rsi_acceleration > 0.05:
+                score += 10
+                reasons.append("EARLY_RSI_ACCEL_UP_SOFT")
             if snapshot.histogram_slope > 0:
-                score += 14
+                score += 16
                 reasons.append("EARLY_HIST_SLOPE_UP")
             if snapshot.histogram_acceleration > 0:
-                score += 12
+                score += 14
                 reasons.append("EARLY_HIST_ACCEL_UP")
             if snapshot.vwap_state in {"RECLAIM", "ABOVE"}:
                 score += 10
@@ -161,17 +163,18 @@ class EarlyMomentumEngine:
                 reasons.append("BULL_CLOSE_QUALITY")
 
         elif direction == DIRECTION_SHORT:
-            if snapshot.rsi_slope < -0.25:
-                score += 14
-                reasons.append("EARLY_RSI_SLOPE_DOWN")
-            if snapshot.rsi_acceleration < -0.10:
-                score += 8
-                reasons.append("EARLY_RSI_ACCEL_DOWN")
+            # Softer ultra-early thresholds for dump hunting.
+            if snapshot.rsi_slope < -0.15:
+                score += 16
+                reasons.append("EARLY_RSI_SLOPE_DOWN_SOFT")
+            if snapshot.rsi_acceleration < -0.05:
+                score += 10
+                reasons.append("EARLY_RSI_ACCEL_DOWN_SOFT")
             if snapshot.histogram_slope < 0:
-                score += 14
+                score += 16
                 reasons.append("EARLY_HIST_SLOPE_DOWN")
             if snapshot.histogram_acceleration < 0:
-                score += 12
+                score += 14
                 reasons.append("EARLY_HIST_ACCEL_DOWN")
             if snapshot.vwap_state in {"LOSS", "BELOW"}:
                 score += 10
@@ -184,11 +187,17 @@ class EarlyMomentumEngine:
                 reasons.append("BEAR_CLOSE_QUALITY")
 
         if snapshot.volume_expansion:
-            score += 6
+            score += 8
             reasons.append("VOLUME_EXPANSION")
         if snapshot.volume_spike:
-            score += 6
+            score += 8
             reasons.append("VOLUME_SPIKE")
+
+        # Compression with the first momentum/volume signs is a pre-pump/pre-dump
+        # hint, not a reason to wait for confirmation.
+        if snapshot.compression_score >= 55 and (snapshot.atr_expansion == "EXPANDING" or snapshot.volume_expansion):
+            score += 10
+            reasons.append("COMPRESSION_IGNITION_EARLY_HINT")
 
         return clamp(score), reasons
 
@@ -201,18 +210,22 @@ class ATRMovementEngine:
         reasons: List[str] = []
 
         if snapshot.atr_explosion:
-            score += 45
+            score += 48
             reasons.append("ATR_EXPLOSION")
         elif snapshot.atr_expansion == "EXPANDING":
-            score += 28
+            score += 34
             reasons.append("ATR_EXPANDING")
         elif snapshot.atr_expansion == "SHRINKING":
-            score -= 8
-            reasons.append("ATR_SHRINKING")
+            score -= 5
+            reasons.append("ATR_SHRINKING_SOFT")
 
         if snapshot.atr_slope > 0:
-            score += 10
+            score += 12
             reasons.append("ATR_SLOPE_UP")
+
+        if snapshot.compression_score >= 60 and snapshot.atr_slope > 0:
+            score += 8
+            reasons.append("PRE_EXPANSION_ATR_FROM_COMPRESSION")
 
         if snapshot.atr_percent > 0:
             score += min(20.0, snapshot.atr_percent * 8.0)
@@ -265,14 +278,17 @@ class RangeSuppressionEngine:
 
         # Keep range as a risk factor, but do not let normal compression kill every scalp setup.
         # Only strong compression without any ATR expansion should create a heavy range penalty.
-        if snapshot.compression_score >= 78 and not snapshot.atr_explosion and snapshot.atr_expansion != "EXPANDING":
-            penalty = max(penalty, 72.0)
-            reasons.append("COMPRESSION_WITHOUT_EXPLOSION")
+        if snapshot.compression_score >= 82 and not snapshot.atr_explosion and snapshot.atr_expansion != "EXPANDING":
+            penalty = max(penalty, 62.0)
+            reasons.append("COMPRESSION_WITHOUT_EXPLOSION_SOFT")
+        elif snapshot.compression_score >= 60 and (snapshot.atr_expansion == "EXPANDING" or snapshot.atr_slope > 0):
+            penalty = min(penalty, 45.0)
+            reasons.append("COMPRESSION_CAN_BE_PRE_MOVE")
 
         # Low ADX + low volume is a warning, not an automatic signal killer.
-        if snapshot.adx < 14 and snapshot.relative_volume < 0.75:
-            penalty = max(penalty, 62.0)
-            reasons.append("WEAK_ADX_LOW_VOLUME_RANGE")
+        if snapshot.adx < 13 and snapshot.relative_volume < 0.65 and snapshot.atr_expansion != "EXPANDING":
+            penalty = max(penalty, 55.0)
+            reasons.append("WEAK_ADX_LOW_VOLUME_RANGE_SOFT")
 
         return clamp(penalty), reasons
 
@@ -295,9 +311,9 @@ class ExhaustionPressureEngine:
             penalty += 45
             reasons.append("BEAR_EXHAUSTION")
 
-        if abs(snapshot.price_change_percent) > max(snapshot.atr_percent * 2.2, 1.5):
-            penalty += 20
-            reasons.append("POSSIBLY_LATE_EXTENDED_MOVE")
+        if abs(snapshot.price_change_percent) > max(snapshot.atr_percent * 2.9, 2.0):
+            penalty += 15
+            reasons.append("POSSIBLY_LATE_EXTENDED_MOVE_SOFT")
 
         if snapshot.stop_hunt_probability >= 70:
             penalty += 15
@@ -316,36 +332,36 @@ class MovementPhaseClassifier:
 
         # Severe range: only mark DEAD when the setup has very weak readiness and no ATR expansion.
         # Moderate range should stay alive as LATE/MID so AI can still learn via GHOST.
-        if snapshot.range_probability >= 82 and readiness < 35 and not snapshot.atr_explosion and snapshot.atr_expansion != "EXPANDING":
-            reasons.append("PHASE_RANGE_SEVERE")
+        if snapshot.range_probability >= 88 and readiness < 30 and not snapshot.atr_explosion and snapshot.atr_expansion != "EXPANDING":
+            reasons.append("PHASE_RANGE_SEVERE_SOFT")
             return PHASE_RANGE, FRESH_DEAD, reversal_pressure, reasons
 
-        if snapshot.range_probability >= 72 and readiness < 50:
-            reasons.append("PHASE_RANGE_MODERATE")
+        if snapshot.range_probability >= 78 and readiness < 42 and snapshot.atr_expansion != "EXPANDING":
+            reasons.append("PHASE_RANGE_MODERATE_SOFT")
             return PHASE_RANGE, FRESH_LATE, reversal_pressure, reasons
 
         # Exhaustion should be DEAD only when very strong. Normal weakness is LATE, not a hard kill.
-        if score.exhaustion_penalty >= 82:
-            reasons.append("PHASE_EXHAUSTION_SEVERE")
+        if score.exhaustion_penalty >= 88:
+            reasons.append("PHASE_EXHAUSTION_SEVERE_SOFT")
             return PHASE_EXHAUSTION, FRESH_DEAD, reversal_pressure, reasons
 
-        if score.exhaustion_penalty >= 65:
-            reasons.append("PHASE_EXHAUSTION_MODERATE")
+        if score.exhaustion_penalty >= 72 and readiness < 55:
+            reasons.append("PHASE_EXHAUSTION_MODERATE_SOFT")
             return PHASE_EXHAUSTION, FRESH_LATE, reversal_pressure, reasons
 
-        if readiness >= 72 and score.early_momentum >= 52:
+        if readiness >= 66 and score.early_momentum >= 44:
             reasons.append("PHASE_START_EARLY")
             return PHASE_EARLY, FRESH_FRESH, reversal_pressure, reasons
 
-        if readiness >= 55 and score.early_momentum >= 35:
-            reasons.append("PHASE_START")
+        if readiness >= 48 and score.early_momentum >= 28:
+            reasons.append("PHASE_START_SOFT")
             return PHASE_START, FRESH_FRESH, reversal_pressure, reasons
 
-        if readiness >= 40:
+        if readiness >= 36:
             reasons.append("PHASE_MIDDLE")
             return PHASE_MIDDLE, FRESH_MID, reversal_pressure, reasons
 
-        if readiness >= 25:
+        if readiness >= 20:
             reasons.append("PHASE_LATE_LOW_READINESS")
             return PHASE_LATE, FRESH_LATE, reversal_pressure, reasons
 
@@ -402,16 +418,16 @@ class MovementHunter:
             volume_participation = max(volume_participation, 85.0)
 
         raw_total = (
-            early_score * 0.32
-            + atr_score * 0.20
-            + power_shift * 0.14
-            + volume_participation * 0.14
-            + breakout_score * 0.20
+            early_score * 0.38
+            + atr_score * 0.22
+            + power_shift * 0.15
+            + volume_participation * 0.12
+            + breakout_score * 0.13
         )
 
         # Balanced suppression: range/exhaustion reduce quality, but should not silence
         # every early-movement candidate before AI can classify REAL/GHOST/REJECT.
-        penalty = range_penalty * 0.25 + exhaustion_penalty * 0.35
+        penalty = range_penalty * 0.18 + exhaustion_penalty * 0.30
         total = clamp(raw_total - penalty)
 
         movement_score = MovementScore(
@@ -429,8 +445,8 @@ class MovementHunter:
 
         continuation = clamp(
             total
-            - reversal_pressure * 0.45
-            - snapshot.range_probability * 0.25
+            - reversal_pressure * 0.38
+            - snapshot.range_probability * 0.18
             + (10 if snapshot.atr_explosion else 0)
         )
 
