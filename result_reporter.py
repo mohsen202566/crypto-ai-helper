@@ -178,7 +178,7 @@ class SignalReportFormatter:
         return ReportPayload(
             report_type=REPORT_SIGNAL,
             text=text,
-            should_send=decision.decision_type in {DECISION_REAL, DECISION_GHOST},
+            should_send=decision.decision_type == DECISION_REAL,
             meta={"decision": decision.to_dict(), "tp_sl_plan": plan.to_dict()},
         )
 
@@ -221,8 +221,10 @@ class TradeOpenReportFormatter:
             f"{error_line}"
         )
 
+        report_type = REPORT_STATUS if result.status in {STATUS_CONFIRMED, STATUS_PENDING_REAL_CONFIRM} else REPORT_ERROR
+
         return ReportPayload(
-            report_type=REPORT_STATUS if result.status == STATUS_CONFIRMED else REPORT_ERROR,
+            report_type=report_type,
             text=text,
             reply_to_message_id=reply_to_message_id,
             should_send=should_send,
@@ -265,6 +267,15 @@ class ResultReportFormatter:
             title = event_type
 
         pnl_line = self._format_pnl(event)
+        protection_line = ""
+        if event_type == EVENT_TP1:
+            raw = event.raw if isinstance(event.raw, dict) else {}
+            protected_sl = raw.get("protected_sl")
+            runner_qty = raw.get("runner_quantity")
+            if protected_sl:
+                protection_line = f"\n{SHIELD} سود محافظت شد | SL محافظ: {fmt_price(protected_sl)}"
+                if runner_qty:
+                    protection_line += f" | رانر TP2: {runner_qty}"
         reason_line = _short_reasons(event.reason_codes)
         reason_text = f"\nدلیل: {reason_line}" if reason_line else ""
 
@@ -274,6 +285,7 @@ class ResultReportFormatter:
             f"جهت: {event.direction}\n"
             f"قیمت: {fmt_price(event.price)}\n"
             f"{pnl_line}"
+            f"{protection_line}"
             f"{reason_text}"
         )
 
@@ -329,19 +341,13 @@ class GhostReportFormatter:
             icon = INFO
             title = f"Ghost {result.status}"
 
-        text = (
-            f"{icon} {title}\n"
-            f"نماد: {result.symbol}\n"
-            f"جهت: {result.direction}\n"
-            f"قیمت: {fmt_price(result.price)}\n"
-            f"MFE: {fmt_percent(result.mfe_percent)} | MAE: {fmt_percent(result.mae_percent)}"
-        )
-
+        # GHOST results are intentionally hidden from Telegram. They are only
+        # stored/used for learning by ghost_manager/stats_manager.
         return ReportPayload(
             report_type=REPORT_GHOST,
-            text=text,
-            should_send=True,
-            meta={"ghost_result": result.to_dict()},
+            text="",
+            should_send=False,
+            meta={"ghost_result": result.to_dict(), "hidden_from_telegram": True},
         )
 
 
