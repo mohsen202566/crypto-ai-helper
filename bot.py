@@ -981,7 +981,10 @@ async def auto_scan_loop(app: Any) -> None:
                 for symbol in symbols:
                     try:
                         result = await asyncio.to_thread(orchestrator().run_pipeline, symbol, "5m", None, True)
-                        if result.signal_report and result.decision.decision_type in {DECISION_REAL, DECISION_GHOST}:
+                        # Auto-scan must send Telegram alerts only for REAL signals.
+                        # GHOST signals are still created/stored inside run_pipeline()
+                        # for learning, but they should stay hidden from Telegram.
+                        if result.signal_report and result.decision.decision_type == DECISION_REAL:
                             oid = owner_id()
                             if oid:
                                 await app.bot.send_message(chat_id=oid, text=result.signal_report.text)
