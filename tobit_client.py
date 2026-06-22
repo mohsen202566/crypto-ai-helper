@@ -57,6 +57,35 @@ DIRECTION_NEUTRAL = "NEUTRAL"
 MARGIN_ISOLATED = "ISOLATED"
 MARGIN_CROSS = "CROSS"
 
+# Toobit USDT-M futures uses SWAP symbols on the working v1 endpoints.
+# Market data can still come from OKX elsewhere; this client is only for real Toobit account/trade routes.
+TOBIT_FUTURES_SYMBOL_MAP = {
+    "SHIBUSDT": "1000SHIBUSDT",
+    "PEPEUSDT": "1000PEPEUSDT",
+    "BONKUSDT": "1000BONKUSDT",
+    "FLOKIUSDT": "1000FLOKIUSDT",
+}
+TOBIT_REVERSE_SYMBOL_MAP = {v: k for k, v in TOBIT_FUTURES_SYMBOL_MAP.items()}
+
+
+def normalize_toobit_plain_symbol(symbol: str) -> str:
+    raw = str(symbol or "").upper().strip()
+    if not raw:
+        return raw
+    raw = raw.replace("/", "").replace("_", "-")
+    if raw.endswith("-SWAP-USDT"):
+        plain = raw.replace("-SWAP-USDT", "USDT").replace("-", "")
+    elif raw.endswith("-SWAP-USDC"):
+        plain = raw.replace("-SWAP-USDC", "USDC").replace("-", "")
+    else:
+        plain = raw.replace("-", "").replace("SWAP", "")
+    return TOBIT_FUTURES_SYMBOL_MAP.get(plain, plain)
+
+
+def normalize_bot_plain_symbol(symbol: str) -> str:
+    plain = normalize_toobit_plain_symbol(symbol)
+    return TOBIT_REVERSE_SYMBOL_MAP.get(plain, plain)
+
 
 class ToobitAPIError(RuntimeError):
     """Raised for Toobit API errors."""
@@ -244,15 +273,19 @@ class ToobitClient:
         )
         self.signer = ToobitSigner(self.credentials)
         self.session = requests.Session()
+        self._leverage_cache: Dict[str, Dict[str, Any]] = {}
+        self._margin_mode_cache: Dict[str, Dict[str, Any]] = {}
         if self.credentials.api_key:
-            # Official Toobit REST docs require X-BB-APIKEY.
-            # Keep legacy aliases only as compatibility fallbacks for older gateways.
+            # Working Toobit futures v1 routes require X-BB-APIKEY.
+            # X-MBX/accessKey are kept only as harmless compatibility aliases.
             self.session.headers.update(
                 {
                     "X-BB-APIKEY": self.credentials.api_key,
                     "X-MBX-APIKEY": self.credentials.api_key,
                     "accessKey": self.credentials.api_key,
                     "AccessKey": self.credentials.api_key,
+                    "User-Agent": "crypto-ai-helper/1.0",
+                    "Content-Type": "application/x-www-form-urlencoded",
                 }
             )
 
@@ -275,7 +308,9 @@ class ToobitClient:
             if method == "GET":
                 response = self.session.get(url, params=params, timeout=self.timeout)
             elif method == "POST":
-                response = self.session.post(url, params=params, timeout=self.timeout)
+                # Toobit futures v1 accepts signed form data. Sending signed params
+                # in the query string caused account/order route failures on the VPS.
+                response = self.session.post(url, data=params, timeout=self.timeout)
             elif method == "DELETE":
                 response = self.session.delete(url, params=params, timeout=self.timeout)
             else:
@@ -314,15 +349,109 @@ class ToobitClient:
             raise ToobitAPIError(f"{action}_failed:{response.error}")
         return response.data
 
+
+    def normalize_futures_symbol(self, symbol: str) -> str:
+        raw = str(symbol or "").upper().strip()
+        if not raw:
+            return raw
+        plain = normalize_toobit_plain_symbol(raw)
+        if plain.endswith("USDT"):
+            return f"{plain[:-4]}-SWAP-USDT"
+        if plain.endswith("USDC"):
+            return f"{plain[:-4]}-SWAP-USDC"
+        return plain
+
+    def _symbol_candidates(self, symbol: str) -> List[str]:
+        raw = str(symbol or "").upper().strip()
+        if not raw:
+            return []
+        toobit_plain = normalize_toobit_plain_symbol(raw)
+        bot_plain = normalize_bot_plain_symbol(raw)
+        normalized = self.normalize_futures_symbol(raw)
+        out: List[str] = []
+        for item in (normalized, toobit_plain, bot_plain, raw.replace("/", "").replace("_", "").replace("-", "").replace("SWAP", ""), raw):
+            item = str(item or "").upper().strip()
+            if item and item not in out:
+                out.append(item)
+        return out
+
+    def _cache_get(self, cache: Dict[str, Dict[str, Any]], key: str, max_age_sec: int) -> Any:
+        item = cache.get(str(key))
+        if not isinstance(item, dict):
+            return None
+        age = time.time() - safe_float(item.get("ts"), 0.0)
+        if 0 <= age <= max_age_sec:
+            return item.get("value")
+        return None
+
+    def _cache_set(self, cache: Dict[str, Dict[str, Any]], key: str, value: Any) -> None:
+        cache[str(key)] = {"value": value, "ts": time.time()}
+
+    def _extract_leverage_value(self, data: Any) -> int:
+        def walk(value: Any):
+            if isinstance(value, dict):
+                yield value
+                for v in value.values():
+                    yield from walk(v)
+            elif isinstance(value, list):
+                for item in value:
+                    yield from walk(item)
+        for item in walk(data):
+            for key in ("leverage", "lever", "leverageValue", "longLeverage", "shortLeverage", "lev"):
+                if key in item:
+                    value = safe_int(item.get(key), 0)
+                    if value > 0:
+                        return value
+        return 0
+
+    def _flatten_items(self, payload: Any) -> List[JsonDict]:
+        payload = payload.get("data", payload) if isinstance(payload, dict) else payload
+        out: List[JsonDict] = []
+        def walk(value: Any) -> None:
+            if isinstance(value, dict):
+                if any(k in value for k in ("symbol", "contractCode", "positionAmt", "positionSize", "size", "qty", "quantity", "availablePosition", "holdVol", "leverage", "side", "positionSide")):
+                    out.append(value)
+                for v in value.values():
+                    if isinstance(v, (dict, list)):
+                        walk(v)
+            elif isinstance(value, list):
+                for item in value:
+                    walk(item)
+        walk(payload)
+        if not out and isinstance(payload, dict):
+            out.append(payload)
+        return out
+
+    def _position_qty(self, item: JsonDict) -> float:
+        for key in ("positionAmt", "positionSize", "size", "qty", "quantity", "positionQuantity", "availablePosition", "totalPosition", "holdVol", "holdVolume", "volume", "position"):
+            qty = safe_float(item.get(key), 0.0)
+            if qty != 0:
+                return abs(qty)
+        return 0.0
+
+    def _position_symbol_matches(self, item: JsonDict, symbol: str) -> bool:
+        wanted = set(self._symbol_candidates(symbol))
+        fields = ("symbol", "contractCode", "instrument", "instId", "pair", "symbolName", "contract", "contractName")
+        present = False
+        for key in fields:
+            value = item.get(key)
+            if value is None or str(value).strip() == "":
+                continue
+            present = True
+            if set(self._symbol_candidates(str(value))) & wanted:
+                return True
+        return not present
+
     # -------------------------------------------------------------------------
     # Public market / exchange info
     # -------------------------------------------------------------------------
 
     def get_exchange_info(self) -> JsonDict:
-        res = self._request("GET", "/api/v2/futures/exchangeInfo", signed=False)
-        if not res.ok:
-            # v1 fallback kept for older Toobit deployments.
-            res = self._request("GET", "/api/v1/futures/exchangeInfo", signed=False)
+        # Working Toobit account used v1 public metadata endpoints.
+        for path in ("/api/v1/futures/exchangeInfo", "/api/v1/futures/symbols", "/api/v1/exchangeInfo"):
+            res = self._request("GET", path, signed=False)
+            if res.ok:
+                return res.data
         return self._unwrap(res, "exchange_info")
 
     def get_symbol_rules(self, symbol: str) -> JsonDict:
@@ -394,58 +523,51 @@ class ToobitClient:
         mode = str(margin_mode or MARGIN_ISOLATED).upper()
         if mode != MARGIN_ISOLATED:
             raise ToobitAPIError("cross_margin_not_allowed_by_bot")
-
-        res = self._request(
-            "POST",
-            "/api/v2/futures/marginType",
-            params={"symbol": symbol, "marginType": MARGIN_ISOLATED},
-            signed=True,
-        )
-        if not res.ok and "-4046" in res.error:
-            return {"symbol": symbol, "margin_mode": MARGIN_ISOLATED, "note": "already_isolated"}
-        return self._unwrap(res, "set_margin_mode")
+        normalized = self.normalize_futures_symbol(symbol)
+        self._cache_set(self._margin_mode_cache, normalized, MARGIN_ISOLATED)
+        # Do not spam Toobit margin-mode endpoints: the working legacy client used
+        # manual/global isolated mode because Toobit margin read/set routes were unstable.
+        return {"symbol": normalized, "margin_mode": MARGIN_ISOLATED, "source": "manual_global_isolated_no_api_call"}
 
     def get_margin_mode(self, symbol: str) -> JsonDict:
-        positions = self.get_open_positions(symbol=symbol)
-        for pos in positions:
-            if str(pos.get("symbol", "")) == symbol:
-                mode = str(pos.get("marginType", pos.get("margin_mode", pos.get("isolated", "")))).upper()
-                if mode in {"TRUE", "1"}:
-                    mode = MARGIN_ISOLATED
-                return {"symbol": symbol, "margin_mode": mode or MARGIN_ISOLATED}
-        # If no position exists, Toobit may not expose margin type directly.
-        # Return isolated after set_margin_mode succeeds, because preflight already calls set first.
-        return {"symbol": symbol, "margin_mode": MARGIN_ISOLATED}
+        normalized = self.normalize_futures_symbol(symbol)
+        cached = self._cache_get(self._margin_mode_cache, normalized, 3600)
+        if cached == MARGIN_ISOLATED:
+            return {"symbol": normalized, "margin_mode": MARGIN_ISOLATED, "source": "recent_margin_mode_cache"}
+        self._cache_set(self._margin_mode_cache, normalized, MARGIN_ISOLATED)
+        return {"symbol": normalized, "margin_mode": MARGIN_ISOLATED, "source": "manual_global_isolated_no_api_read"}
 
     def set_leverage(self, symbol: str, leverage: int) -> JsonDict:
+        normalized = self.normalize_futures_symbol(symbol)
         lev = int(leverage)
         if lev <= 0:
             raise ToobitAPIError("invalid_leverage")
-
-        res = self._request(
-            "POST",
-            "/api/v2/futures/leverage",
-            params={"symbol": symbol, "leverage": lev},
-            signed=True,
-        )
-        return self._unwrap(res, "set_leverage")
+        cached = self._cache_get(self._leverage_cache, normalized, 600)
+        if safe_int(cached, 0) == lev:
+            return {"symbol": normalized, "leverage": lev, "source": "recent_leverage_cache"}
+        res = self._request("POST", "/api/v1/futures/leverage", params={"symbol": normalized, "leverage": lev}, signed=True)
+        if not res.ok:
+            raise ToobitAPIError(f"set_leverage_failed:{res.error}")
+        self._cache_set(self._leverage_cache, normalized, lev)
+        data = res.data.get("data", res.data) if isinstance(res.data, dict) else res.data
+        return {"symbol": normalized, "leverage": lev, "data": data, "source": "/api/v1/futures/leverage"}
 
     def get_leverage(self, symbol: str) -> JsonDict:
-        positions = self.get_open_positions(symbol=symbol)
-        for pos in positions:
-            if str(pos.get("symbol", "")) == symbol:
-                return {"symbol": symbol, "leverage": safe_int(pos.get("leverage", pos.get("lev", 0)))}
-
-        # Fallback endpoint if Toobit exposes account leverage bracket/position config.
-        res = self._request("GET", "/api/v2/futures/positionRisk", params={"symbol": symbol}, signed=True)
-        if res.ok:
-            data = res.data.get("data", res.data)
-            if isinstance(data, list) and data:
-                return {"symbol": symbol, "leverage": safe_int(data[0].get("leverage", 0))}
-            if isinstance(data, dict):
-                return {"symbol": symbol, "leverage": safe_int(data.get("leverage", 0))}
-        return {"symbol": symbol, "leverage": 0}
-
+        normalized = self.normalize_futures_symbol(symbol)
+        cached = self._cache_get(self._leverage_cache, normalized, 600)
+        if safe_int(cached, 0) > 0:
+            return {"symbol": normalized, "leverage": safe_int(cached), "source": "recent_leverage_cache"}
+        try:
+            positions = self.get_open_positions(symbol=normalized)
+            for pos in positions:
+                if self._position_symbol_matches(pos.get("raw", pos), normalized):
+                    lev = safe_int(pos.get("leverage"), 0)
+                    if lev > 0:
+                        self._cache_set(self._leverage_cache, normalized, lev)
+                        return {"symbol": normalized, "leverage": lev, "source": "positions"}
+        except Exception:
+            pass
+        return {"symbol": normalized, "leverage": 0, "source": "not_exposed_without_open_position"}
 
     def ping_private(self) -> JsonDict:
         """
@@ -469,21 +591,9 @@ class ToobitClient:
         return last or ToobitResponse(ok=False, status_code=0, data={}, error="no_endpoint_attempted", raw_text="")
 
     def get_account_info(self) -> JsonDict:
-        """
-        Read raw futures account data from Toobit with several v2/v1 fallbacks.
-        """
-        res = self._request_first_ok(
-            "GET",
-            [
-                "/api/v2/futures/account",
-                "/api/v1/futures/account",
-                "/api/v2/futures/balance",
-                "/api/v1/futures/balance",
-                "/api/v2/account",
-                "/api/v1/account",
-            ],
-            signed=True,
-        )
+        # The working account route is v1 futures balance. v2/account and
+        # positionRisk are Binance-like and returned 404 on the VPS.
+        res = self._request("GET", "/api/v1/futures/balance", signed=True)
         data = self._unwrap(res, "get_account_info")
         return {"account_type": "FUTURES", "raw": data}
 
@@ -613,44 +723,39 @@ class ToobitClient:
         if qty <= 0:
             raise ToobitAPIError("quantity_must_be_positive")
 
-        side = normalize_side(side, direction)
-        order_type = str(order_type or "MARKET").upper()
+        normalized_direction = normalize_direction(direction)
+        if normalized_direction == DIRECTION_LONG:
+            toobit_side = "BUY_OPEN"
+        elif normalized_direction == DIRECTION_SHORT:
+            toobit_side = "SELL_OPEN"
+        else:
+            raise ToobitAPIError("invalid_direction")
 
-        position_side = "LONG" if normalize_direction(direction) == DIRECTION_LONG else "SHORT"
-
+        normalized_symbol = self.normalize_futures_symbol(symbol)
         params: JsonDict = {
-            "symbol": symbol,
-            "side": side,
-            "positionSide": position_side,
-            "type": order_type,
+            "symbol": normalized_symbol,
+            "side": toobit_side,
+            "type": "LIMIT",
+            "priceType": "MARKET",
             "quantity": qty,
-            "newClientOrderId": client_order_id or f"mh_{int(time.time())}",
-            "category": "USDT",
+            "newClientOrderId": client_order_id or f"mh_{int(time.time() * 1000)}",
         }
-
-        if order_type != "MARKET" and safe_float(price) > 0:
-            params["price"] = safe_float(price)
-            params["timeInForce"] = "GTC"
-
-        # Toobit v2 futures order supports attached TP/SL fields.
-        if take_profit > 0:
-            params["takeProfit"] = take_profit
-            params["tpTriggerBy"] = "MARK_PRICE"
+        if safe_float(take_profit) > 0:
+            params["takeProfit"] = safe_float(take_profit)
             params["tpOrderType"] = "MARKET"
-        if stop_loss > 0:
-            params["stopLoss"] = stop_loss
-            params["slTriggerBy"] = "MARK_PRICE"
+        if safe_float(stop_loss) > 0:
+            params["stopLoss"] = safe_float(stop_loss)
             params["slOrderType"] = "MARKET"
-        # TP2 is not part of the regular-order endpoint; it is repaired/managed
-        # later by set_position_tp_sl when the position is confirmed.
+        # Toobit regular order endpoint does not reliably support a second TP.
+        # TP2 is managed later by monitor/repair if supported.
 
-        res = self._request("POST", "/api/v2/futures/order", params=params, signed=True)
-        if not res.ok:
-            # fallback endpoint name
-            res = self._request("POST", "/api/v1/futures/order", params=params, signed=True)
-
+        res = self._request("POST", "/api/v1/futures/order", params=params, signed=True)
         data = self._unwrap(res, "open_futures_position")
-        return self._normalize_order_response(data)
+        normalized = self._normalize_order_response(data)
+        normalized.setdefault("symbol", normalized_symbol)
+        normalized.setdefault("side", toobit_side)
+        normalized["normalized_params"] = params
+        return normalized
 
     def _normalize_order_response(self, data: JsonDict) -> JsonDict:
         payload = data.get("data", data)
@@ -669,60 +774,58 @@ class ToobitClient:
 
     def close_position(self, symbol: str, direction: str, quantity: float, client_order_id: str = "") -> JsonDict:
         normalized_direction = normalize_direction(direction)
-        side = SIDE_SELL if normalized_direction == DIRECTION_LONG else SIDE_BUY
-        position_side = "LONG" if normalized_direction == DIRECTION_LONG else "SHORT"
+        if normalized_direction == DIRECTION_LONG:
+            toobit_side = "SELL_CLOSE"
+        elif normalized_direction == DIRECTION_SHORT:
+            toobit_side = "BUY_CLOSE"
+        else:
+            raise ToobitAPIError("invalid_direction")
+        normalized_symbol = self.normalize_futures_symbol(symbol)
         params = {
-            "symbol": symbol,
-            "side": side,
-            "positionSide": position_side,
-            "type": "MARKET",
+            "symbol": normalized_symbol,
+            "side": toobit_side,
+            "type": "LIMIT",
+            "priceType": "MARKET",
             "quantity": safe_float(quantity),
-            "reduceOnly": "true",
-            "newClientOrderId": client_order_id or f"mh_close_{int(time.time())}",
-            "category": "USDT",
+            "newClientOrderId": client_order_id or f"mh_close_{int(time.time() * 1000)}",
         }
-        res = self._request("POST", "/api/v2/futures/order", params=params, signed=True)
-        if not res.ok:
-            res = self._request("POST", "/api/v1/futures/order", params=params, signed=True)
+        res = self._request("POST", "/api/v1/futures/order", params=params, signed=True)
         return self._normalize_order_response(self._unwrap(res, "close_position"))
 
-    # -------------------------------------------------------------------------
-    # Positions / TP SL
-    # -------------------------------------------------------------------------
-
     def get_open_positions(self, symbol: Optional[str] = None) -> List[JsonDict]:
-        params = {"symbol": symbol} if symbol else {}
-        res = self._request("GET", "/api/v2/futures/positionRisk", params=params, signed=True)
-        if not res.ok:
-            res = self._request("GET", "/api/v1/futures/positionRisk", params=params, signed=True)
+        normalized_symbol = self.normalize_futures_symbol(symbol) if symbol else None
+        params = {"symbol": normalized_symbol} if normalized_symbol else {}
+        res = self._request("GET", "/api/v1/futures/positions", params=params, signed=True)
         data = self._unwrap(res, "get_open_positions")
-        payload = data.get("data", data)
-        if isinstance(payload, dict):
-            payload = payload.get("positions", payload.get("list", [payload]))
-        if not isinstance(payload, list):
-            return []
+        items = self._flatten_items(data)
 
         positions: List[JsonDict] = []
-        for p in payload:
+        for p in items:
             if not isinstance(p, dict):
                 continue
-            qty = safe_float(p.get("positionAmt", p.get("quantity", p.get("qty", p.get("size", 0.0)))))
-            if qty == 0:
+            qty = self._position_qty(p)
+            if qty <= 0:
                 continue
-            side = p.get("side", p.get("positionSide", ""))
-            direction = normalize_direction(side)
+            if normalized_symbol and not self._position_symbol_matches(p, normalized_symbol):
+                continue
+            raw_side = str(p.get("side", p.get("positionSide", p.get("direction", p.get("holdSide", p.get("tradeSide", "")))))).upper()
+            direction = normalize_direction(raw_side)
             if direction == DIRECTION_NEUTRAL:
-                direction = DIRECTION_LONG if qty > 0 else DIRECTION_SHORT
+                if "SHORT" in raw_side or "SELL" in raw_side or "空" in raw_side:
+                    direction = DIRECTION_SHORT
+                else:
+                    direction = DIRECTION_LONG
+            sym = str(p.get("symbol", p.get("contractCode", p.get("instId", normalized_symbol or ""))))
             positions.append(
                 {
-                    "symbol": str(p.get("symbol", symbol or "")),
+                    "symbol": sym or normalized_symbol or "",
                     "direction": direction,
-                    "quantity": abs(qty),
-                    "entry_price": safe_float(p.get("entryPrice", p.get("entry_price", p.get("avgPrice", 0.0)))),
-                    "mark_price": safe_float(p.get("markPrice", p.get("mark_price", p.get("lastPrice", 0.0)))),
-                    "unrealized_pnl": safe_float(p.get("unRealizedProfit", p.get("unrealizedPnl", p.get("unrealizedProfit", 0.0)))),
-                    "leverage": safe_int(p.get("leverage", p.get("lev", 0))),
-                    "marginType": str(p.get("marginType", p.get("margin_mode", ""))).upper(),
+                    "quantity": qty,
+                    "entry_price": safe_float(p.get("entryPrice", p.get("entry_price", p.get("avgPrice", p.get("openPrice", p.get("positionAvgPrice", 0.0)))))),
+                    "mark_price": safe_float(p.get("markPrice", p.get("mark_price", p.get("lastPrice", p.get("price", 0.0))))),
+                    "unrealized_pnl": safe_float(p.get("unRealizedProfit", p.get("unrealizedPnl", p.get("unrealizedProfit", p.get("pnl", 0.0))))),
+                    "leverage": safe_int(p.get("leverage", p.get("lev", p.get("lever", 0))), 0),
+                    "marginType": str(p.get("marginType", p.get("marginMode", p.get("margin_mode", MARGIN_ISOLATED)))).upper() or MARGIN_ISOLATED,
                     "raw": p,
                 }
             )
@@ -732,85 +835,54 @@ class ToobitClient:
         return self.set_position_tp_sl(symbol, direction, tp1, tp2, sl)
 
     def set_position_tp_sl(self, symbol: str, direction: str, tp1: float, tp2: float, sl: float) -> JsonDict:
+        # Primary TP/SL is attached at order opening on this Toobit account.
+        # Keep a conservative v1 repair fallback; if unsupported, return the
+        # exchange error instead of pretending success.
+        normalized_symbol = self.normalize_futures_symbol(symbol)
         normalized_direction = normalize_direction(direction)
-        position_side = "LONG" if normalized_direction == DIRECTION_LONG else "SHORT"
-        close_side = SIDE_SELL if normalized_direction == DIRECTION_LONG else SIDE_BUY
-        results: List[JsonDict] = []
-
-        def place_stop(stop_price: float, stop_order_type: str, suffix: str) -> None:
-            if safe_float(stop_price) <= 0:
-                return
-            params = {
-                "symbol": symbol,
-                "side": close_side,
-                "positionSide": position_side,
-                "type": "STOP_PROFIT_LOSS_MARKET",
-                "stopPrice": safe_float(stop_price),
-                "triggerBy": "MARK_PRICE",
-                "stopOrderType": stop_order_type,
-                "stopType": "FIXED_STOP",
-                "newClientOrderId": f"mh_{suffix}_{int(time.time() * 1000)}",
-                "category": "USDT",
-            }
-            res = self._request("POST", "/api/v2/futures/algo-order", params=params, signed=True)
-            if not res.ok:
-                # Older deployments may expose a position-level TP/SL endpoint.
-                legacy_params = {
-                    "symbol": symbol,
-                    "positionSide": position_side,
-                    "takeProfit": safe_float(tp1),
-                    "stopLoss": safe_float(sl),
-                    "category": "USDT",
-                }
-                legacy = self._request("POST", "/api/v2/futures/position/tpsl", params=legacy_params, signed=True)
-                results.append(self._unwrap(legacy, f"set_position_tp_sl_{suffix}"))
-                return
-            results.append(self._unwrap(res, f"set_position_tp_sl_{suffix}"))
-
-        place_stop(tp1, "TAKE_PROFIT", "tp1")
-        # Optional TP2 is managed as an extra take-profit row if Toobit accepts it.
-        place_stop(tp2, "TAKE_PROFIT", "tp2")
-        place_stop(sl, "STOP_LOSS", "sl")
-
-        return {"ok": True, "symbol": symbol, "direction": position_side, "rows": results}
-
-    repair_tp_sl = set_position_tp_sl
-
-    # -------------------------------------------------------------------------
-    # Realized PnL / history
-    # -------------------------------------------------------------------------
+        close_side = "SELL_CLOSE" if normalized_direction == DIRECTION_LONG else "BUY_CLOSE"
+        params = {
+            "symbol": normalized_symbol,
+            "side": close_side,
+            "takeProfit": safe_float(tp1),
+            "stopLoss": safe_float(sl),
+            "tpOrderType": "MARKET",
+            "slOrderType": "MARKET",
+        }
+        res = self._request("POST", "/api/v1/futures/position/tpsl", params=params, signed=True)
+        if res.ok:
+            return {"ok": True, "symbol": normalized_symbol, "direction": normalized_direction, "raw": res.data}
+        return {"ok": False, "symbol": normalized_symbol, "direction": normalized_direction, "error": res.error, "raw": res.data}
 
     def get_closed_position_pnl(self, symbol: str, start_time: Optional[int] = None, end_time: Optional[int] = None) -> JsonDict:
-        params: JsonDict = {"symbol": symbol}
+        normalized_symbol = self.normalize_futures_symbol(symbol)
+        params: JsonDict = {"symbol": normalized_symbol}
         if start_time:
             params["startTime"] = start_time
         if end_time:
             params["endTime"] = end_time
 
-        res = self._request("GET", "/api/v2/futures/income", params=params, signed=True)
-        if not res.ok:
-            res = self._request("GET", "/api/v1/futures/income", params=params, signed=True)
-
-        data = self._unwrap(res, "get_closed_position_pnl")
-        payload = data.get("data", data)
-        if isinstance(payload, dict):
-            payload = payload.get("list", payload.get("income", []))
-        if not isinstance(payload, list):
-            payload = []
-
-        pnl = 0.0
-        rows: List[JsonDict] = []
-        for row in payload:
-            if not isinstance(row, dict):
-                continue
-            income_type = str(row.get("incomeType", row.get("type", ""))).upper()
-            if income_type and income_type not in {"REALIZED_PNL", "PNL", "CLOSED_PNL"}:
-                continue
-            value = safe_float(row.get("income", row.get("pnl", row.get("realizedPnl", 0.0))))
-            pnl += value
-            rows.append(row)
-
-        return {"symbol": symbol, "realized_pnl": pnl, "rows": rows, "raw": data}
+        last: Optional[ToobitResponse] = None
+        for path in ("/api/v1/futures/income", "/api/v1/futures/incomeHistory", "/api/v1/futures/closedPositions", "/api/v1/futures/positionHistory"):
+            res = self._request("GET", path, params=params, signed=True)
+            if res.ok:
+                data = res.data
+                payload = data.get("data", data) if isinstance(data, dict) else data
+                if isinstance(payload, dict):
+                    payload = payload.get("list", payload.get("rows", payload.get("income", [payload])))
+                if not isinstance(payload, list):
+                    payload = []
+                pnl = 0.0
+                rows: List[JsonDict] = []
+                for row in payload:
+                    if not isinstance(row, dict):
+                        continue
+                    value = safe_float(row.get("realizedPnl", row.get("closedPnl", row.get("pnl", row.get("income", row.get("profit", 0.0))))))
+                    pnl += value
+                    rows.append(row)
+                return {"symbol": normalized_symbol, "realized_pnl": pnl, "rows": rows, "raw": data, "source": path}
+            last = res
+        raise ToobitAPIError(f"get_closed_position_pnl_failed:{last.error if last else 'no_endpoint_attempted'}")
 
     def wait_for_closed_position_pnl(
         self,
@@ -829,6 +901,12 @@ class ToobitClient:
                 last = {"symbol": symbol, "realized_pnl": 0.0, "rows": [], "error": str(exc)}
             time.sleep(sleep_seconds)
         return {**last, "confirmed": False}
+
+
+
+# Backward-compatible aliases used by older managers/scripts.
+ToBitClient = ToobitClient
+toobit_client = ToobitClient
 
 
 _default_client: Optional[ToobitClient] = None
