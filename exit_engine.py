@@ -207,11 +207,14 @@ def protected_sl_price(ctx: PositionContext) -> float:
     if entry <= 0 or price <= 0:
         return 0.0
 
-    # After TP1, save profit around TP1 for the remaining runner.
+    # After TP1, protect the runner without choking it exactly at TP1.
+    # Give the remaining runner ~10% of Entry→TP1 distance as breathing room.
     if ctx.tp1_hit and ctx.tp1 > 0:
+        tp1 = safe_float(ctx.tp1)
+        buffer_dist = abs(tp1 - entry) * 0.10
         if direction == DIRECTION_LONG:
-            return max(entry, safe_float(ctx.tp1))
-        return min(entry, safe_float(ctx.tp1))
+            return max(entry, tp1 - buffer_dist)
+        return min(entry, tp1 + buffer_dist)
 
     if direction == DIRECTION_LONG:
         # Before TP1, protect at entry + 15% of current open profit.
@@ -341,7 +344,7 @@ class ExitActionClassifier:
             tp1_progress = progress_to_tp1(ctx)
             tp2_progress = progress_tp1_to_tp2(ctx)
 
-            if not ctx.tp1_hit and tp1_progress >= 0.45 and (
+            if not ctx.tp1_hit and tp1_progress >= 0.55 and (
                 score.momentum_weakness_score >= 45
                 or score.reversal_score >= 50
                 or score.invalidation_score >= 45
@@ -368,7 +371,7 @@ class ExitActionClassifier:
             if score.total_exit_score >= 70:
                 reasons.append("AI_CLOSE_PROFIT_WEAKNESS")
                 return EXIT_AI_CLOSE, True, False, reasons
-            if score.total_exit_score >= 45:
+            if score.total_exit_score >= 50:
                 reasons.append("PROTECT_OPEN_PROFIT")
                 return EXIT_PROTECT_PROFIT, False, True, reasons
 
