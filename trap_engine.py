@@ -180,12 +180,29 @@ class LiquidityGrabDetector:
             liquidity += 55
             reasons.append("LIQUIDITY_GRAB_DOWN")
 
-        if snapshot.upper_wick_percent >= 45:
-            wick_rejection += 25
-            reasons.append("LARGE_UPPER_WICK")
-        if snapshot.lower_wick_percent >= 45:
-            wick_rejection += 25
-            reasons.append("LARGE_LOWER_WICK")
+        # Direction-aware wick risk:
+        # For a LONG idea, a large upper wick is rejection risk, while a lower
+        # wick can be a bullish sweep/recovery and should not dry REAL signals.
+        # For a SHORT idea, the opposite is true.
+        if direction == DIRECTION_LONG:
+            if snapshot.upper_wick_percent >= 45:
+                wick_rejection += 25
+                reasons.append("LONG_UPPER_WICK_REJECTION")
+            if snapshot.lower_wick_percent >= 55 and not snapshot.liquidity_grab_down:
+                reasons.append("LONG_LOWER_WICK_SUPPORT")
+        elif direction == DIRECTION_SHORT:
+            if snapshot.lower_wick_percent >= 45:
+                wick_rejection += 25
+                reasons.append("SHORT_LOWER_WICK_REJECTION")
+            if snapshot.upper_wick_percent >= 55 and not snapshot.liquidity_grab_up:
+                reasons.append("SHORT_UPPER_WICK_RESISTANCE")
+        else:
+            if snapshot.upper_wick_percent >= 45:
+                wick_rejection += 12
+                reasons.append("NEUTRAL_LARGE_UPPER_WICK")
+            if snapshot.lower_wick_percent >= 45:
+                wick_rejection += 12
+                reasons.append("NEUTRAL_LARGE_LOWER_WICK")
 
         if direction == DIRECTION_LONG and snapshot.liquidity_grab_up:
             liquidity += 20
@@ -212,14 +229,14 @@ class CloseQualityTrapDetector:
                 risk += 45
                 reasons.append("LONG_WEAK_CLOSE")
             elif snapshot.close_quality < 0.50:
-                risk += 20
+                risk += 12
                 reasons.append("LONG_CLOSE_NOT_STRONG")
         elif direction == DIRECTION_SHORT:
             if snapshot.close_quality > 0.65:
                 risk += 45
                 reasons.append("SHORT_STRONG_CLOSE_AGAINST")
             elif snapshot.close_quality > 0.50:
-                risk += 20
+                risk += 12
                 reasons.append("SHORT_CLOSE_NOT_WEAK")
 
         return clamp(risk), reasons
@@ -240,8 +257,10 @@ class RangeTrapDetector:
             reasons.append("MEDIUM_RANGE_TRAP")
 
         if snapshot.compression_score >= 70 and not snapshot.atr_explosion:
-            risk += 35
-            reasons.append("COMPRESSION_FAKE_MOVE_RISK")
+            # Compression is not always bad; for Movement Hunter it can be the
+            # pre-move phase. Keep it as a soft risk, not a REAL killer.
+            risk += 22
+            reasons.append("COMPRESSION_SOFT_FAKE_MOVE_RISK")
 
         if snapshot.adx < 16 and snapshot.relative_volume < 0.9:
             risk += 25
@@ -392,7 +411,9 @@ class TrapEngine:
             range_trap,
         ])
 
-        # Movement context can increase risk if movement is late/exhausted.
+        # Movement context can increase risk if movement is late/exhausted,
+        # but strong fresh movement should soften trap risk so REAL does not
+        # become too dry.
         if movement is not None:
             if movement.freshness in {"LATE", "DEAD"}:
                 total += 12
@@ -400,6 +421,26 @@ class TrapEngine:
             if movement.reversal_pressure >= 60:
                 total += 12
                 reasons.append("MOVEMENT_REVERSAL_PRESSURE_TRAP_RISK")
+
+            strong_fresh = (
+                movement.freshness == "FRESH"
+                and movement.readiness_score >= 65
+                and movement.continuation_probability >= 55
+                and total < 75
+            )
+            if strong_fresh:
+                total -= 10
+                reasons.append("FRESH_CONFIRMED_MOVEMENT_SOFTENS_TRAP_RISK")
+
+            strong_mid = (
+                movement.freshness == "MID"
+                and movement.readiness_score >= 72
+                and movement.continuation_probability >= 62
+                and total < 70
+            )
+            if strong_mid:
+                total -= 6
+                reasons.append("STRONG_MID_MOVEMENT_SOFTENS_TRAP_RISK")
 
         total = clamp(total)
         liquidity_total = clamp(avg([liquidity_risk, stop_hunt, wick_rejection]))
