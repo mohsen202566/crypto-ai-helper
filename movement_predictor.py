@@ -281,11 +281,21 @@ class PhasePredictionEngine:
         s = candidate.sensor_snapshot
         reasons: List[str] = []
 
-        if state.market_state == "RANGE" and movement.readiness_score < 65:
+        # Do not over-classify every range/late warning as a dead prediction.
+        # Strong enough readiness can still be a learnable MID/GHOST candidate.
+        if state.market_state == "RANGE" and movement.readiness_score < 45 and similarity < 55:
             reasons.append("PREDICT_RANGE")
             return PREDICT_RANGE, reasons
 
-        if state.market_state in {"EXHAUSTION", "LATE"} or movement.freshness in {"LATE", "DEAD"}:
+        if (
+            state.market_state in {"EXHAUSTION", "LATE"}
+            and movement.readiness_score < 45
+            and similarity < 55
+        ) or (movement.freshness == "DEAD" and movement.readiness_score < 40):
+            reasons.append("PREDICT_LATE")
+            return PREDICT_LATE, reasons
+
+        if movement.freshness == "LATE" and movement.readiness_score < 45:
             reasons.append("PREDICT_LATE")
             return PREDICT_LATE, reasons
 
@@ -346,13 +356,13 @@ class MovementProbabilityEngine:
         exhaustion_penalty = clamp(state.exhaustion_risk * 0.55 + movement.reversal_pressure * 0.35)
 
         final_similarity = clamp(
-            memory_similarity * 0.28
-            + sensor_alignment * 0.28
-            + movement_alignment * 0.24
-            + state_alignment * 0.20
-            - trap_penalty * 0.35
-            - range_penalty * 0.22
-            - exhaustion_penalty * 0.30
+            memory_similarity * 0.25
+            + sensor_alignment * 0.30
+            + movement_alignment * 0.27
+            + state_alignment * 0.18
+            - trap_penalty * 0.32
+            - range_penalty * 0.18
+            - exhaustion_penalty * 0.24
         )
 
         base_probability = final_similarity
