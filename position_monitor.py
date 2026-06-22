@@ -23,7 +23,7 @@ Strictly forbidden:
 """
 
 from dataclasses import asdict, dataclass, field
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Sequence
 from uuid import uuid4
 import math
 import time
@@ -390,8 +390,28 @@ class PositionMonitor:
         for exchange_symbol, pos in stored.items():
             if exchange_symbol not in seen and pos.status == POSITION_OPEN:
                 closed = RealPositionState(**{**pos.to_dict(), "status": POSITION_CLOSED, "close_time": now_ts()})
+                pnl, pnl_status, pnl_raw = self._resolve_closed_pnl(closed)
+                closed = RealPositionState(**{
+                    **closed.to_dict(),
+                    "realized_pnl_usdt": pnl,
+                    "realized_pnl_percent": pnl_percent(closed.direction, closed.entry, closed.current_price),
+                    "pnl_status": pnl_status,
+                })
+                # Full REAL learning needs fresh analysis objects and original candidate,
+                # so unknown/manual exchange closes are persisted with real PnL and reported
+                # instead of creating fake learning context.
                 save_position(closed.position_id, closed.to_dict())
-                events.append(self._event(closed, EVENT_CLOSED_UNKNOWN, closed.current_price, reason_codes=("POSITION_MISSING_ON_EXCHANGE",), should_report=True))
+                events.append(self._event(
+                    closed,
+                    EVENT_CLOSED_UNKNOWN,
+                    closed.current_price,
+                    pnl,
+                    closed.realized_pnl_percent,
+                    pnl_status,
+                    reason_codes=("POSITION_MISSING_ON_EXCHANGE", "UNKNOWN_CLOSE_PNL_RESOLVED"),
+                    raw={"pnl": pnl_raw},
+                    should_report=True,
+                ))
 
         return events
 
@@ -441,6 +461,24 @@ class PositionMonitor:
         return tp1
 
 
+    def _close_order_ok(self, raw: JsonDict) -> bool:
+        """Return False only when close API clearly failed.
+
+Some Toobit responses do not expose a simple ok/success flag, so absence of an
+explicit error is treated as acceptable. This avoids falsely blocking valid
+market-close responses while still catching clear failures.
+        """
+        if not isinstance(raw, dict):
+            return True
+        if raw.get("error"):
+            return False
+        if raw.get("ok") is False or raw.get("success") is False:
+            return False
+        status = str(raw.get("status", "")).upper()
+        if status in {"REJECTED", "FAILED", "ERROR"}:
+            return False
+        return True
+
     def monitor_position(
         self,
         pos: RealPositionState,
@@ -464,6 +502,18 @@ class PositionMonitor:
                     close_qty = max(0.0, original_qty * TP1_STRONG_CLOSE_FRACTION)
                     runner_qty = max(0.0, original_qty - close_qty)
                     close_raw = self._close_position(updated, quantity=close_qty)
+                    if not self._close_order_ok(close_raw):
+                        save_error("position_monitor_tp1_partial_close_failed", str(close_raw), updated.to_dict())
+                        events.append(self._event(
+                            updated,
+                            EVENT_TP1,
+                            updated.current_price,
+                            reason_codes=("TP1_PRICE_REACHED", "TP1_PARTIAL_CLOSE_FAILED"),
+                            warnings=("TP1_NOT_MARKED_BECAUSE_CLOSE_FAILED",),
+                            raw={"partial_close": close_raw},
+                            should_report=False,
+                        ))
+                        continue
                     protected_sl = self._tp1_protected_sl(updated)
 
                     meta = dict(updated.meta or {})
@@ -500,6 +550,18 @@ class PositionMonitor:
                     ))
                 else:
                     close_raw = self._close_position(updated, quantity=updated.quantity)
+                    if not self._close_order_ok(close_raw):
+                        save_error("position_monitor_tp1_full_close_failed", str(close_raw), updated.to_dict())
+                        events.append(self._event(
+                            updated,
+                            EVENT_TP1,
+                            updated.current_price,
+                            reason_codes=("TP1_PRICE_REACHED", "TP1_FULL_CLOSE_FAILED"),
+                            warnings=("TP1_NOT_MARKED_BECAUSE_CLOSE_FAILED",),
+                            raw={"close": close_raw},
+                            should_report=False,
+                        ))
+                        continue
                     closed = RealPositionState(**{**updated.to_dict(), "tp1_hit": True, "status": POSITION_CLOSED, "close_time": now_ts()})
                     pnl, pnl_status, pnl_raw = self._resolve_closed_pnl(closed)
                     if pnl_status != PNL_CONFIRMED:
@@ -528,12 +590,14 @@ class PositionMonitor:
                 pnl, pnl_status, raw = self._resolve_closed_pnl(updated)
                 updated = RealPositionState(**{**updated.to_dict(), "realized_pnl_usdt": pnl, "realized_pnl_percent": pnl_percent(updated.direction, updated.entry, updated.current_price), "pnl_status": pnl_status})
                 self._learn_real_outcome(updated, EVENT_TP2, updated.current_price, snapshot, movement, trap, state, pnl, updated.realized_pnl_percent)
+                save_position(updated.position_id, updated.to_dict())
                 events.append(self._event(updated, EVENT_TP2, updated.current_price, pnl, updated.realized_pnl_percent, pnl_status, ("TP2_PRICE_REACHED",), raw=raw))
             elif event_type == EVENT_SL and not updated.sl_hit:
                 updated = RealPositionState(**{**updated.to_dict(), "sl_hit": True, "status": POSITION_CLOSED, "close_time": now_ts()})
                 pnl, pnl_status, raw = self._resolve_closed_pnl(updated)
                 updated = RealPositionState(**{**updated.to_dict(), "realized_pnl_usdt": pnl, "realized_pnl_percent": pnl_percent(updated.direction, updated.entry, updated.current_price), "pnl_status": pnl_status})
                 self._learn_real_outcome(updated, EVENT_SL, updated.current_price, snapshot, movement, trap, state, pnl, updated.realized_pnl_percent)
+                save_position(updated.position_id, updated.to_dict())
                 events.append(self._event(updated, EVENT_SL, updated.current_price, pnl, updated.realized_pnl_percent, pnl_status, ("SL_PRICE_REACHED",), raw=raw))
 
         # AI exit/profit protection only if all analysis objects are provided.
@@ -545,6 +609,19 @@ class PositionMonitor:
                 events.append(self._event(updated, EVENT_PROTECT_SL, updated.current_price, reason_codes=exit_decision.reason_codes, warnings=exit_decision.warnings, should_report=False))
             if exit_decision.should_close:
                 close_raw = self._close_position(updated)
+                if not self._close_order_ok(close_raw):
+                    save_error("position_monitor_ai_exit_close_failed", str(close_raw), updated.to_dict())
+                    events.append(self._event(
+                        updated,
+                        EVENT_AI_EXIT,
+                        updated.current_price,
+                        reason_codes=exit_decision.reason_codes,
+                        warnings=tuple(list(exit_decision.warnings) + ["AI_EXIT_NOT_MARKED_BECAUSE_CLOSE_FAILED"]),
+                        raw={"close": close_raw},
+                        should_report=False,
+                    ))
+                    save_position(updated.position_id, updated.to_dict())
+                    return events
                 closed = RealPositionState(**{**updated.to_dict(), "ai_exit_hit": True, "status": POSITION_CLOSED, "close_time": now_ts()})
                 pnl, pnl_status, pnl_raw = self._resolve_closed_pnl(closed)
                 closed = RealPositionState(**{**closed.to_dict(), "realized_pnl_usdt": pnl, "realized_pnl_percent": pnl_percent(closed.direction, closed.entry, closed.current_price), "pnl_status": pnl_status})
