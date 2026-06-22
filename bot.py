@@ -47,7 +47,7 @@ except Exception:  # allows compile/test without telegram package installed
     ParseMode = None  # type: ignore
 
 from config import SETTINGS
-from data_store import store, save_error
+from data_store import store, save_error, save_position
 from market_data import get_multi_timeframe_snapshot, get_latest_price
 from analysis_engine import analyze_symbol, analyze_multi_timeframe, AnalysisCandidate
 from movement_hunter import analyze_movement, MovementHunterResult
@@ -79,6 +79,38 @@ CMD_ID = "/id"
 
 PERSIAN_TRUE = {"روشن", "فعال", "on", "ON", "true", "True"}
 PERSIAN_FALSE = {"خاموش", "غیرفعال", "off", "OFF", "false", "False"}
+
+
+# Persian / common aliases for direct asset commands.
+# Keep this local fallback even when symbol_mapper.py is limited on VPS.
+PERSIAN_SYMBOL_ALIASES = {
+    "بیتکوین": "BTCUSDT", "بیت کوین": "BTCUSDT", "بیت": "BTCUSDT", "btc": "BTCUSDT",
+    "اتریوم": "ETHUSDT", "اتر": "ETHUSDT", "eth": "ETHUSDT",
+    "سولانا": "SOLUSDT", "سول": "SOLUSDT", "sol": "SOLUSDT",
+    "دوج": "DOGEUSDT", "دوج کوین": "DOGEUSDT", "doge": "DOGEUSDT",
+    "ریپل": "XRPUSDT", "xrp": "XRPUSDT",
+    "کاردانو": "ADAUSDT", "ادا": "ADAUSDT", "ada": "ADAUSDT",
+    "بایننس": "BNBUSDT", "بی ان بی": "BNBUSDT", "bnb": "BNBUSDT",
+    "تون": "TONUSDT", "ton": "TONUSDT",
+    "ترون": "TRXUSDT", "trx": "TRXUSDT",
+    "لینک": "LINKUSDT", "چین لینک": "LINKUSDT", "link": "LINKUSDT",
+    "آوالانچ": "AVAXUSDT", "اواکس": "AVAXUSDT", "avax": "AVAXUSDT",
+    "پالیگان": "MATICUSDT", "متیک": "MATICUSDT", "matic": "MATICUSDT",
+    "شیبا": "SHIBUSDT", "shib": "SHIBUSDT",
+    "پپه": "PEPEUSDT", "pepe": "PEPEUSDT",
+    "بونک": "BONKUSDT", "bonk": "BONKUSDT",
+    "فلوکی": "FLOKIUSDT", "floki": "FLOKIUSDT",
+    "لایت کوین": "LTCUSDT", "لایت": "LTCUSDT", "ltc": "LTCUSDT",
+    "بیت کوین کش": "BCHUSDT", "bch": "BCHUSDT",
+    "اپتوس": "APTUSDT", "apt": "APTUSDT",
+    "آربیتروم": "ARBUSDT", "arb": "ARBUSDT",
+    "آپتیمیزم": "OPUSDT", "op": "OPUSDT",
+    "نیر": "NEARUSDT", "near": "NEARUSDT",
+    "فانتوم": "FTMUSDT", "ftm": "FTMUSDT",
+    "طلا": "XAUUSDT", "گلد": "XAUUSDT", "gold": "XAUUSDT", "xau": "XAUUSDT",
+}
+
+ASSET_COMMAND_PREFIXES = ("تحلیل", "سیگنال")
 
 
 @dataclass(frozen=True)
@@ -223,33 +255,89 @@ def is_allowed(user_id: int) -> bool:
     return not allowed or int(user_id) in allowed
 
 
-def extract_symbol(text: str) -> str:
-    t = str(text or "").upper()
+def _normalize_symbol_safe(symbol: str) -> str:
+    raw = str(symbol or "").upper().strip().replace("/", "").replace("-", "")
+    if not raw:
+        return ""
+    try:
+        normalized = normalize_symbol(raw)
+        if normalized:
+            raw = str(normalized).upper().replace("/", "").replace("-", "")
+    except Exception:
+        pass
+    if raw.endswith("USDT"):
+        return raw
+    if 2 <= len(raw) <= 12 and re.match(r"^[A-Z0-9]+$", raw):
+        return raw + "USDT"
+    return raw
+
+
+def extract_symbol(text: str, default: str = "BTCUSDT") -> str:
+    """Resolve English tickers and Persian asset names into bot symbols."""
+    original = str(text or "").strip()
+    compact = original.lower().replace("‌", " ").replace("\u200c", " ")
+    compact = re.sub(r"\s+", " ", compact).strip()
+
+    # Remove command words but keep the asset name.
+    asset_part = compact
+    for prefix in ASSET_COMMAND_PREFIXES:
+        if asset_part.startswith(prefix):
+            asset_part = asset_part[len(prefix):].strip()
+
+    # Longest alias first so "بیت کوین" wins before "بیت".
+    for alias in sorted(PERSIAN_SYMBOL_ALIASES, key=len, reverse=True):
+        if asset_part == alias or alias in asset_part:
+            return PERSIAN_SYMBOL_ALIASES[alias]
+
+    # If symbol_mapper.py on VPS exposes a richer resolver, use it safely.
+    try:
+        import symbol_mapper as _sm  # type: ignore
+        for fn_name in ("resolve_symbol", "normalize_input_symbol", "map_symbol", "symbol_from_text"):
+            fn = getattr(_sm, fn_name, None)
+            if callable(fn):
+                resolved = fn(original)
+                if resolved:
+                    return _normalize_symbol_safe(str(resolved))
+    except Exception:
+        pass
+
+    t = original.upper()
     t = re.sub(r"[^\w\s]", " ", t)
     words = [w for w in t.split() if w]
     for w in reversed(words):
-        if w in {"تحلیل", "سیگنال", "بازار", "بررسی", "LONG", "SHORT"}:
+        if w in {"تحلیل", "سیگنال", "بازار", "بررسی", "LONG", "SHORT", "وضعیت", "ترید"}:
             continue
-        if w.endswith("USDT"):
-            return w
-        if 2 <= len(w) <= 12 and re.match(r"^[A-Z0-9]+$", w):
-            return w + "USDT"
-    return "BTCUSDT"
+        if re.match(r"^[A-Z0-9]{2,15}$", w):
+            return _normalize_symbol_safe(w)
+    return default
 
 
-async def send_payload(update: Update, payload: ReportPayload) -> None:
+def is_direct_asset_query(text: str) -> bool:
+    """Allow commands like 'بیتکوین' or 'SOL' without تحلیل/سیگنال."""
+    compact = str(text or "").strip().lower().replace("‌", " ").replace("\u200c", " ")
+    compact = re.sub(r"\s+", " ", compact).strip()
+    if not compact or len(compact) > 30:
+        return False
+    if compact.startswith(("وضعیت", "ترید", "آمار", "بررسی", "موجودی", "بالانس", "پوزیشن", "توبیت", "بستن", "هوش")):
+        return False
+    if extract_symbol(compact, default=""):
+        return True
+    return False
+
+
+async def send_payload(update: Update, payload: ReportPayload) -> Any:
     if not payload.should_send or not payload.text:
-        return
+        return None
     message = getattr(update, "effective_message", None)
     if message is None:
-        return
+        return None
     kwargs: Dict[str, Any] = {}
     if payload.reply_to_message_id:
         kwargs["reply_to_message_id"] = payload.reply_to_message_id
     try:
-        await message.reply_text(payload.text, **kwargs)
+        return await message.reply_text(payload.text, **kwargs)
     except TypeError:
-        await message.reply_text(payload.text)
+        return await message.reply_text(payload.text)
     except Exception as exc:
         LOGGER.exception("send_payload failed: %s", exc)
 
@@ -258,6 +346,65 @@ async def send_text(update: Update, text: str) -> None:
     message = getattr(update, "effective_message", None)
     if message is not None:
         await message.reply_text(text)
+
+
+
+def active_position_count() -> int:
+    """Count internal active positions including PENDING_REAL_CONFIRM."""
+    closed = {"CLOSED", "TP2", "AI_EXIT", "SL", "FAILED", "REJECTED"}
+    try:
+        positions = store().section("positions")
+        count = 0
+        for item in positions.values():
+            if not isinstance(item, dict):
+                continue
+            status = str(item.get("status", "")).upper()
+            if status not in closed:
+                count += 1
+        return count
+    except Exception:
+        return 0
+
+
+def real_capacity_available() -> bool:
+    """Soft slot guard for auto-scan before running costly REAL execution path."""
+    max_pos = runtime_max_positions()
+    if max_pos <= 0:
+        return True
+    internal_count = active_position_count()
+    exchange_count = 0
+    try:
+        summary = toobit_summary()
+        exchange_count = safe_int(summary.get("open_positions_count", 0), 0) if isinstance(summary, dict) else 0
+    except Exception:
+        exchange_count = 0
+    return max(internal_count, exchange_count) < max_pos
+
+
+def attach_signal_message_to_position(trade_result: Optional[RealTradeOpenResult], message_obj: Any) -> None:
+    """Persist Telegram signal message id so TP/SL/AI_EXIT reports can reply to it."""
+    if not trade_result or message_obj is None:
+        return
+    msg_id = safe_int(getattr(message_obj, "message_id", 0), 0)
+    if msg_id <= 0:
+        return
+    try:
+        trade_id = str(getattr(trade_result, "trade_id", "") or "")
+        if not trade_id:
+            return
+        positions = store().section("positions")
+        rec = positions.get(trade_id)
+        if isinstance(rec, dict):
+            rec["signal_message_id"] = msg_id
+            meta = rec.get("meta") if isinstance(rec.get("meta"), dict) else {}
+            meta["signal_message_id"] = msg_id
+            rec["meta"] = meta
+            save_position(trade_id, rec)
+    except Exception as exc:
+        try:
+            save_error("attach_signal_message_to_position", str(exc), {"trade_result": trade_result.to_dict()})
+        except Exception:
+            pass
 
 
 class PipelineOrchestrator:
@@ -457,7 +604,11 @@ def toobit_summary() -> Dict[str, Any]:
 
     balance = {"ok": False, "error": "account_summary_missing"}
     if hasattr(c, "get_account_balance") and callable(c.get_account_balance):
-        balance = c.get_account_balance("USDT")
+        
+        try:
+            balance = c.get_account_balance("USDT")
+        except TypeError:
+            balance = c.get_account_balance()
     positions = c.get_open_positions() if hasattr(c, "get_open_positions") else []
     return {
         "ok": bool(balance.get("ok", False)) if isinstance(balance, dict) else False,
@@ -581,7 +732,7 @@ async def close_toobit_position_command(update: Update, text: str) -> bool:
         close_all = compact.startswith("بستن همه پوزیشن")
         if not close_all:
             target_symbol = extract_symbol(compact)
-            positions_to_close = [p for p in positions if str(p.get("symbol", "")).upper() == target_symbol.upper()]
+            positions_to_close = [p for p in positions if extract_symbol(str(p.get("symbol", "")), default=str(p.get("symbol", ""))) == target_symbol]
         else:
             target_symbol = "ALL"
             positions_to_close = positions
@@ -719,9 +870,9 @@ def build_ai_status_text() -> str:
     if isinstance(weak_layers, dict):
         weak_layers = list(weak_layers.keys())
 
-    real_wins = real.tp1_count + real.tp2_count + real.ai_exit_count
-    ghost_wins = ghost_tp1 + ghost_tp2 + ghost_ai_exit
-    all_wins = all_summary.tp1_count + all_summary.tp2_count + all_summary.ai_exit_count
+    real_wins = real.tp1_count
+    ghost_wins = ghost_tp1
+    all_wins = all_summary.tp1_count
 
     return (
         "🤖 وضعیت هوش مصنوعی\n\n"
@@ -858,7 +1009,7 @@ async def handle_stats(update: Update, text: str) -> bool:
 
 async def handle_analysis(update: Update, text: str) -> bool:
     t = str(text or "").strip()
-    if not (t.startswith("تحلیل") or t.startswith("سیگنال")):
+    if not (t.startswith("تحلیل") or t.startswith("سیگنال") or is_direct_asset_query(t)):
         return False
 
     symbol = extract_symbol(t)
@@ -866,7 +1017,8 @@ async def handle_analysis(update: Update, text: str) -> bool:
     try:
         result = await asyncio.to_thread(orchestrator().run_pipeline, symbol, "5m", None, True)
         if result.signal_report and result.decision.decision_type == DECISION_REAL:
-            await send_payload(update, result.signal_report)
+            sent_msg = await send_payload(update, result.signal_report)
+            attach_signal_message_to_position(result.trade_result, sent_msg)
         elif result.decision.decision_type == DECISION_GHOST:
             await send_text(update, f"{symbol}: سیگنال واقعی صادر نشد؛ فقط در یادگیری داخلی ثبت شد.")
         else:
@@ -981,6 +1133,8 @@ async def auto_scan_loop(app: Any) -> None:
             if auto_signal_enabled():
                 symbols = list(getattr(SETTINGS.market_data, "scan_symbols", ["BTCUSDT", "ETHUSDT"]))
                 for symbol in symbols:
+                    if real_trading_enabled() and not real_capacity_available():
+                        break
                     try:
                         result = await asyncio.to_thread(orchestrator().run_pipeline, symbol, "5m", None, True)
                         # Auto-scan must send Telegram alerts only for REAL signals.
@@ -989,7 +1143,8 @@ async def auto_scan_loop(app: Any) -> None:
                         if result.signal_report and result.decision.decision_type == DECISION_REAL:
                             oid = owner_id()
                             if oid:
-                                await app.bot.send_message(chat_id=oid, text=result.signal_report.text)
+                                sent_msg = await app.bot.send_message(chat_id=oid, text=result.signal_report.text)
+                                attach_signal_message_to_position(result.trade_result, sent_msg)
                         if result.trade_report:
                             oid = owner_id()
                             if oid:
