@@ -30,7 +30,7 @@ import logging
 import os
 import re
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields, is_dataclass, replace
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 try:
@@ -243,6 +243,82 @@ def save_runtime_settings(values: Dict[str, Any]) -> None:
 
 def real_trading_enabled() -> bool:
     return bool(get_runtime_settings().get("real_trading_enabled", False))
+
+
+def force_real_decision_to_ghost(decision: AIDecision, reason: str = "REAL_TRADING_DISABLED_TO_GHOST") -> AIDecision:
+    """
+    Downgrade a REAL decision to GHOST when real trading is disabled.
+
+    This keeps the AI decision/learning path alive while guaranteeing that:
+    - no REAL signal text is sent,
+    - no Toobit order is opened,
+    - the candidate is still stored as a hidden Ghost for learning.
+    """
+    if getattr(decision, "decision_type", "") != DECISION_REAL:
+        return decision
+
+    updates: Dict[str, Any] = {"decision_type": DECISION_GHOST}
+
+    try:
+        field_names = {f.name for f in fields(decision)} if is_dataclass(decision) else set()
+    except Exception:
+        field_names = set()
+
+    def _append_tuple_field(name: str) -> None:
+        if name not in field_names:
+            return
+        current = getattr(decision, name, ())
+        if current is None:
+            current = ()
+        if isinstance(current, str):
+            current_items = (current,)
+        else:
+            try:
+                current_items = tuple(current)
+            except Exception:
+                current_items = ()
+        if reason not in current_items:
+            updates[name] = tuple(list(current_items) + [reason])
+
+    def _append_list_field(name: str) -> None:
+        if name not in field_names:
+            return
+        current = getattr(decision, name, [])
+        if current is None:
+            current = []
+        if isinstance(current, str):
+            current_items = [current]
+        else:
+            try:
+                current_items = list(current)
+            except Exception:
+                current_items = []
+        if reason not in current_items:
+            updates[name] = current_items + [reason]
+
+    for name in ("reason_codes", "warnings"):
+        _append_tuple_field(name)
+
+    for name in ("reject_reasons", "ghost_reasons", "notes"):
+        _append_list_field(name)
+
+    # Optional flags used by some decision versions.
+    for name, value in {
+        "real_allowed": False,
+        "ghost_allowed": True,
+        "should_execute_real": False,
+        "execute_real": False,
+    }.items():
+        if name in field_names:
+            updates[name] = value
+
+    try:
+        return replace(decision, **updates)
+    except Exception:
+        # Last-resort fallback: keep original object but do not break the bot.
+        # If this happens, run_pipeline still blocks real execution below.
+        save_error("force_real_decision_to_ghost", "replace_failed", {"reason": reason})
+        return decision
 
 
 def auto_signal_enabled() -> bool:
@@ -501,6 +577,9 @@ class PipelineOrchestrator:
             learning=learning,
             meta=meta,
         )
+
+        if decision.decision_type == DECISION_REAL and not real_trading_enabled():
+            decision = force_real_decision_to_ghost(decision, "REAL_TRADING_DISABLED_TO_GHOST")
 
         plan: Optional[TPSLPlan] = None
         trade_result: Optional[RealTradeOpenResult] = None
