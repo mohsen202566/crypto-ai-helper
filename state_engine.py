@@ -177,9 +177,11 @@ class StateScorer:
             reasons.append("STATE_POWER_DOMINANT")
 
         # Late state / exhaustion.
-        if abs(snapshot.price_change_percent) > max(snapshot.atr_percent * 2.2, 1.2):
-            late += 25
-            reasons.append("STATE_PRICE_EXTENDED")
+        # Softer late detection for Movement Hunter:
+        # early pump/dump hunting must not mark a fresh expanding move as LATE too soon.
+        if abs(snapshot.price_change_percent) > max(snapshot.atr_percent * 2.8, 1.8):
+            late += 18
+            reasons.append("STATE_PRICE_EXTENDED_SOFT")
         if snapshot.momentum_weakness:
             late += 20
             exhaustion += 35
@@ -198,9 +200,11 @@ class StateScorer:
         if snapshot.liquidity_grab_up or snapshot.liquidity_grab_down:
             reversal += 24
             reasons.append("STATE_LIQUIDITY_GRAB_REVERSAL")
-        if trap is not None and trap.trap_risk >= 60:
-            reversal += 18
-            reasons.append("STATE_TRAP_REVERSAL_PRESSURE")
+        # Trap pressure should warn, not dry REAL too early.
+        # After trap_engine was softened, only stronger trap risk should push reversal state.
+        if trap is not None and trap.trap_risk >= 70:
+            reversal += 16
+            reasons.append("STATE_TRAP_REVERSAL_PRESSURE_SOFT")
         if movement is not None and movement.reversal_pressure >= 60:
             reversal += 20
             reasons.append("STATE_MOVEMENT_REVERSAL_PRESSURE")
@@ -232,12 +236,14 @@ class TransitionClassifier:
     def classify(self, snapshot: SensorSnapshot, score: StateScore, direction: str) -> Tuple[str, List[str]]:
         reasons: List[str] = []
 
-        if score.range_score >= 65 and score.start_score < 45:
-            reasons.append("TRANSITION_TREND_TO_RANGE")
+        # Avoid calling trend-to-range too early when start evidence exists.
+        if score.range_score >= 72 and score.start_score < 42 and score.middle_score < 45:
+            reasons.append("TRANSITION_TREND_TO_RANGE_SOFT")
             return TRANSITION_TREND_TO_RANGE, reasons
 
-        if snapshot.compression_score >= 65 and snapshot.atr_explosion:
-            reasons.append("TRANSITION_RANGE_TO_TREND")
+        # Movement Hunter priority: compression + ATR expansion/explosion is often pre-start/start.
+        if snapshot.compression_score >= 60 and (snapshot.atr_explosion or snapshot.atr_expansion == "EXPANDING"):
+            reasons.append("TRANSITION_RANGE_TO_TREND_EARLY")
             return TRANSITION_RANGE_TO_TREND, reasons
 
         if snapshot.breakout_candidate:
@@ -285,12 +291,17 @@ class StateClassifier:
         state, value = max(candidates.items(), key=lambda kv: kv[1])
 
         # Guardrails: exhaustion/reversal/range override weak start.
-        if score.exhaustion_score >= 65:
+        # Softer overrides: do not let range/exhaustion/reversal kill early movement too fast.
+        if score.exhaustion_score >= 72 and score.start_score < 55:
             return STATE_EXHAUSTION, clamp(score.exhaustion_score)
-        if score.reversal_score >= 70:
+        if score.reversal_score >= 76 and score.start_score < 58:
             return STATE_REVERSAL, clamp(score.reversal_score)
-        if score.range_score >= 75 and score.start_score < 60:
+        if score.range_score >= 82 and score.start_score < 55 and score.middle_score < 50:
             return STATE_RANGE, clamp(score.range_score)
+
+        # If start evidence is strong, prefer START even inside compression/range context.
+        if score.start_score >= 62 and score.start_score >= score.late_score and score.start_score >= score.exhaustion_score:
+            return STATE_START, clamp(score.start_score)
 
         if value < 25:
             return STATE_UNKNOWN, clamp(value)
@@ -348,10 +359,11 @@ class StateEngine:
             + (trap.trap_risk * 0.20 if trap else 0)
         )
 
+        # Softer late-entry risk: range alone should not heavily punish early movement hunting.
         late_entry_risk = clamp(
-            score.late_score * 0.50
-            + score.exhaustion_score * 0.35
-            + snapshot.range_probability * 0.15
+            score.late_score * 0.46
+            + score.exhaustion_score * 0.32
+            + snapshot.range_probability * 0.10
         )
 
         exhaustion_risk = clamp(score.exhaustion_score)
