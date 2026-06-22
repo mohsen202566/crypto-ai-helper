@@ -297,7 +297,7 @@ def build_direction_score(snapshot: SensorSnapshot) -> Tuple[DirectionScore, Tup
     short_total = clamp(short_total)
     gap = abs(long_total - short_total)
 
-    if gap < 8:
+    if gap < 4:
         direction = DIRECTION_NEUTRAL
         bias = BIAS_NEUTRAL
     elif long_total > short_total:
