@@ -173,12 +173,22 @@ def round_price(price: float, symbol: str = "") -> float:
     """
     Generic safe rounding. Exchange exact tick-size validation is done later
     inside tobit_client.py / real_trade_manager.py.
+
+    Important fix for meme/very-low-price futures:
+    PEPE/SHIB/BONK/FLOKI-style prices need more than 8 decimals. Rounding
+    everything below 0.1 to 8 decimals can collapse TP/SL too close to Entry
+    and Toobit rejects SHORT orders with: -3144 invalid short stop loss price.
     """
     price = safe_float(price)
     if price <= 0:
         return 0.0
 
-    if price >= 1000:
+    sym = str(symbol or "").upper()
+    if any(x in sym for x in ("PEPE", "SHIB", "BONK", "FLOKI")) or price < 0.0001:
+        decimals = 12
+    elif price < 0.01:
+        decimals = 10
+    elif price >= 1000:
         decimals = 2
     elif price >= 100:
         decimals = 3
@@ -191,6 +201,42 @@ def round_price(price: float, symbol: str = "") -> float:
     else:
         decimals = 8
     return round(price, decimals)
+
+
+def _min_distance_percent_for_symbol(symbol: str, entry: float) -> float:
+    """Minimum practical TP/SL distance before exchange tick validation.
+
+    This prevents tiny-price symbols from producing TP/SL values that are only
+    one display tick away from entry after rounding. It is deliberately small
+    enough for scalping, but large enough to avoid Toobit invalid stop prices.
+    """
+    sym = str(symbol or "").upper()
+    entry = safe_float(entry)
+
+    if any(x in sym for x in ("PEPE", "SHIB", "BONK", "FLOKI")):
+        return 0.28
+    if entry > 0 and entry < 0.0001:
+        return 0.28
+    if entry > 0 and entry < 0.01:
+        return 0.22
+    return 0.18
+
+
+def _enforce_min_distances(entry: float, direction: str, tp1_percent: float, tp2_percent: float, sl_percent: float, symbol: str) -> Tuple[float, float, float, List[str]]:
+    reasons: List[str] = []
+    min_pct = _min_distance_percent_for_symbol(symbol, entry)
+
+    if tp1_percent < min_pct:
+        tp1_percent = min_pct
+        reasons.append("TP1_MIN_DISTANCE_ENFORCED_FOR_EXCHANGE")
+    if sl_percent < min_pct:
+        sl_percent = min_pct
+        reasons.append("SL_MIN_DISTANCE_ENFORCED_FOR_EXCHANGE")
+    if tp2_percent > 0 and tp2_percent < tp1_percent * 1.25:
+        tp2_percent = tp1_percent * 1.25
+        reasons.append("TP2_MIN_DISTANCE_ENFORCED_FOR_EXCHANGE")
+
+    return tp1_percent, tp2_percent, sl_percent, reasons
 
 
 class BaseMultiplierEngine:
@@ -497,8 +543,20 @@ class TPSLEngine:
         sl_percent = min(sl_percent, max_sl_percent)
 
         # TP1 should remain reachable for 5M-15M scalping.
-        tp1_percent = clamp(tp1_percent, 0.18, max(1.50, atr_percent * 1.50))
+        min_exchange_distance = _min_distance_percent_for_symbol(decision.symbol, entry)
+        tp1_percent = clamp(tp1_percent, min_exchange_distance, max(1.50, atr_percent * 1.50))
         tp2_percent = clamp(tp2_percent, tp1_percent * 1.25, max(3.50, atr_percent * 2.80))
+        sl_percent = max(sl_percent, min_exchange_distance)
+
+        tp1_percent, tp2_percent, sl_percent, r = _enforce_min_distances(
+            entry=entry,
+            direction=direction,
+            tp1_percent=tp1_percent,
+            tp2_percent=tp2_percent,
+            sl_percent=sl_percent,
+            symbol=decision.symbol,
+        )
+        reasons.extend(r)
 
         mode, r = self.tp_mode.decide(
             decision=decision,
