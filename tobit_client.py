@@ -275,6 +275,12 @@ class ToobitClient:
         self.session = requests.Session()
         self._leverage_cache: Dict[str, Dict[str, Any]] = {}
         self._margin_mode_cache: Dict[str, Dict[str, Any]] = {}
+        # Exchange metadata is public but Toobit rate-limits it quickly.
+        # Cache it aggressively because order-size validation calls symbol rules
+        # before every real order. Without this cache, several REAL signals in a
+        # row can fail with: exchange_info_failed:{'raw': 'too many requests'}.
+        self._exchange_info_cache: Dict[str, Dict[str, Any]] = {}
+        self._symbol_rules_cache: Dict[str, Dict[str, Any]] = {}
         if self.credentials.api_key:
             # Working Toobit futures v1 routes require X-BB-APIKEY.
             # X-MBX/accessKey are kept only as harmless compatibility aliases.
@@ -446,15 +452,71 @@ class ToobitClient:
     # Public market / exchange info
     # -------------------------------------------------------------------------
 
+    def _is_rate_limit_response(self, response: Optional[ToobitResponse]) -> bool:
+        if response is None:
+            return False
+        text = f"{getattr(response, 'error', '')} {getattr(response, 'raw_text', '')} {getattr(response, 'data', '')}".lower()
+        return (
+            "too many requests" in text
+            or "rate limit" in text
+            or "ratelimit" in text
+            or str(getattr(response, "status_code", "")) == "429"
+        )
+
+    def _get_cached_exchange_info(self, allow_stale: bool = False) -> Optional[JsonDict]:
+        item = self._exchange_info_cache.get("exchange_info")
+        if not isinstance(item, dict):
+            return None
+        age = time.time() - safe_float(item.get("ts"), 0.0)
+        max_age = 600.0 if not allow_stale else 6 * 3600.0
+        if 0 <= age <= max_age and isinstance(item.get("value"), dict):
+            cached = dict(item["value"])
+            cached.setdefault("_cache", {})
+            cached["_cache"] = {**cached.get("_cache", {}), "hit": True, "age_seconds": round(age, 2), "stale": allow_stale and age > 600.0}
+            return cached
+        return None
+
+    def _set_cached_exchange_info(self, value: JsonDict, source: str = "") -> None:
+        if isinstance(value, dict) and value:
+            cached = dict(value)
+            cached.setdefault("_cache", {})
+            cached["_cache"] = {**cached.get("_cache", {}), "source": source, "saved_at": time.time()}
+            self._exchange_info_cache["exchange_info"] = {"value": cached, "ts": time.time()}
+
     def get_exchange_info(self) -> JsonDict:
         # Working Toobit account used v1 public metadata endpoints.
+        cached = self._get_cached_exchange_info(allow_stale=False)
+        if cached is not None:
+            return cached
+
+        last: Optional[ToobitResponse] = None
         for path in ("/api/v1/futures/exchangeInfo", "/api/v1/futures/symbols", "/api/v1/exchangeInfo"):
             res = self._request("GET", path, signed=False)
             if res.ok:
-                return res.data
-        return self._unwrap(res, "exchange_info")
+                data = res.data if isinstance(res.data, dict) else {"data": res.data}
+                self._set_cached_exchange_info(data, source=path)
+                return data
+            last = res
+
+        # If Toobit rate-limits public metadata, keep trading with the last
+        # valid cached exchangeInfo instead of failing otherwise valid orders.
+        if self._is_rate_limit_response(last):
+            stale = self._get_cached_exchange_info(allow_stale=True)
+            if stale is not None:
+                stale.setdefault("_cache", {})
+                stale["_cache"] = {**stale.get("_cache", {}), "used_due_to_rate_limit": True}
+                return stale
+
+        return self._unwrap(last, "exchange_info")
 
     def get_symbol_rules(self, symbol: str) -> JsonDict:
+        target = self.normalize_futures_symbol(symbol)
+        cached_rules = self._cache_get(self._symbol_rules_cache, target, 6 * 3600)
+        if isinstance(cached_rules, dict):
+            out = dict(cached_rules)
+            out.setdefault("source", "symbol_rules_cache")
+            return out
+
         info = self.get_exchange_info()
         symbols = info.get("symbols", info.get("data", info.get("contracts", [])))
         if isinstance(symbols, dict):
@@ -462,7 +524,7 @@ class ToobitClient:
         if not isinstance(symbols, list):
             symbols = []
 
-        target = str(symbol)
+        # target is already normalized to Toobit's futures format above.
         found: JsonDict = {}
         for item in symbols:
             if not isinstance(item, dict):
@@ -498,7 +560,7 @@ class ToobitClient:
         min_notional = max(min_notional, safe_float(found.get("minNotional", found.get("min_notional", 0.0))))
         price_tick = max(price_tick, safe_float(found.get("tickSize", found.get("priceTick", 0.0))))
 
-        return SymbolRules(
+        rules = SymbolRules(
             symbol=target,
             min_qty=min_qty,
             qty_step=qty_step,
@@ -507,6 +569,9 @@ class ToobitClient:
             quantity_precision=qty_precision,
             price_precision=price_precision,
         ).to_dict()
+        rules["source"] = "exchange_info" if found else "safe_fallback_no_symbol_rules"
+        self._cache_set(self._symbol_rules_cache, target, rules)
+        return rules
 
     def get_latest_price(self, symbol: str) -> float:
         res = self._request("GET", "/api/v2/futures/ticker/price", params={"symbol": symbol}, signed=False)
