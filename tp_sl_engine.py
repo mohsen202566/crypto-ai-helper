@@ -113,7 +113,7 @@ def safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
-def clamp(value: float, low: float, high: float) -> float:
+def clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
     return max(low, min(high, safe_float(value, low)))
 
 
@@ -575,7 +575,7 @@ def profit_quality_score(
         volume_bonus = -8.0
         warnings.append("LOW_VOLUME_TP_SL")
 
-    score = clamp(net_score + rr_score + noise_score + volume_bonus)
+    score = clamp(net_score + rr_score + noise_score + volume_bonus, 0.0, 100.0)
 
     if net < min_net:
         warnings.append("NET_PROFIT_BELOW_MIN")
