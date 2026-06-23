@@ -192,6 +192,22 @@ class MarketSnapshot:
         }
 
 
+
+@dataclass(frozen=True)
+class MultiTimeframeSnapshot:
+    symbol: str
+    snapshots: Dict[str, MarketSnapshot]
+    timestamp: int
+    source: str = "OKX"
+
+    def to_dict(self) -> JsonDict:
+        return {
+            "symbol": self.symbol,
+            "snapshots": {tf: snap.to_dict() for tf, snap in self.snapshots.items()},
+            "timestamp": self.timestamp,
+            "source": self.source,
+        }
+
 @dataclass(frozen=True)
 class MarketMode:
     mode: str
@@ -505,6 +521,26 @@ def scan_raw_market(
 def get_market_mode() -> Dict[str, Any]:
     return provider().get_market_mode().to_dict()
 
+
+
+def get_multi_timeframe_snapshot(
+    symbol: str,
+    timeframes: Optional[Iterable[str]] = None,
+    limit: Optional[int] = None,
+) -> MultiTimeframeSnapshot:
+    """Compatibility helper for bot.py.
+
+    Level 1 uses 5m-first, but this object keeps the old bot interface safe.
+    """
+    internal = normalize_symbol(symbol)
+    if not internal:
+        raise MarketDataError(f"unsupported_symbol:{symbol}")
+    selected = list(timeframes or ["5m"])
+    snaps: Dict[str, MarketSnapshot] = {}
+    for tf in selected:
+        tf_value = str(tf or "5m")
+        snaps[tf_value] = provider().get_snapshot(internal, interval=tf_value, limit=limit)
+    return MultiTimeframeSnapshot(symbol=internal, snapshots=snaps, timestamp=now_ms(), source="OKX")
 
 def market_data_health_check() -> Dict[str, Any]:
     return provider().health_check()
