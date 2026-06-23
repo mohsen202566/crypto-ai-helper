@@ -133,40 +133,127 @@ def _get_learning_value(learning_summary: Optional[Any], key: str, default: Any 
     return getattr(learning_summary, key, default)
 
 
+def _safe_learning_float(learning_summary: Optional[Any], key: str, default: float = 0.0) -> float:
+    try:
+        value = _get_learning_value(learning_summary, key, default)
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _safe_learning_int(learning_summary: Optional[Any], key: str, default: int = 0) -> int:
+    try:
+        value = _get_learning_value(learning_summary, key, default)
+        if value is None:
+            return default
+        return int(float(value))
+    except Exception:
+        return default
+
+
+def _learning_notes(learning_summary: Optional[Any]) -> Tuple[str, ...]:
+    notes = _get_learning_value(learning_summary, "notes", ())
+    if notes is None:
+        return ()
+    if isinstance(notes, str):
+        return (notes,)
+    try:
+        return tuple(str(x) for x in notes)
+    except Exception:
+        return ()
+
+
 class DataConfidenceEngine:
-    """Estimates confidence from historical sample counts and learning quality."""
+    """Estimates confidence from historical sample counts and learning quality.
+
+    Movement Hunter rule:
+    - Result history matters.
+    - Timing history matters too.
+    - Ghost samples are useful training data, not noise.
+    - Low data is caution, not blindness.
+    """
 
     def score(self, candidate: AnalysisCandidate, learning_summary: Optional[Any] = None) -> Tuple[float, int, float, List[str]]:
         reasons: List[str] = []
 
-        sample_count = int(_get_learning_value(learning_summary, "sample_count", 0) or 0)
-        similar_win_rate = float(_get_learning_value(learning_summary, "similar_win_rate", 50.0) or 50.0)
-        real_samples = int(_get_learning_value(learning_summary, "real_samples", 0) or 0)
-        ghost_samples = int(_get_learning_value(learning_summary, "ghost_samples", 0) or 0)
+        sample_count = _safe_learning_int(learning_summary, "sample_count", 0)
+        similar_win_rate = _safe_learning_float(learning_summary, "similar_win_rate", 50.0)
+        real_samples = _safe_learning_int(learning_summary, "real_samples", 0)
+        ghost_samples = _safe_learning_int(learning_summary, "ghost_samples", 0)
+
+        # New fields from movement_memory.py. They may not exist in older summaries,
+        # so every read is backward-compatible.
+        outcome_success_rate = _safe_learning_float(learning_summary, "outcome_success_rate", similar_win_rate)
+        timing_score = _safe_learning_float(learning_summary, "timing_score", 50.0)
+        early_success_rate = _safe_learning_float(learning_summary, "early_success_rate", 0.0)
+        fuzzy_match_score = _safe_learning_float(learning_summary, "fuzzy_match_score", 0.0)
+        notes = _learning_notes(learning_summary)
 
         if sample_count <= 0:
-            reasons.append("NO_SIMILAR_HISTORY")
-            return 20.0, 0, 50.0, reasons
+            reasons.append("NO_SIMILAR_HISTORY_SOFT")
+            # No memory should not bury a fresh movement. It only means the AI
+            # should be cautious and let ai_decision_engine decide GHOST/REAL.
+            return 28.0, 0, 50.0, reasons
 
-        # Data confidence grows with sample size but avoids overconfidence.
-        sample_score = clamp(sample_count * 4.0)
+        # Sample confidence grows with both REAL and GHOST data. Ghost is the AI's
+        # practice school, so it gets meaningful credit but still less than REAL.
+        sample_score = clamp(sample_count * 5.0)
         if sample_count >= 30:
-            sample_score = 90.0
+            sample_score = 92.0
             reasons.append("HIGH_SAMPLE_COUNT")
         elif sample_count >= 10:
-            sample_score = 70.0
+            sample_score = 74.0
             reasons.append("MEDIUM_SAMPLE_COUNT")
+        elif sample_count >= 5:
+            sample_score = 56.0
+            reasons.append("SMALL_BUT_USABLE_SAMPLE_COUNT")
         else:
-            reasons.append("LOW_SAMPLE_COUNT")
+            sample_score = 42.0
+            reasons.append("LOW_SAMPLE_COUNT_SOFT")
 
-        real_weight_bonus = min(10.0, real_samples * 1.2)
-        ghost_weight_bonus = min(5.0, ghost_samples * 0.25)
+        real_weight_bonus = min(12.0, real_samples * 1.4)
+        ghost_weight_bonus = min(11.0, ghost_samples * 0.55)
 
-        wr_score = clamp(50.0 + (similar_win_rate - 50.0) * 0.8)
-        confidence = clamp(sample_score * 0.55 + wr_score * 0.35 + real_weight_bonus + ghost_weight_bonus)
+        wr_score = clamp(50.0 + (similar_win_rate - 50.0) * 0.75)
+        outcome_score = clamp(50.0 + (outcome_success_rate - 50.0) * 0.85)
+        timing_component = clamp(timing_score)
+        early_component = clamp(50.0 + early_success_rate * 0.55)
+        fuzzy_component = clamp(fuzzy_match_score)
+
+        confidence = clamp(
+            sample_score * 0.26
+            + wr_score * 0.20
+            + outcome_score * 0.20
+            + timing_component * 0.18
+            + early_component * 0.10
+            + fuzzy_component * 0.06
+            + real_weight_bonus
+            + ghost_weight_bonus
+        )
+
+        if timing_score >= 65:
+            reasons.append("LEARNING_TIMING_SUPPORTS_CONFIDENCE")
+        elif timing_score <= 40 and sample_count >= 5:
+            reasons.append("LEARNING_TIMING_WEAK")
+
+        if early_success_rate >= 45 and sample_count >= 5:
+            reasons.append("EARLY_SUCCESS_HISTORY_SUPPORTS_CONFIDENCE")
+
+        if fuzzy_match_score >= 70:
+            reasons.append("FUZZY_MEMORY_MATCH_STRONG")
+        elif fuzzy_match_score > 0 and fuzzy_match_score < 55:
+            reasons.append("FUZZY_MEMORY_MATCH_WEAK")
+
+        if "PREMOVE_PATTERN_WEAK_OR_LATE" in notes:
+            confidence = clamp(confidence - 8.0)
+            reasons.append("MEMORY_PATTERN_WEAK_OR_LATE_REDUCED_CONFIDENCE")
+        if "PREMOVE_PATTERN_WORKED_WITH_TIMING" in notes:
+            confidence = clamp(confidence + 5.0)
+            reasons.append("MEMORY_PATTERN_WORKED_WITH_TIMING_BONUS")
 
         return confidence, sample_count, similar_win_rate, reasons
-
 
 class ConflictDetector:
     """Detects disagreement between analysis, movement, trap and state layers."""
@@ -209,7 +296,11 @@ class ConflictDetector:
 
 
 class UnknownStateDetector:
-    """Detects out-of-distribution / unknown conditions."""
+    """Detects out-of-distribution / unknown conditions.
+
+    Low-data should encourage Ghost when uncertain, but it must not erase fresh
+    high-quality movement births. Real invalid sensor data remains dangerous.
+    """
 
     def score(
         self,
@@ -223,19 +314,32 @@ class UnknownStateDetector:
         boundary = BOUNDARY_KNOWN
         reasons: List[str] = []
 
-        sample_count = int(_get_learning_value(learning_summary, "sample_count", 0) or 0)
+        sample_count = _safe_learning_int(learning_summary, "sample_count", 0)
+        timing_score = _safe_learning_float(learning_summary, "timing_score", 50.0)
+        early_success_rate = _safe_learning_float(learning_summary, "early_success_rate", 0.0)
+        fuzzy_match_score = _safe_learning_float(learning_summary, "fuzzy_match_score", 0.0)
+
+        fresh_live_move = (
+            movement.freshness in {"FRESH", "MID"}
+            and movement.readiness_score >= 45
+            and movement.continuation_probability >= 35
+        )
+        learning_timing_support = (
+            sample_count >= 3
+            and (timing_score >= 62 or early_success_rate >= 35 or fuzzy_match_score >= 68)
+        )
 
         if sample_count == 0:
-            penalty += 35
+            penalty += 24 if fresh_live_move else 32
             boundary = BOUNDARY_UNKNOWN
-            reasons.append("UNKNOWN_CONDITION_NO_HISTORY")
+            reasons.append("UNKNOWN_CONDITION_NO_HISTORY_SOFT")
         elif sample_count < 5:
-            penalty += 22
+            penalty += 12 if (fresh_live_move or learning_timing_support) else 20
             boundary = BOUNDARY_LOW_DATA
-            reasons.append("LOW_DATA_CONDITION")
+            reasons.append("LOW_DATA_CONDITION_SOFT")
 
         if state.market_state == "UNKNOWN":
-            penalty += 18
+            penalty += 14
             boundary = BOUNDARY_UNKNOWN
             reasons.append("UNKNOWN_STATE")
 
@@ -259,20 +363,56 @@ class UnknownStateDetector:
             boundary = BOUNDARY_OUT_OF_DISTRIBUTION
             reasons.append("EXTREME_POWER_WITH_TRAP_RISK")
 
-        return clamp(penalty), boundary, reasons
+        if learning_timing_support and boundary in {BOUNDARY_LOW_DATA, BOUNDARY_UNKNOWN}:
+            penalty = max(0.0, penalty - 6.0)
+            reasons.append("TIMING_MEMORY_SOFTENS_UNKNOWN_BOUNDARY")
 
+        return clamp(penalty), boundary, reasons
 
 class ConfidenceLevelClassifier:
     """Classifies final confidence level and downgrade flags."""
 
-    def classify(self, total: float, boundary: str, trap: TrapResult, state: StateResult) -> Tuple[str, bool, bool, List[str]]:
+    def classify(
+        self,
+        total: float,
+        boundary: str,
+        trap: TrapResult,
+        state: StateResult,
+        movement: Optional[MovementHunterResult] = None,
+        learning_summary: Optional[Any] = None,
+    ) -> Tuple[str, bool, bool, List[str]]:
         reasons: List[str] = []
         downgrade = False
         reject_if_risk_high = False
 
+        timing_score = _safe_learning_float(learning_summary, "timing_score", 50.0)
+        early_success_rate = _safe_learning_float(learning_summary, "early_success_rate", 0.0)
+        fuzzy_match_score = _safe_learning_float(learning_summary, "fuzzy_match_score", 0.0)
+        sample_count = _safe_learning_int(learning_summary, "sample_count", 0)
+
+        fresh_supported = bool(
+            movement is not None
+            and movement.freshness in {"FRESH", "MID"}
+            and movement.readiness_score >= 45
+            and movement.continuation_probability >= 35
+        )
+        memory_supported = bool(
+            sample_count >= 3
+            and (timing_score >= 62 or early_success_rate >= 40 or fuzzy_match_score >= 70)
+        )
+
         if boundary in {BOUNDARY_UNKNOWN, BOUNDARY_OUT_OF_DISTRIBUTION, BOUNDARY_LOW_DATA}:
             downgrade = True
             reasons.append("BOUNDARY_REQUIRES_GHOST_DOWNGRADE")
+
+        # Allow the AI brain to consider strong fresh/memory-supported cases;
+        # do not force downgrade only because data is still small.
+        if boundary == BOUNDARY_LOW_DATA and fresh_supported and total >= 58 and trap.trap_risk < 65:
+            downgrade = False
+            reasons.append("LOW_DATA_OVERRIDDEN_BY_FRESH_CONFIDENCE")
+        elif boundary == BOUNDARY_UNKNOWN and fresh_supported and memory_supported and total >= 64 and trap.trap_risk < 60:
+            downgrade = False
+            reasons.append("UNKNOWN_SOFTENED_BY_FRESH_MEMORY_SUPPORT")
 
         if trap.trap_risk >= 75:
             downgrade = True
@@ -280,11 +420,15 @@ class ConfidenceLevelClassifier:
             reasons.append("TRAP_RISK_LIMITS_CONFIDENCE")
 
         if state.market_state in {"RANGE", "EXHAUSTION"} and total < 75:
+            # Fresh movement can still be Ghost/learnable, but not blindly trusted.
             downgrade = True
             reasons.append("STATE_LIMITS_CONFIDENCE")
 
         if total >= 78 and boundary == BOUNDARY_KNOWN and trap.trap_risk < 60:
             level = CONFIDENCE_HIGH
+        elif total >= 66 and fresh_supported and memory_supported and trap.trap_risk < 65:
+            level = CONFIDENCE_HIGH
+            reasons.append("HUNTER_MEMORY_CONFIDENCE_HIGH")
         elif total >= 55:
             level = CONFIDENCE_MEDIUM
         elif total >= 35:
@@ -296,7 +440,6 @@ class ConfidenceLevelClassifier:
             reject_if_risk_high = True
 
         return level, downgrade, reject_if_risk_high, reasons
-
 
 class ConfidenceEngine:
     """
@@ -342,25 +485,37 @@ class ConfidenceEngine:
         unknown_penalty, boundary, r = self.unknown.score(candidate, movement, trap, state, learning_summary)
         reasons.extend(r)
 
-        # Balanced confidence:
-        # Keep uncertainty/trap/conflict as real risk controls, but do not let
-        # low-data or normal caution crush confidence to 0 and silence auto signals.
+        timing_score = _safe_learning_float(learning_summary, "timing_score", 50.0)
+        early_success_rate = _safe_learning_float(learning_summary, "early_success_rate", 0.0)
+        fuzzy_match_score = _safe_learning_float(learning_summary, "fuzzy_match_score", 0.0)
+        outcome_success_rate = _safe_learning_float(learning_summary, "outcome_success_rate", similar_wr)
+
+        learning_timing_confidence = clamp(
+            timing_score * 0.45
+            + early_success_rate * 0.30
+            + fuzzy_match_score * 0.15
+            + outcome_success_rate * 0.10
+        )
+
+        # Movement Hunter confidence:
+        # data/learning timing must actively help confidence, not just sit in reports.
         positive_confidence = (
-            data_score * 0.22
-            + signal_confidence * 0.34
-            + state_confidence * 0.18
-            + movement_confidence * 0.26
+            data_score * 0.24
+            + signal_confidence * 0.30
+            + state_confidence * 0.15
+            + movement_confidence * 0.22
+            + learning_timing_confidence * 0.09
         )
 
         risk_deduction = (
-            trap_penalty * 0.42
-            + conflict_penalty * 0.50
-            + unknown_penalty * 0.35
+            trap_penalty * 0.40
+            + conflict_penalty * 0.48
+            + unknown_penalty * 0.30
         )
 
         # Low-data / cautious states should downgrade to GHOST, not become zero-confidence.
         # Only truly broken input data is allowed to collapse confidence toward 0.
-        low_data_floor = 18.0 if sample_count <= 0 else 8.0
+        low_data_floor = 24.0 if sample_count <= 0 else 14.0
 
         sensor = getattr(candidate, "sensor_snapshot", None)
         try:
@@ -385,7 +540,9 @@ class ConfidenceEngine:
             boundary = BOUNDARY_CONFLICTED
             warnings.append("HIGH_LAYER_CONFLICT")
 
-        level, downgrade, reject_if_risk_high, r = self.classifier.classify(total, boundary, trap, state)
+        level, downgrade, reject_if_risk_high, r = self.classifier.classify(
+            total, boundary, trap, state, movement=movement, learning_summary=learning_summary
+        )
         reasons.extend(r)
 
         if downgrade:
