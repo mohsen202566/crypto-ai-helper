@@ -120,6 +120,34 @@ def avg(values: Sequence[float]) -> float:
     return sum(vals) / len(vals) if vals else 0.0
 
 
+def _learning_value(learning_summary: Optional[Any], key: str, default: Any = None) -> Any:
+    if learning_summary is None:
+        return default
+    if isinstance(learning_summary, dict):
+        return learning_summary.get(key, default)
+    return getattr(learning_summary, key, default)
+
+
+def _learning_float(learning_summary: Optional[Any], key: str, default: float = 0.0) -> float:
+    try:
+        value = _learning_value(learning_summary, key, default)
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _learning_int(learning_summary: Optional[Any], key: str, default: int = 0) -> int:
+    try:
+        value = _learning_value(learning_summary, key, default)
+        if value is None:
+            return default
+        return int(float(value))
+    except Exception:
+        return default
+
+
 def risk_level(score: float) -> str:
     score = clamp(score)
     if score >= 85:
@@ -243,28 +271,79 @@ class CloseQualityTrapDetector:
 
 
 class RangeTrapDetector:
-    """Detects fake-move probability inside range/compression."""
+    """Detects fake-move probability inside range/compression.
 
-    def score(self, snapshot: SensorSnapshot) -> Tuple[float, List[str]]:
+    Movement Hunter rule:
+    - Range alone is not a trap. Many strong pump/dump moves are born from range.
+    - Range becomes trap-risk only when there is no participation, no squeeze release,
+      and no learned early-success support.
+    """
+
+    def score(self, snapshot: SensorSnapshot, learning_summary: Optional[Any] = None) -> Tuple[float, List[str]]:
         risk = 0.0
         reasons: List[str] = []
 
-        if snapshot.range_probability >= 70:
-            risk += 45
-            reasons.append("HIGH_RANGE_TRAP")
+        timing_score = _learning_float(learning_summary, "timing_score", 50.0)
+        early_success_rate = _learning_float(learning_summary, "early_success_rate", 0.0)
+        fuzzy_match_score = _learning_float(learning_summary, "fuzzy_match_score", 0.0)
+        sample_count = _learning_int(learning_summary, "sample_count", 0)
+
+        participation = bool(
+            snapshot.atr_explosion
+            or snapshot.atr_expansion == "EXPANDING"
+            or snapshot.atr_slope > 0
+            or snapshot.volume_expansion
+            or snapshot.volume_spike
+            or abs(snapshot.power_delta) >= 8
+            or snapshot.breakout_candidate
+            or snapshot.breakdown_candidate
+        )
+
+        compression_breakout_context = bool(
+            snapshot.compression_score >= 38
+            and snapshot.range_probability < 92
+            and participation
+        )
+
+        memory_supports_breakout = bool(
+            sample_count >= 3
+            and (timing_score >= 62 or early_success_rate >= 35 or fuzzy_match_score >= 68)
+        )
+
+        if snapshot.range_probability >= 78:
+            if compression_breakout_context or memory_supports_breakout:
+                risk += 18
+                reasons.append("HIGH_RANGE_BUT_PRE_MOVE_CONTEXT")
+            else:
+                risk += 42
+                reasons.append("HIGH_RANGE_TRAP_NO_PRE_MOVE_CONTEXT")
         elif snapshot.range_probability >= 45:
-            risk += 25
-            reasons.append("MEDIUM_RANGE_TRAP")
+            if compression_breakout_context or memory_supports_breakout:
+                risk += 10
+                reasons.append("MEDIUM_RANGE_WITH_BREAKOUT_CONTEXT")
+            else:
+                risk += 22
+                reasons.append("MEDIUM_RANGE_TRAP_NO_CONTEXT")
 
         if snapshot.compression_score >= 70 and not snapshot.atr_explosion:
-            # Compression is not always bad; for Movement Hunter it can be the
-            # pre-move phase. Keep it as a soft risk, not a REAL killer.
-            risk += 22
-            reasons.append("COMPRESSION_SOFT_FAKE_MOVE_RISK")
+            if participation or memory_supports_breakout:
+                risk += 8
+                reasons.append("COMPRESSION_AS_PRE_MOVE_SOFT_RISK")
+            else:
+                risk += 22
+                reasons.append("COMPRESSION_NO_PARTICIPATION_FAKE_MOVE_RISK")
 
         if snapshot.adx < 16 and snapshot.relative_volume < 0.9:
-            risk += 25
-            reasons.append("LOW_ADX_LOW_VOLUME_TRAP")
+            if compression_breakout_context or memory_supports_breakout or abs(snapshot.power_delta) >= 12:
+                risk += 10
+                reasons.append("LOW_ADX_LOW_VOLUME_BUT_HUNTER_CONTEXT")
+            else:
+                risk += 25
+                reasons.append("LOW_ADX_LOW_VOLUME_TRAP")
+
+        if memory_supports_breakout:
+            risk = max(0.0, risk - 8.0)
+            reasons.append("MEMORY_SOFTENS_RANGE_TRAP_RISK")
 
         return clamp(risk), reasons
 
@@ -365,6 +444,7 @@ class TrapEngine:
         self,
         candidate_or_snapshot: AnalysisCandidate | SensorSnapshot,
         movement: Optional[MovementHunterResult] = None,
+        learning_summary: Optional[Any] = None,
     ) -> TrapResult:
         if isinstance(candidate_or_snapshot, AnalysisCandidate):
             snapshot = candidate_or_snapshot.sensor_snapshot
@@ -387,7 +467,7 @@ class TrapEngine:
         close_risk, r = self.close_quality.score(snapshot, direction)
         reasons.extend(r)
 
-        range_trap, r = self.range_trap.score(snapshot)
+        range_trap, r = self.range_trap.score(snapshot, learning_summary=learning_summary)
         reasons.extend(r)
 
         trap_type, long_prob, short_prob, r = self.classifier.classify(
@@ -441,6 +521,44 @@ class TrapEngine:
             if strong_mid:
                 total -= 6
                 reasons.append("STRONG_MID_MOVEMENT_SOFTENS_TRAP_RISK")
+
+        # Memory-aware trap softening:
+        # If the same coin/direction/condition historically produced early moves,
+        # do not let generic range/compression trap logic bury the setup.
+        timing_score = _learning_float(learning_summary, "timing_score", 50.0)
+        early_success_rate = _learning_float(learning_summary, "early_success_rate", 0.0)
+        fuzzy_match_score = _learning_float(learning_summary, "fuzzy_match_score", 0.0)
+        outcome_success_rate = _learning_float(learning_summary, "outcome_success_rate", 50.0)
+        sample_count = _learning_int(learning_summary, "sample_count", 0)
+
+        memory_supports_move = (
+            sample_count >= 3
+            and (
+                timing_score >= 62
+                or early_success_rate >= 35
+                or fuzzy_match_score >= 68
+            )
+            and outcome_success_rate >= 45
+        )
+
+        range_birth_context = (
+            snapshot.compression_score >= 38
+            and snapshot.range_probability < 92
+            and (
+                snapshot.atr_expansion == "EXPANDING"
+                or snapshot.atr_slope > 0
+                or snapshot.volume_expansion
+                or snapshot.volume_spike
+                or abs(snapshot.power_delta) >= 8
+            )
+        )
+
+        if memory_supports_move and range_birth_context and total < 78:
+            total -= 8
+            reasons.append("MEMORY_RANGE_BIRTH_SOFTENS_TRAP_RISK")
+        elif memory_supports_move and total < 72:
+            total -= 5
+            reasons.append("MEMORY_EARLY_SUCCESS_SOFTENS_TRAP_RISK")
 
         total = clamp(total)
         liquidity_total = clamp(avg([liquidity_risk, stop_hunt, wick_rejection]))
@@ -525,12 +643,14 @@ def engine() -> TrapEngine:
 def analyze_trap(
     candidate_or_snapshot: AnalysisCandidate | SensorSnapshot,
     movement: Optional[MovementHunterResult] = None,
+    learning_summary: Optional[Any] = None,
 ) -> TrapResult:
-    return engine().analyze(candidate_or_snapshot, movement=movement)
+    return engine().analyze(candidate_or_snapshot, movement=movement, learning_summary=learning_summary)
 
 
 def trap_engine(
     candidate_or_snapshot: AnalysisCandidate | SensorSnapshot,
     movement: Optional[MovementHunterResult] = None,
+    learning_summary: Optional[Any] = None,
 ) -> TrapResult:
-    return analyze_trap(candidate_or_snapshot, movement=movement)
+    return analyze_trap(candidate_or_snapshot, movement=movement, learning_summary=learning_summary)
