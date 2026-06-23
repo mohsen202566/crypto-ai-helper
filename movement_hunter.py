@@ -130,77 +130,117 @@ def _direction_from_input(candidate_or_snapshot: Any) -> str:
 class EarlyMomentumEngine:
     """
     Detects 0-candle / 1-candle / 2-candle movement ignition using sensors.
-    Does not wait for 3 candles as a hard condition.
+
+    Movement Hunter rule:
+    - Do not wait until the move is obvious.
+    - Detect birth-of-momentum from small but aligned RSI/MACD/Power/VWAP/volume/compression clues.
+    - This layer does not decide REAL/GHOST; it only tells the AI that a move may be forming.
     """
 
     def score(self, snapshot: SensorSnapshot, direction: str) -> Tuple[float, List[str]]:
         score = 0.0
         reasons: List[str] = []
 
+        # Generic participation context used by both directions.
+        volume_live = bool(snapshot.volume_expansion or snapshot.volume_spike)
+        atr_live = bool(snapshot.atr_expansion == "EXPANDING" or snapshot.atr_explosion or snapshot.atr_slope > 0)
+        compression_live = bool(snapshot.compression_score >= 38 and snapshot.range_probability < 86)
+        power_abs = abs(float(getattr(snapshot, "power_delta", 0.0) or 0.0))
+
         if direction == DIRECTION_LONG:
-            # Softer ultra-early thresholds: the bot must detect the first
-            # ignition signs before the pump is fully visible.
-            if snapshot.rsi_slope > 0.15:
-                score += 16
-                reasons.append("EARLY_RSI_SLOPE_UP_SOFT")
-            if snapshot.rsi_acceleration > 0.05:
-                score += 10
-                reasons.append("EARLY_RSI_ACCEL_UP_SOFT")
-            if snapshot.histogram_slope > 0:
-                score += 16
-                reasons.append("EARLY_HIST_SLOPE_UP")
-            if snapshot.histogram_acceleration > 0:
-                score += 14
-                reasons.append("EARLY_HIST_ACCEL_UP")
-            if snapshot.vwap_state in {"RECLAIM", "ABOVE"}:
-                score += 10
-                reasons.append("VWAP_RECLAIM_OR_ABOVE")
-            if snapshot.power_delta > 8:
+            # Ultra-early bullish birth. Keep thresholds soft but require alignment across clues.
+            if snapshot.rsi_slope > 0.08:
                 score += 12
-                reasons.append("BUY_POWER_SHIFT")
-            if snapshot.close_quality > 0.65:
-                score += 6
-                reasons.append("BULL_CLOSE_QUALITY")
+                reasons.append("BIRTH_RSI_SLOPE_UP")
+            if snapshot.rsi_acceleration > 0.02:
+                score += 8
+                reasons.append("BIRTH_RSI_ACCEL_UP")
+            if snapshot.histogram_slope > 0:
+                score += 15
+                reasons.append("BIRTH_HIST_SLOPE_UP")
+            if snapshot.histogram_acceleration > 0:
+                score += 13
+                reasons.append("BIRTH_HIST_ACCEL_UP")
+            if snapshot.power_delta > 5:
+                score += 12
+                reasons.append("BIRTH_BUY_POWER_SHIFT")
+            if snapshot.power_delta > 14:
+                score += 8
+                reasons.append("STRONG_BUY_POWER_BIRTH")
+            if snapshot.vwap_state in {"RECLAIM", "ABOVE"}:
+                score += 9
+                reasons.append("VWAP_BULLISH_CONTEXT")
+            if snapshot.failed_breakdown or snapshot.liquidity_grab_down:
+                score += 10
+                reasons.append("SELL_SIDE_SWEEP_RECOVERY_BIRTH")
+            if snapshot.close_quality > 0.58:
+                score += 5
+                reasons.append("BULL_CLOSE_QUALITY_BIRTH")
+
+            aligned_birth = (
+                (snapshot.rsi_slope > 0 and snapshot.histogram_slope > 0 and snapshot.power_delta > 0)
+                or (snapshot.histogram_acceleration > 0 and snapshot.power_delta > 8)
+            )
+            if aligned_birth:
+                score += 10
+                reasons.append("ALIGNED_BULLISH_BIRTH_CLUSTER")
 
         elif direction == DIRECTION_SHORT:
-            # Softer ultra-early thresholds for dump hunting.
-            if snapshot.rsi_slope < -0.15:
-                score += 16
-                reasons.append("EARLY_RSI_SLOPE_DOWN_SOFT")
-            if snapshot.rsi_acceleration < -0.05:
-                score += 10
-                reasons.append("EARLY_RSI_ACCEL_DOWN_SOFT")
-            if snapshot.histogram_slope < 0:
-                score += 16
-                reasons.append("EARLY_HIST_SLOPE_DOWN")
-            if snapshot.histogram_acceleration < 0:
-                score += 14
-                reasons.append("EARLY_HIST_ACCEL_DOWN")
-            if snapshot.vwap_state in {"LOSS", "BELOW"}:
-                score += 10
-                reasons.append("VWAP_LOSS_OR_BELOW")
-            if snapshot.power_delta < -8:
+            # Ultra-early bearish birth. Same logic mirrored for dumps.
+            if snapshot.rsi_slope < -0.08:
                 score += 12
-                reasons.append("SELL_POWER_SHIFT")
-            if snapshot.close_quality < 0.35:
-                score += 6
-                reasons.append("BEAR_CLOSE_QUALITY")
+                reasons.append("BIRTH_RSI_SLOPE_DOWN")
+            if snapshot.rsi_acceleration < -0.02:
+                score += 8
+                reasons.append("BIRTH_RSI_ACCEL_DOWN")
+            if snapshot.histogram_slope < 0:
+                score += 15
+                reasons.append("BIRTH_HIST_SLOPE_DOWN")
+            if snapshot.histogram_acceleration < 0:
+                score += 13
+                reasons.append("BIRTH_HIST_ACCEL_DOWN")
+            if snapshot.power_delta < -5:
+                score += 12
+                reasons.append("BIRTH_SELL_POWER_SHIFT")
+            if snapshot.power_delta < -14:
+                score += 8
+                reasons.append("STRONG_SELL_POWER_BIRTH")
+            if snapshot.vwap_state in {"LOSS", "BELOW"}:
+                score += 9
+                reasons.append("VWAP_BEARISH_CONTEXT")
+            if snapshot.failed_breakout or snapshot.liquidity_grab_up:
+                score += 10
+                reasons.append("BUY_SIDE_SWEEP_REVERSAL_BIRTH")
+            if snapshot.close_quality < 0.42:
+                score += 5
+                reasons.append("BEAR_CLOSE_QUALITY_BIRTH")
 
-        if snapshot.volume_expansion:
-            score += 8
-            reasons.append("VOLUME_EXPANSION")
-        if snapshot.volume_spike:
-            score += 8
-            reasons.append("VOLUME_SPIKE")
+            aligned_birth = (
+                (snapshot.rsi_slope < 0 and snapshot.histogram_slope < 0 and snapshot.power_delta < 0)
+                or (snapshot.histogram_acceleration < 0 and snapshot.power_delta < -8)
+            )
+            if aligned_birth:
+                score += 10
+                reasons.append("ALIGNED_BEARISH_BIRTH_CLUSTER")
 
-        # Compression with the first momentum/volume signs is a pre-pump/pre-dump
-        # hint, not a reason to wait for confirmation.
-        if snapshot.compression_score >= 55 and (snapshot.atr_expansion == "EXPANDING" or snapshot.volume_expansion):
-            score += 10
-            reasons.append("COMPRESSION_IGNITION_EARLY_HINT")
+        if volume_live:
+            score += 9 if snapshot.volume_expansion else 0
+            score += 9 if snapshot.volume_spike else 0
+            reasons.append("LIVE_VOLUME_PARTICIPATION")
+
+        # Compression before breakout is valuable even before full ATR expansion.
+        if compression_live and (power_abs >= 8 or volume_live or atr_live):
+            score += 12
+            reasons.append("COMPRESSION_WITH_EARLY_PARTICIPATION")
+        elif compression_live and power_abs >= 5:
+            score += 7
+            reasons.append("EARLY_SQUEEZE_PRESSURE")
+
+        if atr_live and power_abs >= 5:
+            score += 6
+            reasons.append("ATR_POWER_IGNITION_COMBO")
 
         return clamp(score), reasons
-
 
 class ATRMovementEngine:
     """ATR expansion / volatility ignition detection."""
@@ -323,51 +363,92 @@ class ExhaustionPressureEngine:
 
 
 class MovementPhaseClassifier:
-    """Classifies movement phase for AI."""
+    """Classifies movement phase for AI.
+
+    Goal: produce more FRESH/EARLY/PRE-MOVE descriptions and avoid calling
+    forming moves LATE too early. Final REAL/GHOST still belongs to AI decision.
+    """
 
     def classify(self, snapshot: SensorSnapshot, score: MovementScore, direction: str) -> Tuple[str, str, float, List[str]]:
         reasons: List[str] = []
         readiness = score.total_score
         reversal_pressure = clamp(score.exhaustion_penalty + snapshot.stop_hunt_probability * 0.35)
 
-        # Severe range: only mark DEAD when the setup has very weak readiness and no ATR expansion.
-        # Moderate range should stay alive as LATE/MID so AI can still learn via GHOST.
-        if snapshot.range_probability >= 88 and readiness < 30 and not snapshot.atr_explosion and snapshot.atr_expansion != "EXPANDING":
-            reasons.append("PHASE_RANGE_SEVERE_SOFT")
+        compression_birth = (
+            snapshot.compression_score >= 38
+            and snapshot.range_probability < 86
+            and (
+                abs(snapshot.power_delta) >= 8
+                or snapshot.volume_expansion
+                or snapshot.volume_spike
+                or snapshot.atr_expansion == "EXPANDING"
+                or snapshot.atr_slope > 0
+            )
+        )
+        momentum_birth = score.early_momentum >= 24 and abs(snapshot.power_delta) >= 5
+        live_ignition = score.early_momentum >= 34 or score.atr_expansion >= 28 or score.breakout_readiness >= 20
+
+        # Severe range only when no birth/ignition evidence exists.
+        if (
+            snapshot.range_probability >= 90
+            and readiness < 28
+            and not snapshot.atr_explosion
+            and snapshot.atr_expansion != "EXPANDING"
+            and not compression_birth
+            and not momentum_birth
+        ):
+            reasons.append("PHASE_RANGE_SEVERE_NO_BIRTH")
             return PHASE_RANGE, FRESH_DEAD, reversal_pressure, reasons
 
-        if snapshot.range_probability >= 78 and readiness < 42 and snapshot.atr_expansion != "EXPANDING":
-            reasons.append("PHASE_RANGE_MODERATE_SOFT")
+        if (
+            snapshot.range_probability >= 82
+            and readiness < 34
+            and snapshot.atr_expansion != "EXPANDING"
+            and not compression_birth
+            and not momentum_birth
+        ):
+            reasons.append("PHASE_RANGE_LATE_NO_BREAKOUT_BIRTH")
             return PHASE_RANGE, FRESH_LATE, reversal_pressure, reasons
 
-        # Exhaustion should be DEAD only when very strong. Normal weakness is LATE, not a hard kill.
-        if score.exhaustion_penalty >= 88:
-            reasons.append("PHASE_EXHAUSTION_SEVERE_SOFT")
+        # Exhaustion should not kill a forming counter-move / squeeze birth.
+        if score.exhaustion_penalty >= 90 and readiness < 46 and not compression_birth and not momentum_birth:
+            reasons.append("PHASE_EXHAUSTION_SEVERE_CONFIRMED")
             return PHASE_EXHAUSTION, FRESH_DEAD, reversal_pressure, reasons
 
-        if score.exhaustion_penalty >= 72 and readiness < 55:
-            reasons.append("PHASE_EXHAUSTION_MODERATE_SOFT")
+        if score.exhaustion_penalty >= 76 and readiness < 46 and not live_ignition:
+            reasons.append("PHASE_EXHAUSTION_MODERATE_CONFIRMED")
             return PHASE_EXHAUSTION, FRESH_LATE, reversal_pressure, reasons
 
-        if readiness >= 66 and score.early_momentum >= 44:
-            reasons.append("PHASE_START_EARLY")
+        # Strongest hunter states first.
+        if readiness >= 62 and score.early_momentum >= 38:
+            reasons.append("PHASE_EARLY_STRONG_BIRTH")
             return PHASE_EARLY, FRESH_FRESH, reversal_pressure, reasons
 
-        if readiness >= 48 and score.early_momentum >= 28:
-            reasons.append("PHASE_START_SOFT")
+        if readiness >= 46 and (score.early_momentum >= 26 or compression_birth):
+            reasons.append("PHASE_START_BIRTH_CONFIRMED")
             return PHASE_START, FRESH_FRESH, reversal_pressure, reasons
 
-        if readiness >= 36:
-            reasons.append("PHASE_MIDDLE")
+        # Pre-start / weak fresh state: keep it fresh for predictor/AI learning instead of labeling it LATE.
+        if compression_birth or momentum_birth:
+            reasons.append("PHASE_START_PRE_MOVE_BIRTH")
+            return PHASE_START, FRESH_FRESH, reversal_pressure, reasons
+
+        # MID now requires stronger readiness than before so weak early setups are not swallowed as MID.
+        if readiness >= 44 and live_ignition:
+            reasons.append("PHASE_MIDDLE_LIVE_MOVE")
             return PHASE_MIDDLE, FRESH_MID, reversal_pressure, reasons
 
-        if readiness >= 20:
-            reasons.append("PHASE_LATE_LOW_READINESS")
+        # Low readiness with some early clues remains UNKNOWN/FRESH-ish for learning, not automatic late.
+        if readiness >= 24 and score.early_momentum >= 18:
+            reasons.append("PHASE_UNKNOWN_EARLY_WATCH")
+            return PHASE_UNKNOWN, FRESH_UNKNOWN, reversal_pressure, reasons
+
+        if readiness >= 24:
+            reasons.append("PHASE_LATE_LOW_IGNITION")
             return PHASE_LATE, FRESH_LATE, reversal_pressure, reasons
 
         reasons.append("PHASE_UNKNOWN")
         return PHASE_UNKNOWN, FRESH_UNKNOWN, reversal_pressure, reasons
-
 
 class MovementHunter:
     """
@@ -418,17 +499,27 @@ class MovementHunter:
             volume_participation = max(volume_participation, 85.0)
 
         raw_total = (
-            early_score * 0.38
-            + atr_score * 0.22
-            + power_shift * 0.15
-            + volume_participation * 0.12
-            + breakout_score * 0.13
+            early_score * 0.44
+            + atr_score * 0.18
+            + power_shift * 0.16
+            + volume_participation * 0.10
+            + breakout_score * 0.12
         )
 
         # Balanced suppression: range/exhaustion reduce quality, but should not silence
         # every early-movement candidate before AI can classify REAL/GHOST/REJECT.
-        penalty = range_penalty * 0.18 + exhaustion_penalty * 0.30
-        total = clamp(raw_total - penalty)
+        # Birth-of-momentum bonus: avoid losing the first candle when multiple
+        # early clues align before the move is obvious.
+        birth_bonus = 0.0
+        if early_score >= 32 and abs(snapshot.power_delta) >= 8:
+            birth_bonus += 6.0
+            reasons.append("BIRTH_BONUS_POWER_ALIGNED")
+        if snapshot.compression_score >= 40 and snapshot.range_probability < 86 and (snapshot.volume_expansion or snapshot.atr_slope > 0 or abs(snapshot.power_delta) >= 10):
+            birth_bonus += 6.0
+            reasons.append("BIRTH_BONUS_SQUEEZE_CONTEXT")
+
+        penalty = range_penalty * 0.14 + exhaustion_penalty * 0.26
+        total = clamp(raw_total + birth_bonus - penalty)
 
         movement_score = MovementScore(
             early_momentum=early_score,
@@ -445,9 +536,10 @@ class MovementHunter:
 
         continuation = clamp(
             total
-            - reversal_pressure * 0.38
-            - snapshot.range_probability * 0.18
+            - reversal_pressure * 0.34
+            - snapshot.range_probability * 0.14
             + (10 if snapshot.atr_explosion else 0)
+            + (6 if (snapshot.compression_score >= 40 and abs(snapshot.power_delta) >= 8) else 0)
         )
 
         reasons.extend(early_reasons)
