@@ -50,6 +50,11 @@ from coin_learning import LearningSummary
 from movement_predictor import MovementPredictionResult
 from config import SETTINGS
 
+try:
+    from data_store import store
+except Exception:  # keep compile-safe when data_store is unavailable in isolated tests
+    store = None  # type: ignore
+
 
 JsonDict = Dict[str, Any]
 
@@ -82,6 +87,15 @@ class TPSLPlan:
     tp2_distance_percent: float
     atr_percent: float
     quality_label: str
+
+    # Fee-aware / capital-aware estimates. These are informational for reports
+    # and validation; real order sizing is still done later by real_trade_manager.
+    notional_usdt: float = 0.0
+    estimated_tp1_gross_usdt: float = 0.0
+    estimated_tp1_fee_usdt: float = 0.0
+    estimated_tp1_net_usdt: float = 0.0
+    min_required_net_profit_usdt: float = 0.0
+
     reason_codes: Tuple[str, ...] = field(default_factory=tuple)
     warnings: Tuple[str, ...] = field(default_factory=tuple)
     valid: bool = True
@@ -238,6 +252,222 @@ def _enforce_min_distances(entry: float, direction: str, tp1_percent: float, tp2
 
     return tp1_percent, tp2_percent, sl_percent, reasons
 
+
+
+
+def _runtime_setting_float(key: str, default: float) -> float:
+    """Read runtime_settings without creating a hard dependency on bot.py."""
+    try:
+        if store is not None:
+            section = store().section("runtime_settings")
+            if key in section:
+                return safe_float(section.get(key), default)
+    except Exception:
+        pass
+    return default
+
+
+def _runtime_setting_int(key: str, default: int) -> int:
+    try:
+        return int(round(_runtime_setting_float(key, float(default))))
+    except Exception:
+        return default
+
+
+def _trade_margin_usdt() -> float:
+    default = safe_float(getattr(SETTINGS.trading, "margin_usdt", 5.0), 5.0)
+    # Support both names used by bot.py / real_trade_manager.py.
+    return max(0.0, _runtime_setting_float("margin_usdt", _runtime_setting_float("trade_margin_usdt", default)))
+
+
+def _trade_leverage() -> int:
+    default = int(safe_float(getattr(SETTINGS.trading, "leverage", 10), 10))
+    return max(1, _runtime_setting_int("leverage", default))
+
+
+def _fee_rate_per_side() -> float:
+    # Conservative default taker fee. Config can override with trading.taker_fee_rate
+    # or tp.fee_rate_per_side.
+    cfg = safe_float(getattr(SETTINGS.tp, "fee_rate_per_side", 0.0), 0.0)
+    if cfg <= 0:
+        cfg = safe_float(getattr(SETTINGS.trading, "taker_fee_rate", 0.0006), 0.0006)
+    return max(0.0, cfg)
+
+
+def _min_net_profit_usdt() -> float:
+    # User preference: avoid TP where profit is eaten by fees. Default 10 cents.
+    cfg = safe_float(getattr(SETTINGS.tp, "min_net_profit_usdt", 0.10), 0.10)
+    return max(0.0, cfg)
+
+
+def _notional_usdt() -> float:
+    return _trade_margin_usdt() * float(_trade_leverage())
+
+
+def _estimated_fee_usdt(notional: float) -> float:
+    # Entry + TP exit. This is intentionally conservative.
+    return max(0.0, safe_float(notional) * _fee_rate_per_side() * 2.0)
+
+
+def _gross_profit_usdt(notional: float, tp_percent: float) -> float:
+    return max(0.0, safe_float(notional) * safe_float(tp_percent) / 100.0)
+
+
+def _min_tp_percent_for_net_profit() -> Tuple[float, float, float, float, List[str]]:
+    """Return minimum TP percent required to clear fee + min net profit."""
+    reasons: List[str] = []
+    notional = _notional_usdt()
+    fee = _estimated_fee_usdt(notional)
+    min_net = _min_net_profit_usdt()
+    if notional <= 0:
+        return 0.0, notional, fee, min_net, ["FEE_AWARE_SKIPPED_NO_NOTIONAL"]
+    required = (fee + min_net) / notional * 100.0
+    reasons.append("FEE_AWARE_MIN_NET_PROFIT_CHECK")
+    return required, notional, fee, min_net, reasons
+
+
+def _iter_numeric_levels(value: Any) -> List[float]:
+    levels: List[float] = []
+    if value is None:
+        return levels
+    if isinstance(value, (int, float)):
+        v = safe_float(value)
+        if v > 0:
+            levels.append(v)
+        return levels
+    if isinstance(value, dict):
+        for k in ("price", "level", "value", "low", "high", "support", "resistance"):
+            if k in value:
+                levels.extend(_iter_numeric_levels(value.get(k)))
+        return levels
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            levels.extend(_iter_numeric_levels(item))
+        return levels
+    return levels
+
+
+def _snapshot_levels(candidate: AnalysisCandidate, side: str) -> List[float]:
+    """Extract support/resistance/swing levels from whatever analysis_layers provides."""
+    s = candidate.sensor_snapshot
+    if side == "support":
+        names = (
+            "nearest_support", "support", "support_price", "support_level", "supports",
+            "swing_low", "last_swing_low", "recent_low", "low_20", "low_50",
+            "demand_zone", "demand_zone_low", "demand_low", "sr_support",
+        )
+    else:
+        names = (
+            "nearest_resistance", "resistance", "resistance_price", "resistance_level", "resistances",
+            "swing_high", "last_swing_high", "recent_high", "high_20", "high_50",
+            "supply_zone", "supply_zone_high", "supply_high", "sr_resistance",
+        )
+    out: List[float] = []
+    for name in names:
+        out.extend(_iter_numeric_levels(getattr(s, name, None)))
+    # Deduplicate while preserving meaningful levels only.
+    dedup: List[float] = []
+    for v in out:
+        if v > 0 and all(abs(v - x) / max(v, x, 1e-12) > 0.00001 for x in dedup):
+            dedup.append(v)
+    return dedup
+
+
+def _nearest_above(entry: float, levels: List[float]) -> Optional[float]:
+    above = [v for v in levels if v > entry]
+    return min(above) if above else None
+
+
+def _nearest_below(entry: float, levels: List[float]) -> Optional[float]:
+    below = [v for v in levels if 0 < v < entry]
+    return max(below) if below else None
+
+
+def _apply_sr_liquidity_rules(
+    entry: float,
+    direction: str,
+    tp1_percent: float,
+    tp2_percent: float,
+    sl_percent: float,
+    atr_percent: float,
+    candidate: AnalysisCandidate,
+) -> Tuple[float, float, float, List[str], List[str]]:
+    """Make TP cautious near SR and put SL beyond the nearest invalidation level.
+
+    LONG: SL should be below support; TP should normally be before resistance.
+    SHORT: SL should be above resistance; TP should normally be before support.
+    """
+    reasons: List[str] = []
+    warnings: List[str] = []
+    d = normalize_direction(direction)
+    buffer_pct = max(0.06, safe_float(atr_percent) * 0.16)
+
+    supports = _snapshot_levels(candidate, "support")
+    resistances = _snapshot_levels(candidate, "resistance")
+
+    if d == DIRECTION_LONG:
+        support = _nearest_below(entry, supports)
+        resistance = _nearest_above(entry, resistances)
+        if support:
+            support_dist = distance_percent(entry, support)
+            target_sl = support_dist + buffer_pct
+            if target_sl > sl_percent:
+                sl_percent = target_sl
+                reasons.append("SL_PLACED_BELOW_SUPPORT_WITH_BUFFER")
+        if resistance:
+            res_dist = distance_percent(entry, resistance)
+            # Take profit before resistance so TP1 is hit faster instead of waiting
+            # for a clean break through resistance.
+            cautious_tp = max(0.01, res_dist - buffer_pct)
+            if cautious_tp > 0 and cautious_tp < tp1_percent:
+                tp1_percent = cautious_tp
+                reasons.append("TP1_CAUTIOUS_BEFORE_RESISTANCE")
+            if tp2_percent > 0 and res_dist > 0:
+                tp2_cap = max(tp1_percent * 1.15, res_dist + buffer_pct * 0.50)
+                if tp2_percent > tp2_cap:
+                    tp2_percent = tp2_cap
+                    reasons.append("TP2_CAPPED_AROUND_RESISTANCE_ZONE")
+    elif d == DIRECTION_SHORT:
+        support = _nearest_below(entry, supports)
+        resistance = _nearest_above(entry, resistances)
+        if resistance:
+            resistance_dist = distance_percent(entry, resistance)
+            target_sl = resistance_dist + buffer_pct
+            if target_sl > sl_percent:
+                sl_percent = target_sl
+                reasons.append("SL_PLACED_ABOVE_RESISTANCE_WITH_BUFFER")
+        if support:
+            sup_dist = distance_percent(entry, support)
+            cautious_tp = max(0.01, sup_dist - buffer_pct)
+            if cautious_tp > 0 and cautious_tp < tp1_percent:
+                tp1_percent = cautious_tp
+                reasons.append("TP1_CAUTIOUS_BEFORE_SUPPORT")
+            if tp2_percent > 0 and sup_dist > 0:
+                tp2_cap = max(tp1_percent * 1.15, sup_dist + buffer_pct * 0.50)
+                if tp2_percent > tp2_cap:
+                    tp2_percent = tp2_cap
+                    reasons.append("TP2_CAPPED_AROUND_SUPPORT_ZONE")
+
+    return tp1_percent, tp2_percent, sl_percent, reasons, warnings
+
+
+def _apply_fee_aware_tp_floor(tp1_percent: float, tp2_percent: float) -> Tuple[float, float, float, float, float, float, List[str], List[str]]:
+    """Ensure TP1 gross profit covers estimated fees plus minimum net profit."""
+    reasons: List[str] = []
+    warnings: List[str] = []
+    required_pct, notional, fee, min_net, r = _min_tp_percent_for_net_profit()
+    reasons.extend(r)
+    if required_pct > 0 and tp1_percent < required_pct:
+        tp1_percent = required_pct
+        reasons.append("TP1_RAISED_TO_COVER_FEES_AND_MIN_NET_PROFIT")
+    if tp2_percent > 0 and tp2_percent < tp1_percent * 1.20:
+        tp2_percent = tp1_percent * 1.20
+        reasons.append("TP2_RAISED_AFTER_FEE_AWARE_TP1")
+    gross = _gross_profit_usdt(notional, tp1_percent)
+    net = gross - fee
+    if net < min_net:
+        warnings.append("TP1_NET_PROFIT_BELOW_MIN_AFTER_FEES")
+    return tp1_percent, tp2_percent, notional, gross, fee, min_net, reasons, warnings
 
 class BaseMultiplierEngine:
     """Base scalping multipliers for 5M-15M Movement Hunter."""
@@ -482,6 +712,9 @@ class TPSLValidator:
             warnings.append("SL_DISTANCE_ZERO")
             return False, warnings
 
+        if plan.min_required_net_profit_usdt > 0 and plan.estimated_tp1_net_usdt < plan.min_required_net_profit_usdt:
+            warnings.append("TP1_NET_PROFIT_BELOW_MIN_AFTER_FEES")
+
         return True, warnings
 
 
@@ -533,6 +766,31 @@ class TPSLEngine:
         tp1_percent = atr_percent * m.tp1_atr
         tp2_percent = atr_percent * m.tp2_atr
         sl_percent = atr_percent * m.sl_atr
+
+        # First align with support/resistance and liquidity structure:
+        # LONG => SL below support, TP before resistance.
+        # SHORT => SL above resistance, TP before support.
+        tp1_percent, tp2_percent, sl_percent, r, w = _apply_sr_liquidity_rules(
+            entry=entry,
+            direction=direction,
+            tp1_percent=tp1_percent,
+            tp2_percent=tp2_percent,
+            sl_percent=sl_percent,
+            atr_percent=atr_percent,
+            candidate=candidate,
+        )
+        reasons.extend(r)
+        warnings.extend(w)
+
+        # Then ensure TP1 is not smaller than estimated round-trip fees +
+        # minimum desired net profit. This prevents useless TPs such as 6 cents
+        # profit against 6 cents fee.
+        tp1_percent, tp2_percent, notional_usdt, est_gross, est_fee, min_net, r, w = _apply_fee_aware_tp_floor(
+            tp1_percent=tp1_percent,
+            tp2_percent=tp2_percent,
+        )
+        reasons.extend(r)
+        warnings.extend(w)
 
         # Hard minimum SL distance so breakout/retest noise doesn't instantly stop out.
         min_sl_percent = max(atr_percent * m.min_sl_atr, 0.18)
@@ -599,6 +857,11 @@ class TPSLEngine:
             tp2_distance_percent=distance_percent(entry, tp2) if tp2 > 0 else 0.0,
             atr_percent=atr_percent,
             quality_label=quality_label,
+            notional_usdt=safe_float(locals().get("notional_usdt", 0.0)),
+            estimated_tp1_gross_usdt=safe_float(locals().get("est_gross", 0.0)),
+            estimated_tp1_fee_usdt=safe_float(locals().get("est_fee", 0.0)),
+            estimated_tp1_net_usdt=safe_float(locals().get("est_gross", 0.0)) - safe_float(locals().get("est_fee", 0.0)),
+            min_required_net_profit_usdt=safe_float(locals().get("min_net", 0.0)),
             reason_codes=tuple(dict.fromkeys(reasons)),
             warnings=tuple(warnings),
             valid=True,
