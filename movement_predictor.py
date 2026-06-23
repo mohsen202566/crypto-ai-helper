@@ -182,21 +182,32 @@ class MemorySimilarityEngine:
         reasons: List[str] = []
 
         if summary.sample_count <= 0:
+            # No memory yet must not kill fresh hunting. Give a neutral-low base
+            # so raw birth-of-momentum sensors can still create useful GHOSTs
+            # and, if the AI brain agrees, early REALs.
             reasons.append("NO_MOVEMENT_MEMORY")
-            return 25.0, reasons
+            return 32.0, reasons
 
-        sample_score = clamp(summary.sample_count * 5.0)
+        # Movement Hunter memory should matter more than a simple count.
+        # Use sample confidence, historical success, and average move size, but
+        # keep low-sample memories soft so one or two lucky ghosts do not dominate.
+        sample_score = clamp(summary.sample_count * 7.0)
         success_score = clamp(summary.success_rate)
-        move_score = clamp(abs(summary.avg_move_percent) * 35.0)
+        move_score = clamp(abs(summary.avg_move_percent) * 45.0)
 
-        similarity = clamp(sample_score * 0.30 + success_score * 0.45 + move_score * 0.25)
-
-        if summary.sample_count >= 10:
-            reasons.append("ENOUGH_MOVEMENT_MEMORY")
-        else:
+        if summary.sample_count < 3:
+            similarity = clamp(sample_score * 0.18 + success_score * 0.48 + move_score * 0.34)
+            reasons.append("VERY_LOW_MOVEMENT_MEMORY_SAMPLE")
+        elif summary.sample_count < 8:
+            similarity = clamp(sample_score * 0.24 + success_score * 0.50 + move_score * 0.26)
             reasons.append("LOW_MOVEMENT_MEMORY_SAMPLE")
+        else:
+            similarity = clamp(sample_score * 0.28 + success_score * 0.52 + move_score * 0.20)
+            reasons.append("ENOUGH_MOVEMENT_MEMORY")
 
-        if summary.success_rate >= 65:
+        if summary.success_rate >= 68 and summary.sample_count >= 5:
+            reasons.append("SIMILAR_PREMOVE_WORKED_STRONGLY")
+        elif summary.success_rate >= 60:
             reasons.append("SIMILAR_PREMOVE_WORKED")
         elif summary.success_rate <= 40 and summary.sample_count >= 5:
             reasons.append("SIMILAR_PREMOVE_WEAK")
@@ -258,11 +269,21 @@ class SensorAlignmentEngine:
             score += 10
             reasons.append("ATR_EXPLOSION")
         if s.volume_expansion:
-            score += 6
+            score += 8
             reasons.append("VOLUME_EXPANDING")
         if s.volume_spike:
-            score += 6
+            score += 8
             reasons.append("VOLUME_SPIKE")
+
+        # Compression is not automatically range-risk. In Movement Hunter mode,
+        # compression + aligned power/volume can be the exact pre-breakout state
+        # we want to catch before the first large candle.
+        if safe_float(getattr(s, "compression_score", 0.0)) >= 45 and safe_float(getattr(s, "range_probability", 0.0)) < 82:
+            score += 8
+            reasons.append("COMPRESSION_PRE_BREAKOUT_CONTEXT")
+        if safe_float(getattr(s, "compression_score", 0.0)) >= 60 and (s.volume_expansion or s.volume_spike or abs(s.power_delta) >= 12):
+            score += 8
+            reasons.append("SQUEEZE_WITH_PARTICIPATION")
 
         return clamp(score), reasons
 
@@ -281,44 +302,76 @@ class PhasePredictionEngine:
         s = candidate.sensor_snapshot
         reasons: List[str] = []
 
-        # Do not over-classify every range/late warning as a dead prediction.
-        # Strong enough readiness can still be a learnable MID/GHOST candidate.
-        if state.market_state == "RANGE" and movement.readiness_score < 45 and similarity < 55:
-            reasons.append("PREDICT_RANGE")
+        readiness = safe_float(movement.readiness_score)
+        continuation = safe_float(movement.continuation_probability)
+        compression = safe_float(getattr(s, "compression_score", 0.0))
+        range_probability = safe_float(getattr(s, "range_probability", 0.0))
+        state_range = safe_float(getattr(state, "range_probability", range_probability))
+        late_risk = safe_float(getattr(state, "late_entry_risk", 0.0))
+        exhaustion_risk = safe_float(getattr(state, "exhaustion_risk", 0.0))
+        trap_risk = safe_float(getattr(trap, "trap_risk", 0.0))
+        power_delta = abs(safe_float(getattr(s, "power_delta", 0.0)))
+        hist_accel = abs(safe_float(getattr(s, "histogram_acceleration", 0.0)))
+        hist_slope = abs(safe_float(getattr(s, "histogram_slope", 0.0)))
+        volume_live = bool(getattr(s, "volume_expansion", False) or getattr(s, "volume_spike", False))
+        atr_live = bool(getattr(s, "atr_expansion", "") == "EXPANDING" or getattr(s, "atr_explosion", False))
+
+        early_sensor_birth = (
+            (compression >= 40 and range_probability < 85 and (power_delta >= 10 or volume_live or atr_live))
+            or (hist_accel > 0 and hist_slope > 0 and power_delta >= 8)
+            or (similarity >= 58 and readiness < 62 and late_risk < 72)
+        )
+
+        # Only classify as RANGE when both memory/sensors and live readiness are weak.
+        if state.market_state == "RANGE" and readiness < 38 and similarity < 48 and not early_sensor_birth:
+            reasons.append("PREDICT_RANGE_WEAK_NO_BREAKOUT_CONTEXT")
             return PREDICT_RANGE, reasons
 
+        # LATE must be stricter. The old logic produced too many LATE/MID labels
+        # and missed pre-start opportunities. Do not call it late while fresh
+        # sensors, memory similarity, or compression breakout context are alive.
         if (
-            state.market_state in {"EXHAUSTION", "LATE"}
-            and movement.readiness_score < 45
-            and similarity < 55
-        ) or (movement.freshness == "DEAD" and movement.readiness_score < 40):
-            reasons.append("PREDICT_LATE")
-            return PREDICT_LATE, reasons
-
-        if movement.freshness == "LATE" and movement.readiness_score < 45:
-            reasons.append("PREDICT_LATE")
-            return PREDICT_LATE, reasons
-
-        if (
-            similarity >= 65
-            and movement.readiness_score < 60
-            and s.compression_score >= 45
-            and s.range_probability < 75
+            (state.market_state in {"EXHAUSTION", "LATE"} and readiness < 42 and similarity < 50 and not early_sensor_birth)
+            or (movement.freshness == "DEAD" and readiness < 38 and similarity < 52)
+            or (late_risk >= 82 and exhaustion_risk >= 72 and continuation < 42 and similarity < 58)
         ):
-            reasons.append("PREDICT_PRE_START")
+            reasons.append("PREDICT_LATE_CONFIRMED_EXHAUSTION")
+            return PREDICT_LATE, reasons
+
+        if movement.freshness == "LATE" and readiness < 42 and similarity < 52 and not early_sensor_birth:
+            reasons.append("PREDICT_LATE_WEAK_LATE_FRESHNESS")
+            return PREDICT_LATE, reasons
+
+        # PRE_START: strongest hunter case. It should trigger before the big move,
+        # when memory or compression/participation suggests the move is forming.
+        if (
+            (similarity >= 58 and readiness < 65 and compression >= 35 and state_range < 82 and trap_risk < 72)
+            or (early_sensor_birth and readiness < 62 and trap_risk < 75 and late_risk < 78)
+        ):
+            reasons.append("PREDICT_PRE_START_HUNTER")
             return PREDICT_PRE_START, reasons
 
-        if movement.freshness == "FRESH" and movement.readiness_score >= 60:
-            reasons.append("PREDICT_START")
+        if movement.freshness == "FRESH" and readiness >= 52 and trap_risk < 78:
+            reasons.append("PREDICT_START_FRESH_MOVE")
             return PREDICT_START, reasons
 
-        if movement.readiness_score >= 45:
-            reasons.append("PREDICT_MID")
+        if readiness >= 58 and continuation >= 45 and late_risk < 78:
+            reasons.append("PREDICT_START_LIVE_CONTINUATION")
+            return PREDICT_START, reasons
+
+        # MID should not swallow every weak candidate. Require stronger live move.
+        if readiness >= 48 and (continuation >= 42 or similarity >= 55) and late_risk < 82:
+            reasons.append("PREDICT_MID_CONFIRMED")
             return PREDICT_MID, reasons
+
+        # If the market is still building pressure, keep it as PRE_START instead
+        # of UNKNOWN so the AI can watch/learn it as an early candidate.
+        if early_sensor_birth and trap_risk < 80:
+            reasons.append("PREDICT_PRE_START_EARLY_SENSOR_BIRTH")
+            return PREDICT_PRE_START, reasons
 
         reasons.append("PREDICT_UNKNOWN")
         return PREDICT_UNKNOWN, reasons
-
 
 class MovementProbabilityEngine:
     """Combines memory, sensors, movement, state and trap into probabilities."""
@@ -341,28 +394,36 @@ class MovementProbabilityEngine:
         reasons.extend(r)
 
         movement_alignment = clamp(
-            movement.readiness_score * 0.55
-            + movement.continuation_probability * 0.45
+            movement.readiness_score * 0.58
+            + movement.continuation_probability * 0.42
         )
 
         state_alignment = clamp(
             state.state_confidence
-            - state.late_entry_risk * 0.35
-            - state.exhaustion_risk * 0.35
+            - state.late_entry_risk * 0.28
+            - state.exhaustion_risk * 0.30
         )
 
-        trap_penalty = clamp(trap.trap_risk * 0.55 + trap.liquidity_risk * 0.25)
-        range_penalty = clamp(state.range_probability * 0.45 + candidate.sensor_snapshot.compression_score * 0.12)
-        exhaustion_penalty = clamp(state.exhaustion_risk * 0.55 + movement.reversal_pressure * 0.35)
+        trap_penalty = clamp(trap.trap_risk * 0.52 + trap.liquidity_risk * 0.24)
+
+        # Compression can be a positive squeeze before breakout. Do not punish it
+        # as range unless range probability is high and participation is weak.
+        s = candidate.sensor_snapshot
+        compression = safe_float(getattr(s, "compression_score", 0.0))
+        participation = 1.0 if (getattr(s, "volume_expansion", False) or getattr(s, "volume_spike", False) or abs(safe_float(getattr(s, "power_delta", 0.0))) >= 12) else 0.0
+        compression_bonus = clamp(compression * 0.22) if participation else clamp(compression * 0.08)
+        range_penalty = clamp(state.range_probability * 0.42 + max(0.0, compression - 55.0) * 0.05 - compression_bonus)
+        exhaustion_penalty = clamp(state.exhaustion_risk * 0.50 + movement.reversal_pressure * 0.32)
 
         final_similarity = clamp(
-            memory_similarity * 0.25
-            + sensor_alignment * 0.30
-            + movement_alignment * 0.27
-            + state_alignment * 0.18
-            - trap_penalty * 0.32
-            - range_penalty * 0.18
-            - exhaustion_penalty * 0.24
+            memory_similarity * 0.34
+            + sensor_alignment * 0.28
+            + movement_alignment * 0.24
+            + state_alignment * 0.14
+            + compression_bonus * 0.10
+            - trap_penalty * 0.30
+            - range_penalty * 0.14
+            - exhaustion_penalty * 0.22
         )
 
         base_probability = final_similarity
@@ -400,24 +461,26 @@ class ConfidenceClassifier:
 
         if sample_count <= 0:
             reasons.append("PREDICTOR_LOW_DATA")
-            prefer_ghost = True
+            # Low data should be caution, not blindness. PRE_START/START with
+            # strong probability can still be considered by ai_decision_engine.
+            prefer_ghost = phase not in {PREDICT_PRE_START, PREDICT_START} or probability < 66
         elif sample_count < 5:
             reasons.append("PREDICTOR_SMALL_SAMPLE")
-            prefer_ghost = True
+            prefer_ghost = phase not in {PREDICT_PRE_START, PREDICT_START} or probability < 62
 
         if phase in {PREDICT_RANGE, PREDICT_LATE, PREDICT_UNKNOWN}:
             reasons.append("PREDICTOR_PHASE_NOT_IDEAL")
             prefer_ghost = True
 
-        if trap.trap_risk >= 65 or state.late_entry_risk >= 65:
+        if trap.trap_risk >= 72 or state.late_entry_risk >= 78:
             reasons.append("PREDICTOR_RISK_REQUIRES_GHOST_CAUTION")
             prefer_ghost = True
 
-        if probability >= 75 and sample_count >= 10 and not prefer_ghost:
+        if probability >= 72 and sample_count >= 8 and phase in {PREDICT_PRE_START, PREDICT_START, PREDICT_MID} and not prefer_ghost:
             return CONF_HIGH, False, reasons
-        if probability >= 60:
+        if probability >= 58:
             return CONF_MEDIUM, prefer_ghost, reasons
-        if probability >= 40:
+        if probability >= 38:
             return CONF_LOW, True, reasons
         return CONF_UNKNOWN, True, reasons
 
