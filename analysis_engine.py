@@ -81,6 +81,13 @@ class RiskProfile:
     total_risk: float
     risk_level: str
 
+    # Movement Hunter context. These are descriptive only and do not decide
+    # REAL/GHOST/REJECT. They help later layers understand whether raw range/
+    # compression is danger or a pre-move opportunity.
+    raw_range_risk: float = 0.0
+    opportunity_score: float = 0.0
+    premove_readiness_score: float = 0.0
+
     def to_dict(self) -> JsonDict:
         return asdict(self)
 
@@ -143,6 +150,85 @@ def clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
 def avg(values: Sequence[float]) -> float:
     vals = [float(v) for v in values if v is not None]
     return sum(vals) / len(vals) if vals else 0.0
+
+
+def build_movement_opportunity(snapshot: SensorSnapshot) -> Tuple[float, float, Tuple[str, ...]]:
+    """Estimate pre-move opportunity from raw sensors.
+
+    This is not a trade decision. It only tells the downstream Movement Hunter
+    whether a high-range/compression state may be the birth area of a pump/dump
+    instead of ordinary risk.
+    """
+    opportunity = 0.0
+    premove = 0.0
+    reasons: List[str] = []
+
+    compression = clamp(getattr(snapshot, "compression_score", 0.0))
+    range_probability = clamp(getattr(snapshot, "range_probability", 0.0))
+    power_delta = abs(float(getattr(snapshot, "power_delta", 0.0) or 0.0))
+
+    participation = (
+        bool(getattr(snapshot, "volume_expansion", False))
+        or bool(getattr(snapshot, "volume_spike", False))
+        or str(getattr(snapshot, "atr_expansion", "")).upper() == "EXPANDING"
+        or bool(getattr(snapshot, "atr_explosion", False))
+        or float(getattr(snapshot, "atr_slope", 0.0) or 0.0) > 0
+        or power_delta >= 8
+        or bool(getattr(snapshot, "breakout_candidate", False))
+        or bool(getattr(snapshot, "breakdown_candidate", False))
+    )
+
+    if compression >= 35 and range_probability >= 45:
+        premove += 20
+        opportunity += 14
+        reasons.append("RANGE_COMPRESSION_PREMOVE_CONTEXT")
+
+    if compression >= 55 and participation:
+        premove += 22
+        opportunity += 18
+        reasons.append("COMPRESSION_WITH_PARTICIPATION")
+
+    if str(getattr(snapshot, "atr_expansion", "")).upper() == "EXPANDING":
+        premove += 14
+        opportunity += 12
+        reasons.append("ATR_EXPANSION_PREMOVE")
+
+    if bool(getattr(snapshot, "atr_explosion", False)):
+        premove += 18
+        opportunity += 16
+        reasons.append("ATR_EXPLOSION_MOVEMENT_BIRTH")
+
+    if bool(getattr(snapshot, "volume_expansion", False)):
+        premove += 12
+        opportunity += 12
+        reasons.append("VOLUME_EXPANSION_PREMOVE")
+
+    if bool(getattr(snapshot, "volume_spike", False)):
+        premove += 16
+        opportunity += 14
+        reasons.append("VOLUME_SPIKE_MOVEMENT_CONTEXT")
+
+    if power_delta >= 10:
+        premove += 12
+        opportunity += 12
+        reasons.append("POWER_SHIFT_PREMOVE")
+
+    if abs(float(getattr(snapshot, "histogram_acceleration", 0.0) or 0.0)) > 0 and power_delta >= 6:
+        premove += 10
+        opportunity += 10
+        reasons.append("MACD_ACCEL_POWER_BIRTH")
+
+    if bool(getattr(snapshot, "breakout_candidate", False)) or bool(getattr(snapshot, "breakdown_candidate", False)):
+        premove += 16
+        opportunity += 14
+        reasons.append("BREAK_CANDIDATE_PREMOVE")
+
+    if bool(getattr(snapshot, "momentum_weakness", False)):
+        opportunity -= 12
+        premove -= 10
+        reasons.append("MOMENTUM_WEAKNESS_REDUCES_OPPORTUNITY")
+
+    return clamp(opportunity), clamp(premove), tuple(dict.fromkeys(reasons))
 
 
 def _score_ema(snapshot: SensorSnapshot) -> Tuple[float, float, List[str]]:
@@ -377,7 +463,19 @@ def build_quality_profile(snapshot: SensorSnapshot) -> QualityProfile:
 
 
 def build_risk_profile(snapshot: SensorSnapshot) -> RiskProfile:
-    range_risk = clamp(snapshot.range_probability)
+    opportunity_score, premove_readiness_score, _ = build_movement_opportunity(snapshot)
+
+    raw_range_risk = clamp(snapshot.range_probability)
+
+    # In Movement Hunter mode, range/compression is not automatically bad.
+    # Many pump/dump moves start from range. So range risk is softened when
+    # there is compression + participation / power / ATR expansion.
+    range_risk = raw_range_risk
+    if premove_readiness_score >= 55:
+        range_risk = min(range_risk, 42.0)
+    elif premove_readiness_score >= 35:
+        range_risk = min(range_risk, 55.0)
+
     trap_risk = 0.0
     if snapshot.failed_breakout or snapshot.failed_breakdown:
         trap_risk += 45
@@ -392,10 +490,14 @@ def build_risk_profile(snapshot: SensorSnapshot) -> RiskProfile:
     exhaustion_risk = clamp(exhaustion_risk)
 
     late_move_risk = 0.0
-    if abs(snapshot.price_change_percent) > max(snapshot.atr_percent * 2.0, 1.2):
-        late_move_risk += 40
+    if abs(snapshot.price_change_percent) > max(snapshot.atr_percent * 2.3, 1.5):
+        late_move_risk += 34
     if snapshot.atr_explosion and snapshot.volume_spike and snapshot.momentum_weakness:
         late_move_risk += 25
+    # If this looks like a range-to-trend birth, do not classify it as late just
+    # because ATR/volume started waking up.
+    if premove_readiness_score >= 50 and not snapshot.momentum_weakness:
+        late_move_risk = max(0.0, late_move_risk - 14.0)
     late_move_risk = clamp(late_move_risk)
 
     liquidity_risk = clamp(snapshot.stop_hunt_probability)
@@ -408,6 +510,14 @@ def build_risk_profile(snapshot: SensorSnapshot) -> RiskProfile:
         liquidity_risk,
     ])
 
+    # High opportunity should be visible to the AI and should not be hidden by a
+    # raw range warning. This only softens the raw candidate risk; later trap,
+    # state, confidence and final AI decision still control safety.
+    if opportunity_score >= 60 and exhaustion_risk < 55 and trap_risk < 65:
+        total = max(0.0, total - 8.0)
+    elif opportunity_score >= 40 and exhaustion_risk < 65:
+        total = max(0.0, total - 4.0)
+
     if total >= 65:
         level = RISK_HIGH
     elif total >= 35:
@@ -416,13 +526,16 @@ def build_risk_profile(snapshot: SensorSnapshot) -> RiskProfile:
         level = RISK_LOW
 
     return RiskProfile(
-        range_risk=range_risk,
+        range_risk=clamp(range_risk),
         trap_risk=trap_risk,
         exhaustion_risk=exhaustion_risk,
         late_move_risk=late_move_risk,
         liquidity_risk=liquidity_risk,
         total_risk=clamp(total),
         risk_level=level,
+        raw_range_risk=raw_range_risk,
+        opportunity_score=clamp(opportunity_score),
+        premove_readiness_score=clamp(premove_readiness_score),
     )
 
 
@@ -441,6 +554,7 @@ class AnalysisEngine:
         direction_score, direction_reasons = build_direction_score(snapshot)
         quality = build_quality_profile(snapshot)
         risk = build_risk_profile(snapshot)
+        opportunity_score, premove_readiness_score, opportunity_reasons = build_movement_opportunity(snapshot)
 
         warnings: List[str] = list(snapshot.warnings)
         valid = bool(snapshot.valid)
@@ -449,7 +563,15 @@ class AnalysisEngine:
             warnings.append("NO_CLEAR_DIRECTION")
 
         if risk.risk_level == RISK_HIGH:
-            warnings.append("HIGH_RISK_CANDIDATE")
+            if premove_readiness_score >= 55 and risk.exhaustion_risk < 55:
+                warnings.append("HIGH_RISK_BUT_PREMOVE_OPPORTUNITY")
+            else:
+                warnings.append("HIGH_RISK_CANDIDATE")
+
+        if premove_readiness_score >= 55:
+            warnings.append("PREMOVE_READINESS_HIGH")
+        elif premove_readiness_score >= 35:
+            warnings.append("PREMOVE_READINESS_MEDIUM")
 
         ctx_dict: JsonDict = {}
         if market_context is not None:
@@ -459,6 +581,14 @@ class AnalysisEngine:
                 ctx_dict = dict(market_context)
             else:
                 ctx_dict = dict(getattr(market_context, "__dict__", {}))
+
+        ctx_dict.setdefault("analysis_opportunity", {
+            "opportunity_score": clamp(opportunity_score),
+            "premove_readiness_score": clamp(premove_readiness_score),
+            "raw_range_risk": clamp(risk.raw_range_risk),
+            "softened_range_risk": clamp(risk.range_risk),
+            "reason_codes": list(opportunity_reasons),
+        })
 
         return AnalysisCandidate(
             candidate_id=f"cand_{uuid4().hex}",
@@ -472,8 +602,8 @@ class AnalysisEngine:
             risk=risk,
             sensor_snapshot=snapshot,
             market_context=ctx_dict,
-            reason_codes=direction_reasons,
-            warnings=tuple(warnings),
+            reason_codes=tuple(dict.fromkeys(list(direction_reasons) + list(opportunity_reasons))),
+            warnings=tuple(dict.fromkeys(warnings)),
             valid=valid,
         )
 
