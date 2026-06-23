@@ -3,26 +3,24 @@ from __future__ import annotations
 """
 26 - bot.py
 
-Telegram command router and orchestration layer for the locked Movement Hunter bot.
+Telegram router and orchestration layer for the simplified Level 1 / 5M bot.
 
-Responsibilities:
+Locked goals:
+- 10 selected coins only for auto scan:
+  DOGE, XRP, SOL, ADA, AVAX, LINK, INJ, PEPE, WIF, BONK
 - Telegram command routing only.
-- Preserve user-facing commands and Persian output.
-- Run the REAL/GHOST/REJECT pipeline by calling the proper modules.
-- Send reports produced by result_reporter.py.
-- Start/stop real trading setting through runtime data store.
-- Run auto scan loop and position monitor loop.
-- Never contain Paper mode.
-- Never contain Setup flow.
-- Never make AI decisions itself.
-- Never call Toobit directly except through tobit_client.py / real_trade_manager.py / position_monitor.py.
-
-Architecture:
-market_data -> analysis_layers -> analysis_engine -> movement_hunter -> trap_engine
--> state_engine -> confidence_engine -> correlation_engine -> coin_learning
--> movement_memory -> movement_predictor -> ai_decision_engine -> tp_sl_engine
--> ghost_manager OR real_trade_manager
--> position_monitor -> result_reporter -> Telegram
+- AI is final decision maker through ai_decision_engine.py.
+- Technical analysis is raw sensor/candidate only.
+- Pattern Start / movement prediction is handled by movement_predictor.py.
+- Learning is handled by coin_learning.py and movement_memory.py.
+- TP/SL is handled by tp_sl_engine.py.
+- REAL orders only through real_trade_manager.py.
+- GHOST records only through ghost_manager.py.
+- REAL position results only through position_monitor.py and result_reporter.py.
+- No paper mode.
+- No setup flow.
+- No trap/state/confidence/correlation/meta/movement_hunter dependency.
+- No direct Toobit order logic in this file.
 """
 
 import asyncio
@@ -30,35 +28,27 @@ import logging
 import os
 import re
 import time
-from dataclasses import asdict, dataclass, fields, is_dataclass, replace
+from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 try:
     from telegram import Update
-    from telegram.constants import ParseMode
     from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
-except Exception:  # allows compile/test without telegram package installed
+except Exception:  # lets py_compile pass on VPS/dev machines without telegram installed
     Update = Any  # type: ignore
     ContextTypes = Any  # type: ignore
     Application = None  # type: ignore
     CommandHandler = None  # type: ignore
     MessageHandler = None  # type: ignore
     filters = None  # type: ignore
-    ParseMode = None  # type: ignore
 
 from config import SETTINGS
 from data_store import store, save_error, save_position
 from market_data import get_multi_timeframe_snapshot, get_latest_price
-from analysis_engine import analyze_symbol, analyze_multi_timeframe, AnalysisCandidate
-from movement_hunter import analyze_movement, MovementHunterResult
-from trap_engine import analyze_trap, TrapResult
-from state_engine import analyze_state, StateResult
-from confidence_engine import analyze_confidence, ConfidenceResult
-from correlation_engine import analyze_correlation, CorrelationResult
+from analysis_engine import analyze_symbol, AnalysisCandidate
 from coin_learning import summarize_candidate_learning, LearningSummary
 from movement_memory import summarize_movement_candidate
 from movement_predictor import predict_movement, MovementPredictionResult
-from meta_learning import get_meta_learning_summary
 from ai_decision_engine import decide, AIDecision, DECISION_REAL, DECISION_GHOST, DECISION_REJECT
 from tp_sl_engine import build_tp_sl_plan, apply_tp_sl_to_decision, TPSLPlan
 from ghost_manager import create_ghost, monitor_ghost, ghost_stats, manager as ghost_manager_instance
@@ -66,77 +56,94 @@ from real_trade_manager import open_real_position, RealTradeOpenResult
 from tobit_client import get_client
 from position_monitor import monitor_all_positions
 from result_reporter import reporter, ReportPayload, format_error_report
-from stats_manager import record_decision, record_position_event, record_ghost_result, stats_report, detailed_stats_report, clear_stats, manager as stats_manager_instance
+from stats_manager import (
+    record_decision,
+    record_position_event,
+    record_ghost_result,
+    stats_report,
+    detailed_stats_report,
+    clear_stats,
+    manager as stats_manager_instance,
+)
 
 
-LOGGER = logging.getLogger("movement_hunter_bot")
+LOGGER = logging.getLogger("level1_5m_bot")
 
 DIRECTION_LONG = "LONG"
 DIRECTION_SHORT = "SHORT"
 
-CMD_START = "/start"
-CMD_ID = "/id"
+LEVEL1_SYMBOLS: Tuple[str, ...] = (
+    "DOGEUSDT",
+    "XRPUSDT",
+    "SOLUSDT",
+    "ADAUSDT",
+    "AVAXUSDT",
+    "LINKUSDT",
+    "INJUSDT",
+    "PEPEUSDT",
+    "WIFUSDT",
+    "BONKUSDT",
+)
 
 PERSIAN_TRUE = {"روشن", "فعال", "on", "ON", "true", "True"}
 PERSIAN_FALSE = {"خاموش", "غیرفعال", "off", "OFF", "false", "False"}
 
+PERSIAN_SYMBOL_ALIASES: Dict[str, str] = {
+    "دوج": "DOGEUSDT",
+    "دوج کوین": "DOGEUSDT",
+    "داج": "DOGEUSDT",
+    "داج کوین": "DOGEUSDT",
+    "doge": "DOGEUSDT",
+    "dog": "DOGEUSDT",
+    "dogecoin": "DOGEUSDT",
 
-# Persian / common aliases for direct asset commands.
-# Keep this local fallback even when symbol_mapper.py is limited on VPS.
-PERSIAN_SYMBOL_ALIASES = {
-    # Majors
-    "بیتکوین": "BTCUSDT", "بیت کوین": "BTCUSDT", "بیتکوین کش نه": "BTCUSDT", "بیت": "BTCUSDT", "btc": "BTCUSDT", "bitcoin": "BTCUSDT",
-    "اتریوم": "ETHUSDT", "اتر": "ETHUSDT", "eth": "ETHUSDT", "ethereum": "ETHUSDT",
-    "سولانا": "SOLUSDT", "سول": "SOLUSDT", "sol": "SOLUSDT", "solana": "SOLUSDT",
+    "ریپل": "XRPUSDT",
+    "ایکس آر پی": "XRPUSDT",
+    "ایکس ار پی": "XRPUSDT",
+    "xrp": "XRPUSDT",
+    "ripple": "XRPUSDT",
 
-    # Meme / high-volume coins
-    "دوج": "DOGEUSDT", "دوج کوین": "DOGEUSDT", "داج": "DOGEUSDT", "داج کوین": "DOGEUSDT", "داگ": "DOGEUSDT", "dog": "DOGEUSDT", "doge": "DOGEUSDT", "dogecoin": "DOGEUSDT",
-    "شیبا": "SHIBUSDT", "شیب": "SHIBUSDT", "شیبا اینو": "SHIBUSDT", "shib": "SHIBUSDT", "shiba": "SHIBUSDT",
-    "پپه": "PEPEUSDT", "پپه کوین": "PEPEUSDT", "pepe": "PEPEUSDT",
-    "بونک": "BONKUSDT", "بونک کوین": "BONKUSDT", "bonk": "BONKUSDT",
-    "فلوکی": "FLOKIUSDT", "فلوکی کوین": "FLOKIUSDT", "floki": "FLOKIUSDT",
+    "سولانا": "SOLUSDT",
+    "سول": "SOLUSDT",
+    "sol": "SOLUSDT",
+    "solana": "SOLUSDT",
 
-    # Large caps / common Persian aliases
-    "ریپل": "XRPUSDT", "ایکس آر پی": "XRPUSDT", "ایکس ار پی": "XRPUSDT", "xrp": "XRPUSDT", "ripple": "XRPUSDT",
-    "کاردانو": "ADAUSDT", "ادا": "ADAUSDT", "آدا": "ADAUSDT", "ada": "ADAUSDT", "cardano": "ADAUSDT",
-    "بایننس": "BNBUSDT", "بایننس کوین": "BNBUSDT", "بی ان بی": "BNBUSDT", "بی‌ان‌بی": "BNBUSDT", "bnb": "BNBUSDT",
-    "تون": "TONUSDT", "تون کوین": "TONUSDT", "ton": "TONUSDT", "toncoin": "TONUSDT",
-    "ترون": "TRXUSDT", "ترونیکس": "TRXUSDT", "trx": "TRXUSDT", "tron": "TRXUSDT",
-    "لینک": "LINKUSDT", "چین لینک": "LINKUSDT", "چینلینک": "LINKUSDT", "link": "LINKUSDT", "chainlink": "LINKUSDT",
-    "آوالانچ": "AVAXUSDT", "اوالانچ": "AVAXUSDT", "اواکس": "AVAXUSDT", "آواکس": "AVAXUSDT", "avax": "AVAXUSDT", "avalanche": "AVAXUSDT",
-    "پالیگان": "MATICUSDT", "متیک": "MATICUSDT", "matic": "MATICUSDT", "polygon": "MATICUSDT",
-    "لایت کوین": "LTCUSDT", "لایت": "LTCUSDT", "ltc": "LTCUSDT", "litecoin": "LTCUSDT",
-    "بیت کوین کش": "BCHUSDT", "بیتکوین کش": "BCHUSDT", "bch": "BCHUSDT", "bitcoin cash": "BCHUSDT",
-    "اپتوس": "APTUSDT", "apt": "APTUSDT", "aptos": "APTUSDT",
-    "آربیتروم": "ARBUSDT", "ارب": "ARBUSDT", "آرب": "ARBUSDT", "arb": "ARBUSDT", "arbitrum": "ARBUSDT",
-    "آپتیمیزم": "OPUSDT", "اپتیمیزم": "OPUSDT", "اپتیمیسم": "OPUSDT", "op": "OPUSDT", "optimism": "OPUSDT",
-    "نیر": "NEARUSDT", "نیر پروتکل": "NEARUSDT", "near": "NEARUSDT",
-    "فانتوم": "FTMUSDT", "ftm": "FTMUSDT", "fantom": "FTMUSDT",
+    "کاردانو": "ADAUSDT",
+    "ادا": "ADAUSDT",
+    "آدا": "ADAUSDT",
+    "ada": "ADAUSDT",
+    "cardano": "ADAUSDT",
 
-    # Other common futures symbols
-    "پولکادات": "DOTUSDT", "دات": "DOTUSDT", "dot": "DOTUSDT",
-    "یونی": "UNIUSDT", "یونی سواپ": "UNIUSDT", "uni": "UNIUSDT",
-    "آوه": "AAVEUSDT", "اوه": "AAVEUSDT", "aave": "AAVEUSDT",
-    "اتم": "ATOMUSDT", "کازموس": "ATOMUSDT", "atom": "ATOMUSDT", "cosmos": "ATOMUSDT",
-    "اینترنت کامپیوتر": "ICPUSDT", "آی سی پی": "ICPUSDT", "icp": "ICPUSDT",
-    "رندر": "RNDRUSDT", "render": "RNDRUSDT", "rndr": "RNDRUSDT",
-    "فایل کوین": "FILUSDT", "فایل": "FILUSDT", "fil": "FILUSDT",
-    "اینجکتیو": "INJUSDT", "inj": "INJUSDT",
-    "سویی": "SUIUSDT", "سوئی": "SUIUSDT", "sui": "SUIUSDT",
-    "سی": "SEIUSDT", "sei": "SEIUSDT",
-    "استکس": "STXUSDT", "stx": "STXUSDT",
-    "ایپ": "APEUSDT", "ape": "APEUSDT",
-    "گالا": "GALAUSDT", "gala": "GALAUSDT",
-    "سند": "SANDUSDT", "سندباکس": "SANDUSDT", "sand": "SANDUSDT",
-    "مانا": "MANAUSDT", "mana": "MANAUSDT",
-    "اکسی": "AXSUSDT", "axs": "AXSUSDT",
-    "چلیز": "CHZUSDT", "chz": "CHZUSDT",
-    "ایاس": "EOSUSDT", "eos": "EOSUSDT",
-    "نات کوین": "NOTUSDT", "نات": "NOTUSDT", "not": "NOTUSDT",
-    "ونوم": "VENOMUSDT", "venom": "VENOMUSDT",
+    "آوالانچ": "AVAXUSDT",
+    "اوالانچ": "AVAXUSDT",
+    "آواکس": "AVAXUSDT",
+    "اواکس": "AVAXUSDT",
+    "avax": "AVAXUSDT",
+    "avalanche": "AVAXUSDT",
 
-    # Metals / synthetic symbols if configured in market_data
-    "طلا": "XAUUSDT", "گلد": "XAUUSDT", "gold": "XAUUSDT", "xau": "XAUUSDT",
+    "لینک": "LINKUSDT",
+    "چین لینک": "LINKUSDT",
+    "چینلینک": "LINKUSDT",
+    "link": "LINKUSDT",
+    "chainlink": "LINKUSDT",
+
+    "اینجکتیو": "INJUSDT",
+    "اینج": "INJUSDT",
+    "inj": "INJUSDT",
+    "injective": "INJUSDT",
+
+    "پپه": "PEPEUSDT",
+    "پپه کوین": "PEPEUSDT",
+    "pepe": "PEPEUSDT",
+
+    "ویف": "WIFUSDT",
+    "داگ ویف": "WIFUSDT",
+    "داگ ویف هت": "WIFUSDT",
+    "wif": "WIFUSDT",
+
+    "بونک": "BONKUSDT",
+    "بونک کوین": "BONKUSDT",
+    "bonk": "BONKUSDT",
 }
 
 ASSET_COMMAND_PREFIXES = ("تحلیل", "سیگنال")
@@ -145,11 +152,6 @@ ASSET_COMMAND_PREFIXES = ("تحلیل", "سیگنال")
 @dataclass(frozen=True)
 class PipelineResult:
     candidate: AnalysisCandidate
-    movement: MovementHunterResult
-    trap: TrapResult
-    state: StateResult
-    confidence: ConfidenceResult
-    correlation: CorrelationResult
     learning: LearningSummary
     prediction: MovementPredictionResult
     decision: AIDecision
@@ -160,17 +162,12 @@ class PipelineResult:
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "candidate": self.candidate.to_dict(),
-            "movement": self.movement.to_dict(),
-            "trap": self.trap.to_dict(),
-            "state": self.state.to_dict(),
-            "confidence": self.confidence.to_dict(),
-            "correlation": self.correlation.to_dict(),
-            "learning": self.learning.to_dict(),
-            "prediction": self.prediction.to_dict(),
-            "decision": self.decision.to_dict(),
-            "plan": self.plan.to_dict() if self.plan else None,
-            "trade_result": self.trade_result.to_dict() if self.trade_result else None,
+            "candidate": self.candidate.to_dict() if hasattr(self.candidate, "to_dict") else {},
+            "learning": self.learning.to_dict() if hasattr(self.learning, "to_dict") else {},
+            "prediction": self.prediction.to_dict() if hasattr(self.prediction, "to_dict") else {},
+            "decision": self.decision.to_dict() if hasattr(self.decision, "to_dict") else {},
+            "plan": self.plan.to_dict() if self.plan and hasattr(self.plan, "to_dict") else None,
+            "trade_result": self.trade_result.to_dict() if self.trade_result and hasattr(self.trade_result, "to_dict") else None,
         }
 
 
@@ -194,20 +191,92 @@ def safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def normalize_symbol_safe(symbol: str) -> str:
+    raw = str(symbol or "").upper().strip().replace("/", "").replace("-", "").replace("_", "")
+    if not raw:
+        return ""
+    try:
+        from symbol_mapper import normalize_symbol as _normalize_symbol
+        mapped = _normalize_symbol(raw)
+        if mapped:
+            raw = str(mapped).upper().replace("/", "").replace("-", "").replace("_", "")
+    except Exception:
+        pass
+    if raw.endswith("USDT"):
+        return raw
+    if 2 <= len(raw) <= 12 and re.match(r"^[A-Z0-9]+$", raw):
+        return raw + "USDT"
+    return raw
+
+
+def allowed_level1_symbol(symbol: str) -> str:
+    normalized = normalize_symbol_safe(symbol)
+    if normalized in LEVEL1_SYMBOLS:
+        return normalized
+    return ""
+
+
+def level1_scan_symbols() -> List[str]:
+    runtime = get_runtime_settings()
+    configured = runtime.get("level1_symbols")
+    if isinstance(configured, list):
+        symbols = [allowed_level1_symbol(str(x)) for x in configured]
+        symbols = [s for s in symbols if s]
+        if symbols:
+            return list(dict.fromkeys(symbols))[:10]
+    return list(LEVEL1_SYMBOLS)
+
+
+def extract_symbol(text: str, default: str = "DOGEUSDT") -> str:
+    original = str(text or "").strip()
+    compact = original.lower().replace("‌", " ").replace("\u200c", " ")
+    compact = re.sub(r"\s+", " ", compact).strip()
+
+    asset_part = compact
+    for prefix in ASSET_COMMAND_PREFIXES:
+        if asset_part.startswith(prefix):
+            asset_part = asset_part[len(prefix):].strip()
+
+    for alias in sorted(PERSIAN_SYMBOL_ALIASES, key=len, reverse=True):
+        if asset_part == alias:
+            return PERSIAN_SYMBOL_ALIASES[alias]
+
+    if original.lower().strip().startswith(ASSET_COMMAND_PREFIXES):
+        for alias in sorted(PERSIAN_SYMBOL_ALIASES, key=len, reverse=True):
+            if alias in asset_part:
+                return PERSIAN_SYMBOL_ALIASES[alias]
+
+    t = original.upper()
+    t = re.sub(r"[^\w\s]", " ", t)
+    words = [w for w in t.split() if w]
+    for w in reversed(words):
+        if w in {"تحلیل", "سیگنال", "بازار", "بررسی", "LONG", "SHORT", "وضعیت", "ترید"}:
+            continue
+        if re.match(r"^[A-Z0-9]{2,15}$", w):
+            symbol = normalize_symbol_safe(w)
+            return symbol if symbol else default
+
+    return default
+
+
+def is_direct_asset_query(text: str) -> bool:
+    compact = str(text or "").strip().lower().replace("‌", " ").replace("\u200c", " ")
+    compact = re.sub(r"\s+", " ", compact).strip()
+    if not compact or len(compact) > 30:
+        return False
+    if compact.startswith(("وضعیت", "ترید", "آمار", "بررسی", "موجودی", "بالانس", "پوزیشن", "توبیت", "بستن", "هوش")):
+        return False
+    symbol = extract_symbol(compact, default="")
+    return bool(symbol and allowed_level1_symbol(symbol))
+
+
 def get_runtime_settings() -> Dict[str, Any]:
-    """
-    Persistent runtime settings.
-
-    These values are command-controlled and must not be only visual.
-    real_trade_manager reads the same runtime_settings section, so changing
-    margin/leverage/max_positions here changes real order sizing and safety.
-    """
     section = store().section("runtime_settings")
-
     defaults = {
         "real_trading_enabled": bool(getattr(SETTINGS.trading, "enabled", False)),
         "auto_signal_enabled": bool(os.getenv("AUTO_SIGNAL_ENABLED", "true").lower() in {"1", "true", "yes", "on"}),
-        "scan_interval_seconds": safe_int(getattr(SETTINGS.monitor, "scan_interval_seconds", 180), 180),
+        "scan_interval_seconds": safe_int(getattr(SETTINGS.monitor, "scan_interval_seconds", 20), 20),
+        "ghost_monitor_interval_seconds": safe_int(getattr(SETTINGS.monitor, "ghost_monitor_interval_seconds", 3), 3),
         "margin_usdt": safe_float(getattr(SETTINGS.trading, "margin_usdt", 5.0), 5.0),
         "trade_margin_usdt": safe_float(getattr(SETTINGS.trading, "margin_usdt", 5.0), 5.0),
         "leverage": safe_int(getattr(SETTINGS.trading, "leverage", 10), 10),
@@ -215,6 +284,7 @@ def get_runtime_settings() -> Dict[str, Any]:
         "daily_loss_lock_enabled": True,
         "daily_loss_locked_until": 0,
         "last_scan_ts": 0,
+        "level1_symbols": list(LEVEL1_SYMBOLS),
     }
     changed = False
     for key, value in defaults.items():
@@ -245,82 +315,6 @@ def real_trading_enabled() -> bool:
     return bool(get_runtime_settings().get("real_trading_enabled", False))
 
 
-def force_real_decision_to_ghost(decision: AIDecision, reason: str = "REAL_TRADING_DISABLED_TO_GHOST") -> AIDecision:
-    """
-    Downgrade a REAL decision to GHOST when real trading is disabled.
-
-    This keeps the AI decision/learning path alive while guaranteeing that:
-    - no REAL signal text is sent,
-    - no Toobit order is opened,
-    - the candidate is still stored as a hidden Ghost for learning.
-    """
-    if getattr(decision, "decision_type", "") != DECISION_REAL:
-        return decision
-
-    updates: Dict[str, Any] = {"decision_type": DECISION_GHOST}
-
-    try:
-        field_names = {f.name for f in fields(decision)} if is_dataclass(decision) else set()
-    except Exception:
-        field_names = set()
-
-    def _append_tuple_field(name: str) -> None:
-        if name not in field_names:
-            return
-        current = getattr(decision, name, ())
-        if current is None:
-            current = ()
-        if isinstance(current, str):
-            current_items = (current,)
-        else:
-            try:
-                current_items = tuple(current)
-            except Exception:
-                current_items = ()
-        if reason not in current_items:
-            updates[name] = tuple(list(current_items) + [reason])
-
-    def _append_list_field(name: str) -> None:
-        if name not in field_names:
-            return
-        current = getattr(decision, name, [])
-        if current is None:
-            current = []
-        if isinstance(current, str):
-            current_items = [current]
-        else:
-            try:
-                current_items = list(current)
-            except Exception:
-                current_items = []
-        if reason not in current_items:
-            updates[name] = current_items + [reason]
-
-    for name in ("reason_codes", "warnings"):
-        _append_tuple_field(name)
-
-    for name in ("reject_reasons", "ghost_reasons", "notes"):
-        _append_list_field(name)
-
-    # Optional flags used by some decision versions.
-    for name, value in {
-        "real_allowed": False,
-        "ghost_allowed": True,
-        "should_execute_real": False,
-        "execute_real": False,
-    }.items():
-        if name in field_names:
-            updates[name] = value
-
-    try:
-        return replace(decision, **updates)
-    except Exception:
-        # Last-resort fallback: keep original object but do not break the bot.
-        # If this happens, run_pipeline still blocks real execution below.
-        save_error("force_real_decision_to_ghost", "replace_failed", {"reason": reason})
-        return decision
-
-
 def auto_signal_enabled() -> bool:
     return bool(get_runtime_settings().get("auto_signal_enabled", True))
 
@@ -349,9 +343,12 @@ def allowed_user_ids() -> set[int]:
             ids.add(safe_int(item))
     except Exception:
         pass
-    runtime = store().section("allowed_users")
-    for item in runtime.values():
-        ids.add(safe_int(item))
+    try:
+        runtime = store().section("allowed_users")
+        for item in runtime.values():
+            ids.add(safe_int(item))
+    except Exception:
+        pass
     return {i for i in ids if i > 0}
 
 
@@ -360,96 +357,36 @@ def is_allowed(user_id: int) -> bool:
     return not allowed or int(user_id) in allowed
 
 
-def _normalize_symbol_safe(symbol: str) -> str:
-    raw = str(symbol or "").upper().strip().replace("/", "").replace("-", "")
-    if not raw:
-        return ""
-    try:
-        from symbol_mapper import normalize_symbol as _normalize_symbol  # type: ignore
-        normalized = _normalize_symbol(raw)
-        if normalized:
-            raw = str(normalized).upper().replace("/", "").replace("-", "")
-    except Exception:
-        pass
-    if raw.endswith("USDT"):
-        return raw
-    if 2 <= len(raw) <= 12 and re.match(r"^[A-Z0-9]+$", raw):
-        return raw + "USDT"
-    return raw
+def force_real_decision_to_ghost(decision: AIDecision, reason: str = "REAL_TRADING_DISABLED_TO_GHOST") -> AIDecision:
+    if getattr(decision, "decision_type", "") != DECISION_REAL:
+        return decision
 
+    data = decision.to_dict()
+    data["decision_type"] = DECISION_GHOST
+    data["should_trade_real"] = False
+    data["should_create_ghost"] = True
+    data["should_reject"] = False
 
-def extract_symbol(text: str, default: str = "BTCUSDT") -> str:
-    """Resolve English tickers and Persian asset names into bot symbols."""
-    original = str(text or "").strip()
-    compact = original.lower().replace("‌", " ").replace("\u200c", " ")
-    compact = re.sub(r"\s+", " ", compact).strip()
+    reasons = list(data.get("reason_codes", ()) or ())
+    warnings = list(data.get("warnings", ()) or ())
+    if reason not in reasons:
+        reasons.append(reason)
+    if reason not in warnings:
+        warnings.append(reason)
 
-    # Remove command words but keep the asset name.
-    asset_part = compact
-    for prefix in ASSET_COMMAND_PREFIXES:
-        if asset_part.startswith(prefix):
-            asset_part = asset_part[len(prefix):].strip()
-
-    asset_part = asset_part.strip()
-
-    # Exact alias first so short aliases like "بیت" do not accidentally
-    # override longer names such as "بیتکوین کش".
-    for alias in sorted(PERSIAN_SYMBOL_ALIASES, key=len, reverse=True):
-        if asset_part == alias:
-            return PERSIAN_SYMBOL_ALIASES[alias]
-
-    # Then allow contained aliases only when the user wrote a command phrase
-    # like "تحلیل دوج" or "سیگنال بیت کوین".
-    if original.lower().strip().startswith(ASSET_COMMAND_PREFIXES):
-        padded = f" {asset_part} "
-        for alias in sorted(PERSIAN_SYMBOL_ALIASES, key=len, reverse=True):
-            if f" {alias} " in padded or alias in asset_part:
-                return PERSIAN_SYMBOL_ALIASES[alias]
-
-    # If symbol_mapper.py on VPS exposes a richer resolver, use it safely.
-    try:
-        import symbol_mapper as _sm  # type: ignore
-        for fn_name in ("resolve_symbol", "normalize_input_symbol", "map_symbol", "symbol_from_text"):
-            fn = getattr(_sm, fn_name, None)
-            if callable(fn):
-                resolved = fn(original)
-                if resolved:
-                    return _normalize_symbol_safe(str(resolved))
-    except Exception:
-        pass
-
-    t = original.upper()
-    t = re.sub(r"[^\w\s]", " ", t)
-    words = [w for w in t.split() if w]
-    for w in reversed(words):
-        if w in {"تحلیل", "سیگنال", "بازار", "بررسی", "LONG", "SHORT", "وضعیت", "ترید"}:
-            continue
-        if re.match(r"^[A-Z0-9]{2,15}$", w):
-            return _normalize_symbol_safe(w)
-    return default
-
-
-def is_direct_asset_query(text: str) -> bool:
-    """Allow commands like 'بیتکوین' or 'SOL' without تحلیل/سیگنال."""
-    compact = str(text or "").strip().lower().replace("‌", " ").replace("\u200c", " ")
-    compact = re.sub(r"\s+", " ", compact).strip()
-    if not compact or len(compact) > 30:
-        return False
-    if compact.startswith(("وضعیت", "ترید", "آمار", "بررسی", "موجودی", "بالانس", "پوزیشن", "توبیت", "بستن", "هوش")):
-        return False
-    if extract_symbol(compact, default=""):
-        return True
-    return False
+    data["reason_codes"] = tuple(reasons)
+    data["warnings"] = tuple(warnings)
+    return AIDecision(**data)
 
 
 async def send_payload(update: Update, payload: ReportPayload) -> Any:
-    if not payload.should_send or not payload.text:
+    if not payload or not getattr(payload, "should_send", False) or not getattr(payload, "text", ""):
         return None
     message = getattr(update, "effective_message", None)
     if message is None:
         return None
     kwargs: Dict[str, Any] = {}
-    if payload.reply_to_message_id:
+    if getattr(payload, "reply_to_message_id", 0):
         kwargs["reply_to_message_id"] = payload.reply_to_message_id
     try:
         return await message.reply_text(payload.text, **kwargs)
@@ -457,6 +394,7 @@ async def send_payload(update: Update, payload: ReportPayload) -> Any:
         return await message.reply_text(payload.text)
     except Exception as exc:
         LOGGER.exception("send_payload failed: %s", exc)
+        return None
 
 
 async def send_text(update: Update, text: str) -> None:
@@ -465,9 +403,7 @@ async def send_text(update: Update, text: str) -> None:
         await message.reply_text(text)
 
 
-
 def active_position_count() -> int:
-    """Count internal active positions including PENDING_REAL_CONFIRM."""
     closed = {"CLOSED", "TP2", "AI_EXIT", "SL", "FAILED", "REJECTED"}
     try:
         positions = store().section("positions")
@@ -484,27 +420,30 @@ def active_position_count() -> int:
 
 
 def real_capacity_available() -> bool:
-    """Soft slot guard for auto-scan before running costly REAL execution path."""
     max_pos = runtime_max_positions()
     if max_pos <= 0:
         return True
+
     internal_count = active_position_count()
     exchange_count = 0
     try:
         summary = toobit_summary()
-        exchange_count = safe_int(summary.get("open_positions_count", 0), 0) if isinstance(summary, dict) else 0
+        if isinstance(summary, dict):
+            exchange_count = safe_int(summary.get("open_positions_count", 0), 0)
     except Exception:
         exchange_count = 0
+
     return max(internal_count, exchange_count) < max_pos
 
 
 def attach_signal_message_to_position(trade_result: Optional[RealTradeOpenResult], message_obj: Any) -> None:
-    """Persist Telegram signal message id so TP/SL/AI_EXIT reports can reply to it."""
     if not trade_result or message_obj is None:
         return
+
     msg_id = safe_int(getattr(message_obj, "message_id", 0), 0)
     if msg_id <= 0:
         return
+
     try:
         trade_id = str(getattr(trade_result, "trade_id", "") or "")
         if not trade_id:
@@ -525,20 +464,51 @@ def attach_signal_message_to_position(trade_result: Optional[RealTradeOpenResult
 
 
 class PipelineOrchestrator:
-    """
-    Runs the full analysis/decision/TP-SL/trade/ghost path.
-
-    The router calls this; it does not contain Telegram logic.
-    """
-
     def __init__(self):
         self.client = get_client()
 
     def build_candidate(self, symbol: str, timeframe: str = "5m") -> AnalysisCandidate:
-        mtf = get_multi_timeframe_snapshot(symbol, timeframes=[timeframe], limit=120)
+        symbol = allowed_level1_symbol(symbol)
+        if not symbol:
+            raise ValueError("SYMBOL_NOT_ALLOWED_LEVEL1")
+
+        mtf = get_multi_timeframe_snapshot(symbol, timeframes=[timeframe], limit=160)
         snapshot = mtf.snapshots[timeframe]
         candles = [c.to_dict() for c in snapshot.candles]
         return analyze_symbol(symbol=symbol, timeframe=timeframe, candles=candles, market_context=None)
+
+    def predict_for_candidate(self, candidate: AnalysisCandidate, learning: LearningSummary) -> MovementPredictionResult:
+        learning_summary = learning.to_dict() if hasattr(learning, "to_dict") else {}
+
+        movement_summary: Dict[str, Any] = {}
+        try:
+            ms = summarize_movement_candidate(candidate)
+            movement_summary = ms.to_dict() if hasattr(ms, "to_dict") else dict(ms or {})
+        except TypeError:
+            try:
+                ms = summarize_movement_candidate(candidate=candidate)
+                movement_summary = ms.to_dict() if hasattr(ms, "to_dict") else dict(ms or {})
+            except Exception:
+                movement_summary = {}
+        except Exception:
+            movement_summary = {}
+
+        attempts = [
+            lambda: predict_movement(candidate=candidate, learning_summary=learning_summary, movement_summary=movement_summary),
+            lambda: predict_movement(candidate=candidate, learning=learning),
+            lambda: predict_movement(candidate),
+        ]
+
+        last_error: Optional[Exception] = None
+        for fn in attempts:
+            try:
+                return fn()
+            except TypeError as exc:
+                last_error = exc
+                continue
+        if last_error:
+            raise last_error
+        raise RuntimeError("predict_movement_failed")
 
     def run_pipeline(
         self,
@@ -548,57 +518,10 @@ class PipelineOrchestrator:
         execute_real: bool = True,
     ) -> PipelineResult:
         candidate = self.build_candidate(symbol, timeframe=timeframe)
+        learning = summarize_candidate_learning(candidate)
+        prediction = self.predict_for_candidate(candidate, learning)
 
-        movement = analyze_movement(candidate)
-
-        # First-pass learning is available before trap/state are built.
-        # It allows downstream layers to use historical coin+direction+condition
-        # memory instead of treating every fresh range/compression setup as new.
-        early_learning = summarize_candidate_learning(candidate, movement=movement, trap=None, state=None)
-        early_learning_summary = early_learning.to_dict()
-
-        try:
-            trap = analyze_trap(candidate, movement=movement, learning_summary=early_learning_summary)
-        except TypeError:
-            trap = analyze_trap(candidate, movement=movement)
-
-        try:
-            state = analyze_state(candidate, movement=movement, trap=trap, learning_summary=early_learning_summary)
-        except TypeError:
-            state = analyze_state(candidate, movement=movement, trap=trap)
-
-        # Final learning summary uses the full context after trap/state exist.
-        learning = summarize_candidate_learning(candidate, movement=movement, trap=trap, state=state)
-        learning_summary = learning.to_dict()
-
-        confidence = analyze_confidence(candidate, movement=movement, trap=trap, state=state, learning_summary=learning_summary)
-        correlation = analyze_correlation(candidate, open_positions=open_positions, market_context=candidate.market_context)
-        movement_summary = summarize_movement_candidate(candidate, movement=movement, trap=trap, state=state)
-        prediction_kwargs = {
-            "candidate": candidate,
-            "movement": movement,
-            "trap": trap,
-            "state": state,
-            "confidence": confidence,
-            "movement_summary": movement_summary,
-        }
-        try:
-            prediction = predict_movement(**prediction_kwargs, learning_summary=learning_summary)
-        except TypeError:
-            prediction = predict_movement(**prediction_kwargs)
-
-        meta = get_meta_learning_summary()
-        decision = decide(
-            candidate=candidate,
-            movement=movement,
-            trap=trap,
-            state=state,
-            confidence=confidence,
-            correlation=correlation,
-            prediction=prediction,
-            learning=learning,
-            meta=meta,
-        )
+        decision = decide(candidate=candidate, prediction=prediction, learning=learning)
 
         if decision.decision_type == DECISION_REAL and not real_trading_enabled():
             decision = force_real_decision_to_ghost(decision, "REAL_TRADING_DISABLED_TO_GHOST")
@@ -612,10 +535,6 @@ class PipelineOrchestrator:
             plan = build_tp_sl_plan(
                 decision=decision,
                 candidate=candidate,
-                movement=movement,
-                trap=trap,
-                state=state,
-                confidence=confidence,
                 prediction=prediction,
                 learning=learning,
             )
@@ -625,17 +544,19 @@ class PipelineOrchestrator:
 
         if decision.decision_type == DECISION_GHOST and plan:
             create_ghost(
-                decision_id=decision.decision_id,
+                decision=decision,
                 candidate=candidate,
                 entry=plan.entry,
                 tp1=plan.tp1,
                 tp2=plan.tp2,
                 sl=plan.sl,
-                movement=movement,
-                trap=trap,
-                state=state,
-                confidence=confidence,
-                meta={"decision": decision.to_dict(), "plan": plan.to_dict()},
+                meta={
+                    "decision": decision.to_dict(),
+                    "plan": plan.to_dict(),
+                    "candidate": candidate.to_dict() if hasattr(candidate, "to_dict") else {},
+                    "learning": learning.to_dict() if hasattr(learning, "to_dict") else {},
+                    "prediction": prediction.to_dict() if hasattr(prediction, "to_dict") else {},
+                },
             )
 
         if decision.decision_type == DECISION_REAL and plan and execute_real and real_trading_enabled():
@@ -644,15 +565,11 @@ class PipelineOrchestrator:
                 decision,
                 plan,
                 analysis_meta={
-                    "candidate": candidate.to_dict(),
-                    "movement": movement.to_dict(),
-                    "trap": trap.to_dict(),
-                    "state": state.to_dict(),
-                    "confidence": confidence.to_dict(),
-                    "correlation": correlation.to_dict(),
-                    "prediction": prediction.to_dict(),
-                    "learning": learning.to_dict(),
-                    "ai_decision": decision.to_dict(),
+                    "candidate": candidate.to_dict() if hasattr(candidate, "to_dict") else {},
+                    "learning": learning.to_dict() if hasattr(learning, "to_dict") else {},
+                    "prediction": prediction.to_dict() if hasattr(prediction, "to_dict") else {},
+                    "ai_decision": decision.to_dict() if hasattr(decision, "to_dict") else {},
+                    "tp_sl_plan": plan.to_dict() if hasattr(plan, "to_dict") else {},
                 },
             )
 
@@ -663,11 +580,6 @@ class PipelineOrchestrator:
 
         return PipelineResult(
             candidate=candidate,
-            movement=movement,
-            trap=trap,
-            state=state,
-            confidence=confidence,
-            correlation=correlation,
             learning=learning,
             prediction=prediction,
             decision=decision,
@@ -700,39 +612,33 @@ async def require_access(update: Update) -> bool:
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await require_access(update):
         return
-    text = (
-        "🤖 ربات Movement Hunter فعال است\n"
-        "معماری: REAL / GHOST / REJECT\n"
-        "Paper و Setup در این نسخه وجود ندارد.\n\n"
+    await send_text(update, (
+        "🤖 ربات Level 1 / 5M فعال است\n"
+        "معماری: AI + Pattern + Learning → REAL / GHOST / REJECT\n"
+        "Paper و Setup حذف شده‌اند.\n\n"
+        "ارزهای فعال:\n"
+        "DOGE | XRP | SOL | ADA | AVAX | LINK | INJ | PEPE | WIF | BONK\n\n"
         "دستورات:\n"
-        "تحلیل BTC\n"
-        "سیگنال BTC\n"
+        "تحلیل DOGE\n"
+        "سیگنال XRP\n"
         "بررسی بازار\n"
         "وضعیت / وضعیت ترید\n"
         "ترید فعال / ترید خاموش\n"
-        "ترید دلار 10 / سرمایه ترید 10\n"
+        "ترید دلار 10\n"
         "ترید لوریج 10\n"
         "حداکثر پوزیشن 3\n"
-        "قفل ضرر خاموش\n"
         "موجودی / بالانس\n"
         "پوزیشن‌ها\n"
         "توبیت / وضعیت توبیت\n"
-        "بستن پوزیشن BTCUSDT\n"
-        "آمار / آمار 7 روز / آمار کل\n"
-        "آمار هوشمند\n"
-        "حذف آمار"
-    )
-    await send_text(update, text)
+        "بستن پوزیشن DOGE\n"
+        "آمار / آمار هوشمند\n"
+        "هوش مصنوعی"
+    ))
 
 
 async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = getattr(update, "effective_user", None)
     await send_text(update, f"ID: {getattr(user, 'id', 0)}")
-
-
-async def trade_status(update: Update) -> None:
-    await send_toobit_status(update)
-
 
 
 def format_usdt(value: Any) -> str:
@@ -746,11 +652,11 @@ def toobit_summary() -> Dict[str, Any]:
 
     balance = {"ok": False, "error": "account_summary_missing"}
     if hasattr(c, "get_account_balance") and callable(c.get_account_balance):
-        
         try:
             balance = c.get_account_balance("USDT")
         except TypeError:
             balance = c.get_account_balance()
+
     positions = c.get_open_positions() if hasattr(c, "get_open_positions") else []
     return {
         "ok": bool(balance.get("ok", False)) if isinstance(balance, dict) else False,
@@ -775,11 +681,7 @@ def format_positions(positions: List[Dict[str, Any]], max_rows: int = 10) -> str
         mark = safe_float(p.get("mark_price", 0.0))
         pnl = safe_float(p.get("unrealized_pnl", 0.0))
         lev = safe_int(p.get("leverage", 0))
-        lines.append(
-            f"• {symbol} {direction} | qty:{qty:g} | entry:{entry:g} | mark:{mark:g} | PnL:{pnl:+.4f}$ | lev:{lev}x"
-        )
-    if len(positions) > max_rows:
-        lines.append(f"... و {len(positions) - max_rows} پوزیشن دیگر")
+        lines.append(f"• {symbol} {direction} | qty:{qty:g} | entry:{entry:g} | mark:{mark:g} | PnL:{pnl:+.4f}$ | lev:{lev}x")
     return "\n".join(lines)
 
 
@@ -808,6 +710,7 @@ def format_toobit_status(include_positions: bool = True) -> str:
             f"ترید واقعی: {'روشن ✅' if real_trading_enabled() else 'خاموش ❌'}\n"
             f"سیگنال خودکار: {'روشن ✅' if auto_signal_enabled() else 'خاموش ❌'}\n"
             f"سرمایه هر ترید: {runtime_margin_usdt():.2f}$ | لوریج: {runtime_leverage()}x | حداکثر پوزیشن: {runtime_max_positions()}\n"
+            f"ارزهای فعال: {', '.join(level1_scan_symbols())}\n"
             f"{balance_text}\n"
         )
         if include_positions:
@@ -815,17 +718,11 @@ def format_toobit_status(include_positions: bool = True) -> str:
         return text
     except Exception as exc:
         save_error("toobit_status", str(exc), {})
-        return (
-            "⚠️ خطا در خواندن وضعیت Toobit\n"
-            f"{exc}\n"
-            f"ترید واقعی: {'روشن ✅' if real_trading_enabled() else 'خاموش ❌'}\n"
-            f"سرمایه هر ترید: {runtime_margin_usdt():.2f}$ | لوریج: {runtime_leverage()}x | حداکثر پوزیشن: {runtime_max_positions()}"
-        )
+        return f"⚠️ خطا در خواندن وضعیت Toobit\n{exc}"
 
 
 async def send_toobit_status(update: Update) -> None:
-    text = await asyncio.to_thread(format_toobit_status, True)
-    await send_text(update, text)
+    await send_text(update, await asyncio.to_thread(format_toobit_status, True))
 
 
 async def send_toobit_balance(update: Update) -> None:
@@ -874,7 +771,7 @@ async def close_toobit_position_command(update: Update, text: str) -> bool:
         close_all = compact.startswith("بستن همه پوزیشن")
         if not close_all:
             target_symbol = extract_symbol(compact)
-            positions_to_close = [p for p in positions if extract_symbol(str(p.get("symbol", "")), default=str(p.get("symbol", ""))) == target_symbol]
+            positions_to_close = [p for p in positions if normalize_symbol_safe(str(p.get("symbol", ""))) == target_symbol]
         else:
             target_symbol = "ALL"
             positions_to_close = positions
@@ -892,15 +789,14 @@ async def close_toobit_position_command(update: Update, text: str) -> bool:
                 continue
             try:
                 res = c.close_position(sym, direction, qty)
-                results.append(f"✅ {sym} {direction} بسته شد | order:{res.get('order_id', '-')}")
+                order_id = res.get("order_id", "-") if isinstance(res, dict) else "-"
+                results.append(f"✅ {sym} {direction} بسته شد | order:{order_id}")
             except Exception as exc:
                 results.append(f"❌ {sym} {direction} خطا: {exc}")
         return "\n".join(results)
 
     await send_text(update, await asyncio.to_thread(run_close))
     return True
-
-
 
 
 def parse_first_number(text: str, default: Optional[float] = None) -> Optional[float]:
@@ -918,12 +814,6 @@ def percent(part: float, total: float) -> float:
 
 
 def build_ai_status_text() -> str:
-    """
-    Full AI report for command: هوش مصنوعی
-
-    Includes REAL/GHOST TP1/TP2/SL/AI_EXIT, metadata counts, Movement Hunter
-    pump/dump outcome counts, and meta-learning status.
-    """
     sm = stats_manager_instance()
     real = sm.summary(days=None, source_type="REAL")
     ghost = sm.summary(days=None, source_type="GHOST")
@@ -951,96 +841,46 @@ def build_ai_status_text() -> str:
 
     learning_section = store().section("learning")
     movement_section = store().section("movement_memory")
-    meta_section = store().section("meta_learning")
     ghosts_section = store().section("ghosts")
 
-    movement_items = [v for v in movement_section.values() if isinstance(v, dict)]
-    pump_total = pump_ok = dump_total = dump_ok = 0
-    fresh_count = late_count = 0
+    pattern_pump = 0
+    pattern_dump = 0
+    early_patterns = 0
 
-    for rec in movement_items:
-        direction = str(
-            rec.get("direction")
-            or rec.get("predicted_direction")
-            or rec.get("side")
-            or rec.get("signal_direction")
-            or ""
-        ).upper()
-        result = str(
-            rec.get("result")
-            or rec.get("outcome")
-            or rec.get("final_result")
-            or rec.get("movement_result")
-            or ""
-        ).upper()
-        freshness = str(rec.get("freshness") or rec.get("move_freshness") or rec.get("phase") or "").upper()
-
-        win = result in {"TP1", "TP2", "AI_EXIT", "SUCCESS", "WIN", "MOVE_SUCCESS", "CORRECT"}
+    for rec in movement_section.values():
+        if not isinstance(rec, dict):
+            continue
+        direction = str(rec.get("direction") or rec.get("predicted_direction") or rec.get("side") or "").upper()
+        phase = str(rec.get("phase") or rec.get("freshness") or rec.get("predicted_phase") or "").upper()
         if direction == "LONG":
-            pump_total += 1
-            if win:
-                pump_ok += 1
+            pattern_pump += 1
         elif direction == "SHORT":
-            dump_total += 1
-            if win:
-                dump_ok += 1
-
-        if "FRESH" in freshness or "START" in freshness or "EARLY" in freshness:
-            fresh_count += 1
-        if "LATE" in freshness or "EXHAUST" in freshness:
-            late_count += 1
-
-    meta_samples = len(meta_section)
-    learning_samples = len(learning_section)
-    movement_samples = len(movement_items)
-
-    try:
-        meta = get_meta_learning_summary()
-        if hasattr(meta, "to_dict") and callable(meta.to_dict):
-            meta_dict = meta.to_dict()
-        elif isinstance(meta, dict):
-            meta_dict = meta
-        else:
-            meta_dict = {}
-    except Exception:
-        meta_dict = {}
-
-    strong_layers = meta_dict.get("strong_layers") or meta_dict.get("best_layers") or []
-    weak_layers = meta_dict.get("weak_layers") or meta_dict.get("worst_layers") or []
-    if isinstance(strong_layers, dict):
-        strong_layers = list(strong_layers.keys())
-    if isinstance(weak_layers, dict):
-        weak_layers = list(weak_layers.keys())
-
-    real_wins = real.tp1_count
-    ghost_wins = ghost_tp1
-    all_wins = all_summary.tp1_count
+            pattern_dump += 1
+        if any(x in phase for x in ("PRE", "START", "EARLY", "FRESH")):
+            early_patterns += 1
 
     return (
-        "🤖 وضعیت هوش مصنوعی\n\n"
+        "🤖 وضعیت هوش مصنوعی Level 1 / 5M\n\n"
         "📊 REAL\n"
         f"کل: {real.total_events} | بسته: {real.closed_count}\n"
         f"TP1: {real.tp1_count} | TP2: {real.tp2_count} | AI Exit: {real.ai_exit_count} | SL: {real.sl_count}\n"
-        f"WinRate: {real.win_rate:.2f}% | بردها: {real_wins}\n"
+        f"WinRate: {real.win_rate:.2f}%\n"
         f"PnL واقعی تاییدشده: {real.confirmed_pnl_usdt:+.4f}$\n\n"
         "👻 GHOST\n"
         f"کل: {ghost_total} | باز: {ghost_open} | بسته: {ghost_closed}\n"
         f"TP1: {ghost_tp1} | TP2: {ghost_tp2} | AI Exit: {ghost_ai_exit} | SL: {ghost_sl}\n"
-        f"WinRate: {ghost_wr:.2f}% | بردها: {ghost_wins}\n\n"
-        "🎯 TP/SL کلی\n"
+        f"WinRate: {ghost_wr:.2f}%\n\n"
+        "🎯 کلی\n"
         f"TP1: {all_summary.tp1_count} | TP2: {all_summary.tp2_count} | AI Exit: {all_summary.ai_exit_count} | SL: {all_summary.sl_count}\n"
-        f"WinRate کل: {all_summary.win_rate:.2f}% | Long WR: {all_summary.long_win_rate:.2f}% | Short WR: {all_summary.short_win_rate:.2f}%\n\n"
-        "🧠 Movement Hunter\n"
-        f"تشخیص پامپ درست: {pump_ok}/{pump_total} ({percent(pump_ok, pump_total):.1f}%)\n"
-        f"تشخیص دامپ درست: {dump_ok}/{dump_total} ({percent(dump_ok, dump_total):.1f}%)\n"
-        f"Fresh/Early: {fresh_count} | Late/Exhaustion: {late_count}\n\n"
-        "🧬 Metadata / Learning\n"
-        f"Learning samples: {learning_samples}\n"
-        f"Movement memory: {movement_samples}\n"
+        f"WinRate کل: {all_summary.win_rate:.2f}%\n\n"
+        "🧬 Pattern / Learning\n"
+        f"Learning samples: {len(learning_section)}\n"
+        f"Movement memory: {len(movement_section)}\n"
         f"Ghost records: {len(ghosts_section)}\n"
-        f"Meta records: {meta_samples}\n"
-        f"لایه‌های قوی: {', '.join(map(str, strong_layers[:4])) if strong_layers else '-'}\n"
-        f"لایه‌های ضعیف: {', '.join(map(str, weak_layers[:4])) if weak_layers else '-'}"
+        f"الگوی تشخیص پامپ: {pattern_pump}\n"
+        f"الگوی تشخیص دامپ: {pattern_dump}\n"
+        f"الگوهای شروع/زودهنگام: {early_patterns}\n"
+        f"ارزهای فعال: {', '.join(level1_scan_symbols())}"
     )
 
 
@@ -1050,7 +890,7 @@ async def handle_trade_toggle(update: Update, text: str) -> bool:
     settings_update: Dict[str, Any] = {}
 
     if compact in {"ترید", "وضعیت", "وضعیت ترید", "trade", "trade status"}:
-        await trade_status(update)
+        await send_toobit_status(update)
         return True
 
     if "ترید فعال" in compact or "ترید روشن" in compact or "trade on" in compact:
@@ -1062,15 +902,11 @@ async def handle_trade_toggle(update: Update, text: str) -> bool:
     if "ترید خاموش" in compact or "ترید غیرفعال" in compact or "trade off" in compact:
         settings_update.update({"real_trading_enabled": False})
         save_runtime_settings(settings_update)
-        await send_text(update, "❌ ترید واقعی خاموش شد. این تغییر واقعی و ذخیره شد.")
+        await send_text(update, "❌ ترید واقعی خاموش شد. از این به بعد سیگنال REAL به GHOST تبدیل می‌شود.")
         return True
 
     if "قفل ضرر خاموش" in compact:
-        settings_update.update({
-            "daily_loss_lock_enabled": False,
-            "daily_loss_locked_until": 0,
-            "daily_loss_unlocked_at": now_ts(),
-        })
+        settings_update.update({"daily_loss_lock_enabled": False, "daily_loss_locked_until": 0, "daily_loss_unlocked_at": now_ts()})
         save_runtime_settings(settings_update)
         await send_text(update, "🔓 قفل ضرر خاموش و آزاد شد.")
         return True
@@ -1084,7 +920,7 @@ async def handle_trade_toggle(update: Update, text: str) -> bool:
     if compact.startswith("ترید دلار") or compact.startswith("سرمایه ترید"):
         value = parse_first_number(compact)
         if value is None or value <= 0:
-            await send_text(update, "❌ مقدار سرمایه ترید نامعتبر است. مثال: سرمایه ترید 10")
+            await send_text(update, "❌ مقدار سرمایه ترید نامعتبر است. مثال: ترید دلار 10")
             return True
         value = max(1.0, min(float(value), 1_000_000.0))
         settings_update.update({"margin_usdt": value, "trade_margin_usdt": value})
@@ -1126,16 +962,15 @@ async def handle_trade_toggle(update: Update, text: str) -> bool:
 
     return False
 
+
 async def handle_stats(update: Update, text: str) -> bool:
     t = str(text or "").strip()
     if t.startswith("حذف آمار"):
         await send_text(update, clear_stats())
         return True
-
     if t.startswith("آمار هوشمند"):
         await send_text(update, detailed_stats_report(days=30, source_type="ALL"))
         return True
-
     if t.startswith("آمار"):
         days = None
         m = re.search(r"(\d+)", t)
@@ -1145,7 +980,6 @@ async def handle_stats(update: Update, text: str) -> bool:
             days = None
         await send_text(update, stats_report(days=days))
         return True
-
     return False
 
 
@@ -1155,24 +989,32 @@ async def handle_analysis(update: Update, text: str) -> bool:
         return False
 
     symbol = extract_symbol(t)
-    await send_text(update, f"🔎 در حال بررسی {symbol} ...")
+    if not allowed_level1_symbol(symbol):
+        await send_text(update, "❌ این نسخه فقط روی ۱۰ ارز Level 1 کار می‌کند:\n" + ", ".join(LEVEL1_SYMBOLS))
+        return True
+
+    await send_text(update, f"🔎 بررسی سریع {symbol} در 5M ...")
     try:
         result = await asyncio.to_thread(orchestrator().run_pipeline, symbol, "5m", None, True)
+
         if result.signal_report and result.decision.decision_type == DECISION_REAL:
             sent_msg = await send_payload(update, result.signal_report)
             attach_signal_message_to_position(result.trade_result, sent_msg)
         elif result.decision.decision_type == DECISION_GHOST:
-            await send_text(update, f"{symbol}: سیگنال واقعی صادر نشد؛ فقط در یادگیری داخلی ثبت شد.")
+            await send_text(update, f"👻 {symbol}: شرایط برای REAL کافی نبود؛ به GHOST رفت و برای یادگیری ثبت شد.")
         else:
             decision = result.decision
-            reject_line = " | ".join(decision.reject_reasons[:4]) if decision.reject_reasons else "شرایط کافی نبود"
-            await send_text(update, f"❌ {symbol} رد شد\nدلیل: {reject_line}\nAI: {decision.ai_score:.1f}")
+            rejects = getattr(decision, "reject_reasons", ()) or ()
+            reject_line = " | ".join(list(rejects)[:4]) if rejects else "شرایط کافی نبود"
+            await send_text(update, f"❌ {symbol} رد شد\nدلیل: {reject_line}\nAI: {safe_float(getattr(decision, 'ai_score', 0)):.1f}")
 
         if result.trade_report:
             await send_payload(update, result.trade_report)
+
     except Exception as exc:
         save_error("bot_analysis", str(exc), {"symbol": symbol})
         await send_payload(update, format_error_report("خطا در تحلیل", exc))
+
     return True
 
 
@@ -1180,20 +1022,20 @@ async def handle_market_overview(update: Update, text: str) -> bool:
     if not str(text or "").strip().startswith("بررسی"):
         return False
 
-    symbols = list(getattr(SETTINGS.market_data, "scan_symbols", ["BTCUSDT", "ETHUSDT"]))[:30]
+    symbols = level1_scan_symbols()
     bullish = 0
     bearish = 0
     neutral = 0
     errors = 0
 
-    await send_text(update, "🔎 بررسی سریع بازار شروع شد...")
+    await send_text(update, "🔎 بررسی سریع بازار ۱۰ ارز Level 1 شروع شد...")
 
     for symbol in symbols:
         try:
             candidate = await asyncio.to_thread(orchestrator().build_candidate, symbol, "5m")
-            if candidate.direction_hint == "LONG":
+            if getattr(candidate, "direction_hint", "") == "LONG":
                 bullish += 1
-            elif candidate.direction_hint == "SHORT":
+            elif getattr(candidate, "direction_hint", "") == "SHORT":
                 bearish += 1
             else:
                 neutral += 1
@@ -1201,20 +1043,21 @@ async def handle_market_overview(update: Update, text: str) -> bool:
             errors += 1
 
     total = max(1, bullish + bearish + neutral)
-    text_out = (
-        "📊 بررسی بازار\n"
+    if neutral >= bullish and neutral >= bearish:
+        summary = "بازار بیشتر رنج/نامشخص است."
+    elif bullish > bearish:
+        summary = "تمایل کلی بازار صعودی است."
+    else:
+        summary = "تمایل کلی بازار نزولی است."
+
+    await send_text(update, (
+        "📊 بررسی بازار Level 1\n"
         f"صعودی: {bullish} ({bullish / total * 100:.1f}%)\n"
         f"نزولی: {bearish} ({bearish / total * 100:.1f}%)\n"
         f"رنج/خنثی: {neutral} ({neutral / total * 100:.1f}%)\n"
         f"خطا: {errors}\n\n"
-    )
-    if neutral >= bullish and neutral >= bearish:
-        text_out += "جمع‌بندی: بازار بیشتر رنج/نامشخص است."
-    elif bullish > bearish:
-        text_out += "جمع‌بندی: تمایل کلی بازار صعودی است."
-    else:
-        text_out += "جمع‌بندی: تمایل کلی بازار نزولی است."
-    await send_text(update, text_out)
+        f"جمع‌بندی: {summary}"
+    ))
     return True
 
 
@@ -1243,20 +1086,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if await close_toobit_position_command(update, text):
         return
-
     if await handle_trade_toggle(update, text):
         return
-
-    if text.startswith("وضعیت ترید"):
-        await trade_status(update)
-        return
-
     if await handle_stats(update, text):
         return
-
     if await handle_market_overview(update, text):
         return
-
     if await handle_analysis(update, text):
         return
 
@@ -1271,67 +1106,48 @@ async def auto_scan_loop(app: Any) -> None:
     while True:
         try:
             settings = get_runtime_settings()
-            interval = safe_int(settings.get("scan_interval_seconds", 240), 240)
+            interval = safe_int(settings.get("scan_interval_seconds", 20), 20)
+            interval = max(5, interval)
+
             if auto_signal_enabled():
-                symbols = list(getattr(SETTINGS.market_data, "scan_symbols", ["BTCUSDT", "ETHUSDT"]))
-                for symbol in symbols:
+                for symbol in level1_scan_symbols():
                     if real_trading_enabled() and not real_capacity_available():
                         break
+
                     try:
                         result = await asyncio.to_thread(orchestrator().run_pipeline, symbol, "5m", None, True)
-                        # Auto-scan must send Telegram alerts only for REAL signals.
-                        # GHOST signals are still created/stored inside run_pipeline()
-                        # for learning, but they should stay hidden from Telegram.
+
+                        # Auto scan sends only REAL signal reports. GHOST remains hidden.
                         if result.signal_report and result.decision.decision_type == DECISION_REAL:
                             oid = owner_id()
                             if oid:
                                 sent_msg = await app.bot.send_message(chat_id=oid, text=result.signal_report.text)
                                 attach_signal_message_to_position(result.trade_result, sent_msg)
+
                         if result.trade_report:
                             oid = owner_id()
                             if oid:
                                 await app.bot.send_message(chat_id=oid, text=result.trade_report.text)
+
                     except Exception as exc:
                         save_error("auto_scan_symbol", str(exc), {"symbol": symbol})
-                    await asyncio.sleep(0.2)
-            await asyncio.sleep(max(30, interval))
+
+                    await asyncio.sleep(0.05)
+
+            await asyncio.sleep(interval)
+
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             save_error("auto_scan_loop", str(exc), {})
-            await asyncio.sleep(30)
+            await asyncio.sleep(10)
 
 
-def build_position_monitor_analysis(pos: Any) -> Tuple[Any, MovementHunterResult, TrapResult, StateResult]:
-    """
-    Build fresh AI context for an already-open REAL position.
-
-    Critical for AI Profit Exit:
-    position_monitor.py can only close a profitable position on weakness/reversal
-    when it receives fresh movement/trap/state data. Passing None disables that
-    logic and leaves the bot waiting only for TP/SL.
-    """
+def build_position_monitor_analysis(pos: Any) -> Any:
     symbol = str(getattr(pos, "symbol", "") or getattr(pos, "exchange_symbol", "") or "")
-    orch = orchestrator()
-    candidate = orch.build_candidate(symbol, timeframe="5m")
-    movement = analyze_movement(candidate)
-    early_learning = summarize_candidate_learning(candidate, movement=movement, trap=None, state=None)
-    early_learning_summary = early_learning.to_dict()
-    try:
-        trap = analyze_trap(candidate, movement=movement, learning_summary=early_learning_summary)
-    except TypeError:
-        trap = analyze_trap(candidate, movement=movement)
-    try:
-        state = analyze_state(candidate, movement=movement, trap=trap, learning_summary=early_learning_summary)
-    except TypeError:
-        state = analyze_state(candidate, movement=movement, trap=trap)
-    snapshot = (
-        getattr(candidate, "snapshot", None)
-        or getattr(candidate, "sensor_snapshot", None)
-        or getattr(candidate, "sensors", None)
-        or candidate
-    )
-    return snapshot, movement, trap, state
+    symbol = allowed_level1_symbol(symbol) or normalize_symbol_safe(symbol)
+    candidate = orchestrator().build_candidate(symbol, timeframe="5m")
+    return getattr(candidate, "sensor_snapshot", candidate)
 
 
 async def position_monitor_loop(app: Any) -> None:
@@ -1348,19 +1164,21 @@ async def position_monitor_loop(app: Any) -> None:
                         kwargs = {}
                         if payload.reply_to_message_id:
                             kwargs["reply_to_message_id"] = payload.reply_to_message_id
-                        await app.bot.send_message(chat_id=oid, text=payload.text, **kwargs)
+                        try:
+                            await app.bot.send_message(chat_id=oid, text=payload.text, **kwargs)
+                        except Exception:
+                            await app.bot.send_message(chat_id=oid, text=payload.text)
                 except Exception as exc:
-                    save_error("position_event_report", str(exc), event.to_dict())
-            await asyncio.sleep(5)
+                    save_error("position_event_report", str(exc), event.to_dict() if hasattr(event, "to_dict") else {})
+            await asyncio.sleep(2)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             save_error("position_monitor_loop", str(exc), {})
-            await asyncio.sleep(10)
+            await asyncio.sleep(5)
 
 
 def latest_price_value(raw: Any) -> float:
-    """Extract a numeric latest price from market_data.get_latest_price output."""
     if isinstance(raw, (int, float)):
         return safe_float(raw)
     if isinstance(raw, dict):
@@ -1378,20 +1196,11 @@ def latest_price_value(raw: Any) -> float:
 
 
 async def ghost_monitor_loop(app: Any) -> None:
-    """
-    Monitors hidden GHOST signals for TP/SL outcomes and learning.
-
-    Ghosts must stay hidden from Telegram, but their outcomes must be stored so
-    coin_learning, movement_memory, meta_learning and stats can improve later.
-    """
     LOGGER.info("ghost_monitor_loop started")
     while True:
         try:
-            interval = safe_int(
-                getattr(SETTINGS.monitor, "ghost_monitor_interval_seconds", 10),
-                10,
-            )
-            interval = max(3, interval)
+            interval = safe_int(get_runtime_settings().get("ghost_monitor_interval_seconds", 3), 3)
+            interval = max(2, interval)
 
             ghosts = await asyncio.to_thread(ghost_manager_instance().open_ghosts)
             for ghost in ghosts:
@@ -1408,21 +1217,22 @@ async def ghost_monitor_loop(app: Any) -> None:
                         except TypeError:
                             record_ghost_result(result.to_dict())
                         except Exception as exc:
-                            save_error("ghost_result_record", str(exc), result.to_dict())
+                            save_error("ghost_result_record", str(exc), result.to_dict() if hasattr(result, "to_dict") else {})
                 except Exception as exc:
                     payload = ghost.to_dict() if hasattr(ghost, "to_dict") else {"ghost": str(ghost)}
                     save_error("ghost_monitor_symbol", str(exc), payload)
 
             await asyncio.sleep(interval)
+
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             save_error("ghost_monitor_loop", str(exc), {})
-            await asyncio.sleep(10)
+            await asyncio.sleep(5)
 
 
 async def post_init(app: Any) -> None:
-    LOGGER.info("starting background loops: auto_scan, position_monitor, ghost_monitor")
+    LOGGER.info("starting loops: auto_scan, position_monitor, ghost_monitor")
     app.create_task(auto_scan_loop(app))
     app.create_task(position_monitor_loop(app))
     app.create_task(ghost_monitor_loop(app))
@@ -1446,7 +1256,7 @@ def build_application() -> Any:
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
     app = build_application()
-    LOGGER.info("Movement Hunter bot started")
+    LOGGER.info("Level 1 / 5M bot started")
     app.run_polling()
 
 
