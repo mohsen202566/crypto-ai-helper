@@ -609,7 +609,7 @@ class DecisionTypeClassifier:
         configured_min_ghost = safe_float(getattr(SETTINGS.ai, "min_ghost_confidence", 45.0), 45.0)
 
         # Keep real trading selective. GHOST remains broad for learning.
-        min_real = clamp(configured_min_real, 68.0, 76.0)
+        min_real = clamp(configured_min_real, 64.0, 74.0)
         min_ghost = clamp(configured_min_ghost, 22.0, 40.0)
         max_real_risk = safe_float(getattr(SETTINGS.ai, "max_real_risk", 38.0), 38.0)
 
@@ -647,6 +647,19 @@ class DecisionTypeClassifier:
             and fuzzy_match_score >= 62.0
             and "TIMING_LATE_OR_WEAK_PATTERN" not in learning_notes
         )
+        # Warm-up bridge:
+        # After a clean reset the bot may have many strong GHOST wins but still
+        # mark each individual coin/condition as LOW_DATA. LOW_DATA should slow
+        # REAL down, not fully freeze it when movement, timing and profit quality
+        # are all good.
+        low_data_real_bridge = (
+            low_data
+            and learning is not None
+            and learning_sample_count >= 3
+            and outcome_success_rate >= 58.0
+            and (timing_score >= 60.0 or early_success_rate >= 35.0 or fuzzy_match_score >= 64.0)
+        )
+
         good_learning = (
             learning is not None
             and learning_sample_count >= 6
@@ -687,8 +700,8 @@ class DecisionTypeClassifier:
         )
 
         tradability_score = clamp(getattr(score, "tradability_score", 50.0))
-        low_tradability = tradability_score < 40.0
-        very_low_tradability = tradability_score < 25.0
+        low_tradability = tradability_score < 35.0
+        very_low_tradability = tradability_score < 22.0
 
         must_ghost = False
 
@@ -703,8 +716,11 @@ class DecisionTypeClassifier:
             must_ghost = True
             reasons.append("CORRELATION_REDUCES_PRIORITY")
         if low_data:
-            must_ghost = True
-            reasons.append("LEARNING_LOW_DATA_GHOST")
+            if low_data_real_bridge and tradability_score >= 45.0 and trap.trap_risk < 55.0:
+                reasons.append("LOW_DATA_WARMUP_REAL_BRIDGE_ALLOWED")
+            else:
+                must_ghost = True
+                reasons.append("LEARNING_LOW_DATA_GHOST")
         if risky_learning:
             must_ghost = True
             reasons.append("LEARNING_RISKY_CONDITION_GHOST_ONLY")
@@ -783,8 +799,8 @@ class DecisionTypeClassifier:
             and not severe_risk_block
             and live_or_early_move
             and good_learning
-            and score.final_score >= (min_real - (10.0 if hunter_memory_good else 8.0))
-            and confidence.confidence_score >= (32.0 if hunter_memory_good else 34.0)
+            and score.final_score >= (min_real - (13.0 if hunter_memory_good else 10.0))
+            and confidence.confidence_score >= (28.0 if hunter_memory_good else 31.0)
             and (movement.readiness_score >= 50.0 or prediction.movement_probability >= 48.0 or hunter_memory_good)
             and trap.trap_risk < 58.0
             and correlation.exposure_risk < 68.0
@@ -799,15 +815,37 @@ class DecisionTypeClassifier:
             and not severe_risk_block
             and live_or_early_move
             and very_strong_learning
-            and score.final_score >= (min_real - (15.0 if hunter_memory_strong else 12.0))
-            and confidence.confidence_score >= (28.0 if hunter_memory_strong else 30.0)
+            and score.final_score >= (min_real - (18.0 if hunter_memory_strong else 14.0))
+            and confidence.confidence_score >= (24.0 if hunter_memory_strong else 28.0)
             and (movement.readiness_score >= 46.0 or prediction.movement_probability >= 45.0 or hunter_memory_strong)
             and trap.trap_risk < 55.0
             and correlation.exposure_risk < 65.0
         )
 
-        if real_allowed or learned_hunter_real or very_strong_learned_hunter_real:
+        # Controlled warm-up REAL:
+        # Prevents the bot from becoming "dry" after a reset. It is still
+        # protected by trap/correlation/tradability/freshness checks and needs
+        # a strong GHOST-style learning footprint.
+        controlled_warmup_real = (
+            not real_allowed
+            and not learned_hunter_real
+            and not very_strong_learned_hunter_real
+            and not must_ghost
+            and not severe_risk_block
+            and low_data_real_bridge
+            and live_or_early_move
+            and strong_live_confirmation
+            and score.final_score >= (min_real - 18.0)
+            and confidence.confidence_score >= 24.0
+            and tradability_score >= 45.0
+            and trap.trap_risk < 50.0
+            and correlation.exposure_risk < 62.0
+        )
+
+        if real_allowed or learned_hunter_real or very_strong_learned_hunter_real or controlled_warmup_real:
             reasons.append("AI_DECISION_REAL_ALLOWED")
+            if controlled_warmup_real:
+                reasons.append("CONTROLLED_WARMUP_REAL")
             if learned_hunter_real:
                 reasons.append("LEARNING_ASSISTED_HUNTER_REAL")
             if very_strong_learned_hunter_real:
