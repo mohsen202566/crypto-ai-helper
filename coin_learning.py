@@ -3,41 +3,37 @@ from __future__ import annotations
 """
 13 - coin_learning.py
 
-Coin + direction + condition learning layer for the locked Movement Hunter bot.
+Simplified coin learning layer for the Level 1 / 5M crypto futures bot.
 
-Responsibilities:
+Locked goals:
 - Learn from REAL and GHOST outcomes.
-- Store and summarize coin + direction + condition behavior.
-- Never learn broad labels like "DOGE is bad".
-- Learn conditional patterns:
-  coin + direction + market_state + indicator buckets + trap/range/volatility context.
-- Track TP1, TP2, AI_EXIT, SL, MFE, MAE, holding time, movement size.
-- Provide learning summaries to confidence_engine.py and ai_decision_engine.py.
+- Learn separately per coin + direction + 5m condition.
+- Store raw sensor values, MFE/MAE, realized PnL, holding time and movement quality.
+- Provide learning summaries to Pattern Start Predictor and AI Decision Engine.
+- WinRate is TP1 vs SL only. TP2 and AI_EXIT are separate stats.
+- No final REAL / GHOST / REJECT decision.
+- No trap/confidence/correlation/meta/state engine.
+- No Toobit, no Telegram, no paper/setup flow.
 
-Strictly forbidden:
-- No REAL/GHOST/REJECT decision.
-- No trade execution.
-- No Toobit calls.
-- No Telegram.
-- No Paper mode.
-- No Setup flow.
-
-This file learns and summarizes. It does not decide final signals.
+This file learns and summarizes. It never opens trades and never sends messages.
 """
 
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from uuid import uuid4
-import time
 import math
+import time
 
 from analysis_engine import AnalysisCandidate
-from movement_hunter import MovementHunterResult
-from trap_engine import TrapResult
-from state_engine import StateResult
-from confidence_engine import ConfidenceResult
-from data_store import save_learning_record, append_bounded, save_coin_behavior, new_id, store, save_error
-from config import SETTINGS
+from config import SETTINGS, normalize_symbol
+
+try:
+    from data_store import append_bounded, store, save_error, save_coin_behavior
+except Exception:  # keeps file import-safe during staged rewrites
+    append_bounded = None
+    store = None
+    save_error = None
+    save_coin_behavior = None
 
 
 JsonDict = Dict[str, Any]
@@ -50,6 +46,7 @@ SOURCE_GHOST = "GHOST"
 RESULT_TP1 = "TP1"
 RESULT_TP2 = "TP2"
 RESULT_AI_EXIT = "AI_EXIT"
+RESULT_AI_EXIT_PROFIT = "AI_EXIT_PROFIT"
 RESULT_SL = "SL"
 RESULT_OPEN = "OPEN"
 RESULT_UNKNOWN = "UNKNOWN"
@@ -58,169 +55,14 @@ DIRECTION_LONG = "LONG"
 DIRECTION_SHORT = "SHORT"
 DIRECTION_NEUTRAL = "NEUTRAL"
 
-
-@dataclass(frozen=True)
-class ConditionKey:
-    coin: str
-    direction: str
-    market_state: str
-    rsi_bucket: str
-    adx_bucket: str
-    macd_bucket: str
-    atr_bucket: str
-    volume_bucket: str
-    power_bucket: str
-    vwap_state: str
-    ema_state: str
-    trap_bucket: str
-    range_bucket: str
-    freshness: str
-
-    def key(self) -> str:
-        return "|".join(
-            [
-                self.coin,
-                self.direction,
-                self.market_state,
-                self.rsi_bucket,
-                self.adx_bucket,
-                self.macd_bucket,
-                self.atr_bucket,
-                self.volume_bucket,
-                self.power_bucket,
-                self.vwap_state,
-                self.ema_state,
-                self.trap_bucket,
-                self.range_bucket,
-                self.freshness,
-            ]
-        )
-
-    def to_dict(self) -> JsonDict:
-        return asdict(self)
+QUALITY_BAD = "BAD"
+QUALITY_WEAK = "WEAK"
+QUALITY_GOOD = "GOOD"
+QUALITY_EXCELLENT = "EXCELLENT"
 
 
-@dataclass(frozen=True)
-class LearningRecord:
-    learning_id: str
-    source_type: str
-    coin: str
-    direction: str
-    condition_key: str
-    timestamp: int
-
-    market_state: str
-    movement_phase: str
-    freshness: str
-    confidence_level: str
-
-    entry_price: float
-    exit_price: float
-    result: str
-    realized_pnl: float
-    realized_pnl_percent: float
-    mfe_percent: float
-    mae_percent: float
-    holding_seconds: int
-
-    rsi: float
-    rsi_slope: float
-    macd: float
-    macd_histogram: float
-    histogram_slope: float
-    histogram_acceleration: float
-    adx: float
-    atr_percent: float
-    relative_volume: float
-    buy_power: float
-    sell_power: float
-    power_delta: float
-    vwap_state: str
-    ema_state: str
-    trap_risk: float
-    liquidity_risk: float
-    range_probability: float
-    reversal_probability: float
-    quality_score: float
-    risk_score: float
-    movement_score: float
-    confidence_score: float
-
-    meta: JsonDict = field(default_factory=dict)
-
-    def to_dict(self) -> JsonDict:
-        return asdict(self)
-
-
-@dataclass(frozen=True)
-class LearningSummary:
-    condition_key: str
-    coin: str
-    direction: str
-    sample_count: int
-    real_samples: int
-    ghost_samples: int
-    tp1_count: int
-    tp2_count: int
-    ai_exit_count: int
-    sl_count: int
-    win_rate: float
-    similar_win_rate: float
-    avg_mfe_percent: float
-    avg_mae_percent: float
-    avg_holding_seconds: float
-    avg_realized_pnl_percent: float
-
-    # Movement Hunter learning metrics. These are consumed by
-    # movement_memory.py, confidence_engine.py, trap_engine.py,
-    # state_engine.py and ai_decision_engine.py.
-    outcome_success_rate: float = 50.0
-    timing_score: float = 50.0
-    early_success_rate: float = 0.0
-    fuzzy_match_score: float = 0.0
-    premove_success_rate: float = 0.0
-    late_failure_rate: float = 0.0
-
-    risk_label: str = "UNKNOWN"
-    confidence_hint: str = "LOW_DATA"
-    notes: Tuple[str, ...] = field(default_factory=tuple)
-
-    def to_dict(self) -> JsonDict:
-        return asdict(self)
-
-
-@dataclass(frozen=True)
-class CoinBehaviorRecord:
-    behavior_id: str
-    coin: str
-    direction: str
-    condition_key: str
-    sample_count: int
-    real_samples: int
-    ghost_samples: int
-    tp1_count: int
-    tp2_count: int
-    ai_exit_count: int
-    sl_count: int
-    win_rate: float
-    avg_mfe_percent: float
-    avg_mae_percent: float
-    avg_holding_seconds: float
-    last_updated: int
-    best_conditions: Tuple[str, ...] = field(default_factory=tuple)
-    worst_conditions: Tuple[str, ...] = field(default_factory=tuple)
-
-    def to_dict(self) -> JsonDict:
-        return asdict(self)
-
-
-def clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
-    try:
-        if math.isnan(float(value)) or math.isinf(float(value)):
-            return low
-        return max(low, min(high, float(value)))
-    except Exception:
-        return low
+def now_ts() -> int:
+    return int(time.time())
 
 
 def safe_float(value: Any, default: float = 0.0) -> float:
@@ -237,16 +79,15 @@ def safe_float(value: Any, default: float = 0.0) -> float:
 
 def safe_int(value: Any, default: int = 0) -> int:
     try:
+        if value is None:
+            return default
         return int(float(value))
     except Exception:
         return default
 
 
-def normalize_symbol(symbol: str) -> str:
-    s = str(symbol or "").upper().replace("-", "").replace("/", "").replace("_", "").strip()
-    if s and not s.endswith("USDT") and len(s) <= 14:
-        s += "USDT"
-    return s
+def clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
+    return max(low, min(high, safe_float(value, low)))
 
 
 def normalize_direction(direction: str) -> str:
@@ -258,250 +99,334 @@ def normalize_direction(direction: str) -> str:
     return DIRECTION_NEUTRAL
 
 
+def pct_move(direction: str, entry_price: float, exit_price: float) -> float:
+    entry = safe_float(entry_price)
+    exit_ = safe_float(exit_price)
+    if entry <= 0 or exit_ <= 0:
+        return 0.0
+    if normalize_direction(direction) == DIRECTION_SHORT:
+        return (entry - exit_) / entry * 100.0
+    return (exit_ - entry) / entry * 100.0
+
+
+def bucket_range(value: float, step: float, prefix: str) -> str:
+    v = safe_float(value)
+    if step <= 0:
+        step = 1.0
+    low = math.floor(v / step) * step
+    high = low + step
+    return f"{prefix}_{round(low, 6)}_{round(high, 6)}"
+
+
 def bucket_rsi(value: float) -> str:
-    v = safe_float(value, 50.0)
-    if v < 25:
-        return "RSI_EXTREME_LOW"
-    if v < 35:
-        return "RSI_LOW"
-    if v < 45:
-        return "RSI_LOW_MID"
-    if v < 55:
-        return "RSI_MID"
-    if v < 65:
-        return "RSI_HIGH_MID"
-    if v < 75:
-        return "RSI_HIGH"
-    return "RSI_EXTREME_HIGH"
+    # 3-point buckets preserve examples like RSI 65-68 for DOGE LONG.
+    return bucket_range(safe_float(value, 50.0), 3.0, "RSI")
 
 
 def bucket_adx(value: float) -> str:
     v = safe_float(value)
     if v < 14:
-        return "ADX_VERY_WEAK"
+        return "ADX_UNDER_14"
     if v < 20:
-        return "ADX_WEAK"
-    if v < 28:
-        return "ADX_NORMAL"
+        return "ADX_14_20"
+    if v < 25:
+        return "ADX_20_25"
+    if v < 30:
+        return "ADX_25_30"
     if v < 40:
-        return "ADX_STRONG"
-    return "ADX_EXTREME"
+        return "ADX_30_40"
+    return "ADX_40_PLUS"
 
 
-def bucket_signed(value: float, prefix: str, small: float = 0.0, medium: float = 1.0) -> str:
+def bucket_signed(value: float, prefix: str, tiny: float = 0.0) -> str:
     v = safe_float(value)
-    if v > medium:
-        return f"{prefix}_STRONG_UP"
-    if v > small:
+    if v > tiny:
         return f"{prefix}_UP"
-    if v < -medium:
-        return f"{prefix}_STRONG_DOWN"
-    if v < -small:
+    if v < -tiny:
         return f"{prefix}_DOWN"
     return f"{prefix}_FLAT"
 
 
-def bucket_atr_percent(value: float) -> str:
+def bucket_power(value: float) -> str:
     v = safe_float(value)
-    if v < 0.25:
-        return "ATR_TINY"
-    if v < 0.60:
-        return "ATR_NORMAL"
-    if v < 1.20:
-        return "ATR_HIGH"
-    if v < 2.50:
-        return "ATR_EXTREME"
-    return "ATR_DANGER"
-
-
-def bucket_relative_volume(value: float) -> str:
-    v = safe_float(value)
-    if v < 0.7:
-        return "VOL_LOW"
-    if v < 1.2:
-        return "VOL_NORMAL"
-    if v < 2.0:
-        return "VOL_HIGH"
-    if v < 4.0:
-        return "VOL_SPIKE"
-    return "VOL_EXTREME"
-
-
-def bucket_power_delta(value: float) -> str:
-    v = safe_float(value)
-    if v >= 35:
+    if v >= 20:
         return "POWER_STRONG_BUY"
-    if v >= 12:
+    if v >= 6:
         return "POWER_BUY"
-    if v <= -35:
+    if v <= -20:
         return "POWER_STRONG_SELL"
-    if v <= -12:
+    if v <= -6:
         return "POWER_SELL"
     return "POWER_BALANCED"
 
 
-def bucket_percent(value: float, prefix: str) -> str:
-    v = clamp(value)
-    if v < 25:
-        return f"{prefix}_LOW"
-    if v < 50:
-        return f"{prefix}_MID"
-    if v < 75:
-        return f"{prefix}_HIGH"
-    return f"{prefix}_EXTREME"
+def bucket_volume(value: float) -> str:
+    v = safe_float(value)
+    if v < 0.8:
+        return "VOL_LOW"
+    if v < 1.25:
+        return "VOL_NORMAL"
+    if v < 2.0:
+        return "VOL_HIGH"
+    return "VOL_SPIKE"
 
 
-def result_is_win(result: str) -> bool:
-    """WinRate is based only on TP1 vs SL.
-
-    TP2 and AI_EXIT are tracked as separate learning achievements/exits,
-    but they must not inflate conditional win rate because TP2 can happen
-    after TP1 on the same position and AI_EXIT is a trade-management event.
-    """
-    return str(result).upper() == RESULT_TP1
+def bucket_atr(value: float) -> str:
+    v = safe_float(value)
+    if v < 0.25:
+        return "ATR_TINY"
+    if v < 0.65:
+        return "ATR_NORMAL"
+    if v < 1.2:
+        return "ATR_HIGH"
+    return "ATR_EXTREME"
 
 
 def result_is_winrate_result(result: str) -> bool:
-    """Only results that enter the WR denominator."""
-    return str(result).upper() in {RESULT_TP1, RESULT_SL}
+    return str(result or "").upper() in {RESULT_TP1, RESULT_SL}
 
 
-def result_is_positive_outcome(result: str) -> bool:
-    """Outcome success for movement hunting.
-
-    TP1/TP2 are clean wins. AI_EXIT is useful only when it exited with profit
-    or protected a favorable move, which is detected from pnl/MFE in the
-    summarizer. This helper stays conservative.
-    """
-    return str(result).upper() in {RESULT_TP1, RESULT_TP2}
+def result_is_win(result: str) -> bool:
+    return str(result or "").upper() == RESULT_TP1
 
 
-def _is_early_or_premove(record: LearningRecord) -> bool:
-    freshness = str(record.freshness or "").upper()
-    phase = str(record.movement_phase or "").upper()
-    return (
-        freshness in {"FRESH", "PRE_START", "START", "EARLY"}
-        or phase in {"PRE_START", "START", "BIRTH", "EARLY"}
-    )
-
-
-def _is_late_or_exhausted(record: LearningRecord) -> bool:
-    freshness = str(record.freshness or "").upper()
-    phase = str(record.movement_phase or "").upper()
-    state = str(record.market_state or "").upper()
-    return (
-        freshness in {"LATE", "DEAD", "EXHAUSTED"}
-        or phase in {"LATE", "DEAD", "EXHAUSTION", "ENDED"}
-        or state in {"LATE", "EXHAUSTION"}
-    )
-
-
-def _record_outcome_success(record: LearningRecord) -> bool:
-    result = str(record.result or "").upper()
-    if result in {RESULT_TP1, RESULT_TP2}:
+def result_is_positive(result: str, pnl_percent: float = 0.0, mfe_percent: float = 0.0, mae_percent: float = 0.0) -> bool:
+    r = str(result or "").upper()
+    if r in {RESULT_TP1, RESULT_TP2, RESULT_AI_EXIT_PROFIT}:
         return True
-    if result == RESULT_AI_EXIT:
-        return record.realized_pnl_percent > 0 or record.mfe_percent > abs(record.mae_percent)
+    if r == RESULT_AI_EXIT:
+        return safe_float(pnl_percent) > 0 or safe_float(mfe_percent) > abs(safe_float(mae_percent))
     return False
 
 
-def _record_timing_points(record: LearningRecord) -> float:
-    """Score how useful this sample is for pre-move hunting.
+@dataclass(frozen=True)
+class ConditionKey:
+    coin: str
+    direction: str
+    timeframe: str
+    market_mode: str
+    rsi_bucket: str
+    rsi_slope_bucket: str
+    hist_bucket: str
+    hist_slope_bucket: str
+    adx_bucket: str
+    power_bucket: str
+    volume_bucket: str
+    atr_bucket: str
+    vwap_state: str
+    ema_state: str
+    compression_bucket: str
 
-    A profitable early/fresh sample is very valuable. A late win is still a win
-    but should not teach the AI to enter late. A late SL is especially bad.
-    """
-    success = _record_outcome_success(record)
-    early = _is_early_or_premove(record)
-    late = _is_late_or_exhausted(record)
+    def key(self) -> str:
+        return "|".join([
+            self.coin,
+            self.direction,
+            self.timeframe,
+            self.market_mode,
+            self.rsi_bucket,
+            self.rsi_slope_bucket,
+            self.hist_bucket,
+            self.hist_slope_bucket,
+            self.adx_bucket,
+            self.power_bucket,
+            self.volume_bucket,
+            self.atr_bucket,
+            self.vwap_state,
+            self.ema_state,
+            self.compression_bucket,
+        ])
 
-    if success and early:
-        return 100.0
-    if success and not late:
-        return 72.0
-    if success and late:
-        return 48.0
-    if record.result == RESULT_SL and late:
-        return 10.0
-    if record.result == RESULT_SL:
-        return 25.0
-    if record.result == RESULT_AI_EXIT and record.realized_pnl_percent > 0:
-        return 70.0 if early else 55.0
-    return 45.0
+    def soft_key(self) -> str:
+        return "|".join([
+            self.coin,
+            self.direction,
+            self.timeframe,
+            self.rsi_bucket,
+            self.hist_slope_bucket,
+            self.power_bucket,
+            self.volume_bucket,
+        ])
+
+    def to_dict(self) -> JsonDict:
+        return asdict(self)
 
 
-def _record_condition_similarity(current_key: str, record_key: str) -> float:
-    """Cheap fuzzy similarity over condition-key buckets.
+@dataclass(frozen=True)
+class LearningRecord:
+    learning_id: str
+    source_type: str
+    coin: str
+    direction: str
+    timeframe: str
+    condition_key: str
+    soft_condition_key: str
+    timestamp: int
 
-    This keeps exact signature useful but gives credit to near conditions such
-    as same coin+direction with slightly different RSI/ADX/power buckets.
-    """
-    if not current_key or not record_key:
-        return 0.0
-    if current_key == record_key:
-        return 100.0
+    entry_price: float
+    exit_price: float
+    result: str
+    realized_pnl: float
+    realized_pnl_percent: float
+    mfe_percent: float
+    mae_percent: float
+    holding_seconds: int
+    move_percent: float
+    quality: str
 
-    a = str(current_key).split("|")
-    b = str(record_key).split("|")
-    if not a or not b:
-        return 0.0
+    rsi: float
+    rsi_slope: float
+    rsi_acceleration: float
+    macd: float
+    macd_signal: float
+    macd_histogram: float
+    histogram_slope: float
+    histogram_acceleration: float
+    adx: float
+    adx_slope: float
+    plus_di: float
+    minus_di: float
+    buy_power: float
+    sell_power: float
+    power_delta: float
+    relative_volume: float
+    volume_expansion: bool
+    volume_spike: bool
+    atr_percent: float
+    atr_slope: float
+    atr_expansion: str
+    atr_explosion: bool
+    ema_state: str
+    vwap_state: str
+    vwap_distance_percent: float
+    range_probability: float
+    compression_score: float
+    price_change_percent: float
 
-    length = max(len(a), len(b), 1)
-    matches = sum(1 for i in range(min(len(a), len(b))) if a[i] == b[i])
-    base = matches / length * 100.0
+    market_mode: str = "NEUTRAL"
+    pattern_match_score: float = 0.0
+    pattern_id: str = ""
+    meta: JsonDict = field(default_factory=dict)
 
-    # Coin and direction are the most important anchors. Penalize heavily if
-    # they do not match, but keep a small value for broad diagnostics.
-    try:
-        if a[0] != b[0]:
-            base *= 0.35
-        if len(a) > 1 and len(b) > 1 and a[1] != b[1]:
-            base *= 0.45
-    except Exception:
-        pass
-    return clamp(base)
+    def to_dict(self) -> JsonDict:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class LearningSummary:
+    condition_key: str
+    coin: str
+    direction: str
+    timeframe: str
+
+    sample_count: int
+    real_samples: int
+    ghost_samples: int
+
+    tp1_count: int
+    tp2_count: int
+    ai_exit_count: int
+    sl_count: int
+    win_rate: float
+    similar_win_rate: float
+
+    avg_move_percent: float
+    expected_move_percent: float
+    avg_mfe_percent: float
+    avg_mae_percent: float
+    avg_holding_seconds: float
+    avg_realized_pnl_percent: float
+
+    outcome_success_rate: float
+    timing_score: float
+    early_success_rate: float
+    fuzzy_match_score: float
+    pattern_match_score: float
+    pattern_confidence: float
+    pattern_count: int
+    pattern_win_rate: float
+    matched_pattern_id: str
+
+    risk_label: str = "UNKNOWN"
+    confidence_hint: str = "LOW_DATA"
+    notes: Tuple[str, ...] = field(default_factory=tuple)
+
+    def to_dict(self) -> JsonDict:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class CoinBehaviorRecord:
+    behavior_id: str
+    coin: str
+    direction: str
+    timeframe: str
+    condition_key: str
+    sample_count: int
+    real_samples: int
+    ghost_samples: int
+    tp1_count: int
+    tp2_count: int
+    ai_exit_count: int
+    sl_count: int
+    win_rate: float
+    pattern_count: int
+    pattern_win_rate: float
+    avg_mfe_percent: float
+    avg_mae_percent: float
+    last_updated: int
+    best_conditions: Tuple[str, ...] = field(default_factory=tuple)
+    weak_conditions: Tuple[str, ...] = field(default_factory=tuple)
+
+    def to_dict(self) -> JsonDict:
+        return asdict(self)
 
 
 class ConditionKeyBuilder:
-    """Builds coin+direction+condition keys from current candidate and AI context."""
-
-    def build(
-        self,
-        candidate: AnalysisCandidate,
-        movement: Optional[MovementHunterResult] = None,
-        trap: Optional[TrapResult] = None,
-        state: Optional[StateResult] = None,
-    ) -> ConditionKey:
-        s = candidate.sensor_snapshot
+    def build(self, candidate: AnalysisCandidate) -> ConditionKey:
+        m = candidate.momentum_state
         coin = normalize_symbol(candidate.symbol)
         direction = normalize_direction(candidate.direction_hint)
-
-        market_state = state.market_state if state else str(getattr(s, "market_state", "UNKNOWN"))
-        trap_risk = trap.trap_risk if trap else 0.0
-        range_probability = state.range_probability if state else s.range_probability
-        freshness = movement.freshness if movement else "UNKNOWN"
+        market_mode = str((candidate.market_mode or {}).get("mode", "NEUTRAL")).upper()
 
         return ConditionKey(
             coin=coin,
             direction=direction,
-            market_state=str(market_state),
-            rsi_bucket=bucket_rsi(s.rsi),
-            adx_bucket=bucket_adx(s.adx),
-            macd_bucket=bucket_signed(s.histogram_slope, "HIST", small=0.0, medium=0.0001),
-            atr_bucket=bucket_atr_percent(s.atr_percent),
-            volume_bucket=bucket_relative_volume(s.relative_volume),
-            power_bucket=bucket_power_delta(s.power_delta),
-            vwap_state=str(s.vwap_state),
-            ema_state=str(s.ema_state),
-            trap_bucket=bucket_percent(trap_risk, "TRAP"),
-            range_bucket=bucket_percent(range_probability, "RANGE"),
-            freshness=str(freshness),
+            timeframe=str(candidate.timeframe or "5m"),
+            market_mode=market_mode,
+            rsi_bucket=bucket_rsi(m.rsi),
+            rsi_slope_bucket=bucket_signed(m.rsi_slope, "RSI_SLOPE"),
+            hist_bucket=bucket_signed(m.macd_histogram, "HIST"),
+            hist_slope_bucket=bucket_signed(m.histogram_slope, "HIST_SLOPE"),
+            adx_bucket=bucket_adx(m.adx),
+            power_bucket=bucket_power(m.power_delta),
+            volume_bucket=bucket_volume(m.relative_volume),
+            atr_bucket=bucket_atr(m.atr_percent),
+            vwap_state=str(m.vwap_state or "UNKNOWN").upper(),
+            ema_state=str(m.ema_state or "UNKNOWN").upper(),
+            compression_bucket=bucket_range(m.compression_score, 20.0, "COMP"),
         )
 
 
-class LearningRecordBuilder:
-    """Builds immutable LearningRecord objects from outcome data."""
+def classify_quality(result: str, move_percent: float, mfe_percent: float, mae_percent: float, atr_percent: float, pnl_percent: float = 0.0) -> str:
+    r = str(result or "").upper()
+    favorable = max(safe_float(move_percent), safe_float(mfe_percent))
+    adverse = abs(safe_float(mae_percent))
+    atr = max(0.05, safe_float(atr_percent))
 
+    if r == RESULT_SL:
+        return QUALITY_BAD
+    if r in {RESULT_TP2} or (favorable >= atr * 1.55 and favorable > adverse * 1.5):
+        return QUALITY_EXCELLENT
+    if r in {RESULT_TP1, RESULT_AI_EXIT_PROFIT} or (favorable >= atr * 0.90 and favorable >= adverse):
+        return QUALITY_GOOD
+    if r == RESULT_AI_EXIT and (safe_float(pnl_percent) > 0 or favorable >= atr * 0.45):
+        return QUALITY_WEAK
+    if favorable >= atr * 0.45:
+        return QUALITY_WEAK
+    return QUALITY_BAD
+
+
+class LearningRecordBuilder:
     def __init__(self):
         self.key_builder = ConditionKeyBuilder()
 
@@ -510,10 +435,6 @@ class LearningRecordBuilder:
         source_type: str,
         candidate: AnalysisCandidate,
         result: str,
-        movement: Optional[MovementHunterResult] = None,
-        trap: Optional[TrapResult] = None,
-        state: Optional[StateResult] = None,
-        confidence: Optional[ConfidenceResult] = None,
         entry_price: float = 0.0,
         exit_price: float = 0.0,
         realized_pnl: float = 0.0,
@@ -521,276 +442,384 @@ class LearningRecordBuilder:
         mfe_percent: float = 0.0,
         mae_percent: float = 0.0,
         holding_seconds: int = 0,
+        pattern_summary: Optional[Any] = None,
         meta: Optional[JsonDict] = None,
+        **_: Any,
     ) -> LearningRecord:
-        s = candidate.sensor_snapshot
-        key = self.key_builder.build(candidate, movement=movement, trap=trap, state=state)
+        m = candidate.momentum_state
+        key = self.key_builder.build(candidate)
+        entry = safe_float(entry_price or getattr(candidate.sensor_snapshot, "price", 0.0))
+        exit_ = safe_float(exit_price)
+        move = pct_move(key.direction, entry, exit_) if exit_ > 0 else 0.0
+        result_value = str(result or RESULT_UNKNOWN).upper()
+
+        pattern_score = safe_float(obj_value(pattern_summary, "pattern_match_score", 0.0), 0.0)
+        pattern_id = str(obj_value(pattern_summary, "matched_pattern_id", "") or "")
+
+        quality = classify_quality(
+            result=result_value,
+            move_percent=move,
+            mfe_percent=mfe_percent,
+            mae_percent=mae_percent,
+            atr_percent=m.atr_percent,
+            pnl_percent=realized_pnl_percent,
+        )
 
         return LearningRecord(
             learning_id=f"learn_{uuid4().hex}",
-            source_type=str(source_type).upper(),
+            source_type=str(source_type or SOURCE_GHOST).upper(),
             coin=key.coin,
             direction=key.direction,
+            timeframe=key.timeframe,
             condition_key=key.key(),
-            timestamp=candidate.timestamp or int(time.time()),
-            market_state=key.market_state,
-            movement_phase=movement.movement_phase if movement else "UNKNOWN",
-            freshness=movement.freshness if movement else "UNKNOWN",
-            confidence_level=confidence.confidence_level if confidence else "UNKNOWN",
-            entry_price=safe_float(entry_price or s.price),
-            exit_price=safe_float(exit_price),
-            result=str(result or RESULT_UNKNOWN).upper(),
+            soft_condition_key=key.soft_key(),
+            timestamp=int(candidate.timestamp or now_ts()),
+            entry_price=entry,
+            exit_price=exit_,
+            result=result_value,
             realized_pnl=safe_float(realized_pnl),
             realized_pnl_percent=safe_float(realized_pnl_percent),
             mfe_percent=safe_float(mfe_percent),
             mae_percent=safe_float(mae_percent),
             holding_seconds=safe_int(holding_seconds),
-            rsi=safe_float(s.rsi),
-            rsi_slope=safe_float(s.rsi_slope),
-            macd=safe_float(s.macd),
-            macd_histogram=safe_float(s.macd_histogram),
-            histogram_slope=safe_float(s.histogram_slope),
-            histogram_acceleration=safe_float(s.histogram_acceleration),
-            adx=safe_float(s.adx),
-            atr_percent=safe_float(s.atr_percent),
-            relative_volume=safe_float(s.relative_volume),
-            buy_power=safe_float(s.buy_power),
-            sell_power=safe_float(s.sell_power),
-            power_delta=safe_float(s.power_delta),
-            vwap_state=str(s.vwap_state),
-            ema_state=str(s.ema_state),
-            trap_risk=safe_float(trap.trap_risk if trap else 0.0),
-            liquidity_risk=safe_float(trap.liquidity_risk if trap else 0.0),
-            range_probability=safe_float(state.range_probability if state else s.range_probability),
-            reversal_probability=safe_float(state.reversal_probability if state else 0.0),
-            quality_score=safe_float(candidate.quality.total_quality),
-            risk_score=safe_float(candidate.risk.total_risk),
-            movement_score=safe_float(movement.readiness_score if movement else 0.0),
-            confidence_score=safe_float(confidence.confidence_score if confidence else 0.0),
+            move_percent=safe_float(move),
+            quality=quality,
+            rsi=safe_float(m.rsi),
+            rsi_slope=safe_float(m.rsi_slope),
+            rsi_acceleration=safe_float(m.rsi_acceleration),
+            macd=safe_float(m.macd),
+            macd_signal=safe_float(m.macd_signal),
+            macd_histogram=safe_float(m.macd_histogram),
+            histogram_slope=safe_float(m.histogram_slope),
+            histogram_acceleration=safe_float(m.histogram_acceleration),
+            adx=safe_float(m.adx),
+            adx_slope=safe_float(m.adx_slope),
+            plus_di=safe_float(m.plus_di),
+            minus_di=safe_float(m.minus_di),
+            buy_power=safe_float(m.buy_power),
+            sell_power=safe_float(m.sell_power),
+            power_delta=safe_float(m.power_delta),
+            relative_volume=safe_float(m.relative_volume),
+            volume_expansion=bool(m.volume_expansion),
+            volume_spike=bool(m.volume_spike),
+            atr_percent=safe_float(m.atr_percent),
+            atr_slope=safe_float(m.atr_slope),
+            atr_expansion=str(m.atr_expansion),
+            atr_explosion=bool(m.atr_explosion),
+            ema_state=str(m.ema_state),
+            vwap_state=str(m.vwap_state),
+            vwap_distance_percent=safe_float(m.vwap_distance_percent),
+            range_probability=safe_float(m.range_probability),
+            compression_score=safe_float(m.compression_score),
+            price_change_percent=safe_float(m.price_change_percent),
+            market_mode=key.market_mode,
+            pattern_match_score=pattern_score,
+            pattern_id=pattern_id,
             meta=dict(meta or {}),
         )
 
 
+def obj_value(obj: Optional[Any], key: str, default: Any = None) -> Any:
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def coerce_record(item: Any) -> LearningRecord:
+    if isinstance(item, LearningRecord):
+        return item
+    if hasattr(item, "to_dict") and callable(item.to_dict):
+        item = item.to_dict()
+    if not isinstance(item, dict):
+        item = {}
+
+    return LearningRecord(
+        learning_id=str(item.get("learning_id", item.get("id", f"learn_{uuid4().hex}"))),
+        source_type=str(item.get("source_type", SOURCE_GHOST)).upper(),
+        coin=normalize_symbol(str(item.get("coin", item.get("symbol", "")))),
+        direction=normalize_direction(str(item.get("direction", ""))),
+        timeframe=str(item.get("timeframe", "5m")),
+        condition_key=str(item.get("condition_key", "")),
+        soft_condition_key=str(item.get("soft_condition_key", "")),
+        timestamp=safe_int(item.get("timestamp", now_ts())),
+        entry_price=safe_float(item.get("entry_price")),
+        exit_price=safe_float(item.get("exit_price")),
+        result=str(item.get("result", RESULT_UNKNOWN)).upper(),
+        realized_pnl=safe_float(item.get("realized_pnl")),
+        realized_pnl_percent=safe_float(item.get("realized_pnl_percent")),
+        mfe_percent=safe_float(item.get("mfe_percent")),
+        mae_percent=safe_float(item.get("mae_percent")),
+        holding_seconds=safe_int(item.get("holding_seconds")),
+        move_percent=safe_float(item.get("move_percent")),
+        quality=str(item.get("quality", QUALITY_WEAK)).upper(),
+        rsi=safe_float(item.get("rsi"), 50.0),
+        rsi_slope=safe_float(item.get("rsi_slope")),
+        rsi_acceleration=safe_float(item.get("rsi_acceleration")),
+        macd=safe_float(item.get("macd")),
+        macd_signal=safe_float(item.get("macd_signal")),
+        macd_histogram=safe_float(item.get("macd_histogram")),
+        histogram_slope=safe_float(item.get("histogram_slope")),
+        histogram_acceleration=safe_float(item.get("histogram_acceleration")),
+        adx=safe_float(item.get("adx")),
+        adx_slope=safe_float(item.get("adx_slope")),
+        plus_di=safe_float(item.get("plus_di")),
+        minus_di=safe_float(item.get("minus_di")),
+        buy_power=safe_float(item.get("buy_power")),
+        sell_power=safe_float(item.get("sell_power")),
+        power_delta=safe_float(item.get("power_delta")),
+        relative_volume=safe_float(item.get("relative_volume")),
+        volume_expansion=bool(item.get("volume_expansion", False)),
+        volume_spike=bool(item.get("volume_spike", False)),
+        atr_percent=safe_float(item.get("atr_percent")),
+        atr_slope=safe_float(item.get("atr_slope")),
+        atr_expansion=str(item.get("atr_expansion", "")),
+        atr_explosion=bool(item.get("atr_explosion", False)),
+        ema_state=str(item.get("ema_state", "")),
+        vwap_state=str(item.get("vwap_state", "")),
+        vwap_distance_percent=safe_float(item.get("vwap_distance_percent")),
+        range_probability=safe_float(item.get("range_probability")),
+        compression_score=safe_float(item.get("compression_score")),
+        price_change_percent=safe_float(item.get("price_change_percent")),
+        market_mode=str(item.get("market_mode", "NEUTRAL")).upper(),
+        pattern_match_score=safe_float(item.get("pattern_match_score")),
+        pattern_id=str(item.get("pattern_id", "")),
+        meta=dict(item.get("meta", {}) if isinstance(item.get("meta", {}), dict) else {}),
+    )
+
+
+def condition_similarity(current_key: str, record_key: str) -> float:
+    if not current_key or not record_key:
+        return 0.0
+    if current_key == record_key:
+        return 100.0
+    a = str(current_key).split("|")
+    b = str(record_key).split("|")
+    if not a or not b:
+        return 0.0
+
+    matches = sum(1 for i in range(min(len(a), len(b))) if a[i] == b[i])
+    base = matches / max(len(a), len(b), 1) * 100.0
+
+    # coin and direction are anchors
+    if len(a) > 0 and len(b) > 0 and a[0] != b[0]:
+        base *= 0.25
+    if len(a) > 1 and len(b) > 1 and a[1] != b[1]:
+        base *= 0.35
+    return clamp(base)
+
+
+def record_timing_score(record: LearningRecord) -> float:
+    score = 50.0
+    duration = safe_int(record.holding_seconds)
+    favorable = max(safe_float(record.move_percent), safe_float(record.mfe_percent))
+    adverse = abs(safe_float(record.mae_percent))
+
+    if 0 < duration <= 300:
+        score += 15
+    elif duration <= 900:
+        score += 8
+    elif duration >= 1800:
+        score -= 10
+
+    # Start-move samples should not already be far extended.
+    if abs(safe_float(record.price_change_percent)) < max(1.5, safe_float(record.atr_percent) * 2.0):
+        score += 6
+    else:
+        score -= 10
+
+    if favorable > adverse * 1.25:
+        score += 10
+    elif adverse > favorable * 1.25:
+        score -= 10
+
+    if record.quality == QUALITY_EXCELLENT:
+        score += 8
+    elif record.quality == QUALITY_GOOD:
+        score += 5
+    elif record.quality == QUALITY_BAD:
+        score -= 8
+
+    return clamp(score)
+
+
+def record_success(record: LearningRecord) -> bool:
+    if record.quality in {QUALITY_GOOD, QUALITY_EXCELLENT}:
+        return True
+    return result_is_positive(record.result, record.realized_pnl_percent, record.mfe_percent, record.mae_percent)
+
+
 class CoinLearningMemory:
-    """
-    In-memory learning index.
-
-    data_store.py is used for persistence. This class provides fast summaries.
-    """
-
     def __init__(self, records: Optional[Iterable[Any]] = None):
         self.records: List[LearningRecord] = []
-        for record in records or []:
+        for item in records or []:
             try:
-                self.records.append(self._coerce_record(record))
+                self.records.append(coerce_record(item))
             except Exception:
                 continue
 
-    def _coerce_record(self, item: Any) -> LearningRecord:
-        if isinstance(item, LearningRecord):
-            return item
-        if hasattr(item, "to_dict") and callable(item.to_dict):
-            item = item.to_dict()
-        if not isinstance(item, dict):
-            item = {}
-        return LearningRecord(
-            learning_id=str(item.get("learning_id", item.get("id", new_id("learn")))),
-            source_type=str(item.get("source_type", SOURCE_GHOST)).upper(),
-            coin=normalize_symbol(item.get("coin", item.get("symbol", ""))),
-            direction=normalize_direction(item.get("direction", "")),
-            condition_key=str(item.get("condition_key", "")),
-            timestamp=safe_int(item.get("timestamp", time.time())),
-            market_state=str(item.get("market_state", "UNKNOWN")),
-            movement_phase=str(item.get("movement_phase", "UNKNOWN")),
-            freshness=str(item.get("freshness", "UNKNOWN")),
-            confidence_level=str(item.get("confidence_level", "UNKNOWN")),
-            entry_price=safe_float(item.get("entry_price")),
-            exit_price=safe_float(item.get("exit_price")),
-            result=str(item.get("result", RESULT_UNKNOWN)).upper(),
-            realized_pnl=safe_float(item.get("realized_pnl")),
-            realized_pnl_percent=safe_float(item.get("realized_pnl_percent")),
-            mfe_percent=safe_float(item.get("mfe_percent")),
-            mae_percent=safe_float(item.get("mae_percent")),
-            holding_seconds=safe_int(item.get("holding_seconds")),
-            rsi=safe_float(item.get("rsi"), 50.0),
-            rsi_slope=safe_float(item.get("rsi_slope")),
-            macd=safe_float(item.get("macd")),
-            macd_histogram=safe_float(item.get("macd_histogram")),
-            histogram_slope=safe_float(item.get("histogram_slope")),
-            histogram_acceleration=safe_float(item.get("histogram_acceleration")),
-            adx=safe_float(item.get("adx")),
-            atr_percent=safe_float(item.get("atr_percent")),
-            relative_volume=safe_float(item.get("relative_volume")),
-            buy_power=safe_float(item.get("buy_power")),
-            sell_power=safe_float(item.get("sell_power")),
-            power_delta=safe_float(item.get("power_delta")),
-            vwap_state=str(item.get("vwap_state", "UNKNOWN")),
-            ema_state=str(item.get("ema_state", "UNKNOWN")),
-            trap_risk=safe_float(item.get("trap_risk")),
-            liquidity_risk=safe_float(item.get("liquidity_risk")),
-            range_probability=safe_float(item.get("range_probability")),
-            reversal_probability=safe_float(item.get("reversal_probability")),
-            quality_score=safe_float(item.get("quality_score")),
-            risk_score=safe_float(item.get("risk_score")),
-            movement_score=safe_float(item.get("movement_score")),
-            confidence_score=safe_float(item.get("confidence_score")),
-            meta=dict(item.get("meta", {}) if isinstance(item.get("meta", {}), dict) else {}),
-        )
-
     def add(self, record: LearningRecord) -> None:
         self.records.append(record)
-        max_records = max(100, int(getattr(SETTINGS.learning, "max_records", 20000)))
+        max_records = max(100, int(getattr(SETTINGS.learning, "max_records", MAX_LEARNING_RECORDS)))
         if len(self.records) > max_records:
             self.records = self.records[-max_records:]
 
-    def similar_records(self, condition_key: str, coin: Optional[str] = None, direction: Optional[str] = None) -> List[LearningRecord]:
-        result = [r for r in self.records if r.condition_key == condition_key]
-        if not result and coin and direction:
-            c = normalize_symbol(coin)
-            d = normalize_direction(direction)
-            result = [r for r in self.records if r.coin == c and r.direction == d]
-        return result
+    def matching_records(self, condition_key: str, coin: str, direction: str, min_similarity: float = 52.0, limit: int = 160) -> List[LearningRecord]:
+        c = normalize_symbol(coin)
+        d = normalize_direction(direction)
+        scored: List[Tuple[float, int, LearningRecord]] = []
 
-    def summarize(self, condition_key: str, coin: str, direction: str) -> LearningSummary:
-        records = self.similar_records(condition_key, coin=coin, direction=direction)
-        if not records:
-            return LearningSummary(
-                condition_key=condition_key,
-                coin=normalize_symbol(coin),
-                direction=normalize_direction(direction),
-                sample_count=0,
-                real_samples=0,
-                ghost_samples=0,
-                tp1_count=0,
-                tp2_count=0,
-                ai_exit_count=0,
-                sl_count=0,
-                win_rate=50.0,
-                similar_win_rate=50.0,
-                avg_mfe_percent=0.0,
-                avg_mae_percent=0.0,
-                avg_holding_seconds=0.0,
-                avg_realized_pnl_percent=0.0,
-                outcome_success_rate=50.0,
-                timing_score=50.0,
-                early_success_rate=0.0,
-                fuzzy_match_score=0.0,
-                premove_success_rate=0.0,
-                late_failure_rate=0.0,
-                risk_label="UNKNOWN",
-                confidence_hint="LOW_DATA",
-                notes=("NO_HISTORY",),
-            )
+        for record in self.records:
+            if normalize_symbol(record.coin) != c:
+                continue
+            if normalize_direction(record.direction) != d:
+                continue
+            sim = condition_similarity(condition_key, record.condition_key)
+            if sim >= min_similarity:
+                scored.append((sim, safe_int(record.timestamp), record))
 
-        return summarize_records(condition_key, normalize_symbol(coin), normalize_direction(direction), records)
+        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return [r for _, _, r in scored[:max(1, limit)]]
 
-    def summarize_for_candidate(
-        self,
-        candidate: AnalysisCandidate,
-        movement: Optional[MovementHunterResult] = None,
-        trap: Optional[TrapResult] = None,
-        state: Optional[StateResult] = None,
-    ) -> LearningSummary:
-        key = ConditionKeyBuilder().build(candidate, movement=movement, trap=trap, state=state)
-        return self.summarize(key.key(), key.coin, key.direction)
+    def summarize(self, condition_key: str, coin: str, direction: str, timeframe: str = "5m") -> LearningSummary:
+        records = self.matching_records(condition_key, coin=coin, direction=direction)
+        return summarize_records(condition_key, normalize_symbol(coin), normalize_direction(direction), timeframe, records)
+
+    def summarize_for_candidate(self, candidate: AnalysisCandidate, **_: Any) -> LearningSummary:
+        key = ConditionKeyBuilder().build(candidate)
+        return self.summarize(key.key(), key.coin, key.direction, key.timeframe)
 
 
-def summarize_records(condition_key: str, coin: str, direction: str, records: Sequence[LearningRecord]) -> LearningSummary:
+def summarize_records(
+    condition_key: str,
+    coin: str,
+    direction: str,
+    timeframe: str,
+    records: Sequence[LearningRecord],
+) -> LearningSummary:
     total = len(records)
+
+    if total <= 0:
+        return LearningSummary(
+            condition_key=condition_key,
+            coin=coin,
+            direction=direction,
+            timeframe=timeframe,
+            sample_count=0,
+            real_samples=0,
+            ghost_samples=0,
+            tp1_count=0,
+            tp2_count=0,
+            ai_exit_count=0,
+            sl_count=0,
+            win_rate=50.0,
+            similar_win_rate=50.0,
+            avg_move_percent=0.0,
+            expected_move_percent=0.0,
+            avg_mfe_percent=0.0,
+            avg_mae_percent=0.0,
+            avg_holding_seconds=0.0,
+            avg_realized_pnl_percent=0.0,
+            outcome_success_rate=50.0,
+            timing_score=50.0,
+            early_success_rate=0.0,
+            fuzzy_match_score=0.0,
+            pattern_match_score=0.0,
+            pattern_confidence=0.0,
+            pattern_count=0,
+            pattern_win_rate=0.0,
+            matched_pattern_id="",
+            risk_label="UNKNOWN",
+            confidence_hint="LOW_DATA",
+            notes=("NO_HISTORY",),
+        )
+
     real = sum(1 for r in records if r.source_type == SOURCE_REAL)
     ghost = sum(1 for r in records if r.source_type == SOURCE_GHOST)
     tp1 = sum(1 for r in records if r.result == RESULT_TP1)
     tp2 = sum(1 for r in records if r.result == RESULT_TP2)
-    ai_exit = sum(1 for r in records if r.result == RESULT_AI_EXIT)
+    ai_exit = sum(1 for r in records if r.result in {RESULT_AI_EXIT, RESULT_AI_EXIT_PROFIT})
     sl = sum(1 for r in records if r.result == RESULT_SL)
 
-    # Conditional WinRate must stay TP1-vs-SL only.
-    # TP2 and AI_EXIT remain separate learning metrics and must not double-count
-    # a position that already hit TP1.
-    wins = tp1
-    closed = tp1 + sl
-    wr = (wins / closed * 100.0) if closed else 50.0
+    closed_for_wr = tp1 + sl
+    wr = tp1 / closed_for_wr * 100.0 if closed_for_wr else 50.0
 
-    avg_mfe = sum(r.mfe_percent for r in records) / total if total else 0.0
-    avg_mae = sum(r.mae_percent for r in records) / total if total else 0.0
-    avg_hold = sum(r.holding_seconds for r in records) / total if total else 0.0
-    avg_pnl = sum(r.realized_pnl_percent for r in records) / total if total else 0.0
+    avg_move = sum(safe_float(r.move_percent) for r in records) / total
+    avg_mfe = sum(safe_float(r.mfe_percent) for r in records) / total
+    avg_mae = sum(safe_float(r.mae_percent) for r in records) / total
+    avg_hold = sum(safe_float(r.holding_seconds) for r in records) / total
+    avg_pnl = sum(safe_float(r.realized_pnl_percent) for r in records) / total
 
-    # Movement Hunter metrics. These are different from plain WinRate:
-    # - outcome_success_rate rewards TP and useful profitable AI exits.
-    # - timing_score rewards early/fresh wins and penalizes late failures.
-    # - early_success_rate measures how often pre-move/fresh samples worked.
-    # - fuzzy_match_score measures whether stored conditions are near the current condition.
-    # - premove_success_rate specifically measures pre-start/start/fresh success.
-    # - late_failure_rate measures how often late/exhausted samples failed.
-    outcome_successes = sum(1 for r in records if _record_outcome_success(r))
-    outcome_success_rate = (outcome_successes / total * 100.0) if total else 50.0
+    successes = [record_success(r) for r in records]
+    outcome_success_rate = sum(1 for ok in successes if ok) / total * 100.0
 
-    timing_points = [_record_timing_points(r) for r in records]
-    timing_score = sum(timing_points) / len(timing_points) if timing_points else 50.0
+    timing_scores = [record_timing_score(r) for r in records]
+    timing = sum(timing_scores) / total if timing_scores else 50.0
 
-    early_records = [r for r in records if _is_early_or_premove(r)]
-    early_successes = sum(1 for r in early_records if _record_outcome_success(r))
-    early_success_rate = (early_successes / len(early_records) * 100.0) if early_records else 0.0
+    early_successes = [
+        r for r, ok, t in zip(records, successes, timing_scores)
+        if ok and t >= 60.0
+    ]
+    early_success_rate = len(early_successes) / total * 100.0
 
-    premove_success_rate = early_success_rate
+    similarities = [condition_similarity(condition_key, r.condition_key) for r in records]
+    fuzzy_match = sum(similarities) / total if similarities else 0.0
 
-    late_records = [r for r in records if _is_late_or_exhausted(r)]
-    late_failures = sum(1 for r in late_records if r.result == RESULT_SL or not _record_outcome_success(r))
-    late_failure_rate = (late_failures / len(late_records) * 100.0) if late_records else 0.0
+    pattern_records = [r for r in records if safe_float(r.pattern_match_score) > 0 or r.pattern_id]
+    pattern_count = len(pattern_records)
+    pattern_successes = [record_success(r) for r in pattern_records]
+    pattern_win_rate = sum(1 for ok in pattern_successes if ok) / pattern_count * 100.0 if pattern_count else 0.0
+    avg_pattern_score = sum(safe_float(r.pattern_match_score) for r in pattern_records) / pattern_count if pattern_count else 0.0
 
-    fuzzy_scores = [_record_condition_similarity(condition_key, r.condition_key) for r in records]
-    fuzzy_match_score = sum(fuzzy_scores) / len(fuzzy_scores) if fuzzy_scores else 0.0
+    pattern_confidence = clamp(
+        fuzzy_match * 0.30
+        + outcome_success_rate * 0.25
+        + timing * 0.25
+        + min(100.0, total * 7.0) * 0.10
+        + avg_pattern_score * 0.10
+    )
 
     notes: List[str] = []
-    min_samples = int(getattr(SETTINGS.learning, "min_samples_for_confidence", 10))
-    if total < min_samples:
+    min_samples = int(getattr(SETTINGS.pattern, "min_repeats_for_importance", 3))
+    if total < max(3, min_samples):
         confidence_hint = "LOW_DATA"
         notes.append("LOW_SAMPLE_COUNT")
-    elif wr >= 65 or (outcome_success_rate >= 62 and timing_score >= 60):
+    elif outcome_success_rate >= 62 and timing >= 58:
         confidence_hint = "GOOD_HISTORY"
-        notes.append("CONDITION_PERFORMED_WELL")
-    elif (wr <= 40 and closed >= 5) or (outcome_success_rate <= 40 and total >= 5):
+        notes.append("CONDITION_WORKED")
+    elif outcome_success_rate <= 40 and total >= 5:
         confidence_hint = "WEAK_HISTORY"
-        notes.append("CONDITION_PERFORMED_WEAK")
+        notes.append("CONDITION_WEAK")
     else:
         confidence_hint = "MIXED_HISTORY"
 
-    if timing_score >= 65 and early_success_rate >= 35:
-        notes.append("PREMOVE_PATTERN_WORKED_WITH_TIMING")
-    elif timing_score <= 42 and total >= 5:
-        notes.append("TIMING_LATE_OR_WEAK_PATTERN")
+    if early_success_rate >= 35 and total >= 3:
+        notes.append("EARLY_MOVE_PATTERN_WORKED")
+    if timing <= 42 and total >= 5:
+        notes.append("TIMING_WEAK_OR_LATE")
+    if sl >= 3 and wr <= 45:
+        notes.append("REPEATED_SL_CONDITION")
+    if avg_mae > avg_mfe:
+        notes.append("PULLBACK_RISK_HIGH")
 
-    if late_failure_rate >= 55 and len(late_records) >= 3:
-        notes.append("LATE_FAILURE_PATTERN")
-    if early_records and early_success_rate < 35 and len(early_records) >= 3:
-        notes.append("PREMOVE_PATTERN_WEAK_OR_LATE")
-    if fuzzy_match_score >= 70:
-        notes.append("FUZZY_CONDITION_MATCH_STRONG")
-    elif 0 < fuzzy_match_score < 55:
-        notes.append("FUZZY_CONDITION_MATCH_WEAK")
-
-    # Risk labels are now conditional and timing-aware. A high WR late pattern
-    # is not automatically favorable for a Movement Hunter entry.
-    if sl >= 3 and wr <= 45 and timing_score <= 50:
+    if sl >= 3 and wr <= 45:
         risk_label = "RISKY_CONDITION"
-        notes.append("REPEATED_SL_PATTERN")
-    elif outcome_success_rate <= 38 and total >= 5 and timing_score <= 42:
-        risk_label = "RISKY_CONDITION"
-        notes.append("POOR_OUTCOME_AND_TIMING_PATTERN")
-    elif (
-        (wr >= 65 or outcome_success_rate >= 62)
-        and avg_mfe > abs(avg_mae)
-        and (timing_score >= 58 or early_success_rate >= 35)
-    ):
+    elif outcome_success_rate >= 62 and avg_mfe > abs(avg_mae) and timing >= 55:
         risk_label = "FAVORABLE_CONDITION"
     else:
         risk_label = "NEUTRAL_CONDITION"
+
+    best_pattern = max(pattern_records, key=lambda r: safe_float(r.pattern_match_score), default=None)
+    matched_pattern_id = best_pattern.pattern_id or best_pattern.learning_id if best_pattern else ""
+
+    expected_move = max(0.0, avg_mfe * 0.88 if avg_mfe > 0 else avg_move)
 
     return LearningSummary(
         condition_key=condition_key,
         coin=coin,
         direction=direction,
+        timeframe=timeframe,
         sample_count=total,
         real_samples=real,
         ghost_samples=ghost,
@@ -800,16 +829,21 @@ def summarize_records(condition_key: str, coin: str, direction: str, records: Se
         sl_count=sl,
         win_rate=clamp(wr),
         similar_win_rate=clamp(wr),
-        avg_mfe_percent=avg_mfe,
-        avg_mae_percent=avg_mae,
-        avg_holding_seconds=avg_hold,
-        avg_realized_pnl_percent=avg_pnl,
+        avg_move_percent=safe_float(avg_move),
+        expected_move_percent=safe_float(expected_move),
+        avg_mfe_percent=safe_float(avg_mfe),
+        avg_mae_percent=safe_float(avg_mae),
+        avg_holding_seconds=safe_float(avg_hold),
+        avg_realized_pnl_percent=safe_float(avg_pnl),
         outcome_success_rate=clamp(outcome_success_rate),
-        timing_score=clamp(timing_score),
+        timing_score=clamp(timing),
         early_success_rate=clamp(early_success_rate),
-        fuzzy_match_score=clamp(fuzzy_match_score),
-        premove_success_rate=clamp(premove_success_rate),
-        late_failure_rate=clamp(late_failure_rate),
+        fuzzy_match_score=clamp(fuzzy_match),
+        pattern_match_score=clamp(avg_pattern_score),
+        pattern_confidence=clamp(pattern_confidence),
+        pattern_count=pattern_count,
+        pattern_win_rate=clamp(pattern_win_rate),
+        matched_pattern_id=matched_pattern_id,
         risk_label=risk_label,
         confidence_hint=confidence_hint,
         notes=tuple(dict.fromkeys(notes)),
@@ -818,19 +852,18 @@ def summarize_records(condition_key: str, coin: str, direction: str, records: Se
 
 def build_coin_behavior(summary: LearningSummary) -> CoinBehaviorRecord:
     best: List[str] = []
-    worst: List[str] = []
+    weak: List[str] = []
 
-    if summary.win_rate >= 65:
+    if summary.outcome_success_rate >= 62 and summary.timing_score >= 58:
         best.append(summary.condition_key)
-    if summary.win_rate <= 40 and summary.sample_count >= 5:
-        worst.append(summary.condition_key)
-    if summary.sl_count >= 3:
-        worst.append("REPEATED_SL_PATTERN")
+    if summary.sl_count >= 3 or summary.outcome_success_rate <= 40:
+        weak.append(summary.condition_key)
 
     return CoinBehaviorRecord(
         behavior_id=f"beh_{uuid4().hex}",
         coin=summary.coin,
         direction=summary.direction,
+        timeframe=summary.timeframe,
         condition_key=summary.condition_key,
         sample_count=summary.sample_count,
         real_samples=summary.real_samples,
@@ -840,23 +873,20 @@ def build_coin_behavior(summary: LearningSummary) -> CoinBehaviorRecord:
         ai_exit_count=summary.ai_exit_count,
         sl_count=summary.sl_count,
         win_rate=summary.win_rate,
+        pattern_count=summary.pattern_count,
+        pattern_win_rate=summary.pattern_win_rate,
         avg_mfe_percent=summary.avg_mfe_percent,
         avg_mae_percent=summary.avg_mae_percent,
-        avg_holding_seconds=summary.avg_holding_seconds,
-        last_updated=int(time.time()),
+        last_updated=now_ts(),
         best_conditions=tuple(best),
-        worst_conditions=tuple(worst),
+        weak_conditions=tuple(weak),
     )
 
 
 class CoinLearningEngine:
-    """
-    Main learning engine.
-
-    It builds learning records and summaries. It does not decide trades.
-    """
-
     def __init__(self, records: Optional[Iterable[Any]] = None):
+        if records is None:
+            records = load_persisted_learning_records()
         self.memory = CoinLearningMemory(records=records)
         self.record_builder = LearningRecordBuilder()
 
@@ -865,10 +895,6 @@ class CoinLearningEngine:
         source_type: str,
         candidate: AnalysisCandidate,
         result: str,
-        movement: Optional[MovementHunterResult] = None,
-        trap: Optional[TrapResult] = None,
-        state: Optional[StateResult] = None,
-        confidence: Optional[ConfidenceResult] = None,
         entry_price: float = 0.0,
         exit_price: float = 0.0,
         realized_pnl: float = 0.0,
@@ -876,17 +902,15 @@ class CoinLearningEngine:
         mfe_percent: float = 0.0,
         mae_percent: float = 0.0,
         holding_seconds: int = 0,
+        pattern_summary: Optional[Any] = None,
         meta: Optional[JsonDict] = None,
         persist: bool = True,
+        **kwargs: Any,
     ) -> LearningRecord:
         record = self.record_builder.build(
             source_type=source_type,
             candidate=candidate,
             result=result,
-            movement=movement,
-            trap=trap,
-            state=state,
-            confidence=confidence,
             entry_price=entry_price,
             exit_price=exit_price,
             realized_pnl=realized_pnl,
@@ -894,47 +918,54 @@ class CoinLearningEngine:
             mfe_percent=mfe_percent,
             mae_percent=mae_percent,
             holding_seconds=holding_seconds,
+            pattern_summary=pattern_summary,
             meta=meta,
+            **kwargs,
         )
+
         self.memory.add(record)
 
-        if persist:
-            append_bounded('learning', record.learning_id, record.to_dict(), max_items=MAX_LEARNING_RECORDS, sort_key='timestamp')
-            summary = self.memory.summarize(record.condition_key, record.coin, record.direction)
+        if persist and append_bounded is not None:
+            append_bounded(
+                "learning",
+                record.learning_id,
+                record.to_dict(),
+                max_items=MAX_LEARNING_RECORDS,
+                sort_key="timestamp",
+            )
+
+            summary = self.memory.summarize(record.condition_key, record.coin, record.direction, record.timeframe)
             behavior = build_coin_behavior(summary)
-            save_coin_behavior(f"{record.coin}|{record.direction}|{record.condition_key}", behavior.to_dict())
+            if save_coin_behavior is not None:
+                save_coin_behavior(f"{record.coin}|{record.direction}|{record.condition_key}", behavior.to_dict())
 
         return record
 
-    def summarize_candidate(
-        self,
-        candidate: AnalysisCandidate,
-        movement: Optional[MovementHunterResult] = None,
-        trap: Optional[TrapResult] = None,
-        state: Optional[StateResult] = None,
-    ) -> LearningSummary:
-        return self.memory.summarize_for_candidate(candidate, movement=movement, trap=trap, state=state)
+    def summarize_candidate(self, candidate: AnalysisCandidate, **_: Any) -> LearningSummary:
+        return self.memory.summarize_for_candidate(candidate)
+
+
+def load_persisted_learning_records() -> List[Any]:
+    if store is None:
+        return []
+    try:
+        return list(store().section("learning").values())
+    except Exception as exc:
+        if save_error is not None:
+            try:
+                save_error("coin_learning_load", str(exc), {})
+            except Exception:
+                pass
+        return []
 
 
 _default_engine: Optional[CoinLearningEngine] = None
 
 
-def _load_persisted_learning_records() -> List[Any]:
-    """Load persisted learning records so summaries survive restarts."""
-    try:
-        return list(store().section("learning").values())
-    except Exception as exc:
-        try:
-            save_error("coin_learning_load", str(exc), {})
-        except Exception:
-            pass
-        return []
-
-
 def engine(records: Optional[Iterable[Any]] = None) -> CoinLearningEngine:
     global _default_engine
     if _default_engine is None:
-        _default_engine = CoinLearningEngine(records=_load_persisted_learning_records())
+        _default_engine = CoinLearningEngine(records=records)
     elif records is not None:
         existing = list(_default_engine.memory.records)
         _default_engine = CoinLearningEngine(records=[*existing, *list(records)])
@@ -945,10 +976,6 @@ def learn_outcome(
     source_type: str,
     candidate: AnalysisCandidate,
     result: str,
-    movement: Optional[MovementHunterResult] = None,
-    trap: Optional[TrapResult] = None,
-    state: Optional[StateResult] = None,
-    confidence: Optional[ConfidenceResult] = None,
     entry_price: float = 0.0,
     exit_price: float = 0.0,
     realized_pnl: float = 0.0,
@@ -956,17 +983,15 @@ def learn_outcome(
     mfe_percent: float = 0.0,
     mae_percent: float = 0.0,
     holding_seconds: int = 0,
+    pattern_summary: Optional[Any] = None,
     meta: Optional[JsonDict] = None,
     persist: bool = True,
+    **kwargs: Any,
 ) -> LearningRecord:
     return engine().learn_outcome(
         source_type=source_type,
         candidate=candidate,
         result=result,
-        movement=movement,
-        trap=trap,
-        state=state,
-        confidence=confidence,
         entry_price=entry_price,
         exit_price=exit_price,
         realized_pnl=realized_pnl,
@@ -974,24 +999,21 @@ def learn_outcome(
         mfe_percent=mfe_percent,
         mae_percent=mae_percent,
         holding_seconds=holding_seconds,
+        pattern_summary=pattern_summary,
         meta=meta,
         persist=persist,
+        **kwargs,
     )
 
 
-def summarize_candidate_learning(
-    candidate: AnalysisCandidate,
-    movement: Optional[MovementHunterResult] = None,
-    trap: Optional[TrapResult] = None,
-    state: Optional[StateResult] = None,
-) -> LearningSummary:
-    return engine().summarize_candidate(candidate, movement=movement, trap=trap, state=state)
+def summarize_candidate_learning(candidate: AnalysisCandidate, **kwargs: Any) -> LearningSummary:
+    return engine().summarize_candidate(candidate, **kwargs)
 
 
-def coin_learning_summary_for_confidence(
-    candidate: AnalysisCandidate,
-    movement: Optional[MovementHunterResult] = None,
-    trap: Optional[TrapResult] = None,
-    state: Optional[StateResult] = None,
-) -> JsonDict:
-    return summarize_candidate_learning(candidate, movement=movement, trap=trap, state=state).to_dict()
+def coin_learning_summary_for_ai(candidate: AnalysisCandidate, **kwargs: Any) -> JsonDict:
+    return summarize_candidate_learning(candidate, **kwargs).to_dict()
+
+
+def coin_learning_summary_for_confidence(candidate: AnalysisCandidate, **kwargs: Any) -> JsonDict:
+    # compatibility name while old files are being rewritten
+    return coin_learning_summary_for_ai(candidate, **kwargs)
