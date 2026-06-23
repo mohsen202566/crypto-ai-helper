@@ -3,32 +3,19 @@ from __future__ import annotations
 """
 19 - tp_sl_engine.py
 
-Smart TP/SL engine for the locked Movement Hunter architecture.
+Light TP/SL engine for the simplified Level 1 / 5M crypto futures bot.
 
-Responsibilities:
-- Calculate TP1, optional TP2, and SL for AIDecision.
-- Adapt TP/SL to:
-  ATR / volatility
-  coin learning
-  movement prediction
-  market state
-  trap/liquidity risk
-  range/compression
-  breakout survival / retest tolerance
-  coin noise
-- Keep SL not too close, especially around breakout/retest/liquidity zones.
-- Decide TP mode:
-  TP1_ONLY
-  TP1_TP2
-
-Strictly forbidden:
-- No trade execution.
-- No Toobit calls.
-- No Telegram.
-- No persistence.
+Locked goals:
+- TP1 minimum = 0.95 ATR.
+- SL minimum = 1.25 ATR.
+- AI may make TP/SL wider/smarter, but never smaller than those ATR floors.
+- TP should not sit exactly on support/resistance.
+- SL should be behind support/resistance with a small buffer.
+- Minimum useful distance for tiny-price symbols is enforced.
+- Fee/net-profit check is included.
+- No trap/state/confidence/correlation/meta/movement_hunter dependency.
 - No REAL/GHOST/REJECT decision.
-- No Paper mode.
-- No Setup flow.
+- No Toobit, no Telegram, no persistence, no paper/setup flow.
 
 This file only calculates prices.
 real_trade_manager.py opens orders later.
@@ -42,18 +29,9 @@ import time
 
 from ai_decision_engine import AIDecision
 from analysis_engine import AnalysisCandidate
-from movement_hunter import MovementHunterResult
-from trap_engine import TrapResult
-from state_engine import StateResult
-from confidence_engine import ConfidenceResult
 from coin_learning import LearningSummary
 from movement_predictor import MovementPredictionResult
 from config import SETTINGS
-
-try:
-    from data_store import store
-except Exception:  # keep compile-safe when data_store is unavailable in isolated tests
-    store = None  # type: ignore
 
 
 JsonDict = Dict[str, Any]
@@ -68,6 +46,10 @@ QUALITY_LOW = "LOW"
 QUALITY_MEDIUM = "MEDIUM"
 QUALITY_HIGH = "HIGH"
 
+MIN_TP1_ATR = 0.95
+MIN_SL_ATR = 1.25
+DEFAULT_TP2_ATR = 1.65
+
 
 @dataclass(frozen=True)
 class TPSLPlan:
@@ -80,44 +62,27 @@ class TPSLPlan:
     tp2: float
     sl: float
     tp_mode: str
+
     rr_tp1: float
     rr_tp2: float
-    sl_distance_percent: float
     tp1_distance_percent: float
     tp2_distance_percent: float
+    sl_distance_percent: float
     atr_percent: float
     quality_label: str
 
-    # Fee-aware / capital-aware estimates. These are informational for reports
-    # and validation; real order sizing is still done later by real_trade_manager.
     notional_usdt: float = 0.0
     estimated_tp1_gross_usdt: float = 0.0
     estimated_tp1_fee_usdt: float = 0.0
     estimated_tp1_net_usdt: float = 0.0
-    min_required_net_profit_usdt: float = 0.0
-
-    # Tradability / profit-quality estimates. These help downstream layers
-    # avoid REAL trades where a coin technically moves, but the practical
-    # TP is too small compared with fees/noise.
     estimated_sl_loss_usdt: float = 0.0
     estimated_rr_net: float = 0.0
+    min_required_net_profit_usdt: float = 0.0
     tradability_score: float = 50.0
 
     reason_codes: Tuple[str, ...] = field(default_factory=tuple)
     warnings: Tuple[str, ...] = field(default_factory=tuple)
     valid: bool = True
-
-    def to_dict(self) -> JsonDict:
-        return asdict(self)
-
-
-@dataclass(frozen=True)
-class TPSLMultipliers:
-    tp1_atr: float
-    tp2_atr: float
-    sl_atr: float
-    min_sl_atr: float
-    max_sl_atr: float
 
     def to_dict(self) -> JsonDict:
         return asdict(self)
@@ -139,14 +104,17 @@ def safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
-def clamp(value: float, low: float, high: float) -> float:
+def safe_int(value: Any, default: int = 0) -> int:
     try:
-        v = float(value)
-        if math.isnan(v) or math.isinf(v):
-            return low
-        return max(low, min(high, v))
+        if value is None:
+            return default
+        return int(float(value))
     except Exception:
-        return low
+        return default
+
+
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, safe_float(value, low)))
 
 
 def normalize_direction(direction: str) -> str:
@@ -158,20 +126,32 @@ def normalize_direction(direction: str) -> str:
     return d
 
 
+def obj_value(obj: Optional[Any], key: str, default: Any = None) -> Any:
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def obj_float(obj: Optional[Any], key: str, default: float = 0.0) -> float:
+    return safe_float(obj_value(obj, key, default), default)
+
+
 def price_from_percent(entry: float, direction: str, percent: float) -> float:
     entry = safe_float(entry)
-    p = safe_float(percent) / 100.0
+    pct = safe_float(percent) / 100.0
     if normalize_direction(direction) == DIRECTION_LONG:
-        return entry * (1.0 + p)
-    return entry * (1.0 - p)
+        return entry * (1.0 + pct)
+    return entry * (1.0 - pct)
 
 
 def sl_from_percent(entry: float, direction: str, percent: float) -> float:
     entry = safe_float(entry)
-    p = safe_float(percent) / 100.0
+    pct = safe_float(percent) / 100.0
     if normalize_direction(direction) == DIRECTION_LONG:
-        return entry * (1.0 - p)
-    return entry * (1.0 + p)
+        return entry * (1.0 - pct)
+    return entry * (1.0 + pct)
 
 
 def distance_percent(entry: float, price: float) -> float:
@@ -183,158 +163,105 @@ def distance_percent(entry: float, price: float) -> float:
 
 
 def rr_ratio(entry: float, tp: float, sl: float) -> float:
-    risk = abs(entry - sl)
-    reward = abs(tp - entry)
+    risk = abs(safe_float(entry) - safe_float(sl))
+    reward = abs(safe_float(tp) - safe_float(entry))
     if risk <= 0:
         return 0.0
     return reward / risk
 
 
 def round_price(price: float, symbol: str = "") -> float:
-    """
-    Generic safe rounding. Exchange exact tick-size validation is done later
-    inside tobit_client.py / real_trade_manager.py.
-
-    Important fix for meme/very-low-price futures:
-    PEPE/SHIB/BONK/FLOKI-style prices need more than 8 decimals. Rounding
-    everything below 0.1 to 8 decimals can collapse TP/SL too close to Entry
-    and Toobit rejects SHORT orders with: -3144 invalid short stop loss price.
-    """
     price = safe_float(price)
     if price <= 0:
         return 0.0
 
     sym = str(symbol or "").upper()
-    if any(x in sym for x in ("PEPE", "SHIB", "BONK", "FLOKI")) or price < 0.0001:
+    if any(x in sym for x in ("PEPE", "BONK", "SHIB", "FLOKI")) or price < 0.0001:
         decimals = 12
     elif price < 0.01:
         decimals = 10
-    elif price >= 1000:
-        decimals = 2
-    elif price >= 100:
-        decimals = 3
-    elif price >= 10:
-        decimals = 4
-    elif price >= 1:
-        decimals = 5
-    elif price >= 0.1:
-        decimals = 6
-    else:
+    elif price < 0.1:
         decimals = 8
+    elif price < 1:
+        decimals = 6
+    elif price < 10:
+        decimals = 5
+    elif price < 100:
+        decimals = 4
+    elif price < 1000:
+        decimals = 3
+    else:
+        decimals = 2
+
     return round(price, decimals)
 
 
-def _min_distance_percent_for_symbol(symbol: str, entry: float) -> float:
-    """Minimum practical TP/SL distance before exchange tick validation.
-
-    This prevents tiny-price symbols from producing TP/SL values that are only
-    one display tick away from entry after rounding. It is deliberately small
-    enough for scalping, but large enough to avoid Toobit invalid stop prices.
-    """
+def min_distance_percent_for_symbol(symbol: str, entry: float) -> float:
     sym = str(symbol or "").upper()
     entry = safe_float(entry)
 
-    if any(x in sym for x in ("PEPE", "SHIB", "BONK", "FLOKI")):
+    if any(x in sym for x in ("PEPE", "BONK", "SHIB", "FLOKI")):
         return 0.28
-    if entry > 0 and entry < 0.0001:
-        return 0.28
-    if entry > 0 and entry < 0.01:
+    if 0 < entry < 0.01:
         return 0.22
     return 0.18
 
 
-def _enforce_min_distances(entry: float, direction: str, tp1_percent: float, tp2_percent: float, sl_percent: float, symbol: str) -> Tuple[float, float, float, List[str]]:
-    reasons: List[str] = []
-    min_pct = _min_distance_percent_for_symbol(symbol, entry)
-
-    if tp1_percent < min_pct:
-        tp1_percent = min_pct
-        reasons.append("TP1_MIN_DISTANCE_ENFORCED_FOR_EXCHANGE")
-    if sl_percent < min_pct:
-        sl_percent = min_pct
-        reasons.append("SL_MIN_DISTANCE_ENFORCED_FOR_EXCHANGE")
-    if tp2_percent > 0 and tp2_percent < tp1_percent * 1.25:
-        tp2_percent = tp1_percent * 1.25
-        reasons.append("TP2_MIN_DISTANCE_ENFORCED_FOR_EXCHANGE")
-
-    return tp1_percent, tp2_percent, sl_percent, reasons
-
-
-
-
-def _runtime_setting_float(key: str, default: float) -> float:
-    """Read runtime_settings without creating a hard dependency on bot.py."""
+def settings_float(path: str, default: float) -> float:
     try:
-        if store is not None:
-            section = store().section("runtime_settings")
-            if key in section:
-                return safe_float(section.get(key), default)
-    except Exception:
-        pass
-    return default
-
-
-def _runtime_setting_int(key: str, default: int) -> int:
-    try:
-        return int(round(_runtime_setting_float(key, float(default))))
+        obj: Any = SETTINGS
+        for part in str(path).split("."):
+            obj = getattr(obj, part)
+        return safe_float(obj, default)
     except Exception:
         return default
 
 
-def _trade_margin_usdt() -> float:
-    default = safe_float(getattr(SETTINGS.trading, "margin_usdt", 5.0), 5.0)
-    # Support both names used by bot.py / real_trade_manager.py.
-    return max(0.0, _runtime_setting_float("margin_usdt", _runtime_setting_float("trade_margin_usdt", default)))
+def trade_margin_usdt() -> float:
+    return max(0.0, settings_float("trading.margin_usdt", 5.0))
 
 
-def _trade_leverage() -> int:
-    default = int(safe_float(getattr(SETTINGS.trading, "leverage", 10), 10))
-    return max(1, _runtime_setting_int("leverage", default))
+def trade_leverage() -> float:
+    return max(1.0, settings_float("trading.leverage", 10.0))
 
 
-def _fee_rate_per_side() -> float:
-    # Conservative default taker fee. Config can override with trading.taker_fee_rate
-    # or tp.fee_rate_per_side.
-    cfg = safe_float(getattr(SETTINGS.tp, "fee_rate_per_side", 0.0), 0.0)
-    if cfg <= 0:
-        cfg = safe_float(getattr(SETTINGS.trading, "taker_fee_rate", 0.0006), 0.0006)
-    return max(0.0, cfg)
+def notional_usdt() -> float:
+    return trade_margin_usdt() * trade_leverage()
 
 
-def _min_net_profit_usdt() -> float:
-    # User preference: avoid TP where profit is eaten by fees. Default 10 cents.
-    cfg = safe_float(getattr(SETTINGS.tp, "min_net_profit_usdt", 0.10), 0.10)
-    return max(0.0, cfg)
+def fee_rate_per_side() -> float:
+    fee = settings_float("tp.fee_rate_per_side", 0.0)
+    if fee <= 0:
+        fee = settings_float("trading.taker_fee_rate", 0.0006)
+    return max(0.0, fee)
 
 
-def _notional_usdt() -> float:
-    return _trade_margin_usdt() * float(_trade_leverage())
+def min_net_profit_usdt() -> float:
+    return max(0.0, settings_float("tp.min_net_profit_usdt", 0.20))
 
 
-def _estimated_fee_usdt(notional: float) -> float:
-    # Entry + TP exit. This is intentionally conservative.
-    return max(0.0, safe_float(notional) * _fee_rate_per_side() * 2.0)
+def estimated_fee_usdt(notional: float) -> float:
+    return max(0.0, safe_float(notional) * fee_rate_per_side() * 2.0)
 
 
-def _gross_profit_usdt(notional: float, tp_percent: float) -> float:
+def gross_profit_usdt(notional: float, tp_percent: float) -> float:
     return max(0.0, safe_float(notional) * safe_float(tp_percent) / 100.0)
 
 
-def _min_tp_percent_for_net_profit() -> Tuple[float, float, float, float, List[str]]:
-    """Return minimum TP percent required to clear fee + min net profit."""
-    reasons: List[str] = []
-    notional = _notional_usdt()
-    fee = _estimated_fee_usdt(notional)
-    min_net = _min_net_profit_usdt()
-    if notional <= 0:
-        return 0.0, notional, fee, min_net, ["FEE_AWARE_SKIPPED_NO_NOTIONAL"]
-    required = (fee + min_net) / notional * 100.0
-    reasons.append("FEE_AWARE_MIN_NET_PROFIT_CHECK")
-    return required, notional, fee, min_net, reasons
+def estimated_loss_usdt(notional: float, sl_percent: float) -> float:
+    return max(0.0, safe_float(notional) * safe_float(sl_percent) / 100.0)
 
 
-def _iter_numeric_levels(value: Any) -> List[float]:
+def net_rr(gross: float, fee: float, loss: float) -> float:
+    loss = safe_float(loss)
+    if loss <= 0:
+        return 0.0
+    return (safe_float(gross) - safe_float(fee)) / loss
+
+
+def iter_numeric_levels(value: Any) -> List[float]:
     levels: List[float] = []
+
     if value is None:
         return levels
     if isinstance(value, (int, float)):
@@ -343,20 +270,21 @@ def _iter_numeric_levels(value: Any) -> List[float]:
             levels.append(v)
         return levels
     if isinstance(value, dict):
-        for k in ("price", "level", "value", "low", "high", "support", "resistance"):
-            if k in value:
-                levels.extend(_iter_numeric_levels(value.get(k)))
+        for key in ("price", "level", "value", "low", "high", "support", "resistance"):
+            if key in value:
+                levels.extend(iter_numeric_levels(value.get(key)))
         return levels
     if isinstance(value, (list, tuple, set)):
         for item in value:
-            levels.extend(_iter_numeric_levels(item))
+            levels.extend(iter_numeric_levels(item))
         return levels
+
     return levels
 
 
-def _snapshot_levels(candidate: AnalysisCandidate, side: str) -> List[float]:
-    """Extract support/resistance/swing levels from whatever analysis_layers provides."""
+def snapshot_levels(candidate: AnalysisCandidate, side: str) -> List[float]:
     s = candidate.sensor_snapshot
+
     if side == "support":
         names = (
             "nearest_support", "support", "support_price", "support_level", "supports",
@@ -369,28 +297,30 @@ def _snapshot_levels(candidate: AnalysisCandidate, side: str) -> List[float]:
             "swing_high", "last_swing_high", "recent_high", "high_20", "high_50",
             "supply_zone", "supply_zone_high", "supply_high", "sr_resistance",
         )
+
     out: List[float] = []
     for name in names:
-        out.extend(_iter_numeric_levels(getattr(s, name, None)))
-    # Deduplicate while preserving meaningful levels only.
+        out.extend(iter_numeric_levels(getattr(s, name, None)))
+
     dedup: List[float] = []
-    for v in out:
-        if v > 0 and all(abs(v - x) / max(v, x, 1e-12) > 0.00001 for x in dedup):
-            dedup.append(v)
+    for level in out:
+        if level > 0 and all(abs(level - existing) / max(level, existing, 1e-12) > 0.00001 for existing in dedup):
+            dedup.append(level)
+
     return dedup
 
 
-def _nearest_above(entry: float, levels: List[float]) -> Optional[float]:
-    above = [v for v in levels if v > entry]
+def nearest_above(entry: float, levels: List[float]) -> Optional[float]:
+    above = [x for x in levels if x > entry]
     return min(above) if above else None
 
 
-def _nearest_below(entry: float, levels: List[float]) -> Optional[float]:
-    below = [v for v in levels if 0 < v < entry]
+def nearest_below(entry: float, levels: List[float]) -> Optional[float]:
+    below = [x for x in levels if 0 < x < entry]
     return max(below) if below else None
 
 
-def _apply_sr_liquidity_rules(
+def apply_support_resistance_rules(
     entry: float,
     direction: str,
     tp1_percent: float,
@@ -399,96 +329,219 @@ def _apply_sr_liquidity_rules(
     atr_percent: float,
     candidate: AnalysisCandidate,
 ) -> Tuple[float, float, float, List[str], List[str]]:
-    """Make TP cautious near SR and put SL beyond the nearest invalidation level.
-
-    LONG: SL should be below support; TP should normally be before resistance.
-    SHORT: SL should be above resistance; TP should normally be before support.
-    """
     reasons: List[str] = []
     warnings: List[str] = []
-    d = normalize_direction(direction)
+
+    direction = normalize_direction(direction)
     buffer_pct = max(0.06, safe_float(atr_percent) * 0.16)
 
-    supports = _snapshot_levels(candidate, "support")
-    resistances = _snapshot_levels(candidate, "resistance")
+    supports = snapshot_levels(candidate, "support")
+    resistances = snapshot_levels(candidate, "resistance")
 
-    if d == DIRECTION_LONG:
-        support = _nearest_below(entry, supports)
-        resistance = _nearest_above(entry, resistances)
+    if direction == DIRECTION_LONG:
+        support = nearest_below(entry, supports)
+        resistance = nearest_above(entry, resistances)
+
         if support:
             support_dist = distance_percent(entry, support)
             target_sl = support_dist + buffer_pct
             if target_sl > sl_percent:
                 sl_percent = target_sl
-                reasons.append("SL_PLACED_BELOW_SUPPORT_WITH_BUFFER")
+                reasons.append("SL_BELOW_SUPPORT_WITH_BUFFER")
+
         if resistance:
-            res_dist = distance_percent(entry, resistance)
-            # Take profit before resistance so TP1 is hit faster instead of waiting
-            # for a clean break through resistance.
-            cautious_tp = max(0.01, res_dist - buffer_pct)
-            if cautious_tp > 0 and cautious_tp < tp1_percent:
+            resistance_dist = distance_percent(entry, resistance)
+            cautious_tp = resistance_dist - buffer_pct
+            # Do not reduce below locked minimum. If resistance is too close, keep
+            # minimum TP and warn so AI/REAL side can downgrade if needed.
+            if cautious_tp > 0 and cautious_tp >= tp1_percent * 0.92 and cautious_tp < tp1_percent:
                 tp1_percent = cautious_tp
-                reasons.append("TP1_CAUTIOUS_BEFORE_RESISTANCE")
-            if tp2_percent > 0 and res_dist > 0:
-                tp2_cap = max(tp1_percent * 1.15, res_dist + buffer_pct * 0.50)
-                if tp2_percent > tp2_cap:
-                    tp2_percent = tp2_cap
-                    reasons.append("TP2_CAPPED_AROUND_RESISTANCE_ZONE")
-    elif d == DIRECTION_SHORT:
-        support = _nearest_below(entry, supports)
-        resistance = _nearest_above(entry, resistances)
+                reasons.append("TP1_ADJUSTED_BEFORE_RESISTANCE")
+            elif 0 < cautious_tp < tp1_percent * 0.92:
+                warnings.append("RESISTANCE_TOO_CLOSE_TO_REDUCE_TP1_BELOW_MIN")
+
+    elif direction == DIRECTION_SHORT:
+        support = nearest_below(entry, supports)
+        resistance = nearest_above(entry, resistances)
+
         if resistance:
             resistance_dist = distance_percent(entry, resistance)
             target_sl = resistance_dist + buffer_pct
             if target_sl > sl_percent:
                 sl_percent = target_sl
-                reasons.append("SL_PLACED_ABOVE_RESISTANCE_WITH_BUFFER")
+                reasons.append("SL_ABOVE_RESISTANCE_WITH_BUFFER")
+
         if support:
-            sup_dist = distance_percent(entry, support)
-            cautious_tp = max(0.01, sup_dist - buffer_pct)
-            if cautious_tp > 0 and cautious_tp < tp1_percent:
+            support_dist = distance_percent(entry, support)
+            cautious_tp = support_dist - buffer_pct
+            if cautious_tp > 0 and cautious_tp >= tp1_percent * 0.92 and cautious_tp < tp1_percent:
                 tp1_percent = cautious_tp
-                reasons.append("TP1_CAUTIOUS_BEFORE_SUPPORT")
-            if tp2_percent > 0 and sup_dist > 0:
-                tp2_cap = max(tp1_percent * 1.15, sup_dist + buffer_pct * 0.50)
-                if tp2_percent > tp2_cap:
-                    tp2_percent = tp2_cap
-                    reasons.append("TP2_CAPPED_AROUND_SUPPORT_ZONE")
+                reasons.append("TP1_ADJUSTED_BEFORE_SUPPORT")
+            elif 0 < cautious_tp < tp1_percent * 0.92:
+                warnings.append("SUPPORT_TOO_CLOSE_TO_REDUCE_TP1_BELOW_MIN")
 
     return tp1_percent, tp2_percent, sl_percent, reasons, warnings
 
 
-def _apply_fee_aware_tp_floor(tp1_percent: float, tp2_percent: float) -> Tuple[float, float, float, float, float, float, List[str], List[str]]:
-    """Ensure TP1 gross profit covers estimated fees plus minimum net profit."""
+def base_distances(
+    candidate: AnalysisCandidate,
+    prediction: MovementPredictionResult,
+    learning: Optional[LearningSummary],
+) -> Tuple[float, float, float, List[str], List[str]]:
     reasons: List[str] = []
     warnings: List[str] = []
-    required_pct, notional, fee, min_net, r = _min_tp_percent_for_net_profit()
-    reasons.extend(r)
-    if required_pct > 0 and tp1_percent < required_pct:
-        tp1_percent = required_pct
-        reasons.append("TP1_RAISED_TO_COVER_FEES_AND_MIN_NET_PROFIT")
-    if tp2_percent > 0 and tp2_percent < tp1_percent * 1.20:
-        tp2_percent = tp1_percent * 1.20
-        reasons.append("TP2_RAISED_AFTER_FEE_AWARE_TP1")
-    gross = _gross_profit_usdt(notional, tp1_percent)
+
+    m = candidate.momentum_state
+    atr_percent = safe_float(m.atr_percent)
+    if atr_percent <= 0:
+        atr_percent = 0.55
+        warnings.append("ATR_FALLBACK_USED")
+
+    tp1_atr = MIN_TP1_ATR
+    tp2_atr = DEFAULT_TP2_ATR
+    sl_atr = MIN_SL_ATR
+
+    phase = str(obj_value(prediction, "predicted_phase", "")).upper()
+    movement_probability = obj_float(prediction, "movement_probability", 0.0)
+    expected_move = obj_float(prediction, "expected_move_percent", 0.0)
+
+    if phase in {"PRE_START", "START"}:
+        tp2_atr += 0.15
+        reasons.append("EARLY_PHASE_TP2_ALLOWED")
+    elif phase == "MID":
+        tp2_atr -= 0.10
+        reasons.append("MID_PHASE_TP2_CONSERVATIVE")
+    elif phase in {"LATE", "RANGE"}:
+        tp2_atr -= 0.25
+        sl_atr += 0.10
+        reasons.append("LATE_OR_RANGE_MORE_CONSERVATIVE")
+
+    if movement_probability >= 70:
+        tp2_atr += 0.15
+        reasons.append("HIGH_MOVEMENT_PROBABILITY_TP2_PLUS")
+    elif movement_probability < 45:
+        tp2_atr -= 0.15
+        reasons.append("LOW_MOVEMENT_PROBABILITY_TP2_MINUS")
+
+    if expected_move > 0:
+        # Expected move can make TP1 wider, never smaller than 0.95 ATR.
+        expected_tp1_pct = expected_move * 0.72
+        if expected_tp1_pct > atr_percent * tp1_atr:
+            tp1_atr = max(tp1_atr, expected_tp1_pct / atr_percent)
+            reasons.append("EXPECTED_MOVE_WIDENED_TP1")
+
+    if learning is not None:
+        risk_label = str(obj_value(learning, "risk_label", "")).upper()
+        early_success = obj_float(learning, "early_success_rate", 0.0)
+        timing = obj_float(learning, "timing_score", 50.0)
+        avg_mae = obj_float(learning, "avg_mae_percent", 0.0)
+        avg_mfe = obj_float(learning, "avg_mfe_percent", 0.0)
+        samples = obj_float(learning, "sample_count", 0.0)
+
+        if risk_label == "FAVORABLE_CONDITION" and samples >= 3:
+            tp2_atr += 0.10
+            reasons.append("LEARNING_FAVORABLE_TP2_PLUS")
+        elif risk_label == "RISKY_CONDITION":
+            sl_atr += 0.12
+            tp2_atr -= 0.20
+            reasons.append("LEARNING_RISKY_CONDITION_MORE_CAREFUL")
+
+        if early_success >= 40 or timing >= 65:
+            tp1_atr += 0.05
+            tp2_atr += 0.12
+            reasons.append("LEARNING_EARLY_PATTERN_SUPPORT")
+
+        if samples >= 5 and avg_mae > avg_mfe:
+            sl_atr += 0.15
+            reasons.append("LEARNING_PULLBACK_NOISE_WIDER_SL")
+
+    # Locked floors.
+    tp1_atr = max(tp1_atr, MIN_TP1_ATR)
+    sl_atr = max(sl_atr, MIN_SL_ATR)
+    tp2_atr = max(tp2_atr, tp1_atr * 1.25)
+
+    # Keep Level 1 scalable and not oversized.
+    tp1_atr = clamp(tp1_atr, MIN_TP1_ATR, 1.55)
+    tp2_atr = clamp(tp2_atr, tp1_atr * 1.25, 2.80)
+    sl_atr = clamp(sl_atr, MIN_SL_ATR, 2.60)
+
+    return atr_percent * tp1_atr, atr_percent * tp2_atr, atr_percent * sl_atr, reasons, warnings
+
+
+def apply_minimum_distance_and_fee_floor(
+    entry: float,
+    symbol: str,
+    tp1_percent: float,
+    tp2_percent: float,
+    sl_percent: float,
+) -> Tuple[float, float, float, float, float, float, float, List[str], List[str]]:
+    reasons: List[str] = []
+    warnings: List[str] = []
+
+    min_dist = min_distance_percent_for_symbol(symbol, entry)
+
+    if tp1_percent < min_dist:
+        tp1_percent = min_dist
+        reasons.append("TP1_EXCHANGE_MIN_DISTANCE_ENFORCED")
+    if sl_percent < min_dist:
+        sl_percent = min_dist
+        reasons.append("SL_EXCHANGE_MIN_DISTANCE_ENFORCED")
+    if tp2_percent < tp1_percent * 1.25:
+        tp2_percent = tp1_percent * 1.25
+        reasons.append("TP2_MIN_DISTANCE_FROM_TP1_ENFORCED")
+
+    notional = notional_usdt()
+    fee = estimated_fee_usdt(notional)
+    min_net = min_net_profit_usdt()
+    required_tp_percent = ((fee + min_net) / notional * 100.0) if notional > 0 else 0.0
+
+    if required_tp_percent > 0 and tp1_percent < required_tp_percent:
+        tp1_percent = required_tp_percent
+        reasons.append("TP1_RAISED_FOR_FEES_AND_MIN_NET")
+    if tp2_percent < tp1_percent * 1.25:
+        tp2_percent = tp1_percent * 1.25
+        reasons.append("TP2_RAISED_AFTER_FEE_FLOOR")
+
+    gross = gross_profit_usdt(notional, tp1_percent)
     net = gross - fee
     if net < min_net:
-        warnings.append("TP1_NET_PROFIT_BELOW_MIN_AFTER_FEES")
-    return tp1_percent, tp2_percent, notional, gross, fee, min_net, reasons, warnings
+        warnings.append("TP1_NET_PROFIT_STILL_BELOW_MIN")
+
+    return tp1_percent, tp2_percent, sl_percent, notional, gross, fee, min_net, reasons, warnings
 
 
-def _estimated_loss_usdt(notional: float, sl_percent: float) -> float:
-    return max(0.0, safe_float(notional) * safe_float(sl_percent) / 100.0)
+def choose_tp_mode(decision: AIDecision, prediction: MovementPredictionResult, learning: Optional[LearningSummary]) -> Tuple[str, List[str]]:
+    reasons: List[str] = []
+
+    tp2_enabled = bool(getattr(SETTINGS.tp, "tp2_enabled", True))
+    if not tp2_enabled:
+        reasons.append("TP2_DISABLED_BY_CONFIG")
+        return TP_MODE_TP1_ONLY, reasons
+
+    strong = (
+        safe_float(decision.ai_score) >= 68
+        and obj_float(prediction, "movement_probability", 0.0) >= 62
+        and str(obj_value(prediction, "predicted_phase", "")).upper() in {"PRE_START", "START", "MID"}
+    )
+
+    if learning is not None:
+        risk_label = str(obj_value(learning, "risk_label", "")).upper()
+        if risk_label == "RISKY_CONDITION":
+            strong = False
+            reasons.append("TP2_BLOCKED_BY_RISKY_LEARNING")
+        if obj_float(learning, "early_success_rate", 0.0) >= 45:
+            strong = True
+            reasons.append("TP2_ALLOWED_BY_EARLY_LEARNING")
+
+    if strong:
+        reasons.append("TP2_ALLOWED")
+        return TP_MODE_TP1_TP2, reasons
+
+    reasons.append("TP1_ONLY_SIMPLE_SCALP")
+    return TP_MODE_TP1_ONLY, reasons
 
 
-def _net_rr(gross_profit: float, fee: float, loss: float) -> float:
-    net_profit = safe_float(gross_profit) - safe_float(fee)
-    if loss <= 0:
-        return 0.0
-    return net_profit / loss
-
-
-def _profit_quality_score(
+def profit_quality_score(
     tp1_percent: float,
     sl_percent: float,
     notional: float,
@@ -497,379 +550,114 @@ def _profit_quality_score(
     min_net: float,
     atr_percent: float,
     candidate: AnalysisCandidate,
-    prediction: MovementPredictionResult,
-    learning: Optional[LearningSummary],
 ) -> Tuple[float, float, float, List[str], List[str]]:
-    """Score whether this TP/SL plan is worth real capital.
-
-    A coin can be technically active but still poor for REAL trading when the
-    expected TP is only a few cents after fees or when TP is too close to normal
-    candle noise. This score is informational for AI/reporting and is also used
-    by the validator to mark truly useless plans invalid.
-    """
     reasons: List[str] = []
     warnings: List[str] = []
 
-    est_loss = _estimated_loss_usdt(notional, sl_percent)
-    net_profit = safe_float(gross) - safe_float(fee)
-    net_rr = _net_rr(gross, fee, est_loss)
+    loss = estimated_loss_usdt(notional, sl_percent)
+    rr_net = net_rr(gross, fee, loss)
+    net = safe_float(gross) - safe_float(fee)
 
-    required_net_score = clamp((net_profit / max(min_net, 0.01)) * 35.0, 0.0, 40.0)
-    fee_cover_score = clamp((safe_float(tp1_percent) / max(((fee + min_net) / max(notional, 1e-9) * 100.0), 1e-9)) * 35.0, 0.0, 40.0)
-    rr_score = clamp(net_rr * 25.0, 0.0, 25.0)
-
-    # TP must be bigger than normal micro-noise. For very tight coins, this
-    # prevents two tiny ticks deciding the whole trade.
+    net_score = clamp((net / max(min_net, 0.01)) * 35.0, 0.0, 40.0)
+    rr_score = clamp(rr_net * 25.0, 0.0, 25.0)
     noise_ratio = safe_float(tp1_percent) / max(safe_float(atr_percent), 0.05)
-    noise_score = clamp(noise_ratio * 12.0, 0.0, 18.0)
+    noise_score = clamp(noise_ratio * 18.0, 0.0, 22.0)
 
-    s = candidate.sensor_snapshot
+    m = candidate.momentum_state
     volume_bonus = 0.0
-    rel_vol = safe_float(getattr(s, "relative_volume", 0.0), 0.0)
-    if rel_vol >= 1.8 or bool(getattr(s, "volume_spike", False)):
-        volume_bonus += 6.0
-        reasons.append("PROFIT_QUALITY_VOLUME_SUPPORT")
-    elif rel_vol > 0 and rel_vol < 0.65:
-        volume_bonus -= 8.0
-        warnings.append("PROFIT_QUALITY_LOW_VOLUME")
+    if m.relative_volume >= 1.8 or m.volume_spike:
+        volume_bonus = 8.0
+        reasons.append("VOLUME_SUPPORTS_TP_SL")
+    elif 0 < m.relative_volume < 0.65:
+        volume_bonus = -8.0
+        warnings.append("LOW_VOLUME_TP_SL")
 
-    # If learning says this exact condition catches early moves, tolerate a
-    # slightly more ambitious TP. Otherwise keep low-value scalps in GHOST.
-    try:
-        early = safe_float(getattr(learning, "early_success_rate", 0.0), 0.0) if learning is not None else 0.0
-        premove = safe_float(getattr(learning, "premove_success_rate", 0.0), 0.0) if learning is not None else 0.0
-        timing = safe_float(getattr(learning, "timing_score", 50.0), 50.0) if learning is not None else 50.0
-        if early >= 45.0 or premove >= 45.0 or timing >= 68.0:
-            volume_bonus += 5.0
-            reasons.append("PROFIT_QUALITY_EARLY_LEARNING_SUPPORT")
-    except Exception:
-        pass
+    score = clamp(net_score + rr_score + noise_score + volume_bonus)
 
-    score = clamp(required_net_score + fee_cover_score + rr_score + noise_score + volume_bonus, 0.0, 100.0)
+    if net < min_net:
+        warnings.append("NET_PROFIT_BELOW_MIN")
+    if rr_net < 0.25:
+        warnings.append("NET_RR_LOW")
+    if score < 30:
+        warnings.append("TP_SL_PROFIT_QUALITY_LOW")
+    elif score >= 65:
+        reasons.append("TP_SL_PROFIT_QUALITY_GOOD")
 
-    if net_profit < min_net:
-        warnings.append("PROFIT_QUALITY_NET_BELOW_MIN")
-    if net_rr < 0.25:
-        warnings.append("PROFIT_QUALITY_NET_RR_TOO_LOW")
-    if noise_ratio < 0.45:
-        warnings.append("PROFIT_QUALITY_TP_INSIDE_NORMAL_NOISE")
-    if score < 35.0:
-        warnings.append("PROFIT_QUALITY_TOO_LOW_FOR_REAL")
-        reasons.append("PROFIT_QUALITY_GHOST_OR_BLOCK")
-    elif score >= 65.0:
-        reasons.append("PROFIT_QUALITY_REAL_USABLE")
-    else:
-        reasons.append("PROFIT_QUALITY_BORDERLINE")
-
-    return score, est_loss, net_rr, reasons, warnings
-
-class BaseMultiplierEngine:
-    """Base scalping multipliers for 5M-15M Movement Hunter."""
-
-    def base(self) -> TPSLMultipliers:
-        min_sl = safe_float(getattr(SETTINGS.tp, "min_sl_atr_multiplier", 1.0), 1.0)
-        max_sl = safe_float(getattr(SETTINGS.tp, "max_sl_atr_multiplier", 2.6), 2.6)
-        return TPSLMultipliers(
-            tp1_atr=0.85,
-            tp2_atr=1.55,
-            sl_atr=1.15,
-            min_sl_atr=min_sl,
-            max_sl_atr=max_sl,
-        )
-
-
-class VolatilityAdjustmentEngine:
-    """Adjusts multipliers based on ATR/volatility/range."""
-
-    def adjust(self, m: TPSLMultipliers, candidate: AnalysisCandidate, state: StateResult) -> Tuple[TPSLMultipliers, List[str]]:
-        s = candidate.sensor_snapshot
-        reasons: List[str] = []
-
-        tp1 = m.tp1_atr
-        tp2 = m.tp2_atr
-        sl = m.sl_atr
-
-        if s.atr_explosion:
-            tp1 += 0.10
-            tp2 += 0.25
-            sl += 0.20
-            reasons.append("ATR_EXPLOSION_WIDER_PLAN")
-        elif s.atr_expansion == "EXPANDING":
-            tp1 += 0.05
-            tp2 += 0.15
-            sl += 0.10
-            reasons.append("ATR_EXPANDING_ADJUSTMENT")
-
-        if state.range_probability >= 65:
-            tp1 -= 0.10
-            tp2 -= 0.25
-            sl += 0.10
-            reasons.append("RANGE_TIGHTER_TP_WIDER_SL")
-        elif state.range_probability <= 30:
-            tp2 += 0.10
-            reasons.append("LOW_RANGE_ALLOW_TP2")
-
-        return TPSLMultipliers(
-            tp1_atr=clamp(tp1, 0.45, 1.40),
-            tp2_atr=clamp(tp2, 0.90, 2.50),
-            sl_atr=clamp(sl, m.min_sl_atr, m.max_sl_atr),
-            min_sl_atr=m.min_sl_atr,
-            max_sl_atr=m.max_sl_atr,
-        ), reasons
-
-
-class TrapLiquidityAdjustmentEngine:
-    """Avoids SL being too close to liquidity/retest noise."""
-
-    def adjust(self, m: TPSLMultipliers, trap: TrapResult, candidate: AnalysisCandidate) -> Tuple[TPSLMultipliers, List[str]]:
-        s = candidate.sensor_snapshot
-        reasons: List[str] = []
-
-        tp1 = m.tp1_atr
-        tp2 = m.tp2_atr
-        sl = m.sl_atr
-
-        if trap.trap_risk >= 65:
-            tp1 -= 0.10
-            tp2 -= 0.30
-            sl += 0.20
-            reasons.append("HIGH_TRAP_CAUTION")
-        elif trap.trap_risk >= 40:
-            sl += 0.10
-            reasons.append("MEDIUM_TRAP_SL_TOLERANCE")
-
-        if trap.liquidity_risk >= 60:
-            sl += 0.20
-            reasons.append("LIQUIDITY_RISK_WIDER_SL")
-
-        if s.breakout_candidate or s.breakdown_candidate:
-            sl += 0.12
-            reasons.append("BREAKOUT_RETEST_TOLERANCE")
-
-        if s.failed_breakout or s.failed_breakdown:
-            tp1 -= 0.08
-            tp2 -= 0.20
-            reasons.append("FAILED_BREAK_CAUTION")
-
-        return TPSLMultipliers(
-            tp1_atr=clamp(tp1, 0.40, 1.35),
-            tp2_atr=clamp(tp2, 0.75, 2.40),
-            sl_atr=clamp(sl, m.min_sl_atr, m.max_sl_atr),
-            min_sl_atr=m.min_sl_atr,
-            max_sl_atr=m.max_sl_atr,
-        ), reasons
-
-
-class PredictionLearningAdjustmentEngine:
-    """Uses prediction and coin learning to adapt targets."""
-
-    def adjust(
-        self,
-        m: TPSLMultipliers,
-        prediction: MovementPredictionResult,
-        learning: Optional[LearningSummary],
-    ) -> Tuple[TPSLMultipliers, List[str]]:
-        reasons: List[str] = []
-        tp1 = m.tp1_atr
-        tp2 = m.tp2_atr
-        sl = m.sl_atr
-
-        if prediction.predicted_phase == "PRE_START":
-            tp2 += 0.20
-            reasons.append("PRE_START_ALLOW_MORE_TP2")
-        elif prediction.predicted_phase == "START":
-            tp2 += 0.10
-            reasons.append("START_PHASE_TP2_OK")
-        elif prediction.predicted_phase == "LATE":
-            tp1 -= 0.18
-            tp2 -= 0.45
-            sl += 0.12
-            reasons.append("LATE_CONSERVATIVE_TP_STRONGER")
-        elif prediction.predicted_phase == "RANGE":
-            tp1 -= 0.12
-            tp2 -= 0.35
-            sl += 0.10
-            reasons.append("RANGE_CONSERVATIVE_TP")
-
-        if prediction.expected_move_percent > 0:
-            # Convert expected percent into soft ATR estimate when enough memory exists.
-            if prediction.sample_count >= 5:
-                if prediction.expected_move_percent > 1.2:
-                    tp2 += 0.15
-                    reasons.append("MEMORY_EXPECTS_LARGER_MOVE")
-                elif prediction.expected_move_percent < 0.45:
-                    tp1 -= 0.10
-                    tp2 -= 0.25
-                    reasons.append("MEMORY_EXPECTS_SMALL_MOVE")
-
-        if learning is not None:
-            if learning.risk_label == "FAVORABLE_CONDITION" and learning.win_rate >= 65:
-                tp2 += 0.15
-                sl -= 0.05
-                reasons.append("LEARNING_FAVORABLE_CONDITION")
-            elif learning.risk_label == "RISKY_CONDITION":
-                tp1 -= 0.08
-                tp2 -= 0.30
-                sl += 0.10
-                reasons.append("LEARNING_RISKY_CONDITION")
-
-            if learning.avg_mae_percent > learning.avg_mfe_percent and learning.sample_count >= 5:
-                sl += 0.15
-                tp2 -= 0.15
-                reasons.append("LEARNING_HIGH_ADVERSE_NOISE")
-
-        return TPSLMultipliers(
-            tp1_atr=clamp(tp1, 0.40, 1.45),
-            tp2_atr=clamp(tp2, 0.70, 2.70),
-            sl_atr=clamp(sl, m.min_sl_atr, m.max_sl_atr),
-            min_sl_atr=m.min_sl_atr,
-            max_sl_atr=m.max_sl_atr,
-        ), reasons
-
-
-class TPModeEngine:
-    """Decides whether TP2 should be used."""
-
-    def decide(
-        self,
-        decision: AIDecision,
-        movement: MovementHunterResult,
-        trap: TrapResult,
-        state: StateResult,
-        confidence: ConfidenceResult,
-        prediction: MovementPredictionResult,
-        learning: Optional[LearningSummary],
-    ) -> Tuple[str, List[str]]:
-        reasons: List[str] = []
-
-        if not bool(getattr(SETTINGS.tp, "tp2_enabled", True)):
-            reasons.append("TP2_DISABLED_BY_CONFIG")
-            return TP_MODE_TP1_ONLY, reasons
-
-        strong = (
-            decision.ai_score >= 70
-            and movement.continuation_probability >= 60
-            and confidence.confidence_score >= 60
-            and prediction.movement_probability >= 60
-            and trap.trap_risk < 60
-            and state.market_state not in {"RANGE", "EXHAUSTION", "LATE"}
-            and prediction.predicted_phase in {"PRE_START", "START", "MID"}
-        )
-
-        if learning is not None and learning.risk_label == "RISKY_CONDITION":
-            strong = False
-            reasons.append("TP2_BLOCKED_BY_RISKY_LEARNING")
-
-        if strong:
-            reasons.append("TP2_ALLOWED_STRONG_SIGNAL")
-            return TP_MODE_TP1_TP2, reasons
-
-        reasons.append("TP1_ONLY_CONSERVATIVE")
-        return TP_MODE_TP1_ONLY, reasons
+    return score, loss, rr_net, reasons, warnings
 
 
 class TPSLValidator:
-    """Validates price relationships and minimum RR."""
-
     def validate(self, plan: TPSLPlan) -> Tuple[bool, List[str]]:
         warnings: List[str] = []
 
         if plan.entry <= 0 or plan.tp1 <= 0 or plan.sl <= 0:
-            warnings.append("INVALID_PRICE_IN_TP_SL_PLAN")
+            warnings.append("INVALID_PRICE")
             return False, warnings
 
         if plan.direction == DIRECTION_LONG:
             if not (plan.sl < plan.entry < plan.tp1):
-                warnings.append("INVALID_LONG_TP_SL_RELATION")
+                warnings.append("INVALID_LONG_TP_SL")
                 return False, warnings
             if plan.tp_mode == TP_MODE_TP1_TP2 and plan.tp2 > 0 and not (plan.tp2 > plan.tp1):
-                warnings.append("INVALID_LONG_TP2_RELATION")
+                warnings.append("INVALID_LONG_TP2")
                 return False, warnings
+
         elif plan.direction == DIRECTION_SHORT:
             if not (plan.tp1 < plan.entry < plan.sl):
-                warnings.append("INVALID_SHORT_TP_SL_RELATION")
+                warnings.append("INVALID_SHORT_TP_SL")
                 return False, warnings
             if plan.tp_mode == TP_MODE_TP1_TP2 and plan.tp2 > 0 and not (plan.tp2 < plan.tp1):
-                warnings.append("INVALID_SHORT_TP2_RELATION")
+                warnings.append("INVALID_SHORT_TP2")
                 return False, warnings
         else:
             warnings.append("INVALID_DIRECTION")
             return False, warnings
 
-        min_rr = safe_float(getattr(SETTINGS.tp, "min_rr", 1.1), 1.1)
-        if plan.rr_tp1 < min_rr * 0.55:
-            warnings.append("TP1_RR_LOW_BUT_ALLOWED_FOR_SCALP")
-        if plan.tp_mode == TP_MODE_TP1_TP2 and plan.rr_tp2 < min_rr:
-            warnings.append("TP2_RR_BELOW_MIN")
-
-        if plan.sl_distance_percent <= 0:
-            warnings.append("SL_DISTANCE_ZERO")
+        if plan.tp1_distance_percent <= 0 or plan.sl_distance_percent <= 0:
+            warnings.append("ZERO_DISTANCE")
             return False, warnings
 
-        if plan.min_required_net_profit_usdt > 0 and plan.estimated_tp1_net_usdt < plan.min_required_net_profit_usdt:
-            warnings.append("TP1_NET_PROFIT_BELOW_MIN_AFTER_FEES")
+        if plan.estimated_tp1_net_usdt < plan.min_required_net_profit_usdt:
+            warnings.append("NET_PROFIT_BELOW_REQUIRED")
             return False, warnings
 
-        if safe_float(getattr(plan, "tradability_score", 50.0), 50.0) < 25.0:
-            warnings.append("TP_SL_TRADABILITY_SCORE_TOO_LOW")
+        if plan.tradability_score < 25:
+            warnings.append("TRADABILITY_TOO_LOW")
             return False, warnings
 
         return True, warnings
 
 
 class TPSLEngine:
-    """Main smart TP/SL engine."""
-
     def __init__(self):
-        self.base = BaseMultiplierEngine()
-        self.volatility = VolatilityAdjustmentEngine()
-        self.trap = TrapLiquidityAdjustmentEngine()
-        self.prediction_learning = PredictionLearningAdjustmentEngine()
-        self.tp_mode = TPModeEngine()
         self.validator = TPSLValidator()
 
     def build_plan(
         self,
         decision: AIDecision,
         candidate: AnalysisCandidate,
-        movement: MovementHunterResult,
-        trap: TrapResult,
-        state: StateResult,
-        confidence: ConfidenceResult,
         prediction: MovementPredictionResult,
         learning: Optional[LearningSummary] = None,
+        **_: Any,
     ) -> TPSLPlan:
         reasons: List[str] = []
         warnings: List[str] = []
 
         direction = normalize_direction(decision.direction)
-        entry = safe_float(decision.entry or candidate.sensor_snapshot.price)
-        atr_percent = safe_float(candidate.sensor_snapshot.atr_percent)
+        entry = safe_float(decision.entry or getattr(candidate.sensor_snapshot, "price", 0.0), 0.0)
+        symbol = str(decision.symbol or candidate.symbol)
 
-        if atr_percent <= 0:
-            # Fallback when ATR is unavailable. Conservative scalping default.
-            atr_percent = 0.55
-            warnings.append("ATR_PERCENT_FALLBACK_USED")
-
-        m = self.base.base()
-        m, r = self.volatility.adjust(m, candidate, state)
+        tp1_percent, tp2_percent, sl_percent, r, w = base_distances(candidate, prediction, learning)
         reasons.extend(r)
+        warnings.extend(w)
 
-        m, r = self.trap.adjust(m, trap, candidate)
-        reasons.extend(r)
+        atr_percent = max(0.05, safe_float(candidate.momentum_state.atr_percent, 0.55))
 
-        m, r = self.prediction_learning.adjust(m, prediction, learning)
-        reasons.extend(r)
+        # Locked minimums are enforced after every smart adjustment.
+        tp1_floor = atr_percent * MIN_TP1_ATR
+        sl_floor = atr_percent * MIN_SL_ATR
 
-        # Convert ATR multipliers to percentage distances.
-        tp1_percent = atr_percent * m.tp1_atr
-        tp2_percent = atr_percent * m.tp2_atr
-        sl_percent = atr_percent * m.sl_atr
-
-        # First align with support/resistance and liquidity structure:
-        # LONG => SL below support, TP before resistance.
-        # SHORT => SL above resistance, TP before support.
-        tp1_percent, tp2_percent, sl_percent, r, w = _apply_sr_liquidity_rules(
+        tp1_percent, tp2_percent, sl_percent, r, w = apply_support_resistance_rules(
             entry=entry,
             direction=direction,
             tp1_percent=tp1_percent,
@@ -881,119 +669,95 @@ class TPSLEngine:
         reasons.extend(r)
         warnings.extend(w)
 
-        # Then ensure TP1 is not smaller than estimated round-trip fees +
-        # minimum desired net profit. This prevents useless TPs such as 6 cents
-        # profit against 6 cents fee.
-        tp1_percent, tp2_percent, notional_usdt, est_gross, est_fee, min_net, r, w = _apply_fee_aware_tp_floor(
+        tp1_percent = max(tp1_percent, tp1_floor)
+        sl_percent = max(sl_percent, sl_floor)
+        tp2_percent = max(tp2_percent, tp1_percent * 1.25)
+
+        tp1_percent, tp2_percent, sl_percent, notional, gross, fee, min_net, r, w = apply_minimum_distance_and_fee_floor(
+            entry=entry,
+            symbol=symbol,
             tp1_percent=tp1_percent,
             tp2_percent=tp2_percent,
+            sl_percent=sl_percent,
         )
         reasons.extend(r)
         warnings.extend(w)
 
-        # Hard minimum SL distance so breakout/retest noise doesn't instantly stop out.
-        min_sl_percent = max(atr_percent * m.min_sl_atr, 0.18)
-        sl_percent = max(sl_percent, min_sl_percent)
+        # Keep Level 1 from becoming swing-style.
+        max_tp1_percent = max(tp1_floor, max(1.80, atr_percent * 1.70))
+        max_sl_percent = max(sl_floor, max(2.60, atr_percent * 2.60))
+        tp1_percent = clamp(tp1_percent, tp1_floor, max_tp1_percent)
+        sl_percent = clamp(sl_percent, sl_floor, max_sl_percent)
+        tp2_percent = clamp(tp2_percent, tp1_percent * 1.25, max(3.80, atr_percent * 2.90))
 
-        # Avoid absurd SL in sudden volatility.
-        max_sl_percent = max(atr_percent * m.max_sl_atr, min_sl_percent)
-        sl_percent = min(sl_percent, max_sl_percent)
-
-        # TP1 should remain reachable for 5M-15M scalping.
-        min_exchange_distance = _min_distance_percent_for_symbol(decision.symbol, entry)
-        tp1_percent = clamp(tp1_percent, min_exchange_distance, max(1.50, atr_percent * 1.50))
-        tp2_percent = clamp(tp2_percent, tp1_percent * 1.25, max(3.50, atr_percent * 2.80))
-        sl_percent = max(sl_percent, min_exchange_distance)
-
-        tp1_percent, tp2_percent, sl_percent, r = _enforce_min_distances(
-            entry=entry,
-            direction=direction,
-            tp1_percent=tp1_percent,
-            tp2_percent=tp2_percent,
-            sl_percent=sl_percent,
-            symbol=decision.symbol,
-        )
-        reasons.extend(r)
-
-        # Recalculate fee/net/profit quality after all clamps/SR adjustments.
-        # This keeps plan metadata consistent with the final TP1 percent.
-        notional_usdt = _notional_usdt()
-        est_fee = _estimated_fee_usdt(notional_usdt)
-        min_net = _min_net_profit_usdt()
-        est_gross = _gross_profit_usdt(notional_usdt, tp1_percent)
-        tradability_score, est_loss, estimated_rr_net, r, w = _profit_quality_score(
+        gross = gross_profit_usdt(notional, tp1_percent)
+        fee = estimated_fee_usdt(notional)
+        tradability, est_loss, rr_net, r, w = profit_quality_score(
             tp1_percent=tp1_percent,
             sl_percent=sl_percent,
-            notional=notional_usdt,
-            gross=est_gross,
-            fee=est_fee,
+            notional=notional,
+            gross=gross,
+            fee=fee,
             min_net=min_net,
             atr_percent=atr_percent,
             candidate=candidate,
-            prediction=prediction,
-            learning=learning,
         )
         reasons.extend(r)
         warnings.extend(w)
 
-        mode, r = self.tp_mode.decide(
-            decision=decision,
-            movement=movement,
-            trap=trap,
-            state=state,
-            confidence=confidence,
-            prediction=prediction,
-            learning=learning,
-        )
+        mode, r = choose_tp_mode(decision, prediction, learning)
         reasons.extend(r)
 
-        tp1 = round_price(price_from_percent(entry, direction, tp1_percent), decision.symbol)
-        tp2 = round_price(price_from_percent(entry, direction, tp2_percent), decision.symbol) if mode == TP_MODE_TP1_TP2 else 0.0
-        sl = round_price(sl_from_percent(entry, direction, sl_percent), decision.symbol)
+        tp1 = round_price(price_from_percent(entry, direction, tp1_percent), symbol)
+        tp2 = round_price(price_from_percent(entry, direction, tp2_percent), symbol) if mode == TP_MODE_TP1_TP2 else 0.0
+        sl = round_price(sl_from_percent(entry, direction, sl_percent), symbol)
 
         rr1 = rr_ratio(entry, tp1, sl)
         rr2 = rr_ratio(entry, tp2, sl) if tp2 > 0 else 0.0
 
         quality_label = QUALITY_MEDIUM
-        if decision.ai_score >= 75 and prediction.movement_probability >= 70 and trap.trap_risk < 45:
+        if decision.ai_score >= 72 and obj_float(prediction, "movement_probability", 0.0) >= 65 and tradability >= 60:
             quality_label = QUALITY_HIGH
-        elif decision.ai_score < 55 or trap.trap_risk >= 65 or state.market_state in {"RANGE", "EXHAUSTION"}:
+        elif decision.ai_score < 52 or tradability < 40:
             quality_label = QUALITY_LOW
 
         plan = TPSLPlan(
             plan_id=f"tpsl_{uuid4().hex}",
             decision_id=decision.decision_id,
-            symbol=decision.symbol,
+            symbol=symbol,
             direction=direction,
-            entry=round_price(entry, decision.symbol),
+            entry=round_price(entry, symbol),
             tp1=tp1,
             tp2=tp2,
             sl=sl,
             tp_mode=mode,
             rr_tp1=rr1,
             rr_tp2=rr2,
-            sl_distance_percent=distance_percent(entry, sl),
             tp1_distance_percent=distance_percent(entry, tp1),
             tp2_distance_percent=distance_percent(entry, tp2) if tp2 > 0 else 0.0,
+            sl_distance_percent=distance_percent(entry, sl),
             atr_percent=atr_percent,
             quality_label=quality_label,
-            notional_usdt=safe_float(locals().get("notional_usdt", 0.0)),
-            estimated_tp1_gross_usdt=safe_float(locals().get("est_gross", 0.0)),
-            estimated_tp1_fee_usdt=safe_float(locals().get("est_fee", 0.0)),
-            estimated_tp1_net_usdt=safe_float(locals().get("est_gross", 0.0)) - safe_float(locals().get("est_fee", 0.0)),
-            min_required_net_profit_usdt=safe_float(locals().get("min_net", 0.0)),
-            estimated_sl_loss_usdt=safe_float(locals().get("est_loss", 0.0)),
-            estimated_rr_net=safe_float(locals().get("estimated_rr_net", 0.0)),
-            tradability_score=safe_float(locals().get("tradability_score", 50.0), 50.0),
+            notional_usdt=safe_float(notional),
+            estimated_tp1_gross_usdt=safe_float(gross),
+            estimated_tp1_fee_usdt=safe_float(fee),
+            estimated_tp1_net_usdt=safe_float(gross - fee),
+            estimated_sl_loss_usdt=safe_float(est_loss),
+            estimated_rr_net=safe_float(rr_net),
+            min_required_net_profit_usdt=safe_float(min_net),
+            tradability_score=safe_float(tradability),
             reason_codes=tuple(dict.fromkeys(reasons)),
-            warnings=tuple(warnings),
+            warnings=tuple(dict.fromkeys(warnings)),
             valid=True,
         )
 
         valid, validation_warnings = self.validator.validate(plan)
-        all_warnings = tuple(dict.fromkeys(list(plan.warnings) + validation_warnings))
         if not valid or validation_warnings:
-            plan = TPSLPlan(**{**plan.to_dict(), "valid": valid, "warnings": all_warnings})
+            plan = TPSLPlan(**{
+                **plan.to_dict(),
+                "valid": valid,
+                "warnings": tuple(dict.fromkeys(list(plan.warnings) + validation_warnings)),
+            })
 
         return plan
 
@@ -1011,67 +775,49 @@ def engine() -> TPSLEngine:
 def build_tp_sl_plan(
     decision: AIDecision,
     candidate: AnalysisCandidate,
-    movement: MovementHunterResult,
-    trap: TrapResult,
-    state: StateResult,
-    confidence: ConfidenceResult,
     prediction: MovementPredictionResult,
     learning: Optional[LearningSummary] = None,
+    **kwargs: Any,
 ) -> TPSLPlan:
     return engine().build_plan(
         decision=decision,
         candidate=candidate,
-        movement=movement,
-        trap=trap,
-        state=state,
-        confidence=confidence,
         prediction=prediction,
         learning=learning,
+        **kwargs,
     )
 
 
 def apply_tp_sl_to_decision(decision: AIDecision, plan: TPSLPlan) -> AIDecision:
-    """
-    Return a new AIDecision with TP/SL fields filled.
-    No trade execution happens here.
-    """
     data = decision.to_dict()
-    data.update(
-        {
-            "tp1": plan.tp1,
-            "tp2": plan.tp2,
-            "sl": plan.sl,
-            "tp_mode": plan.tp_mode,
-            "warnings": tuple(dict.fromkeys(list(decision.warnings) + list(plan.warnings))),
-            "reason_codes": tuple(dict.fromkeys(list(decision.reason_codes) + list(plan.reason_codes))),
-            "meta": {
-                **dict(decision.meta),
-                "tp_sl_plan": plan.to_dict(),
-                "tradability_score": getattr(plan, "tradability_score", 50.0),
-                "estimated_tp1_net_usdt": getattr(plan, "estimated_tp1_net_usdt", 0.0),
-            },
-        }
-    )
+    data.update({
+        "tp1": plan.tp1,
+        "tp2": plan.tp2,
+        "sl": plan.sl,
+        "tp_mode": plan.tp_mode,
+        "warnings": tuple(dict.fromkeys(list(decision.warnings) + list(plan.warnings))),
+        "reason_codes": tuple(dict.fromkeys(list(decision.reason_codes) + list(plan.reason_codes))),
+        "meta": {
+            **dict(decision.meta),
+            "tp_sl_plan": plan.to_dict(),
+            "tradability_score": plan.tradability_score,
+            "estimated_tp1_net_usdt": plan.estimated_tp1_net_usdt,
+        },
+    })
     return AIDecision(**data)
 
 
 def tp_sl_engine(
     decision: AIDecision,
     candidate: AnalysisCandidate,
-    movement: MovementHunterResult,
-    trap: TrapResult,
-    state: StateResult,
-    confidence: ConfidenceResult,
     prediction: MovementPredictionResult,
     learning: Optional[LearningSummary] = None,
+    **kwargs: Any,
 ) -> TPSLPlan:
     return build_tp_sl_plan(
         decision=decision,
         candidate=candidate,
-        movement=movement,
-        trap=trap,
-        state=state,
-        confidence=confidence,
         prediction=prediction,
         learning=learning,
+        **kwargs,
     )
