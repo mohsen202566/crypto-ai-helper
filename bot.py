@@ -550,20 +550,42 @@ class PipelineOrchestrator:
         candidate = self.build_candidate(symbol, timeframe=timeframe)
 
         movement = analyze_movement(candidate)
-        trap = analyze_trap(candidate, movement=movement)
-        state = analyze_state(candidate, movement=movement, trap=trap)
+
+        # First-pass learning is available before trap/state are built.
+        # It allows downstream layers to use historical coin+direction+condition
+        # memory instead of treating every fresh range/compression setup as new.
+        early_learning = summarize_candidate_learning(candidate, movement=movement, trap=None, state=None)
+        early_learning_summary = early_learning.to_dict()
+
+        try:
+            trap = analyze_trap(candidate, movement=movement, learning_summary=early_learning_summary)
+        except TypeError:
+            trap = analyze_trap(candidate, movement=movement)
+
+        try:
+            state = analyze_state(candidate, movement=movement, trap=trap, learning_summary=early_learning_summary)
+        except TypeError:
+            state = analyze_state(candidate, movement=movement, trap=trap)
+
+        # Final learning summary uses the full context after trap/state exist.
         learning = summarize_candidate_learning(candidate, movement=movement, trap=trap, state=state)
-        confidence = analyze_confidence(candidate, movement=movement, trap=trap, state=state, learning_summary=learning.to_dict())
+        learning_summary = learning.to_dict()
+
+        confidence = analyze_confidence(candidate, movement=movement, trap=trap, state=state, learning_summary=learning_summary)
         correlation = analyze_correlation(candidate, open_positions=open_positions, market_context=candidate.market_context)
         movement_summary = summarize_movement_candidate(candidate, movement=movement, trap=trap, state=state)
-        prediction = predict_movement(
-            candidate=candidate,
-            movement=movement,
-            trap=trap,
-            state=state,
-            confidence=confidence,
-            movement_summary=movement_summary,
-        )
+        prediction_kwargs = {
+            "candidate": candidate,
+            "movement": movement,
+            "trap": trap,
+            "state": state,
+            "confidence": confidence,
+            "movement_summary": movement_summary,
+        }
+        try:
+            prediction = predict_movement(**prediction_kwargs, learning_summary=learning_summary)
+        except TypeError:
+            prediction = predict_movement(**prediction_kwargs)
 
         meta = get_meta_learning_summary()
         decision = decide(
@@ -1293,8 +1315,16 @@ def build_position_monitor_analysis(pos: Any) -> Tuple[Any, MovementHunterResult
     orch = orchestrator()
     candidate = orch.build_candidate(symbol, timeframe="5m")
     movement = analyze_movement(candidate)
-    trap = analyze_trap(candidate, movement=movement)
-    state = analyze_state(candidate, movement=movement, trap=trap)
+    early_learning = summarize_candidate_learning(candidate, movement=movement, trap=None, state=None)
+    early_learning_summary = early_learning.to_dict()
+    try:
+        trap = analyze_trap(candidate, movement=movement, learning_summary=early_learning_summary)
+    except TypeError:
+        trap = analyze_trap(candidate, movement=movement)
+    try:
+        state = analyze_state(candidate, movement=movement, trap=trap, learning_summary=early_learning_summary)
+    except TypeError:
+        state = analyze_state(candidate, movement=movement, trap=trap)
     snapshot = (
         getattr(candidate, "snapshot", None)
         or getattr(candidate, "sensor_snapshot", None)
