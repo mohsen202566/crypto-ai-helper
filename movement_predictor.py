@@ -138,6 +138,7 @@ class MovementPredictionResult:
     expected_move_percent: float
     expected_pullback_percent: float
     expected_duration_seconds: float
+    best_entry_zone: str
 
     confidence_level: str
     should_prefer_ghost_if_uncertain: bool
@@ -167,6 +168,7 @@ class MovementPredictionResult:
             "expected_move_percent": self.expected_move_percent,
             "expected_pullback_percent": self.expected_pullback_percent,
             "expected_duration_seconds": self.expected_duration_seconds,
+            "best_entry_zone": self.best_entry_zone,
             "confidence_level": self.confidence_level,
             "should_prefer_ghost_if_uncertain": self.should_prefer_ghost_if_uncertain,
             "breakdown": self.breakdown.to_dict(),
@@ -224,6 +226,7 @@ def extract_pattern_metrics(pattern_summary: Optional[Any]) -> Dict[str, Any]:
         "expected_move_percent": safe_float(expected_move, 0.0),
         "expected_pullback_percent": safe_float(expected_pullback, 0.0),
         "expected_duration_seconds": safe_float(obj_value(pattern_summary, "expected_duration_seconds", 300.0), 300.0),
+        "best_entry_zone": str(obj_value(pattern_summary, "best_entry_zone", "UNKNOWN") or "UNKNOWN"),
     }
 
 
@@ -557,6 +560,14 @@ class MovementPredictor:
             expected_pullback = max(0.0, safe_float(candidate.momentum_state.atr_percent) * 0.45)
 
         expected_duration = pattern["expected_duration_seconds"] or 300.0
+        best_entry_zone = str(pattern.get("best_entry_zone", "UNKNOWN") or "UNKNOWN")
+        if best_entry_zone == "UNKNOWN":
+            if expected_pullback <= max(0.03, expected_move * 0.20):
+                best_entry_zone = "IMMEDIATE_START_ZONE"
+            elif expected_pullback <= max(0.05, expected_move * 0.45):
+                best_entry_zone = "SMALL_PULLBACK_ZONE"
+            else:
+                best_entry_zone = "WAIT_FOR_RETEST_ZONE"
 
         breakdown = PredictorBreakdown(
             pattern_match_score=clamp(pattern_score),
@@ -587,6 +598,7 @@ class MovementPredictor:
             expected_move_percent=safe_float(expected_move),
             expected_pullback_percent=safe_float(expected_pullback),
             expected_duration_seconds=safe_float(expected_duration),
+            best_entry_zone=best_entry_zone,
             confidence_level=confidence,
             should_prefer_ghost_if_uncertain=prefer_ghost,
             breakdown=breakdown,
