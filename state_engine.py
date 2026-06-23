@@ -123,6 +123,34 @@ def avg(values: Sequence[float]) -> float:
     return sum(vals) / len(vals) if vals else 0.0
 
 
+def _learning_value(learning_summary: Optional[Any], key: str, default: Any = None) -> Any:
+    if learning_summary is None:
+        return default
+    if isinstance(learning_summary, dict):
+        return learning_summary.get(key, default)
+    return getattr(learning_summary, key, default)
+
+
+def _learning_float(learning_summary: Optional[Any], key: str, default: float = 0.0) -> float:
+    try:
+        value = _learning_value(learning_summary, key, default)
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _learning_int(learning_summary: Optional[Any], key: str, default: int = 0) -> int:
+    try:
+        value = _learning_value(learning_summary, key, default)
+        if value is None:
+            return default
+        return int(float(value))
+    except Exception:
+        return default
+
+
 class StateScorer:
     """Builds state scores from sensors and movement/trap context."""
 
@@ -132,6 +160,7 @@ class StateScorer:
         direction: str,
         movement: Optional[MovementHunterResult] = None,
         trap: Optional[TrapResult] = None,
+        learning_summary: Optional[Any] = None,
     ) -> Tuple[StateScore, List[str]]:
         reasons: List[str] = []
 
@@ -140,10 +169,44 @@ class StateScorer:
         late = 0.0
         exhaustion = 0.0
         reversal = 0.0
+        # Range is not always a bad state in Movement Hunter mode. Many pumps/dumps
+        # are born from compression/range. Keep range as context, but soften it when
+        # early participation, squeeze pressure, or learned early-success memory exists.
+        timing_score = _learning_float(learning_summary, "timing_score", 50.0)
+        early_success_rate = _learning_float(learning_summary, "early_success_rate", 0.0)
+        fuzzy_match_score = _learning_float(learning_summary, "fuzzy_match_score", 0.0)
+        sample_count = _learning_int(learning_summary, "sample_count", 0)
+
+        compression_breakout_context = (
+            snapshot.compression_score >= 38
+            and snapshot.range_probability < 92
+            and (
+                snapshot.atr_expansion == "EXPANDING"
+                or snapshot.atr_slope > 0
+                or snapshot.volume_expansion
+                or snapshot.volume_spike
+                or abs(snapshot.power_delta) >= 8
+                or snapshot.breakout_candidate
+                or snapshot.breakdown_candidate
+            )
+        )
+        memory_range_breakout_support = (
+            sample_count >= 3
+            and (timing_score >= 62 or early_success_rate >= 35 or fuzzy_match_score >= 68)
+        )
+
         range_score = clamp(snapshot.range_probability)
+        if compression_breakout_context:
+            range_score = min(range_score, 58.0)
+            start += 12
+            reasons.append("STATE_RANGE_COMPRESSION_PRE_MOVE_CONTEXT")
+        if memory_range_breakout_support:
+            range_score = min(range_score, 54.0)
+            start += 8
+            reasons.append("STATE_MEMORY_SUPPORTS_RANGE_BREAKOUT")
 
         if snapshot.range_probability >= 70:
-            reasons.append("STATE_RANGE_HIGH_PROBABILITY")
+            reasons.append("STATE_RANGE_HIGH_PROBABILITY_CONTEXT")
 
         # Start / early state signals.
         if abs(snapshot.rsi_slope) > 0.25:
@@ -164,6 +227,12 @@ class StateScorer:
         if snapshot.breakout_candidate or snapshot.breakdown_candidate:
             start += 16
             reasons.append("STATE_BREAK_CANDIDATE")
+        if abs(snapshot.power_delta) >= 8 and (snapshot.compression_score >= 35 or snapshot.atr_slope > 0):
+            start += 10
+            reasons.append("STATE_POWER_SQUEEZE_START")
+        if abs(snapshot.histogram_acceleration) > 0 and abs(snapshot.power_delta) >= 6:
+            start += 8
+            reasons.append("STATE_HIST_ACCEL_POWER_BIRTH")
 
         # Middle state signals.
         if snapshot.adx >= 20 and not snapshot.momentum_weakness:
@@ -237,12 +306,19 @@ class TransitionClassifier:
         reasons: List[str] = []
 
         # Avoid calling trend-to-range too early when start evidence exists.
-        if score.range_score >= 72 and score.start_score < 42 and score.middle_score < 45:
-            reasons.append("TRANSITION_TREND_TO_RANGE_SOFT")
+        if score.range_score >= 76 and score.start_score < 38 and score.middle_score < 42:
+            reasons.append("TRANSITION_TREND_TO_RANGE_CONFIRMED_WEAK_START")
             return TRANSITION_TREND_TO_RANGE, reasons
 
         # Movement Hunter priority: compression + ATR expansion/explosion is often pre-start/start.
-        if snapshot.compression_score >= 60 and (snapshot.atr_explosion or snapshot.atr_expansion == "EXPANDING"):
+        if snapshot.compression_score >= 45 and (
+            snapshot.atr_explosion
+            or snapshot.atr_expansion == "EXPANDING"
+            or snapshot.atr_slope > 0
+            or snapshot.volume_expansion
+            or snapshot.volume_spike
+            or abs(snapshot.power_delta) >= 10
+        ):
             reasons.append("TRANSITION_RANGE_TO_TREND_EARLY")
             return TRANSITION_RANGE_TO_TREND, reasons
 
@@ -296,11 +372,12 @@ class StateClassifier:
             return STATE_EXHAUSTION, clamp(score.exhaustion_score)
         if score.reversal_score >= 76 and score.start_score < 58:
             return STATE_REVERSAL, clamp(score.reversal_score)
-        if score.range_score >= 82 and score.start_score < 55 and score.middle_score < 50:
+        if score.range_score >= 88 and score.start_score < 50 and score.middle_score < 48:
             return STATE_RANGE, clamp(score.range_score)
 
         # If start evidence is strong, prefer START even inside compression/range context.
-        if score.start_score >= 62 and score.start_score >= score.late_score and score.start_score >= score.exhaustion_score:
+        # Pumps/dumps often begin from range, so START must win earlier.
+        if score.start_score >= 56 and score.start_score >= score.late_score and score.start_score >= score.exhaustion_score:
             return STATE_START, clamp(score.start_score)
 
         if value < 25:
@@ -332,6 +409,7 @@ class StateEngine:
         candidate_or_snapshot: AnalysisCandidate | SensorSnapshot,
         movement: Optional[MovementHunterResult] = None,
         trap: Optional[TrapResult] = None,
+        learning_summary: Optional[Any] = None,
     ) -> StateResult:
         if isinstance(candidate_or_snapshot, AnalysisCandidate):
             snapshot = candidate_or_snapshot.sensor_snapshot
@@ -345,7 +423,7 @@ class StateEngine:
         warnings: List[str] = list(base_warnings)
         reasons: List[str] = []
 
-        score, r = self.scorer.score(snapshot, direction, movement=movement, trap=trap)
+        score, r = self.scorer.score(snapshot, direction, movement=movement, trap=trap, learning_summary=learning_summary)
         reasons.extend(r)
 
         transition, r = self.transition.classify(snapshot, score, direction)
@@ -360,10 +438,13 @@ class StateEngine:
         )
 
         # Softer late-entry risk: range alone should not heavily punish early movement hunting.
+        range_late_component = snapshot.range_probability * 0.06
+        if transition == TRANSITION_RANGE_TO_TREND or state == STATE_START:
+            range_late_component = min(range_late_component, 3.5)
         late_entry_risk = clamp(
-            score.late_score * 0.46
+            score.late_score * 0.44
             + score.exhaustion_score * 0.32
-            + snapshot.range_probability * 0.10
+            + range_late_component
         )
 
         exhaustion_risk = clamp(score.exhaustion_score)
@@ -441,13 +522,15 @@ def analyze_state(
     candidate_or_snapshot: AnalysisCandidate | SensorSnapshot,
     movement: Optional[MovementHunterResult] = None,
     trap: Optional[TrapResult] = None,
+    learning_summary: Optional[Any] = None,
 ) -> StateResult:
-    return engine().analyze(candidate_or_snapshot, movement=movement, trap=trap)
+    return engine().analyze(candidate_or_snapshot, movement=movement, trap=trap, learning_summary=learning_summary)
 
 
 def state_engine(
     candidate_or_snapshot: AnalysisCandidate | SensorSnapshot,
     movement: Optional[MovementHunterResult] = None,
     trap: Optional[TrapResult] = None,
+    learning_summary: Optional[Any] = None,
 ) -> StateResult:
-    return analyze_state(candidate_or_snapshot, movement=movement, trap=trap)
+    return analyze_state(candidate_or_snapshot, movement=movement, trap=trap, learning_summary=learning_summary)
