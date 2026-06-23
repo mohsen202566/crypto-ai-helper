@@ -501,12 +501,12 @@ class AIScoreComposer:
         # classic analysis remains a sensor, while movement prediction and
         # conditional coin-learning carry more influence in the final score.
         positive = (
-            analysis_score * 0.12 * w_analysis
-            + movement_score * 0.22 * w_movement
-            + prediction_score * 0.20 * w_pred
-            + confidence_score * 0.16 * w_conf
-            + learning_score * 0.20 * w_learning
-            + state_score * 0.08 * w_state
+            analysis_score * 0.10 * w_analysis
+            + movement_score * 0.26 * w_movement
+            + prediction_score * 0.26 * w_pred
+            + confidence_score * 0.12 * w_conf
+            + learning_score * 0.18 * w_learning
+            + state_score * 0.06 * w_state
             + tradability_score * 0.02
         )
 
@@ -514,15 +514,15 @@ class AIScoreComposer:
         # The previous weights could crush otherwise valid Movement Hunter setups
         # into near-zero scores, causing continuous REJECT decisions.
         penalty = (
-            trap_penalty * 0.18
+            trap_penalty * 0.16
             + correlation_penalty * 0.08
-            + range_penalty * 0.12
-            + late_penalty * 0.15
+            + range_penalty * 0.09
+            + late_penalty * 0.11
         )
 
         # Slightly normalize positive evidence so balanced conditions can reach
         # GHOST/REAL thresholds without removing risk protection.
-        final = clamp((positive * 1.15) - penalty)
+        final = clamp((positive * 1.22) - penalty)
 
         return DecisionScore(
             analysis_score=clamp(analysis_score),
@@ -608,9 +608,10 @@ class DecisionTypeClassifier:
         configured_min_real = safe_float(getattr(SETTINGS.ai, "min_real_confidence", 72.0), 72.0)
         configured_min_ghost = safe_float(getattr(SETTINGS.ai, "min_ghost_confidence", 45.0), 45.0)
 
-        # Keep real trading selective. GHOST remains broad for learning.
-        min_real = clamp(configured_min_real, 64.0, 74.0)
-        min_ghost = clamp(configured_min_ghost, 22.0, 40.0)
+        # Speed Hunter mode: REAL remains protected, but the AI must not wait
+        # until the whole 5M move becomes obvious. GHOST remains broad for learning.
+        min_real = clamp(configured_min_real, 58.0, 70.0)
+        min_ghost = clamp(configured_min_ghost, 20.0, 38.0)
         max_real_risk = safe_float(getattr(SETTINGS.ai, "max_real_risk", 38.0), 38.0)
 
         learning_sample_count = 0
@@ -685,18 +686,60 @@ class DecisionTypeClassifier:
         s = candidate.sensor_snapshot
         compression_score = safe_float(getattr(s, "compression_score", 0.0), 0.0)
         expansion_probability = safe_float(getattr(s, "expansion_probability", 0.0), 0.0)
+
+        # Speed Hunter birth signal:
+        # No candle-confirmation logic here. This is a probability gate built
+        # from live technical sensors so Level-1/5M style decisions can be
+        # predictive instead of follower/chaser.
+        sensor_direction_birth = (
+            (
+                normalize_direction(candidate.direction_hint) == DIRECTION_LONG
+                and safe_float(getattr(s, "rsi_slope", 0.0), 0.0) > 0
+                and safe_float(getattr(s, "histogram_slope", 0.0), 0.0) > 0
+                and safe_float(getattr(s, "power_delta", 0.0), 0.0) > 2.5
+            )
+            or (
+                normalize_direction(candidate.direction_hint) == DIRECTION_SHORT
+                and safe_float(getattr(s, "rsi_slope", 0.0), 0.0) < 0
+                and safe_float(getattr(s, "histogram_slope", 0.0), 0.0) < 0
+                and safe_float(getattr(s, "power_delta", 0.0), 0.0) < -2.5
+            )
+        )
+        compression_birth = (
+            compression_score >= 30.0
+            and safe_float(getattr(s, "range_probability", 0.0), 0.0) < 90.0
+            and (
+                abs(safe_float(getattr(s, "power_delta", 0.0), 0.0)) >= 6.0
+                or bool(getattr(s, "volume_expansion", False))
+                or bool(getattr(s, "volume_spike", False))
+                or str(getattr(s, "atr_expansion", "")).upper() == "EXPANDING"
+                or safe_float(getattr(s, "atr_slope", 0.0), 0.0) > 0
+            )
+        )
+        speed_prediction_signal = (
+            prediction.predicted_phase in {"PRE_START", "START"}
+            or sensor_direction_birth
+            or compression_birth
+            or (
+                prediction.movement_probability >= 52.0
+                and movement.readiness_score >= 38.0
+                and state.late_entry_risk < 84.0
+            )
+        )
+
         range_breakout_opportunity = (
             state.market_state == "RANGE"
-            and compression_score >= 58.0
+            and compression_score >= 44.0
             and (
-                expansion_probability >= 42.0
-                or movement.readiness_score >= 58.0
-                or prediction.movement_probability >= 55.0
+                expansion_probability >= 34.0
+                or movement.readiness_score >= 44.0
+                or prediction.movement_probability >= 48.0
+                or speed_prediction_signal
                 or bool(getattr(s, "volume_expansion", False))
                 or str(getattr(s, "atr_expansion", "")).upper() == "EXPANDING"
                 or hunter_memory_good
             )
-            and trap.trap_risk < 60.0
+            and trap.trap_risk < 68.0
         )
 
         tradability_score = clamp(getattr(score, "tradability_score", 50.0))
@@ -707,17 +750,28 @@ class DecisionTypeClassifier:
 
         # GHOST-only conditions. These must not be bypassed by a loose bridge.
         if confidence.should_downgrade_to_ghost:
-            must_ghost = True
-            reasons.append("CONFIDENCE_REQUIRES_GHOST")
+            if speed_prediction_signal and confidence.confidence_score >= 22.0 and trap.trap_risk < 62.0:
+                reasons.append("CONFIDENCE_DOWNGRADE_SOFTENED_BY_SPEED_SIGNAL")
+            else:
+                must_ghost = True
+                reasons.append("CONFIDENCE_REQUIRES_GHOST")
         if prediction.should_prefer_ghost_if_uncertain:
-            must_ghost = True
-            reasons.append("PREDICTOR_PREFERS_GHOST")
+            if speed_prediction_signal and prediction.movement_probability >= 50.0 and trap.trap_risk < 64.0:
+                reasons.append("PREDICTOR_GHOST_SOFTENED_BY_SPEED_SIGNAL")
+            else:
+                must_ghost = True
+                reasons.append("PREDICTOR_PREFERS_GHOST")
         if correlation.should_reduce_priority:
             must_ghost = True
             reasons.append("CORRELATION_REDUCES_PRIORITY")
         if low_data:
-            if low_data_real_bridge and tradability_score >= 45.0 and trap.trap_risk < 55.0:
-                reasons.append("LOW_DATA_WARMUP_REAL_BRIDGE_ALLOWED")
+            if (
+                (low_data_real_bridge or speed_prediction_signal)
+                and tradability_score >= 38.0
+                and trap.trap_risk < 62.0
+                and prediction.predicted_phase in {"PRE_START", "START", "MID"}
+            ):
+                reasons.append("LOW_DATA_SPEED_REAL_BRIDGE_ALLOWED")
             else:
                 must_ghost = True
                 reasons.append("LEARNING_LOW_DATA_GHOST")
@@ -728,7 +782,7 @@ class DecisionTypeClassifier:
             must_ghost = True
             reasons.append("TRADABILITY_LOW_PROFIT_GHOST_ONLY")
             warnings.append("REAL_BLOCKED_BY_LOW_NET_PROFIT_QUALITY")
-        if trap.trap_risk >= 65:
+        if trap.trap_risk >= 72:
             must_ghost = True
             reasons.append("TRAP_RISK_GHOST_ONLY")
         if state.market_state == "RANGE":
@@ -738,11 +792,17 @@ class DecisionTypeClassifier:
                 must_ghost = True
                 reasons.append("RANGE_GHOST_ONLY")
         elif state.market_state in {"EXHAUSTION", "LATE"}:
-            must_ghost = True
-            reasons.append(f"{state.market_state}_GHOST_ONLY")
+            if speed_prediction_signal and state.late_entry_risk < 84.0 and state.exhaustion_risk < 84.0 and trap.trap_risk < 62.0:
+                reasons.append(f"{state.market_state}_SOFTENED_BY_SPEED_SIGNAL")
+            else:
+                must_ghost = True
+                reasons.append(f"{state.market_state}_GHOST_ONLY")
         if movement.freshness in {"DEAD", "UNKNOWN", "LATE"}:
-            must_ghost = True
-            reasons.append(f"FRESHNESS_{movement.freshness}_GHOST_ONLY")
+            if movement.freshness != "DEAD" and speed_prediction_signal and prediction.predicted_phase in {"PRE_START", "START"} and trap.trap_risk < 62.0:
+                reasons.append(f"FRESHNESS_{movement.freshness}_SOFTENED_BY_PREDICTION")
+            else:
+                must_ghost = True
+                reasons.append(f"FRESHNESS_{movement.freshness}_GHOST_ONLY")
         if prediction.predicted_phase == "RANGE":
             if range_breakout_opportunity:
                 reasons.append("PREDICTED_RANGE_COMPRESSION_EXCEPTION")
@@ -750,45 +810,50 @@ class DecisionTypeClassifier:
                 must_ghost = True
                 reasons.append("PREDICTED_PHASE_RANGE_GHOST_ONLY")
         elif prediction.predicted_phase in {"UNKNOWN", "LATE"}:
-            must_ghost = True
-            reasons.append(f"PREDICTED_PHASE_{prediction.predicted_phase}_GHOST_ONLY")
+            if prediction.predicted_phase == "UNKNOWN" and (sensor_direction_birth or compression_birth) and trap.trap_risk < 62.0:
+                reasons.append("PREDICTED_UNKNOWN_SOFTENED_BY_SENSOR_BIRTH")
+            else:
+                must_ghost = True
+                reasons.append(f"PREDICTED_PHASE_{prediction.predicted_phase}_GHOST_ONLY")
 
         live_or_early_move = (
             movement.freshness in {"FRESH", "MID"}
             or prediction.predicted_phase in {"PRE_START", "START", "MID"}
+            or speed_prediction_signal
         )
         strong_live_confirmation = (
-            movement.readiness_score >= 60.0
-            or prediction.movement_probability >= 58.0
+            movement.readiness_score >= 46.0
+            or prediction.movement_probability >= 50.0
+            or speed_prediction_signal
             or (
-                movement.readiness_score >= 52.0
-                and prediction.movement_probability >= 50.0
-                and confidence.confidence_score >= 38.0
+                movement.readiness_score >= 38.0
+                and prediction.movement_probability >= 44.0
+                and confidence.confidence_score >= 22.0
             )
         )
         severe_risk_block = (
-            trap.trap_risk >= 75.0
-            or trap.liquidity_risk >= 82.0
-            or correlation.exposure_risk >= 82.0
+            trap.trap_risk >= 78.0
+            or trap.liquidity_risk >= 86.0
+            or correlation.exposure_risk >= 84.0
             or movement.freshness == "DEAD"
-            or state.exhaustion_risk >= 82.0
-            or state.late_entry_risk >= 82.0
-            or (state.range_probability >= 85.0 and movement.readiness_score < 68.0 and not range_breakout_opportunity)
+            or state.exhaustion_risk >= 88.0
+            or state.late_entry_risk >= 88.0
+            or (state.range_probability >= 90.0 and movement.readiness_score < 54.0 and not range_breakout_opportunity and not speed_prediction_signal)
             or very_low_tradability
         )
 
-        real_conf_floor = max(38.0, min_real - 22.0)
+        real_conf_floor = max(22.0, min_real - 30.0)
 
         # Main REAL gate: strong score + live/fresh movement + no GHOST-only flags.
         real_allowed = (
-            score.final_score >= min_real
+            score.final_score >= (min_real - 4.0)
             and confidence.confidence_score >= real_conf_floor
             and strong_live_confirmation
             and live_or_early_move
             and not must_ghost
             and not severe_risk_block
-            and trap.trap_risk <= max_real_risk + 18.0
-            and correlation.exposure_risk < 72.0
+            and trap.trap_risk <= max_real_risk + 24.0
+            and correlation.exposure_risk < 76.0
         )
 
         # Learning-assisted REAL: only when familiar condition history is good.
@@ -799,11 +864,11 @@ class DecisionTypeClassifier:
             and not severe_risk_block
             and live_or_early_move
             and good_learning
-            and score.final_score >= (min_real - (13.0 if hunter_memory_good else 10.0))
-            and confidence.confidence_score >= (28.0 if hunter_memory_good else 31.0)
-            and (movement.readiness_score >= 50.0 or prediction.movement_probability >= 48.0 or hunter_memory_good)
-            and trap.trap_risk < 58.0
-            and correlation.exposure_risk < 68.0
+            and score.final_score >= (min_real - (18.0 if hunter_memory_good else 15.0))
+            and confidence.confidence_score >= (20.0 if hunter_memory_good else 22.0)
+            and (movement.readiness_score >= 38.0 or prediction.movement_probability >= 44.0 or speed_prediction_signal or hunter_memory_good)
+            and trap.trap_risk < 64.0
+            and correlation.exposure_risk < 72.0
         )
 
         # Very strong learned condition can accept a slightly lower score, but
@@ -815,11 +880,11 @@ class DecisionTypeClassifier:
             and not severe_risk_block
             and live_or_early_move
             and very_strong_learning
-            and score.final_score >= (min_real - (18.0 if hunter_memory_strong else 14.0))
-            and confidence.confidence_score >= (24.0 if hunter_memory_strong else 28.0)
-            and (movement.readiness_score >= 46.0 or prediction.movement_probability >= 45.0 or hunter_memory_strong)
-            and trap.trap_risk < 55.0
-            and correlation.exposure_risk < 65.0
+            and score.final_score >= (min_real - (22.0 if hunter_memory_strong else 18.0))
+            and confidence.confidence_score >= (18.0 if hunter_memory_strong else 20.0)
+            and (movement.readiness_score >= 34.0 or prediction.movement_probability >= 42.0 or speed_prediction_signal or hunter_memory_strong)
+            and trap.trap_risk < 62.0
+            and correlation.exposure_risk < 70.0
         )
 
         # Controlled warm-up REAL:
@@ -835,17 +900,41 @@ class DecisionTypeClassifier:
             and low_data_real_bridge
             and live_or_early_move
             and strong_live_confirmation
-            and score.final_score >= (min_real - 18.0)
-            and confidence.confidence_score >= 24.0
-            and tradability_score >= 45.0
-            and trap.trap_risk < 50.0
-            and correlation.exposure_risk < 62.0
+            and score.final_score >= (min_real - 24.0)
+            and confidence.confidence_score >= 18.0
+            and tradability_score >= 38.0
+            and trap.trap_risk < 60.0
+            and correlation.exposure_risk < 70.0
         )
 
-        if real_allowed or learned_hunter_real or very_strong_learned_hunter_real or controlled_warmup_real:
+        # Pure speed-hunter REAL bridge:
+        # Used when the predictor/sensors say PRE_START/START before classic
+        # confirmation becomes obvious. This keeps the bot predictive, while
+        # still blocking severe trap, correlation, and fee-eaten trades.
+        speed_hunter_real = (
+            not real_allowed
+            and not learned_hunter_real
+            and not very_strong_learned_hunter_real
+            and not controlled_warmup_real
+            and not severe_risk_block
+            and not must_ghost
+            and speed_prediction_signal
+            and live_or_early_move
+            and score.final_score >= (min_real - 20.0)
+            and confidence.confidence_score >= 16.0
+            and prediction.movement_probability >= 44.0
+            and tradability_score >= 35.0
+            and trap.trap_risk < 62.0
+            and correlation.exposure_risk < 70.0
+            and not very_low_tradability
+        )
+
+        if real_allowed or learned_hunter_real or very_strong_learned_hunter_real or controlled_warmup_real or speed_hunter_real:
             reasons.append("AI_DECISION_REAL_ALLOWED")
             if controlled_warmup_real:
                 reasons.append("CONTROLLED_WARMUP_REAL")
+            if speed_hunter_real:
+                reasons.append("SPEED_HUNTER_REAL_BRIDGE")
             if learned_hunter_real:
                 reasons.append("LEARNING_ASSISTED_HUNTER_REAL")
             if very_strong_learned_hunter_real:
