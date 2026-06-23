@@ -516,6 +516,7 @@ class PipelineOrchestrator:
         timeframe: str = "5m",
         open_positions: Optional[Iterable[Any]] = None,
         execute_real: bool = True,
+        force_real_to_ghost_reason: Optional[str] = None,
     ) -> PipelineResult:
         candidate = self.build_candidate(symbol, timeframe=timeframe)
         learning = summarize_candidate_learning(candidate)
@@ -525,6 +526,8 @@ class PipelineOrchestrator:
 
         if decision.decision_type == DECISION_REAL and not real_trading_enabled():
             decision = force_real_decision_to_ghost(decision, "REAL_TRADING_DISABLED_TO_GHOST")
+        elif decision.decision_type == DECISION_REAL and force_real_to_ghost_reason:
+            decision = force_real_decision_to_ghost(decision, force_real_to_ghost_reason)
 
         plan: Optional[TPSLPlan] = None
         trade_result: Optional[RealTradeOpenResult] = None
@@ -541,6 +544,17 @@ class PipelineOrchestrator:
             decision = apply_tp_sl_to_decision(decision, plan)
 
         record_decision(decision)
+        LOGGER.info(
+            "AI decision %s %s ai=%.1f conf=%.1f phase=%s patterns=%s reasons=%s warnings=%s",
+            symbol,
+            decision.decision_type,
+            safe_float(getattr(decision, "ai_score", 0.0)),
+            safe_float(getattr(decision, "confidence_score", 0.0)),
+            str(getattr(decision, "predicted_phase", "")),
+            safe_int(getattr(decision, "pattern_count", 0), 0),
+            ",".join(list(getattr(decision, "reason_codes", ()) or ())[:6]),
+            ",".join(list(getattr(decision, "warnings", ()) or ())[:6]),
+        )
 
         if decision.decision_type == DECISION_GHOST and plan:
             create_ghost(
@@ -1103,45 +1117,77 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def auto_scan_loop(app: Any) -> None:
+    LOGGER.info("auto_scan_loop started")
+    last_disabled_log = 0
+
     while True:
         try:
             settings = get_runtime_settings()
             interval = safe_int(settings.get("scan_interval_seconds", 20), 20)
             interval = max(5, interval)
 
-            if auto_signal_enabled():
-                for symbol in level1_scan_symbols():
-                    if real_trading_enabled() and not real_capacity_available():
-                        break
+            if not auto_signal_enabled():
+                # Keep the loop alive and visible in journalctl; do not silently look stuck.
+                if now_ts() - last_disabled_log >= 60:
+                    LOGGER.info("auto_scan_loop alive but auto_signal_enabled=false")
+                    last_disabled_log = now_ts()
+                await asyncio.sleep(interval)
+                continue
 
-                    try:
-                        result = await asyncio.to_thread(orchestrator().run_pipeline, symbol, "5m", None, True)
+            symbols = level1_scan_symbols()
+            LOGGER.info("auto_scan_cycle symbols=%s interval=%ss real=%s", ",".join(symbols), interval, real_trading_enabled())
 
-                        # Auto scan sends only REAL signal reports. GHOST remains hidden.
-                        if result.signal_report and result.decision.decision_type == DECISION_REAL:
-                            oid = owner_id()
-                            if oid:
-                                sent_msg = await app.bot.send_message(chat_id=oid, text=result.signal_report.text)
-                                attach_signal_message_to_position(result.trade_result, sent_msg)
+            for symbol in symbols:
+                try:
+                    capacity_full = bool(real_trading_enabled() and not real_capacity_available())
+                    force_reason = "REAL_CAPACITY_FULL_TO_GHOST" if capacity_full else None
 
-                        if result.trade_report:
-                            oid = owner_id()
-                            if oid:
-                                await app.bot.send_message(chat_id=oid, text=result.trade_report.text)
+                    result = await asyncio.to_thread(
+                        orchestrator().run_pipeline,
+                        symbol,
+                        "5m",
+                        None,
+                        not capacity_full,
+                        force_reason,
+                    )
 
-                    except Exception as exc:
-                        save_error("auto_scan_symbol", str(exc), {"symbol": symbol})
+                    LOGGER.info(
+                        "auto_scan_result %s decision=%s ai=%.1f ghost=%s real=%s reject=%s",
+                        symbol,
+                        getattr(result.decision, "decision_type", "-"),
+                        safe_float(getattr(result.decision, "ai_score", 0.0)),
+                        getattr(result.decision, "should_create_ghost", False),
+                        getattr(result.decision, "should_trade_real", False),
+                        getattr(result.decision, "should_reject", False),
+                    )
 
-                    await asyncio.sleep(0.05)
+                    # Auto scan sends only REAL signal reports. GHOST is stored/monitored silently
+                    # so it can learn without spamming Telegram.
+                    if result.signal_report and result.decision.decision_type == DECISION_REAL:
+                        oid = owner_id()
+                        if oid:
+                            sent_msg = await app.bot.send_message(chat_id=oid, text=result.signal_report.text)
+                            attach_signal_message_to_position(result.trade_result, sent_msg)
+
+                    if result.trade_report:
+                        oid = owner_id()
+                        if oid:
+                            await app.bot.send_message(chat_id=oid, text=result.trade_report.text)
+
+                except Exception as exc:
+                    LOGGER.exception("auto_scan_symbol failed for %s: %s", symbol, exc)
+                    save_error("auto_scan_symbol", str(exc), {"symbol": symbol})
+
+                await asyncio.sleep(0.05)
 
             await asyncio.sleep(interval)
 
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            LOGGER.exception("auto_scan_loop failed: %s", exc)
             save_error("auto_scan_loop", str(exc), {})
             await asyncio.sleep(10)
-
 
 def build_position_monitor_analysis(pos: Any) -> Any:
     symbol = str(getattr(pos, "symbol", "") or getattr(pos, "exchange_symbol", "") or "")
