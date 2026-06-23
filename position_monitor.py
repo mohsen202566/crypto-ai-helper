@@ -723,11 +723,29 @@ market-close responses while still catching clear failures.
                 events.append(self._event(updated, EVENT_PROTECT_SL, updated.current_price, reason_codes=exit_decision.reason_codes, warnings=exit_decision.warnings, should_report=False))
 
             # AI profit exit must not fire on tiny gross profit.
-            # User-approved minimum for current 7 USDT margin / 10x setup:
-            # close only when floating/estimated profit is at least 0.10 USDT.
-            min_ai_profit_exit_usdt = 0.10
+            # Real-user safety fix:
+            # - Small closes such as +0.01 / +0.02 USDT are not useful after
+            #   fee/slippage and should not be treated as a good AI exit.
+            # - Normal AI profit exit requires at least 0.25 USDT floating/estimated profit.
+            # - Before TP1, AI close is blocked unless there is severe trap/reversal/emergency.
+            min_ai_profit_exit_usdt = 0.25
             estimated_profit_usdt = self._estimate_pnl_usdt(updated, updated.current_price, 1.0)
             current_profit_usdt = max(safe_float(updated.unrealized_pnl_usdt), estimated_profit_usdt)
+
+            exit_score_obj = getattr(exit_decision, "score", None)
+            emergency_score = safe_float(getattr(exit_score_obj, "emergency_score", 0.0), 0.0)
+            severe_ai_exit = (
+                str(getattr(exit_decision, "action", "")).upper() == "EMERGENCY"
+                or emergency_score >= 70.0
+                or (
+                    safe_float(getattr(trap, "trap_risk", 0.0), 0.0) >= 75.0
+                    and (
+                        safe_float(getattr(state, "reversal_probability", 0.0), 0.0) >= 60.0
+                        or safe_float(getattr(movement, "reversal_pressure", 0.0), 0.0) >= 60.0
+                    )
+                )
+            )
+
             in_profit = current_profit_usdt >= min_ai_profit_exit_usdt
             ai_profit_exit, ai_profit_reasons, ai_profit_warnings = self._ai_weakness_or_reversal_seen(
                 updated,
@@ -738,7 +756,19 @@ market-close responses while still catching clear failures.
                 exit_decision=exit_decision,
             )
 
-            if in_profit and ai_profit_exit:
+            if ai_profit_exit and not in_profit and not severe_ai_exit:
+                ai_profit_exit = False
+                ai_profit_warnings = tuple(list(ai_profit_warnings) + [
+                    "AI_PROFIT_EXIT_BLOCKED_MIN_0_25_USDT_NOT_REACHED"
+                ])
+
+            if ai_profit_exit and not updated.tp1_hit and not severe_ai_exit:
+                ai_profit_exit = False
+                ai_profit_warnings = tuple(list(ai_profit_warnings) + [
+                    "AI_PROFIT_EXIT_BLOCKED_BEFORE_TP1_UNLESS_SEVERE"
+                ])
+
+            if ai_profit_exit and (in_profit or severe_ai_exit):
                 close_raw = self._close_position_verified(updated)
                 if not self._close_order_ok(close_raw) or close_raw.get("closed_confirmed") is False:
                     save_error("position_monitor_ai_profit_exit_close_failed", str(close_raw), updated.to_dict())
@@ -1034,7 +1064,7 @@ market-close responses while still catching clear failures.
         Strict AI Profit Exit rule:
         - No percent threshold.
         - Gross/floating profit threshold is handled in monitor_position
-          (currently >= 0.10 USDT).
+          (normally >= 0.25 USDT after fee/slippage safety).
         - Do not close only because the market is NEUTRAL / RANGE / CHOP.
         - Close only when a real reversal/continuation failure is confirmed:
           either exit_engine explicitly says close, or at least two strong
@@ -1120,7 +1150,7 @@ market-close responses while still catching clear failures.
 
         if should_close:
             warnings.append("AI_PROFIT_EXIT_STRICT_CONFIRMED")
-            warnings.append("AI_PROFIT_EXIT_MIN_0_10_USDT_REQUIRED")
+            warnings.append("AI_PROFIT_EXIT_MIN_0_25_USDT_REQUIRED")
         elif reason_codes:
             warnings.append("AI_PROFIT_EXIT_SKIPPED_NEEDS_SECOND_CONFIRMATION")
 
