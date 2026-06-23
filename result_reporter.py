@@ -3,34 +3,28 @@ from __future__ import annotations
 """
 24 - result_reporter.py
 
-Result reporting formatter for the locked Movement Hunter architecture.
+Light Persian formatter for the simplified Level 1 / 5M bot.
 
-Responsibilities:
-- Convert monitor/trade/decision events into short Persian Telegram-ready text.
-- Format TP1 / TP2 / AI_EXIT / SL results with:
-  green check for profit events
-  red cross for SL/loss events
-  real Toobit PnL when confirmed
-  PnL pending/unavailable warning when not confirmed
-- Preserve reply_to_message_id so bot.py can reply to original signal.
-- Format REAL order result, GHOST result, AI status and concise errors.
-- Keep output simple and decision-focused.
-
-Strictly forbidden:
+Locked goals:
+- Short Persian Telegram-ready texts.
+- Format:
+  AIDecision + TPSLPlan
+  RealTradeOpenResult
+  PositionMonitorEvent
+  GhostMonitorResult
+- Preserve reply_to_message_id for TP/SL/AI_EXIT result replies.
+- GHOST results stay hidden from Telegram and are only used for learning/stats.
 - No Telegram sending.
 - No Toobit calls.
-- No AI decision.
 - No trading.
 - No persistence.
-- No Paper mode.
-- No Setup flow.
-
-bot.py is responsible for sending messages.
-This file only formats report payloads.
+- No AI decision.
+- No paper/setup flow.
+- No trap/state/confidence/meta/correlation/movement_hunter dependency.
 """
 
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Optional, Sequence
 import math
 import time
 
@@ -51,7 +45,6 @@ from position_monitor import (
     PNL_UNAVAILABLE,
 )
 from ghost_manager import GhostMonitorResult
-from meta_learning import MetaLearningSummary
 from coin_learning import LearningSummary
 
 
@@ -68,8 +61,7 @@ RED_CROSS = "❌"
 WARNING = "⚠️"
 INFO = "ℹ️"
 ROBOT = "🤖"
-MONEY = "💰"
-TARGET = "🎯"
+GHOST = "👻"
 SHIELD = "🛡️"
 
 
@@ -109,6 +101,35 @@ def safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def obj_value(obj: Any, key: str, default: Any = None) -> Any:
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def obj_float(obj: Any, key: str, default: float = 0.0) -> float:
+    return safe_float(obj_value(obj, key, default), default)
+
+
+def to_dict(obj: Any) -> JsonDict:
+    if obj is None:
+        return {}
+    if isinstance(obj, dict):
+        return dict(obj)
+    if hasattr(obj, "to_dict") and callable(obj.to_dict):
+        try:
+            data = obj.to_dict()
+            return dict(data) if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+    try:
+        return dict(getattr(obj, "__dict__", {}))
+    except Exception:
+        return {}
+
+
 def fmt_price(value: Any) -> str:
     v = safe_float(value)
     if v <= 0:
@@ -138,265 +159,254 @@ def fmt_percent(value: Any) -> str:
     return f"{sign}{v:.3f}%"
 
 
-def _short_reasons(reasons: Sequence[str], limit: int = 4) -> str:
+def short_reasons(reasons: Sequence[str], limit: int = 3) -> str:
     items = [str(r) for r in reasons if r]
-    if not items:
-        return ""
     return " | ".join(items[:limit])
 
 
 class SignalReportFormatter:
-    """Formats AI final signal text after TP/SL has been calculated."""
-
     def format_signal(self, decision: AIDecision, plan: TPSLPlan) -> ReportPayload:
-        if decision.decision_type == DECISION_REAL:
-            title = f"{ROBOT} سیگنال واقعی"
-            status = "✅ آماده ورود واقعی"
-        elif decision.decision_type == DECISION_GHOST:
-            title = f"{ROBOT} سیگنال Ghost"
-            status = "👻 فقط یادگیری"
-        else:
-            title = f"{ROBOT} رد شد"
-            status = "❌ بدون ورود"
+        decision_type = str(obj_value(decision, "decision_type", "")).upper()
 
-        direction_icon = "🟢 LONG" if decision.direction == "LONG" else "🔴 SHORT"
-        tp2_line = f"\nTP2: {fmt_price(plan.tp2)}" if plan.tp2 and plan.tp2 > 0 else ""
+        if decision_type == DECISION_REAL:
+            title = f"{ROBOT} سیگنال واقعی"
+            status = "✅ ورود واقعی"
+            should_send = True
+        elif decision_type == DECISION_GHOST:
+            title = f"{GHOST} سیگنال Ghost"
+            status = "👻 فقط یادگیری"
+            should_send = False
+        else:
+            title = f"{RED_CROSS} رد شد"
+            status = "بدون ورود"
+            should_send = False
+
+        direction = str(obj_value(decision, "direction", "")).upper()
+        direction_icon = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
+
+        tp2 = obj_float(plan, "tp2", 0.0)
+        tp2_line = f"\nTP2: {fmt_price(tp2)}" if tp2 > 0 else ""
+
+        pattern_count = safe_int(obj_value(decision, "pattern_count", 0), 0)
+        phase = str(obj_value(decision, "predicted_phase", "-") or "-")
+        probability = obj_float(decision, "movement_probability", 0.0)
 
         text = (
             f"{title}\n"
-            f"نماد: {decision.symbol}\n"
+            f"نماد: {obj_value(decision, 'symbol', '-')}\n"
             f"جهت: {direction_icon}\n"
             f"وضعیت: {status}\n\n"
-            f"Entry: {fmt_price(plan.entry)}\n"
-            f"TP1: {fmt_price(plan.tp1)}"
+            f"Entry: {fmt_price(obj_value(plan, 'entry', 0.0))}\n"
+            f"TP1: {fmt_price(obj_value(plan, 'tp1', 0.0))}"
             f"{tp2_line}\n"
-            f"SL: {fmt_price(plan.sl)}\n\n"
-            f"AI: {decision.ai_score:.1f} | Confidence: {decision.confidence_score:.1f} | Risk: {decision.risk_score:.1f}\n"
-            f"فاز: {decision.freshness} / {decision.market_state}"
+            f"SL: {fmt_price(obj_value(plan, 'sl', 0.0))}\n\n"
+            f"AI: {obj_float(decision, 'ai_score', 0.0):.1f} | "
+            f"Conf: {obj_float(decision, 'confidence_score', 0.0):.1f} | "
+            f"Risk: {obj_float(decision, 'risk_score', 0.0):.1f}\n"
+            f"فاز: {phase} | احتمال حرکت: {probability:.1f}% | الگو: {pattern_count}"
         )
 
         return ReportPayload(
             report_type=REPORT_SIGNAL,
             text=text,
-            should_send=decision.decision_type == DECISION_REAL,
-            meta={"decision": decision.to_dict(), "tp_sl_plan": plan.to_dict()},
+            should_send=should_send,
+            meta={"decision": to_dict(decision), "tp_sl_plan": to_dict(plan)},
         )
 
 
 class TradeOpenReportFormatter:
-    """Formats real trade open/preflight results."""
-
     def format_open_result(self, result: RealTradeOpenResult, reply_to_message_id: int = 0) -> ReportPayload:
-        if result.status == STATUS_CONFIRMED:
+        status = str(obj_value(result, "status", "")).upper()
+
+        if status == STATUS_CONFIRMED:
             icon = GREEN_CHECK
             title = "پوزیشن واقعی تایید شد"
-            should_send = True
-        elif result.status == STATUS_PENDING_REAL_CONFIRM:
+        elif status == STATUS_PENDING_REAL_CONFIRM:
             icon = WARNING
             title = "سفارش ارسال شد؛ منتظر تایید پوزیشن"
-            should_send = True
-        elif result.status in {STATUS_REJECTED, STATUS_FAILED}:
+        elif status in {STATUS_REJECTED, STATUS_FAILED}:
             icon = RED_CROSS
             title = "پوزیشن واقعی باز نشد"
-            should_send = True
         else:
             icon = INFO
-            title = f"وضعیت سفارش: {result.status}"
-            should_send = True
+            title = f"وضعیت سفارش: {status or '-'}"
 
-        error_line = f"\nخطا: {result.error}" if result.error else ""
-        pos_line = f"\nPosition ID: {result.position_id}" if result.position_id else ""
+        error = str(obj_value(result, "error", "") or "")
+        error_line = f"\nخطا: {error}" if error else ""
+        pos_id = str(obj_value(result, "position_id", "") or "")
+        pos_line = f"\nPosition ID: {pos_id}" if pos_id else ""
+
+        tp2 = obj_float(result, "tp2", 0.0)
+        tp2_line = f" | TP2: {fmt_price(tp2)}" if tp2 > 0 else ""
 
         text = (
             f"{icon} {title}\n"
-            f"نماد: {result.symbol}\n"
-            f"جهت: {result.direction}\n"
-            f"مقدار: {result.quantity}\n"
-            f"مارجین: {result.margin_usdt}$ | لوریج: {result.leverage}x\n"
-            f"Entry: {fmt_price(result.entry)}\n"
-            f"TP1: {fmt_price(result.tp1)}"
-            f"{f' | TP2: {fmt_price(result.tp2)}' if result.tp2 else ''}\n"
-            f"SL: {fmt_price(result.sl)}"
+            f"نماد: {obj_value(result, 'symbol', '-')}\n"
+            f"جهت: {obj_value(result, 'direction', '-')}\n"
+            f"مقدار: {obj_value(result, 'quantity', '-')}\n"
+            f"مارجین: {fmt_usdt(obj_value(result, 'margin_usdt', 0.0))} | "
+            f"لوریج: {safe_int(obj_value(result, 'leverage', 0), 0)}x\n"
+            f"Entry: {fmt_price(obj_value(result, 'entry', 0.0))}\n"
+            f"TP1: {fmt_price(obj_value(result, 'tp1', 0.0))}{tp2_line}\n"
+            f"SL: {fmt_price(obj_value(result, 'sl', 0.0))}"
             f"{pos_line}"
             f"{error_line}"
         )
 
-        report_type = REPORT_STATUS if result.status in {STATUS_CONFIRMED, STATUS_PENDING_REAL_CONFIRM} else REPORT_ERROR
+        report_type = REPORT_STATUS if status in {STATUS_CONFIRMED, STATUS_PENDING_REAL_CONFIRM} else REPORT_ERROR
 
         return ReportPayload(
             report_type=report_type,
             text=text,
-            reply_to_message_id=reply_to_message_id,
-            should_send=should_send,
-            meta={"open_result": result.to_dict()},
+            reply_to_message_id=safe_int(reply_to_message_id, 0),
+            should_send=True,
+            meta={"open_result": to_dict(result)},
         )
 
 
 class ResultReportFormatter:
-    """Formats position monitor events."""
-
     def format_event(self, event: PositionMonitorEvent) -> ReportPayload:
-        if not event.should_report:
+        if not bool(obj_value(event, "should_report", True)):
             return ReportPayload(
                 report_type=REPORT_RESULT,
                 text="",
-                reply_to_message_id=event.reply_to_message_id,
+                reply_to_message_id=safe_int(obj_value(event, "reply_to_message_id", 0), 0),
                 should_send=False,
-                meta={"event": event.to_dict()},
+                meta={"event": to_dict(event)},
             )
 
-        event_type = event.event_type
+        event_type = str(obj_value(event, "event_type", "")).upper()
 
         if event_type == EVENT_TP1:
             icon = GREEN_CHECK
-            title = "TP1 خورد ✅"
+            title = "TP1 خورد"
         elif event_type == EVENT_TP2:
             icon = GREEN_CHECK
-            title = "TP2 خورد ✅"
+            title = "TP2 خورد"
         elif event_type == EVENT_AI_EXIT:
-            icon = GREEN_CHECK if event.realized_pnl_usdt >= 0 else WARNING
-            title = "خروج AI در سود ✅" if event.realized_pnl_usdt >= 0 else "خروج AI ⚠️"
+            pnl = obj_float(event, "realized_pnl_usdt", 0.0)
+            icon = GREEN_CHECK if pnl >= 0 else WARNING
+            title = "خروج AI در سود" if pnl >= 0 else "خروج AI"
         elif event_type == EVENT_SL:
             icon = RED_CROSS
-            title = "Stop Loss خورد ❌"
+            title = "Stop Loss خورد"
         elif event_type == EVENT_CLOSED_UNKNOWN:
             icon = WARNING
             title = "پوزیشن بسته شد"
+        elif event_type == EVENT_PROTECT_SL:
+            icon = SHIELD
+            title = "SL محافظ فعال شد"
+        elif event_type == EVENT_SYNC_OPEN:
+            icon = INFO
+            title = "پوزیشن Sync شد"
         else:
             icon = INFO
-            title = event_type
+            title = event_type or "رویداد پوزیشن"
 
-        pnl_line = self._format_pnl(event)
+        pnl_line = self.format_pnl(event)
+        raw = obj_value(event, "raw", {}) if isinstance(obj_value(event, "raw", {}), dict) else {}
+
         protection_line = ""
         if event_type == EVENT_TP1:
-            raw = event.raw if isinstance(event.raw, dict) else {}
             protected_sl = raw.get("protected_sl")
             runner_qty = raw.get("runner_quantity")
             if protected_sl:
-                protection_line = f"\n{SHIELD} سود محافظت شد | SL محافظ: {fmt_price(protected_sl)}"
+                protection_line = f"\n{SHIELD} SL محافظ: {fmt_price(protected_sl)}"
                 if runner_qty:
                     protection_line += f" | رانر TP2: {runner_qty}"
-        reason_line = _short_reasons(event.reason_codes)
-        reason_text = f"\nدلیل: {reason_line}" if reason_line else ""
+
+        reason = short_reasons(obj_value(event, "reason_codes", ()) or ())
+        reason_line = f"\nدلیل: {reason}" if reason else ""
 
         text = (
             f"{icon} {title}\n"
-            f"نماد: {event.symbol}\n"
-            f"جهت: {event.direction}\n"
-            f"قیمت: {fmt_price(event.price)}\n"
+            f"نماد: {obj_value(event, 'symbol', '-')}\n"
+            f"جهت: {obj_value(event, 'direction', '-')}\n"
+            f"قیمت: {fmt_price(obj_value(event, 'price', 0.0))}\n"
             f"{pnl_line}"
             f"{protection_line}"
-            f"{reason_text}"
+            f"{reason_line}"
         )
 
         return ReportPayload(
             report_type=REPORT_RESULT,
             text=text,
-            reply_to_message_id=event.reply_to_message_id,
+            reply_to_message_id=safe_int(obj_value(event, "reply_to_message_id", 0), 0),
             should_send=True,
-            meta={"event": event.to_dict()},
+            meta={"event": to_dict(event)},
         )
 
-    def _format_pnl(self, event: PositionMonitorEvent) -> str:
-        if event.pnl_status == PNL_CONFIRMED:
+    def format_pnl(self, event: PositionMonitorEvent) -> str:
+        event_type = str(obj_value(event, "event_type", "")).upper()
+        pnl_status = str(obj_value(event, "pnl_status", "")).upper()
+
+        if pnl_status == PNL_CONFIRMED:
             return (
-                f"PnL واقعی توبیت: {fmt_usdt(event.realized_pnl_usdt)} "
-                f"({fmt_percent(event.realized_pnl_percent)})"
+                f"PnL واقعی توبیت: {fmt_usdt(obj_value(event, 'realized_pnl_usdt', 0.0))} "
+                f"({fmt_percent(obj_value(event, 'realized_pnl_percent', 0.0))})"
             )
 
-        if event.event_type in {EVENT_TP1}:
-            return "PnL: هنوز پوزیشن کامل بسته نشده"
+        if event_type == EVENT_TP1:
+            return "PnL: TP1 ثبت شد؛ اگر رانر باز باشد PnL نهایی بعداً تایید می‌شود"
 
-        if event.pnl_status == PNL_UNAVAILABLE:
+        if pnl_status == PNL_UNAVAILABLE:
             return (
-                f"PnL: هنوز از توبیت تایید نشد "
-                f"(محاسبه تقریبی: {fmt_percent(event.realized_pnl_percent)})"
+                "PnL: هنوز از توبیت تایید نشد "
+                f"(تقریبی: {fmt_percent(obj_value(event, 'realized_pnl_percent', 0.0))})"
             )
 
         return (
-            f"PnL: در حال دریافت از توبیت "
-            f"(تقریبی: {fmt_percent(event.realized_pnl_percent)})"
+            "PnL: در حال دریافت از توبیت "
+            f"(تقریبی: {fmt_percent(obj_value(event, 'realized_pnl_percent', 0.0))})"
         )
 
 
 class GhostReportFormatter:
-    """Formats Ghost monitoring results."""
-
     def format_ghost_result(self, result: GhostMonitorResult) -> ReportPayload:
-        if not result.closed:
-            return ReportPayload(
-                report_type=REPORT_GHOST,
-                text="",
-                should_send=False,
-                meta={"ghost_result": result.to_dict()},
-            )
-
-        if result.result in {"TP1", "TP2", "AI_EXIT"}:
-            icon = GREEN_CHECK
-            title = f"Ghost {result.result}"
-        elif result.result == "SL":
-            icon = RED_CROSS
-            title = "Ghost SL"
-        else:
-            icon = INFO
-            title = f"Ghost {result.status}"
-
-        # GHOST results are intentionally hidden from Telegram. They are only
-        # stored/used for learning by ghost_manager/stats_manager.
         return ReportPayload(
             report_type=REPORT_GHOST,
             text="",
             should_send=False,
-            meta={"ghost_result": result.to_dict(), "hidden_from_telegram": True},
+            meta={
+                "ghost_result": to_dict(result),
+                "hidden_from_telegram": True,
+            },
         )
 
 
 class StatusReportFormatter:
-    """Formats AI/learning status reports."""
-
-    def format_meta_status(self, meta: MetaLearningSummary) -> ReportPayload:
-        best = ", ".join(meta.best_modules[:5]) if meta.best_modules else "-"
-        weak = ", ".join(meta.weak_modules[:5]) if meta.weak_modules else "-"
-
-        text = (
-            f"{ROBOT} وضعیت یادگیری متا\n"
-            f"نمونه‌ها: {meta.sample_count}\n"
-            f"لایه‌های قوی: {best}\n"
-            f"لایه‌های ضعیف: {weak}"
-        )
-        return ReportPayload(REPORT_STATUS, text, meta={"meta_learning": meta.to_dict()})
-
     def format_learning_summary(self, learning: LearningSummary) -> ReportPayload:
         text = (
             f"{ROBOT} خلاصه یادگیری\n"
-            f"{learning.coin} {learning.direction}\n"
-            f"نمونه: {learning.sample_count} | Real: {learning.real_samples} | Ghost: {learning.ghost_samples}\n"
-            f"WR: {learning.win_rate:.1f}% | TP1: {learning.tp1_count} | TP2: {learning.tp2_count} | SL: {learning.sl_count}\n"
-            f"وضعیت: {learning.risk_label} / {learning.confidence_hint}"
+            f"{obj_value(learning, 'coin', '-') or obj_value(learning, 'symbol', '-')} "
+            f"{obj_value(learning, 'direction', '-')}\n"
+            f"نمونه: {safe_int(obj_value(learning, 'sample_count', 0), 0)} | "
+            f"Real: {safe_int(obj_value(learning, 'real_samples', 0), 0)} | "
+            f"Ghost: {safe_int(obj_value(learning, 'ghost_samples', 0), 0)}\n"
+            f"WR: {obj_float(learning, 'win_rate', obj_float(learning, 'outcome_success_rate', 0.0)):.1f}% | "
+            f"TP1: {safe_int(obj_value(learning, 'tp1_count', 0), 0)} | "
+            f"TP2: {safe_int(obj_value(learning, 'tp2_count', 0), 0)} | "
+            f"SL: {safe_int(obj_value(learning, 'sl_count', 0), 0)}\n"
+            f"وضعیت: {obj_value(learning, 'risk_label', '-')} / {obj_value(learning, 'confidence_hint', '-')}"
         )
-        return ReportPayload(REPORT_STATUS, text, meta={"learning": learning.to_dict()})
+        return ReportPayload(REPORT_STATUS, text, meta={"learning": to_dict(learning)})
 
 
 class ErrorReportFormatter:
-    """Formats concise errors."""
-
     def format_error(self, title: str, error: Any, reply_to_message_id: int = 0) -> ReportPayload:
         err = str(error)
         if len(err) > 700:
             err = err[:700] + "..."
-        text = f"{RED_CROSS} {title}\n{err}"
         return ReportPayload(
             report_type=REPORT_ERROR,
-            text=text,
-            reply_to_message_id=reply_to_message_id,
+            text=f"{RED_CROSS} {title}\n{err}",
+            reply_to_message_id=safe_int(reply_to_message_id, 0),
             should_send=True,
             meta={"error": err},
         )
 
 
 class ResultReporter:
-    """Facade used by bot.py."""
-
     def __init__(self):
         self.signal = SignalReportFormatter()
         self.trade = TradeOpenReportFormatter()
@@ -416,9 +426,6 @@ class ResultReporter:
 
     def ghost_result_report(self, result: GhostMonitorResult) -> ReportPayload:
         return self.ghost.format_ghost_result(result)
-
-    def meta_status_report(self, meta: MetaLearningSummary) -> ReportPayload:
-        return self.status.format_meta_status(meta)
 
     def learning_summary_report(self, learning: LearningSummary) -> ReportPayload:
         return self.status.format_learning_summary(learning)
