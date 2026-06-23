@@ -937,6 +937,88 @@ class PositionMonitor:
         })
         return None
 
+    def _extract_pattern_summary_from_position(self, pos: RealPositionState) -> JsonDict:
+        """Recover prediction/pattern data saved at entry time.
+
+        There is no separate meta file.  The entry pipeline stores metadata inside
+        the position record itself (pos.meta).  This helper safely searches common
+        keys so REAL learning can keep Pattern Start information.
+        """
+        meta = pos.meta if isinstance(pos.meta, dict) else {}
+
+        candidates: List[Any] = [
+            meta.get("prediction"),
+            meta.get("movement_prediction"),
+            meta.get("pattern_summary"),
+            meta.get("pattern"),
+        ]
+
+        decision_meta = meta.get("decision") if isinstance(meta.get("decision"), dict) else {}
+        candidates.extend([
+            decision_meta.get("prediction"),
+            decision_meta.get("movement_prediction"),
+            decision_meta.get("pattern_summary"),
+        ])
+
+        ai_decision = meta.get("ai_decision") if isinstance(meta.get("ai_decision"), dict) else {}
+        candidates.extend([
+            ai_decision.get("prediction"),
+            ai_decision.get("movement_prediction"),
+            ai_decision.get("pattern_summary"),
+            ai_decision,
+        ])
+
+        analysis_meta = meta.get("analysis_meta") if isinstance(meta.get("analysis_meta"), dict) else {}
+        candidates.extend([
+            analysis_meta.get("prediction"),
+            analysis_meta.get("movement_prediction"),
+            analysis_meta.get("pattern_summary"),
+            analysis_meta.get("ai_decision"),
+        ])
+
+        for item in candidates:
+            if not isinstance(item, dict):
+                continue
+            has_pattern_signal = any(k in item for k in (
+                "pattern_match_score",
+                "pattern_confidence",
+                "matched_pattern_id",
+                "pattern_count",
+                "pattern_win_rate",
+                "movement_probability",
+                "predicted_phase",
+            ))
+            if has_pattern_signal:
+                return dict(item)
+
+        return {}
+
+    def _learning_meta(self, pos: RealPositionState, event_type: str, pnl_usdt: float) -> JsonDict:
+        base_meta = dict(pos.meta or {}) if isinstance(pos.meta, dict) else {}
+        prediction = self._extract_pattern_summary_from_position(pos)
+
+        # Keep all useful fields in meta so coin_learning can recover them even if
+        # pattern_summary was not passed directly.
+        learning_meta: JsonDict = dict(base_meta)
+        learning_meta.update({
+            "source_type": SOURCE_REAL,
+            "position_id": pos.position_id,
+            "decision_id": pos.decision_id,
+            "event_type": event_type,
+            "realized_pnl_usdt": pnl_usdt,
+        })
+
+        if prediction:
+            learning_meta.setdefault("prediction", prediction)
+            learning_meta.setdefault("movement_prediction", prediction)
+            learning_meta.setdefault("pattern_summary", prediction)
+            learning_meta.setdefault("pattern_match_score", safe_float(prediction.get("pattern_match_score", 0.0)))
+            learning_meta.setdefault("matched_pattern_id", str(prediction.get("matched_pattern_id", "") or ""))
+            learning_meta.setdefault("predicted_phase", str(prediction.get("predicted_phase", "") or ""))
+
+        return learning_meta
+
+
     def _learn_real_outcome(
         self,
         pos: RealPositionState,
@@ -955,6 +1037,13 @@ class PositionMonitor:
         holding_seconds = max(0, (pos.close_time or now_ts()) - pos.open_time)
 
         try:
+            learning_meta = self._learning_meta(pos, event_type, pnl_usdt)
+            pattern_summary = (
+                learning_meta.get("prediction")
+                or learning_meta.get("movement_prediction")
+                or learning_meta.get("pattern_summary")
+                or None
+            )
             learn_outcome(
                 source_type=SOURCE_REAL,
                 candidate=candidate,
@@ -966,13 +1055,8 @@ class PositionMonitor:
                 mfe_percent=mfe,
                 mae_percent=mae,
                 holding_seconds=holding_seconds,
-                meta={
-                    "source_type": SOURCE_REAL,
-                    "position_id": pos.position_id,
-                    "decision_id": pos.decision_id,
-                    "event_type": event_type,
-                    "realized_pnl_usdt": pnl_usdt,
-                },
+                pattern_summary=pattern_summary,
+                meta=learning_meta,
                 persist=True,
             )
         except Exception as exc:
@@ -987,9 +1071,7 @@ class PositionMonitor:
                 mfe_percent=mfe,
                 mae_percent=mae,
                 meta={
-                    "source_type": SOURCE_REAL,
-                    "position_id": pos.position_id,
-                    "decision_id": pos.decision_id,
+                    **self._learning_meta(pos, event_type, pnl_usdt),
                     "result": event_type,
                 },
                 persist=True,
