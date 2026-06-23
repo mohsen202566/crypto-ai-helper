@@ -172,6 +172,14 @@ class MovementMemorySummary:
     quality_label: str
     notes: Tuple[str, ...] = field(default_factory=tuple)
 
+    # Extra hunter metrics. They do not change the public responsibility of
+    # this file, but they let movement_predictor / ai_decision_engine know
+    # whether a pattern was only profitable late, or actually detected early.
+    outcome_success_rate: float = 0.0
+    timing_score: float = 0.0
+    early_success_rate: float = 0.0
+    fuzzy_match_score: float = 0.0
+
     def to_dict(self) -> JsonDict:
         return asdict(self)
 
@@ -440,6 +448,102 @@ class MovementMemoryRecordBuilder:
         )
 
 
+def _bucket_family(bucket: str) -> str:
+    """Return the part before the last bucket qualifier for fuzzy matching."""
+    b = str(bucket or "UNKNOWN")
+    if "_" not in b:
+        return b
+    return "_".join(b.split("_")[:-1])
+
+
+def _bucket_similarity(a: str, b: str) -> float:
+    """Soft bucket comparison: exact > same family > opposite/unknown."""
+    a = str(a or "UNKNOWN")
+    b = str(b or "UNKNOWN")
+    if a == b:
+        return 1.0
+    if "UNKNOWN" in {a, b}:
+        return 0.35
+    if _bucket_family(a) == _bucket_family(b):
+        return 0.68
+
+    # Directional buckets such as HIST_UP/HIST_STRONG_UP or POWER_BUY/STRONG_BUY
+    # should still count as nearby even when the exact strength differs.
+    bullish_tokens = ("UP", "BUY", "HIGH")
+    bearish_tokens = ("DOWN", "SELL", "LOW")
+    if any(t in a for t in bullish_tokens) and any(t in b for t in bullish_tokens):
+        return 0.55
+    if any(t in a for t in bearish_tokens) and any(t in b for t in bearish_tokens):
+        return 0.55
+    return 0.0
+
+
+def _record_signature(record: MovementMemoryRecord) -> PreMoveSignature:
+    """Rebuild a comparable signature from a stored memory record."""
+    return PreMoveSignature(
+        coin=normalize_symbol(record.coin),
+        movement_type=str(record.movement_type or MOVE_NONE).upper(),
+        direction=normalize_direction(record.direction),
+        market_state=str(record.market_state or "UNKNOWN"),
+        freshness=str(record.freshness or "UNKNOWN"),
+        rsi_bucket=bucket_rsi(record.rsi),
+        adx_bucket=bucket_adx(record.adx),
+        hist_bucket=bucket_signed(record.histogram_slope, "HIST"),
+        atr_bucket=bucket_atr(record.atr_percent),
+        volume_bucket=bucket_volume(record.relative_volume),
+        power_bucket=bucket_power(record.power_delta),
+        trap_bucket=bucket_percent(record.trap_risk, "TRAP"),
+        range_bucket=bucket_percent(record.range_probability, "RANGE"),
+        state_bucket=bucket_percent(record.confidence_score, "STATE"),
+    )
+
+
+def signature_similarity(target: PreMoveSignature, record: MovementMemoryRecord) -> float:
+    """Fuzzy condition similarity for Movement Hunter.
+
+    Old behavior was exact signature -> soft signature -> coin/direction. That
+    misses near-identical conditions. This score lets the AI use nearby memories
+    like DOGE LONG RSI 54 vs RSI 56, while still keeping coin+direction as the
+    anchor so unrelated markets do not dominate.
+    """
+    r = _record_signature(record)
+    score = 0.0
+    total = 0.0
+
+    def add(weight: float, value: float) -> None:
+        nonlocal score, total
+        total += weight
+        score += weight * max(0.0, min(1.0, value))
+
+    add(22.0, 1.0 if target.coin == r.coin else 0.0)
+    add(20.0, 1.0 if target.direction == r.direction else 0.0)
+    add(8.0, 1.0 if target.movement_type == r.movement_type else 0.0)
+    add(8.0, 1.0 if target.market_state == r.market_state else (0.55 if "UNKNOWN" in {target.market_state, r.market_state} else 0.25))
+
+    # Fresh/MID are close for hunters; LATE/DEAD are not close to FRESH.
+    if target.freshness == r.freshness:
+        fresh_sim = 1.0
+    elif {target.freshness, r.freshness} <= {"FRESH", "MID", "UNKNOWN"}:
+        fresh_sim = 0.62
+    else:
+        fresh_sim = 0.15
+    add(8.0, fresh_sim)
+
+    add(6.0, _bucket_similarity(target.rsi_bucket, r.rsi_bucket))
+    add(5.0, _bucket_similarity(target.adx_bucket, r.adx_bucket))
+    add(9.0, _bucket_similarity(target.hist_bucket, r.hist_bucket))
+    add(5.0, _bucket_similarity(target.atr_bucket, r.atr_bucket))
+    add(6.0, _bucket_similarity(target.volume_bucket, r.volume_bucket))
+    add(9.0, _bucket_similarity(target.power_bucket, r.power_bucket))
+    add(4.0, _bucket_similarity(target.trap_bucket, r.trap_bucket))
+    add(4.0, _bucket_similarity(target.range_bucket, r.range_bucket))
+    add(4.0, _bucket_similarity(target.state_bucket, r.state_bucket))
+
+    if total <= 0:
+        return 0.0
+    return clamp(score / total * 100.0)
+
+
 class MovementMemoryIndex:
     """Fast in-memory index for pre-move memory similarity."""
 
@@ -516,14 +620,122 @@ class MovementMemoryIndex:
         d = normalize_direction(direction)
         return [r for r in self.records if r.coin == c and r.direction == d]
 
-    def summarize(self, signature: PreMoveSignature) -> MovementMemorySummary:
-        records = self.by_signature(signature.key())
-        if not records:
-            records = self.by_soft_signature(signature.soft_key())
-        if not records:
-            records = self.by_coin_direction(signature.coin, signature.direction)
+    def by_fuzzy_similarity(self, signature: PreMoveSignature, min_similarity: float = 54.0, limit: int = 80) -> List[MovementMemoryRecord]:
+        scored: List[Tuple[float, int, MovementMemoryRecord]] = []
+        for idx, record in enumerate(self.records):
+            # Keep coin+direction anchored. Similarity across another coin can be
+            # added later as sector memory, but this file learns per coin/direction.
+            if normalize_symbol(record.coin) != signature.coin:
+                continue
+            if normalize_direction(record.direction) != signature.direction:
+                continue
+            sim = signature_similarity(signature, record)
+            if sim >= min_similarity:
+                # Prefer more similar and more recent records.
+                scored.append((sim, safe_int(record.timestamp), record))
+        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return [r for _, _, r in scored[:max(1, limit)]]
 
-        return summarize_movement_memory(signature, records)
+    def summarize(self, signature: PreMoveSignature) -> MovementMemorySummary:
+        exact = self.by_signature(signature.key())
+        soft = self.by_soft_signature(signature.soft_key())
+        fuzzy = self.by_fuzzy_similarity(signature)
+
+        # Use exact matches first, but enrich with near matches. This fixes the
+        # old all-or-nothing behavior and lets the AI learn from similar RSI/ADX/
+        # power/volume conditions instead of pretending they are unrelated.
+        combined: List[MovementMemoryRecord] = []
+        seen: set[str] = set()
+        for group in (exact, soft, fuzzy):
+            for record in group:
+                if record.movement_id in seen:
+                    continue
+                combined.append(record)
+                seen.add(record.movement_id)
+
+        if not combined:
+            # Last fallback stays per coin+direction, but cap it so ancient or
+            # unrelated states do not overwhelm the current signature.
+            combined = sorted(
+                self.by_coin_direction(signature.coin, signature.direction),
+                key=lambda r: safe_int(r.timestamp),
+                reverse=True,
+            )[:80]
+
+        return summarize_movement_memory(signature, combined)
+
+
+def _record_outcome_success(record: MovementMemoryRecord) -> bool:
+    """Was the direction eventually profitable enough to matter?"""
+    favorable = max(safe_float(record.move_percent), safe_float(record.mfe_percent))
+    adverse = abs(safe_float(record.mae_percent))
+    min_move = max(0.18, min(0.75, safe_float(record.atr_percent) * 0.55))
+    return favorable >= min_move and favorable >= adverse * 0.75
+
+
+def _record_timing_score(record: MovementMemoryRecord) -> float:
+    """How early/useful was the detection timing? 0-100.
+
+    Result matters, but Movement Hunter also needs timing. A winning setup that
+    was detected late should score lower than a fresh setup that gave enough MFE
+    quickly.
+    """
+    score = 50.0
+    freshness = str(record.freshness or "UNKNOWN").upper()
+    phase = str(record.movement_phase or "UNKNOWN").upper()
+    duration = max(0, safe_int(record.move_duration_seconds))
+
+    if freshness == "FRESH":
+        score += 22
+    elif freshness == "MID":
+        score += 8
+    elif freshness in {"LATE", "DEAD"}:
+        score -= 22
+
+    if phase in {"START", "EARLY"}:
+        score += 18
+    elif phase in {"MIDDLE", "MID"}:
+        score += 3
+    elif phase in {"LATE", "EXHAUSTION", "RANGE"}:
+        score -= 18
+
+    # The target style is 5M-15M hunting. Reward moves that developed fast,
+    # but do not punish slightly longer wins too hard.
+    if 0 < duration <= 300:
+        score += 12
+    elif duration <= 900:
+        score += 6
+    elif duration >= 1800:
+        score -= 8
+
+    # MFE before MAE means timing and entry quality were useful.
+    if safe_float(record.mfe_percent) > abs(safe_float(record.mae_percent)) * 1.25:
+        score += 8
+    elif abs(safe_float(record.mae_percent)) > safe_float(record.mfe_percent) * 1.25:
+        score -= 8
+
+    return clamp(score)
+
+
+def _record_composite_success_score(record: MovementMemoryRecord) -> float:
+    """Combine outcome and timing for Movement Hunter memory."""
+    outcome_ok = _record_outcome_success(record)
+    timing = _record_timing_score(record)
+    favorable = max(safe_float(record.move_percent), safe_float(record.mfe_percent))
+    adverse = abs(safe_float(record.mae_percent))
+
+    if outcome_ok:
+        # Result is primary, timing decides how valuable the pattern is.
+        score = 68.0 + timing * 0.32
+        if favorable >= adverse * 1.8:
+            score += 4.0
+        return clamp(score)
+
+    # Bad result must remain bad even if the initial timing looked early.
+    score = timing * 0.35
+    if adverse > favorable * 1.5:
+        score -= 10.0
+    return clamp(score)
 
 
 def summarize_movement_memory(signature: PreMoveSignature, records: Sequence[MovementMemoryRecord]) -> MovementMemorySummary:
@@ -541,28 +753,57 @@ def summarize_movement_memory(signature: PreMoveSignature, records: Sequence[Mov
             success_rate=50.0,
             quality_label="LOW_DATA",
             notes=("NO_PREMOVE_HISTORY",),
+            outcome_success_rate=0.0,
+            timing_score=0.0,
+            early_success_rate=0.0,
+            fuzzy_match_score=0.0,
         )
 
-    avg_move = sum(r.move_percent for r in records) / total
-    avg_duration = sum(r.move_duration_seconds for r in records) / total
-    avg_mfe = sum(r.mfe_percent for r in records) / total
-    avg_mae = sum(r.mae_percent for r in records) / total
+    avg_move = sum(safe_float(r.move_percent) for r in records) / total
+    avg_duration = sum(safe_float(r.move_duration_seconds) for r in records) / total
+    avg_mfe = sum(safe_float(r.mfe_percent) for r in records) / total
+    avg_mae = sum(safe_float(r.mae_percent) for r in records) / total
 
-    successful = sum(1 for r in records if r.move_percent > 0 and r.mfe_percent >= max(0.25, abs(r.mae_percent) * 0.8))
-    success_rate = successful / total * 100.0
+    outcome_successes = [_record_outcome_success(r) for r in records]
+    timing_scores = [_record_timing_score(r) for r in records]
+    composite_scores = [_record_composite_success_score(r) for r in records]
+    similarity_scores = [signature_similarity(signature, r) for r in records]
+
+    outcome_success_rate = sum(1 for ok in outcome_successes if ok) / total * 100.0
+    timing_score = sum(timing_scores) / total if timing_scores else 0.0
+    success_rate = sum(composite_scores) / total if composite_scores else 50.0
+    fuzzy_match_score = sum(similarity_scores) / total if similarity_scores else 0.0
+
+    early_success_items = [
+        r for r, ok, t in zip(records, outcome_successes, timing_scores)
+        if ok and t >= 62.0
+    ]
+    early_success_rate = len(early_success_items) / total * 100.0
 
     notes: List[str] = []
     if total < int(getattr(SETTINGS.learning, "min_samples_for_confidence", 10)):
         quality = "LOW_DATA"
         notes.append("LOW_SAMPLE_COUNT")
-    elif success_rate >= 65 and avg_move > 0:
+    elif success_rate >= 68 and outcome_success_rate >= 58 and avg_move > 0:
         quality = QUALITY_HIGH
-        notes.append("PREMOVE_PATTERN_WORKED")
-    elif success_rate <= 40:
+        notes.append("PREMOVE_PATTERN_WORKED_WITH_TIMING")
+    elif success_rate <= 42 or outcome_success_rate <= 38:
         quality = QUALITY_LOW
-        notes.append("PREMOVE_PATTERN_WEAK")
+        notes.append("PREMOVE_PATTERN_WEAK_OR_LATE")
     else:
         quality = QUALITY_MEDIUM
+
+    if timing_score >= 65:
+        notes.append("TIMING_GOOD_EARLY_PATTERN")
+    elif timing_score <= 42:
+        notes.append("TIMING_LATE_OR_WEAK_PATTERN")
+
+    if early_success_rate >= 45 and total >= 5:
+        notes.append("EARLY_SUCCESS_PATTERN_FOUND")
+    if fuzzy_match_score >= 70:
+        notes.append("FUZZY_SIMILARITY_STRONG")
+    elif fuzzy_match_score < 55:
+        notes.append("FUZZY_SIMILARITY_WEAK")
 
     if avg_mae > avg_mfe:
         notes.append("ADVERSE_MOVE_LARGER_THAN_FAVORABLE")
@@ -578,7 +819,11 @@ def summarize_movement_memory(signature: PreMoveSignature, records: Sequence[Mov
         avg_mae_percent=avg_mae,
         success_rate=clamp(success_rate),
         quality_label=quality,
-        notes=tuple(notes),
+        notes=tuple(dict.fromkeys(notes)),
+        outcome_success_rate=clamp(outcome_success_rate),
+        timing_score=clamp(timing_score),
+        early_success_rate=clamp(early_success_rate),
+        fuzzy_match_score=clamp(fuzzy_match_score),
     )
 
 
