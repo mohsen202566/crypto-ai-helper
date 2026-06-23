@@ -175,41 +175,136 @@ def movement_type_from_direction(direction: str) -> str:
     return MOVE_NONE
 
 
-class MemorySimilarityEngine:
-    """Scores current condition similarity against movement_memory.py summary."""
+def _obj_value(obj: Optional[Any], key: str, default: Any = None) -> Any:
+    """Read a field from dict/dataclass-like summaries safely."""
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
 
-    def score(self, summary: MovementMemorySummary) -> Tuple[float, List[str]]:
+
+def _summary_float(summary: Optional[Any], key: str, default: float = 0.0) -> float:
+    return safe_float(_obj_value(summary, key, default), default)
+
+
+def _best_memory_float(
+    movement_summary: Optional[Any],
+    learning_summary: Optional[Any],
+    key: str,
+    default: float = 0.0,
+) -> float:
+    """Prefer Movement Memory metric; fall back to Coin Learning metric.
+
+    This keeps backward compatibility while allowing the predictor to consume
+    the new Movement Hunter fields produced by coin_learning.py:
+    timing_score, early_success_rate, premove_success_rate, late_failure_rate,
+    fuzzy_match_score and outcome_success_rate.
+    """
+    value = _obj_value(movement_summary, key, None)
+    if value is None:
+        value = _obj_value(learning_summary, key, default)
+    return safe_float(value, default)
+
+
+class MemorySimilarityEngine:
+    """Scores current condition similarity against movement_memory.py and coin_learning summaries."""
+
+    def score(
+        self,
+        summary: MovementMemorySummary,
+        learning_summary: Optional[Any] = None,
+    ) -> Tuple[float, List[str]]:
         reasons: List[str] = []
 
-        if summary.sample_count <= 0:
+        sample_count = int(max(0, safe_float(getattr(summary, "sample_count", 0), 0)))
+        learning_samples = int(max(0, safe_float(_obj_value(learning_summary, "sample_count", 0), 0)))
+        effective_samples = max(sample_count, learning_samples)
+
+        timing_score = clamp(_best_memory_float(summary, learning_summary, "timing_score", 50.0))
+        early_success_rate = clamp(_best_memory_float(summary, learning_summary, "early_success_rate", 0.0))
+        premove_success_rate = clamp(_best_memory_float(summary, learning_summary, "premove_success_rate", early_success_rate))
+        fuzzy_match_score = clamp(_best_memory_float(summary, learning_summary, "fuzzy_match_score", 0.0))
+        outcome_success_rate = clamp(_best_memory_float(summary, learning_summary, "outcome_success_rate", getattr(summary, "success_rate", 50.0)))
+        late_failure_rate = clamp(_best_memory_float(summary, learning_summary, "late_failure_rate", 0.0))
+
+        if effective_samples <= 0:
             # No memory yet must not kill fresh hunting. Give a neutral-low base
             # so raw birth-of-momentum sensors can still create useful GHOSTs
             # and, if the AI brain agrees, early REALs.
             reasons.append("NO_MOVEMENT_MEMORY")
             return 32.0, reasons
 
-        # Movement Hunter memory should matter more than a simple count.
-        # Use sample confidence, historical success, and average move size, but
-        # keep low-sample memories soft so one or two lucky ghosts do not dominate.
-        sample_score = clamp(summary.sample_count * 7.0)
-        success_score = clamp(summary.success_rate)
-        move_score = clamp(abs(summary.avg_move_percent) * 45.0)
+        # Movement Hunter memory should prioritize timing and early success over
+        # raw move size. A large but late move should not teach the AI to chase.
+        sample_score = clamp(effective_samples * 7.0)
+        success_score = clamp(getattr(summary, "success_rate", outcome_success_rate))
+        move_score = clamp(abs(getattr(summary, "avg_move_percent", 0.0)) * 38.0)
 
-        if summary.sample_count < 3:
-            similarity = clamp(sample_score * 0.18 + success_score * 0.48 + move_score * 0.34)
+        hunter_timing_score = clamp(
+            timing_score * 0.34
+            + max(early_success_rate, premove_success_rate) * 0.24
+            + outcome_success_rate * 0.22
+            + fuzzy_match_score * 0.12
+            + sample_score * 0.08
+            - late_failure_rate * 0.18
+        )
+
+        if effective_samples < 3:
+            similarity = clamp(
+                success_score * 0.30
+                + hunter_timing_score * 0.46
+                + move_score * 0.16
+                + sample_score * 0.08
+            )
             reasons.append("VERY_LOW_MOVEMENT_MEMORY_SAMPLE")
-        elif summary.sample_count < 8:
-            similarity = clamp(sample_score * 0.24 + success_score * 0.50 + move_score * 0.26)
+        elif effective_samples < 8:
+            similarity = clamp(
+                success_score * 0.28
+                + hunter_timing_score * 0.50
+                + move_score * 0.12
+                + sample_score * 0.10
+            )
             reasons.append("LOW_MOVEMENT_MEMORY_SAMPLE")
         else:
-            similarity = clamp(sample_score * 0.28 + success_score * 0.52 + move_score * 0.20)
+            similarity = clamp(
+                success_score * 0.24
+                + hunter_timing_score * 0.54
+                + move_score * 0.10
+                + sample_score * 0.12
+            )
             reasons.append("ENOUGH_MOVEMENT_MEMORY")
 
-        if summary.success_rate >= 68 and summary.sample_count >= 5:
+        if timing_score >= 68 and max(early_success_rate, premove_success_rate) >= 45 and outcome_success_rate >= 58:
+            similarity = clamp(similarity + 8.0)
+            reasons.append("PREMOVE_TIMING_MEMORY_STRONG")
+        elif timing_score >= 62 and max(early_success_rate, premove_success_rate) >= 35:
+            similarity = clamp(similarity + 5.0)
+            reasons.append("PREMOVE_TIMING_MEMORY_GOOD")
+
+        if fuzzy_match_score >= 70:
+            similarity = clamp(similarity + 4.0)
+            reasons.append("FUZZY_CONDITION_MATCH_SUPPORTS_PREDICTION")
+        elif 0 < fuzzy_match_score < 50 and effective_samples >= 4:
+            similarity = clamp(similarity - 3.0)
+            reasons.append("FUZZY_CONDITION_MATCH_WEAK")
+
+        if late_failure_rate >= 55 and effective_samples >= 4:
+            similarity = clamp(similarity - 9.0)
+            reasons.append("LATE_FAILURE_MEMORY_PENALTY")
+        elif late_failure_rate >= 40 and effective_samples >= 4:
+            similarity = clamp(similarity - 5.0)
+            reasons.append("MODERATE_LATE_FAILURE_MEMORY_PENALTY")
+
+        if outcome_success_rate <= 40 and timing_score <= 45 and effective_samples >= 5:
+            similarity = clamp(similarity - 7.0)
+            reasons.append("WEAK_OUTCOME_AND_TIMING_MEMORY")
+
+        if success_score >= 68 and effective_samples >= 5:
             reasons.append("SIMILAR_PREMOVE_WORKED_STRONGLY")
-        elif summary.success_rate >= 60:
+        elif success_score >= 60:
             reasons.append("SIMILAR_PREMOVE_WORKED")
-        elif summary.success_rate <= 40 and summary.sample_count >= 5:
+        elif success_score <= 40 and effective_samples >= 5:
             reasons.append("SIMILAR_PREMOVE_WEAK")
 
         return similarity, reasons
@@ -298,6 +393,7 @@ class PhasePredictionEngine:
         state: StateResult,
         trap: TrapResult,
         similarity: float,
+        learning_summary: Optional[Any] = None,
     ) -> Tuple[str, List[str]]:
         s = candidate.sensor_snapshot
         reasons: List[str] = []
@@ -315,11 +411,21 @@ class PhasePredictionEngine:
         hist_slope = abs(safe_float(getattr(s, "histogram_slope", 0.0)))
         volume_live = bool(getattr(s, "volume_expansion", False) or getattr(s, "volume_spike", False))
         atr_live = bool(getattr(s, "atr_expansion", "") == "EXPANDING" or getattr(s, "atr_explosion", False))
+        timing_score = clamp(_summary_float(learning_summary, "timing_score", 50.0))
+        early_success_rate = clamp(_summary_float(learning_summary, "early_success_rate", 0.0))
+        premove_success_rate = clamp(_summary_float(learning_summary, "premove_success_rate", early_success_rate))
+        late_failure_rate = clamp(_summary_float(learning_summary, "late_failure_rate", 0.0))
+        learned_premove_support = (
+            timing_score >= 62
+            and max(early_success_rate, premove_success_rate) >= 35
+            and late_failure_rate < 55
+        )
 
         early_sensor_birth = (
             (compression >= 40 and range_probability < 85 and (power_delta >= 10 or volume_live or atr_live))
             or (hist_accel > 0 and hist_slope > 0 and power_delta >= 8)
             or (similarity >= 58 and readiness < 62 and late_risk < 72)
+            or (learned_premove_support and readiness < 66 and late_risk < 76)
         )
 
         # Only classify as RANGE when both memory/sensors and live readiness are weak.
@@ -347,6 +453,7 @@ class PhasePredictionEngine:
         if (
             (similarity >= 58 and readiness < 65 and compression >= 35 and state_range < 82 and trap_risk < 72)
             or (early_sensor_birth and readiness < 62 and trap_risk < 75 and late_risk < 78)
+            or (learned_premove_support and similarity >= 52 and readiness < 68 and trap_risk < 74)
         ):
             reasons.append("PREDICT_PRE_START_HUNTER")
             return PREDICT_PRE_START, reasons
@@ -383,11 +490,12 @@ class MovementProbabilityEngine:
         movement: MovementHunterResult,
         trap: TrapResult,
         state: StateResult,
+        learning_summary: Optional[Any] = None,
     ) -> Tuple[SimilarityBreakdown, float, float, float, List[str]]:
         direction = normalize_direction(candidate.direction_hint)
         reasons: List[str] = []
 
-        memory_similarity, r = MemorySimilarityEngine().score(summary)
+        memory_similarity, r = MemorySimilarityEngine().score(summary, learning_summary=learning_summary)
         reasons.extend(r)
 
         sensor_alignment, r = SensorAlignmentEngine().score(candidate, direction)
@@ -415,12 +523,27 @@ class MovementProbabilityEngine:
         range_penalty = clamp(state.range_probability * 0.42 + max(0.0, compression - 55.0) * 0.05 - compression_bonus)
         exhaustion_penalty = clamp(state.exhaustion_risk * 0.50 + movement.reversal_pressure * 0.32)
 
+        timing_score = clamp(_summary_float(learning_summary, "timing_score", 50.0))
+        early_success_rate = clamp(_summary_float(learning_summary, "early_success_rate", 0.0))
+        premove_success_rate = clamp(_summary_float(learning_summary, "premove_success_rate", early_success_rate))
+        late_failure_rate = clamp(_summary_float(learning_summary, "late_failure_rate", 0.0))
+        learning_premove_bonus = clamp(
+            (timing_score - 50.0) * 0.16
+            + max(early_success_rate, premove_success_rate) * 0.08
+            - late_failure_rate * 0.07
+        )
+        if learning_premove_bonus > 4:
+            reasons.append("LEARNING_PREMOVE_BONUS_APPLIED")
+        elif learning_premove_bonus < -4:
+            reasons.append("LEARNING_LATE_FAILURE_PENALTY_APPLIED")
+
         final_similarity = clamp(
             memory_similarity * 0.34
             + sensor_alignment * 0.28
             + movement_alignment * 0.24
             + state_alignment * 0.14
             + compression_bonus * 0.10
+            + learning_premove_bonus
             - trap_penalty * 0.30
             - range_penalty * 0.14
             - exhaustion_penalty * 0.22
@@ -509,6 +632,7 @@ class MovementPredictor:
         state: StateResult,
         confidence: Optional[ConfidenceResult] = None,
         movement_summary: Optional[MovementMemorySummary] = None,
+        learning_summary: Optional[Any] = None,
     ) -> MovementPredictionResult:
         direction = normalize_direction(candidate.direction_hint)
         movement_type = movement_type_from_direction(direction)
@@ -528,6 +652,7 @@ class MovementPredictor:
             movement=movement,
             trap=trap,
             state=state,
+            learning_summary=learning_summary,
         )
 
         phase, r = PhasePredictionEngine().classify(
@@ -536,6 +661,7 @@ class MovementPredictor:
             state=state,
             trap=trap,
             similarity=breakdown.final_similarity,
+            learning_summary=learning_summary,
         )
         reasons.extend(r)
 
@@ -607,6 +733,7 @@ def predict_movement(
     state: StateResult,
     confidence: Optional[ConfidenceResult] = None,
     movement_summary: Optional[MovementMemorySummary] = None,
+    learning_summary: Optional[Any] = None,
 ) -> MovementPredictionResult:
     return predictor().predict(
         candidate=candidate,
@@ -615,6 +742,7 @@ def predict_movement(
         state=state,
         confidence=confidence,
         movement_summary=movement_summary,
+        learning_summary=learning_summary,
     )
 
 
@@ -625,6 +753,7 @@ def movement_predictor(
     state: StateResult,
     confidence: Optional[ConfidenceResult] = None,
     movement_summary: Optional[MovementMemorySummary] = None,
+    learning_summary: Optional[Any] = None,
 ) -> MovementPredictionResult:
     return predict_movement(
         candidate=candidate,
@@ -633,4 +762,5 @@ def movement_predictor(
         state=state,
         confidence=confidence,
         movement_summary=movement_summary,
+        learning_summary=learning_summary,
     )
