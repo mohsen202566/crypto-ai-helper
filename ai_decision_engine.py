@@ -83,6 +83,7 @@ class DecisionScore:
     correlation_penalty: float
     range_penalty: float
     late_penalty: float
+    tradability_score: float
     final_score: float
 
     def to_dict(self) -> JsonDict:
@@ -117,7 +118,7 @@ class AIDecision:
     should_create_ghost: bool = False
     should_reject: bool = False
 
-    score: DecisionScore = field(default_factory=lambda: DecisionScore(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+    score: DecisionScore = field(default_factory=lambda: DecisionScore(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 50, 0))
     reason_codes: Tuple[str, ...] = field(default_factory=tuple)
     warnings: Tuple[str, ...] = field(default_factory=tuple)
     reject_reasons: Tuple[str, ...] = field(default_factory=tuple)
@@ -230,6 +231,111 @@ def _learning_to_dict(learning: Optional[Any]) -> JsonDict:
     except Exception:
         return {}
 
+
+
+
+def _settings_float(path: str, default: float) -> float:
+    """Read SETTINGS.foo.bar safely without adding runtime dependencies."""
+    try:
+        obj: Any = SETTINGS
+        for part in str(path).split("."):
+            obj = getattr(obj, part)
+        return safe_float(obj, default)
+    except Exception:
+        return default
+
+
+def _estimated_notional_usdt() -> float:
+    margin = _settings_float("trading.margin_usdt", 5.0)
+    leverage = max(1.0, _settings_float("trading.leverage", 10.0))
+    return max(0.0, margin * leverage)
+
+
+def _fee_rate_per_side() -> float:
+    fee = _settings_float("tp.fee_rate_per_side", 0.0)
+    if fee <= 0:
+        fee = _settings_float("trading.taker_fee_rate", 0.0006)
+    return max(0.0, fee)
+
+
+def _min_net_profit_usdt() -> float:
+    return max(0.0, _settings_float("tp.min_net_profit_usdt", 0.10))
+
+
+def _tradability_score(
+    candidate: AnalysisCandidate,
+    movement: MovementHunterResult,
+    prediction: MovementPredictionResult,
+    learning: Optional[Any],
+) -> Tuple[float, List[str], List[str]]:
+    """Estimate whether a technically good move is worth REAL money.
+
+    This is not order sizing and does not replace tp_sl_engine.py. It prevents
+    AI from sending REAL on tiny/fee-eaten moves. Good but low-profit moves go
+    to GHOST so the hunter still learns from them.
+    """
+    reasons: List[str] = []
+    warnings: List[str] = []
+
+    notional = _estimated_notional_usdt()
+    fee = notional * _fee_rate_per_side() * 2.0
+    min_net = _min_net_profit_usdt()
+
+    if notional <= 0:
+        warnings.append("TRADABILITY_NO_NOTIONAL_FALLBACK")
+        return 50.0, reasons, warnings
+
+    s = candidate.sensor_snapshot
+    atr_pct = max(0.0, safe_float(getattr(s, "atr_percent", 0.0), 0.0))
+    expected_pct = max(0.0, safe_float(getattr(prediction, "expected_move_percent", 0.0), 0.0))
+
+    phase = str(getattr(prediction, "predicted_phase", "") or "").upper()
+    if phase in {"PRE_START", "START"}:
+        expected_component = expected_pct * 0.65
+    elif phase == "MID":
+        expected_component = expected_pct * 0.50
+    else:
+        expected_component = expected_pct * 0.35
+
+    candidate_tp_pct = max(atr_pct * 0.85, expected_component)
+
+    early = _learning_float(learning, "early_success_rate", 0.0)
+    premove = _learning_float(learning, "premove_success_rate", 0.0)
+    timing = _learning_float(learning, "timing_score", 50.0)
+    if early >= 45.0 or premove >= 45.0 or timing >= 68.0:
+        candidate_tp_pct = max(candidate_tp_pct, expected_pct * 0.70, atr_pct * 0.95)
+        reasons.append("TRADABILITY_EARLY_MEMORY_SUPPORT")
+
+    gross = notional * candidate_tp_pct / 100.0
+    net = gross - fee
+    required_pct = ((fee + min_net) / notional) * 100.0 if notional > 0 else 0.0
+
+    rel_vol = safe_float(getattr(s, "relative_volume", 0.0), 0.0)
+    volume_bonus = 0.0
+    if rel_vol >= 1.8 or bool(getattr(s, "volume_spike", False)):
+        volume_bonus += 8.0
+        reasons.append("TRADABILITY_VOLUME_SUPPORT")
+    elif rel_vol > 0 and rel_vol < 0.65:
+        volume_bonus -= 10.0
+        warnings.append("TRADABILITY_LOW_VOLUME")
+
+    fee_cover_score = clamp((candidate_tp_pct / max(required_pct, 1e-9)) * 55.0, 0.0, 70.0)
+    net_score = clamp((net / max(min_net, 0.01)) * 30.0, 0.0, 35.0)
+    move_score = clamp(candidate_tp_pct * 12.0, 0.0, 18.0)
+    score = clamp(fee_cover_score + net_score + move_score + volume_bonus, 0.0, 100.0)
+
+    if net < min_net:
+        warnings.append("TRADABILITY_NET_PROFIT_BELOW_MIN")
+    if candidate_tp_pct < required_pct:
+        warnings.append("TRADABILITY_TP_TOO_SMALL_FOR_FEES")
+    if score >= 70:
+        reasons.append("TRADABILITY_REAL_PROFIT_OK")
+    elif score >= 45:
+        reasons.append("TRADABILITY_BORDERLINE")
+    else:
+        reasons.append("TRADABILITY_GHOST_FEE_RISK")
+
+    return score, reasons, warnings
 
 def _hunter_memory_support(learning: Optional[Any]) -> Tuple[float, float, float, float, int, Tuple[str, ...]]:
     """Return timing/outcome memory fields when available.
@@ -384,6 +490,13 @@ class AIScoreComposer:
         range_penalty = clamp(state.range_probability * 0.45 + candidate.sensor_snapshot.range_probability * 0.25)
         late_penalty = clamp(state.late_entry_risk * 0.50 + movement.reversal_pressure * 0.35)
 
+        tradability_score, _, _ = _tradability_score(
+            candidate=candidate,
+            movement=movement,
+            prediction=prediction,
+            learning=learning,
+        )
+
         # Movement Hunter balance:
         # classic analysis remains a sensor, while movement prediction and
         # conditional coin-learning carry more influence in the final score.
@@ -393,7 +506,8 @@ class AIScoreComposer:
             + prediction_score * 0.20 * w_pred
             + confidence_score * 0.16 * w_conf
             + learning_score * 0.20 * w_learning
-            + state_score * 0.10 * w_state
+            + state_score * 0.08 * w_state
+            + tradability_score * 0.02
         )
 
         # Keep penalties meaningful but not dominant.
@@ -421,6 +535,7 @@ class AIScoreComposer:
             correlation_penalty=clamp(correlation_penalty),
             range_penalty=clamp(range_penalty),
             late_penalty=clamp(late_penalty),
+            tradability_score=clamp(tradability_score),
             final_score=final,
         )
 
@@ -554,6 +669,27 @@ class DecisionTypeClassifier:
             )
         )
 
+        s = candidate.sensor_snapshot
+        compression_score = safe_float(getattr(s, "compression_score", 0.0), 0.0)
+        expansion_probability = safe_float(getattr(s, "expansion_probability", 0.0), 0.0)
+        range_breakout_opportunity = (
+            state.market_state == "RANGE"
+            and compression_score >= 58.0
+            and (
+                expansion_probability >= 42.0
+                or movement.readiness_score >= 58.0
+                or prediction.movement_probability >= 55.0
+                or bool(getattr(s, "volume_expansion", False))
+                or str(getattr(s, "atr_expansion", "")).upper() == "EXPANDING"
+                or hunter_memory_good
+            )
+            and trap.trap_risk < 60.0
+        )
+
+        tradability_score = clamp(getattr(score, "tradability_score", 50.0))
+        low_tradability = tradability_score < 40.0
+        very_low_tradability = tradability_score < 25.0
+
         must_ghost = False
 
         # GHOST-only conditions. These must not be bypassed by a loose bridge.
@@ -572,16 +708,32 @@ class DecisionTypeClassifier:
         if risky_learning:
             must_ghost = True
             reasons.append("LEARNING_RISKY_CONDITION_GHOST_ONLY")
+        if low_tradability:
+            must_ghost = True
+            reasons.append("TRADABILITY_LOW_PROFIT_GHOST_ONLY")
+            warnings.append("REAL_BLOCKED_BY_LOW_NET_PROFIT_QUALITY")
         if trap.trap_risk >= 65:
             must_ghost = True
             reasons.append("TRAP_RISK_GHOST_ONLY")
-        if state.market_state in {"RANGE", "EXHAUSTION", "LATE"}:
+        if state.market_state == "RANGE":
+            if range_breakout_opportunity:
+                reasons.append("RANGE_COMPRESSION_BREAKOUT_EXCEPTION")
+            else:
+                must_ghost = True
+                reasons.append("RANGE_GHOST_ONLY")
+        elif state.market_state in {"EXHAUSTION", "LATE"}:
             must_ghost = True
             reasons.append(f"{state.market_state}_GHOST_ONLY")
         if movement.freshness in {"DEAD", "UNKNOWN", "LATE"}:
             must_ghost = True
             reasons.append(f"FRESHNESS_{movement.freshness}_GHOST_ONLY")
-        if prediction.predicted_phase in {"RANGE", "UNKNOWN", "LATE"}:
+        if prediction.predicted_phase == "RANGE":
+            if range_breakout_opportunity:
+                reasons.append("PREDICTED_RANGE_COMPRESSION_EXCEPTION")
+            else:
+                must_ghost = True
+                reasons.append("PREDICTED_PHASE_RANGE_GHOST_ONLY")
+        elif prediction.predicted_phase in {"UNKNOWN", "LATE"}:
             must_ghost = True
             reasons.append(f"PREDICTED_PHASE_{prediction.predicted_phase}_GHOST_ONLY")
 
@@ -605,7 +757,8 @@ class DecisionTypeClassifier:
             or movement.freshness == "DEAD"
             or state.exhaustion_risk >= 82.0
             or state.late_entry_risk >= 82.0
-            or (state.range_probability >= 85.0 and movement.readiness_score < 68.0)
+            or (state.range_probability >= 85.0 and movement.readiness_score < 68.0 and not range_breakout_opportunity)
+            or very_low_tradability
         )
 
         real_conf_floor = max(38.0, min_real - 22.0)
@@ -667,6 +820,8 @@ class DecisionTypeClassifier:
                 reasons.append("STRONG_PREMOVE_MEMORY_SUPPORTS_REAL")
             if live_or_early_move:
                 reasons.append("LIVE_OR_EARLY_MOVEMENT_CONFIRMED")
+            if tradability_score >= 55.0:
+                reasons.append("TRADABILITY_CONFIRMS_REAL_VALUE")
             return DECISION_REAL, reasons, warnings
 
         ghost_allowed = (
@@ -860,6 +1015,7 @@ class AIDecisionEngine:
                 "meta_learning": meta.to_dict() if meta else {},
                 "prediction": prediction.to_dict(),
                 "correlation": correlation.to_dict(),
+                "tradability_score": score.tradability_score,
                 "note": "TP/SL will be calculated by tp_sl_engine.py",
             },
         )
