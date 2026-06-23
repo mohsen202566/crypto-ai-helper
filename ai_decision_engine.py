@@ -3,52 +3,34 @@ from __future__ import annotations
 """
 18 - ai_decision_engine.py
 
-Final AI decision layer for the locked Movement Hunter architecture.
+Final AI decision layer for the simplified Level 1 / 5M crypto futures bot.
 
-Responsibilities:
-- Be the ONLY component allowed to output:
-  REAL / GHOST / REJECT
-- Combine all previous layers:
-  AnalysisCandidate
-  MovementHunterResult
-  TrapResult
-  StateResult
-  ConfidenceResult
-  CorrelationResult
-  LearningSummary
-  MovementPredictionResult
-  MetaLearningSummary / module weights
-- Decide final direction, entry readiness, decision type, and decision reasons.
-- Keep output simple and structured for tp_sl_engine.py and real_trade_manager.py.
-
-Strictly forbidden in every other file:
-- REAL/GHOST/REJECT final decision.
-
-Strictly forbidden in this file:
+Locked goals:
+- AI is the only final decision maker: REAL / GHOST / REJECT.
+- Inputs are only:
+  1) AnalysisCandidate = raw technical sensor package
+  2) MovementPredictionResult = Pattern Start Predictor output
+  3) LearningSummary / dict = coin learning output
+- Technical analysis is only sensor input.
+- No candle-confirmation logic.
+- No trap/confidence/correlation/meta/state engine.
 - No Toobit order execution.
 - No Telegram sending.
-- No persistence side effects by default.
-- No Paper mode.
-- No Setup flow.
+- No persistence side effects.
+- No paper/setup flow.
 
 This file decides only. It does not open trades.
 """
 
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 import math
 import time
 
 from analysis_engine import AnalysisCandidate
-from movement_hunter import MovementHunterResult
-from trap_engine import TrapResult
-from state_engine import StateResult
-from confidence_engine import ConfidenceResult
-from correlation_engine import CorrelationResult
 from coin_learning import LearningSummary
 from movement_predictor import MovementPredictionResult
-from meta_learning import MetaLearningSummary, get_meta_learning_summary
 from config import SETTINGS
 
 
@@ -62,27 +44,135 @@ DIRECTION_LONG = "LONG"
 DIRECTION_SHORT = "SHORT"
 DIRECTION_NEUTRAL = "NEUTRAL"
 
-REJECT_REASON_HIGH_TRAP = "HIGH_TRAP_RISK"
-REJECT_REASON_RANGE = "RANGE_MARKET"
-REJECT_REASON_EXHAUSTED = "EXHAUSTED_OR_LATE"
-REJECT_REASON_LOW_CONFIDENCE = "LOW_CONFIDENCE"
-REJECT_REASON_LOW_MOVEMENT = "LOW_MOVEMENT_PROBABILITY"
-REJECT_REASON_CORRELATION = "CORRELATION_LIMIT"
-REJECT_REASON_INVALID = "INVALID_INPUT"
+PHASE_PRE_START = "PRE_START"
+PHASE_START = "START"
+PHASE_MID = "MID"
+PHASE_LATE = "LATE"
+PHASE_RANGE = "RANGE"
+PHASE_UNKNOWN = "UNKNOWN"
+
+
+def now_ts() -> int:
+    return int(time.time())
+
+
+def safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        v = float(value)
+        if math.isnan(v) or math.isinf(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+
+def safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None:
+            return default
+        return int(float(value))
+    except Exception:
+        return default
+
+
+def clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
+    return max(low, min(high, safe_float(value, low)))
+
+
+def normalize_direction(direction: str) -> str:
+    d = str(direction or "").upper().strip()
+    if d in {"LONG", "BUY"}:
+        return DIRECTION_LONG
+    if d in {"SHORT", "SELL"}:
+        return DIRECTION_SHORT
+    return DIRECTION_NEUTRAL
+
+
+def obj_value(obj: Optional[Any], key: str, default: Any = None) -> Any:
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def obj_float(obj: Optional[Any], key: str, default: float = 0.0) -> float:
+    return safe_float(obj_value(obj, key, default), default)
+
+
+def obj_int(obj: Optional[Any], key: str, default: int = 0) -> int:
+    return safe_int(obj_value(obj, key, default), default)
+
+
+def obj_tuple(obj: Optional[Any], key: str) -> Tuple[str, ...]:
+    value = obj_value(obj, key, ())
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        return (value,)
+    try:
+        return tuple(str(x) for x in value)
+    except Exception:
+        return ()
+
+
+def to_dict(obj: Optional[Any]) -> JsonDict:
+    if obj is None:
+        return {}
+    if isinstance(obj, dict):
+        return dict(obj)
+    if hasattr(obj, "to_dict") and callable(obj.to_dict):
+        try:
+            data = obj.to_dict()
+            return dict(data) if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+    try:
+        return dict(getattr(obj, "__dict__", {}))
+    except Exception:
+        return {}
+
+
+def settings_float(path: str, default: float) -> float:
+    try:
+        obj: Any = SETTINGS
+        for part in str(path).split("."):
+            obj = getattr(obj, part)
+        return safe_float(obj, default)
+    except Exception:
+        return default
+
+
+def estimated_notional_usdt() -> float:
+    margin = settings_float("trading.margin_usdt", 5.0)
+    leverage = max(1.0, settings_float("trading.leverage", 10.0))
+    return max(0.0, margin * leverage)
+
+
+def fee_rate_per_side() -> float:
+    fee = settings_float("tp.fee_rate_per_side", 0.0)
+    if fee <= 0:
+        fee = settings_float("trading.taker_fee_rate", 0.0006)
+    return max(0.0, fee)
+
+
+def min_net_profit_usdt() -> float:
+    # Level 1 default: do not send REAL if the expected net profit is fee-eaten.
+    return max(0.0, settings_float("tp.min_net_profit_usdt", 0.20))
 
 
 @dataclass(frozen=True)
 class DecisionScore:
-    analysis_score: float
-    movement_score: float
+    sensor_score: float
     prediction_score: float
-    confidence_score: float
     learning_score: float
-    state_score: float
-    trap_penalty: float
-    correlation_penalty: float
+    market_score: float
+    freshness_score: float
     range_penalty: float
     late_penalty: float
+    fee_penalty: float
     tradability_score: float
     final_score: float
 
@@ -109,16 +199,17 @@ class AIDecision:
     sl: float = 0.0
     tp_mode: str = "PENDING_TP_SL_ENGINE"
 
-    movement_phase: str = "UNKNOWN"
-    freshness: str = "UNKNOWN"
-    market_state: str = "UNKNOWN"
-    predicted_phase: str = "UNKNOWN"
+    predicted_phase: str = PHASE_UNKNOWN
+    movement_probability: float = 0.0
+    pattern_count: int = 0
+    pattern_match_score: float = 0.0
+    pattern_confidence: float = 0.0
 
     should_trade_real: bool = False
     should_create_ghost: bool = False
     should_reject: bool = False
 
-    score: DecisionScore = field(default_factory=lambda: DecisionScore(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 50, 0))
+    score: DecisionScore = field(default_factory=lambda: DecisionScore(0, 0, 0, 0, 0, 0, 0, 0, 50, 0))
     reason_codes: Tuple[str, ...] = field(default_factory=tuple)
     warnings: Tuple[str, ...] = field(default_factory=tuple)
     reject_reasons: Tuple[str, ...] = field(default_factory=tuple)
@@ -128,1008 +219,472 @@ class AIDecision:
         return asdict(self)
 
 
-def now_ts() -> int:
-    return int(time.time())
-
-
-def safe_float(value: Any, default: float = 0.0) -> float:
-    try:
-        if value is None:
-            return default
-        v = float(value)
-        if math.isnan(v) or math.isinf(v):
-            return default
-        return v
-    except Exception:
-        return default
-
-
-def clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
-    try:
-        v = float(value)
-        if math.isnan(v) or math.isinf(v):
-            return low
-        return max(low, min(high, v))
-    except Exception:
-        return low
-
-
-def normalize_direction(direction: str) -> str:
-    d = str(direction or "").upper().strip()
-    if d in {"LONG", "BUY"}:
-        return DIRECTION_LONG
-    if d in {"SHORT", "SELL"}:
-        return DIRECTION_SHORT
-    return DIRECTION_NEUTRAL
-
-
-def _meta_weight(meta: Optional[MetaLearningSummary], module_name: str, default: float = 1.0) -> float:
-    if meta is None:
-        return default
-    try:
-        return safe_float(meta.module_weights.get(module_name, default), default)
-    except Exception:
-        return default
-
-
-def _learning_value(learning: Optional[Any], key: str, default: Any = None) -> Any:
-    if learning is None:
-        return default
-    if isinstance(learning, dict):
-        return learning.get(key, default)
-    return getattr(learning, key, default)
-
-
-def _learning_float(learning: Optional[Any], key: str, default: float = 0.0) -> float:
-    try:
-        value = _learning_value(learning, key, default)
-        if value is None:
-            return default
-        v = float(value)
-        if math.isnan(v) or math.isinf(v):
-            return default
-        return v
-    except Exception:
-        return default
-
-
-def _learning_int(learning: Optional[Any], key: str, default: int = 0) -> int:
-    try:
-        value = _learning_value(learning, key, default)
-        if value is None:
-            return default
-        return int(float(value))
-    except Exception:
-        return default
-
-
-def _learning_notes(learning: Optional[Any]) -> Tuple[str, ...]:
-    notes = _learning_value(learning, "notes", ())
-    if notes is None:
-        return ()
-    if isinstance(notes, str):
-        return (notes,)
-    try:
-        return tuple(str(x) for x in notes)
-    except Exception:
-        return ()
-
-
-def _learning_to_dict(learning: Optional[Any]) -> JsonDict:
-    if learning is None:
-        return {}
-    if isinstance(learning, dict):
-        return dict(learning)
-    if hasattr(learning, "to_dict") and callable(learning.to_dict):
-        try:
-            data = learning.to_dict()
-            return dict(data) if isinstance(data, dict) else {}
-        except Exception:
-            return {}
-    try:
-        return dict(getattr(learning, "__dict__", {}))
-    except Exception:
-        return {}
-
-
-
-
-def _settings_float(path: str, default: float) -> float:
-    """Read SETTINGS.foo.bar safely without adding runtime dependencies."""
-    try:
-        obj: Any = SETTINGS
-        for part in str(path).split("."):
-            obj = getattr(obj, part)
-        return safe_float(obj, default)
-    except Exception:
-        return default
-
-
-def _estimated_notional_usdt() -> float:
-    margin = _settings_float("trading.margin_usdt", 5.0)
-    leverage = max(1.0, _settings_float("trading.leverage", 10.0))
-    return max(0.0, margin * leverage)
-
-
-def _fee_rate_per_side() -> float:
-    fee = _settings_float("tp.fee_rate_per_side", 0.0)
-    if fee <= 0:
-        fee = _settings_float("trading.taker_fee_rate", 0.0006)
-    return max(0.0, fee)
-
-
-def _min_net_profit_usdt() -> float:
-    return max(0.0, _settings_float("tp.min_net_profit_usdt", 0.10))
-
-
-def _tradability_score(
-    candidate: AnalysisCandidate,
-    movement: MovementHunterResult,
-    prediction: MovementPredictionResult,
-    learning: Optional[Any],
-) -> Tuple[float, List[str], List[str]]:
-    """Estimate whether a technically good move is worth REAL money.
-
-    This is not order sizing and does not replace tp_sl_engine.py. It prevents
-    AI from sending REAL on tiny/fee-eaten moves. Good but low-profit moves go
-    to GHOST so the hunter still learns from them.
-    """
-    reasons: List[str] = []
-    warnings: List[str] = []
-
-    notional = _estimated_notional_usdt()
-    fee = notional * _fee_rate_per_side() * 2.0
-    min_net = _min_net_profit_usdt()
-
-    if notional <= 0:
-        warnings.append("TRADABILITY_NO_NOTIONAL_FALLBACK")
-        return 50.0, reasons, warnings
-
-    s = candidate.sensor_snapshot
-    atr_pct = max(0.0, safe_float(getattr(s, "atr_percent", 0.0), 0.0))
-    expected_pct = max(0.0, safe_float(getattr(prediction, "expected_move_percent", 0.0), 0.0))
-
-    phase = str(getattr(prediction, "predicted_phase", "") or "").upper()
-    if phase in {"PRE_START", "START"}:
-        expected_component = expected_pct * 0.65
-    elif phase == "MID":
-        expected_component = expected_pct * 0.50
-    else:
-        expected_component = expected_pct * 0.35
-
-    candidate_tp_pct = max(atr_pct * 0.85, expected_component)
-
-    early = _learning_float(learning, "early_success_rate", 0.0)
-    premove = _learning_float(learning, "premove_success_rate", 0.0)
-    timing = _learning_float(learning, "timing_score", 50.0)
-    if early >= 45.0 or premove >= 45.0 or timing >= 68.0:
-        candidate_tp_pct = max(candidate_tp_pct, expected_pct * 0.70, atr_pct * 0.95)
-        reasons.append("TRADABILITY_EARLY_MEMORY_SUPPORT")
-
-    gross = notional * candidate_tp_pct / 100.0
-    net = gross - fee
-    required_pct = ((fee + min_net) / notional) * 100.0 if notional > 0 else 0.0
-
-    rel_vol = safe_float(getattr(s, "relative_volume", 0.0), 0.0)
-    volume_bonus = 0.0
-    if rel_vol >= 1.8 or bool(getattr(s, "volume_spike", False)):
-        volume_bonus += 8.0
-        reasons.append("TRADABILITY_VOLUME_SUPPORT")
-    elif rel_vol > 0 and rel_vol < 0.65:
-        volume_bonus -= 10.0
-        warnings.append("TRADABILITY_LOW_VOLUME")
-
-    fee_cover_score = clamp((candidate_tp_pct / max(required_pct, 1e-9)) * 55.0, 0.0, 70.0)
-    net_score = clamp((net / max(min_net, 0.01)) * 30.0, 0.0, 35.0)
-    move_score = clamp(candidate_tp_pct * 12.0, 0.0, 18.0)
-    score = clamp(fee_cover_score + net_score + move_score + volume_bonus, 0.0, 100.0)
-
-    if net < min_net:
-        warnings.append("TRADABILITY_NET_PROFIT_BELOW_MIN")
-    if candidate_tp_pct < required_pct:
-        warnings.append("TRADABILITY_TP_TOO_SMALL_FOR_FEES")
-    if score >= 70:
-        reasons.append("TRADABILITY_REAL_PROFIT_OK")
-    elif score >= 45:
-        reasons.append("TRADABILITY_BORDERLINE")
-    else:
-        reasons.append("TRADABILITY_GHOST_FEE_RISK")
-
-    return score, reasons, warnings
-
-def _hunter_memory_support(learning: Optional[Any]) -> Tuple[float, float, float, float, int, Tuple[str, ...]]:
-    """Return timing/outcome memory fields when available.
-
-    Backward compatible: older coin_learning summaries do not have these fields,
-    so this function falls back to similar_win_rate and neutral timing.
-    """
-    similar_wr = _learning_float(learning, "similar_win_rate", 50.0)
-    return (
-        clamp(_learning_float(learning, "timing_score", 50.0)),
-        clamp(_learning_float(learning, "early_success_rate", 0.0)),
-        clamp(_learning_float(learning, "fuzzy_match_score", 0.0)),
-        clamp(_learning_float(learning, "outcome_success_rate", similar_wr)),
-        max(0, _learning_int(learning, "sample_count", 0)),
-        _learning_notes(learning),
-    )
-
-
-class DecisionInputValidator:
-    """Hard safety validation before any AI decision."""
-
-    def validate(
-        self,
-        candidate: AnalysisCandidate,
-        movement: MovementHunterResult,
-        trap: TrapResult,
-        state: StateResult,
-        confidence: ConfidenceResult,
-        correlation: CorrelationResult,
-        prediction: MovementPredictionResult,
-    ) -> Tuple[bool, List[str], List[str]]:
-        warnings: List[str] = []
-        reject_reasons: List[str] = []
-
-        # Only truly unusable raw input is a hard validation reject.
-        # Layer-level invalid states should remain learnable and go to GHOST.
-        if not candidate.valid:
-            reject_reasons.append("INVALID_ANALYSIS_CANDIDATE")
-
-        try:
-            if candidate.sensor_snapshot.price <= 0:
-                reject_reasons.append("INVALID_ENTRY_PRICE")
-        except Exception:
-            reject_reasons.append("INVALID_ENTRY_PRICE")
-
-        if not movement.valid:
-            warnings.append("INVALID_MOVEMENT_RESULT_SOFT_GHOST")
-        if not trap.valid:
-            warnings.append("INVALID_TRAP_RESULT_SOFT_GHOST")
-        if not state.valid:
-            warnings.append("INVALID_STATE_RESULT_SOFT_GHOST")
-        if not confidence.valid:
-            warnings.append("INVALID_CONFIDENCE_RESULT_SOFT_GHOST")
-        if not correlation.valid:
-            warnings.append("INVALID_CORRELATION_RESULT_SOFT_GHOST")
-        if not prediction.valid:
-            warnings.append("INVALID_MOVEMENT_PREDICTION_SOFT_GHOST")
-
-        direction = normalize_direction(candidate.direction_hint)
-        if direction not in {DIRECTION_LONG, DIRECTION_SHORT}:
-            warnings.append("NO_VALID_CANDIDATE_DIRECTION_SOFT_GHOST")
-
-        if candidate.symbol != movement.symbol:
-            warnings.append("SYMBOL_MISMATCH_MOVEMENT")
-        if candidate.symbol != trap.symbol:
-            warnings.append("SYMBOL_MISMATCH_TRAP")
-        if candidate.symbol != state.symbol:
-            warnings.append("SYMBOL_MISMATCH_STATE")
-        if candidate.symbol != correlation.symbol:
-            warnings.append("SYMBOL_MISMATCH_CORRELATION")
-        if candidate.symbol != prediction.symbol:
-            warnings.append("SYMBOL_MISMATCH_PREDICTION")
-
-        return len(reject_reasons) == 0, warnings, reject_reasons
-
-
 class AIScoreComposer:
-    """Combines all layers into one final AI score."""
+    def sensor_birth_score(self, candidate: AnalysisCandidate, direction: str) -> Tuple[float, List[str]]:
+        m = candidate.momentum_state
+        reasons: List[str] = []
+        score = 0.0
+
+        if direction == DIRECTION_LONG:
+            if m.rsi_slope > 0:
+                score += min(18.0, abs(m.rsi_slope) * 5.0)
+                reasons.append("RSI_BUILDING_LONG")
+            if m.rsi_acceleration > 0:
+                score += min(12.0, abs(m.rsi_acceleration) * 5.0)
+                reasons.append("RSI_ACCEL_LONG")
+            if m.histogram_slope > 0:
+                score += min(20.0, abs(m.histogram_slope) * 1000.0)
+                reasons.append("HIST_BUILDING_LONG")
+            if m.histogram_acceleration > 0:
+                score += min(14.0, abs(m.histogram_acceleration) * 1000.0)
+                reasons.append("HIST_ACCEL_LONG")
+            if m.power_delta > 0:
+                score += min(18.0, abs(m.power_delta) * 0.75)
+                reasons.append("BUY_POWER_BUILDING")
+            if m.plus_di > m.minus_di and m.adx_slope >= 0:
+                score += 8.0
+                reasons.append("ADX_DI_LONG_SUPPORT")
+
+        elif direction == DIRECTION_SHORT:
+            if m.rsi_slope < 0:
+                score += min(18.0, abs(m.rsi_slope) * 5.0)
+                reasons.append("RSI_BUILDING_SHORT")
+            if m.rsi_acceleration < 0:
+                score += min(12.0, abs(m.rsi_acceleration) * 5.0)
+                reasons.append("RSI_ACCEL_SHORT")
+            if m.histogram_slope < 0:
+                score += min(20.0, abs(m.histogram_slope) * 1000.0)
+                reasons.append("HIST_BUILDING_SHORT")
+            if m.histogram_acceleration < 0:
+                score += min(14.0, abs(m.histogram_acceleration) * 1000.0)
+                reasons.append("HIST_ACCEL_SHORT")
+            if m.power_delta < 0:
+                score += min(18.0, abs(m.power_delta) * 0.75)
+                reasons.append("SELL_POWER_BUILDING")
+            if m.minus_di > m.plus_di and m.adx_slope >= 0:
+                score += 8.0
+                reasons.append("ADX_DI_SHORT_SUPPORT")
+
+        if m.volume_expansion:
+            score += 8.0
+            reasons.append("VOLUME_EXPANSION")
+        if m.volume_spike:
+            score += 8.0
+            reasons.append("VOLUME_SPIKE")
+        if str(m.atr_expansion).upper() == "EXPANDING":
+            score += 8.0
+            reasons.append("ATR_EXPANDING")
+        if m.atr_explosion:
+            score += 8.0
+            reasons.append("ATR_EXPLOSION")
+        if m.compression_score >= 45 and m.range_probability < 85:
+            score += 8.0
+            reasons.append("COMPRESSION_BEFORE_MOVE")
+
+        return clamp(score), reasons
+
+    def market_score(self, candidate: AnalysisCandidate, direction: str) -> Tuple[float, List[str]]:
+        mode = str((candidate.market_mode or {}).get("mode", "NEUTRAL")).upper()
+        reasons: List[str] = []
+
+        if mode == "BULLISH":
+            if direction == DIRECTION_LONG:
+                reasons.append("MARKET_MODE_SUPPORTS_LONG")
+                return 8.0, reasons
+            if direction == DIRECTION_SHORT:
+                reasons.append("MARKET_MODE_AGAINST_SHORT")
+                return -6.0, reasons
+        elif mode == "BEARISH":
+            if direction == DIRECTION_SHORT:
+                reasons.append("MARKET_MODE_SUPPORTS_SHORT")
+                return 8.0, reasons
+            if direction == DIRECTION_LONG:
+                reasons.append("MARKET_MODE_AGAINST_LONG")
+                return -6.0, reasons
+        elif mode == "CHOPPY":
+            reasons.append("MARKET_MODE_CHOPPY")
+            return -5.0, reasons
+
+        reasons.append("MARKET_MODE_NEUTRAL")
+        return 0.0, reasons
+
+    def tradability_score(self, candidate: AnalysisCandidate, prediction: MovementPredictionResult, learning: Optional[Any]) -> Tuple[float, float, List[str], List[str]]:
+        reasons: List[str] = []
+        warnings: List[str] = []
+
+        notional = estimated_notional_usdt()
+        if notional <= 0:
+            warnings.append("NO_NOTIONAL_FOR_FEE_CHECK")
+            return 50.0, 0.0, reasons, warnings
+
+        total_fee = notional * fee_rate_per_side() * 2.0
+        min_net = min_net_profit_usdt()
+
+        m = candidate.momentum_state
+        atr_pct = max(0.0, safe_float(m.atr_percent))
+        expected_pct = max(0.0, obj_float(prediction, "expected_move_percent", 0.0))
+        phase = str(obj_value(prediction, "predicted_phase", PHASE_UNKNOWN)).upper()
+
+        if phase in {PHASE_PRE_START, PHASE_START}:
+            gross_move_pct = max(atr_pct * 0.95, expected_pct * 0.70)
+        elif phase == PHASE_MID:
+            gross_move_pct = max(atr_pct * 0.75, expected_pct * 0.55)
+        else:
+            gross_move_pct = max(atr_pct * 0.55, expected_pct * 0.35)
+
+        if obj_float(learning, "early_success_rate", 0.0) >= 35 or obj_float(learning, "timing_score", 50.0) >= 62:
+            gross_move_pct = max(gross_move_pct, atr_pct * 0.95, expected_pct * 0.72)
+            reasons.append("LEARNING_SUPPORTS_EXPECTED_MOVE")
+
+        gross_usdt = notional * gross_move_pct / 100.0
+        net_usdt = gross_usdt - total_fee
+        required_pct = ((total_fee + min_net) / notional) * 100.0
+
+        fee_cover = clamp((gross_move_pct / max(required_pct, 1e-9)) * 70.0, 0.0, 75.0)
+        net_quality = clamp((net_usdt / max(min_net, 0.01)) * 28.0, 0.0, 35.0)
+        volume_bonus = 0.0
+        if m.relative_volume >= 1.8 or m.volume_spike:
+            volume_bonus = 8.0
+            reasons.append("VOLUME_SUPPORTS_TRADABILITY")
+        elif 0 < m.relative_volume < 0.65:
+            volume_bonus = -8.0
+            warnings.append("LOW_VOLUME_TRADABILITY")
+
+        score = clamp(fee_cover + net_quality + volume_bonus)
+
+        if net_usdt < min_net:
+            warnings.append("NET_PROFIT_BELOW_MINIMUM")
+        else:
+            reasons.append("NET_PROFIT_USEFUL")
+        if gross_move_pct < required_pct:
+            warnings.append("MOVE_TOO_SMALL_FOR_FEES")
+
+        return score, net_usdt, reasons, warnings
+
+    def learning_score(self, learning: Optional[Any]) -> Tuple[float, List[str], List[str]]:
+        reasons: List[str] = []
+        warnings: List[str] = []
+
+        if learning is None:
+            warnings.append("NO_LEARNING_SUMMARY")
+            return 50.0, reasons, warnings
+
+        sample_count = obj_int(learning, "sample_count", 0)
+        outcome = obj_float(learning, "outcome_success_rate", 50.0)
+        timing = obj_float(learning, "timing_score", 50.0)
+        early = obj_float(learning, "early_success_rate", 0.0)
+        fuzzy = obj_float(learning, "fuzzy_match_score", 0.0)
+        pattern_conf = obj_float(learning, "pattern_confidence", 0.0)
+        risk_label = str(obj_value(learning, "risk_label", "UNKNOWN")).upper()
+
+        sample_score = min(100.0, sample_count * 7.0)
+        score = clamp(
+            outcome * 0.28
+            + timing * 0.24
+            + early * 0.14
+            + fuzzy * 0.12
+            + pattern_conf * 0.12
+            + sample_score * 0.10
+        )
+
+        if risk_label == "FAVORABLE_CONDITION":
+            score = clamp(score + 8.0)
+            reasons.append("LEARNING_FAVORABLE")
+        elif risk_label == "RISKY_CONDITION":
+            score = clamp(score - 14.0)
+            warnings.append("LEARNING_RISKY_CONDITION")
+
+        if sample_count <= 0:
+            warnings.append("LEARNING_LOW_DATA")
+        elif sample_count < 3:
+            warnings.append("LEARNING_SMALL_SAMPLE")
+        if early >= 35 and timing >= 58:
+            reasons.append("LEARNING_EARLY_PATTERN_WORKED")
+
+        return score, reasons, warnings
 
     def compose(
         self,
         candidate: AnalysisCandidate,
-        movement: MovementHunterResult,
-        trap: TrapResult,
-        state: StateResult,
-        confidence: ConfidenceResult,
-        correlation: CorrelationResult,
-        learning: Optional[LearningSummary],
         prediction: MovementPredictionResult,
-        meta: Optional[MetaLearningSummary],
-    ) -> DecisionScore:
-        w_analysis = _meta_weight(meta, "analysis_engine")
-        w_movement = _meta_weight(meta, "movement_hunter")
-        w_trap = _meta_weight(meta, "trap_engine")
-        w_state = _meta_weight(meta, "state_engine")
-        w_conf = _meta_weight(meta, "confidence_engine")
-        w_corr = _meta_weight(meta, "correlation_engine")
-        w_learning = _meta_weight(meta, "coin_learning")
-        w_pred = _meta_weight(meta, "movement_predictor")
-
-        analysis_score = clamp(candidate.quality.total_quality - candidate.risk.total_risk * 0.25)
-        movement_score = clamp(movement.readiness_score * 0.60 + movement.continuation_probability * 0.40)
-        prediction_score = clamp(prediction.movement_probability * 0.70 + prediction.similarity_score * 0.30)
-        confidence_score = clamp(confidence.confidence_score)
-
-        learning_score = 50.0
-        if learning is not None:
-            timing_score, early_success_rate, fuzzy_match_score, outcome_success_rate, sample_count, notes = _hunter_memory_support(learning)
-            similar_wr = clamp(_learning_float(learning, "similar_win_rate", 50.0))
-            risk_label = str(_learning_value(learning, "risk_label", "") or "").upper()
-
-            # Movement Hunter learning score:
-            # result matters, but timing and pre-move similarity matter too.
-            # A late profitable setup must not score the same as a setup that
-            # repeatedly caught the first candle before pump/dump.
-            sample_score = min(100.0, sample_count * 5.0)
-            memory_bonus = 0.0
-            if timing_score >= 65:
-                memory_bonus += 5.0
-            if early_success_rate >= 45:
-                memory_bonus += 6.0
-            if fuzzy_match_score >= 70:
-                memory_bonus += 4.0
-            if "PREMOVE_PATTERN_WORKED_WITH_TIMING" in notes:
-                memory_bonus += 5.0
-            if "PREMOVE_PATTERN_WEAK_OR_LATE" in notes:
-                memory_bonus -= 8.0
-            if "TIMING_LATE_OR_WEAK_PATTERN" in notes:
-                memory_bonus -= 5.0
-
-            learning_score = clamp(
-                similar_wr * 0.28
-                + outcome_success_rate * 0.24
-                + timing_score * 0.20
-                + early_success_rate * 0.12
-                + fuzzy_match_score * 0.08
-                + sample_score * 0.08
-                + (10.0 if risk_label == "FAVORABLE_CONDITION" else 0.0)
-                - (16.0 if risk_label == "RISKY_CONDITION" else 0.0)
-                + memory_bonus
-            )
-
-        state_score = clamp(
-            state.state_confidence
-            - state.late_entry_risk * 0.35
-            - state.exhaustion_risk * 0.35
-            - state.range_probability * 0.20
-        )
-
-        trap_penalty = clamp(trap.trap_risk * 0.75 + trap.liquidity_risk * 0.30) * w_trap
-        correlation_penalty = clamp(correlation.exposure_risk * 0.55) * w_corr
-        range_penalty = clamp(state.range_probability * 0.45 + candidate.sensor_snapshot.range_probability * 0.25)
-        late_penalty = clamp(state.late_entry_risk * 0.50 + movement.reversal_pressure * 0.35)
-
-        tradability_score, _, _ = _tradability_score(
-            candidate=candidate,
-            movement=movement,
-            prediction=prediction,
-            learning=learning,
-        )
-
-        # Movement Hunter balance:
-        # classic analysis remains a sensor, while movement prediction and
-        # conditional coin-learning carry more influence in the final score.
-        positive = (
-            analysis_score * 0.10 * w_analysis
-            + movement_score * 0.26 * w_movement
-            + prediction_score * 0.26 * w_pred
-            + confidence_score * 0.12 * w_conf
-            + learning_score * 0.18 * w_learning
-            + state_score * 0.06 * w_state
-            + tradability_score * 0.02
-        )
-
-        # Keep penalties meaningful but not dominant.
-        # The previous weights could crush otherwise valid Movement Hunter setups
-        # into near-zero scores, causing continuous REJECT decisions.
-        penalty = (
-            trap_penalty * 0.16
-            + correlation_penalty * 0.08
-            + range_penalty * 0.09
-            + late_penalty * 0.11
-        )
-
-        # Slightly normalize positive evidence so balanced conditions can reach
-        # GHOST/REAL thresholds without removing risk protection.
-        final = clamp((positive * 1.22) - penalty)
-
-        return DecisionScore(
-            analysis_score=clamp(analysis_score),
-            movement_score=clamp(movement_score),
-            prediction_score=clamp(prediction_score),
-            confidence_score=clamp(confidence_score),
-            learning_score=clamp(learning_score),
-            state_score=clamp(state_score),
-            trap_penalty=clamp(trap_penalty),
-            correlation_penalty=clamp(correlation_penalty),
-            range_penalty=clamp(range_penalty),
-            late_penalty=clamp(late_penalty),
-            tradability_score=clamp(tradability_score),
-            final_score=final,
-        )
-
-
-class HardRejectRules:
-    """
-    Safety-only hard blocks.
-
-    Important architecture rule:
-    Market conditions such as RANGE / DEAD / LATE / LOW_DATA must NOT hard-reject.
-    They should be routed to GHOST so the AI can learn from them.
-    """
-
-    def check(
-        self,
-        candidate: AnalysisCandidate,
-        movement: MovementHunterResult,
-        trap: TrapResult,
-        state: StateResult,
-        confidence: ConfidenceResult,
-        correlation: CorrelationResult,
-        prediction: MovementPredictionResult,
-        score: DecisionScore,
-    ) -> Tuple[bool, List[str]]:
-        reasons: List[str] = []
-
-        # Only corrupted/unusable input remains a hard reject.
-        # Risky market states are handled by DecisionTypeClassifier as GHOST,
-        # not by blocking the learning pipeline.
-        try:
-            if not bool(candidate.valid):
-                reasons.append(REJECT_REASON_INVALID)
-            if getattr(candidate, "sensor_snapshot", None) is None:
-                reasons.append(REJECT_REASON_INVALID)
-            elif not bool(getattr(candidate.sensor_snapshot, "valid", True)):
-                reasons.append(REJECT_REASON_INVALID)
-            elif safe_float(getattr(candidate.sensor_snapshot, "price", 0.0), 0.0) <= 0.0:
-                reasons.append(REJECT_REASON_INVALID)
-        except Exception:
-            reasons.append(REJECT_REASON_INVALID)
-
-        return len(reasons) > 0, list(dict.fromkeys(reasons))
-
-
-class DecisionTypeClassifier:
-    """Converts score/context into REAL, GHOST or REJECT.
-
-    Movement Hunter policy:
-    - REAL must be selective and fresh/live.
-    - GHOST remains the broad learning path.
-    - Learning can promote strong familiar conditions, but it must not override
-      explicit GHOST-only warnings such as LATE, RANGE, HIGH_TRAP, or LOW_DATA.
-    """
-
-    def classify(
-        self,
-        score: DecisionScore,
-        candidate: AnalysisCandidate,
-        movement: MovementHunterResult,
-        trap: TrapResult,
-        state: StateResult,
-        confidence: ConfidenceResult,
-        correlation: CorrelationResult,
-        learning: Optional[LearningSummary],
-        prediction: MovementPredictionResult,
-    ) -> Tuple[str, List[str], List[str]]:
+        learning: Optional[Any] = None,
+    ) -> Tuple[DecisionScore, Tuple[str, ...], Tuple[str, ...], float]:
         reasons: List[str] = []
         warnings: List[str] = []
 
-        configured_min_real = safe_float(getattr(SETTINGS.ai, "min_real_confidence", 72.0), 72.0)
-        configured_min_ghost = safe_float(getattr(SETTINGS.ai, "min_ghost_confidence", 45.0), 45.0)
+        direction = normalize_direction(candidate.direction_hint)
+        sensor_score, r = self.sensor_birth_score(candidate, direction)
+        reasons.extend(r)
 
-        # Speed Hunter mode: REAL remains protected, but the AI must not wait
-        # until the whole 5M move becomes obvious. GHOST remains broad for learning.
-        min_real = clamp(configured_min_real, 58.0, 70.0)
-        min_ghost = clamp(configured_min_ghost, 20.0, 38.0)
-        max_real_risk = safe_float(getattr(SETTINGS.ai, "max_real_risk", 38.0), 38.0)
-
-        learning_sample_count = 0
-        learning_win_rate = 0.0
-        learning_risk_label = ""
-        learning_confidence_hint = ""
-        timing_score = 50.0
-        early_success_rate = 0.0
-        fuzzy_match_score = 0.0
-        outcome_success_rate = 50.0
-        learning_notes: Tuple[str, ...] = ()
-        if learning is not None:
-            learning_sample_count = max(0, _learning_int(learning, "sample_count", 0))
-            learning_win_rate = clamp(_learning_float(learning, "similar_win_rate", 0.0), 0.0)
-            learning_risk_label = str(_learning_value(learning, "risk_label", "") or "").upper()
-            learning_confidence_hint = str(_learning_value(learning, "confidence_hint", "") or "").upper()
-            timing_score, early_success_rate, fuzzy_match_score, outcome_success_rate, _, learning_notes = _hunter_memory_support(learning)
-
-        low_data = learning is not None and learning_confidence_hint == "LOW_DATA"
-        # Risk is evaluated after hunter-memory quality below.
-        risky_learning = False
-        hunter_memory_good = (
-            learning is not None
-            and learning_sample_count >= 3
-            and outcome_success_rate >= 52.0
-            and (timing_score >= 62.0 or early_success_rate >= 35.0 or fuzzy_match_score >= 68.0)
-            and "PREMOVE_PATTERN_WEAK_OR_LATE" not in learning_notes
-        )
-        hunter_memory_strong = (
-            learning is not None
-            and learning_sample_count >= 5
-            and outcome_success_rate >= 58.0
-            and (timing_score >= 68.0 or early_success_rate >= 45.0)
-            and fuzzy_match_score >= 62.0
-            and "TIMING_LATE_OR_WEAK_PATTERN" not in learning_notes
-        )
-        # Warm-up bridge:
-        # After a clean reset the bot may have many strong GHOST wins but still
-        # mark each individual coin/condition as LOW_DATA. LOW_DATA should slow
-        # REAL down, not fully freeze it when movement, timing and profit quality
-        # are all good.
-        low_data_real_bridge = (
-            low_data
-            and learning is not None
-            and learning_sample_count >= 3
-            and outcome_success_rate >= 58.0
-            and (timing_score >= 60.0 or early_success_rate >= 35.0 or fuzzy_match_score >= 64.0)
+        prediction_score = clamp(
+            obj_float(prediction, "movement_probability", 0.0) * 0.56
+            + obj_float(prediction, "pattern_match_score", 0.0) * 0.22
+            + obj_float(prediction, "pattern_confidence", 0.0) * 0.14
+            + obj_float(prediction, "pattern_win_rate", 0.0) * 0.08
         )
 
-        good_learning = (
-            learning is not None
-            and learning_sample_count >= 6
-            and learning_win_rate >= 62.0
-            and learning_risk_label != "RISKY_CONDITION"
-        ) or hunter_memory_good
-        very_strong_learning = (
-            learning is not None
-            and learning_sample_count >= 10
-            and learning_win_rate >= 68.0
-            and learning_risk_label == "FAVORABLE_CONDITION"
-        ) or hunter_memory_strong
+        learning_score, r, w = self.learning_score(learning)
+        reasons.extend(r)
+        warnings.extend(w)
 
-        risky_learning = (
-            learning is not None
-            and (
-                learning_risk_label == "RISKY_CONDITION"
-                or (learning_sample_count >= 4 and learning_win_rate > 0 and learning_win_rate <= 45.0 and not hunter_memory_good)
-                or (learning_sample_count >= 5 and outcome_success_rate <= 38.0 and timing_score <= 42.0)
-            )
+        market_score, r = self.market_score(candidate, direction)
+        reasons.extend(r)
+
+        phase = str(obj_value(prediction, "predicted_phase", PHASE_UNKNOWN)).upper()
+        if phase in {PHASE_PRE_START, PHASE_START}:
+            freshness_score = 100.0
+            reasons.append("PREDICTED_EARLY_START")
+        elif phase == PHASE_MID:
+            freshness_score = 62.0
+            reasons.append("PREDICTED_MID_MOVE")
+        elif phase == PHASE_LATE:
+            freshness_score = 18.0
+            warnings.append("PREDICTED_LATE_MOVE")
+        elif phase == PHASE_RANGE:
+            freshness_score = 20.0
+            warnings.append("PREDICTED_RANGE")
+        else:
+            freshness_score = 35.0
+            warnings.append("PREDICTED_UNKNOWN")
+
+        m = candidate.momentum_state
+        range_penalty = 0.0
+        if m.range_probability >= 88:
+            range_penalty = 22.0
+            warnings.append("HIGH_RANGE_PROBABILITY")
+        elif m.range_probability >= 75:
+            range_penalty = 10.0
+            warnings.append("RANGE_CAUTION")
+
+        late_penalty = 0.0
+        change = safe_float(m.price_change_percent)
+        atr = max(0.05, safe_float(m.atr_percent))
+        if direction == DIRECTION_LONG and change > max(atr * 2.2, 1.65):
+            late_penalty = 24.0
+            warnings.append("LONG_MOVE_ALREADY_EXTENDED")
+        elif direction == DIRECTION_SHORT and change < -max(atr * 2.2, 1.65):
+            late_penalty = 24.0
+            warnings.append("SHORT_MOVE_ALREADY_EXTENDED")
+        if phase == PHASE_LATE:
+            late_penalty = max(late_penalty, 30.0)
+
+        tradability, net_usdt, r, w = self.tradability_score(candidate, prediction, learning)
+        reasons.extend(r)
+        warnings.extend(w)
+
+        fee_penalty = 0.0
+        if tradability < 35:
+            fee_penalty = 18.0
+        elif tradability < 50:
+            fee_penalty = 8.0
+
+        final_score = clamp(
+            sensor_score * 0.28
+            + prediction_score * 0.30
+            + learning_score * 0.18
+            + freshness_score * 0.14
+            + clamp(50.0 + market_score, 0.0, 100.0) * 0.04
+            + tradability * 0.06
+            - range_penalty * 0.45
+            - late_penalty * 0.70
+            - fee_penalty
         )
 
-        s = candidate.sensor_snapshot
-        compression_score = safe_float(getattr(s, "compression_score", 0.0), 0.0)
-        expansion_probability = safe_float(getattr(s, "expansion_probability", 0.0), 0.0)
+        score = DecisionScore(
+            sensor_score=clamp(sensor_score),
+            prediction_score=clamp(prediction_score),
+            learning_score=clamp(learning_score),
+            market_score=clamp(market_score, -100.0, 100.0),
+            freshness_score=clamp(freshness_score),
+            range_penalty=clamp(range_penalty),
+            late_penalty=clamp(late_penalty),
+            fee_penalty=clamp(fee_penalty),
+            tradability_score=clamp(tradability),
+            final_score=clamp(final_score),
+        )
+        return score, tuple(dict.fromkeys(reasons)), tuple(dict.fromkeys(warnings)), net_usdt
 
-        # Speed Hunter birth signal:
-        # No candle-confirmation logic here. This is a probability gate built
-        # from live technical sensors so Level-1/5M style decisions can be
-        # predictive instead of follower/chaser.
-        sensor_direction_birth = (
-            (
-                normalize_direction(candidate.direction_hint) == DIRECTION_LONG
-                and safe_float(getattr(s, "rsi_slope", 0.0), 0.0) > 0
-                and safe_float(getattr(s, "histogram_slope", 0.0), 0.0) > 0
-                and safe_float(getattr(s, "power_delta", 0.0), 0.0) > 2.5
-            )
-            or (
-                normalize_direction(candidate.direction_hint) == DIRECTION_SHORT
-                and safe_float(getattr(s, "rsi_slope", 0.0), 0.0) < 0
-                and safe_float(getattr(s, "histogram_slope", 0.0), 0.0) < 0
-                and safe_float(getattr(s, "power_delta", 0.0), 0.0) < -2.5
-            )
-        )
-        compression_birth = (
-            compression_score >= 30.0
-            and safe_float(getattr(s, "range_probability", 0.0), 0.0) < 90.0
-            and (
-                abs(safe_float(getattr(s, "power_delta", 0.0), 0.0)) >= 6.0
-                or bool(getattr(s, "volume_expansion", False))
-                or bool(getattr(s, "volume_spike", False))
-                or str(getattr(s, "atr_expansion", "")).upper() == "EXPANDING"
-                or safe_float(getattr(s, "atr_slope", 0.0), 0.0) > 0
-            )
-        )
-        speed_prediction_signal = (
-            prediction.predicted_phase in {"PRE_START", "START"}
-            or sensor_direction_birth
-            or compression_birth
-            or (
-                prediction.movement_probability >= 52.0
-                and movement.readiness_score >= 38.0
-                and state.late_entry_risk < 84.0
-            )
-        )
 
-        range_breakout_opportunity = (
-            state.market_state == "RANGE"
-            and compression_score >= 44.0
-            and (
-                expansion_probability >= 34.0
-                or movement.readiness_score >= 44.0
-                or prediction.movement_probability >= 48.0
-                or speed_prediction_signal
-                or bool(getattr(s, "volume_expansion", False))
-                or str(getattr(s, "atr_expansion", "")).upper() == "EXPANDING"
-                or hunter_memory_good
-            )
-            and trap.trap_risk < 68.0
-        )
+class DecisionTypeClassifier:
+    def classify(
+        self,
+        candidate: AnalysisCandidate,
+        prediction: MovementPredictionResult,
+        learning: Optional[Any],
+        score: DecisionScore,
+    ) -> Tuple[str, Tuple[str, ...], Tuple[str, ...], Tuple[str, ...]]:
+        reasons: List[str] = []
+        warnings: List[str] = []
+        rejects: List[str] = []
 
-        tradability_score = clamp(getattr(score, "tradability_score", 50.0))
-        low_tradability = tradability_score < 35.0
-        very_low_tradability = tradability_score < 22.0
+        if not bool(getattr(candidate, "valid", True)):
+            rejects.append("INVALID_CANDIDATE")
+        if safe_float(getattr(candidate.sensor_snapshot, "price", 0.0), 0.0) <= 0:
+            rejects.append("INVALID_PRICE")
+        direction = normalize_direction(candidate.direction_hint)
+        if direction == DIRECTION_NEUTRAL:
+            rejects.append("NO_DIRECTION")
+        if rejects:
+            return DECISION_REJECT, tuple(reasons), tuple(warnings), tuple(dict.fromkeys(rejects))
+
+        min_real = clamp(settings_float("ai.min_real_confidence", 62.0), 52.0, 72.0)
+        min_ghost = clamp(settings_float("ai.min_ghost_confidence", 28.0), 18.0, 45.0)
+
+        phase = str(obj_value(prediction, "predicted_phase", PHASE_UNKNOWN)).upper()
+        movement_probability = obj_float(prediction, "movement_probability", 0.0)
+        pattern_count = obj_int(prediction, "pattern_count", 0)
+        pattern_confidence = obj_float(prediction, "pattern_confidence", 0.0)
+
+        learning_samples = obj_int(learning, "sample_count", 0)
+        learning_risk = str(obj_value(learning, "risk_label", "UNKNOWN")).upper()
+        learning_hint = str(obj_value(learning, "confidence_hint", "LOW_DATA")).upper()
+        early_rate = obj_float(learning, "early_success_rate", 0.0)
+        timing_score = obj_float(learning, "timing_score", 50.0)
+
+        early_phase = phase in {PHASE_PRE_START, PHASE_START}
+        live_enough = movement_probability >= 44 or score.sensor_score >= 42 or score.prediction_score >= 42
+        useful_patterns = pattern_count >= 3 or pattern_confidence >= 45 or early_rate >= 35 or timing_score >= 60
 
         must_ghost = False
-
-        # GHOST-only conditions. These must not be bypassed by a loose bridge.
-        if confidence.should_downgrade_to_ghost:
-            if speed_prediction_signal and confidence.confidence_score >= 22.0 and trap.trap_risk < 62.0:
-                reasons.append("CONFIDENCE_DOWNGRADE_SOFTENED_BY_SPEED_SIGNAL")
-            else:
-                must_ghost = True
-                reasons.append("CONFIDENCE_REQUIRES_GHOST")
-        if prediction.should_prefer_ghost_if_uncertain:
-            if speed_prediction_signal and prediction.movement_probability >= 50.0 and trap.trap_risk < 64.0:
-                reasons.append("PREDICTOR_GHOST_SOFTENED_BY_SPEED_SIGNAL")
-            else:
-                must_ghost = True
-                reasons.append("PREDICTOR_PREFERS_GHOST")
-        if correlation.should_reduce_priority:
+        if score.tradability_score < 35:
             must_ghost = True
-            reasons.append("CORRELATION_REDUCES_PRIORITY")
-        if low_data:
-            if (
-                (low_data_real_bridge or speed_prediction_signal)
-                and tradability_score >= 38.0
-                and trap.trap_risk < 62.0
-                and prediction.predicted_phase in {"PRE_START", "START", "MID"}
-            ):
-                reasons.append("LOW_DATA_SPEED_REAL_BRIDGE_ALLOWED")
-            else:
-                must_ghost = True
-                reasons.append("LEARNING_LOW_DATA_GHOST")
-        if risky_learning:
+            reasons.append("LOW_TRADABILITY_GHOST")
+        if learning_risk == "RISKY_CONDITION":
             must_ghost = True
-            reasons.append("LEARNING_RISKY_CONDITION_GHOST_ONLY")
-        if low_tradability:
+            reasons.append("RISKY_LEARNING_GHOST")
+        if phase in {PHASE_LATE, PHASE_RANGE} and not (early_rate >= 45 and score.sensor_score >= 50):
             must_ghost = True
-            reasons.append("TRADABILITY_LOW_PROFIT_GHOST_ONLY")
-            warnings.append("REAL_BLOCKED_BY_LOW_NET_PROFIT_QUALITY")
-        if trap.trap_risk >= 72:
+            reasons.append(f"{phase}_GHOST")
+        if learning_hint == "LOW_DATA" and not (learning_samples >= 3 and live_enough and score.tradability_score >= 45):
             must_ghost = True
-            reasons.append("TRAP_RISK_GHOST_ONLY")
-        if state.market_state == "RANGE":
-            if range_breakout_opportunity:
-                reasons.append("RANGE_COMPRESSION_BREAKOUT_EXCEPTION")
-            else:
-                must_ghost = True
-                reasons.append("RANGE_GHOST_ONLY")
-        elif state.market_state in {"EXHAUSTION", "LATE"}:
-            if speed_prediction_signal and state.late_entry_risk < 84.0 and state.exhaustion_risk < 84.0 and trap.trap_risk < 62.0:
-                reasons.append(f"{state.market_state}_SOFTENED_BY_SPEED_SIGNAL")
-            else:
-                must_ghost = True
-                reasons.append(f"{state.market_state}_GHOST_ONLY")
-        if movement.freshness in {"DEAD", "UNKNOWN", "LATE"}:
-            if movement.freshness != "DEAD" and speed_prediction_signal and prediction.predicted_phase in {"PRE_START", "START"} and trap.trap_risk < 62.0:
-                reasons.append(f"FRESHNESS_{movement.freshness}_SOFTENED_BY_PREDICTION")
-            else:
-                must_ghost = True
-                reasons.append(f"FRESHNESS_{movement.freshness}_GHOST_ONLY")
-        if prediction.predicted_phase == "RANGE":
-            if range_breakout_opportunity:
-                reasons.append("PREDICTED_RANGE_COMPRESSION_EXCEPTION")
-            else:
-                must_ghost = True
-                reasons.append("PREDICTED_PHASE_RANGE_GHOST_ONLY")
-        elif prediction.predicted_phase in {"UNKNOWN", "LATE"}:
-            if prediction.predicted_phase == "UNKNOWN" and (sensor_direction_birth or compression_birth) and trap.trap_risk < 62.0:
-                reasons.append("PREDICTED_UNKNOWN_SOFTENED_BY_SENSOR_BIRTH")
-            else:
-                must_ghost = True
-                reasons.append(f"PREDICTED_PHASE_{prediction.predicted_phase}_GHOST_ONLY")
+            reasons.append("LOW_DATA_GHOST")
 
-        live_or_early_move = (
-            movement.freshness in {"FRESH", "MID"}
-            or prediction.predicted_phase in {"PRE_START", "START", "MID"}
-            or speed_prediction_signal
-        )
-        strong_live_confirmation = (
-            movement.readiness_score >= 46.0
-            or prediction.movement_probability >= 50.0
-            or speed_prediction_signal
-            or (
-                movement.readiness_score >= 38.0
-                and prediction.movement_probability >= 44.0
-                and confidence.confidence_score >= 22.0
-            )
-        )
-        severe_risk_block = (
-            trap.trap_risk >= 78.0
-            or trap.liquidity_risk >= 86.0
-            or correlation.exposure_risk >= 84.0
-            or movement.freshness == "DEAD"
-            or state.exhaustion_risk >= 88.0
-            or state.late_entry_risk >= 88.0
-            or (state.range_probability >= 90.0 and movement.readiness_score < 54.0 and not range_breakout_opportunity and not speed_prediction_signal)
-            or very_low_tradability
-        )
-
-        real_conf_floor = max(22.0, min_real - 30.0)
-
-        # Main REAL gate: strong score + live/fresh movement + no GHOST-only flags.
         real_allowed = (
-            score.final_score >= (min_real - 4.0)
-            and confidence.confidence_score >= real_conf_floor
-            and strong_live_confirmation
-            and live_or_early_move
-            and not must_ghost
-            and not severe_risk_block
-            and trap.trap_risk <= max_real_risk + 24.0
-            and correlation.exposure_risk < 76.0
+            not must_ghost
+            and score.final_score >= min_real
+            and live_enough
+            and early_phase
+            and useful_patterns
+            and score.tradability_score >= 45
+            and score.late_penalty < 24
+            and score.range_penalty < 22
         )
 
-        # Learning-assisted REAL: only when familiar condition history is good.
-        # This is intentionally much stricter than the old loose Ghost->REAL bridge.
-        learned_hunter_real = (
+        speed_real_bridge = (
             not real_allowed
             and not must_ghost
-            and not severe_risk_block
-            and live_or_early_move
-            and good_learning
-            and score.final_score >= (min_real - (18.0 if hunter_memory_good else 15.0))
-            and confidence.confidence_score >= (20.0 if hunter_memory_good else 22.0)
-            and (movement.readiness_score >= 38.0 or prediction.movement_probability >= 44.0 or speed_prediction_signal or hunter_memory_good)
-            and trap.trap_risk < 64.0
-            and correlation.exposure_risk < 72.0
+            and early_phase
+            and live_enough
+            and score.final_score >= min_real - 12
+            and score.sensor_score >= 48
+            and movement_probability >= 48
+            and score.tradability_score >= 45
         )
 
-        # Very strong learned condition can accept a slightly lower score, but
-        # still cannot override RANGE/LATE/HIGH_TRAP/LOW_DATA GHOST-only flags.
-        very_strong_learned_hunter_real = (
+        learning_real_bridge = (
             not real_allowed
-            and not learned_hunter_real
+            and not speed_real_bridge
             and not must_ghost
-            and not severe_risk_block
-            and live_or_early_move
-            and very_strong_learning
-            and score.final_score >= (min_real - (22.0 if hunter_memory_strong else 18.0))
-            and confidence.confidence_score >= (18.0 if hunter_memory_strong else 20.0)
-            and (movement.readiness_score >= 34.0 or prediction.movement_probability >= 42.0 or speed_prediction_signal or hunter_memory_strong)
-            and trap.trap_risk < 62.0
-            and correlation.exposure_risk < 70.0
+            and early_phase
+            and live_enough
+            and learning_samples >= 5
+            and early_rate >= 40
+            and timing_score >= 62
+            and score.final_score >= min_real - 14
+            and score.tradability_score >= 42
         )
 
-        # Controlled warm-up REAL:
-        # Prevents the bot from becoming "dry" after a reset. It is still
-        # protected by trap/correlation/tradability/freshness checks and needs
-        # a strong GHOST-style learning footprint.
-        controlled_warmup_real = (
-            not real_allowed
-            and not learned_hunter_real
-            and not very_strong_learned_hunter_real
-            and not must_ghost
-            and not severe_risk_block
-            and low_data_real_bridge
-            and live_or_early_move
-            and strong_live_confirmation
-            and score.final_score >= (min_real - 24.0)
-            and confidence.confidence_score >= 18.0
-            and tradability_score >= 38.0
-            and trap.trap_risk < 60.0
-            and correlation.exposure_risk < 70.0
-        )
-
-        # Pure speed-hunter REAL bridge:
-        # Used when the predictor/sensors say PRE_START/START before classic
-        # confirmation becomes obvious. This keeps the bot predictive, while
-        # still blocking severe trap, correlation, and fee-eaten trades.
-        speed_hunter_real = (
-            not real_allowed
-            and not learned_hunter_real
-            and not very_strong_learned_hunter_real
-            and not controlled_warmup_real
-            and not severe_risk_block
-            and not must_ghost
-            and speed_prediction_signal
-            and live_or_early_move
-            and score.final_score >= (min_real - 20.0)
-            and confidence.confidence_score >= 16.0
-            and prediction.movement_probability >= 44.0
-            and tradability_score >= 35.0
-            and trap.trap_risk < 62.0
-            and correlation.exposure_risk < 70.0
-            and not very_low_tradability
-        )
-
-        if real_allowed or learned_hunter_real or very_strong_learned_hunter_real or controlled_warmup_real or speed_hunter_real:
-            reasons.append("AI_DECISION_REAL_ALLOWED")
-            if controlled_warmup_real:
-                reasons.append("CONTROLLED_WARMUP_REAL")
-            if speed_hunter_real:
+        if real_allowed or speed_real_bridge or learning_real_bridge:
+            reasons.append("AI_DECISION_REAL")
+            if speed_real_bridge:
                 reasons.append("SPEED_HUNTER_REAL_BRIDGE")
-            if learned_hunter_real:
-                reasons.append("LEARNING_ASSISTED_HUNTER_REAL")
-            if very_strong_learned_hunter_real:
-                reasons.append("VERY_STRONG_LEARNING_HUNTER_REAL")
-            if good_learning:
-                reasons.append("CONDITIONAL_LEARNING_SUPPORTS_REAL")
-            if hunter_memory_good:
-                reasons.append("HUNTER_MEMORY_TIMING_SUPPORTS_REAL")
-            if hunter_memory_strong:
-                reasons.append("STRONG_PREMOVE_MEMORY_SUPPORTS_REAL")
-            if live_or_early_move:
-                reasons.append("LIVE_OR_EARLY_MOVEMENT_CONFIRMED")
-            if tradability_score >= 55.0:
-                reasons.append("TRADABILITY_CONFIRMS_REAL_VALUE")
-            return DECISION_REAL, reasons, warnings
+            if learning_real_bridge:
+                reasons.append("LEARNING_REAL_BRIDGE")
+            return DECISION_REAL, tuple(dict.fromkeys(reasons)), tuple(dict.fromkeys(warnings)), ()
 
         ghost_allowed = (
             score.final_score >= min_ghost
-            or confidence.confidence_score >= 8.0
-            or prediction.movement_probability >= 18.0
-            or movement.readiness_score >= 12.0
-            or score.analysis_score >= 45.0
-            or score.state_score >= 35.0
-            or low_data
-            or risky_learning
+            or movement_probability >= 18
+            or score.sensor_score >= 18
+            or score.prediction_score >= 18
+            or pattern_count > 0
+            or learning_samples >= 0
         )
-
         if ghost_allowed:
             reasons.append("AI_DECISION_GHOST_FOR_LEARNING")
             if must_ghost:
-                warnings.append("DOWNGRADED_TO_GHOST")
-            if risky_learning:
-                warnings.append("LEARNING_BLOCKED_REAL_TO_GHOST")
-            if low_data:
-                warnings.append("LOW_DATA_COLLECT_MORE_GHOST")
-            return DECISION_GHOST, reasons, warnings
+                warnings.append("REAL_DOWNGRADED_TO_GHOST")
+            return DECISION_GHOST, tuple(dict.fromkeys(reasons)), tuple(dict.fromkeys(warnings)), ()
 
-        # Final soft fallback: keep weak but valid candidates as GHOST so the AI
-        # keeps learning why they failed instead of losing data.
-        reasons.append("AI_DECISION_GHOST_SOFT_FALLBACK")
-        warnings.append("VERY_WEAK_CANDIDATE_GHOST_LEARNING")
-        return DECISION_GHOST, reasons, warnings
+        return DECISION_REJECT, tuple(reasons), tuple(warnings), ("TOO_WEAK_FOR_LEARNING",)
 
 
 class AIDecisionEngine:
-    """
-    The only final decision-maker in the architecture.
-
-    It decides:
-        REAL
-        GHOST
-        REJECT
-
-    It does not open trades.
-    """
-
     def __init__(self):
-        self.validator = DecisionInputValidator()
-        self.scorer = AIScoreComposer()
-        self.reject_rules = HardRejectRules()
+        self.composer = AIScoreComposer()
         self.classifier = DecisionTypeClassifier()
 
     def decide(
         self,
         candidate: AnalysisCandidate,
-        movement: MovementHunterResult,
-        trap: TrapResult,
-        state: StateResult,
-        confidence: ConfidenceResult,
-        correlation: CorrelationResult,
         prediction: MovementPredictionResult,
         learning: Optional[LearningSummary] = None,
-        meta: Optional[MetaLearningSummary] = None,
+        **_: Any,
     ) -> AIDecision:
-        if meta is None:
-            try:
-                meta = get_meta_learning_summary()
-            except Exception:
-                meta = None
-
-        valid, validation_warnings, validation_rejects = self.validator.validate(
+        score, score_reasons, score_warnings, expected_net_usdt = self.composer.compose(
             candidate=candidate,
-            movement=movement,
-            trap=trap,
-            state=state,
-            confidence=confidence,
-            correlation=correlation,
             prediction=prediction,
+            learning=learning,
+        )
+
+        decision_type, classify_reasons, classify_warnings, reject_reasons = self.classifier.classify(
+            candidate=candidate,
+            prediction=prediction,
+            learning=learning,
+            score=score,
+        )
+
+        direction = normalize_direction(candidate.direction_hint)
+        entry = safe_float(getattr(candidate.sensor_snapshot, "price", 0.0), 0.0)
+
+        confidence_score = clamp(
+            score.final_score * 0.55
+            + obj_float(prediction, "movement_probability", 0.0) * 0.25
+            + obj_float(learning, "pattern_confidence", 0.0) * 0.20
+        )
+
+        risk_score = clamp(
+            score.range_penalty * 1.6
+            + score.late_penalty * 1.8
+            + score.fee_penalty * 1.5
+            + (20.0 if str(obj_value(learning, "risk_label", "")).upper() == "RISKY_CONDITION" else 0.0)
         )
 
         reasons: List[str] = []
         warnings: List[str] = []
-        reject_reasons: List[str] = []
-        warnings.extend(validation_warnings)
-        reject_reasons.extend(validation_rejects)
-
-        score = self.scorer.compose(
-            candidate=candidate,
-            movement=movement,
-            trap=trap,
-            state=state,
-            confidence=confidence,
-            correlation=correlation,
-            learning=learning,
-            prediction=prediction,
-            meta=meta,
-        )
-
-        hard_reject, hard_reject_reasons = self.reject_rules.check(
-            candidate=candidate,
-            movement=movement,
-            trap=trap,
-            state=state,
-            confidence=confidence,
-            correlation=correlation,
-            prediction=prediction,
-            score=score,
-        )
-
-        if hard_reject:
-            reject_reasons.extend(hard_reject_reasons)
-            decision_type = DECISION_REJECT
-            reasons.append("HARD_REJECT_RULE_TRIGGERED")
-        elif not valid:
-            decision_type = DECISION_REJECT
-            reasons.append("INVALID_INPUT_REJECT")
-        else:
-            decision_type, r, w = self.classifier.classify(
-                score=score,
-                candidate=candidate,
-                movement=movement,
-                trap=trap,
-                state=state,
-                confidence=confidence,
-                correlation=correlation,
-                learning=learning,
-                prediction=prediction,
-            )
-            reasons.extend(r)
-            warnings.extend(w)
-
-        # Collect important reasons from all layers without flooding output.
-        layer_reasons = []
-        layer_reasons.extend(list(candidate.reason_codes)[:8])
-        layer_reasons.extend(list(movement.reason_codes)[:8])
-        layer_reasons.extend(list(trap.reason_codes)[:8])
-        layer_reasons.extend(list(state.reason_codes)[:8])
-        layer_reasons.extend(list(confidence.reason_codes)[:8])
-        layer_reasons.extend(list(correlation.reason_codes)[:8])
-        layer_reasons.extend(list(prediction.reason_codes)[:8])
-        reasons.extend(layer_reasons)
-
-        # Prefer candidate direction, but do not hard-reject NEUTRAL immediately.
-        # For learning/GHOST, fall back to movement/trap/prediction direction when available.
-        direction = normalize_direction(candidate.direction_hint)
-        if direction == DIRECTION_NEUTRAL:
-            for fallback_direction in (
-                getattr(movement, "direction_hint", None),
-                getattr(trap, "direction_hint", None),
-                getattr(prediction, "direction_hint", None),
-            ):
-                direction = normalize_direction(fallback_direction)
-                if direction in {DIRECTION_LONG, DIRECTION_SHORT}:
-                    warnings.append("DIRECTION_FALLBACK_USED_FOR_LEARNING")
-                    break
-
-        if direction == DIRECTION_NEUTRAL:
-            decision_type = DECISION_REJECT
-            reject_reasons.append("NO_USABLE_DIRECTION")
-
-        risk_score = clamp(
-            trap.trap_risk * 0.30
-            + state.late_entry_risk * 0.20
-            + state.range_probability * 0.18
-            + correlation.exposure_risk * 0.12
-            + candidate.risk.total_risk * 0.20
-        )
-
-        entry = safe_float(candidate.sensor_snapshot.price)
+        reasons.extend(score_reasons)
+        reasons.extend(classify_reasons)
+        warnings.extend(score_warnings)
+        warnings.extend(classify_warnings)
+        reasons.extend(list(getattr(candidate, "reason_codes", ()) or ())[:8])
+        reasons.extend(list(obj_value(prediction, "reason_codes", ()) or ())[:8])
 
         return AIDecision(
             decision_id=f"dec_{uuid4().hex}",
-            symbol=candidate.symbol,
-            timeframe=candidate.timeframe,
-            timestamp=candidate.timestamp or now_ts(),
+            symbol=str(candidate.symbol),
+            timeframe=str(candidate.timeframe or "5m"),
+            timestamp=int(candidate.timestamp or now_ts()),
             direction=direction,
             decision_type=decision_type,
-            confidence_score=clamp(confidence.confidence_score),
-            risk_score=risk_score,
-            ai_score=score.final_score,
+            confidence_score=clamp(confidence_score),
+            risk_score=clamp(risk_score),
+            ai_score=clamp(score.final_score),
             entry=entry,
-            movement_phase=movement.movement_phase,
-            freshness=movement.freshness,
-            market_state=state.market_state,
-            predicted_phase=prediction.predicted_phase,
+            predicted_phase=str(obj_value(prediction, "predicted_phase", PHASE_UNKNOWN)).upper(),
+            movement_probability=clamp(obj_float(prediction, "movement_probability", 0.0)),
+            pattern_count=obj_int(prediction, "pattern_count", 0),
+            pattern_match_score=clamp(obj_float(prediction, "pattern_match_score", 0.0)),
+            pattern_confidence=clamp(obj_float(prediction, "pattern_confidence", 0.0)),
             should_trade_real=decision_type == DECISION_REAL,
             should_create_ghost=decision_type == DECISION_GHOST,
             should_reject=decision_type == DECISION_REJECT,
@@ -1138,12 +693,10 @@ class AIDecisionEngine:
             warnings=tuple(dict.fromkeys(warnings)),
             reject_reasons=tuple(dict.fromkeys(reject_reasons)),
             meta={
-                "learning": _learning_to_dict(learning),
-                "meta_learning": meta.to_dict() if meta else {},
-                "prediction": prediction.to_dict(),
-                "correlation": correlation.to_dict(),
-                "tradability_score": score.tradability_score,
-                "note": "TP/SL will be calculated by tp_sl_engine.py",
+                "learning": to_dict(learning),
+                "prediction": to_dict(prediction),
+                "expected_net_usdt": expected_net_usdt,
+                "tp_sl_note": "TP/SL will be calculated by tp_sl_engine.py",
             },
         )
 
@@ -1160,47 +713,22 @@ def engine() -> AIDecisionEngine:
 
 def decide(
     candidate: AnalysisCandidate,
-    movement: MovementHunterResult,
-    trap: TrapResult,
-    state: StateResult,
-    confidence: ConfidenceResult,
-    correlation: CorrelationResult,
     prediction: MovementPredictionResult,
     learning: Optional[LearningSummary] = None,
-    meta: Optional[MetaLearningSummary] = None,
+    **kwargs: Any,
 ) -> AIDecision:
     return engine().decide(
         candidate=candidate,
-        movement=movement,
-        trap=trap,
-        state=state,
-        confidence=confidence,
-        correlation=correlation,
         prediction=prediction,
         learning=learning,
-        meta=meta,
+        **kwargs,
     )
 
 
 def ai_decision_engine(
     candidate: AnalysisCandidate,
-    movement: MovementHunterResult,
-    trap: TrapResult,
-    state: StateResult,
-    confidence: ConfidenceResult,
-    correlation: CorrelationResult,
     prediction: MovementPredictionResult,
     learning: Optional[LearningSummary] = None,
-    meta: Optional[MetaLearningSummary] = None,
+    **kwargs: Any,
 ) -> AIDecision:
-    return decide(
-        candidate=candidate,
-        movement=movement,
-        trap=trap,
-        state=state,
-        confidence=confidence,
-        correlation=correlation,
-        prediction=prediction,
-        learning=learning,
-        meta=meta,
-    )
+    return decide(candidate=candidate, prediction=prediction, learning=learning, **kwargs)
