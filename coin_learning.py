@@ -170,8 +170,19 @@ class LearningSummary:
     avg_mae_percent: float
     avg_holding_seconds: float
     avg_realized_pnl_percent: float
-    risk_label: str
-    confidence_hint: str
+
+    # Movement Hunter learning metrics. These are consumed by
+    # movement_memory.py, confidence_engine.py, trap_engine.py,
+    # state_engine.py and ai_decision_engine.py.
+    outcome_success_rate: float = 50.0
+    timing_score: float = 50.0
+    early_success_rate: float = 0.0
+    fuzzy_match_score: float = 0.0
+    premove_success_rate: float = 0.0
+    late_failure_rate: float = 0.0
+
+    risk_label: str = "UNKNOWN"
+    confidence_hint: str = "LOW_DATA"
     notes: Tuple[str, ...] = field(default_factory=tuple)
 
     def to_dict(self) -> JsonDict:
@@ -353,6 +364,102 @@ def result_is_win(result: str) -> bool:
 def result_is_winrate_result(result: str) -> bool:
     """Only results that enter the WR denominator."""
     return str(result).upper() in {RESULT_TP1, RESULT_SL}
+
+
+def result_is_positive_outcome(result: str) -> bool:
+    """Outcome success for movement hunting.
+
+    TP1/TP2 are clean wins. AI_EXIT is useful only when it exited with profit
+    or protected a favorable move, which is detected from pnl/MFE in the
+    summarizer. This helper stays conservative.
+    """
+    return str(result).upper() in {RESULT_TP1, RESULT_TP2}
+
+
+def _is_early_or_premove(record: LearningRecord) -> bool:
+    freshness = str(record.freshness or "").upper()
+    phase = str(record.movement_phase or "").upper()
+    return (
+        freshness in {"FRESH", "PRE_START", "START", "EARLY"}
+        or phase in {"PRE_START", "START", "BIRTH", "EARLY"}
+    )
+
+
+def _is_late_or_exhausted(record: LearningRecord) -> bool:
+    freshness = str(record.freshness or "").upper()
+    phase = str(record.movement_phase or "").upper()
+    state = str(record.market_state or "").upper()
+    return (
+        freshness in {"LATE", "DEAD", "EXHAUSTED"}
+        or phase in {"LATE", "DEAD", "EXHAUSTION", "ENDED"}
+        or state in {"LATE", "EXHAUSTION"}
+    )
+
+
+def _record_outcome_success(record: LearningRecord) -> bool:
+    result = str(record.result or "").upper()
+    if result in {RESULT_TP1, RESULT_TP2}:
+        return True
+    if result == RESULT_AI_EXIT:
+        return record.realized_pnl_percent > 0 or record.mfe_percent > abs(record.mae_percent)
+    return False
+
+
+def _record_timing_points(record: LearningRecord) -> float:
+    """Score how useful this sample is for pre-move hunting.
+
+    A profitable early/fresh sample is very valuable. A late win is still a win
+    but should not teach the AI to enter late. A late SL is especially bad.
+    """
+    success = _record_outcome_success(record)
+    early = _is_early_or_premove(record)
+    late = _is_late_or_exhausted(record)
+
+    if success and early:
+        return 100.0
+    if success and not late:
+        return 72.0
+    if success and late:
+        return 48.0
+    if record.result == RESULT_SL and late:
+        return 10.0
+    if record.result == RESULT_SL:
+        return 25.0
+    if record.result == RESULT_AI_EXIT and record.realized_pnl_percent > 0:
+        return 70.0 if early else 55.0
+    return 45.0
+
+
+def _record_condition_similarity(current_key: str, record_key: str) -> float:
+    """Cheap fuzzy similarity over condition-key buckets.
+
+    This keeps exact signature useful but gives credit to near conditions such
+    as same coin+direction with slightly different RSI/ADX/power buckets.
+    """
+    if not current_key or not record_key:
+        return 0.0
+    if current_key == record_key:
+        return 100.0
+
+    a = str(current_key).split("|")
+    b = str(record_key).split("|")
+    if not a or not b:
+        return 0.0
+
+    length = max(len(a), len(b), 1)
+    matches = sum(1 for i in range(min(len(a), len(b))) if a[i] == b[i])
+    base = matches / length * 100.0
+
+    # Coin and direction are the most important anchors. Penalize heavily if
+    # they do not match, but keep a small value for broad diagnostics.
+    try:
+        if a[0] != b[0]:
+            base *= 0.35
+        if len(a) > 1 and len(b) > 1 and a[1] != b[1]:
+            base *= 0.45
+    except Exception:
+        pass
+    return clamp(base)
 
 
 class ConditionKeyBuilder:
@@ -564,6 +671,12 @@ class CoinLearningMemory:
                 avg_mae_percent=0.0,
                 avg_holding_seconds=0.0,
                 avg_realized_pnl_percent=0.0,
+                outcome_success_rate=50.0,
+                timing_score=50.0,
+                early_success_rate=0.0,
+                fuzzy_match_score=0.0,
+                premove_success_rate=0.0,
+                late_failure_rate=0.0,
                 risk_label="UNKNOWN",
                 confidence_hint="LOW_DATA",
                 notes=("NO_HISTORY",),
@@ -603,23 +716,73 @@ def summarize_records(condition_key: str, coin: str, direction: str, records: Se
     avg_hold = sum(r.holding_seconds for r in records) / total if total else 0.0
     avg_pnl = sum(r.realized_pnl_percent for r in records) / total if total else 0.0
 
+    # Movement Hunter metrics. These are different from plain WinRate:
+    # - outcome_success_rate rewards TP and useful profitable AI exits.
+    # - timing_score rewards early/fresh wins and penalizes late failures.
+    # - early_success_rate measures how often pre-move/fresh samples worked.
+    # - fuzzy_match_score measures whether stored conditions are near the current condition.
+    # - premove_success_rate specifically measures pre-start/start/fresh success.
+    # - late_failure_rate measures how often late/exhausted samples failed.
+    outcome_successes = sum(1 for r in records if _record_outcome_success(r))
+    outcome_success_rate = (outcome_successes / total * 100.0) if total else 50.0
+
+    timing_points = [_record_timing_points(r) for r in records]
+    timing_score = sum(timing_points) / len(timing_points) if timing_points else 50.0
+
+    early_records = [r for r in records if _is_early_or_premove(r)]
+    early_successes = sum(1 for r in early_records if _record_outcome_success(r))
+    early_success_rate = (early_successes / len(early_records) * 100.0) if early_records else 0.0
+
+    premove_success_rate = early_success_rate
+
+    late_records = [r for r in records if _is_late_or_exhausted(r)]
+    late_failures = sum(1 for r in late_records if r.result == RESULT_SL or not _record_outcome_success(r))
+    late_failure_rate = (late_failures / len(late_records) * 100.0) if late_records else 0.0
+
+    fuzzy_scores = [_record_condition_similarity(condition_key, r.condition_key) for r in records]
+    fuzzy_match_score = sum(fuzzy_scores) / len(fuzzy_scores) if fuzzy_scores else 0.0
+
     notes: List[str] = []
-    if total < int(getattr(SETTINGS.learning, "min_samples_for_confidence", 10)):
+    min_samples = int(getattr(SETTINGS.learning, "min_samples_for_confidence", 10))
+    if total < min_samples:
         confidence_hint = "LOW_DATA"
         notes.append("LOW_SAMPLE_COUNT")
-    elif wr >= 65:
+    elif wr >= 65 or (outcome_success_rate >= 62 and timing_score >= 60):
         confidence_hint = "GOOD_HISTORY"
         notes.append("CONDITION_PERFORMED_WELL")
-    elif wr <= 40 and closed >= 5:
+    elif (wr <= 40 and closed >= 5) or (outcome_success_rate <= 40 and total >= 5):
         confidence_hint = "WEAK_HISTORY"
         notes.append("CONDITION_PERFORMED_WEAK")
     else:
         confidence_hint = "MIXED_HISTORY"
 
-    if sl >= 3 and wr <= 45:
+    if timing_score >= 65 and early_success_rate >= 35:
+        notes.append("PREMOVE_PATTERN_WORKED_WITH_TIMING")
+    elif timing_score <= 42 and total >= 5:
+        notes.append("TIMING_LATE_OR_WEAK_PATTERN")
+
+    if late_failure_rate >= 55 and len(late_records) >= 3:
+        notes.append("LATE_FAILURE_PATTERN")
+    if early_records and early_success_rate < 35 and len(early_records) >= 3:
+        notes.append("PREMOVE_PATTERN_WEAK_OR_LATE")
+    if fuzzy_match_score >= 70:
+        notes.append("FUZZY_CONDITION_MATCH_STRONG")
+    elif 0 < fuzzy_match_score < 55:
+        notes.append("FUZZY_CONDITION_MATCH_WEAK")
+
+    # Risk labels are now conditional and timing-aware. A high WR late pattern
+    # is not automatically favorable for a Movement Hunter entry.
+    if sl >= 3 and wr <= 45 and timing_score <= 50:
         risk_label = "RISKY_CONDITION"
         notes.append("REPEATED_SL_PATTERN")
-    elif wr >= 65 and avg_mfe > abs(avg_mae):
+    elif outcome_success_rate <= 38 and total >= 5 and timing_score <= 42:
+        risk_label = "RISKY_CONDITION"
+        notes.append("POOR_OUTCOME_AND_TIMING_PATTERN")
+    elif (
+        (wr >= 65 or outcome_success_rate >= 62)
+        and avg_mfe > abs(avg_mae)
+        and (timing_score >= 58 or early_success_rate >= 35)
+    ):
         risk_label = "FAVORABLE_CONDITION"
     else:
         risk_label = "NEUTRAL_CONDITION"
@@ -641,9 +804,15 @@ def summarize_records(condition_key: str, coin: str, direction: str, records: Se
         avg_mae_percent=avg_mae,
         avg_holding_seconds=avg_hold,
         avg_realized_pnl_percent=avg_pnl,
+        outcome_success_rate=clamp(outcome_success_rate),
+        timing_score=clamp(timing_score),
+        early_success_rate=clamp(early_success_rate),
+        fuzzy_match_score=clamp(fuzzy_match_score),
+        premove_success_rate=clamp(premove_success_rate),
+        late_failure_rate=clamp(late_failure_rate),
         risk_label=risk_label,
         confidence_hint=confidence_hint,
-        notes=tuple(notes),
+        notes=tuple(dict.fromkeys(notes)),
     )
 
 
