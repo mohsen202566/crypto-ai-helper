@@ -216,19 +216,35 @@ class StatEventBuilder:
 
         return StatEvent(
             stat_id=f"stat_{uuid4().hex}",
-            timestamp=decision.timestamp or now_ts(),
+            timestamp=getattr(decision, "timestamp", 0) or now_ts(),
             source_type=source,
-            symbol=normalize_symbol(decision.symbol),
-            direction=normalize_direction(decision.direction),
+            symbol=normalize_symbol(getattr(decision, "symbol", "")),
+            direction=normalize_direction(getattr(decision, "direction", "")),
             result=result,
-            decision_id=decision.decision_id,
-            market_state=decision.market_state,
-            freshness=decision.freshness,
-            predicted_phase=decision.predicted_phase,
-            ai_score=safe_float(decision.ai_score),
-            confidence_score=safe_float(decision.confidence_score),
-            risk_score=safe_float(decision.risk_score),
-            meta={"decision_type": decision.decision_type},
+            decision_id=str(getattr(decision, "decision_id", "")),
+            market_state=str(
+                getattr(
+                    decision,
+                    "market_state",
+                    decision.meta.get("market_state", "UNKNOWN")
+                    if isinstance(getattr(decision, "meta", {}), dict)
+                    else "UNKNOWN",
+                )
+            ),
+            freshness=str(
+                getattr(
+                    decision,
+                    "freshness",
+                    decision.meta.get("freshness", "UNKNOWN")
+                    if isinstance(getattr(decision, "meta", {}), dict)
+                    else "UNKNOWN",
+                )
+            ),
+            predicted_phase=str(getattr(decision, "predicted_phase", "UNKNOWN")),
+            ai_score=safe_float(getattr(decision, "ai_score", 0.0)),
+            confidence_score=safe_float(getattr(decision, "confidence_score", 0.0)),
+            risk_score=safe_float(getattr(decision, "risk_score", 0.0)),
+            meta={"decision_type": getattr(decision, "decision_type", "UNKNOWN")},
         )
 
     def from_position_event(self, event: PositionMonitorEvent) -> StatEvent:
