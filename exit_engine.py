@@ -3,26 +3,26 @@ from __future__ import annotations
 """
 20 - exit_engine.py
 
-AI profit-protection / exit confirmation engine for the locked Movement Hunter architecture.
+Light smart-exit engine for the simplified Level 1 / 5M crypto futures bot.
 
-Responsibilities:
-- Monitor an open position context and decide whether AI exit is recommended.
-- Require confirmation before closing profit, to avoid single-tick false exits.
-- Protect profit after TP1 and before TP2 when momentum weakens.
-- Detect invalidated movement, reversal pressure, trap after entry, range re-entry.
-- Return ExitDecision only; actual close is handled by position_monitor.py / real_trade_manager.py.
-
-Strictly forbidden:
-- No Toobit close order call.
+Locked rule:
+- Before TP1, AI close is allowed ONLY when price has reached at least 70%
+  of the path from entry to TP1 AND weakness/reversal is visible.
+- Before 70% TP1 progress: no AI close, except emergency protection.
+- After TP1: protect profit and optionally close runner if weakness appears.
+- No movement_hunter / trap / state / confidence / meta / correlation dependency.
+- No Toobit call.
 - No Telegram sending.
 - No persistence.
 - No REAL/GHOST/REJECT entry decision.
-- No Paper mode.
-- No Setup flow.
+- No paper/setup flow.
+
+This file returns ExitDecision only.
+position_monitor.py / real_trade_manager.py will execute actual closing later.
 """
 
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 from uuid import uuid4
 import math
 import time
@@ -30,9 +30,6 @@ import time
 from ai_decision_engine import AIDecision
 from tp_sl_engine import TPSLPlan
 from analysis_layers import SensorSnapshot
-from movement_hunter import MovementHunterResult
-from trap_engine import TrapResult
-from state_engine import StateResult
 
 
 JsonDict = Dict[str, Any]
@@ -40,7 +37,6 @@ JsonDict = Dict[str, Any]
 DIRECTION_LONG = "LONG"
 DIRECTION_SHORT = "SHORT"
 
-EXIT_NONE = "NONE"
 EXIT_HOLD = "HOLD"
 EXIT_PROTECT_PROFIT = "PROTECT_PROFIT"
 EXIT_AI_CLOSE = "AI_CLOSE"
@@ -48,7 +44,8 @@ EXIT_EMERGENCY = "EMERGENCY"
 
 CONFIRM_WAITING = "WAITING"
 CONFIRM_CONFIRMED = "CONFIRMED"
-CONFIRM_REJECTED = "REJECTED"
+
+AI_EXIT_MIN_TP1_PROGRESS = 0.70
 
 
 @dataclass(frozen=True)
@@ -76,11 +73,11 @@ class PositionContext:
 
 @dataclass(frozen=True)
 class ExitScore:
-    profit_protection_score: float
-    momentum_weakness_score: float
+    tp1_progress: float
+    tp2_progress: float
+    profit_score: float
+    weakness_score: float
     reversal_score: float
-    trap_score: float
-    range_score: float
     invalidation_score: float
     emergency_score: float
     total_exit_score: float
@@ -116,11 +113,11 @@ class ExitDecision:
 @dataclass
 class ExitConfirmationState:
     position_id: str
-    pending_action: str = EXIT_NONE
-    first_seen_at: int = 0
-    last_seen_at: int = 0
-    confirmation_count: int = 0
-    last_score: float = 0.0
+    action: str
+    first_seen_at: int
+    last_seen_at: int
+    confirmation_count: int
+    last_score: float
 
 
 def now_ts() -> int:
@@ -140,13 +137,7 @@ def safe_float(value: Any, default: float = 0.0) -> float:
 
 
 def clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
-    try:
-        v = float(value)
-        if math.isnan(v) or math.isinf(v):
-            return low
-        return max(low, min(high, v))
-    except Exception:
-        return low
+    return max(low, min(high, safe_float(value, low)))
 
 
 def normalize_direction(direction: str) -> str:
@@ -168,258 +159,269 @@ def pnl_percent(direction: str, entry: float, price: float) -> float:
     return (entry - price) / entry * 100.0
 
 
-
-
 def progress_to_tp1(ctx: PositionContext) -> float:
-    """0..1 progress from entry toward TP1."""
     entry = safe_float(ctx.entry)
     tp1 = safe_float(ctx.tp1)
     price = safe_float(ctx.current_price)
     direction = normalize_direction(ctx.direction)
+
     if entry <= 0 or tp1 <= 0 or price <= 0 or abs(tp1 - entry) <= 0:
         return 0.0
+
     if direction == DIRECTION_LONG:
-        return clamp((price - entry) / abs(tp1 - entry) * 100.0, 0.0, 100.0) / 100.0
-    return clamp((entry - price) / abs(entry - tp1) * 100.0, 0.0, 100.0) / 100.0
+        return clamp((price - entry) / abs(tp1 - entry), 0.0, 1.0)
+    if direction == DIRECTION_SHORT:
+        return clamp((entry - price) / abs(entry - tp1), 0.0, 1.0)
+    return 0.0
 
 
 def progress_tp1_to_tp2(ctx: PositionContext) -> float:
-    """0..1 progress from TP1 toward TP2 after TP1 hit."""
     tp1 = safe_float(ctx.tp1)
     tp2 = safe_float(ctx.tp2)
     price = safe_float(ctx.current_price)
     direction = normalize_direction(ctx.direction)
+
     if tp1 <= 0 or tp2 <= 0 or price <= 0 or abs(tp2 - tp1) <= 0:
         return 0.0
+
     if direction == DIRECTION_LONG:
-        return clamp((price - tp1) / abs(tp2 - tp1) * 100.0, 0.0, 100.0) / 100.0
-    return clamp((tp1 - price) / abs(tp1 - tp2) * 100.0, 0.0, 100.0) / 100.0
+        return clamp((price - tp1) / abs(tp2 - tp1), 0.0, 1.0)
+    if direction == DIRECTION_SHORT:
+        return clamp((tp1 - price) / abs(tp1 - tp2), 0.0, 1.0)
+    return 0.0
 
 
 def protected_sl_price(ctx: PositionContext) -> float:
-    """
-    After TP1, protect at least around break-even/slightly positive.
-    Exchange tick-size rounding is handled later by real_trade_manager/tobit_client.
-    """
     direction = normalize_direction(ctx.direction)
     entry = safe_float(ctx.entry)
     price = safe_float(ctx.current_price)
+
     if entry <= 0 or price <= 0:
         return 0.0
 
-    # After TP1, protect the runner without choking it exactly at TP1.
-    # Give the remaining runner ~10% of Entry→TP1 distance as breathing room.
     if ctx.tp1_hit and ctx.tp1 > 0:
         tp1 = safe_float(ctx.tp1)
         buffer_dist = abs(tp1 - entry) * 0.10
         if direction == DIRECTION_LONG:
             return max(entry, tp1 - buffer_dist)
-        return min(entry, tp1 + buffer_dist)
+        if direction == DIRECTION_SHORT:
+            return min(entry, tp1 + buffer_dist)
 
+    # Before TP1 only protect lightly if already in profit.
     if direction == DIRECTION_LONG:
-        # Before TP1, protect at entry + 15% of current open profit.
         return max(entry, entry + max(0.0, price - entry) * 0.15)
-    return min(entry, entry - max(0.0, entry - price) * 0.15)
+    if direction == DIRECTION_SHORT:
+        return min(entry, entry - max(0.0, entry - price) * 0.15)
+    return entry
+
+
+def sensor_bool(snapshot: SensorSnapshot, name: str, default: bool = False) -> bool:
+    return bool(getattr(snapshot, name, default))
+
+
+def sensor_float(snapshot: SensorSnapshot, name: str, default: float = 0.0) -> float:
+    return safe_float(getattr(snapshot, name, default), default)
 
 
 class ExitSignalScorer:
-    """Scores whether the current position should be protected or AI-closed."""
-
-    def score(
-        self,
-        ctx: PositionContext,
-        snapshot: SensorSnapshot,
-        movement: MovementHunterResult,
-        trap: TrapResult,
-        state: StateResult,
-    ) -> Tuple[ExitScore, List[str]]:
-        direction = normalize_direction(ctx.direction)
+    def score(self, ctx: PositionContext, snapshot: SensorSnapshot) -> Tuple[ExitScore, List[str], List[str]]:
         reasons: List[str] = []
+        warnings: List[str] = []
 
+        direction = normalize_direction(ctx.direction)
         current_pnl = pnl_percent(direction, ctx.entry, ctx.current_price)
+        tp1_progress = progress_to_tp1(ctx)
+        tp2_progress = progress_tp1_to_tp2(ctx)
 
-        profit_protection = 0.0
+        profit_score = 0.0
         if ctx.tp1_hit and current_pnl > 0:
-            profit_protection += 45
+            profit_score = 75.0
             reasons.append("TP1_HIT_PROFIT_PROTECTION_ACTIVE")
-        elif current_pnl >= max(0.25, snapshot.atr_percent * 0.55):
-            profit_protection += 25
-            reasons.append("OPEN_PROFIT_PROTECTION_CANDIDATE")
+        elif current_pnl > 0 and tp1_progress >= AI_EXIT_MIN_TP1_PROGRESS:
+            profit_score = 55.0
+            reasons.append("PROFIT_70_PERCENT_TO_TP1_REACHED")
+        elif current_pnl > 0:
+            profit_score = 20.0
+            reasons.append("OPEN_PROFIT_BUT_BELOW_70_PERCENT_TP1")
 
-        momentum_weakness = 0.0
-        if snapshot.momentum_weakness:
-            momentum_weakness += 35
+        weakness = 0.0
+        if sensor_bool(snapshot, "momentum_weakness", False):
+            weakness += 30.0
             reasons.append("MOMENTUM_WEAKNESS")
+
+        rsi_slope = sensor_float(snapshot, "rsi_slope", 0.0)
+        hist_slope = sensor_float(snapshot, "histogram_slope", 0.0)
+        power_delta = sensor_float(snapshot, "power_delta", 0.0)
+        adx_slope = sensor_float(snapshot, "adx_slope", 0.0)
+
         if direction == DIRECTION_LONG:
-            if snapshot.rsi_slope < -0.25:
-                momentum_weakness += 18
-                reasons.append("LONG_RSI_SLOPE_WEAKENING")
-            if snapshot.histogram_slope < 0:
-                momentum_weakness += 18
+            if rsi_slope < -0.20:
+                weakness += 18.0
+                reasons.append("LONG_RSI_WEAKENING")
+            if hist_slope < 0:
+                weakness += 18.0
                 reasons.append("LONG_HISTOGRAM_WEAKENING")
-            if snapshot.power_delta < -8:
-                momentum_weakness += 22
+            if power_delta < -8:
+                weakness += 22.0
                 reasons.append("LONG_POWER_FLIPPED")
-        else:
-            if snapshot.rsi_slope > 0.25:
-                momentum_weakness += 18
-                reasons.append("SHORT_RSI_SLOPE_WEAKENING")
-            if snapshot.histogram_slope > 0:
-                momentum_weakness += 18
+            if adx_slope < -0.10:
+                weakness += 10.0
+                reasons.append("LONG_ADX_WEAKENING")
+        elif direction == DIRECTION_SHORT:
+            if rsi_slope > 0.20:
+                weakness += 18.0
+                reasons.append("SHORT_RSI_WEAKENING")
+            if hist_slope > 0:
+                weakness += 18.0
                 reasons.append("SHORT_HISTOGRAM_WEAKENING")
-            if snapshot.power_delta > 8:
-                momentum_weakness += 22
+            if power_delta > 8:
+                weakness += 22.0
                 reasons.append("SHORT_POWER_FLIPPED")
+            if adx_slope < -0.10:
+                weakness += 10.0
+                reasons.append("SHORT_ADX_WEAKENING")
 
-        reversal = clamp(state.reversal_probability * 0.75 + movement.reversal_pressure * 0.45)
-        if reversal >= 55:
-            reasons.append("REVERSAL_PRESSURE")
+        reversal = 0.0
+        # Optional fields from analysis_layers. Safe if missing.
+        reversal += sensor_float(snapshot, "reversal_probability", 0.0) * 0.65
+        reversal += sensor_float(snapshot, "range_probability", 0.0) * 0.15
 
-        trap_score = clamp(trap.trap_risk * 0.70 + trap.liquidity_risk * 0.30)
-        if trap_score >= 55:
-            reasons.append("TRAP_AFTER_ENTRY")
-
-        range_score = clamp(state.range_probability * 0.65)
-        if state.market_state == "RANGE":
-            range_score += 20
-            reasons.append("STATE_RETURNED_TO_RANGE")
-        range_score = clamp(range_score)
+        if sensor_bool(snapshot, "failed_breakout", False) and direction == DIRECTION_LONG:
+            reversal += 20.0
+            reasons.append("FAILED_BREAKOUT_AGAINST_LONG")
+        if sensor_bool(snapshot, "failed_breakdown", False) and direction == DIRECTION_SHORT:
+            reversal += 20.0
+            reasons.append("FAILED_BREAKDOWN_AGAINST_SHORT")
 
         invalidation = 0.0
-        if movement.freshness in {"LATE", "DEAD"}:
-            invalidation += 25
-            reasons.append("MOVEMENT_NO_LONGER_FRESH")
-        if movement.continuation_probability < 35:
-            invalidation += 25
-            reasons.append("CONTINUATION_PROBABILITY_LOW")
-        if state.market_state in {"EXHAUSTION", "REVERSAL"}:
-            invalidation += 25
-            reasons.append("STATE_INVALIDATION")
+        if sensor_float(snapshot, "range_probability", 0.0) >= 88:
+            invalidation += 18.0
+            reasons.append("HIGH_RANGE_PROBABILITY_AFTER_ENTRY")
+        if sensor_bool(snapshot, "valid", True) is False:
+            invalidation += 40.0
+            warnings.append("INVALID_SENSOR_SNAPSHOT")
 
         emergency = 0.0
-        if current_pnl < -abs(snapshot.atr_percent) * 1.8 and trap.trap_risk >= 75:
-            emergency += 65
-            reasons.append("EMERGENCY_TRAP_LOSS")
-        if not snapshot.valid or not movement.valid or not trap.valid or not state.valid:
-            emergency += 40
-            reasons.append("INVALID_MONITORING_INPUT")
+        atr_percent = abs(sensor_float(snapshot, "atr_percent", 0.0))
+        if current_pnl < -max(0.45, atr_percent * 1.8):
+            emergency += 70.0
+            reasons.append("EMERGENCY_LARGE_ADVERSE_MOVE")
+        if not bool(getattr(snapshot, "valid", True)):
+            emergency += 40.0
+            reasons.append("EMERGENCY_INVALID_SENSOR")
 
         total = clamp(
-            profit_protection * 0.20
-            + momentum_weakness * 0.25
-            + reversal * 0.20
-            + trap_score * 0.14
-            + range_score * 0.10
+            profit_score * 0.22
+            + weakness * 0.35
+            + reversal * 0.22
             + invalidation * 0.18
-            + emergency * 0.30
+            + emergency * 0.35
         )
 
         return ExitScore(
-            profit_protection_score=clamp(profit_protection),
-            momentum_weakness_score=clamp(momentum_weakness),
+            tp1_progress=round(tp1_progress, 4),
+            tp2_progress=round(tp2_progress, 4),
+            profit_score=clamp(profit_score),
+            weakness_score=clamp(weakness),
             reversal_score=clamp(reversal),
-            trap_score=clamp(trap_score),
-            range_score=clamp(range_score),
             invalidation_score=clamp(invalidation),
             emergency_score=clamp(emergency),
-            total_exit_score=total,
-        ), reasons
+            total_exit_score=clamp(total),
+        ), reasons, warnings
 
 
 class ExitActionClassifier:
-    """Converts scores into HOLD / protect SL / AI close recommendation."""
-
-    def classify(self, ctx: PositionContext, score: ExitScore) -> Tuple[str, bool, bool, List[str]]:
+    def classify(self, ctx: PositionContext, score: ExitScore) -> Tuple[str, bool, bool, List[str], List[str]]:
         reasons: List[str] = []
+        warnings: List[str] = []
+
         current_pnl = pnl_percent(ctx.direction, ctx.entry, ctx.current_price)
 
         if score.emergency_score >= 70:
-            reasons.append("EXIT_EMERGENCY_SCORE")
-            return EXIT_EMERGENCY, True, False, reasons
+            reasons.append("EMERGENCY_EXIT")
+            return EXIT_EMERGENCY, True, False, reasons, warnings
 
-        # In profit: save-profit logic.
-        # Before TP1: if price has moved meaningfully toward TP1 and AI detects weakness,
-        # close in profit with confirmation instead of letting profit disappear.
-        if current_pnl > 0:
-            tp1_progress = progress_to_tp1(ctx)
-            tp2_progress = progress_tp1_to_tp2(ctx)
+        if current_pnl <= 0:
+            reasons.append("NO_PROFIT_HOLD_UNLESS_EMERGENCY")
+            return EXIT_HOLD, False, False, reasons, warnings
 
-            if not ctx.tp1_hit and tp1_progress >= 0.55 and (
-                score.momentum_weakness_score >= 45
+        # LOCKED RULE:
+        # Before TP1, AI close only after 70% of the path to TP1.
+        if not ctx.tp1_hit:
+            if score.tp1_progress < AI_EXIT_MIN_TP1_PROGRESS:
+                reasons.append("BELOW_70_PERCENT_TP1_NO_AI_EXIT")
+                if score.total_exit_score >= 55:
+                    warnings.append("WEAKNESS_SEEN_BUT_WAITING_FOR_70_PERCENT_TP1")
+                return EXIT_HOLD, False, False, reasons, warnings
+
+            if (
+                score.weakness_score >= 45
                 or score.reversal_score >= 50
-                or score.invalidation_score >= 45
-                or score.trap_score >= 60
+                or score.invalidation_score >= 42
+                or score.total_exit_score >= 62
             ):
-                reasons.append("AI_CLOSE_PROFIT_WEAKNESS_BEFORE_TP1")
-                return EXIT_AI_CLOSE, True, False, reasons
+                reasons.append("AI_CLOSE_AFTER_70_PERCENT_TP1_WEAKNESS")
+                return EXIT_AI_CLOSE, True, False, reasons, warnings
 
-            # After TP1: the runner must be protected at TP1 first.
-            # If it travels toward TP2 and weakness appears, close the runner in profit.
-            if ctx.tp1_hit:
-                if tp2_progress >= 0.20 and (
-                    score.momentum_weakness_score >= 35
-                    or score.reversal_score >= 45
-                    or score.invalidation_score >= 40
-                    or score.trap_score >= 55
-                ):
-                    reasons.append("AI_CLOSE_RUNNER_PROFIT_WEAKNESS_BEFORE_TP2")
-                    return EXIT_AI_CLOSE, True, False, reasons
-                if score.total_exit_score >= 42:
-                    reasons.append("PROTECT_AFTER_TP1")
-                    return EXIT_PROTECT_PROFIT, False, True, reasons
-
-            if score.total_exit_score >= 70:
-                reasons.append("AI_CLOSE_PROFIT_WEAKNESS")
-                return EXIT_AI_CLOSE, True, False, reasons
             if score.total_exit_score >= 50:
-                reasons.append("PROTECT_OPEN_PROFIT")
-                return EXIT_PROTECT_PROFIT, False, True, reasons
+                reasons.append("PROTECT_PROFIT_AFTER_70_PERCENT_TP1")
+                return EXIT_PROTECT_PROFIT, False, True, reasons, warnings
 
-        # In loss: do not randomly AI-close unless emergency; SL handles normal invalidation.
-        if score.total_exit_score >= 85 and score.emergency_score >= 50:
-            reasons.append("AI_CLOSE_EMERGENCY_ONLY")
-            return EXIT_AI_CLOSE, True, False, reasons
+            return EXIT_HOLD, False, False, reasons, warnings
 
-        return EXIT_HOLD, False, False, reasons
+        # After TP1: protect the runner first. Close if weakness is meaningful.
+        if ctx.tp1_hit:
+            if (
+                score.tp2_progress >= 0.20
+                and (
+                    score.weakness_score >= 35
+                    or score.reversal_score >= 45
+                    or score.invalidation_score >= 38
+                    or score.total_exit_score >= 58
+                )
+            ):
+                reasons.append("AI_CLOSE_RUNNER_WEAKNESS_AFTER_TP1")
+                return EXIT_AI_CLOSE, True, False, reasons, warnings
+
+            if score.total_exit_score >= 38:
+                reasons.append("PROTECT_AFTER_TP1")
+                return EXIT_PROTECT_PROFIT, False, True, reasons, warnings
+
+        return EXIT_HOLD, False, False, reasons, warnings
 
 
 class ExitConfirmationEngine:
-    """
-    Requires repeated confirmation for AI_CLOSE.
-
-    Profit-protection SL move can be recommended immediately.
-    Actual execution is done by position_monitor/real_trade_manager.
-    """
-
     def __init__(self, required_count: int = 2, confirmation_window_seconds: int = 70):
         self.required_count = max(1, int(required_count))
         self.confirmation_window_seconds = max(10, int(confirmation_window_seconds))
         self._states: Dict[str, ExitConfirmationState] = {}
 
     def confirm(self, position_id: str, action: str, score: float) -> Tuple[str, bool]:
-        ts = now_ts()
         if action not in {EXIT_AI_CLOSE, EXIT_EMERGENCY}:
             self._states.pop(position_id, None)
             return CONFIRM_CONFIRMED, action == EXIT_EMERGENCY
 
+        if action == EXIT_EMERGENCY:
+            self._states.pop(position_id, None)
+            return CONFIRM_CONFIRMED, True
+
+        ts = now_ts()
         state = self._states.get(position_id)
-        if state is None or state.pending_action != action or ts - state.first_seen_at > self.confirmation_window_seconds:
+
+        if state is None or state.action != action or ts - state.first_seen_at > self.confirmation_window_seconds:
             state = ExitConfirmationState(
                 position_id=position_id,
-                pending_action=action,
+                action=action,
                 first_seen_at=ts,
                 last_seen_at=ts,
                 confirmation_count=1,
-                last_score=score,
+                last_score=safe_float(score),
             )
             self._states[position_id] = state
         else:
             state.last_seen_at = ts
             state.confirmation_count += 1
-            state.last_score = score
-
-        if action == EXIT_EMERGENCY:
-            return CONFIRM_CONFIRMED, True
+            state.last_score = safe_float(score)
 
         if state.confirmation_count >= self.required_count:
             self._states.pop(position_id, None)
@@ -429,8 +431,6 @@ class ExitConfirmationEngine:
 
 
 class ExitEngine:
-    """Main AI exit engine."""
-
     def __init__(self):
         self.scorer = ExitSignalScorer()
         self.classifier = ExitActionClassifier()
@@ -440,26 +440,30 @@ class ExitEngine:
         self,
         ctx: PositionContext,
         snapshot: SensorSnapshot,
-        movement: MovementHunterResult,
-        trap: TrapResult,
-        state: StateResult,
         decision: Optional[AIDecision] = None,
         plan: Optional[TPSLPlan] = None,
+        **_: Any,
     ) -> ExitDecision:
         reasons: List[str] = []
         warnings: List[str] = []
 
-        score, r = self.scorer.score(ctx, snapshot, movement, trap, state)
+        score, r, w = self.scorer.score(ctx, snapshot)
         reasons.extend(r)
+        warnings.extend(w)
 
-        action, wants_close, wants_protect, r = self.classifier.classify(ctx, score)
+        action, wants_close, wants_protect, r, w = self.classifier.classify(ctx, score)
         reasons.extend(r)
+        warnings.extend(w)
 
-        confirmation_status, confirmed_close = self.confirmation.confirm(ctx.position_id, action, score.total_exit_score)
+        confirmation_status, confirmed_close = self.confirmation.confirm(
+            position_id=ctx.position_id,
+            action=action,
+            score=score.total_exit_score,
+        )
 
         if action == EXIT_AI_CLOSE and confirmation_status == CONFIRM_WAITING:
-            warnings.append("AI_EXIT_WAITING_FOR_CONFIRMATION")
             wants_close = False
+            warnings.append("AI_EXIT_WAITING_FOR_CONFIRMATION")
 
         protected_sl = 0.0
         if wants_protect:
@@ -467,8 +471,7 @@ class ExitEngine:
             reasons.append("PROTECTED_SL_RECOMMENDED")
 
         current_pnl = pnl_percent(ctx.direction, ctx.entry, ctx.current_price)
-
-        valid = bool(ctx.entry > 0 and ctx.current_price > 0 and snapshot.valid and movement.valid and trap.valid and state.valid)
+        valid = bool(ctx.entry > 0 and ctx.current_price > 0 and getattr(snapshot, "valid", True))
         if not valid:
             warnings.append("INVALID_EXIT_INPUT")
 
@@ -482,9 +485,9 @@ class ExitEngine:
             confirmation_status=confirmation_status,
             should_close=bool(confirmed_close and wants_close),
             should_move_sl_to_protect=bool(wants_protect),
-            protected_sl=protected_sl,
+            protected_sl=safe_float(protected_sl),
             exit_price=safe_float(ctx.current_price),
-            expected_pnl_percent=current_pnl,
+            expected_pnl_percent=safe_float(current_pnl),
             expected_pnl_usdt=safe_float(ctx.unrealized_pnl_usdt),
             score=score,
             reason_codes=tuple(dict.fromkeys(reasons)),
@@ -506,40 +509,32 @@ def engine() -> ExitEngine:
 def evaluate_exit(
     ctx: PositionContext,
     snapshot: SensorSnapshot,
-    movement: MovementHunterResult,
-    trap: TrapResult,
-    state: StateResult,
     decision: Optional[AIDecision] = None,
     plan: Optional[TPSLPlan] = None,
+    **kwargs: Any,
 ) -> ExitDecision:
     return engine().evaluate(
         ctx=ctx,
         snapshot=snapshot,
-        movement=movement,
-        trap=trap,
-        state=state,
         decision=decision,
         plan=plan,
+        **kwargs,
     )
 
 
 def exit_engine(
     ctx: PositionContext,
     snapshot: SensorSnapshot,
-    movement: MovementHunterResult,
-    trap: TrapResult,
-    state: StateResult,
     decision: Optional[AIDecision] = None,
     plan: Optional[TPSLPlan] = None,
+    **kwargs: Any,
 ) -> ExitDecision:
     return evaluate_exit(
         ctx=ctx,
         snapshot=snapshot,
-        movement=movement,
-        trap=trap,
-        state=state,
         decision=decision,
         plan=plan,
+        **kwargs,
     )
 
 
