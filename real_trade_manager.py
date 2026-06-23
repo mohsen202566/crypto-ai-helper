@@ -184,6 +184,24 @@ def normalize_direction(direction: str) -> str:
     return d
 
 
+def normalize_symbol_key(symbol: str) -> str:
+    raw = str(symbol or "").upper().strip()
+    if not raw:
+        return ""
+    raw = raw.replace("/", "").replace("_", "-")
+    if raw.endswith("-SWAP-USDT"):
+        return raw.replace("-SWAP-USDT", "USDT").replace("-", "")
+    if raw.endswith("-SWAP-USDC"):
+        return raw.replace("-SWAP-USDC", "USDC").replace("-", "")
+    return raw.replace("-", "").replace("SWAP", "")
+
+
+def symbols_match(a: str, b: str) -> bool:
+    ka = normalize_symbol_key(a)
+    kb = normalize_symbol_key(b)
+    return bool(ka and kb and ka == kb)
+
+
 def round_step(value: float, step: float, precision: int = 8) -> float:
     value = safe_float(value)
     step = safe_float(step)
@@ -279,10 +297,23 @@ def _build_position_meta(decision: AIDecision, plan: TPSLPlan, analysis_meta: Op
         or plan_meta.get("analysis_candidate")
     )
 
+    signal_message_id = (
+        meta.get("signal_message_id")
+        or meta.get("reply_to_message_id")
+        or meta.get("message_id")
+    )
+    if not signal_message_id and isinstance(decision_meta, dict):
+        signal_message_id = (
+            decision_meta.get("signal_message_id")
+            or decision_meta.get("reply_to_message_id")
+            or decision_meta.get("message_id")
+        )
+
     meta.update({
         "decision_id": getattr(decision, "decision_id", ""),
         "decision": decision_dict,
         "tp_sl_plan": plan_dict,
+        "signal_message_id": safe_int(signal_message_id, 0),
         "real_learning_context_saved": bool(candidate),
     })
     if candidate:
@@ -294,6 +325,12 @@ def _build_position_meta(decision: AIDecision, plan: TPSLPlan, analysis_meta: Op
 def _position_record_from_result(result: RealTradeOpenResult, status_for_monitor: str, meta: JsonDict, current_price: float = 0.0) -> JsonDict:
     """Build the store record in the shape position_monitor.py expects."""
     record = result.to_dict()
+    signal_message_id = safe_int(
+        meta.get("signal_message_id")
+        or meta.get("reply_to_message_id")
+        or meta.get("message_id"),
+        0,
+    )
     record.update({
         "position_id": result.position_id or result.trade_id,
         "status": status_for_monitor,
@@ -302,6 +339,7 @@ def _position_record_from_result(result: RealTradeOpenResult, status_for_monitor
         "current_price": current_price or result.entry,
         "highest_price": current_price or result.entry,
         "lowest_price": current_price or result.entry,
+        "signal_message_id": signal_message_id,
         "meta": meta,
     })
     return record
@@ -410,10 +448,10 @@ class RealTradeSafetyGuard:
 
             active_count += 1
 
-            item_symbol = str(item.get("exchange_symbol", item.get("symbol", ""))).upper()
+            item_symbol = str(item.get("exchange_symbol", item.get("symbol", "")))
             item_direction = normalize_direction(str(item.get("direction", "")))
 
-            if item_symbol in {symbol.upper(), exchange_symbol.upper()} and item_direction == direction:
+            if (symbols_match(item_symbol, symbol) or symbols_match(item_symbol, exchange_symbol)) and item_direction == direction:
                 raise RealTradeError(f"duplicate_internal_position:{exchange_symbol}:{direction}:{status}")
 
         if max_positions > 0 and active_count >= max_positions:
@@ -443,10 +481,10 @@ class RealTradeSafetyGuard:
 
             active_count += 1
 
-            sym = str(pos.get("symbol", pos.get("contract", ""))).upper()
-            side = normalize_direction(str(pos.get("direction", pos.get("side", pos.get("positionSide", "")))))
+            sym = str(pos.get("symbol", pos.get("contract", pos.get("contractCode", pos.get("instId", "")))))
+            side = normalize_direction(str(pos.get("direction", pos.get("side", pos.get("positionSide", pos.get("holdSide", ""))))))
 
-            if sym == exchange_symbol.upper() and side == direction:
+            if symbols_match(sym, exchange_symbol) and side == direction:
                 raise RealTradeError(f"duplicate_exchange_position:{exchange_symbol}:{direction}")
 
         if max_positions > 0 and active_count >= max_positions:
@@ -610,43 +648,36 @@ class RealTradePreflightBuilder:
         )
 
     def _ensure_isolated(self, client: Any, exchange_symbol: str) -> None:
-        """Ensure isolated mode without drying REAL on unstable Toobit margin endpoints.
+        """Set and verify ISOLATED margin before every REAL order.
 
-        Toobit margin-mode endpoints can be unavailable on some accounts/symbols.
-        We still block explicit CROSS, but we do not reject a good REAL setup only
-        because set/get margin mode returned a transient API/method error.
+        This keeps the existing Toobit method order, but removes the old soft
+        pass. If the account reports CROSS or cannot confirm ISOLATED, the real
+        order is blocked before capital is exposed.
         """
-        try:
-            _call_optional(
-                client,
-                [
-                    "set_margin_mode",
-                    "set_margin_type",
-                    "change_margin_mode",
-                    "change_symbol_margin_mode",
-                    "set_futures_margin_mode",
-                ],
-                exchange_symbol,
-                MARGIN_ISOLATED,
-            )
-        except Exception as exc:
-            save_error("real_trade_margin_mode_set_soft", str(exc), {"symbol": exchange_symbol, "required": MARGIN_ISOLATED})
+        _call_optional(
+            client,
+            [
+                "set_margin_mode",
+                "set_margin_type",
+                "change_margin_mode",
+                "change_symbol_margin_mode",
+                "set_futures_margin_mode",
+            ],
+            exchange_symbol,
+            MARGIN_ISOLATED,
+        )
 
-        try:
-            mode = _call_optional(
-                client,
-                ["get_margin_mode", "get_margin_type", "get_futures_margin_mode"],
-                exchange_symbol,
-            )
-            mode_str = str(mode.get("margin_mode", mode.get("marginType", mode)) if isinstance(mode, dict) else mode).upper()
-        except Exception as exc:
-            save_error("real_trade_margin_mode_get_soft", str(exc), {"symbol": exchange_symbol, "required": MARGIN_ISOLATED})
-            return
+        mode = _call_optional(
+            client,
+            ["get_margin_mode", "get_margin_type", "get_futures_margin_mode"],
+            exchange_symbol,
+        )
+        mode_str = str(mode.get("margin_mode", mode.get("marginType", mode)) if isinstance(mode, dict) else mode).upper()
 
         if "CROSS" in mode_str:
             raise RealTradeError(f"margin_cross_blocked:{mode_str}")
         if MARGIN_ISOLATED not in mode_str:
-            save_error("real_trade_margin_mode_unknown_soft", f"margin_mode_not_explicit_isolated:{mode_str}", {"symbol": exchange_symbol})
+            raise RealTradeError(f"isolated_margin_not_confirmed:{mode_str}")
 
     def _ensure_leverage(self, client: Any, exchange_symbol: str, leverage: int) -> None:
         _call_optional(
@@ -724,7 +755,7 @@ class RealOrderExecutor:
                 "quantity": preflight.size_plan.quantity,
                 "price": 0.0,
                 "order_type": "MARKET",
-                "type": "LIMIT",
+                "type": "MARKET",
                 "priceType": "MARKET",
                 "margin_mode": MARGIN_ISOLATED,
                 "leverage": preflight.leverage,
