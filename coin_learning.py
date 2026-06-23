@@ -39,6 +39,8 @@ except Exception:  # keeps file import-safe during staged rewrites
 JsonDict = Dict[str, Any]
 
 MAX_LEARNING_RECORDS = 20000
+STRATEGY_LEVEL_LEVEL1 = "LEVEL_1"
+DEFAULT_STRATEGY_LEVEL = STRATEGY_LEVEL_LEVEL1
 
 SOURCE_REAL = "REAL"
 SOURCE_GHOST = "GHOST"
@@ -201,6 +203,7 @@ def result_is_positive(result: str, pnl_percent: float = 0.0, mfe_percent: float
 
 @dataclass(frozen=True)
 class ConditionKey:
+    strategy_level: str
     coin: str
     direction: str
     timeframe: str
@@ -219,6 +222,7 @@ class ConditionKey:
 
     def key(self) -> str:
         return "|".join([
+            self.strategy_level,
             self.coin,
             self.direction,
             self.timeframe,
@@ -238,6 +242,7 @@ class ConditionKey:
 
     def soft_key(self) -> str:
         return "|".join([
+            self.strategy_level,
             self.coin,
             self.direction,
             self.timeframe,
@@ -254,6 +259,7 @@ class ConditionKey:
 @dataclass(frozen=True)
 class LearningRecord:
     learning_id: str
+    strategy_level: str
     source_type: str
     coin: str
     direction: str
@@ -313,6 +319,7 @@ class LearningRecord:
 
 @dataclass(frozen=True)
 class LearningSummary:
+    strategy_level: str
     condition_key: str
     coin: str
     direction: str
@@ -331,6 +338,8 @@ class LearningSummary:
 
     avg_move_percent: float
     expected_move_percent: float
+    expected_pullback_percent: float
+    best_entry_zone: str
     avg_mfe_percent: float
     avg_mae_percent: float
     avg_holding_seconds: float
@@ -345,6 +354,7 @@ class LearningSummary:
     pattern_count: int
     pattern_win_rate: float
     matched_pattern_id: str
+    pattern_features: JsonDict = field(default_factory=dict)
 
     risk_label: str = "UNKNOWN"
     confidence_hint: str = "LOW_DATA"
@@ -357,6 +367,7 @@ class LearningSummary:
 @dataclass(frozen=True)
 class CoinBehaviorRecord:
     behavior_id: str
+    strategy_level: str
     coin: str
     direction: str
     timeframe: str
@@ -389,6 +400,7 @@ class ConditionKeyBuilder:
         market_mode = str((candidate.market_mode or {}).get("mode", "NEUTRAL")).upper()
 
         return ConditionKey(
+            strategy_level=DEFAULT_STRATEGY_LEVEL,
             coin=coin,
             direction=direction,
             timeframe=str(candidate.timeframe or "5m"),
@@ -467,6 +479,7 @@ class LearningRecordBuilder:
 
         return LearningRecord(
             learning_id=f"learn_{uuid4().hex}",
+            strategy_level=DEFAULT_STRATEGY_LEVEL,
             source_type=str(source_type or SOURCE_GHOST).upper(),
             coin=key.coin,
             direction=key.direction,
@@ -537,6 +550,7 @@ def coerce_record(item: Any) -> LearningRecord:
 
     return LearningRecord(
         learning_id=str(item.get("learning_id", item.get("id", f"learn_{uuid4().hex}"))),
+        strategy_level=str(item.get("strategy_level", DEFAULT_STRATEGY_LEVEL)).upper(),
         source_type=str(item.get("source_type", SOURCE_GHOST)).upper(),
         coin=normalize_symbol(str(item.get("coin", item.get("symbol", "")))),
         direction=normalize_direction(str(item.get("direction", ""))),
@@ -602,10 +616,12 @@ def condition_similarity(current_key: str, record_key: str) -> float:
     matches = sum(1 for i in range(min(len(a), len(b))) if a[i] == b[i])
     base = matches / max(len(a), len(b), 1) * 100.0
 
-    # coin and direction are anchors
+    # strategy level, coin and direction are anchors
     if len(a) > 0 and len(b) > 0 and a[0] != b[0]:
-        base *= 0.25
+        base *= 0.20
     if len(a) > 1 and len(b) > 1 and a[1] != b[1]:
+        base *= 0.25
+    if len(a) > 2 and len(b) > 2 and a[2] != b[2]:
         base *= 0.35
     return clamp(base)
 
@@ -691,6 +707,43 @@ class CoinLearningMemory:
         return self.summarize(key.key(), key.coin, key.direction, key.timeframe)
 
 
+
+def build_pattern_features(records: Sequence[LearningRecord]) -> JsonDict:
+    if not records:
+        return {}
+    n = max(1, len(records))
+    def avg(name: str) -> float:
+        return sum(safe_float(getattr(r, name, 0.0)) for r in records) / n
+    return {
+        "rsi": round(avg("rsi"), 6),
+        "rsi_slope": round(avg("rsi_slope"), 6),
+        "rsi_acceleration": round(avg("rsi_acceleration"), 6),
+        "macd": round(avg("macd"), 8),
+        "macd_histogram": round(avg("macd_histogram"), 8),
+        "histogram_slope": round(avg("histogram_slope"), 8),
+        "histogram_acceleration": round(avg("histogram_acceleration"), 8),
+        "adx": round(avg("adx"), 6),
+        "adx_slope": round(avg("adx_slope"), 6),
+        "power_delta": round(avg("power_delta"), 6),
+        "relative_volume": round(avg("relative_volume"), 6),
+        "atr_percent": round(avg("atr_percent"), 6),
+        "atr_slope": round(avg("atr_slope"), 6),
+        "compression_score": round(avg("compression_score"), 6),
+    }
+
+
+def infer_best_entry_zone(direction: str, avg_pullback: float, expected_move: float) -> str:
+    d = normalize_direction(direction)
+    pb = max(0.0, safe_float(avg_pullback))
+    em = max(0.0, safe_float(expected_move))
+    if em <= 0:
+        return "UNKNOWN"
+    if pb <= em * 0.20:
+        return "IMMEDIATE_START_ZONE"
+    if pb <= em * 0.45:
+        return "SMALL_PULLBACK_ZONE"
+    return "WAIT_FOR_RETEST_ZONE"
+
 def summarize_records(
     condition_key: str,
     coin: str,
@@ -702,6 +755,7 @@ def summarize_records(
 
     if total <= 0:
         return LearningSummary(
+            strategy_level=DEFAULT_STRATEGY_LEVEL,
             condition_key=condition_key,
             coin=coin,
             direction=direction,
@@ -717,6 +771,8 @@ def summarize_records(
             similar_win_rate=50.0,
             avg_move_percent=0.0,
             expected_move_percent=0.0,
+            expected_pullback_percent=0.0,
+            best_entry_zone="UNKNOWN",
             avg_mfe_percent=0.0,
             avg_mae_percent=0.0,
             avg_holding_seconds=0.0,
@@ -730,6 +786,7 @@ def summarize_records(
             pattern_count=0,
             pattern_win_rate=0.0,
             matched_pattern_id="",
+            pattern_features={},
             risk_label="UNKNOWN",
             confidence_hint="LOW_DATA",
             notes=("NO_HISTORY",),
@@ -814,8 +871,12 @@ def summarize_records(
     matched_pattern_id = best_pattern.pattern_id or best_pattern.learning_id if best_pattern else ""
 
     expected_move = max(0.0, avg_mfe * 0.88 if avg_mfe > 0 else avg_move)
+    expected_pullback = max(0.0, abs(avg_mae))
+    best_entry_zone = infer_best_entry_zone(direction, expected_pullback, expected_move)
+    pattern_features = build_pattern_features(pattern_records or records)
 
     return LearningSummary(
+        strategy_level=DEFAULT_STRATEGY_LEVEL,
         condition_key=condition_key,
         coin=coin,
         direction=direction,
@@ -831,6 +892,8 @@ def summarize_records(
         similar_win_rate=clamp(wr),
         avg_move_percent=safe_float(avg_move),
         expected_move_percent=safe_float(expected_move),
+        expected_pullback_percent=safe_float(expected_pullback),
+        best_entry_zone=best_entry_zone,
         avg_mfe_percent=safe_float(avg_mfe),
         avg_mae_percent=safe_float(avg_mae),
         avg_holding_seconds=safe_float(avg_hold),
@@ -844,6 +907,7 @@ def summarize_records(
         pattern_count=pattern_count,
         pattern_win_rate=clamp(pattern_win_rate),
         matched_pattern_id=matched_pattern_id,
+        pattern_features=pattern_features,
         risk_label=risk_label,
         confidence_hint=confidence_hint,
         notes=tuple(dict.fromkeys(notes)),
@@ -861,6 +925,7 @@ def build_coin_behavior(summary: LearningSummary) -> CoinBehaviorRecord:
 
     return CoinBehaviorRecord(
         behavior_id=f"beh_{uuid4().hex}",
+        strategy_level=summary.strategy_level,
         coin=summary.coin,
         direction=summary.direction,
         timeframe=summary.timeframe,
