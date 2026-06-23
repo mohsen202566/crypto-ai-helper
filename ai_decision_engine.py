@@ -171,6 +171,83 @@ def _meta_weight(meta: Optional[MetaLearningSummary], module_name: str, default:
         return default
 
 
+def _learning_value(learning: Optional[Any], key: str, default: Any = None) -> Any:
+    if learning is None:
+        return default
+    if isinstance(learning, dict):
+        return learning.get(key, default)
+    return getattr(learning, key, default)
+
+
+def _learning_float(learning: Optional[Any], key: str, default: float = 0.0) -> float:
+    try:
+        value = _learning_value(learning, key, default)
+        if value is None:
+            return default
+        v = float(value)
+        if math.isnan(v) or math.isinf(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+
+def _learning_int(learning: Optional[Any], key: str, default: int = 0) -> int:
+    try:
+        value = _learning_value(learning, key, default)
+        if value is None:
+            return default
+        return int(float(value))
+    except Exception:
+        return default
+
+
+def _learning_notes(learning: Optional[Any]) -> Tuple[str, ...]:
+    notes = _learning_value(learning, "notes", ())
+    if notes is None:
+        return ()
+    if isinstance(notes, str):
+        return (notes,)
+    try:
+        return tuple(str(x) for x in notes)
+    except Exception:
+        return ()
+
+
+def _learning_to_dict(learning: Optional[Any]) -> JsonDict:
+    if learning is None:
+        return {}
+    if isinstance(learning, dict):
+        return dict(learning)
+    if hasattr(learning, "to_dict") and callable(learning.to_dict):
+        try:
+            data = learning.to_dict()
+            return dict(data) if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+    try:
+        return dict(getattr(learning, "__dict__", {}))
+    except Exception:
+        return {}
+
+
+def _hunter_memory_support(learning: Optional[Any]) -> Tuple[float, float, float, float, int, Tuple[str, ...]]:
+    """Return timing/outcome memory fields when available.
+
+    Backward compatible: older coin_learning summaries do not have these fields,
+    so this function falls back to similar_win_rate and neutral timing.
+    """
+    similar_wr = _learning_float(learning, "similar_win_rate", 50.0)
+    return (
+        clamp(_learning_float(learning, "timing_score", 50.0)),
+        clamp(_learning_float(learning, "early_success_rate", 0.0)),
+        clamp(_learning_float(learning, "fuzzy_match_score", 0.0)),
+        clamp(_learning_float(learning, "outcome_success_rate", similar_wr)),
+        max(0, _learning_int(learning, "sample_count", 0)),
+        _learning_notes(learning),
+    )
+
+
 class DecisionInputValidator:
     """Hard safety validation before any AI decision."""
 
@@ -260,11 +337,39 @@ class AIScoreComposer:
 
         learning_score = 50.0
         if learning is not None:
+            timing_score, early_success_rate, fuzzy_match_score, outcome_success_rate, sample_count, notes = _hunter_memory_support(learning)
+            similar_wr = clamp(_learning_float(learning, "similar_win_rate", 50.0))
+            risk_label = str(_learning_value(learning, "risk_label", "") or "").upper()
+
+            # Movement Hunter learning score:
+            # result matters, but timing and pre-move similarity matter too.
+            # A late profitable setup must not score the same as a setup that
+            # repeatedly caught the first candle before pump/dump.
+            sample_score = min(100.0, sample_count * 5.0)
+            memory_bonus = 0.0
+            if timing_score >= 65:
+                memory_bonus += 5.0
+            if early_success_rate >= 45:
+                memory_bonus += 6.0
+            if fuzzy_match_score >= 70:
+                memory_bonus += 4.0
+            if "PREMOVE_PATTERN_WORKED_WITH_TIMING" in notes:
+                memory_bonus += 5.0
+            if "PREMOVE_PATTERN_WEAK_OR_LATE" in notes:
+                memory_bonus -= 8.0
+            if "TIMING_LATE_OR_WEAK_PATTERN" in notes:
+                memory_bonus -= 5.0
+
             learning_score = clamp(
-                learning.similar_win_rate * 0.65
-                + min(100.0, learning.sample_count * 5.0) * 0.20
-                + (10.0 if learning.risk_label == "FAVORABLE_CONDITION" else 0.0)
-                - (15.0 if learning.risk_label == "RISKY_CONDITION" else 0.0)
+                similar_wr * 0.28
+                + outcome_success_rate * 0.24
+                + timing_score * 0.20
+                + early_success_rate * 0.12
+                + fuzzy_match_score * 0.08
+                + sample_score * 0.08
+                + (10.0 if risk_label == "FAVORABLE_CONDITION" else 0.0)
+                - (16.0 if risk_label == "RISKY_CONDITION" else 0.0)
+                + memory_bonus
             )
 
         state_score = clamp(
@@ -279,13 +384,16 @@ class AIScoreComposer:
         range_penalty = clamp(state.range_probability * 0.45 + candidate.sensor_snapshot.range_probability * 0.25)
         late_penalty = clamp(state.late_entry_risk * 0.50 + movement.reversal_pressure * 0.35)
 
+        # Movement Hunter balance:
+        # classic analysis remains a sensor, while movement prediction and
+        # conditional coin-learning carry more influence in the final score.
         positive = (
-            analysis_score * 0.16 * w_analysis
-            + movement_score * 0.20 * w_movement
-            + prediction_score * 0.18 * w_pred
-            + confidence_score * 0.18 * w_conf
-            + learning_score * 0.14 * w_learning
-            + state_score * 0.14 * w_state
+            analysis_score * 0.12 * w_analysis
+            + movement_score * 0.22 * w_movement
+            + prediction_score * 0.20 * w_pred
+            + confidence_score * 0.16 * w_conf
+            + learning_score * 0.20 * w_learning
+            + state_score * 0.10 * w_state
         )
 
         # Keep penalties meaningful but not dominant.
@@ -360,10 +468,11 @@ class HardRejectRules:
 class DecisionTypeClassifier:
     """Converts score/context into REAL, GHOST or REJECT.
 
-    Soft-learning policy:
-    - REAL stays selective.
-    - Borderline/weak/range/late/low-data candidates become GHOST.
-    - REJECT is reserved for invalid input handled outside this classifier.
+    Movement Hunter policy:
+    - REAL must be selective and fresh/live.
+    - GHOST remains the broad learning path.
+    - Learning can promote strong familiar conditions, but it must not override
+      explicit GHOST-only warnings such as LATE, RANGE, HIGH_TRAP, or LOW_DATA.
     """
 
     def classify(
@@ -384,16 +493,70 @@ class DecisionTypeClassifier:
         configured_min_real = safe_float(getattr(SETTINGS.ai, "min_real_confidence", 72.0), 72.0)
         configured_min_ghost = safe_float(getattr(SETTINGS.ai, "min_ghost_confidence", 45.0), 45.0)
 
-        # Keep REAL strict enough for safety.
-        min_real = clamp(configured_min_real, 66.0, 72.0)
-
-        # GHOST must be softer because it is the learning path.
-        min_ghost = clamp(configured_min_ghost, 22.0, 38.0)
+        # Keep real trading selective. GHOST remains broad for learning.
+        min_real = clamp(configured_min_real, 68.0, 76.0)
+        min_ghost = clamp(configured_min_ghost, 22.0, 40.0)
         max_real_risk = safe_float(getattr(SETTINGS.ai, "max_real_risk", 38.0), 38.0)
+
+        learning_sample_count = 0
+        learning_win_rate = 0.0
+        learning_risk_label = ""
+        learning_confidence_hint = ""
+        timing_score = 50.0
+        early_success_rate = 0.0
+        fuzzy_match_score = 0.0
+        outcome_success_rate = 50.0
+        learning_notes: Tuple[str, ...] = ()
+        if learning is not None:
+            learning_sample_count = max(0, _learning_int(learning, "sample_count", 0))
+            learning_win_rate = clamp(_learning_float(learning, "similar_win_rate", 0.0), 0.0)
+            learning_risk_label = str(_learning_value(learning, "risk_label", "") or "").upper()
+            learning_confidence_hint = str(_learning_value(learning, "confidence_hint", "") or "").upper()
+            timing_score, early_success_rate, fuzzy_match_score, outcome_success_rate, _, learning_notes = _hunter_memory_support(learning)
+
+        low_data = learning is not None and learning_confidence_hint == "LOW_DATA"
+        # Risk is evaluated after hunter-memory quality below.
+        risky_learning = False
+        hunter_memory_good = (
+            learning is not None
+            and learning_sample_count >= 3
+            and outcome_success_rate >= 52.0
+            and (timing_score >= 62.0 or early_success_rate >= 35.0 or fuzzy_match_score >= 68.0)
+            and "PREMOVE_PATTERN_WEAK_OR_LATE" not in learning_notes
+        )
+        hunter_memory_strong = (
+            learning is not None
+            and learning_sample_count >= 5
+            and outcome_success_rate >= 58.0
+            and (timing_score >= 68.0 or early_success_rate >= 45.0)
+            and fuzzy_match_score >= 62.0
+            and "TIMING_LATE_OR_WEAK_PATTERN" not in learning_notes
+        )
+        good_learning = (
+            learning is not None
+            and learning_sample_count >= 6
+            and learning_win_rate >= 62.0
+            and learning_risk_label != "RISKY_CONDITION"
+        ) or hunter_memory_good
+        very_strong_learning = (
+            learning is not None
+            and learning_sample_count >= 10
+            and learning_win_rate >= 68.0
+            and learning_risk_label == "FAVORABLE_CONDITION"
+        ) or hunter_memory_strong
+
+        risky_learning = (
+            learning is not None
+            and (
+                learning_risk_label == "RISKY_CONDITION"
+                or (learning_sample_count >= 4 and learning_win_rate > 0 and learning_win_rate <= 45.0 and not hunter_memory_good)
+                or (learning_sample_count >= 5 and outcome_success_rate <= 38.0 and timing_score <= 42.0)
+            )
+        )
 
         must_ghost = False
 
-        # Downgrade conditions. These are NOT rejection reasons.
+        # GHOST-only conditions. These must not be bypassed by a loose bridge.
         if confidence.should_downgrade_to_ghost:
             must_ghost = True
             reasons.append("CONFIDENCE_REQUIRES_GHOST")
@@ -403,9 +566,12 @@ class DecisionTypeClassifier:
         if correlation.should_reduce_priority:
             must_ghost = True
             reasons.append("CORRELATION_REDUCES_PRIORITY")
-        if learning is not None and learning.confidence_hint == "LOW_DATA":
+        if low_data:
             must_ghost = True
             reasons.append("LEARNING_LOW_DATA_GHOST")
+        if risky_learning:
+            must_ghost = True
+            reasons.append("LEARNING_RISKY_CONDITION_GHOST_ONLY")
         if trap.trap_risk >= 65:
             must_ghost = True
             reasons.append("TRAP_RISK_GHOST_ONLY")
@@ -415,88 +581,93 @@ class DecisionTypeClassifier:
         if movement.freshness in {"DEAD", "UNKNOWN", "LATE"}:
             must_ghost = True
             reasons.append(f"FRESHNESS_{movement.freshness}_GHOST_ONLY")
-        if prediction.predicted_phase in {"RANGE", "UNKNOWN"}:
+        if prediction.predicted_phase in {"RANGE", "UNKNOWN", "LATE"}:
             must_ghost = True
             reasons.append(f"PREDICTED_PHASE_{prediction.predicted_phase}_GHOST_ONLY")
-
-        real_conf_floor = max(52.0, min_real - 18.0)
-        real_allowed = (
-            score.final_score >= min_real
-            and confidence.confidence_score >= real_conf_floor
-            and (prediction.movement_probability >= 52 or movement.readiness_score >= 62)
-            and movement.freshness in {"FRESH", "MID"}
-            and state.market_state not in {"RANGE", "EXHAUSTION", "LATE"}
-            and prediction.predicted_phase not in {"RANGE", "UNKNOWN"}
-            and trap.trap_risk <= max_real_risk + 22
-            and correlation.exposure_risk < 75
-            and not must_ghost
-        )
-
-        # Strong Ghost -> REAL bridge.
-        #
-        # The main REAL gate above stays conservative, but the bot must not
-        # keep profitable, fast Movement-Hunter candidates trapped as GHOST
-        # forever. This bridge promotes only strong GHOST-quality candidates
-        # to REAL when risk is acceptable. It intentionally does NOT touch:
-        # - hard invalid-input rejects
-        # - TP/SL logic
-        # - Toobit execution
-        # - GHOST creation/learning for weaker candidates
-        #
-        # This keeps the current high-WR Ghost logic intact while allowing
-        # the best of those Ghost candidates to become real trades.
-        learning_sample_count = 0
-        learning_win_rate = 0.0
-        learning_risk_label = ""
-        learning_confidence_hint = ""
-        if learning is not None:
-            learning_sample_count = int(max(0, safe_float(getattr(learning, "sample_count", 0), 0)))
-            learning_win_rate = clamp(safe_float(getattr(learning, "similar_win_rate", 0.0), 0.0))
-            learning_risk_label = str(getattr(learning, "risk_label", "") or "").upper()
-            learning_confidence_hint = str(getattr(learning, "confidence_hint", "") or "").upper()
-
-        strong_learning = (
-            learning_sample_count >= 2
-            and learning_win_rate >= 62.0
-            and learning_risk_label != "RISKY_CONDITION"
-        )
-
-        very_strong_learning = (
-            learning_sample_count >= 5
-            and learning_win_rate >= 68.0
-            and learning_risk_label != "RISKY_CONDITION"
-        )
 
         live_or_early_move = (
             movement.freshness in {"FRESH", "MID"}
             or prediction.predicted_phase in {"PRE_START", "START", "MID"}
-            or movement.readiness_score >= 55.0
-            or prediction.movement_probability >= 50.0
+        )
+        strong_live_confirmation = (
+            movement.readiness_score >= 60.0
+            or prediction.movement_probability >= 58.0
+            or (
+                movement.readiness_score >= 52.0
+                and prediction.movement_probability >= 50.0
+                and confidence.confidence_score >= 38.0
+            )
+        )
+        severe_risk_block = (
+            trap.trap_risk >= 75.0
+            or trap.liquidity_risk >= 82.0
+            or correlation.exposure_risk >= 82.0
+            or movement.freshness == "DEAD"
+            or state.exhaustion_risk >= 82.0
+            or state.late_entry_risk >= 82.0
+            or (state.range_probability >= 85.0 and movement.readiness_score < 68.0)
         )
 
-        severe_risk_block = (
-            trap.trap_risk >= 78.0
-            or trap.liquidity_risk >= 85.0
-            or correlation.exposure_risk >= 85.0
-            or movement.freshness == "DEAD"
-            or (
-                state.market_state == "RANGE"
-                and state.range_probability >= 82.0
-                and movement.readiness_score < 65.0
-                and not very_strong_learning
-            )
-            or (
-                state.market_state == "EXHAUSTION"
-                and state.exhaustion_risk >= 78.0
-                and movement.continuation_probability < 55.0
-                and not very_strong_learning
-            )
-            or (
-                prediction.predicted_phase == "RANGE"
-                and prediction.movement_probability < 55.0
-                and not very_strong_learning
-            )
+        real_conf_floor = max(38.0, min_real - 22.0)
+
+        # Main REAL gate: strong score + live/fresh movement + no GHOST-only flags.
+        real_allowed = (
+            score.final_score >= min_real
+            and confidence.confidence_score >= real_conf_floor
+            and strong_live_confirmation
+            and live_or_early_move
+            and not must_ghost
+            and not severe_risk_block
+            and trap.trap_risk <= max_real_risk + 18.0
+            and correlation.exposure_risk < 72.0
         )
+
+        # Learning-assisted REAL: only when familiar condition history is good.
+        # This is intentionally much stricter than the old loose Ghost->REAL bridge.
+        learned_hunter_real = (
+            not real_allowed
+            and not must_ghost
+            and not severe_risk_block
+            and live_or_early_move
+            and good_learning
+            and score.final_score >= (min_real - (10.0 if hunter_memory_good else 8.0))
+            and confidence.confidence_score >= (32.0 if hunter_memory_good else 34.0)
+            and (movement.readiness_score >= 50.0 or prediction.movement_probability >= 48.0 or hunter_memory_good)
+            and trap.trap_risk < 58.0
+            and correlation.exposure_risk < 68.0
+        )
+
+        # Very strong learned condition can accept a slightly lower score, but
+        # still cannot override RANGE/LATE/HIGH_TRAP/LOW_DATA GHOST-only flags.
+        very_strong_learned_hunter_real = (
+            not real_allowed
+            and not learned_hunter_real
+            and not must_ghost
+            and not severe_risk_block
+            and live_or_early_move
+            and very_strong_learning
+            and score.final_score >= (min_real - (15.0 if hunter_memory_strong else 12.0))
+            and confidence.confidence_score >= (28.0 if hunter_memory_strong else 30.0)
+            and (movement.readiness_score >= 46.0 or prediction.movement_probability >= 45.0 or hunter_memory_strong)
+            and trap.trap_risk < 55.0
+            and correlation.exposure_risk < 65.0
+        )
+
+        if real_allowed or learned_hunter_real or very_strong_learned_hunter_real:
+            reasons.append("AI_DECISION_REAL_ALLOWED")
+            if learned_hunter_real:
+                reasons.append("LEARNING_ASSISTED_HUNTER_REAL")
+            if very_strong_learned_hunter_real:
+                reasons.append("VERY_STRONG_LEARNING_HUNTER_REAL")
+            if good_learning:
+                reasons.append("CONDITIONAL_LEARNING_SUPPORTS_REAL")
+            if hunter_memory_good:
+                reasons.append("HUNTER_MEMORY_TIMING_SUPPORTS_REAL")
+            if hunter_memory_strong:
+                reasons.append("STRONG_PREMOVE_MEMORY_SUPPORTS_REAL")
+            if live_or_early_move:
+                reasons.append("LIVE_OR_EARLY_MOVEMENT_CONFIRMED")
+            return DECISION_REAL, reasons, warnings
 
         ghost_allowed = (
             score.final_score >= min_ghost
@@ -505,53 +676,22 @@ class DecisionTypeClassifier:
             or movement.readiness_score >= 12.0
             or score.analysis_score >= 45.0
             or score.state_score >= 35.0
-            or (learning is not None and learning.confidence_hint == "LOW_DATA")
+            or low_data
+            or risky_learning
         )
-
-        # Soft REAL mode:
-        #
-        # Current live stats showed the GHOST path was highly profitable while
-        # REAL stayed at zero. Therefore the safest coordinated fix is not to
-        # change TP/SL, Toobit, monitoring, or learning. Instead, promote the
-        # same candidates that were already good enough for GHOST into REAL
-        # unless there is an extreme risk block.
-        #
-        # This preserves the working Ghost logic, but prevents missing fast
-        # pump/dump moves. If future real SLs increase, coin_learning and
-        # meta_learning can tighten conditions again through risk labels and
-        # layer weights.
-        strong_ghost_to_real = (
-            ghost_allowed
-            and not severe_risk_block
-            and confidence.confidence_score >= 8.0
-            and trap.trap_risk < 82.0
-            and trap.liquidity_risk < 88.0
-            and correlation.exposure_risk < 82.0
-        )
-
-        if real_allowed or strong_ghost_to_real:
-            reasons.append("AI_DECISION_REAL_ALLOWED")
-            if strong_ghost_to_real and not real_allowed:
-                reasons.append("STRONG_GHOST_TO_REAL_BRIDGE")
-                reasons.append("GHOST_ALLOWED_TO_REAL_SOFT_MODE")
-                if must_ghost:
-                    warnings.append("GHOST_DOWNGRADE_OVERRIDDEN_BY_SOFT_REAL_MODE")
-                if strong_learning:
-                    reasons.append("LEARNING_SUPPORTS_REAL_PROMOTION")
-                if very_strong_learning:
-                    reasons.append("VERY_STRONG_LEARNING_SUPPORTS_REAL")
-                if learning_confidence_hint == "LOW_DATA":
-                    warnings.append("LOW_DATA_ALLOWED_FOR_STRONG_REAL")
-            return DECISION_REAL, reasons, warnings
 
         if ghost_allowed:
             reasons.append("AI_DECISION_GHOST_FOR_LEARNING")
             if must_ghost:
                 warnings.append("DOWNGRADED_TO_GHOST")
+            if risky_learning:
+                warnings.append("LEARNING_BLOCKED_REAL_TO_GHOST")
+            if low_data:
+                warnings.append("LOW_DATA_COLLECT_MORE_GHOST")
             return DECISION_GHOST, reasons, warnings
 
-        # Final soft fallback:
-        # If data is valid but weak, still create GHOST so AI can learn why it failed.
+        # Final soft fallback: keep weak but valid candidates as GHOST so the AI
+        # keeps learning why they failed instead of losing data.
         reasons.append("AI_DECISION_GHOST_SOFT_FALLBACK")
         warnings.append("VERY_WEAK_CANDIDATE_GHOST_LEARNING")
         return DECISION_GHOST, reasons, warnings
@@ -716,7 +856,7 @@ class AIDecisionEngine:
             warnings=tuple(dict.fromkeys(warnings)),
             reject_reasons=tuple(dict.fromkeys(reject_reasons)),
             meta={
-                "learning": learning.to_dict() if learning else {},
+                "learning": _learning_to_dict(learning),
                 "meta_learning": meta.to_dict() if meta else {},
                 "prediction": prediction.to_dict(),
                 "correlation": correlation.to_dict(),
