@@ -521,7 +521,7 @@ def choose_tp_mode(decision: AIDecision, prediction: MovementPredictionResult, l
     strong = (
         safe_float(decision.ai_score) >= 68
         and obj_float(prediction, "movement_probability", 0.0) >= 62
-        and str(obj_value(prediction, "predicted_phase", "")).upper() in {"PRE_START", "START", "MID"}
+        and str(obj_value(prediction, "predicted_phase", "")).upper() in {"PRE_START", "START"}
     )
 
     if learning is not None:
@@ -529,7 +529,10 @@ def choose_tp_mode(decision: AIDecision, prediction: MovementPredictionResult, l
         if risk_label == "RISKY_CONDITION":
             strong = False
             reasons.append("TP2_BLOCKED_BY_RISKY_LEARNING")
-        if obj_float(learning, "early_success_rate", 0.0) >= 45:
+        if (
+            obj_float(learning, "early_success_rate", 0.0) >= 45
+            and str(obj_value(prediction, "predicted_phase", "")).upper() in {"PRE_START", "START"}
+        ):
             strong = True
             reasons.append("TP2_ALLOWED_BY_EARLY_LEARNING")
 
