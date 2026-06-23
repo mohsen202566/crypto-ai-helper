@@ -3,39 +3,36 @@ from __future__ import annotations
 """
 23 - position_monitor.py
 
-Continuous real-position monitor for the locked Movement Hunter architecture.
+Light real-position monitor for the simplified Level 1 / 5M crypto futures bot.
 
-Responsibilities:
-- Continuously sync actual Toobit futures positions.
-- Keep internal position state aligned with real exchange state.
-- Monitor TP1 / TP2 / SL / AI_EXIT events.
-- Use exit_engine.py for profit protection / AI close recommendations.
-- Ask real_trade_manager/tobit_client to close or repair only through safe client methods.
-- Wait/retry real closed-position PnL before confirming result.
-- Return structured monitor events for result_reporter.py.
-
-Strictly forbidden:
+Locked goals:
+- Monitor real Toobit positions.
+- Detect TP1 / TP2 / SL.
+- Use exit_engine.py for simple smart exit.
+- AI exit before TP1 is already locked in exit_engine.py:
+  only after 70% path to TP1.
+- Learn REAL outcomes through coin_learning.py and movement_memory.py.
+- Return events for result_reporter.py; no Telegram sending here.
+- Preserve reply_to_message_id for result replies.
 - No AI entry decision.
-- No Telegram sending.
-- No Paper mode.
-- No Setup flow.
-- No fake PnL confirmation.
+- No paper/setup flow.
+- No fake confirmed PnL.
+- No trap/state/confidence/meta/correlation/movement_hunter dependency.
+
+This file monitors and returns structured events only.
 """
 
 from dataclasses import asdict, dataclass, field
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from uuid import uuid4
 import math
 import time
 
 from data_store import save_position, save_error, store
-from exit_engine import PositionContext, ExitDecision, evaluate_exit, position_context_from_dict
+from exit_engine import PositionContext, ExitDecision, evaluate_exit
 from analysis_layers import SensorSnapshot
-from movement_hunter import MovementHunterResult
-from trap_engine import TrapResult
-from state_engine import StateResult
+from analysis_engine import AnalysisCandidate
 from coin_learning import SOURCE_REAL, learn_outcome
-from meta_learning import audit_outcome
 from movement_memory import record_movement_memory
 
 
@@ -45,7 +42,6 @@ DIRECTION_LONG = "LONG"
 DIRECTION_SHORT = "SHORT"
 
 POSITION_OPEN = "OPEN"
-POSITION_PENDING_REAL_CONFIRM = "PENDING_REAL_CONFIRM"
 POSITION_CLOSED = "CLOSED"
 
 EVENT_SYNC_OPEN = "SYNC_OPEN"
@@ -55,7 +51,6 @@ EVENT_SL = "SL"
 EVENT_AI_EXIT = "AI_EXIT"
 EVENT_PROTECT_SL = "PROTECT_SL"
 EVENT_CLOSED_UNKNOWN = "CLOSED_UNKNOWN"
-EVENT_REPAIR_TP_SL = "REPAIR_TP_SL"
 
 PNL_PENDING = "PENDING"
 PNL_CONFIRMED = "CONFIRMED"
@@ -140,6 +135,8 @@ def safe_float(value: Any, default: float = 0.0) -> float:
 
 def safe_int(value: Any, default: int = 0) -> int:
     try:
+        if value is None:
+            return default
         return int(float(value))
     except Exception:
         return default
@@ -155,18 +152,6 @@ def normalize_direction(direction: str) -> str:
 
 
 def normalize_symbol_key(symbol: str) -> str:
-    """
-    Normalize bot/Toobit symbol formats to the same comparison key.
-
-    Examples:
-    - SOLUSDT
-    - SOL-SWAP-USDT
-    - SOL_SWAP_USDT
-    all become SOLUSDT.
-
-    This is intentionally local to the monitor so TP/SL tracking does not
-    depend on tobit_client internals.
-    """
     raw = str(symbol or "").upper().strip()
     if not raw:
         return ""
@@ -185,7 +170,7 @@ def symbol_match(a: str, b: str) -> bool:
 
 
 def position_symbol_keys(pos: Any) -> set[str]:
-    keys: set[str] = set()
+    values: List[Any] = []
     if isinstance(pos, RealPositionState):
         values = [pos.symbol, pos.exchange_symbol]
     elif isinstance(pos, dict):
@@ -197,15 +182,15 @@ def position_symbol_keys(pos: Any) -> set[str]:
             pos.get("contractCode"),
             pos.get("instId"),
         ]
-    else:
-        values = []
+
+    keys: set[str] = set()
     for value in values:
-        key = normalize_symbol_key(str(value or ""))
-        if key:
-            keys.add(key)
         raw = str(value or "").upper().strip()
+        key = normalize_symbol_key(raw)
         if raw:
             keys.add(raw)
+        if key:
+            keys.add(key)
     return keys
 
 
@@ -239,19 +224,16 @@ def _call_optional(obj: Any, names: List[str], *args, **kwargs) -> Any:
 
 
 class PositionStateMapper:
-    """Maps exchange/open-position dicts and stored state to RealPositionState."""
-
     def from_exchange(self, raw: Dict[str, Any], stored: Optional[RealPositionState] = None) -> RealPositionState:
         symbol = str(raw.get("symbol", raw.get("exchange_symbol", stored.exchange_symbol if stored else "")))
         direction = normalize_direction(str(raw.get("direction", raw.get("side", stored.direction if stored else ""))))
         qty = safe_float(raw.get("quantity", raw.get("qty", raw.get("positionAmt", stored.quantity if stored else 0.0))))
         entry = safe_float(raw.get("entry_price", raw.get("entryPrice", raw.get("avgPrice", stored.entry if stored else 0.0))))
-        mark = safe_float(raw.get("mark_price", raw.get("markPrice", raw.get("current_price", 0.0))))
+        mark = safe_float(raw.get("mark_price", raw.get("markPrice", raw.get("current_price", stored.current_price if stored else 0.0))))
         if mark <= 0:
             mark = entry
 
         position_id = str(raw.get("position_id", raw.get("id", stored.position_id if stored else f"pos_{uuid4().hex}")))
-
         highest = max(safe_float(stored.highest_price if stored else mark), mark)
         lowest = min(safe_float(stored.lowest_price if stored else mark), mark)
 
@@ -321,13 +303,11 @@ class PositionStateMapper:
             pnl_status=str(data.get("pnl_status", PNL_PENDING)),
             decision_id=str(data.get("decision_id", "")),
             signal_message_id=safe_int(data.get("signal_message_id", 0)),
-            meta=dict(data.get("meta", {}) if isinstance(data.get("meta", {}), dict) else {}),
+            meta=dict(data.get("meta", {}) if isinstance(data.get("meta", {}) , dict) else {}),
         )
 
 
 class PositionEventDetector:
-    """Detects TP1/TP2/SL from price and real position state."""
-
     def detect(self, pos: RealPositionState) -> List[str]:
         events: List[str] = []
         direction = normalize_direction(pos.direction)
@@ -343,7 +323,7 @@ class PositionEventDetector:
                 events.append(EVENT_TP2)
             if pos.sl > 0 and not pos.sl_hit and price <= pos.sl:
                 events.append(EVENT_SL)
-        else:
+        elif direction == DIRECTION_SHORT:
             if pos.tp1 > 0 and not pos.tp1_hit and price <= pos.tp1:
                 events.append(EVENT_TP1)
             if pos.tp2 > 0 and not pos.tp2_hit and price <= pos.tp2:
@@ -355,14 +335,6 @@ class PositionEventDetector:
 
 
 class RealPnLResolver:
-    """Fast Toobit closed-position PnL check.
-
-    Result messages must not wait several minutes for Toobit history to update.
-    This resolver tries only briefly. If Toobit does not return confirmed PnL
-    immediately, position_monitor.py sends the TP/SL/AI_EXIT panel right away
-    with an estimated PnL and PNL_UNAVAILABLE status.
-    """
-
     def resolve(self, client: Any, symbol: str, start_time_ms: Optional[int] = None, attempts: int = 2, sleep_seconds: float = 0.25) -> Tuple[float, str, JsonDict]:
         last: JsonDict = {}
         for _ in range(max(1, attempts)):
@@ -391,15 +363,6 @@ class RealPnLResolver:
 
 
 class PositionMonitor:
-    """
-    Main real-position monitor.
-
-    bot.py or a scheduler calls:
-        sync_once()
-        monitor_position()
-    and sends returned events to result_reporter.py.
-    """
-
     def __init__(self, client: Any):
         self.client = client
         self.mapper = PositionStateMapper()
@@ -412,7 +375,7 @@ class PositionMonitor:
         for item in records.values():
             try:
                 pos = self.mapper.from_store(item)
-                if pos.status not in {POSITION_CLOSED, "TP2", "SL", "AI_EXIT"}:
+                if pos.status != POSITION_CLOSED:
                     positions.append(pos)
             except Exception:
                 continue
@@ -435,13 +398,8 @@ class PositionMonitor:
     def sync_once(self) -> List[PositionMonitorEvent]:
         events: List[PositionMonitorEvent] = []
         stored_positions = self.load_stored_positions()
-
-        # Old bug:
-        #   stored = {p.exchange_symbol: p}
-        # and exchange returned e.g. SOL-SWAP-USDT while stored records could be
-        # SOLUSDT. That made old=None, so TP1/SL/message_id were lost and no
-        # result could be reported. Build a normalized multi-key index instead.
         stored_by_key: Dict[str, RealPositionState] = {}
+
         for pos in stored_positions:
             for key in position_symbol_keys(pos):
                 stored_by_key.setdefault(key, pos)
@@ -451,8 +409,8 @@ class PositionMonitor:
         seen_position_ids: set[str] = set()
 
         for raw in exchange_positions:
-            exchange_symbol = str(raw.get("symbol", raw.get("contract", raw.get("contractCode", raw.get("instId", "")))))
             raw_keys = position_symbol_keys(raw)
+            exchange_symbol = str(raw.get("symbol", raw.get("contract", raw.get("contractCode", raw.get("instId", "")))))
             if exchange_symbol:
                 raw_keys.add(exchange_symbol.upper().strip())
                 raw_keys.add(normalize_symbol_key(exchange_symbol))
@@ -465,9 +423,6 @@ class PositionMonitor:
 
             pos = self.mapper.from_exchange(raw, stored=old)
 
-            # Preserve all entry-time tracking data if a stored position was found.
-            # Mapper already falls back to stored tp1/sl/message_id, but this extra
-            # protection keeps the monitor safe when Toobit returns partial fields.
             if old is not None:
                 pos = RealPositionState(**{
                     **pos.to_dict(),
@@ -496,11 +451,8 @@ class PositionMonitor:
             if old is None:
                 events.append(self._event(pos, EVENT_SYNC_OPEN, pos.current_price, reason_codes=("EXCHANGE_POSITION_IMPORTED",), should_report=False))
 
-        # Anything stored but not on exchange may have closed.
-        # Use normalized symbol keys and position_id, not raw exchange_symbol only.
         for pos in stored_positions:
-            keys = position_symbol_keys(pos)
-            matched_by_symbol = bool(keys & seen_keys)
+            matched_by_symbol = bool(position_symbol_keys(pos) & seen_keys)
             matched_by_id = bool(pos.position_id and pos.position_id in seen_position_ids)
             if not matched_by_symbol and not matched_by_id and pos.status == POSITION_OPEN:
                 closed = RealPositionState(**{**pos.to_dict(), "status": POSITION_CLOSED, "close_time": now_ts()})
@@ -511,9 +463,6 @@ class PositionMonitor:
                     "realized_pnl_percent": pnl_percent(closed.direction, closed.entry, closed.current_price),
                     "pnl_status": pnl_status,
                 })
-                # Full REAL learning needs fresh analysis objects and original candidate,
-                # so unknown/manual exchange closes are persisted with real PnL and reported
-                # instead of creating fake learning context.
                 save_position(closed.position_id, closed.to_dict())
                 events.append(self._event(
                     closed,
@@ -522,263 +471,91 @@ class PositionMonitor:
                     pnl,
                     closed.realized_pnl_percent,
                     pnl_status,
-                    reason_codes=("POSITION_MISSING_ON_EXCHANGE", "UNKNOWN_CLOSE_PNL_RESOLVED", "SYMBOL_MATCH_NORMALIZED"),
+                    reason_codes=("POSITION_MISSING_ON_EXCHANGE", "SYMBOL_MATCH_NORMALIZED"),
                     raw={"pnl": pnl_raw},
                     should_report=True,
                 ))
 
         return events
 
-
-    def _tp_mode(self, pos: RealPositionState) -> str:
-        try:
-            plan = pos.meta.get("tp_sl_plan", {}) if isinstance(pos.meta, dict) else {}
-            return str(plan.get("tp_mode", "")).upper()
-        except Exception:
-            return ""
-
-    def _has_tp2_runner(self, pos: RealPositionState) -> bool:
-        return bool(self._tp_mode(pos) == "TP1_TP2" and pos.tp2 > 0 and pos.quantity > 0)
-
-    def _estimate_pnl_usdt(self, pos: RealPositionState, price: float, quantity_fraction: float = 1.0) -> float:
-        pct = pnl_percent(pos.direction, pos.entry, price)
-        base_margin = safe_float(pos.margin_usdt) * max(0.0, min(1.0, quantity_fraction))
-        return base_margin * safe_float(pos.leverage, 1.0) * pct / 100.0
-
-    def _tp1_protected_sl(self, pos: RealPositionState) -> float:
-        """
-        Protect the TP2 runner after TP1 without choking it.
-
-        Old behavior moved SL exactly to TP1, which can close the runner on a
-        normal retest/liquidity wick. This keeps profit protected, but gives the
-        remaining 25% runner a little breathing room toward TP2.
-        """
-        entry = safe_float(pos.entry)
-        tp1 = safe_float(pos.tp1)
-        tp2 = safe_float(pos.tp2)
-        direction = normalize_direction(pos.direction)
-
-        if entry <= 0:
-            return 0.0
-        if tp1 <= 0:
-            return entry
-
-        # If TP2 exists, protect slightly behind TP1 by 15% of TP1→TP2 distance.
-        # Never move protection beyond entry in the wrong direction.
-        if tp2 > 0 and abs(tp2 - tp1) > 0:
-            buffer_dist = abs(tp2 - tp1) * 0.15
-            if direction == DIRECTION_LONG:
-                return max(entry, tp1 - buffer_dist)
-            if direction == DIRECTION_SHORT:
-                return min(entry, tp1 + buffer_dist)
-
-        return tp1
-
-
-    def _close_order_ok(self, raw: JsonDict) -> bool:
-        """Return False only when close API clearly failed.
-
-Some Toobit responses do not expose a simple ok/success flag, so absence of an
-explicit error is treated as acceptable. This avoids falsely blocking valid
-market-close responses while still catching clear failures.
-        """
-        if not isinstance(raw, dict):
-            return True
-        if raw.get("error"):
-            return False
-        if raw.get("ok") is False or raw.get("success") is False:
-            return False
-        status = str(raw.get("status", "")).upper()
-        if status in {"REJECTED", "FAILED", "ERROR"}:
-            return False
-        return True
-
     def monitor_position(
         self,
         pos: RealPositionState,
         snapshot: Optional[SensorSnapshot] = None,
-        movement: Optional[MovementHunterResult] = None,
-        trap: Optional[TrapResult] = None,
-        state: Optional[StateResult] = None,
     ) -> List[PositionMonitorEvent]:
         events: List[PositionMonitorEvent] = []
         detected = self.detector.detect(pos)
-
         updated = pos
 
         for event_type in detected:
             if event_type == EVENT_TP1 and not updated.tp1_hit:
-                # Save-profit plan:
-                # - Normal signals: close 100% at TP1.
-                # - Strong TP1_TP2 signals: close 75% at TP1, keep 25% runner for TP2.
-                if self._has_tp2_runner(updated):
-                    original_qty = safe_float(updated.quantity)
-                    close_qty = max(0.0, original_qty * TP1_STRONG_CLOSE_FRACTION)
-                    runner_qty = max(0.0, original_qty - close_qty)
-                    close_raw = self._close_position_verified(updated, quantity=close_qty)
-                    if not self._close_order_ok(close_raw):
-                        save_error("position_monitor_tp1_partial_close_failed", str(close_raw), updated.to_dict())
-                        events.append(self._event(
-                            updated,
-                            EVENT_TP1,
-                            updated.current_price,
-                            reason_codes=("TP1_PRICE_REACHED", "TP1_PARTIAL_CLOSE_FAILED"),
-                            warnings=("TP1_NOT_MARKED_BECAUSE_CLOSE_FAILED",),
-                            raw={"partial_close": close_raw},
-                            should_report=False,
-                        ))
-                        continue
-                    protected_sl = self._tp1_protected_sl(updated)
+                events.extend(self._handle_tp1(updated, snapshot))
+                updated = self.mapper.from_store(events[-1].raw.get("position", updated.to_dict())) if events and events[-1].raw.get("position") else updated
+                if events and events[-1].event_type == EVENT_TP1 and events[-1].should_report:
+                    return events
 
-                    meta = dict(updated.meta or {})
-                    meta.update({
-                        "tp1_profit_locked": True,
-                        "tp1_close_fraction": TP1_STRONG_CLOSE_FRACTION,
-                        "tp1_closed_quantity": close_qty,
-                        "runner_fraction": TP1_RUNNER_FRACTION,
-                        "runner_quantity": runner_qty,
-                        "protected_sl_after_tp1": protected_sl,
-                    })
-
-                    updated = RealPositionState(**{
-                        **updated.to_dict(),
-                        "tp1_hit": True,
-                        "quantity": runner_qty,
-                        "sl": protected_sl,
-                        "meta": meta,
-                    })
-
-                    self._repair_protected_sl(updated, protected_sl)
-                    pnl_est = self._estimate_pnl_usdt(updated, updated.current_price, TP1_STRONG_CLOSE_FRACTION)
-                    pnl_pct = pnl_percent(updated.direction, updated.entry, updated.current_price)
-                    self._learn_real_outcome(updated, EVENT_TP1, updated.current_price, snapshot, movement, trap, state, pnl_est, pnl_pct)
-                    events.append(self._event(
-                        updated,
-                        EVENT_TP1,
-                        updated.current_price,
-                        pnl_est,
-                        pnl_pct,
-                        PNL_PENDING,
-                        reason_codes=("TP1_PRICE_REACHED", "TP1_PARTIAL_75_PERCENT_CLOSED", "RUNNER_25_PERCENT_TO_TP2", "SL_MOVED_TO_TP1_PROFIT_LOCK"),
-                        raw={"partial_close": close_raw, "closed_quantity": close_qty, "runner_quantity": runner_qty, "protected_sl": protected_sl},
-                    ))
-                else:
-                    close_raw = self._close_position_verified(updated, quantity=updated.quantity)
-                    if not self._close_order_ok(close_raw):
-                        save_error("position_monitor_tp1_full_close_failed", str(close_raw), updated.to_dict())
-                        events.append(self._event(
-                            updated,
-                            EVENT_TP1,
-                            updated.current_price,
-                            reason_codes=("TP1_PRICE_REACHED", "TP1_FULL_CLOSE_FAILED"),
-                            warnings=("TP1_NOT_MARKED_BECAUSE_CLOSE_FAILED",),
-                            raw={"close": close_raw},
-                            should_report=False,
-                        ))
-                        continue
-                    closed = RealPositionState(**{**updated.to_dict(), "tp1_hit": True, "status": POSITION_CLOSED, "close_time": now_ts()})
-                    pnl, pnl_status, pnl_raw = self._resolve_closed_pnl(closed)
-                    if pnl_status != PNL_CONFIRMED:
-                        pnl = self._estimate_pnl_usdt(closed, closed.current_price, 1.0)
-                    closed = RealPositionState(**{
-                        **closed.to_dict(),
-                        "realized_pnl_usdt": pnl,
-                        "realized_pnl_percent": pnl_percent(closed.direction, closed.entry, closed.current_price),
-                        "pnl_status": pnl_status,
-                    })
-                    self._learn_real_outcome(closed, EVENT_TP1, closed.current_price, snapshot, movement, trap, state, pnl, closed.realized_pnl_percent)
-                    save_position(closed.position_id, closed.to_dict())
-                    events.append(self._event(
-                        closed,
-                        EVENT_TP1,
-                        closed.current_price,
-                        pnl,
-                        closed.realized_pnl_percent,
-                        pnl_status,
-                        reason_codes=("TP1_PRICE_REACHED", "TP1_ONLY_FULL_CLOSE"),
-                        raw={"close": close_raw, "pnl": pnl_raw},
-                    ))
-                    updated = closed
             elif event_type == EVENT_TP2 and not updated.tp2_hit:
-                updated = RealPositionState(**{**updated.to_dict(), "tp2_hit": True, "status": POSITION_CLOSED, "close_time": now_ts()})
-                pnl, pnl_status, raw = self._resolve_closed_pnl(updated)
-                updated = RealPositionState(**{**updated.to_dict(), "realized_pnl_usdt": pnl, "realized_pnl_percent": pnl_percent(updated.direction, updated.entry, updated.current_price), "pnl_status": pnl_status})
-                self._learn_real_outcome(updated, EVENT_TP2, updated.current_price, snapshot, movement, trap, state, pnl, updated.realized_pnl_percent)
-                save_position(updated.position_id, updated.to_dict())
-                events.append(self._event(updated, EVENT_TP2, updated.current_price, pnl, updated.realized_pnl_percent, pnl_status, ("TP2_PRICE_REACHED",), raw=raw))
+                closed = RealPositionState(**{**updated.to_dict(), "tp2_hit": True, "status": POSITION_CLOSED, "close_time": now_ts()})
+                pnl, pnl_status, raw = self._resolve_closed_pnl(closed)
+                if pnl_status != PNL_CONFIRMED:
+                    pnl = self._estimate_pnl_usdt(closed, closed.current_price, 1.0)
+                closed = RealPositionState(**{
+                    **closed.to_dict(),
+                    "realized_pnl_usdt": pnl,
+                    "realized_pnl_percent": pnl_percent(closed.direction, closed.entry, closed.current_price),
+                    "pnl_status": pnl_status,
+                })
+                self._learn_real_outcome(closed, EVENT_TP2, closed.current_price, snapshot, pnl, closed.realized_pnl_percent)
+                save_position(closed.position_id, closed.to_dict())
+                events.append(self._event(closed, EVENT_TP2, closed.current_price, pnl, closed.realized_pnl_percent, pnl_status, ("TP2_PRICE_REACHED",), raw={"pnl": raw, "position": closed.to_dict()}))
+                return events
+
             elif event_type == EVENT_SL and not updated.sl_hit:
-                updated = RealPositionState(**{**updated.to_dict(), "sl_hit": True, "status": POSITION_CLOSED, "close_time": now_ts()})
-                pnl, pnl_status, raw = self._resolve_closed_pnl(updated)
-                updated = RealPositionState(**{**updated.to_dict(), "realized_pnl_usdt": pnl, "realized_pnl_percent": pnl_percent(updated.direction, updated.entry, updated.current_price), "pnl_status": pnl_status})
-                self._learn_real_outcome(updated, EVENT_SL, updated.current_price, snapshot, movement, trap, state, pnl, updated.realized_pnl_percent)
-                save_position(updated.position_id, updated.to_dict())
-                events.append(self._event(updated, EVENT_SL, updated.current_price, pnl, updated.realized_pnl_percent, pnl_status, ("SL_PRICE_REACHED",), raw=raw))
+                closed = RealPositionState(**{**updated.to_dict(), "sl_hit": True, "status": POSITION_CLOSED, "close_time": now_ts()})
+                pnl, pnl_status, raw = self._resolve_closed_pnl(closed)
+                if pnl_status != PNL_CONFIRMED:
+                    pnl = self._estimate_pnl_usdt(closed, closed.current_price, 1.0)
+                closed = RealPositionState(**{
+                    **closed.to_dict(),
+                    "realized_pnl_usdt": pnl,
+                    "realized_pnl_percent": pnl_percent(closed.direction, closed.entry, closed.current_price),
+                    "pnl_status": pnl_status,
+                })
+                self._learn_real_outcome(closed, EVENT_SL, closed.current_price, snapshot, pnl, closed.realized_pnl_percent)
+                save_position(closed.position_id, closed.to_dict())
+                events.append(self._event(closed, EVENT_SL, closed.current_price, pnl, closed.realized_pnl_percent, pnl_status, ("SL_PRICE_REACHED",), raw={"pnl": raw, "position": closed.to_dict()}))
+                return events
 
-        # AI exit/profit protection only if all analysis objects are provided.
-        if snapshot and movement and trap and state and updated.status == POSITION_OPEN:
+        if snapshot and updated.status == POSITION_OPEN:
             ctx = self._to_exit_context(updated)
-            exit_decision = evaluate_exit(ctx=ctx, snapshot=snapshot, movement=movement, trap=trap, state=state)
+            exit_decision = evaluate_exit(ctx=ctx, snapshot=snapshot)
+
             if exit_decision.should_move_sl_to_protect and exit_decision.protected_sl > 0:
-                self._repair_protected_sl(updated, exit_decision.protected_sl)
-                events.append(self._event(updated, EVENT_PROTECT_SL, updated.current_price, reason_codes=exit_decision.reason_codes, warnings=exit_decision.warnings, should_report=False))
+                protected = RealPositionState(**{**updated.to_dict(), "sl": exit_decision.protected_sl})
+                self._repair_protected_sl(protected, exit_decision.protected_sl)
+                save_position(protected.position_id, protected.to_dict())
+                events.append(self._event(
+                    protected,
+                    EVENT_PROTECT_SL,
+                    protected.current_price,
+                    reason_codes=exit_decision.reason_codes,
+                    warnings=exit_decision.warnings,
+                    raw={"position": protected.to_dict(), "exit_decision": exit_decision.to_dict()},
+                    should_report=False,
+                ))
+                updated = protected
 
-            # AI profit exit must not fire on tiny gross profit.
-            # Real-user safety fix:
-            # - Small closes such as +0.01 / +0.02 USDT are not useful after
-            #   fee/slippage and should not be treated as a good AI exit.
-            # - Normal AI profit exit requires at least 0.25 USDT floating/estimated profit.
-            # - Before TP1, AI close is blocked unless there is severe trap/reversal/emergency.
-            min_ai_profit_exit_usdt = 0.25
-            estimated_profit_usdt = self._estimate_pnl_usdt(updated, updated.current_price, 1.0)
-            current_profit_usdt = max(safe_float(updated.unrealized_pnl_usdt), estimated_profit_usdt)
-
-            exit_score_obj = getattr(exit_decision, "score", None)
-            emergency_score = safe_float(getattr(exit_score_obj, "emergency_score", 0.0), 0.0)
-            severe_ai_exit = (
-                str(getattr(exit_decision, "action", "")).upper() == "EMERGENCY"
-                or emergency_score >= 70.0
-                or (
-                    safe_float(getattr(trap, "trap_risk", 0.0), 0.0) >= 75.0
-                    and (
-                        safe_float(getattr(state, "reversal_probability", 0.0), 0.0) >= 60.0
-                        or safe_float(getattr(movement, "reversal_pressure", 0.0), 0.0) >= 60.0
-                    )
-                )
-            )
-
-            in_profit = current_profit_usdt >= min_ai_profit_exit_usdt
-            ai_profit_exit, ai_profit_reasons, ai_profit_warnings = self._ai_weakness_or_reversal_seen(
-                updated,
-                snapshot=snapshot,
-                movement=movement,
-                trap=trap,
-                state=state,
-                exit_decision=exit_decision,
-            )
-
-            if ai_profit_exit and not in_profit and not severe_ai_exit:
-                ai_profit_exit = False
-                ai_profit_warnings = tuple(list(ai_profit_warnings) + [
-                    "AI_PROFIT_EXIT_BLOCKED_MIN_0_25_USDT_NOT_REACHED"
-                ])
-
-            if ai_profit_exit and not updated.tp1_hit and not severe_ai_exit:
-                ai_profit_exit = False
-                ai_profit_warnings = tuple(list(ai_profit_warnings) + [
-                    "AI_PROFIT_EXIT_BLOCKED_BEFORE_TP1_UNLESS_SEVERE"
-                ])
-
-            if ai_profit_exit and (in_profit or severe_ai_exit):
+            if exit_decision.should_close:
                 close_raw = self._close_position_verified(updated)
                 if not self._close_order_ok(close_raw) or close_raw.get("closed_confirmed") is False:
-                    save_error("position_monitor_ai_profit_exit_close_failed", str(close_raw), updated.to_dict())
+                    save_error("position_monitor_ai_exit_close_failed", str(close_raw), updated.to_dict())
                     events.append(self._event(
                         updated,
                         EVENT_AI_EXIT,
                         updated.current_price,
-                        reason_codes=ai_profit_reasons,
-                        warnings=tuple(list(ai_profit_warnings) + ["AI_PROFIT_EXIT_NOT_MARKED_BECAUSE_CLOSE_NOT_CONFIRMED"]),
-                        raw={"close": close_raw},
+                        reason_codes=exit_decision.reason_codes,
+                        warnings=tuple(list(exit_decision.warnings) + ["AI_EXIT_NOT_MARKED_BECAUSE_CLOSE_NOT_CONFIRMED"]),
+                        raw={"close": close_raw, "exit_decision": exit_decision.to_dict()},
                         should_report=False,
                     ))
                     save_position(updated.position_id, updated.to_dict())
@@ -794,7 +571,7 @@ market-close responses while still catching clear failures.
                     "realized_pnl_percent": pnl_percent(closed.direction, closed.entry, closed.current_price),
                     "pnl_status": pnl_status,
                 })
-                self._learn_real_outcome(closed, EVENT_AI_EXIT, closed.current_price, snapshot, movement, trap, state, pnl, closed.realized_pnl_percent)
+                self._learn_real_outcome(closed, EVENT_AI_EXIT, closed.current_price, snapshot, pnl, closed.realized_pnl_percent)
                 save_position(closed.position_id, closed.to_dict())
                 events.append(self._event(
                     closed,
@@ -803,370 +580,172 @@ market-close responses while still catching clear failures.
                     pnl,
                     closed.realized_pnl_percent,
                     pnl_status,
-                    tuple(list(ai_profit_reasons) + ["AI_PROFIT_EXIT_ANY_PROFIT"]),
-                    ai_profit_warnings,
-                    raw={"close": close_raw, "pnl": pnl_raw},
+                    reason_codes=tuple(list(exit_decision.reason_codes) + ["AI_EXIT_CONFIRMED_BY_EXIT_ENGINE"]),
+                    warnings=exit_decision.warnings,
+                    raw={"close": close_raw, "pnl": pnl_raw, "exit_decision": exit_decision.to_dict(), "position": closed.to_dict()},
                 ))
+                return events
 
         save_position(updated.position_id, updated.to_dict())
         return events
 
     def monitor_all(
         self,
-        analysis_provider: Optional[Callable[[RealPositionState], Tuple[SensorSnapshot, MovementHunterResult, TrapResult, StateResult]]] = None,
+        analysis_provider: Optional[Callable[[RealPositionState], SensorSnapshot]] = None,
     ) -> List[PositionMonitorEvent]:
         events = self.sync_once()
         for pos in self.load_stored_positions():
             try:
-                if analysis_provider:
-                    snapshot, movement, trap, state = analysis_provider(pos)
-                    events.extend(self.monitor_position(pos, snapshot=snapshot, movement=movement, trap=trap, state=state))
-                else:
-                    events.extend(self.monitor_position(pos))
+                snapshot = analysis_provider(pos) if analysis_provider else None
+                events.extend(self.monitor_position(pos, snapshot=snapshot))
             except Exception as exc:
                 save_error("position_monitor_position", str(exc), pos.to_dict())
         return events
 
+    def _handle_tp1(self, pos: RealPositionState, snapshot: Optional[SensorSnapshot]) -> List[PositionMonitorEvent]:
+        events: List[PositionMonitorEvent] = []
 
-    def _coerce_saved_candidate(self, pos: RealPositionState, snapshot: Optional[SensorSnapshot]) -> Any:
-        """
-        Recover the original AnalysisCandidate for REAL learning.
+        if self._has_tp2_runner(pos):
+            original_qty = safe_float(pos.quantity)
+            close_qty = max(0.0, original_qty * TP1_STRONG_CLOSE_FRACTION)
+            runner_qty = max(0.0, original_qty - close_qty)
+            close_raw = self._close_position_verified(pos, quantity=close_qty)
 
-        Priority:
-        1) pos.meta["candidate"] saved at entry time
-        2) nested common meta locations
-        3) candidate object already embedded in meta
+            if not self._close_order_ok(close_raw):
+                save_error("position_monitor_tp1_partial_close_failed", str(close_raw), pos.to_dict())
+                events.append(self._event(
+                    pos,
+                    EVENT_TP1,
+                    pos.current_price,
+                    reason_codes=("TP1_PRICE_REACHED", "TP1_PARTIAL_CLOSE_FAILED"),
+                    warnings=("TP1_NOT_MARKED_BECAUSE_CLOSE_FAILED",),
+                    raw={"partial_close": close_raw, "position": pos.to_dict()},
+                    should_report=False,
+                ))
+                return events
 
-        If the exact candidate is not available, returns None and records an
-        error instead of silently skipping learning.
-        """
-        meta = pos.meta if isinstance(pos.meta, dict) else {}
-        candidates = [
-            meta.get("candidate"),
-            meta.get("analysis_candidate"),
-            meta.get("entry_candidate"),
-        ]
-
-        decision_meta = meta.get("decision") if isinstance(meta.get("decision"), dict) else {}
-        candidates.extend([
-            decision_meta.get("candidate"),
-            decision_meta.get("analysis_candidate"),
-        ])
-
-        tp_plan = meta.get("tp_sl_plan") if isinstance(meta.get("tp_sl_plan"), dict) else {}
-        plan_meta = tp_plan.get("meta") if isinstance(tp_plan.get("meta"), dict) else {}
-        candidates.extend([
-            plan_meta.get("candidate"),
-            plan_meta.get("analysis_candidate"),
-        ])
-
-        for saved_candidate in candidates:
-            if not saved_candidate:
-                continue
-            try:
-                from analysis_engine import AnalysisCandidate
-                if isinstance(saved_candidate, AnalysisCandidate):
-                    return saved_candidate
-                if hasattr(AnalysisCandidate, "from_dict") and callable(getattr(AnalysisCandidate, "from_dict")):
-                    return AnalysisCandidate.from_dict(saved_candidate)
-                if isinstance(saved_candidate, dict):
-                    return AnalysisCandidate(**saved_candidate)
-            except Exception as exc:
-                try:
-                    save_error("position_monitor_candidate_recover", str(exc), {
-                        "position_id": pos.position_id,
-                        "symbol": pos.symbol,
-                        "candidate_keys": list(saved_candidate.keys()) if isinstance(saved_candidate, dict) else str(type(saved_candidate)),
-                    })
-                except Exception:
-                    pass
-
-        try:
-            save_error("position_monitor_missing_candidate_for_learning", "candidate_not_found_in_position_meta", {
-                "position_id": pos.position_id,
-                "symbol": pos.symbol,
-                "meta_keys": list(meta.keys()),
-                "has_snapshot": snapshot is not None,
+            protected_sl = self._tp1_protected_sl(pos)
+            meta = dict(pos.meta or {})
+            meta.update({
+                "tp1_profit_locked": True,
+                "tp1_close_fraction": TP1_STRONG_CLOSE_FRACTION,
+                "tp1_closed_quantity": close_qty,
+                "runner_fraction": TP1_RUNNER_FRACTION,
+                "runner_quantity": runner_qty,
+                "protected_sl_after_tp1": protected_sl,
             })
-        except Exception:
-            pass
-        return None
 
+            updated = RealPositionState(**{
+                **pos.to_dict(),
+                "tp1_hit": True,
+                "quantity": runner_qty,
+                "sl": protected_sl,
+                "meta": meta,
+            })
+            self._repair_protected_sl(updated, protected_sl)
+            pnl_est = self._estimate_pnl_usdt(pos, pos.current_price, TP1_STRONG_CLOSE_FRACTION)
+            pnl_pct = pnl_percent(pos.direction, pos.entry, pos.current_price)
+            self._learn_real_outcome(updated, EVENT_TP1, updated.current_price, snapshot, pnl_est, pnl_pct)
+            save_position(updated.position_id, updated.to_dict())
+            events.append(self._event(
+                updated,
+                EVENT_TP1,
+                updated.current_price,
+                pnl_est,
+                pnl_pct,
+                PNL_PENDING,
+                reason_codes=("TP1_PRICE_REACHED", "TP1_PARTIAL_75_PERCENT_CLOSED", "RUNNER_25_PERCENT_TO_TP2", "PROTECTED_SL_AFTER_TP1"),
+                raw={"partial_close": close_raw, "closed_quantity": close_qty, "runner_quantity": runner_qty, "protected_sl": protected_sl, "position": updated.to_dict()},
+            ))
+            return events
 
-    def _learn_real_outcome(
-        self,
-        pos: RealPositionState,
-        event_type: str,
-        price: float,
-        snapshot: Optional[SensorSnapshot],
-        movement: Optional[MovementHunterResult],
-        trap: Optional[TrapResult],
-        state: Optional[StateResult],
-        pnl_usdt: float,
-        pnl_percent_value: float,
-    ) -> None:
-        """
-        Feed REAL outcomes back into AI learning.
+        close_raw = self._close_position_verified(pos, quantity=pos.quantity)
+        if not self._close_order_ok(close_raw):
+            save_error("position_monitor_tp1_full_close_failed", str(close_raw), pos.to_dict())
+            events.append(self._event(
+                pos,
+                EVENT_TP1,
+                pos.current_price,
+                reason_codes=("TP1_PRICE_REACHED", "TP1_FULL_CLOSE_FAILED"),
+                warnings=("TP1_NOT_MARKED_BECAUSE_CLOSE_FAILED",),
+                raw={"close": close_raw, "position": pos.to_dict()},
+                should_report=False,
+            ))
+            return events
 
-        This uses the latest provided monitoring context. If full original
-        candidate context is not available, it safely skips instead of creating
-        fake learning data. bot.py/analysis_provider should pass fresh sensor
-        objects for strong learning.
-        """
-        if snapshot is None or movement is None or trap is None or state is None:
-            return
+        closed = RealPositionState(**{**pos.to_dict(), "tp1_hit": True, "status": POSITION_CLOSED, "close_time": now_ts()})
+        pnl, pnl_status, pnl_raw = self._resolve_closed_pnl(closed)
+        if pnl_status != PNL_CONFIRMED:
+            pnl = self._estimate_pnl_usdt(closed, closed.current_price, 1.0)
+        closed = RealPositionState(**{
+            **closed.to_dict(),
+            "realized_pnl_usdt": pnl,
+            "realized_pnl_percent": pnl_percent(closed.direction, closed.entry, closed.current_price),
+            "pnl_status": pnl_status,
+        })
+        self._learn_real_outcome(closed, EVENT_TP1, closed.current_price, snapshot, pnl, closed.realized_pnl_percent)
+        save_position(closed.position_id, closed.to_dict())
+        events.append(self._event(
+            closed,
+            EVENT_TP1,
+            closed.current_price,
+            pnl,
+            closed.realized_pnl_percent,
+            pnl_status,
+            reason_codes=("TP1_PRICE_REACHED", "TP1_ONLY_FULL_CLOSE"),
+            raw={"close": close_raw, "pnl": pnl_raw, "position": closed.to_dict()},
+        ))
+        return events
 
-        candidate = self._coerce_saved_candidate(pos, snapshot)
-
-        if candidate is None:
-            # Learning requires the original candidate context. Do not create fake
-            # learning data, but do record why REAL learning was skipped.
-            return
-
-        result = event_type
+    def _tp_mode(self, pos: RealPositionState) -> str:
         try:
-            learn_outcome(
-                source_type=SOURCE_REAL,
-                candidate=candidate,
-                result=result,
-                movement=movement,
-                trap=trap,
-                state=state,
-                confidence=None,
-                entry_price=pos.entry,
-                exit_price=price,
-                realized_pnl=pnl_usdt,
-                realized_pnl_percent=pnl_percent_value,
-                mfe_percent=max(0.0, pnl_percent(pos.direction, pos.entry, pos.highest_price if pos.direction == DIRECTION_LONG else pos.lowest_price)),
-                mae_percent=max(0.0, -pnl_percent(pos.direction, pos.entry, pos.lowest_price if pos.direction == DIRECTION_LONG else pos.highest_price)),
-                holding_seconds=max(0, (pos.close_time or now_ts()) - pos.open_time),
-                meta={
-                    "source_type": SOURCE_REAL,
-                    "position_id": pos.position_id,
-                    "decision_id": pos.decision_id,
-                    "event_type": event_type,
-                    "realized_pnl_usdt": pnl_usdt,
-                },
-                persist=True,
-            )
+            plan = pos.meta.get("tp_sl_plan", {}) if isinstance(pos.meta, dict) else {}
+            return str(plan.get("tp_mode", "")).upper()
         except Exception:
-            pass
+            return ""
 
-        try:
-            audit_outcome(
-                source_type=SOURCE_REAL,
-                result=result,
-                candidate=candidate,
-                movement=movement,
-                trap=trap,
-                state=state,
-                confidence=None,
-                correlation=None,
-                prediction=None,
-                persist=True,
-            )
-        except Exception:
-            pass
+    def _has_tp2_runner(self, pos: RealPositionState) -> bool:
+        return bool(self._tp_mode(pos) == "TP1_TP2" and pos.tp2 > 0 and pos.quantity > 0)
 
-        try:
-            record_movement_memory(
-                candidate=candidate,
-                after_price=price,
-                move_duration_seconds=max(0, (pos.close_time or now_ts()) - pos.open_time),
-                movement=movement,
-                trap=trap,
-                state=state,
-                confidence=None,
-                mfe_percent=max(0.0, pnl_percent(pos.direction, pos.entry, pos.highest_price if pos.direction == DIRECTION_LONG else pos.lowest_price)),
-                mae_percent=max(0.0, -pnl_percent(pos.direction, pos.entry, pos.lowest_price if pos.direction == DIRECTION_LONG else pos.highest_price)),
-                meta={
-                    "source_type": SOURCE_REAL,
-                    "position_id": pos.position_id,
-                    "decision_id": pos.decision_id,
-                    "result": result,
-                },
-                persist=True,
-            )
-        except Exception:
-            pass
+    def _estimate_pnl_usdt(self, pos: RealPositionState, price: float, quantity_fraction: float = 1.0) -> float:
+        pct = pnl_percent(pos.direction, pos.entry, price)
+        base_margin = safe_float(pos.margin_usdt) * max(0.0, min(1.0, quantity_fraction))
+        return base_margin * max(1.0, safe_float(pos.leverage, 1.0)) * pct / 100.0
 
+    def _tp1_protected_sl(self, pos: RealPositionState) -> float:
+        entry = safe_float(pos.entry)
+        tp1 = safe_float(pos.tp1)
+        tp2 = safe_float(pos.tp2)
+        direction = normalize_direction(pos.direction)
 
+        if entry <= 0:
+            return 0.0
+        if tp1 <= 0:
+            return entry
 
-    def _object_to_dict(self, value: Any) -> JsonDict:
-        """Best-effort conversion for AI/analysis objects used by profit-exit checks."""
-        try:
-            if value is None:
-                return {}
-            if isinstance(value, dict):
-                return value
-            if hasattr(value, "to_dict") and callable(value.to_dict):
-                data = value.to_dict()
-                return data if isinstance(data, dict) else {"value": data}
-            if hasattr(value, "__dict__"):
-                return dict(value.__dict__)
-        except Exception:
-            pass
-        return {"value": str(value)}
+        if tp2 > 0 and abs(tp2 - tp1) > 0:
+            buffer_dist = abs(tp2 - tp1) * 0.15
+            if direction == DIRECTION_LONG:
+                return max(entry, tp1 - buffer_dist)
+            if direction == DIRECTION_SHORT:
+                return min(entry, tp1 + buffer_dist)
+        return tp1
 
-    def _flatten_text_values(self, value: Any) -> List[str]:
-        out: List[str] = []
-        try:
-            if value is None:
-                return out
-            if isinstance(value, dict):
-                for k, v in value.items():
-                    out.append(str(k).upper())
-                    out.extend(self._flatten_text_values(v))
-            elif isinstance(value, (list, tuple, set)):
-                for item in value:
-                    out.extend(self._flatten_text_values(item))
-            else:
-                out.append(str(value).upper())
-        except Exception:
-            pass
-        return out
-
-    def _opposite_direction_seen(self, pos: RealPositionState, *objects: Any) -> bool:
-        """Detect when current AI/context direction no longer agrees with the open position."""
-        wanted_opposite = DIRECTION_SHORT if normalize_direction(pos.direction) == DIRECTION_LONG else DIRECTION_LONG
-        direction_keys = {
-            "direction", "predicted_direction", "prediction_direction", "movement_direction",
-            "trend_direction", "state_direction", "recommended_direction", "signal_direction",
-            "final_direction", "bias", "side",
-        }
-        for obj in objects:
-            data = self._object_to_dict(obj)
-            stack: List[Any] = [data]
-            while stack:
-                item = stack.pop()
-                if isinstance(item, dict):
-                    for k, v in item.items():
-                        key = str(k).lower()
-                        if key in direction_keys or key.endswith("_direction"):
-                            if normalize_direction(str(v)) == wanted_opposite:
-                                return True
-                        if isinstance(v, (dict, list, tuple, set)):
-                            stack.append(v)
-                elif isinstance(item, (list, tuple, set)):
-                    stack.extend(list(item))
-        return False
-
-    def _ai_weakness_or_reversal_seen(
-        self,
-        pos: RealPositionState,
-        snapshot: Optional[SensorSnapshot],
-        movement: Optional[MovementHunterResult],
-        trap: Optional[TrapResult],
-        state: Optional[StateResult],
-        exit_decision: Optional[ExitDecision] = None,
-    ) -> Tuple[bool, Tuple[str, ...], Tuple[str, ...]]:
-        """
-        Strict AI Profit Exit rule:
-        - No percent threshold.
-        - Gross/floating profit threshold is handled in monitor_position
-          (normally >= 0.25 USDT after fee/slippage safety).
-        - Do not close only because the market is NEUTRAL / RANGE / CHOP.
-        - Close only when a real reversal/continuation failure is confirmed:
-          either exit_engine explicitly says close, or at least two strong
-          AI/sensor confirmations are present.
-        """
-        reason_codes: List[str] = []
-        warnings: List[str] = []
-
-        # Exit engine is considered a high-confidence dedicated exit signal.
-        if exit_decision and exit_decision.should_close:
-            reason_codes.extend(list(exit_decision.reason_codes or ()))
-            warnings.extend(list(exit_decision.warnings or ()))
-            reason_codes.append("EXIT_ENGINE_CLOSE_SIGNAL")
-            warnings.append("AI_PROFIT_EXIT_STRICT_CONFIRMED")
-            return True, tuple(dict.fromkeys(reason_codes)), tuple(dict.fromkeys(warnings))
-
-        if self._opposite_direction_seen(pos, movement, trap, state):
-            reason_codes.append("AI_DIRECTION_FLIPPED_AGAINST_POSITION")
-
-        texts = " ".join(self._flatten_text_values({
-            "movement": self._object_to_dict(movement),
-            "trap": self._object_to_dict(trap),
-            "state": self._object_to_dict(state),
-            "snapshot": self._object_to_dict(snapshot),
-        }))
-
-        # Strong weakness terms only. NEUTRAL/RANGE/CHOP are intentionally
-        # not included here because they made profit exit too loose.
-        strong_weak_terms = (
-            "WEAKNESS", "MOMENTUM_WEAK", "CONTINUATION_WEAK",
-            "CONTINUATION_FAILED", "FAILED_CONTINUATION",
-            "LOSS_OF_MOMENTUM", "MOMENTUM_LOSS",
-            "EXHAUST", "EXHAUSTION",
-            "MOMENTUM_FAILURE", "FAILED_MOVE",
-        )
-        reversal_terms = (
-            "REVERSAL", "REVERSE", "TURNING", "MARKET_REVERSED",
-            "TREND_CHANGED", "DIRECTION_CHANGED",
-            "BEARISH_TO_BULLISH", "BULLISH_TO_BEARISH",
-            "VWAP_FLIP", "VWAP_RECLAIM", "VWAP_LOSS",
-            "STRUCTURE_BREAK", "BOS_AGAINST", "CHoCH", "CHOCH",
-        )
-        trap_terms = (
-            "TRAP_HIGH", "HIGH_TRAP", "TRAP_RISK_HIGH",
-            "LIQUIDITY_GRAB", "STOP_HUNT",
-            "FAKE_BREAK", "FAKE_BREAKOUT", "FAKE_BREAKDOWN",
-            "FAILED_BREAKOUT", "FAILED_BREAKDOWN",
-        )
-        opposite_power_terms = (
-            "BUY_POWER_SHIFT", "SELL_POWER_SHIFT",
-            "POWER_SHIFT_AGAINST", "BUYERS_RETURNED", "SELLERS_RETURNED",
-            "BUY_POWER_DOMINANT", "SELL_POWER_DOMINANT",
-        )
-
-        confirmations: List[str] = []
-
-        if any(term in texts for term in strong_weak_terms):
-            reason_codes.append("AI_CONTINUATION_WEAKNESS_DETECTED")
-            confirmations.append("WEAKNESS")
-
-        if any(term in texts for term in reversal_terms):
-            reason_codes.append("AI_REVERSAL_OR_TREND_CHANGE_DETECTED")
-            confirmations.append("REVERSAL")
-
-        if any(term in texts for term in trap_terms):
-            reason_codes.append("AI_TRAP_OR_LIQUIDITY_RISK_DETECTED")
-            confirmations.append("TRAP_OR_LIQUIDITY")
-
-        if any(term in texts for term in opposite_power_terms):
-            reason_codes.append("AI_OPPOSITE_POWER_SHIFT_DETECTED")
-            confirmations.append("OPPOSITE_POWER")
-
-        if "AI_DIRECTION_FLIPPED_AGAINST_POSITION" in reason_codes:
-            confirmations.append("DIRECTION_FLIP")
-
-        # Strict mode:
-        # - Direction flip + one more real warning is enough.
-        # - Or any two independent serious confirmations.
-        # - Single NEUTRAL/RANGE/CHOP is ignored because those terms are not in
-        #   the strong confirmation lists.
-        unique_confirmations = list(dict.fromkeys(confirmations))
-        should_close = len(unique_confirmations) >= 2
-
-        if should_close:
-            warnings.append("AI_PROFIT_EXIT_STRICT_CONFIRMED")
-            warnings.append("AI_PROFIT_EXIT_MIN_0_25_USDT_REQUIRED")
-        elif reason_codes:
-            warnings.append("AI_PROFIT_EXIT_SKIPPED_NEEDS_SECOND_CONFIRMATION")
-
-        return should_close, tuple(dict.fromkeys(reason_codes)), tuple(dict.fromkeys(warnings))
+    def _close_order_ok(self, raw: JsonDict) -> bool:
+        if not isinstance(raw, dict):
+            return True
+        if raw.get("error"):
+            return False
+        if raw.get("ok") is False or raw.get("success") is False:
+            return False
+        status = str(raw.get("status", "")).upper()
+        if status in {"REJECTED", "FAILED", "ERROR"}:
+            return False
+        return True
 
     def _is_position_still_open(self, pos: RealPositionState) -> bool:
-        """Verify whether the same symbol/direction is still open on Toobit.
-
-        This is the API equivalent of the app's final "Confirm" step after a
-        close request: after sending BUY_CLOSE/SELL_CLOSE, we read real open
-        positions again. Only when the same symbol + direction disappears do we
-        treat the close as confirmed.
-        """
         try:
             try:
-                # Prefer symbol-filtered read when the client supports it.
                 positions = _call_optional(self.client, ["get_open_positions", "fetch_open_positions"], pos.exchange_symbol)
             except TypeError:
                 positions = _call_optional(self.client, ["get_open_positions", "fetch_open_positions"])
@@ -1175,7 +754,6 @@ market-close responses while still catching clear failures.
             if isinstance(positions, dict):
                 positions = positions.get("positions", positions.get("data", []))
             if not isinstance(positions, list):
-                # Unknown verification must not be treated as confirmed-closed.
                 return True
 
             target_direction = normalize_direction(pos.direction)
@@ -1188,38 +766,20 @@ market-close responses while still catching clear failures.
                 item_symbol = str(item.get("symbol", item.get("exchange_symbol", item.get("contract", item.get("contractCode", item.get("instId", ""))))))
                 item_dir = normalize_direction(str(item.get("direction", item.get("side", item.get("positionSide", item.get("holdSide", ""))))))
                 if item_dir not in {DIRECTION_LONG, DIRECTION_SHORT}:
-                    raw_side = str(item.get("raw", item)).upper()
-                    if "SHORT" in raw_side or "SELL" in raw_side or "空" in raw_side:
+                    raw_side = str(item).upper()
+                    if "SHORT" in raw_side or "SELL" in raw_side:
                         item_dir = DIRECTION_SHORT
-                    elif "LONG" in raw_side or "BUY" in raw_side or "多" in raw_side:
+                    elif "LONG" in raw_side or "BUY" in raw_side:
                         item_dir = DIRECTION_LONG
 
-                if (
-                    (symbol_match(item_symbol, pos.exchange_symbol) or symbol_match(item_symbol, pos.symbol))
-                    and item_dir == target_direction
-                ):
+                if (symbol_match(item_symbol, pos.exchange_symbol) or symbol_match(item_symbol, pos.symbol)) and item_dir == target_direction:
                     return True
         except Exception as exc:
             save_error("position_monitor_close_verify_failed", str(exc), pos.to_dict())
-            # Unknown verification should not be treated as confirmed-closed.
             return True
         return False
 
     def _close_position_verified(self, pos: RealPositionState, quantity: Optional[float] = None, attempts: int = 5) -> JsonDict:
-        """
-        Send the close order, then confirm full-position closure.
-
-        There is no separate UI-style confirmation button in API trading. The
-        required confirmation is:
-        1) send BUY_CLOSE for SHORT or SELL_CLOSE for LONG,
-        2) wait briefly,
-        3) read real open positions from Toobit,
-        4) retry if the same symbol/direction is still open,
-        5) return closed_confirmed=True only after it disappears.
-
-        For partial TP1 closes, the position is expected to remain open, so full
-        disappearance confirmation is intentionally skipped.
-        """
         qty = safe_float(quantity, pos.quantity)
         if qty <= 0:
             qty = safe_float(pos.quantity)
@@ -1245,7 +805,6 @@ market-close responses while still catching clear failures.
                 last["verification_reason"] = "partial_close_no_full_position_disappearance_expected"
                 return last
 
-            # Give Toobit a moment to apply the market close before checking.
             time.sleep(1.5)
             if not self._is_position_still_open(pos):
                 last["verified"] = True
@@ -1258,11 +817,9 @@ market-close responses while still catching clear failures.
             last["verification_reason"] = "position_still_open_after_close_order"
             time.sleep(1.5)
 
-        # Never allow callers to mistake an unverified close for a confirmed one.
         last.setdefault("closed_confirmed", False)
         last.setdefault("verified", False)
         return last
-
 
     def _to_exit_context(self, pos: RealPositionState) -> PositionContext:
         return PositionContext(
@@ -1304,12 +861,6 @@ market-close responses while still catching clear failures.
             return {"error": str(exc)}
 
     def _resolve_closed_pnl(self, pos: RealPositionState) -> Tuple[float, str, JsonDict]:
-        """Resolve real PnL quickly so Telegram result panel is not delayed.
-
-        Toobit realized-PnL history can appear late. We intentionally avoid the
-        old 10 x 5s blocking wait here. If PnL is not ready, callers already
-        fall back to estimated PnL and mark pnl_status as UNAVAILABLE/PENDING.
-        """
         start_ms = pos.open_time * 1000 if pos.open_time and pos.open_time < 10_000_000_000 else pos.open_time
         return self.pnl_resolver.resolve(
             self.client,
@@ -1318,6 +869,133 @@ market-close responses while still catching clear failures.
             attempts=2,
             sleep_seconds=0.25,
         )
+
+    def _coerce_saved_candidate(self, pos: RealPositionState) -> Optional[AnalysisCandidate]:
+        meta = pos.meta if isinstance(pos.meta, dict) else {}
+        candidates = [
+            meta.get("candidate"),
+            meta.get("analysis_candidate"),
+            meta.get("entry_candidate"),
+        ]
+        decision_meta = meta.get("decision") if isinstance(meta.get("decision"), dict) else {}
+        candidates.extend([
+            decision_meta.get("candidate"),
+            decision_meta.get("analysis_candidate"),
+        ])
+
+        for saved_candidate in candidates:
+            if not saved_candidate:
+                continue
+            try:
+                if isinstance(saved_candidate, AnalysisCandidate):
+                    return saved_candidate
+                if hasattr(AnalysisCandidate, "from_dict") and callable(getattr(AnalysisCandidate, "from_dict")):
+                    return AnalysisCandidate.from_dict(saved_candidate)
+                if isinstance(saved_candidate, dict):
+                    from analysis_layers import SensorSnapshot
+                    from analysis_engine import SensorDirectionHint, SensorMomentumState
+
+                    sensor_data = saved_candidate.get("sensor_snapshot", {}) or {}
+                    direction_data = saved_candidate.get("sensor_direction", {}) or {}
+                    momentum_data = saved_candidate.get("momentum_state", {}) or {}
+
+                    sensor_snapshot = SensorSnapshot(**{
+                        k: v for k, v in sensor_data.items()
+                        if k in getattr(SensorSnapshot, "__dataclass_fields__", {})
+                    })
+                    sensor_direction = SensorDirectionHint(**{
+                        k: v for k, v in direction_data.items()
+                        if k in getattr(SensorDirectionHint, "__dataclass_fields__", {})
+                    })
+                    momentum_state = SensorMomentumState(**{
+                        k: v for k, v in momentum_data.items()
+                        if k in getattr(SensorMomentumState, "__dataclass_fields__", {})
+                    })
+
+                    return AnalysisCandidate(
+                        candidate_id=str(saved_candidate.get("candidate_id", f"cand_recovered_{uuid4().hex}")),
+                        symbol=str(saved_candidate.get("symbol", pos.symbol)),
+                        timeframe=str(saved_candidate.get("timeframe", "5m")),
+                        timestamp=safe_int(saved_candidate.get("timestamp", pos.open_time)),
+                        direction_hint=normalize_direction(saved_candidate.get("direction_hint", pos.direction)),
+                        bias=str(saved_candidate.get("bias", "")),
+                        sensor_direction=sensor_direction,
+                        momentum_state=momentum_state,
+                        sensor_snapshot=sensor_snapshot,
+                        market_mode=dict(saved_candidate.get("market_mode", {}) if isinstance(saved_candidate.get("market_mode", {}), dict) else {}),
+                        reason_codes=tuple(saved_candidate.get("reason_codes", ()) or ()),
+                        warnings=tuple(saved_candidate.get("warnings", ()) or ()),
+                        valid=bool(saved_candidate.get("valid", True)),
+                    )
+            except Exception as exc:
+                save_error("position_monitor_candidate_recover", str(exc), {"position_id": pos.position_id, "symbol": pos.symbol})
+
+        save_error("position_monitor_missing_candidate_for_learning", "candidate_not_found_in_position_meta", {
+            "position_id": pos.position_id,
+            "symbol": pos.symbol,
+            "meta_keys": list(meta.keys()),
+        })
+        return None
+
+    def _learn_real_outcome(
+        self,
+        pos: RealPositionState,
+        event_type: str,
+        price: float,
+        snapshot: Optional[SensorSnapshot],
+        pnl_usdt: float,
+        pnl_percent_value: float,
+    ) -> None:
+        candidate = self._coerce_saved_candidate(pos)
+        if candidate is None:
+            return
+
+        mfe = max(0.0, pnl_percent(pos.direction, pos.entry, pos.highest_price if pos.direction == DIRECTION_LONG else pos.lowest_price))
+        mae = max(0.0, -pnl_percent(pos.direction, pos.entry, pos.lowest_price if pos.direction == DIRECTION_LONG else pos.highest_price))
+        holding_seconds = max(0, (pos.close_time or now_ts()) - pos.open_time)
+
+        try:
+            learn_outcome(
+                source_type=SOURCE_REAL,
+                candidate=candidate,
+                result=event_type,
+                entry_price=pos.entry,
+                exit_price=price,
+                realized_pnl=pnl_usdt,
+                realized_pnl_percent=pnl_percent_value,
+                mfe_percent=mfe,
+                mae_percent=mae,
+                holding_seconds=holding_seconds,
+                meta={
+                    "source_type": SOURCE_REAL,
+                    "position_id": pos.position_id,
+                    "decision_id": pos.decision_id,
+                    "event_type": event_type,
+                    "realized_pnl_usdt": pnl_usdt,
+                },
+                persist=True,
+            )
+        except Exception as exc:
+            save_error("position_monitor_coin_learning", str(exc), pos.to_dict())
+
+        try:
+            record_movement_memory(
+                candidate=candidate,
+                exit_price=price,
+                duration_seconds=holding_seconds,
+                outcome=event_type,
+                mfe_percent=mfe,
+                mae_percent=mae,
+                meta={
+                    "source_type": SOURCE_REAL,
+                    "position_id": pos.position_id,
+                    "decision_id": pos.decision_id,
+                    "result": event_type,
+                },
+                persist=True,
+            )
+        except Exception as exc:
+            save_error("position_monitor_movement_memory", str(exc), pos.to_dict())
 
     def _event(
         self,
@@ -1357,6 +1035,6 @@ def create_monitor(client: Any) -> PositionMonitor:
 
 def monitor_all_positions(
     client: Any,
-    analysis_provider: Optional[Callable[[RealPositionState], Tuple[SensorSnapshot, MovementHunterResult, TrapResult, StateResult]]] = None,
+    analysis_provider: Optional[Callable[[RealPositionState], SensorSnapshot]] = None,
 ) -> List[PositionMonitorEvent]:
     return PositionMonitor(client).monitor_all(analysis_provider=analysis_provider)
