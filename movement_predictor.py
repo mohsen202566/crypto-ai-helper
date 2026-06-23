@@ -368,7 +368,55 @@ def range_penalty(candidate: AnalysisCandidate, live_sensor_score: float, patter
     return 10.0, reasons
 
 
-def classify_phase(final_score: float, late_penalty_value: float, range_penalty_value: float, candidate: AnalysisCandidate) -> Tuple[str, List[str]]:
+
+def early_start_evidence(candidate: AnalysisCandidate, direction: str, live_sensor_score: float, pattern_score: float) -> Tuple[float, List[str]]:
+    """Soft Level 1 early-start detector."""
+    m = candidate.momentum_state
+    reasons: List[str] = []
+    evidence = 0.0
+    direction = normalize_direction(direction)
+
+    if direction == DIRECTION_LONG:
+        if m.rsi_slope > 0:
+            evidence += 12.0; reasons.append("EARLY_LONG_RSI_SLOPE_UP")
+        if m.histogram_slope > 0:
+            evidence += 14.0; reasons.append("EARLY_LONG_HIST_SLOPE_UP")
+        if m.histogram_acceleration > 0:
+            evidence += 10.0; reasons.append("EARLY_LONG_HIST_ACCEL_UP")
+        if m.power_delta >= 3:
+            evidence += 14.0; reasons.append("EARLY_LONG_POWER_SHIFT")
+        if m.plus_di > m.minus_di:
+            evidence += 8.0; reasons.append("EARLY_LONG_DI_SUPPORT")
+    elif direction == DIRECTION_SHORT:
+        if m.rsi_slope < 0:
+            evidence += 12.0; reasons.append("EARLY_SHORT_RSI_SLOPE_DOWN")
+        if m.histogram_slope < 0:
+            evidence += 14.0; reasons.append("EARLY_SHORT_HIST_SLOPE_DOWN")
+        if m.histogram_acceleration < 0:
+            evidence += 10.0; reasons.append("EARLY_SHORT_HIST_ACCEL_DOWN")
+        if m.power_delta <= -3:
+            evidence += 14.0; reasons.append("EARLY_SHORT_POWER_SHIFT")
+        if m.minus_di > m.plus_di:
+            evidence += 8.0; reasons.append("EARLY_SHORT_DI_SUPPORT")
+
+    if m.volume_expansion:
+        evidence += 8.0; reasons.append("EARLY_VOLUME_EXPANSION")
+    if m.volume_spike:
+        evidence += 10.0; reasons.append("EARLY_VOLUME_SPIKE")
+    if str(m.atr_expansion).upper() == "EXPANDING":
+        evidence += 6.0; reasons.append("EARLY_ATR_EXPANDING")
+    if m.compression_score >= 45 and m.range_probability < 88:
+        evidence += 6.0; reasons.append("EARLY_COMPRESSION_RELEASE")
+
+    if live_sensor_score >= 45:
+        evidence += 8.0; reasons.append("EARLY_LIVE_SCORE_SUPPORT")
+    if pattern_score >= 45:
+        evidence += 8.0; reasons.append("EARLY_PATTERN_SCORE_SUPPORT")
+
+    return clamp(evidence), list(dict.fromkeys(reasons))
+
+
+def classify_phase(final_score: float, late_penalty_value: float, range_penalty_value: float, candidate: AnalysisCandidate, direction: str = DIRECTION_NEUTRAL, live_sensor_score: float = 0.0, pattern_score: float = 0.0) -> Tuple[str, List[str]]:
     reasons: List[str] = []
 
     if late_penalty_value >= 40:
@@ -381,20 +429,19 @@ def classify_phase(final_score: float, late_penalty_value: float, range_penalty_
         reasons.append("PHASE_RANGE_NO_START")
         return PREDICT_RANGE, reasons
 
-    m = candidate.momentum_state
-    live_building = (
-        abs(m.rsi_slope) > 0
-        and abs(m.histogram_slope) > 0
-        and abs(m.power_delta) >= 3
-    )
+    early_score, early_reasons = early_start_evidence(candidate, direction, live_sensor_score, pattern_score)
+    reasons.extend(early_reasons)
 
-    if final_score >= 72:
+    if final_score >= 72 or (final_score >= 64 and early_score >= 58):
         reasons.append("PHASE_START_STRONG")
         return PREDICT_START, reasons
-    if final_score >= 58 and live_building:
+    if final_score >= 54 and early_score >= 42:
         reasons.append("PHASE_PRE_START_LIVE_BUILDING")
         return PREDICT_PRE_START, reasons
-    if final_score >= 50:
+    if early_score >= 55 and final_score >= 42:
+        reasons.append("PHASE_PRE_START_EARLY_SENSOR")
+        return PREDICT_PRE_START, reasons
+    if final_score >= 48:
         reasons.append("PHASE_PRE_START_WATCH")
         return PREDICT_PRE_START, reasons
 
@@ -452,9 +499,12 @@ def confidence_from_score(
         reasons.append("PHASE_NOT_IDEAL_FOR_REAL")
         prefer_ghost = True
 
-    if score >= 75 and phase in {PREDICT_PRE_START, PREDICT_START} and (strong_pattern_quality or strong_live_birth):
+    if phase in {PREDICT_PRE_START, PREDICT_START} and strong_live_birth:
+        prefer_ghost = False
+
+    if score >= 72 and phase in {PREDICT_PRE_START, PREDICT_START} and (strong_pattern_quality or strong_live_birth):
         return CONF_HIGH, prefer_ghost, reasons
-    if score >= 60 and (useful_pattern_quality or strong_live_birth):
+    if score >= 56 and phase in {PREDICT_PRE_START, PREDICT_START} and (useful_pattern_quality or strong_live_birth):
         return CONF_MEDIUM, prefer_ghost, reasons
     if score >= 42:
         return CONF_LOW, True, reasons
@@ -523,7 +573,7 @@ class MovementPredictor:
             - range_pen * 0.65
         )
 
-        phase, r = classify_phase(final_score, late_pen, range_pen, candidate)
+        phase, r = classify_phase(final_score, late_pen, range_pen, candidate, direction, live_score, pattern_score)
         reasons.extend(r)
 
         confidence, prefer_ghost, r = confidence_from_score(
