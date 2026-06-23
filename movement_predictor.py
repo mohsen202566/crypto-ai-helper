@@ -229,11 +229,12 @@ class MemorySimilarityEngine:
         late_failure_rate = clamp(_best_memory_float(summary, learning_summary, "late_failure_rate", 0.0))
 
         if effective_samples <= 0:
-            # No memory yet must not kill fresh hunting. Give a neutral-low base
-            # so raw birth-of-momentum sensors can still create useful GHOSTs
-            # and, if the AI brain agrees, early REALs.
-            reasons.append("NO_MOVEMENT_MEMORY")
-            return 32.0, reasons
+            # Movement Hunter speed mode:
+            # No memory must not make the bot a follower. In 5M scalping the
+            # first useful clues often appear before enough learning samples
+            # exist. Give a neutral-predictive base so raw sensors can lead.
+            reasons.append("NO_MOVEMENT_MEMORY_SPEED_MODE")
+            return 44.0, reasons
 
         # Movement Hunter memory should prioritize timing and early success over
         # raw move size. A large but late move should not teach the AI to chase.
@@ -319,42 +320,57 @@ class SensorAlignmentEngine:
         score = 0.0
 
         if direction == DIRECTION_LONG:
+            # Prediction-first: use slope/acceleration/power as live sensors,
+            # not candle confirmation. Soft thresholds intentionally detect
+            # the birth of movement before it becomes obvious.
             if s.rsi_slope > 0:
-                score += 12
-                reasons.append("RSI_ALIGNED_LONG")
-            if s.histogram_slope > 0:
                 score += 14
+                reasons.append("RSI_ALIGNED_LONG")
+            if s.rsi_slope > 0.08:
+                score += 5
+                reasons.append("ULTRA_EARLY_RSI_LONG")
+            if s.histogram_slope > 0:
+                score += 16
                 reasons.append("HIST_ALIGNED_LONG")
             if s.histogram_acceleration > 0:
-                score += 10
-                reasons.append("HIST_ACCEL_LONG")
-            if s.power_delta > 8:
                 score += 14
+                reasons.append("HIST_ACCEL_LONG")
+            if s.power_delta > 4:
+                score += 10
+                reasons.append("EARLY_POWER_ALIGNED_LONG")
+            if s.power_delta > 8:
+                score += 12
                 reasons.append("POWER_ALIGNED_LONG")
             if s.vwap_state in {"RECLAIM", "ABOVE"}:
                 score += 10
                 reasons.append("VWAP_ALIGNED_LONG")
             if s.failed_breakdown or s.liquidity_grab_down:
-                score += 10
+                score += 12
                 reasons.append("DOWN_SWEEP_RECOVERY_LONG")
         elif direction == DIRECTION_SHORT:
             if s.rsi_slope < 0:
-                score += 12
-                reasons.append("RSI_ALIGNED_SHORT")
-            if s.histogram_slope < 0:
                 score += 14
+                reasons.append("RSI_ALIGNED_SHORT")
+            if s.rsi_slope < -0.08:
+                score += 5
+                reasons.append("ULTRA_EARLY_RSI_SHORT")
+            if s.histogram_slope < 0:
+                score += 16
                 reasons.append("HIST_ALIGNED_SHORT")
             if s.histogram_acceleration < 0:
-                score += 10
-                reasons.append("HIST_ACCEL_SHORT")
-            if s.power_delta < -8:
                 score += 14
+                reasons.append("HIST_ACCEL_SHORT")
+            if s.power_delta < -4:
+                score += 10
+                reasons.append("EARLY_POWER_ALIGNED_SHORT")
+            if s.power_delta < -8:
+                score += 12
                 reasons.append("POWER_ALIGNED_SHORT")
             if s.vwap_state in {"LOSS", "BELOW"}:
                 score += 10
                 reasons.append("VWAP_ALIGNED_SHORT")
             if s.failed_breakout or s.liquidity_grab_up:
-                score += 10
+                score += 12
                 reasons.append("UP_SWEEP_REVERSAL_SHORT")
 
         if s.atr_expansion == "EXPANDING":
@@ -421,15 +437,35 @@ class PhasePredictionEngine:
             and late_failure_rate < 55
         )
 
+        # Prediction-first birth detection:
+        # Do not wait for multiple candles or a fully obvious move. For 5M
+        # scalping, aligned momentum slope + small power shift is enough to mark
+        # PRE_START/START when trap and late risk are not severe.
+        directional_slope_birth = (
+            (
+                candidate.direction_hint == DIRECTION_LONG
+                and safe_float(getattr(s, "rsi_slope", 0.0)) > 0
+                and safe_float(getattr(s, "histogram_slope", 0.0)) > 0
+                and safe_float(getattr(s, "power_delta", 0.0)) > 3
+            )
+            or (
+                candidate.direction_hint == DIRECTION_SHORT
+                and safe_float(getattr(s, "rsi_slope", 0.0)) < 0
+                and safe_float(getattr(s, "histogram_slope", 0.0)) < 0
+                and safe_float(getattr(s, "power_delta", 0.0)) < -3
+            )
+        )
+
         early_sensor_birth = (
-            (compression >= 40 and range_probability < 85 and (power_delta >= 10 or volume_live or atr_live))
-            or (hist_accel > 0 and hist_slope > 0 and power_delta >= 8)
-            or (similarity >= 58 and readiness < 62 and late_risk < 72)
-            or (learned_premove_support and readiness < 66 and late_risk < 76)
+            (compression >= 32 and range_probability < 88 and (power_delta >= 6 or volume_live or atr_live))
+            or (hist_accel > 0 and hist_slope > 0 and power_delta >= 5)
+            or directional_slope_birth
+            or (similarity >= 50 and readiness < 68 and late_risk < 78)
+            or (learned_premove_support and readiness < 72 and late_risk < 82)
         )
 
         # Only classify as RANGE when both memory/sensors and live readiness are weak.
-        if state.market_state == "RANGE" and readiness < 38 and similarity < 48 and not early_sensor_birth:
+        if state.market_state == "RANGE" and readiness < 30 and similarity < 42 and not early_sensor_birth:
             reasons.append("PREDICT_RANGE_WEAK_NO_BREAKOUT_CONTEXT")
             return PREDICT_RANGE, reasons
 
@@ -437,37 +473,37 @@ class PhasePredictionEngine:
         # and missed pre-start opportunities. Do not call it late while fresh
         # sensors, memory similarity, or compression breakout context are alive.
         if (
-            (state.market_state in {"EXHAUSTION", "LATE"} and readiness < 42 and similarity < 50 and not early_sensor_birth)
-            or (movement.freshness == "DEAD" and readiness < 38 and similarity < 52)
-            or (late_risk >= 82 and exhaustion_risk >= 72 and continuation < 42 and similarity < 58)
+            (state.market_state in {"EXHAUSTION", "LATE"} and readiness < 34 and similarity < 44 and not early_sensor_birth)
+            or (movement.freshness == "DEAD" and readiness < 32 and similarity < 46)
+            or (late_risk >= 88 and exhaustion_risk >= 80 and continuation < 36 and similarity < 52 and not early_sensor_birth)
         ):
             reasons.append("PREDICT_LATE_CONFIRMED_EXHAUSTION")
             return PREDICT_LATE, reasons
 
-        if movement.freshness == "LATE" and readiness < 42 and similarity < 52 and not early_sensor_birth:
+        if movement.freshness == "LATE" and readiness < 34 and similarity < 46 and not early_sensor_birth:
             reasons.append("PREDICT_LATE_WEAK_LATE_FRESHNESS")
             return PREDICT_LATE, reasons
 
         # PRE_START: strongest hunter case. It should trigger before the big move,
         # when memory or compression/participation suggests the move is forming.
         if (
-            (similarity >= 58 and readiness < 65 and compression >= 35 and state_range < 82 and trap_risk < 72)
-            or (early_sensor_birth and readiness < 62 and trap_risk < 75 and late_risk < 78)
-            or (learned_premove_support and similarity >= 52 and readiness < 68 and trap_risk < 74)
+            (similarity >= 50 and readiness < 74 and compression >= 28 and state_range < 88 and trap_risk < 76)
+            or (early_sensor_birth and readiness < 76 and trap_risk < 78 and late_risk < 84)
+            or (learned_premove_support and similarity >= 46 and readiness < 78 and trap_risk < 78)
         ):
             reasons.append("PREDICT_PRE_START_HUNTER")
             return PREDICT_PRE_START, reasons
 
-        if movement.freshness == "FRESH" and readiness >= 52 and trap_risk < 78:
+        if movement.freshness == "FRESH" and readiness >= 44 and trap_risk < 80:
             reasons.append("PREDICT_START_FRESH_MOVE")
             return PREDICT_START, reasons
 
-        if readiness >= 58 and continuation >= 45 and late_risk < 78:
+        if readiness >= 50 and continuation >= 38 and late_risk < 82:
             reasons.append("PREDICT_START_LIVE_CONTINUATION")
             return PREDICT_START, reasons
 
         # MID should not swallow every weak candidate. Require stronger live move.
-        if readiness >= 48 and (continuation >= 42 or similarity >= 55) and late_risk < 82:
+        if readiness >= 58 and (continuation >= 48 or similarity >= 62) and late_risk < 76:
             reasons.append("PREDICT_MID_CONFIRMED")
             return PREDICT_MID, reasons
 
@@ -537,16 +573,19 @@ class MovementProbabilityEngine:
         elif learning_premove_bonus < -4:
             reasons.append("LEARNING_LATE_FAILURE_PENALTY_APPLIED")
 
+        # Speed mode: prediction must lead, not follow. Sensors and live
+        # movement receive more weight than historical memory/state. Range and
+        # exhaustion still matter, but they should not bury fresh birth signals.
         final_similarity = clamp(
-            memory_similarity * 0.34
-            + sensor_alignment * 0.28
-            + movement_alignment * 0.24
-            + state_alignment * 0.14
-            + compression_bonus * 0.10
+            memory_similarity * 0.24
+            + sensor_alignment * 0.36
+            + movement_alignment * 0.28
+            + state_alignment * 0.10
+            + compression_bonus * 0.16
             + learning_premove_bonus
-            - trap_penalty * 0.30
-            - range_penalty * 0.14
-            - exhaustion_penalty * 0.22
+            - trap_penalty * 0.26
+            - range_penalty * 0.10
+            - exhaustion_penalty * 0.16
         )
 
         base_probability = final_similarity
@@ -583,23 +622,23 @@ class ConfidenceClassifier:
         prefer_ghost = False
 
         if sample_count <= 0:
-            reasons.append("PREDICTOR_LOW_DATA")
-            # Low data should be caution, not blindness. PRE_START/START with
-            # strong probability can still be considered by ai_decision_engine.
-            prefer_ghost = phase not in {PREDICT_PRE_START, PREDICT_START} or probability < 66
+            reasons.append("PREDICTOR_LOW_DATA_SPEED_MODE")
+            # Low data should not force follower behavior. PRE_START/START with
+            # acceptable probability is allowed to reach AI decision layer.
+            prefer_ghost = phase not in {PREDICT_PRE_START, PREDICT_START} or probability < 56
         elif sample_count < 5:
-            reasons.append("PREDICTOR_SMALL_SAMPLE")
-            prefer_ghost = phase not in {PREDICT_PRE_START, PREDICT_START} or probability < 62
+            reasons.append("PREDICTOR_SMALL_SAMPLE_SPEED_MODE")
+            prefer_ghost = phase not in {PREDICT_PRE_START, PREDICT_START} or probability < 54
 
         if phase in {PREDICT_RANGE, PREDICT_LATE, PREDICT_UNKNOWN}:
             reasons.append("PREDICTOR_PHASE_NOT_IDEAL")
             prefer_ghost = True
 
-        if trap.trap_risk >= 72 or state.late_entry_risk >= 78:
+        if trap.trap_risk >= 76 or state.late_entry_risk >= 86:
             reasons.append("PREDICTOR_RISK_REQUIRES_GHOST_CAUTION")
             prefer_ghost = True
 
-        if probability >= 72 and sample_count >= 8 and phase in {PREDICT_PRE_START, PREDICT_START, PREDICT_MID} and not prefer_ghost:
+        if probability >= 68 and sample_count >= 5 and phase in {PREDICT_PRE_START, PREDICT_START, PREDICT_MID} and not prefer_ghost:
             return CONF_HIGH, False, reasons
         if probability >= 58:
             return CONF_MEDIUM, prefer_ghost, reasons
