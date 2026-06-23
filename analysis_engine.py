@@ -3,44 +3,33 @@ from __future__ import annotations
 """
 07 - analysis_engine.py
 
-Candidate analysis builder for the locked Movement Hunter architecture.
+Simplified technical sensor wrapper for the Level 1 / 5M crypto futures bot.
 
-Responsibilities:
-- Consume raw technical SensorSnapshot objects from 06-analysis_layers.py.
-- Convert sensors into an AnalysisCandidate.
-- Create direction hints and quality/risk context for AI.
-- Prepare structured inputs for:
-  08 movement_hunter.py
-  09 trap_engine.py
-  10 state_engine.py
-  18 ai_decision_engine.py
+Locked goals:
+- Technical analysis is raw sensor data only.
+- No classic signal scoring.
+- No REAL / GHOST / REJECT.
+- No trap/confidence/correlation/meta/state engine.
+- No Telegram, no Toobit, no persistence.
+- AI decision engine is the only final decision maker.
+- Pattern Start Layer and AI use this file's structured sensor package.
 
-Strictly forbidden:
-- No REAL/GHOST/REJECT.
-- No trade execution.
-- No Toobit API calls.
-- No Telegram.
-- No persistence.
-- No Paper mode.
-- No Setup flow.
-
-Important:
-analysis_engine.py does NOT decide signals.
-It only prepares candidate analysis from sensors.
-AI decision happens only in ai_decision_engine.py.
+This file only:
+1) builds a SensorSnapshot from candles,
+2) extracts lightweight directional pressure from raw sensors,
+3) packages sensor values, slopes, acceleration, warnings and market mode.
 """
 
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple
 from uuid import uuid4
 import time
 
 from analysis_layers import SensorSnapshot, build_sensor_snapshot
-from market_context import get_market_context
+from market_data import get_market_mode
 
 
 JsonDict = Dict[str, Any]
-
 
 DIRECTION_LONG = "LONG"
 DIRECTION_SHORT = "SHORT"
@@ -50,58 +39,78 @@ BIAS_BULLISH = "BULLISH"
 BIAS_BEARISH = "BEARISH"
 BIAS_NEUTRAL = "NEUTRAL"
 
-QUALITY_LOW = "LOW"
-QUALITY_MEDIUM = "MEDIUM"
-QUALITY_HIGH = "HIGH"
 
-RISK_LOW = "LOW"
-RISK_MEDIUM = "MEDIUM"
-RISK_HIGH = "HIGH"
+def safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
+    return max(low, min(high, float(value)))
 
 
 @dataclass(frozen=True)
-class DirectionScore:
-    long_score: float
-    short_score: float
+class SensorDirectionHint:
+    """Lightweight direction pressure from raw sensors.
+
+    This is NOT a signal and NOT final direction.
+    It only tells AI which side sensors are currently strengthening toward.
+    """
+
+    long_pressure: float
+    short_pressure: float
     direction_hint: str
     bias: str
     gap: float
+    reason_codes: Tuple[str, ...] = field(default_factory=tuple)
 
     def to_dict(self) -> JsonDict:
         return asdict(self)
 
 
 @dataclass(frozen=True)
-class RiskProfile:
-    range_risk: float
-    trap_risk: float
-    exhaustion_risk: float
-    late_move_risk: float
-    liquidity_risk: float
-    total_risk: float
-    risk_level: str
+class SensorMomentumState:
+    """Raw start-movement sensor state for Pattern Layer and AI."""
 
-    # Movement Hunter context. These are descriptive only and do not decide
-    # REAL/GHOST/REJECT. They help later layers understand whether raw range/
-    # compression is danger or a pre-move opportunity.
-    raw_range_risk: float = 0.0
-    opportunity_score: float = 0.0
-    premove_readiness_score: float = 0.0
+    rsi: float
+    rsi_slope: float
+    rsi_acceleration: float
 
-    def to_dict(self) -> JsonDict:
-        return asdict(self)
+    macd: float
+    macd_signal: float
+    macd_histogram: float
+    histogram_slope: float
+    histogram_acceleration: float
 
+    adx: float
+    adx_slope: float
+    plus_di: float
+    minus_di: float
 
-@dataclass(frozen=True)
-class QualityProfile:
-    trend_quality: float
-    momentum_quality: float
-    volatility_quality: float
-    volume_quality: float
-    power_quality: float
-    candle_quality: float
-    total_quality: float
-    quality_level: str
+    buy_power: float
+    sell_power: float
+    power_delta: float
+
+    relative_volume: float
+    volume_expansion: bool
+    volume_spike: bool
+
+    atr_percent: float
+    atr_slope: float
+    atr_expansion: str
+    atr_explosion: bool
+
+    ema_state: str
+    vwap_state: str
+    vwap_distance_percent: float
+
+    price_change_percent: float
+    range_probability: float
+    compression_score: float
 
     def to_dict(self) -> JsonDict:
         return asdict(self)
@@ -109,17 +118,18 @@ class QualityProfile:
 
 @dataclass(frozen=True)
 class AnalysisCandidate:
+    """Structured sensor package for downstream AI and Pattern Layer."""
+
     candidate_id: str
     symbol: str
     timeframe: str
     timestamp: int
     direction_hint: str
     bias: str
-    direction_score: DirectionScore
-    quality: QualityProfile
-    risk: RiskProfile
+    sensor_direction: SensorDirectionHint
+    momentum_state: SensorMomentumState
     sensor_snapshot: SensorSnapshot
-    market_context: JsonDict = field(default_factory=dict)
+    market_mode: JsonDict = field(default_factory=dict)
     reason_codes: Tuple[str, ...] = field(default_factory=tuple)
     warnings: Tuple[str, ...] = field(default_factory=tuple)
     valid: bool = True
@@ -132,477 +142,206 @@ class AnalysisCandidate:
             "timestamp": self.timestamp,
             "direction_hint": self.direction_hint,
             "bias": self.bias,
-            "direction_score": self.direction_score.to_dict(),
-            "quality": self.quality.to_dict(),
-            "risk": self.risk.to_dict(),
+            "sensor_direction": self.sensor_direction.to_dict(),
+            "momentum_state": self.momentum_state.to_dict(),
             "sensor_snapshot": self.sensor_snapshot.to_dict(),
-            "market_context": self.market_context,
+            "market_mode": self.market_mode,
             "reason_codes": list(self.reason_codes),
             "warnings": list(self.warnings),
             "valid": self.valid,
         }
 
 
-def clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
-    return max(low, min(high, float(value)))
+# ---------------------------------------------------------------------------
+# Raw sensor extraction
+# ---------------------------------------------------------------------------
 
+def build_momentum_state(snapshot: SensorSnapshot) -> SensorMomentumState:
+    return SensorMomentumState(
+        rsi=safe_float(getattr(snapshot, "rsi", 0.0)),
+        rsi_slope=safe_float(getattr(snapshot, "rsi_slope", 0.0)),
+        rsi_acceleration=safe_float(getattr(snapshot, "rsi_acceleration", 0.0)),
 
-def avg(values: Sequence[float]) -> float:
-    vals = [float(v) for v in values if v is not None]
-    return sum(vals) / len(vals) if vals else 0.0
+        macd=safe_float(getattr(snapshot, "macd", 0.0)),
+        macd_signal=safe_float(getattr(snapshot, "macd_signal", 0.0)),
+        macd_histogram=safe_float(getattr(snapshot, "macd_histogram", 0.0)),
+        histogram_slope=safe_float(getattr(snapshot, "histogram_slope", 0.0)),
+        histogram_acceleration=safe_float(getattr(snapshot, "histogram_acceleration", 0.0)),
 
+        adx=safe_float(getattr(snapshot, "adx", 0.0)),
+        adx_slope=safe_float(getattr(snapshot, "adx_slope", 0.0)),
+        plus_di=safe_float(getattr(snapshot, "plus_di", 0.0)),
+        minus_di=safe_float(getattr(snapshot, "minus_di", 0.0)),
 
-def build_movement_opportunity(snapshot: SensorSnapshot) -> Tuple[float, float, Tuple[str, ...]]:
-    """Estimate pre-move opportunity from raw sensors.
+        buy_power=safe_float(getattr(snapshot, "buy_power", 0.0)),
+        sell_power=safe_float(getattr(snapshot, "sell_power", 0.0)),
+        power_delta=safe_float(getattr(snapshot, "power_delta", 0.0)),
 
-    This is not a trade decision. It only tells the downstream Movement Hunter
-    whether a high-range/compression state may be the birth area of a pump/dump
-    instead of ordinary risk.
-    """
-    opportunity = 0.0
-    premove = 0.0
-    reasons: List[str] = []
+        relative_volume=safe_float(getattr(snapshot, "relative_volume", 0.0)),
+        volume_expansion=bool(getattr(snapshot, "volume_expansion", False)),
+        volume_spike=bool(getattr(snapshot, "volume_spike", False)),
 
-    compression = clamp(getattr(snapshot, "compression_score", 0.0))
-    range_probability = clamp(getattr(snapshot, "range_probability", 0.0))
-    power_delta = abs(float(getattr(snapshot, "power_delta", 0.0) or 0.0))
+        atr_percent=safe_float(getattr(snapshot, "atr_percent", 0.0)),
+        atr_slope=safe_float(getattr(snapshot, "atr_slope", 0.0)),
+        atr_expansion=str(getattr(snapshot, "atr_expansion", "")),
+        atr_explosion=bool(getattr(snapshot, "atr_explosion", False)),
 
-    participation = (
-        bool(getattr(snapshot, "volume_expansion", False))
-        or bool(getattr(snapshot, "volume_spike", False))
-        or str(getattr(snapshot, "atr_expansion", "")).upper() == "EXPANDING"
-        or bool(getattr(snapshot, "atr_explosion", False))
-        or float(getattr(snapshot, "atr_slope", 0.0) or 0.0) > 0
-        or power_delta >= 8
-        or bool(getattr(snapshot, "breakout_candidate", False))
-        or bool(getattr(snapshot, "breakdown_candidate", False))
+        ema_state=str(getattr(snapshot, "ema_state", "")),
+        vwap_state=str(getattr(snapshot, "vwap_state", "")),
+        vwap_distance_percent=safe_float(getattr(snapshot, "vwap_distance_percent", 0.0)),
+
+        price_change_percent=safe_float(getattr(snapshot, "price_change_percent", 0.0)),
+        range_probability=safe_float(getattr(snapshot, "range_probability", 0.0)),
+        compression_score=safe_float(getattr(snapshot, "compression_score", 0.0)),
     )
 
-    if compression >= 35 and range_probability >= 45:
-        premove += 20
-        opportunity += 14
-        reasons.append("RANGE_COMPRESSION_PREMOVE_CONTEXT")
 
-    if compression >= 55 and participation:
-        premove += 22
-        opportunity += 18
-        reasons.append("COMPRESSION_WITH_PARTICIPATION")
+def build_sensor_direction_hint(snapshot: SensorSnapshot) -> SensorDirectionHint:
+    """Create a lightweight sensor direction hint without classic scoring.
 
-    if str(getattr(snapshot, "atr_expansion", "")).upper() == "EXPANDING":
-        premove += 14
-        opportunity += 12
-        reasons.append("ATR_EXPANSION_PREMOVE")
+    It uses only immediate slope/acceleration/power alignment. AI can ignore or
+    override it. This prevents the old classic engine from becoming decision maker.
+    """
+    long_pressure = 0.0
+    short_pressure = 0.0
+    reasons = []
 
-    if bool(getattr(snapshot, "atr_explosion", False)):
-        premove += 18
-        opportunity += 16
-        reasons.append("ATR_EXPLOSION_MOVEMENT_BIRTH")
+    rsi_slope = safe_float(getattr(snapshot, "rsi_slope", 0.0))
+    rsi_acc = safe_float(getattr(snapshot, "rsi_acceleration", 0.0))
+    hist_slope = safe_float(getattr(snapshot, "histogram_slope", 0.0))
+    hist_acc = safe_float(getattr(snapshot, "histogram_acceleration", 0.0))
+    power_delta = safe_float(getattr(snapshot, "power_delta", 0.0))
+    adx = safe_float(getattr(snapshot, "adx", 0.0))
+    adx_slope = safe_float(getattr(snapshot, "adx_slope", 0.0))
+    plus_di = safe_float(getattr(snapshot, "plus_di", 0.0))
+    minus_di = safe_float(getattr(snapshot, "minus_di", 0.0))
 
-    if bool(getattr(snapshot, "volume_expansion", False)):
-        premove += 12
-        opportunity += 12
-        reasons.append("VOLUME_EXPANSION_PREMOVE")
-
-    if bool(getattr(snapshot, "volume_spike", False)):
-        premove += 16
-        opportunity += 14
-        reasons.append("VOLUME_SPIKE_MOVEMENT_CONTEXT")
-
-    if power_delta >= 10:
-        premove += 12
-        opportunity += 12
-        reasons.append("POWER_SHIFT_PREMOVE")
-
-    if abs(float(getattr(snapshot, "histogram_acceleration", 0.0) or 0.0)) > 0 and power_delta >= 6:
-        premove += 10
-        opportunity += 10
-        reasons.append("MACD_ACCEL_POWER_BIRTH")
-
-    if bool(getattr(snapshot, "breakout_candidate", False)) or bool(getattr(snapshot, "breakdown_candidate", False)):
-        premove += 16
-        opportunity += 14
-        reasons.append("BREAK_CANDIDATE_PREMOVE")
-
-    if bool(getattr(snapshot, "momentum_weakness", False)):
-        opportunity -= 12
-        premove -= 10
-        reasons.append("MOMENTUM_WEAKNESS_REDUCES_OPPORTUNITY")
-
-    return clamp(opportunity), clamp(premove), tuple(dict.fromkeys(reasons))
-
-
-def _score_ema(snapshot: SensorSnapshot) -> Tuple[float, float, List[str]]:
-    long_score = 0.0
-    short_score = 0.0
-    reasons: List[str] = []
-
-    state = str(snapshot.ema_state).upper()
-    if state in {"ABOVE", "CROSS_UP"}:
-        long_score += 14
-        reasons.append("EMA_BULLISH")
-    elif state in {"BELOW", "CROSS_DOWN"}:
-        short_score += 14
-        reasons.append("EMA_BEARISH")
-
-    if snapshot.price > snapshot.ema_fast > snapshot.ema_slow:
-        long_score += 8
-        reasons.append("PRICE_ABOVE_EMA_STACK")
-    elif snapshot.price < snapshot.ema_fast < snapshot.ema_slow:
-        short_score += 8
-        reasons.append("PRICE_BELOW_EMA_STACK")
-
-    return long_score, short_score, reasons
-
-
-def _score_vwap(snapshot: SensorSnapshot) -> Tuple[float, float, List[str]]:
-    long_score = 0.0
-    short_score = 0.0
-    reasons: List[str] = []
-
-    state = str(snapshot.vwap_state).upper()
-    if state in {"ABOVE", "RECLAIM"}:
-        long_score += 12
-        reasons.append("VWAP_BULLISH")
-    elif state in {"BELOW", "LOSS"}:
-        short_score += 12
-        reasons.append("VWAP_BEARISH")
-
-    if snapshot.vwap_distance_percent > 0.05:
-        long_score += 3
-    elif snapshot.vwap_distance_percent < -0.05:
-        short_score += 3
-
-    return long_score, short_score, reasons
-
-
-def _score_rsi(snapshot: SensorSnapshot) -> Tuple[float, float, List[str]]:
-    long_score = 0.0
-    short_score = 0.0
-    reasons: List[str] = []
-
-    rsi = snapshot.rsi
-    if 45 <= rsi <= 68:
-        long_score += 6
-    if 32 <= rsi <= 55:
-        short_score += 6
-
-    if snapshot.rsi_slope > 0.3:
-        long_score += 10
+    if rsi_slope > 0:
+        long_pressure += min(18.0, abs(rsi_slope) * 5.0)
         reasons.append("RSI_SLOPE_UP")
-    elif snapshot.rsi_slope < -0.3:
-        short_score += 10
+    elif rsi_slope < 0:
+        short_pressure += min(18.0, abs(rsi_slope) * 5.0)
         reasons.append("RSI_SLOPE_DOWN")
 
-    if snapshot.rsi_acceleration > 0.15:
-        long_score += 4
+    if rsi_acc > 0:
+        long_pressure += min(10.0, abs(rsi_acc) * 5.0)
         reasons.append("RSI_ACCEL_UP")
-    elif snapshot.rsi_acceleration < -0.15:
-        short_score += 4
+    elif rsi_acc < 0:
+        short_pressure += min(10.0, abs(rsi_acc) * 5.0)
         reasons.append("RSI_ACCEL_DOWN")
 
-    if rsi > 76 and snapshot.rsi_slope < 0:
-        short_score += 5
-        reasons.append("RSI_OVERBOUGHT_WEAKENING")
-    elif rsi < 24 and snapshot.rsi_slope > 0:
-        long_score += 5
-        reasons.append("RSI_OVERSOLD_RECOVERY")
+    if hist_slope > 0:
+        long_pressure += min(18.0, abs(hist_slope) * 1000.0)
+        reasons.append("HIST_SLOPE_UP")
+    elif hist_slope < 0:
+        short_pressure += min(18.0, abs(hist_slope) * 1000.0)
+        reasons.append("HIST_SLOPE_DOWN")
 
-    return long_score, short_score, reasons
+    if hist_acc > 0:
+        long_pressure += min(12.0, abs(hist_acc) * 1000.0)
+        reasons.append("HIST_ACCEL_UP")
+    elif hist_acc < 0:
+        short_pressure += min(12.0, abs(hist_acc) * 1000.0)
+        reasons.append("HIST_ACCEL_DOWN")
 
+    if power_delta > 0:
+        long_pressure += min(20.0, abs(power_delta) * 0.8)
+        reasons.append("BUY_POWER_RISING")
+    elif power_delta < 0:
+        short_pressure += min(20.0, abs(power_delta) * 0.8)
+        reasons.append("SELL_POWER_RISING")
 
-def _score_macd(snapshot: SensorSnapshot) -> Tuple[float, float, List[str]]:
-    long_score = 0.0
-    short_score = 0.0
-    reasons: List[str] = []
+    if adx >= 18 and adx_slope >= 0:
+        if plus_di > minus_di:
+            long_pressure += 10.0
+            reasons.append("DI_ADX_LONG_PRESSURE")
+        elif minus_di > plus_di:
+            short_pressure += 10.0
+            reasons.append("DI_ADX_SHORT_PRESSURE")
 
-    if snapshot.macd_histogram > 0:
-        long_score += 6
-        reasons.append("MACD_HIST_POSITIVE")
-    elif snapshot.macd_histogram < 0:
-        short_score += 6
-        reasons.append("MACD_HIST_NEGATIVE")
+    # VWAP/EMA are context sensors, not final signal.
+    ema_state = str(getattr(snapshot, "ema_state", "")).upper()
+    vwap_state = str(getattr(snapshot, "vwap_state", "")).upper()
+    if ema_state in {"ABOVE", "CROSS_UP"}:
+        long_pressure += 5.0
+        reasons.append("EMA_CONTEXT_LONG")
+    elif ema_state in {"BELOW", "CROSS_DOWN"}:
+        short_pressure += 5.0
+        reasons.append("EMA_CONTEXT_SHORT")
 
-    if snapshot.histogram_slope > 0:
-        long_score += 8
-        reasons.append("MACD_HIST_SLOPE_UP")
-    elif snapshot.histogram_slope < 0:
-        short_score += 8
-        reasons.append("MACD_HIST_SLOPE_DOWN")
+    if vwap_state in {"ABOVE", "RECLAIM"}:
+        long_pressure += 5.0
+        reasons.append("VWAP_CONTEXT_LONG")
+    elif vwap_state in {"BELOW", "LOSS"}:
+        short_pressure += 5.0
+        reasons.append("VWAP_CONTEXT_SHORT")
 
-    if snapshot.histogram_acceleration > 0:
-        long_score += 6
-        reasons.append("MACD_ACCEL_UP")
-    elif snapshot.histogram_acceleration < 0:
-        short_score += 6
-        reasons.append("MACD_ACCEL_DOWN")
+    long_pressure = clamp(long_pressure)
+    short_pressure = clamp(short_pressure)
+    gap = abs(long_pressure - short_pressure)
 
-    return long_score, short_score, reasons
-
-
-def _score_power(snapshot: SensorSnapshot) -> Tuple[float, float, List[str]]:
-    long_score = 0.0
-    short_score = 0.0
-    reasons: List[str] = []
-
-    if snapshot.power_delta > 10:
-        long_score += 12
-        reasons.append("BUY_POWER_DOMINANT")
-    elif snapshot.power_delta < -10:
-        short_score += 12
-        reasons.append("SELL_POWER_DOMINANT")
-
-    if snapshot.close_quality > 0.70:
-        long_score += 4
-        reasons.append("STRONG_CLOSE")
-    elif snapshot.close_quality < 0.30:
-        short_score += 4
-        reasons.append("WEAK_CLOSE")
-
-    return long_score, short_score, reasons
-
-
-def build_direction_score(snapshot: SensorSnapshot) -> Tuple[DirectionScore, Tuple[str, ...]]:
-    long_total = 0.0
-    short_total = 0.0
-    reasons: List[str] = []
-
-    for fn in (_score_ema, _score_vwap, _score_rsi, _score_macd, _score_power):
-        l, s, r = fn(snapshot)
-        long_total += l
-        short_total += s
-        reasons.extend(r)
-
-    if snapshot.plus_di > snapshot.minus_di and snapshot.adx >= 18:
-        long_total += 6
-        reasons.append("DI_BULLISH")
-    elif snapshot.minus_di > snapshot.plus_di and snapshot.adx >= 18:
-        short_total += 6
-        reasons.append("DI_BEARISH")
-
-    long_total = clamp(long_total)
-    short_total = clamp(short_total)
-    gap = abs(long_total - short_total)
-
-    if gap < 4:
+    if gap < 6.0:
         direction = DIRECTION_NEUTRAL
         bias = BIAS_NEUTRAL
-    elif long_total > short_total:
+    elif long_pressure > short_pressure:
         direction = DIRECTION_LONG
         bias = BIAS_BULLISH
     else:
         direction = DIRECTION_SHORT
         bias = BIAS_BEARISH
 
-    return DirectionScore(
-        long_score=long_total,
-        short_score=short_total,
+    return SensorDirectionHint(
+        long_pressure=long_pressure,
+        short_pressure=short_pressure,
         direction_hint=direction,
         bias=bias,
         gap=gap,
-    ), tuple(reasons)
-
-
-def build_quality_profile(snapshot: SensorSnapshot) -> QualityProfile:
-    trend_quality = 0.0
-    if snapshot.trend_strength == "STRONG":
-        trend_quality = 80.0
-    elif snapshot.trend_strength == "NORMAL":
-        trend_quality = 55.0
-    else:
-        trend_quality = 25.0
-
-    momentum_quality = clamp(
-        abs(snapshot.rsi_slope) * 8
-        + abs(snapshot.histogram_slope) * 1000
-        + abs(snapshot.histogram_acceleration) * 1000
-    )
-
-    volatility_quality = 45.0
-    if snapshot.atr_explosion:
-        volatility_quality = 85.0
-    elif snapshot.atr_expansion == "EXPANDING":
-        volatility_quality = 70.0
-    elif snapshot.atr_expansion == "SHRINKING":
-        volatility_quality = 25.0
-
-    volume_quality = clamp(snapshot.relative_volume * 35.0)
-    if snapshot.volume_spike:
-        volume_quality = max(volume_quality, 85.0)
-    elif snapshot.volume_expansion:
-        volume_quality = max(volume_quality, 65.0)
-
-    power_quality = clamp(abs(snapshot.power_delta) * 1.5)
-    candle_quality = clamp(abs(snapshot.close_quality - 0.5) * 200)
-
-    total = avg([
-        trend_quality,
-        momentum_quality,
-        volatility_quality,
-        volume_quality,
-        power_quality,
-        candle_quality,
-    ])
-
-    if total >= 70:
-        level = QUALITY_HIGH
-    elif total >= 45:
-        level = QUALITY_MEDIUM
-    else:
-        level = QUALITY_LOW
-
-    return QualityProfile(
-        trend_quality=clamp(trend_quality),
-        momentum_quality=clamp(momentum_quality),
-        volatility_quality=clamp(volatility_quality),
-        volume_quality=clamp(volume_quality),
-        power_quality=clamp(power_quality),
-        candle_quality=clamp(candle_quality),
-        total_quality=clamp(total),
-        quality_level=level,
+        reason_codes=tuple(dict.fromkeys(reasons)),
     )
 
 
-def build_risk_profile(snapshot: SensorSnapshot) -> RiskProfile:
-    opportunity_score, premove_readiness_score, _ = build_movement_opportunity(snapshot)
-
-    raw_range_risk = clamp(snapshot.range_probability)
-
-    # In Movement Hunter mode, range/compression is not automatically bad.
-    # Many pump/dump moves start from range. So range risk is softened when
-    # there is compression + participation / power / ATR expansion.
-    range_risk = raw_range_risk
-    if premove_readiness_score >= 55:
-        range_risk = min(range_risk, 42.0)
-    elif premove_readiness_score >= 35:
-        range_risk = min(range_risk, 55.0)
-
-    trap_risk = 0.0
-    if snapshot.failed_breakout or snapshot.failed_breakdown:
-        trap_risk += 45
-    trap_risk += snapshot.stop_hunt_probability * 0.55
-    trap_risk = clamp(trap_risk)
-
-    exhaustion_risk = 0.0
-    if snapshot.bull_exhaustion or snapshot.bear_exhaustion:
-        exhaustion_risk += 70
-    if snapshot.momentum_weakness:
-        exhaustion_risk += 20
-    exhaustion_risk = clamp(exhaustion_risk)
-
-    late_move_risk = 0.0
-    if abs(snapshot.price_change_percent) > max(snapshot.atr_percent * 2.3, 1.5):
-        late_move_risk += 34
-    if snapshot.atr_explosion and snapshot.volume_spike and snapshot.momentum_weakness:
-        late_move_risk += 25
-    # If this looks like a range-to-trend birth, do not classify it as late just
-    # because ATR/volume started waking up.
-    if premove_readiness_score >= 50 and not snapshot.momentum_weakness:
-        late_move_risk = max(0.0, late_move_risk - 14.0)
-    late_move_risk = clamp(late_move_risk)
-
-    liquidity_risk = clamp(snapshot.stop_hunt_probability)
-
-    total = avg([
-        range_risk,
-        trap_risk,
-        exhaustion_risk,
-        late_move_risk,
-        liquidity_risk,
-    ])
-
-    # High opportunity should be visible to the AI and should not be hidden by a
-    # raw range warning. This only softens the raw candidate risk; later trap,
-    # state, confidence and final AI decision still control safety.
-    if opportunity_score >= 60 and exhaustion_risk < 55 and trap_risk < 65:
-        total = max(0.0, total - 8.0)
-    elif opportunity_score >= 40 and exhaustion_risk < 65:
-        total = max(0.0, total - 4.0)
-
-    if total >= 65:
-        level = RISK_HIGH
-    elif total >= 35:
-        level = RISK_MEDIUM
-    else:
-        level = RISK_LOW
-
-    return RiskProfile(
-        range_risk=clamp(range_risk),
-        trap_risk=trap_risk,
-        exhaustion_risk=exhaustion_risk,
-        late_move_risk=late_move_risk,
-        liquidity_risk=liquidity_risk,
-        total_risk=clamp(total),
-        risk_level=level,
-        raw_range_risk=raw_range_risk,
-        opportunity_score=clamp(opportunity_score),
-        premove_readiness_score=clamp(premove_readiness_score),
-    )
-
+# ---------------------------------------------------------------------------
+# Engine
+# ---------------------------------------------------------------------------
 
 class AnalysisEngine:
-    """
-    Converts SensorSnapshot into AnalysisCandidate.
-
-    This is still not a signal. It is a structured candidate for AI.
-    """
+    """Builds sensor packages only. It never decides trades."""
 
     def build_candidate(
         self,
         snapshot: SensorSnapshot,
-        market_context: Optional[Any] = None,
+        market_mode: Optional[Any] = None,
     ) -> AnalysisCandidate:
-        direction_score, direction_reasons = build_direction_score(snapshot)
-        quality = build_quality_profile(snapshot)
-        risk = build_risk_profile(snapshot)
-        opportunity_score, premove_readiness_score, opportunity_reasons = build_movement_opportunity(snapshot)
+        direction = build_sensor_direction_hint(snapshot)
+        momentum = build_momentum_state(snapshot)
 
-        warnings: List[str] = list(snapshot.warnings)
-        valid = bool(snapshot.valid)
+        warnings = list(getattr(snapshot, "warnings", ()) or [])
+        valid = bool(getattr(snapshot, "valid", True))
 
-        if direction_score.direction_hint == DIRECTION_NEUTRAL:
-            warnings.append("NO_CLEAR_DIRECTION")
+        if direction.direction_hint == DIRECTION_NEUTRAL:
+            warnings.append("SENSOR_DIRECTION_NEUTRAL")
 
-        if risk.risk_level == RISK_HIGH:
-            if premove_readiness_score >= 55 and risk.exhaustion_risk < 55:
-                warnings.append("HIGH_RISK_BUT_PREMOVE_OPPORTUNITY")
+        market_mode_dict: JsonDict = {}
+        if market_mode is not None:
+            if hasattr(market_mode, "to_dict") and callable(market_mode.to_dict):
+                market_mode_dict = market_mode.to_dict()
+            elif isinstance(market_mode, dict):
+                market_mode_dict = dict(market_mode)
             else:
-                warnings.append("HIGH_RISK_CANDIDATE")
-
-        if premove_readiness_score >= 55:
-            warnings.append("PREMOVE_READINESS_HIGH")
-        elif premove_readiness_score >= 35:
-            warnings.append("PREMOVE_READINESS_MEDIUM")
-
-        ctx_dict: JsonDict = {}
-        if market_context is not None:
-            if hasattr(market_context, "to_dict") and callable(market_context.to_dict):
-                ctx_dict = market_context.to_dict()
-            elif isinstance(market_context, dict):
-                ctx_dict = dict(market_context)
-            else:
-                ctx_dict = dict(getattr(market_context, "__dict__", {}))
-
-        ctx_dict.setdefault("analysis_opportunity", {
-            "opportunity_score": clamp(opportunity_score),
-            "premove_readiness_score": clamp(premove_readiness_score),
-            "raw_range_risk": clamp(risk.raw_range_risk),
-            "softened_range_risk": clamp(risk.range_risk),
-            "reason_codes": list(opportunity_reasons),
-        })
+                market_mode_dict = dict(getattr(market_mode, "__dict__", {}))
 
         return AnalysisCandidate(
             candidate_id=f"cand_{uuid4().hex}",
-            symbol=snapshot.symbol,
-            timeframe=snapshot.timeframe,
-            timestamp=snapshot.timestamp or int(time.time()),
-            direction_hint=direction_score.direction_hint,
-            bias=direction_score.bias,
-            direction_score=direction_score,
-            quality=quality,
-            risk=risk,
+            symbol=str(getattr(snapshot, "symbol", "")),
+            timeframe=str(getattr(snapshot, "timeframe", "5m")),
+            timestamp=int(getattr(snapshot, "timestamp", 0) or time.time()),
+            direction_hint=direction.direction_hint,
+            bias=direction.bias,
+            sensor_direction=direction,
+            momentum_state=momentum,
             sensor_snapshot=snapshot,
-            market_context=ctx_dict,
-            reason_codes=tuple(dict.fromkeys(list(direction_reasons) + list(opportunity_reasons))),
+            market_mode=market_mode_dict,
+            reason_codes=direction.reason_codes,
             warnings=tuple(dict.fromkeys(warnings)),
             valid=valid,
         )
@@ -612,21 +351,21 @@ class AnalysisEngine:
         symbol: str,
         timeframe: str,
         candles: Sequence[Any],
-        market_context: Optional[Any] = None,
+        market_mode: Optional[Any] = None,
     ) -> AnalysisCandidate:
-        if market_context is None:
+        if market_mode is None:
             try:
-                market_context = get_market_context()
+                market_mode = get_market_mode()
             except Exception:
-                market_context = None
+                market_mode = None
 
         snapshot = build_sensor_snapshot(
             symbol=symbol,
-            timeframe=timeframe,
+            timeframe=timeframe or "5m",
             candles=candles,
-            market_context=market_context,
+            market_context=market_mode,
         )
-        return self.build_candidate(snapshot, market_context=market_context)
+        return self.build_candidate(snapshot, market_mode=market_mode)
 
 
 _default_engine: Optional[AnalysisEngine] = None
@@ -640,7 +379,8 @@ def engine() -> AnalysisEngine:
 
 
 def build_analysis_candidate(snapshot: SensorSnapshot, market_context: Optional[Any] = None) -> AnalysisCandidate:
-    return engine().build_candidate(snapshot, market_context=market_context)
+    # market_context name kept for backward compatibility while files are rewritten.
+    return engine().build_candidate(snapshot, market_mode=market_context)
 
 
 def analyze_symbol(
@@ -649,7 +389,7 @@ def analyze_symbol(
     candles: Sequence[Any],
     market_context: Optional[Any] = None,
 ) -> AnalysisCandidate:
-    return engine().analyze(symbol=symbol, timeframe=timeframe, candles=candles, market_context=market_context)
+    return engine().analyze(symbol=symbol, timeframe=timeframe or "5m", candles=candles, market_mode=market_context)
 
 
 def analyze_multi_timeframe(
@@ -657,11 +397,12 @@ def analyze_multi_timeframe(
     timeframe_candles: Dict[str, Sequence[Any]],
     market_context: Optional[Any] = None,
 ) -> Dict[str, AnalysisCandidate]:
+    # Level 1 is 5m-first. This helper remains only for compatibility.
     result: Dict[str, AnalysisCandidate] = {}
     for timeframe, candles in timeframe_candles.items():
         result[timeframe] = analyze_symbol(
             symbol=symbol,
-            timeframe=timeframe,
+            timeframe=timeframe or "5m",
             candles=candles,
             market_context=market_context,
         )
