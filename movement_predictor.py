@@ -181,21 +181,48 @@ class MovementPredictionResult:
 # ---------------------------------------------------------------------------
 
 def extract_pattern_metrics(pattern_summary: Optional[Any]) -> Dict[str, Any]:
-    """Read optional Pattern Start Layer output without importing it.
+    """Read Pattern Start / learning output without importing that layer.
 
-    Expected optional fields:
-    pattern_match_score, pattern_confidence, matched_pattern_id, pattern_count,
-    pattern_win_rate, expected_move_percent, expected_pullback_percent,
-    expected_duration_seconds.
+    Supported aliases are intentional because coin_learning.py and the future
+    Pattern Start Layer may expose slightly different field names.
     """
+    pattern_match_score = (
+        obj_value(pattern_summary, "pattern_match_score", None)
+        if obj_value(pattern_summary, "pattern_match_score", None) is not None
+        else obj_value(pattern_summary, "fuzzy_match_score", 0.0)
+    )
+    pattern_confidence = (
+        obj_value(pattern_summary, "pattern_confidence", None)
+        if obj_value(pattern_summary, "pattern_confidence", None) is not None
+        else obj_value(pattern_summary, "confidence_score", 0.0)
+    )
+    pattern_count = (
+        obj_value(pattern_summary, "pattern_count", None)
+        if obj_value(pattern_summary, "pattern_count", None) is not None
+        else obj_value(pattern_summary, "sample_count", 0)
+    )
+    pattern_win_rate = (
+        obj_value(pattern_summary, "pattern_win_rate", None)
+        if obj_value(pattern_summary, "pattern_win_rate", None) is not None
+        else obj_value(pattern_summary, "outcome_success_rate", obj_value(pattern_summary, "win_rate", 0.0))
+    )
+
+    expected_move = obj_value(pattern_summary, "expected_move_percent", None)
+    if expected_move is None:
+        expected_move = obj_value(pattern_summary, "avg_mfe_percent", 0.0)
+
+    expected_pullback = obj_value(pattern_summary, "expected_pullback_percent", None)
+    if expected_pullback is None:
+        expected_pullback = obj_value(pattern_summary, "avg_mae_percent", 0.0)
+
     return {
-        "pattern_match_score": clamp(obj_value(pattern_summary, "pattern_match_score", 0.0)),
-        "pattern_confidence": clamp(obj_value(pattern_summary, "pattern_confidence", 0.0)),
+        "pattern_match_score": clamp(pattern_match_score),
+        "pattern_confidence": clamp(pattern_confidence),
         "matched_pattern_id": str(obj_value(pattern_summary, "matched_pattern_id", "") or ""),
-        "pattern_count": safe_int(obj_value(pattern_summary, "pattern_count", 0), 0),
-        "pattern_win_rate": clamp(obj_value(pattern_summary, "pattern_win_rate", 0.0)),
-        "expected_move_percent": safe_float(obj_value(pattern_summary, "expected_move_percent", 0.0), 0.0),
-        "expected_pullback_percent": safe_float(obj_value(pattern_summary, "expected_pullback_percent", 0.0), 0.0),
+        "pattern_count": safe_int(pattern_count, 0),
+        "pattern_win_rate": clamp(pattern_win_rate),
+        "expected_move_percent": safe_float(expected_move, 0.0),
+        "expected_pullback_percent": safe_float(expected_pullback, 0.0),
         "expected_duration_seconds": safe_float(obj_value(pattern_summary, "expected_duration_seconds", 300.0), 300.0),
     }
 
@@ -344,7 +371,7 @@ def classify_phase(final_score: float, late_penalty_value: float, range_penalty_
     if late_penalty_value >= 40:
         reasons.append("PHASE_LATE_VERY_EXTENDED")
         return PREDICT_LATE, reasons
-    if late_penalty_value >= 26 and final_score < 72:
+    if late_penalty_value >= 26 and final_score < 74:
         reasons.append("PHASE_LATE_EXTENDED")
         return PREDICT_LATE, reasons
     if range_penalty_value >= 18 and final_score < 55:
@@ -372,24 +399,59 @@ def classify_phase(final_score: float, late_penalty_value: float, range_penalty_
     return PREDICT_UNKNOWN, reasons
 
 
-def confidence_from_score(score: float, pattern_count: int, phase: str) -> Tuple[str, bool, List[str]]:
+def confidence_from_score(
+    score: float,
+    pattern_count: int,
+    pattern_score: float,
+    pattern_confidence: float,
+    pattern_win_rate: float,
+    live_sensor_score: float,
+    phase: str,
+) -> Tuple[str, bool, List[str]]:
+    """Classify prediction confidence.
+
+    Important Level 1 rule:
+    Pattern count is useful, but it must not be the main gate.
+    A few strong repeated patterns with high confidence/win-rate can be better
+    than many weak patterns. Live sensor acceleration can also compensate when
+    a fresh movement is forming before the pattern database is mature.
+    """
     reasons: List[str] = []
     prefer_ghost = False
 
+    strong_pattern_quality = (
+        pattern_score >= 68
+        and pattern_confidence >= 55
+        and (pattern_win_rate >= 55 or pattern_count >= 2)
+    )
+    useful_pattern_quality = (
+        pattern_score >= 55
+        or pattern_confidence >= 50
+        or pattern_win_rate >= 58
+    )
+    strong_live_birth = live_sensor_score >= 62
+
     if pattern_count <= 0:
         reasons.append("NO_PATTERN_SAMPLE_YET")
-        prefer_ghost = score < 68
+        prefer_ghost = not strong_live_birth
     elif pattern_count < 3:
-        reasons.append("LOW_PATTERN_SAMPLE")
-        prefer_ghost = score < 62
+        reasons.append("LOW_PATTERN_SAMPLE_BUT_QUALITY_CHECKED")
+        prefer_ghost = not (strong_pattern_quality or strong_live_birth)
+
+    if useful_pattern_quality:
+        reasons.append("PATTERN_QUALITY_USEFUL")
+    if strong_pattern_quality:
+        reasons.append("PATTERN_QUALITY_STRONG")
+    if strong_live_birth:
+        reasons.append("LIVE_SENSOR_STRONG_EARLY_BIRTH")
 
     if phase in {PREDICT_LATE, PREDICT_RANGE, PREDICT_UNKNOWN}:
         reasons.append("PHASE_NOT_IDEAL_FOR_REAL")
         prefer_ghost = True
 
-    if score >= 75 and phase in {PREDICT_PRE_START, PREDICT_START} and pattern_count >= 3:
+    if score >= 75 and phase in {PREDICT_PRE_START, PREDICT_START} and (strong_pattern_quality or strong_live_birth):
         return CONF_HIGH, prefer_ghost, reasons
-    if score >= 60:
+    if score >= 60 and (useful_pattern_quality or strong_live_birth):
         return CONF_MEDIUM, prefer_ghost, reasons
     if score >= 42:
         return CONF_LOW, True, reasons
@@ -461,7 +523,15 @@ class MovementPredictor:
         phase, r = classify_phase(final_score, late_pen, range_pen, candidate)
         reasons.extend(r)
 
-        confidence, prefer_ghost, r = confidence_from_score(final_score, pattern_count, phase)
+        confidence, prefer_ghost, r = confidence_from_score(
+            score=final_score,
+            pattern_count=pattern_count,
+            pattern_score=pattern_score,
+            pattern_confidence=pattern_confidence,
+            pattern_win_rate=pattern_win_rate,
+            live_sensor_score=live_score,
+            phase=phase,
+        )
         reasons.extend(r)
 
         if prefer_ghost:
