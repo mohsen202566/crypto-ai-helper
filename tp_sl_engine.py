@@ -96,6 +96,13 @@ class TPSLPlan:
     estimated_tp1_net_usdt: float = 0.0
     min_required_net_profit_usdt: float = 0.0
 
+    # Tradability / profit-quality estimates. These help downstream layers
+    # avoid REAL trades where a coin technically moves, but the practical
+    # TP is too small compared with fees/noise.
+    estimated_sl_loss_usdt: float = 0.0
+    estimated_rr_net: float = 0.0
+    tradability_score: float = 50.0
+
     reason_codes: Tuple[str, ...] = field(default_factory=tuple)
     warnings: Tuple[str, ...] = field(default_factory=tuple)
     valid: bool = True
@@ -469,6 +476,93 @@ def _apply_fee_aware_tp_floor(tp1_percent: float, tp2_percent: float) -> Tuple[f
         warnings.append("TP1_NET_PROFIT_BELOW_MIN_AFTER_FEES")
     return tp1_percent, tp2_percent, notional, gross, fee, min_net, reasons, warnings
 
+
+def _estimated_loss_usdt(notional: float, sl_percent: float) -> float:
+    return max(0.0, safe_float(notional) * safe_float(sl_percent) / 100.0)
+
+
+def _net_rr(gross_profit: float, fee: float, loss: float) -> float:
+    net_profit = safe_float(gross_profit) - safe_float(fee)
+    if loss <= 0:
+        return 0.0
+    return net_profit / loss
+
+
+def _profit_quality_score(
+    tp1_percent: float,
+    sl_percent: float,
+    notional: float,
+    gross: float,
+    fee: float,
+    min_net: float,
+    atr_percent: float,
+    candidate: AnalysisCandidate,
+    prediction: MovementPredictionResult,
+    learning: Optional[LearningSummary],
+) -> Tuple[float, float, float, List[str], List[str]]:
+    """Score whether this TP/SL plan is worth real capital.
+
+    A coin can be technically active but still poor for REAL trading when the
+    expected TP is only a few cents after fees or when TP is too close to normal
+    candle noise. This score is informational for AI/reporting and is also used
+    by the validator to mark truly useless plans invalid.
+    """
+    reasons: List[str] = []
+    warnings: List[str] = []
+
+    est_loss = _estimated_loss_usdt(notional, sl_percent)
+    net_profit = safe_float(gross) - safe_float(fee)
+    net_rr = _net_rr(gross, fee, est_loss)
+
+    required_net_score = clamp((net_profit / max(min_net, 0.01)) * 35.0, 0.0, 40.0)
+    fee_cover_score = clamp((safe_float(tp1_percent) / max(((fee + min_net) / max(notional, 1e-9) * 100.0), 1e-9)) * 35.0, 0.0, 40.0)
+    rr_score = clamp(net_rr * 25.0, 0.0, 25.0)
+
+    # TP must be bigger than normal micro-noise. For very tight coins, this
+    # prevents two tiny ticks deciding the whole trade.
+    noise_ratio = safe_float(tp1_percent) / max(safe_float(atr_percent), 0.05)
+    noise_score = clamp(noise_ratio * 12.0, 0.0, 18.0)
+
+    s = candidate.sensor_snapshot
+    volume_bonus = 0.0
+    rel_vol = safe_float(getattr(s, "relative_volume", 0.0), 0.0)
+    if rel_vol >= 1.8 or bool(getattr(s, "volume_spike", False)):
+        volume_bonus += 6.0
+        reasons.append("PROFIT_QUALITY_VOLUME_SUPPORT")
+    elif rel_vol > 0 and rel_vol < 0.65:
+        volume_bonus -= 8.0
+        warnings.append("PROFIT_QUALITY_LOW_VOLUME")
+
+    # If learning says this exact condition catches early moves, tolerate a
+    # slightly more ambitious TP. Otherwise keep low-value scalps in GHOST.
+    try:
+        early = safe_float(getattr(learning, "early_success_rate", 0.0), 0.0) if learning is not None else 0.0
+        premove = safe_float(getattr(learning, "premove_success_rate", 0.0), 0.0) if learning is not None else 0.0
+        timing = safe_float(getattr(learning, "timing_score", 50.0), 50.0) if learning is not None else 50.0
+        if early >= 45.0 or premove >= 45.0 or timing >= 68.0:
+            volume_bonus += 5.0
+            reasons.append("PROFIT_QUALITY_EARLY_LEARNING_SUPPORT")
+    except Exception:
+        pass
+
+    score = clamp(required_net_score + fee_cover_score + rr_score + noise_score + volume_bonus, 0.0, 100.0)
+
+    if net_profit < min_net:
+        warnings.append("PROFIT_QUALITY_NET_BELOW_MIN")
+    if net_rr < 0.25:
+        warnings.append("PROFIT_QUALITY_NET_RR_TOO_LOW")
+    if noise_ratio < 0.45:
+        warnings.append("PROFIT_QUALITY_TP_INSIDE_NORMAL_NOISE")
+    if score < 35.0:
+        warnings.append("PROFIT_QUALITY_TOO_LOW_FOR_REAL")
+        reasons.append("PROFIT_QUALITY_GHOST_OR_BLOCK")
+    elif score >= 65.0:
+        reasons.append("PROFIT_QUALITY_REAL_USABLE")
+    else:
+        reasons.append("PROFIT_QUALITY_BORDERLINE")
+
+    return score, est_loss, net_rr, reasons, warnings
+
 class BaseMultiplierEngine:
     """Base scalping multipliers for 5M-15M Movement Hunter."""
 
@@ -714,6 +808,11 @@ class TPSLValidator:
 
         if plan.min_required_net_profit_usdt > 0 and plan.estimated_tp1_net_usdt < plan.min_required_net_profit_usdt:
             warnings.append("TP1_NET_PROFIT_BELOW_MIN_AFTER_FEES")
+            return False, warnings
+
+        if safe_float(getattr(plan, "tradability_score", 50.0), 50.0) < 25.0:
+            warnings.append("TP_SL_TRADABILITY_SCORE_TOO_LOW")
+            return False, warnings
 
         return True, warnings
 
@@ -816,6 +915,27 @@ class TPSLEngine:
         )
         reasons.extend(r)
 
+        # Recalculate fee/net/profit quality after all clamps/SR adjustments.
+        # This keeps plan metadata consistent with the final TP1 percent.
+        notional_usdt = _notional_usdt()
+        est_fee = _estimated_fee_usdt(notional_usdt)
+        min_net = _min_net_profit_usdt()
+        est_gross = _gross_profit_usdt(notional_usdt, tp1_percent)
+        tradability_score, est_loss, estimated_rr_net, r, w = _profit_quality_score(
+            tp1_percent=tp1_percent,
+            sl_percent=sl_percent,
+            notional=notional_usdt,
+            gross=est_gross,
+            fee=est_fee,
+            min_net=min_net,
+            atr_percent=atr_percent,
+            candidate=candidate,
+            prediction=prediction,
+            learning=learning,
+        )
+        reasons.extend(r)
+        warnings.extend(w)
+
         mode, r = self.tp_mode.decide(
             decision=decision,
             movement=movement,
@@ -862,6 +982,9 @@ class TPSLEngine:
             estimated_tp1_fee_usdt=safe_float(locals().get("est_fee", 0.0)),
             estimated_tp1_net_usdt=safe_float(locals().get("est_gross", 0.0)) - safe_float(locals().get("est_fee", 0.0)),
             min_required_net_profit_usdt=safe_float(locals().get("min_net", 0.0)),
+            estimated_sl_loss_usdt=safe_float(locals().get("est_loss", 0.0)),
+            estimated_rr_net=safe_float(locals().get("estimated_rr_net", 0.0)),
+            tradability_score=safe_float(locals().get("tradability_score", 50.0), 50.0),
             reason_codes=tuple(dict.fromkeys(reasons)),
             warnings=tuple(warnings),
             valid=True,
@@ -924,6 +1047,8 @@ def apply_tp_sl_to_decision(decision: AIDecision, plan: TPSLPlan) -> AIDecision:
             "meta": {
                 **dict(decision.meta),
                 "tp_sl_plan": plan.to_dict(),
+                "tradability_score": getattr(plan, "tradability_score", 50.0),
+                "estimated_tp1_net_usdt": getattr(plan, "estimated_tp1_net_usdt", 0.0),
             },
         }
     )
