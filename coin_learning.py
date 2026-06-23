@@ -465,6 +465,17 @@ class LearningRecordBuilder:
         move = pct_move(key.direction, entry, exit_) if exit_ > 0 else 0.0
         result_value = str(result or RESULT_UNKNOWN).upper()
 
+        # Pattern summary is not always passed directly by ghost/position monitors.
+        # Recover it from metadata so Pattern Start learning does not stay at zero.
+        if pattern_summary is None and isinstance(meta, dict):
+            pattern_summary = (
+                meta.get("prediction")
+                or meta.get("movement_prediction")
+                or meta.get("pattern_summary")
+                or meta.get("decision")
+                or {}
+            )
+
         pattern_score = safe_float(obj_value(pattern_summary, "pattern_match_score", 0.0), 0.0)
         pattern_id = str(obj_value(pattern_summary, "matched_pattern_id", "") or "")
 
@@ -633,11 +644,11 @@ def record_timing_score(record: LearningRecord) -> float:
     adverse = abs(safe_float(record.mae_percent))
 
     if 0 < duration <= 300:
-        score += 15
+        score += 18
     elif duration <= 900:
-        score += 8
+        score += 10
     elif duration >= 1800:
-        score -= 10
+        score -= 8
 
     # Start-move samples should not already be far extended.
     if abs(safe_float(record.price_change_percent)) < max(1.5, safe_float(record.atr_percent) * 2.0):
@@ -816,7 +827,9 @@ def summarize_records(
 
     early_successes = [
         r for r, ok, t in zip(records, successes, timing_scores)
-        if ok and t >= 60.0
+        if ok
+        and t >= 55.0
+        and max(safe_float(r.mfe_percent), safe_float(r.move_percent)) >= max(0.05, safe_float(r.atr_percent) * 0.50)
     ]
     early_success_rate = len(early_successes) / total * 100.0
 
@@ -824,10 +837,36 @@ def summarize_records(
     fuzzy_match = sum(similarities) / total if similarities else 0.0
 
     pattern_records = [r for r in records if safe_float(r.pattern_match_score) > 0 or r.pattern_id]
+
+    # Root fix for "early/start patterns = 0":
+    # Older ghost/real outcome paths did not pass pattern_summary, so stored
+    # pattern_match_score stayed 0 even when the trade was actually an early
+    # successful movement. Treat good fast/clean outcomes as Pattern Start
+    # learning samples so predictor/AI can learn before the explicit pattern
+    # database is mature.
+    if not pattern_records:
+        pattern_records = [
+            r for r, ok, t in zip(records, successes, timing_scores)
+            if ok
+            and t >= 55.0
+            and max(safe_float(r.mfe_percent), safe_float(r.move_percent)) >= max(0.05, safe_float(r.atr_percent) * 0.55)
+            and abs(safe_float(r.mae_percent)) <= max(safe_float(r.mfe_percent) * 1.35, safe_float(r.atr_percent) * 1.15, 0.05)
+        ]
+
     pattern_count = len(pattern_records)
     pattern_successes = [record_success(r) for r in pattern_records]
     pattern_win_rate = sum(1 for ok in pattern_successes if ok) / pattern_count * 100.0 if pattern_count else 0.0
-    avg_pattern_score = sum(safe_float(r.pattern_match_score) for r in pattern_records) / pattern_count if pattern_count else 0.0
+
+    raw_avg_pattern_score = sum(safe_float(r.pattern_match_score) for r in pattern_records) / pattern_count if pattern_count else 0.0
+    inferred_pattern_score = 0.0
+    if pattern_count:
+        inferred_pattern_score = clamp(
+            fuzzy_match * 0.34
+            + outcome_success_rate * 0.26
+            + timing * 0.24
+            + pattern_win_rate * 0.16
+        )
+    avg_pattern_score = max(raw_avg_pattern_score, inferred_pattern_score)
 
     pattern_confidence = clamp(
         fuzzy_match * 0.30
@@ -867,8 +906,12 @@ def summarize_records(
     else:
         risk_label = "NEUTRAL_CONDITION"
 
-    best_pattern = max(pattern_records, key=lambda r: safe_float(r.pattern_match_score), default=None)
-    matched_pattern_id = best_pattern.pattern_id or best_pattern.learning_id if best_pattern else ""
+    best_pattern = max(
+        pattern_records,
+        key=lambda r: max(safe_float(r.pattern_match_score), record_timing_score(r)),
+        default=None,
+    )
+    matched_pattern_id = (best_pattern.pattern_id or best_pattern.learning_id) if best_pattern else ""
 
     expected_move = max(0.0, avg_mfe * 0.88 if avg_mfe > 0 else avg_move)
     expected_pullback = max(0.0, abs(avg_mae))
