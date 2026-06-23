@@ -83,10 +83,37 @@ def clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
 
 def normalize_direction(direction: str) -> str:
     d = str(direction or "").upper().strip()
-    if d in {"LONG", "BUY"}:
+    if d in {"LONG", "BUY", "BULL", "BULLISH", "UP"}:
         return DIRECTION_LONG
-    if d in {"SHORT", "SELL"}:
+    if d in {"SHORT", "SELL", "BEAR", "BEARISH", "DOWN"}:
         return DIRECTION_SHORT
+    return DIRECTION_NEUTRAL
+
+
+def infer_decision_direction(candidate: AnalysisCandidate, prediction: Optional[Any] = None) -> str:
+    """Prefer the live candidate direction, but allow the Pattern Start layer to provide it.
+
+    After a full learning reset the live sensor package can be cautious and leave
+    direction_hint as NEUTRAL while the movement predictor already sees a LONG/SHORT
+    start pattern. For Level 1 this must still become GHOST for learning instead
+    of being rejected as NO_DIRECTION.
+    """
+    direction = normalize_direction(getattr(candidate, "direction_hint", None))
+    if direction != DIRECTION_NEUTRAL:
+        return direction
+
+    for key in (
+        "direction",
+        "predicted_direction",
+        "movement_direction",
+        "signal_direction",
+        "side",
+        "bias",
+    ):
+        direction = normalize_direction(obj_value(prediction, key, None))
+        if direction != DIRECTION_NEUTRAL:
+            return direction
+
     return DIRECTION_NEUTRAL
 
 
@@ -412,7 +439,7 @@ class AIScoreComposer:
         reasons: List[str] = []
         warnings: List[str] = []
 
-        direction = normalize_direction(candidate.direction_hint)
+        direction = infer_decision_direction(candidate, prediction)
         sensor_score, r = self.sensor_birth_score(candidate, direction)
         reasons.extend(r)
 
@@ -521,7 +548,7 @@ class DecisionTypeClassifier:
             rejects.append("INVALID_CANDIDATE")
         if safe_float(getattr(candidate.sensor_snapshot, "price", 0.0), 0.0) <= 0:
             rejects.append("INVALID_PRICE")
-        direction = normalize_direction(candidate.direction_hint)
+        direction = infer_decision_direction(candidate, prediction)
         if direction == DIRECTION_NEUTRAL:
             rejects.append("NO_DIRECTION")
         if rejects:
@@ -555,7 +582,10 @@ class DecisionTypeClassifier:
         if phase in {PHASE_LATE, PHASE_RANGE} and not (early_rate >= 45 and score.sensor_score >= 50):
             must_ghost = True
             reasons.append(f"{phase}_GHOST")
-        if learning_hint == "LOW_DATA" and not (learning_samples >= 3 and live_enough and score.tradability_score >= 45):
+        # Fresh Level 1 reset rule:
+        # LOW_DATA must be used for GHOST learning, not as a dry rejection state.
+        # REAL still stays blocked by must_ghost until enough samples exist.
+        if learning_hint == "LOW_DATA" or learning_samples < 3:
             must_ghost = True
             reasons.append("LOW_DATA_GHOST")
 
@@ -603,12 +633,13 @@ class DecisionTypeClassifier:
             return DECISION_REAL, tuple(dict.fromkeys(reasons)), tuple(dict.fromkeys(warnings)), ()
 
         ghost_allowed = (
-            score.final_score >= min_ghost
-            or movement_probability >= 18
-            or score.sensor_score >= 18
-            or score.prediction_score >= 18
+            must_ghost
+            or score.final_score >= min_ghost
+            or movement_probability >= 12
+            or score.sensor_score >= 12
+            or score.prediction_score >= 12
             or pattern_count > 0
-            or learning_samples >= 0
+            or learning_samples < 3
         )
         if ghost_allowed:
             reasons.append("AI_DECISION_GHOST_FOR_LEARNING")
@@ -644,7 +675,7 @@ class AIDecisionEngine:
             score=score,
         )
 
-        direction = normalize_direction(candidate.direction_hint)
+        direction = infer_decision_direction(candidate, prediction)
         entry = safe_float(getattr(candidate.sensor_snapshot, "price", 0.0), 0.0)
 
         confidence_score = clamp(
