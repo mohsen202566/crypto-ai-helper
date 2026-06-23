@@ -191,6 +191,21 @@ def safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def safe_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    s = str(value).strip().lower()
+    if s in {"1", "true", "yes", "on", "فعال", "روشن"}:
+        return True
+    if s in {"0", "false", "no", "off", "خاموش", "غیرفعال", "غيرفعال"}:
+        return False
+    return default
+
+
 def normalize_symbol_safe(symbol: str) -> str:
     raw = str(symbol or "").upper().strip().replace("/", "").replace("-", "").replace("_", "")
     if not raw:
@@ -272,8 +287,17 @@ def is_direct_asset_query(text: str) -> bool:
 
 def get_runtime_settings() -> Dict[str, Any]:
     section = store().section("runtime_settings")
+
+    default_real_enabled = bool(getattr(SETTINGS.trading, "enabled", False))
+    if "real_trading_enabled" not in section and "trade_enabled" in section:
+        default_real_enabled = safe_bool(section.get("trade_enabled"), default_real_enabled)
+    elif "real_trading_enabled" in section:
+        default_real_enabled = safe_bool(section.get("real_trading_enabled"), default_real_enabled)
+
     defaults = {
-        "real_trading_enabled": bool(getattr(SETTINGS.trading, "enabled", False)),
+        # Keep both names forever so old code/data and new code always agree.
+        "real_trading_enabled": default_real_enabled,
+        "trade_enabled": default_real_enabled,
         "auto_signal_enabled": bool(os.getenv("AUTO_SIGNAL_ENABLED", "true").lower() in {"1", "true", "yes", "on"}),
         "scan_interval_seconds": safe_int(getattr(SETTINGS.monitor, "scan_interval_seconds", 20), 20),
         "ghost_monitor_interval_seconds": safe_int(getattr(SETTINGS.monitor, "ghost_monitor_interval_seconds", 3), 3),
@@ -286,17 +310,46 @@ def get_runtime_settings() -> Dict[str, Any]:
         "last_scan_ts": 0,
         "level1_symbols": list(LEVEL1_SYMBOLS),
     }
+
     changed = False
     for key, value in defaults.items():
         if key not in section:
             section[key] = value
             changed = True
+
+    # Root fix: real_trading_enabled and legacy trade_enabled must never diverge.
+    real_enabled = safe_bool(section.get("real_trading_enabled"), default_real_enabled)
+    legacy_enabled = safe_bool(section.get("trade_enabled"), real_enabled)
+    if real_enabled != legacy_enabled:
+        # Prefer explicit new key when present; otherwise use legacy.
+        unified = real_enabled if "real_trading_enabled" in section else legacy_enabled
+        section["real_trading_enabled"] = unified
+        section["trade_enabled"] = unified
+        changed = True
+
     if changed:
         save_runtime_settings(section)
     return section
 
-
 def save_runtime_settings(values: Dict[str, Any]) -> None:
+    values = dict(values or {})
+
+    # Single source of truth with backward compatibility:
+    # "real_trading_enabled" is the new canonical key, "trade_enabled" is legacy.
+    if "real_trading_enabled" in values:
+        unified = safe_bool(values.get("real_trading_enabled"), False)
+        values["real_trading_enabled"] = unified
+        values["trade_enabled"] = unified
+    elif "trade_enabled" in values:
+        unified = safe_bool(values.get("trade_enabled"), False)
+        values["real_trading_enabled"] = unified
+        values["trade_enabled"] = unified
+
+    if "margin_usdt" in values and "trade_margin_usdt" not in values:
+        values["trade_margin_usdt"] = safe_float(values.get("margin_usdt"), 0.0)
+    elif "trade_margin_usdt" in values and "margin_usdt" not in values:
+        values["margin_usdt"] = safe_float(values.get("trade_margin_usdt"), 0.0)
+
     def mutate(section: Dict[str, Any]) -> Dict[str, Any]:
         section.update(values)
         section["updated_at"] = now_ts()
@@ -310,10 +363,15 @@ def save_runtime_settings(values: Dict[str, Any]) -> None:
         section["updated_at"] = now_ts()
         store().save()
 
-
 def real_trading_enabled() -> bool:
-    return bool(get_runtime_settings().get("real_trading_enabled", False))
-
+    settings = get_runtime_settings()
+    real_value = safe_bool(settings.get("real_trading_enabled"), False)
+    legacy_value = safe_bool(settings.get("trade_enabled"), real_value)
+    if real_value != legacy_value:
+        # Auto-heal any old/corrupted runtime data immediately.
+        real_value = bool(real_value)
+        save_runtime_settings({"real_trading_enabled": real_value})
+    return bool(real_value)
 
 def auto_signal_enabled() -> bool:
     return bool(get_runtime_settings().get("auto_signal_enabled", True))
@@ -908,15 +966,27 @@ async def handle_trade_toggle(update: Update, text: str) -> bool:
         return True
 
     if "ترید فعال" in compact or "ترید روشن" in compact or "trade on" in compact:
-        settings_update.update({"real_trading_enabled": True})
+        settings_update.update({"real_trading_enabled": True, "trade_enabled": True})
         save_runtime_settings(settings_update)
-        await send_text(update, "✅ ترید واقعی فعال شد. این تغییر واقعی و ذخیره شد.")
+        verified = real_trading_enabled()
+        await send_text(
+            update,
+            "✅ ترید واقعی فعال شد و در تنظیمات ذخیره شد."
+            if verified
+            else "⚠️ درخواست فعال‌سازی ثبت شد اما تایید ذخیره‌سازی ناموفق بود؛ لاگ را چک کن."
+        )
         return True
 
     if "ترید خاموش" in compact or "ترید غیرفعال" in compact or "trade off" in compact:
-        settings_update.update({"real_trading_enabled": False})
+        settings_update.update({"real_trading_enabled": False, "trade_enabled": False})
         save_runtime_settings(settings_update)
-        await send_text(update, "❌ ترید واقعی خاموش شد. از این به بعد سیگنال REAL به GHOST تبدیل می‌شود.")
+        verified = not real_trading_enabled()
+        await send_text(
+            update,
+            "❌ ترید واقعی خاموش شد و در تنظیمات ذخیره شد. از این به بعد سیگنال REAL به GHOST تبدیل می‌شود."
+            if verified
+            else "⚠️ درخواست خاموش‌سازی ثبت شد اما تایید ذخیره‌سازی ناموفق بود؛ لاگ را چک کن."
+        )
         return True
 
     if "قفل ضرر خاموش" in compact:
@@ -1135,7 +1205,14 @@ async def auto_scan_loop(app: Any) -> None:
                 continue
 
             symbols = level1_scan_symbols()
-            LOGGER.info("auto_scan_cycle symbols=%s interval=%ss real=%s", ",".join(symbols), interval, real_trading_enabled())
+            current_settings = get_runtime_settings()
+            LOGGER.info(
+                "auto_scan_cycle symbols=%s interval=%ss real=%s trade_enabled=%s",
+                ",".join(symbols),
+                interval,
+                real_trading_enabled(),
+                safe_bool(current_settings.get("trade_enabled"), False),
+            )
 
             for symbol in symbols:
                 try:
