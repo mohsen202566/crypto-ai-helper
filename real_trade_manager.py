@@ -497,6 +497,22 @@ class RealTradePreflightBuilder:
         except Exception as exc:
             return self._invalid(decision, plan, f"SAFETY_GUARD_FAILED:{exc}")
 
+        # Final TP/SL plan safety from tp_sl_engine.py.
+        # The AI may choose REAL, but a REAL order must not be sent if the
+        # smart TP/SL engine marked the plan invalid or if TP1 cannot cover
+        # estimated round-trip fees plus the minimum desired net profit.
+        if hasattr(plan, "valid") and not bool(getattr(plan, "valid", True)):
+            return self._invalid(decision, plan, "TP_SL_PLAN_INVALID")
+
+        min_net = safe_float(getattr(plan, "min_required_net_profit_usdt", 0.0), 0.0)
+        est_net = safe_float(getattr(plan, "estimated_tp1_net_usdt", 0.0), 0.0)
+        if min_net > 0 and est_net < min_net:
+            return self._invalid(
+                decision,
+                plan,
+                f"TP1_NET_PROFIT_BELOW_MIN_AFTER_FEES:net={est_net:.4f}:min={min_net:.4f}",
+            )
+
         if settings.margin_usdt <= 0:
             return self._invalid(decision, plan, "INVALID_MARGIN_USDT")
 
