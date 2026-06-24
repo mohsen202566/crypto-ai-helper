@@ -21,7 +21,7 @@ from constants import (
     STATUS_FAILED, STATUS_OK, STATUS_RECOVERED, SYSTEM_VERSION, TRADE_CONFIG,
 )
 from models import AIDecision, TPSLPlan, TradeCloseResult, TradeOpenResult, TradePosition, RecordResult
-from position_manager import add_position, count_open_real_positions, get_position, has_open_position, mark_real_confirmed, mark_real_failed
+from position_manager import add_position, count_open_real_positions, get_open_positions, get_position, has_open_position, mark_real_confirmed, mark_real_failed
 from strategy_manager import get_trade_runtime_config, is_real_trading_enabled
 from tobit_client import MARGIN_ISOLATED, ToobitClient, get_client
 from utils import fee_estimate, make_position_id, normalize_direction, normalize_symbol, notional_value, profit_usdt, safe_float, safe_int, safe_str, utc_now_iso
@@ -207,6 +207,106 @@ def emergency_disable_real_trading(reason: str = "emergency_stop") -> RecordResu
     return RecordResult(status=res.status, recorded=res.recorded, message=reason, metadata={"source": "real_trade_manager"})
 
 
+
+
+def _exchange_position_to_status(row: Mapping[str, Any], *, client: Optional[ToobitClient] = None) -> dict[str, Any]:
+    """Normalize a Toobit position row for status display only."""
+    c = client or get_client()
+    symbol_raw = row.get("symbol") or row.get("contractCode") or row.get("instrumentId") or row.get("instId") or ""
+    symbol = c.normalize_bot_symbol(symbol_raw) if hasattr(c, "normalize_bot_symbol") else normalize_symbol(symbol_raw)
+    direction = c._position_direction(row) if hasattr(c, "_position_direction") else normalize_direction(row.get("direction") or row.get("side"))
+    qty = c._position_qty(row) if hasattr(c, "_position_qty") else abs(safe_float(row.get("qty") or row.get("volume") or row.get("positionAmt"), 0.0) or 0.0)
+    entry = safe_float(row.get("entryPrice") or row.get("avgPrice") or row.get("price"), 0.0) or 0.0
+    mark = safe_float(row.get("markPrice") or row.get("lastPrice") or row.get("currentPrice") or entry, entry) or entry
+    pnl = safe_float(row.get("unRealizedProfit") or row.get("unrealizedPnl") or row.get("pnl") or row.get("profit"), 0.0) or 0.0
+    leverage = safe_int(row.get("leverage") or row.get("lever"), 0) or 0
+    return {
+        "symbol": symbol,
+        "exchange_symbol": safe_str(symbol_raw),
+        "direction": direction,
+        "quantity": qty,
+        "entry": entry,
+        "mark": mark,
+        "pnl_usdt": pnl,
+        "leverage": leverage,
+        "raw": dict(row),
+    }
+
+
+def get_real_trade_status(*, client: Optional[ToobitClient] = None, include_exchange: bool = True) -> dict[str, Any]:
+    """
+    Build a full REAL trade/Toobit status snapshot for Telegram.
+
+    This is the only layer allowed to touch Toobit for trade-status data.
+    bot.py and telegram_ui.py must consume the returned payload only.
+    """
+    runtime = get_runtime()
+    local_positions = get_open_positions()
+    real_positions = [p for p in local_positions if safe_str(p.mode).upper() == MODE_REAL]
+    ghost_positions = [p for p in local_positions if safe_str(p.mode).upper() != MODE_REAL]
+
+    status: dict[str, Any] = {
+        "system_version": SYSTEM_VERSION,
+        "real_trade_manager_version": REAL_TRADE_MANAGER_VERSION,
+        "status": STATUS_OK,
+        "checked_at": utc_now_iso(),
+        "real_trading_enabled": is_real_trading_enabled(),
+        "runtime": runtime,
+        "margin_usdt": safe_float(runtime.get("margin_usdt"), 0.0) or 0.0,
+        "leverage": safe_int(runtime.get("leverage"), 1) or 1,
+        "margin_mode": safe_str(runtime.get("margin_mode"), MARGIN_ISOLATED).upper(),
+        "max_concurrent_real_positions": safe_int(runtime.get("max_concurrent_real_positions"), 0) or 0,
+        "max_concurrent_total_positions": safe_int(runtime.get("max_concurrent_total_positions"), 0) or 0,
+        "local_open_total": len(local_positions),
+        "local_real_open": len(real_positions),
+        "local_ghost_open": len(ghost_positions),
+        "local_positions": [p.__dict__ for p in local_positions],
+        "toobit_connected": False,
+        "balance": {"status": STATUS_FAILED, "asset": "USDT", "balance": 0.0, "available": 0.0, "error": "not_checked"},
+        "toobit_open_positions": [],
+        "toobit_open_total": 0,
+        "toobit_pnl_usdt": 0.0,
+        "errors": [],
+    }
+
+    if status["margin_mode"] != MARGIN_ISOLATED:
+        status["errors"].append("margin_mode_not_isolated")
+        status["status"] = STATUS_FAILED
+
+    if not include_exchange:
+        status["balance"]["error"] = "exchange_check_skipped"
+        return status
+
+    try:
+        c = client or get_client()
+        status["toobit_connected"] = bool(c.ping_private())
+    except Exception as exc:
+        status["errors"].append(f"toobit_ping_error:{exc}")
+        status["toobit_connected"] = False
+        c = client or get_client()
+
+    try:
+        balance = c.get_account_balance("USDT")
+        status["balance"] = dict(balance)
+    except Exception as exc:
+        status["errors"].append(f"balance_error:{exc}")
+        status["balance"] = {"status": STATUS_FAILED, "asset": "USDT", "balance": 0.0, "available": 0.0, "error": str(exc)}
+
+    try:
+        rows = c.get_open_positions()
+        exchange_positions = [_exchange_position_to_status(row, client=c) for row in rows]
+        status["toobit_open_positions"] = exchange_positions
+        status["toobit_open_total"] = len(exchange_positions)
+        status["toobit_pnl_usdt"] = sum(safe_float(p.get("pnl_usdt"), 0.0) or 0.0 for p in exchange_positions)
+    except Exception as exc:
+        status["errors"].append(f"positions_error:{exc}")
+
+    if status["errors"]:
+        # Keep status OK when only live exchange data failed but internal runtime is usable.
+        status["status"] = STATUS_OK
+    return status
+
+
 def validate_real_trade_manager_light() -> dict[str, Any]:
     errors: list[str] = []
     runtime = get_runtime()
@@ -219,5 +319,5 @@ __all__ = [
     "REAL_TRADE_MANAGER_VERSION", "get_runtime", "estimate_quantity", "estimate_tp1_net_profit",
     "preflight_real_trade", "build_pending_position", "open_real_trade", "confirm_real_open",
     "wait_for_real_open_confirmation", "close_real_position", "close_position_executor",
-    "emergency_disable_real_trading", "validate_real_trade_manager_light",
+    "emergency_disable_real_trading", "get_real_trade_status", "validate_real_trade_manager_light",
 ]
