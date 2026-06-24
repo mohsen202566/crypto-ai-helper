@@ -17,6 +17,7 @@ Architecture lock:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from pathlib import Path
@@ -883,11 +884,151 @@ async def telegram_error_handler(update: object, context: Any) -> None:
     logger.exception("Telegram error", exc_info=getattr(context, "error", None))
 
 
+
+# =============================================================================
+# Auto signal background loop
+# =============================================================================
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    load_env_file(".env")
+    value = safe_str(os.getenv(name))
+    if not value:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on", "enable", "enabled", "فعال", "روشن"}
+
+
+def _auto_signal_enabled() -> bool:
+    """Return whether background auto-scan/signal loop is allowed to run."""
+    if not _env_bool("AUTO_SIGNAL_ENABLED", default=False):
+        return False
+    try:
+        runtime = _get_trade_runtime()
+        if isinstance(runtime, Mapping):
+            if "auto_signal_enabled" in runtime:
+                return bool(runtime.get("auto_signal_enabled"))
+            if "auto_signal" in runtime:
+                return bool(runtime.get("auto_signal"))
+    except Exception:
+        logger.exception("auto signal runtime check failed")
+    return True
+
+
+def _auto_scan_interval_seconds() -> int:
+    load_env_file(".env")
+    raw = (
+        os.getenv("AUTO_SCAN_INTERVAL_SECONDS")
+        or os.getenv("AUTO_SIGNAL_INTERVAL_SECONDS")
+        or os.getenv("SCAN_INTERVAL_SECONDS")
+    )
+    value = safe_int(raw, 300) or 300
+    return max(60, value)
+
+
+def _owner_chat_id() -> Optional[int]:
+    load_env_file(".env")
+    direct = safe_int(os.getenv("OWNER_ID") or os.getenv("TELEGRAM_OWNER_ID"), None)
+    if direct:
+        return direct
+    try:
+        from users import get_owner_id
+        owner = safe_int(get_owner_id(0), None)
+        if owner:
+            return owner
+    except Exception:
+        logger.exception("owner id lookup failed")
+    return None
+
+
+async def _send_long_text_to_chat(application: Any, chat_id: int, text: str) -> None:
+    msg = safe_str(text) or "-"
+    max_len = 3900
+    for i in range(0, len(msg), max_len):
+        await application.bot.send_message(chat_id=chat_id, text=msg[i:i + max_len])
+
+
+async def auto_signal_loop(application: Any) -> None:
+    """
+    Background Level 4 auto scanner.
+
+    Manual "بررسی/اسکن" uses SCAN_MARKET through the Telegram handler.
+    This loop is the non-manual auto-signal path. It logs every pass so
+    journalctl grep can prove whether it is actually running.
+    """
+    interval = _auto_scan_interval_seconds()
+    logger.info("auto_signal_loop_started enabled=%s interval=%ss", _auto_signal_enabled(), interval)
+
+    # Let Telegram polling finish startup before first scan.
+    await asyncio.sleep(15)
+
+    while True:
+        try:
+            enabled = _auto_signal_enabled()
+            level4_active = bool(strategy_manager.is_level4_active())
+            logger.info("auto_signal_tick enabled=%s level4_active=%s", enabled, level4_active)
+
+            if enabled and level4_active:
+                chat_id = _owner_chat_id()
+                if not chat_id:
+                    logger.warning("auto_signal_skipped owner_chat_id_missing")
+                else:
+                    provider = application.bot_data.setdefault("market_provider", OKXMarketProvider())
+                    decisions = scan_market_with_provider(list(LEVEL_4_SYMBOLS), provider)
+                    mode_counts: dict[str, int] = {}
+                    for decision in decisions:
+                        mode_counts[decision.mode] = mode_counts.get(decision.mode, 0) + 1
+                    logger.info(
+                        "auto_signal_scan_result count=%s modes=%s symbols=%s",
+                        len(decisions),
+                        mode_counts,
+                        [d.symbol for d in decisions],
+                    )
+
+                    # Avoid spamming pure reject-only scans, but log them.
+                    sendable = [d for d in decisions if d.mode in {MODE_REAL, MODE_GHOST}]
+                    if sendable:
+                        rendered: list[str] = []
+                        executions: list[dict[str, Any]] = []
+                        for decision in sendable:
+                            execution = (
+                                maybe_execute_real_decision(decision)
+                                if decision.mode == MODE_REAL
+                                else {"executed": False, "status": STATUS_OK}
+                            )
+                            executions.append(execution)
+                            rendered.append(render_ai_decision(decision, compact=True) + render_real_execution_note(execution))
+
+                        text = "🤖 اتو سیگنال Level 4\n\n" + "\n\n".join(rendered)
+                        await _send_long_text_to_chat(application, chat_id, text)
+                        logger.info("auto_signal_sent count=%s executions=%s", len(sendable), executions)
+                    else:
+                        logger.info("auto_signal_no_sendable_signal count=%s", len(decisions))
+            else:
+                logger.info("auto_signal_idle enabled=%s level4_active=%s", enabled, level4_active)
+
+        except asyncio.CancelledError:
+            logger.info("auto_signal_loop_cancelled")
+            raise
+        except Exception as exc:
+            logger.exception("auto_signal_loop_error:%s", exc)
+
+        await asyncio.sleep(interval)
+
+
+async def telegram_post_init(application: Any) -> None:
+    """Start background tasks after Telegram Application initialization."""
+    application.bot_data["market_provider"] = application.bot_data.get("market_provider") or OKXMarketProvider()
+    if _auto_signal_enabled():
+        application.create_task(auto_signal_loop(application), name="level4_auto_signal_loop")
+        logger.info("auto_signal_task_created")
+    else:
+        logger.info("auto_signal_task_not_created disabled")
+
+
 def build_application(token: str) -> Any:
     # Lazy import keeps integration_check/import usable even where telegram package is absent.
     from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
 
-    application = ApplicationBuilder().token(token).build()
+    application = ApplicationBuilder().token(token).post_init(telegram_post_init).build()
     application.add_handler(CommandHandler(["start", "help"], telegram_start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, telegram_message_handler))
     application.add_error_handler(telegram_error_handler)
@@ -933,6 +1074,8 @@ __all__ = [
     "load_env_file",
     "get_bot_token",
     "is_user_allowed",
+    "auto_signal_loop",
+    "telegram_post_init",
     "build_application",
     "main",
 ]
