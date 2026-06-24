@@ -318,6 +318,8 @@ def render_trade_runtime(runtime: Optional[Mapping[str, Any]] = None) -> str:
             *margin_range_lines,
             f"لوریج: {safe_int(leverage, 1)}x",
             f"حداکثر پوزیشن REAL: {safe_int(max_real, 0)}",
+            f"اسلات REAL استفاده‌شده: {safe_int(data.get('effective_real_open', data.get('toobit_open_total', data.get('local_real_open', 0))), 0)} / {safe_int(max_real, 0)}",
+            f"اسلات REAL آزاد: {safe_int(data.get('available_real_slots'), 0)}" + (" ⚠️ بالاتر از سقف" if bool(data.get('real_slots_over_limit')) else ""),
             f"حداکثر کل پوزیشن: {safe_int(max_total, 0)}",
             f"Margin Mode: {safe_str(data.get('margin_mode', rt.get('margin_mode', 'ISOLATED'))).upper()}",
             "",
