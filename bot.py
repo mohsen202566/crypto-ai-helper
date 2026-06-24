@@ -1702,18 +1702,19 @@ async def auto_signal_loop(application: Any) -> None:
                                 or silent_reason
                             ).lower()
 
+                            # Hide GHOST only when REAL intentionally cannot be taken:
+                            # trade OFF or REAL slots full. Do NOT hide preflight/open/
+                            # Toobit/quantity failures while trade is ON and a slot is
+                            # available; those must stay visible so it doesn't look like
+                            # the bot stopped sending signals.
                             silent_converted_ghost = (
                                 safe_str(decision.mode).upper() == MODE_GHOST
+                                and silent_before_execution
                                 and (
-                                    silent_before_execution
-                                    or converted_to_ghost
-                                    or "trade" in block_reason
+                                    "trade_off" in block_reason
+                                    or "real_slots_full" in block_reason
+                                    or "slots_full" in block_reason
                                     or "slot" in block_reason
-                                    or "max" in block_reason
-                                    or "preflight" in block_reason
-                                    or "duplicate" in block_reason
-                                    or "open" in block_reason
-                                    or "toobit" in block_reason
                                 )
                             )
 
@@ -1728,8 +1729,10 @@ async def auto_signal_loop(application: Any) -> None:
                                 )
                                 continue
 
-                            # Do not send original/pure GHOST auto messages. Auto Telegram signals are for REAL only.
-                            if safe_str(decision.mode).upper() != MODE_REAL:
+                            # Original/pure GHOST stays silent for auto mode. But if a
+                            # REAL was attempted and then converted to GHOST by preflight
+                            # or exchange failure, show it with a warning.
+                            if safe_str(decision.mode).upper() != MODE_REAL and not converted_to_ghost:
                                 silent_count += 1
                                 logger.info(
                                     "auto_signal_pure_ghost_silent symbol=%s direction=%s reason=%s lifecycle=%s",
@@ -1740,7 +1743,14 @@ async def auto_signal_loop(application: Any) -> None:
                                 )
                                 continue
 
-                            text = "🤖 اتو سیگنال Level 4\n\n" + render_ai_decision(decision, compact=True) + render_real_execution_note(execution)
+                            warning_note = ""
+                            if converted_to_ghost and not silent_before_execution:
+                                warning_note = (
+                                    "\n\n⚠️ سیگنال REAL تلاش شد ولی اجرا نشد و برای یادگیری GHOST ثبت شد."
+                                    "\nReason: " + safe_str(block_reason or execution.get("reason") or "-")
+                                )
+
+                            text = "🤖 اتو سیگنال Level 4\n\n" + render_ai_decision(decision, compact=True) + render_real_execution_note(execution) + warning_note
                             sent_messages = await _send_long_text_to_chat(application, chat_id, text)
                             sent_count += 1
                             if sent_messages and lifecycle.get("position_id"):
