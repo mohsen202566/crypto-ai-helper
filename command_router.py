@@ -116,6 +116,38 @@ def parse_symbol(text: str) -> str:
 def parse_runtime_update(text: str) -> Optional[CommandRoute]:
     normalized = normalize_text(text).lower()
 
+    # Position-count commands must be parsed before the short "حداکثر" margin command.
+    if any(x in normalized for x in [
+        "حداکثر پوزیشن", "max position", "max_positions", "مکس پوزیشن",
+        "حداکثر معامله", "max trades", "max positions",
+    ]):
+        value = first_number(normalized)
+        if value is not None and value > 0:
+            return route("SET_MAX_POSITIONS", text=text, args={"max_positions": value})
+
+    # AI dynamic margin range:
+    # User-facing simple commands:
+    #   حداقل 5
+    #   حداکثر 15
+    # Also accepts explicit forms such as:
+    #   ترید دلار حداقل 5
+    #   ترید دلار حداکثر 15
+    if any(x in normalized for x in [
+        "حداقل", "مینیمم", "کمترین",
+        "min margin", "minimum margin", "min trade", "minimum trade",
+    ]):
+        value = first_float(normalized)
+        if value is not None:
+            return route("SET_MIN_MARGIN", text=text, args={"min_margin_usdt": value})
+
+    if any(x in normalized for x in [
+        "حداکثر", "ماکزیمم", "بیشترین",
+        "max margin", "maximum margin", "max trade", "maximum trade",
+    ]):
+        value = first_float(normalized)
+        if value is not None:
+            return route("SET_MAX_MARGIN", text=text, args={"max_margin_usdt": value})
+
     if any(x in normalized for x in [
         "مارجین", "margin", "مبلغ",
         "ترید دلار", "دلار ترید", "حجم ترید", "trade dollar", "trade dollars",
@@ -129,14 +161,6 @@ def parse_runtime_update(text: str) -> Optional[CommandRoute]:
         value = first_number(normalized)
         if value is not None and value > 0:
             return route("SET_LEVERAGE", text=text, args={"leverage": value})
-
-    if any(x in normalized for x in [
-        "حداکثر پوزیشن", "max position", "max_positions", "مکس پوزیشن",
-        "حداکثر معامله", "حداکثر ترید", "max trades", "max positions",
-    ]):
-        value = first_number(normalized)
-        if value is not None and value > 0:
-            return route("SET_MAX_POSITIONS", text=text, args={"max_positions": value})
 
     if normalized in {"ریست ترید", "ریست تنظیمات ترید", "reset trade", "reset settings"}:
         return route("RESET_TRADE_SETTINGS", text=text)
