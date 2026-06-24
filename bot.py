@@ -240,6 +240,36 @@ def _update_runtime(**kwargs: Any) -> bool:
             state["margin_usdt"] = safe_float(kwargs["margin_usdt"], state.get("margin_usdt"))
             return bool(strategy_manager.save_strategy_state(state))
 
+        if "min_margin_usdt" in kwargs:
+            fn = getattr(strategy_manager, "set_min_margin_usdt", None)
+            if callable(fn):
+                return _result_ok(fn(kwargs["min_margin_usdt"]))
+            state = strategy_manager.load_strategy_state()
+            value = safe_float(kwargs["min_margin_usdt"], None)
+            if value is None:
+                return False
+            current_max = safe_float(state.get("max_margin_usdt", state.get("margin_usdt", value)), value) or value
+            if value < 1 or value > 1000 or value > current_max:
+                return False
+            state["min_margin_usdt"] = value
+            state["margin_usdt"] = max(value, min(current_max, safe_float(state.get("margin_usdt", value), value) or value))
+            return bool(strategy_manager.save_strategy_state(state))
+
+        if "max_margin_usdt" in kwargs:
+            fn = getattr(strategy_manager, "set_max_margin_usdt", None)
+            if callable(fn):
+                return _result_ok(fn(kwargs["max_margin_usdt"]))
+            state = strategy_manager.load_strategy_state()
+            value = safe_float(kwargs["max_margin_usdt"], None)
+            if value is None:
+                return False
+            current_min = safe_float(state.get("min_margin_usdt", state.get("margin_usdt", value)), value) or value
+            if value < 1 or value > 1000 or value < current_min:
+                return False
+            state["max_margin_usdt"] = value
+            state["margin_usdt"] = max(current_min, min(value, safe_float(state.get("margin_usdt", current_min), current_min) or current_min))
+            return bool(strategy_manager.save_strategy_state(state))
+
         if "leverage" in kwargs:
             fn = getattr(strategy_manager, "set_leverage", None)
             if callable(fn):
@@ -770,10 +800,40 @@ def execute_route(
 
         if action == "SET_MARGIN":
             value = safe_float(args.get("margin_usdt"), None)
-            if value is None or value <= 0:
-                return make_bot_response(text=render_error("مارجین نامعتبر است."), status=STATUS_FAILED, action=action)
+            if value is None or value < 1 or value > 1000:
+                return make_bot_response(text=render_error("مارجین نامعتبر است. عدد باید بین 1 تا 1000 دلار باشد."), status=STATUS_FAILED, action=action)
             ok = _update_runtime(margin_usdt=value)
-            return make_bot_response(text=render_ok(f"مارجین روی {value}$ تنظیم شد.") if ok else render_error("ثبت مارجین انجام نشد."), status=STATUS_OK if ok else STATUS_FAILED, action=action)
+            return make_bot_response(text=render_ok(f"مارجین ثابت روی {value}$ تنظیم شد.") if ok else render_error("ثبت مارجین انجام نشد."), status=STATUS_OK if ok else STATUS_FAILED, action=action)
+
+        if action == "SET_MIN_MARGIN":
+            value = safe_float(args.get("min_margin_usdt"), None)
+            if value is None or value < 1 or value > 1000:
+                return make_bot_response(text=render_error("حداقل مارجین نامعتبر است. عدد باید بین 1 تا 1000 دلار باشد."), status=STATUS_FAILED, action=action)
+            ok = _update_runtime(min_margin_usdt=value)
+            runtime = _get_trade_runtime()
+            max_margin = safe_float(runtime.get("max_margin_usdt"), 0.0) or 0.0
+            if ok:
+                return make_bot_response(
+                    text=render_ok(f"حداقل مارجین ترید روی {value}$ تنظیم شد. بازه فعلی: {value}$ تا {max_margin}$"),
+                    action=action,
+                    data={"min_margin_usdt": value, "max_margin_usdt": max_margin},
+                )
+            return make_bot_response(text=render_error("ثبت حداقل مارجین انجام نشد. حداقل باید بین 1 تا 1000 باشد و از حداکثر بیشتر نباشد."), status=STATUS_FAILED, action=action)
+
+        if action == "SET_MAX_MARGIN":
+            value = safe_float(args.get("max_margin_usdt"), None)
+            if value is None or value < 1 or value > 1000:
+                return make_bot_response(text=render_error("حداکثر مارجین نامعتبر است. عدد باید بین 1 تا 1000 دلار باشد."), status=STATUS_FAILED, action=action)
+            ok = _update_runtime(max_margin_usdt=value)
+            runtime = _get_trade_runtime()
+            min_margin = safe_float(runtime.get("min_margin_usdt"), 0.0) or 0.0
+            if ok:
+                return make_bot_response(
+                    text=render_ok(f"حداکثر مارجین ترید روی {value}$ تنظیم شد. بازه فعلی: {min_margin}$ تا {value}$"),
+                    action=action,
+                    data={"min_margin_usdt": min_margin, "max_margin_usdt": value},
+                )
+            return make_bot_response(text=render_error("ثبت حداکثر مارجین انجام نشد. حداکثر باید بین 1 تا 1000 باشد و از حداقل کمتر نباشد."), status=STATUS_FAILED, action=action)
 
         if action == "SET_LEVERAGE":
             value = safe_int(args.get("leverage"), None)
@@ -794,8 +854,33 @@ def execute_route(
 
         if action == "SHOW_TRADE_SETTINGS":
             status_payload = get_real_trade_status(include_exchange=auto_execute_real)
+            runtime = _get_trade_runtime()
+            for key in (
+                "margin_usdt",
+                "min_margin_usdt",
+                "max_margin_usdt",
+                "dynamic_position_sizing_enabled",
+                "position_sizing_mode",
+                "leverage",
+            ):
+                if key in runtime:
+                    status_payload[key] = runtime.get(key)
             status_payload["watchlist"] = list(LEVEL_4_SYMBOLS)
-            return make_bot_response(text=render_trade_runtime(status_payload), action=action, data={"trade_status": status_payload})
+            rendered = render_trade_runtime(status_payload)
+            # Backward-compatible safety: older telegram_ui.py may not yet render
+            # the new min/max margin fields, so bot.py appends them here.
+            min_margin = safe_float(status_payload.get("min_margin_usdt"), None)
+            max_margin = safe_float(status_payload.get("max_margin_usdt"), None)
+            sizing_mode = safe_str(status_payload.get("position_sizing_mode"))
+            if min_margin is not None and max_margin is not None and "حداقل مارجین" not in rendered and "مارجین حداقل" not in rendered:
+                mode_text = "AI_DYNAMIC" if bool(status_payload.get("dynamic_position_sizing_enabled")) else "FIXED"
+                if sizing_mode:
+                    mode_text = sizing_mode
+                rendered += "\n🎯 بازه مارجین AI"
+                rendered += f"\nحداقل مارجین: {min_margin:+.2f}$"
+                rendered += f"\nحداکثر مارجین: {max_margin:+.2f}$"
+                rendered += f"\nحالت حجم‌دهی: {mode_text}"
+            return make_bot_response(text=rendered, action=action, data={"trade_status": status_payload})
 
         if action == "SHOW_AI_STATUS":
             summary = get_learning_summary()
@@ -950,6 +1035,10 @@ def validate_bot_wiring() -> dict[str, Any]:
         ("ترید دلار 7", "SET_MARGIN"),
         ("دلار ترید 8", "SET_MARGIN"),
         ("حجم ترید 9", "SET_MARGIN"),
+        ("حداقل 5", "SET_MIN_MARGIN"),
+        ("حداکثر 15", "SET_MAX_MARGIN"),
+        ("ترید دلار حداقل 5", "SET_MIN_MARGIN"),
+        ("ترید دلار حداکثر 15", "SET_MAX_MARGIN"),
         ("لوریج 10", "SET_LEVERAGE"),
         ("حداکثر پوزیشن 3", "SET_MAX_POSITIONS"),
         ("ریست ترید", "RESET_TRADE_SETTINGS"),
@@ -963,6 +1052,8 @@ def validate_bot_wiring() -> dict[str, Any]:
         "ENABLE_REAL_TRADING",
         "DISABLE_REAL_TRADING",
         "SET_MARGIN",
+        "SET_MIN_MARGIN",
+        "SET_MAX_MARGIN",
         "SET_LEVERAGE",
         "SET_MAX_POSITIONS",
         "RESET_TRADE_SETTINGS",
