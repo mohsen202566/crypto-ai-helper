@@ -22,6 +22,10 @@ from constants import (
 )
 from models import AIDecision, TPSLPlan, TradeCloseResult, TradeOpenResult, TradePosition, RecordResult
 from position_manager import add_position, count_open_real_positions, get_open_positions, get_position, has_open_position, mark_real_confirmed, mark_real_failed
+try:
+    from position_manager import reconcile_real_positions_with_exchange
+except Exception:  # Backward-compatible when position_manager has not been updated yet.
+    reconcile_real_positions_with_exchange = None
 from strategy_manager import get_trade_runtime_config, is_real_trading_enabled
 from tobit_client import MARGIN_ISOLATED, ToobitClient, get_client
 from utils import fee_estimate, make_position_id, normalize_direction, normalize_symbol, notional_value, profit_usdt, safe_float, safe_int, safe_str, utc_now_iso
@@ -301,6 +305,31 @@ def get_real_trade_status(*, client: Optional[ToobitClient] = None, include_exch
         status["toobit_open_positions"] = exchange_positions
         status["toobit_open_total"] = len(exchange_positions)
         status["toobit_pnl_usdt"] = sum(safe_float(p.get("pnl_usdt"), 0.0) or 0.0 for p in exchange_positions)
+
+        # Keep local REAL slots aligned with the exchange before showing the panel.
+        # If Toobit no longer has a REAL position but positions.json still marks it open,
+        # the stale local record is closed so max-real slots are freed immediately.
+        if reconcile_real_positions_with_exchange is not None:
+            reconcile_result = reconcile_real_positions_with_exchange(
+                exchange_positions,
+                close_reason="trade_status_exchange_reconcile",
+            )
+            status["reconcile"] = reconcile_result
+            if safe_int(reconcile_result.get("closed_count"), 0) > 0:
+                refreshed_local_positions = get_open_positions()
+                refreshed_real_positions = [p for p in refreshed_local_positions if safe_str(p.mode).upper() == MODE_REAL]
+                refreshed_ghost_positions = [p for p in refreshed_local_positions if safe_str(p.mode).upper() != MODE_REAL]
+                status["local_open_total"] = len(refreshed_local_positions)
+                status["local_real_open"] = len(refreshed_real_positions)
+                status["local_ghost_open"] = len(refreshed_ghost_positions)
+                status["local_positions"] = [p.__dict__ for p in refreshed_local_positions]
+        else:
+            status["reconcile"] = {
+                "status": STATUS_FAILED,
+                "changed": False,
+                "closed_count": 0,
+                "error": "position_manager_reconcile_missing",
+            }
     except Exception as exc:
         status["errors"].append(f"positions_error:{exc}")
 
