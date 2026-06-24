@@ -472,6 +472,41 @@ def get_learning_summary() -> dict[str, Any]:
     }
 
 
+
+def reset_learning_memory(*, reset_archives: bool = True, reset_stats: bool = True) -> RecordResult:
+    """
+    Clear learning/statistical records without touching open positions or strategy settings.
+
+    This backs the Telegram command "حذف آمار" and is intentionally real, not display-only.
+    """
+    try:
+        ok_learning = _save_learning_payload(default_learning_payload())
+        ok_ghost = True
+        ok_real = True
+        ok_stats = True
+        if reset_archives:
+            ok_ghost = save_json_atomic(GHOST_KEY, {"system_version": SYSTEM_VERSION, "records": [], "updated_at": utc_now_iso()})
+            ok_real = save_json_atomic(REAL_KEY, {"system_version": SYSTEM_VERSION, "records": [], "updated_at": utc_now_iso()})
+        if reset_stats:
+            ok_stats = save_json_atomic("stats", {"system_version": SYSTEM_VERSION, "events": [], "summary": {}, "updated_at": utc_now_iso()})
+        ok = bool(ok_learning and ok_ghost and ok_real and ok_stats)
+        return RecordResult(
+            status=STATUS_OK if ok else STATUS_FAILED,
+            recorded=ok,
+            message="learning_memory_reset" if ok else "learning_memory_reset_failed",
+            metadata={
+                "learning": ok_learning,
+                "ghost_records": ok_ghost,
+                "real_records": ok_real,
+                "stats": ok_stats,
+                "open_positions_preserved": True,
+            },
+        )
+    except Exception as exc:
+        log_error(module="learning_memory", function="reset_learning_memory", error=exc)
+        return RecordResult(status=STATUS_FAILED, recorded=False, message="learning_memory_reset_exception", error=str(exc))
+
+
 def validate_learning_memory_light() -> dict[str, Any]:
     """Lightweight startup validation."""
     payload = _load_learning_payload()
@@ -517,5 +552,6 @@ __all__ = [
     "win_rate",
     "tp2_rate",
     "get_learning_summary",
+    "reset_learning_memory",
     "validate_learning_memory_light",
 ]
