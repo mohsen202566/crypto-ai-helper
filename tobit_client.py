@@ -808,7 +808,21 @@ class ToobitClient:
         return self.set_position_tp_sl(symbol, direction, take_profit=take_profit, stop_loss=stop_loss, take_profit_2=take_profit_2)
 
     def set_position_tp_sl(self, symbol: str, direction: str, take_profit: Any = None, stop_loss: Any = None, take_profit_2: Any = None) -> dict[str, Any]:
-        return {"status": STATUS_OK, "ok": True, "symbol": normalize_symbol(symbol), "direction": normalize_direction(direction), "take_profit": take_profit, "take_profit_2": take_profit_2, "stop_loss": stop_loss, "note": "tp_sl_repair_noop_until_endpoint_confirmed"}
+        # Safety: TP/SL must normally be attached to the original OPEN order in
+        # open_futures_position().  Until the exact Toobit endpoint for editing
+        # an existing position's TP/SL is verified, do not pretend repair worked
+        # and do not create extra standalone TP/SL orders that could duplicate.
+        return {
+            "status": STATUS_FAILED,
+            "ok": False,
+            "symbol": normalize_symbol(symbol),
+            "direction": normalize_direction(direction),
+            "take_profit": take_profit,
+            "take_profit_2": None,
+            "stop_loss": stop_loss,
+            "error": "tp_sl_repair_endpoint_not_confirmed",
+            "note": "no_extra_tp_sl_order_created",
+        }
 
     def get_closed_position_pnl(self, symbol: str = "", direction: str = "", since_ms: Any = None) -> dict[str, Any]:
         params = {"symbol": self.normalize_futures_symbol(symbol)} if symbol else {}
