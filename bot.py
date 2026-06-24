@@ -687,24 +687,77 @@ def force_real_to_ghost_when_trade_off(decision: AIDecision) -> AIDecision:
         decision.metadata = metadata
     return decision
 
+def _convert_real_failure_to_ghost(decision: AIDecision, *, reason: str, metadata: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
+    """Convert a blocked/failed REAL decision into GHOST safely.
+
+    Important rule: when AI wants REAL but REAL execution is blocked by risk
+    guards (max exchange positions, duplicate, Toobit guard, preflight failure,
+    open-order failure), the signal must still be recorded and learned as GHOST.
+    This function mutates only the decision mode/metadata and does not create
+    the position itself; persist_signal_lifecycle() will create the GHOST record.
+    """
+    original_mode = safe_str(getattr(decision, "mode", "")).upper()
+    decision.mode = MODE_GHOST
+
+    code = safe_str(reason, "real_failed_converted_to_ghost").upper()
+    reason_code = f"REAL_BLOCKED_CONVERTED_TO_GHOST:{code}"
+    if reason_code not in decision.reason_codes:
+        decision.reason_codes.append(reason_code)
+
+    meta = dict(decision.metadata or {})
+    meta["real_blocked_converted_to_ghost"] = True
+    meta["real_block_reason"] = safe_str(reason)
+    meta["original_mode"] = original_mode or MODE_REAL
+    if metadata:
+        meta["real_block_details"] = dict(metadata)
+    decision.metadata = meta
+
+    return {
+        "executed": False,
+        "status": STATUS_OK,
+        "reason": "real_blocked_converted_to_ghost",
+        "converted_to_ghost": True,
+        "real_block_reason": safe_str(reason),
+        "real_block_details": dict(metadata or {}),
+    }
+
+
 def maybe_execute_real_decision(decision: AIDecision) -> dict[str, Any]:
     """
     Execute REAL decision through real_trade_manager only.
 
-    If real trading is off, the decision is converted to GHOST output text only.
+    If real trading is off, or REAL execution is blocked/fails before a
+    confirmed order, the decision is converted to GHOST so it is still recorded
+    and learned. This keeps safety guards strict without losing learning data.
     """
     force_real_to_ghost_when_trade_off(decision)
     if decision.mode != MODE_REAL:
         reason = "real_trading_disabled_converted_to_ghost" if "REAL_TRADE_OFF_CONVERTED_TO_GHOST" in decision.reason_codes else "not_real_decision"
-        return {"executed": False, "status": STATUS_OK, "reason": reason}
+        return {"executed": False, "status": STATUS_OK, "reason": reason, "converted_to_ghost": decision.mode == MODE_GHOST}
 
     pf = preflight_real_trade(decision)
     if not pf.get("ok"):
-        return {"executed": False, "status": STATUS_FAILED, "reason": "preflight_failed", "preflight": pf}
+        return _convert_real_failure_to_ghost(decision, reason="preflight_failed", metadata={"preflight": pf})
 
     result = open_real_trade(decision)
+
+    # Only keep REAL when the exchange order was accepted/recovered. Any failed
+    # open attempt becomes GHOST. This includes max-position guards, duplicate
+    # guards, stale TP/SL guards, quantity errors, and Toobit-side rejects.
+    if result.status != STATUS_OK:
+        return _convert_real_failure_to_ghost(
+            decision,
+            reason="real_open_failed",
+            metadata={
+                "status": result.status,
+                "error": result.error,
+                "message": result.message,
+                "raw": result.raw,
+            },
+        )
+
     return {
-        "executed": result.status == STATUS_OK,
+        "executed": True,
         "status": result.status,
         "position_id": result.position_id,
         "exchange_order_id": result.exchange_order_id,
@@ -1486,25 +1539,17 @@ async def auto_signal_loop(application: Any) -> None:
         await asyncio.sleep(interval)
 
 
-async def telegram_post_init(application: Any) -> None:
-    """Prepare runtime state after Telegram Application initialization.
+def _start_background_tasks_now(application: Any) -> None:
+    """Start background tasks after the Telegram app has entered its running loop.
 
-    Background loops are started from telegram_post_startup(), not here.
-    python-telegram-bot warns when Application.create_task() is called while
-    the application is not running; that warning was causing pending tasks to
-    survive/restart badly and made manual commands slow.
+    This is intentionally compatible with python-telegram-bot 20.7: that
+    version has post_init/post_stop but not ApplicationBuilder.post_startup.
+    We also avoid Application.create_task() here to prevent the warning:
+    "Tasks created via Application.create_task while the application is not running".
     """
-    application.bot_data["market_provider"] = application.bot_data.get("market_provider") or OKXMarketProvider()
-    application.bot_data.setdefault("background_tasks", {})
-    logger.info("telegram_post_init_ready")
-
-
-async def telegram_post_startup(application: Any) -> None:
-    """Start background tasks only after the Telegram application is running."""
     application.bot_data["market_provider"] = application.bot_data.get("market_provider") or OKXMarketProvider()
     tasks: dict[str, asyncio.Task] = application.bot_data.setdefault("background_tasks", {})
 
-    # Do not create duplicate tasks if startup is called again by the framework.
     monitor_task = tasks.get("position_monitor")
     if monitor_task is None or monitor_task.done():
         tasks["position_monitor"] = asyncio.create_task(
@@ -1529,8 +1574,54 @@ async def telegram_post_startup(application: Any) -> None:
         logger.info("auto_signal_task_not_created disabled")
 
 
+async def _delayed_background_start(application: Any, delay_seconds: float = 1.0) -> None:
+    """Delay background task creation until PTB polling is running."""
+    try:
+        await asyncio.sleep(max(0.0, delay_seconds))
+        _start_background_tasks_now(application)
+    except asyncio.CancelledError:
+        logger.info("background_start_cancelled")
+        raise
+    except Exception as exc:
+        logger.exception("background_start_failed:%s", exc)
+
+
+async def telegram_post_init(application: Any) -> None:
+    """Prepare runtime state after Telegram Application initialization.
+
+    PTB 20.7 does not provide ApplicationBuilder.post_startup().  Starting
+    loops immediately with Application.create_task() from post_init produced
+    pending-task warnings and slow manual replies.  Instead, create one raw
+    asyncio delayed starter task; it starts monitor/auto-signal after polling
+    has had time to enter the running state.
+    """
+    application.bot_data["market_provider"] = application.bot_data.get("market_provider") or OKXMarketProvider()
+    application.bot_data.setdefault("background_tasks", {})
+
+    starter = application.bot_data.get("background_start_task")
+    if starter is None or starter.done():
+        application.bot_data["background_start_task"] = asyncio.create_task(
+            _delayed_background_start(application, delay_seconds=1.0),
+            name="level4_background_start",
+        )
+        logger.info("background_start_task_created")
+    else:
+        logger.info("background_start_task_already_running")
+
+
 async def telegram_post_shutdown(application: Any) -> None:
     """Cancel background tasks cleanly on restart/shutdown."""
+    starter = application.bot_data.get("background_start_task")
+    if starter and not starter.done():
+        logger.info("background_start_cancel_requested")
+        starter.cancel()
+        try:
+            await starter
+        except asyncio.CancelledError:
+            logger.info("background_start_cancelled")
+        except Exception as exc:
+            logger.exception("background_start_cancel_error:%s", exc)
+
     tasks = dict(application.bot_data.get("background_tasks") or {})
     if not tasks:
         logger.info("background_tasks_none_to_cancel")
@@ -1558,14 +1649,15 @@ def build_application(token: str) -> Any:
     # Lazy import keeps integration_check/import usable even where telegram package is absent.
     from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
 
-    application = (
-        ApplicationBuilder()
-        .token(token)
-        .post_init(telegram_post_init)
-        .post_startup(telegram_post_startup)
-        .post_shutdown(telegram_post_shutdown)
-        .build()
-    )
+    builder = ApplicationBuilder().token(token).post_init(telegram_post_init)
+    # python-telegram-bot 20.7 supports post_stop, not post_startup.
+    # Use feature detection so this file stays compatible with close PTB versions.
+    if hasattr(builder, "post_stop"):
+        builder = builder.post_stop(telegram_post_shutdown)
+    elif hasattr(builder, "post_shutdown"):
+        builder = builder.post_shutdown(telegram_post_shutdown)
+
+    application = builder.build()
     application.add_handler(CommandHandler(["start", "help"], telegram_start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, telegram_message_handler))
     application.add_error_handler(telegram_error_handler)
@@ -1602,6 +1694,7 @@ __all__ = [
     "analyze_symbol_with_provider",
     "scan_market_with_provider",
     "maybe_execute_real_decision",
+    "_convert_real_failure_to_ghost",
     "render_real_execution_note",
     "find_open_position_for_symbol",
     "render_close_result",
@@ -1619,7 +1712,6 @@ __all__ = [
     "_fast_trade_toggle_action",
     "auto_signal_loop",
     "telegram_post_init",
-    "telegram_post_startup",
     "telegram_post_shutdown",
     "build_application",
     "main",
