@@ -212,15 +212,95 @@ def render_strategy_status(state: Optional[Mapping[str, Any]] = None) -> str:
 
 
 def render_trade_runtime(runtime: Optional[Mapping[str, Any]] = None) -> str:
+    """Render full trade/Toobit status when real_trade_manager payload is provided."""
     data = dict(runtime or _safe_trade_runtime())
+
+    if "runtime" in data or "balance" in data or "toobit_open_positions" in data:
+        rt = dict(data.get("runtime") or data)
+        balance = dict(data.get("balance") or {})
+        positions = list(data.get("toobit_open_positions") or [])
+        local_positions = list(data.get("local_positions") or [])
+        connected = bool(data.get("toobit_connected"))
+        trade_on = bool(data.get("real_trading_enabled", rt.get("real_trading_enabled", False)))
+        margin = data.get("margin_usdt", rt.get("margin_usdt"))
+        leverage = data.get("leverage", rt.get("leverage"))
+        max_real = data.get("max_concurrent_real_positions", rt.get("max_concurrent_real_positions", rt.get("max_positions")))
+        max_total = data.get("max_concurrent_total_positions", rt.get("max_concurrent_total_positions", max_real))
+        watchlist = data.get("watchlist") or rt.get("watchlist") or []
+
+        lines = [
+            "⚙️ وضعیت ترید و Toobit",
+            f"اتصال Toobit: {'وصل ✅' if connected else 'قطع / نامشخص ❌'}",
+            f"ترید واقعی: {'روشن ✅' if trade_on else 'خاموش ❌'}",
+            "سیگنال خودکار: روشن ✅",
+            f"سرمایه هر ترید: {fmt_usdt(margin)}",
+            f"لوریج: {safe_int(leverage, 1)}x",
+            f"حداکثر پوزیشن REAL: {safe_int(max_real, 0)}",
+            f"حداکثر کل پوزیشن: {safe_int(max_total, 0)}",
+            f"Margin Mode: {safe_str(data.get('margin_mode', rt.get('margin_mode', 'ISOLATED'))).upper()}",
+            "",
+            "💰 کیف پول Toobit",
+            f"موجودی کل: {fmt_usdt(balance.get('balance'))}",
+            f"قابل استفاده: {fmt_usdt(balance.get('available'))}",
+            f"وضعیت موجودی: {safe_str(balance.get('status'), '-')}",
+            "",
+            f"📌 پوزیشن‌های باز Toobit: {safe_int(data.get('toobit_open_total'), len(positions))}",
+            f"PnL باز Toobit: {fmt_usdt(data.get('toobit_pnl_usdt'))}",
+        ]
+        if positions:
+            for p in positions[:10]:
+                lines.append(
+                    f"• {normalize_symbol(p.get('symbol'))} {normalize_direction(p.get('direction'))} | "
+                    f"qty:{fmt_float(p.get('quantity'), 6)} | entry:{fmt_price(p.get('entry'))} | "
+                    f"mark:{fmt_price(p.get('mark'))} | PnL:{fmt_usdt(p.get('pnl_usdt'))} | lev:{safe_int(p.get('leverage'), 0)}x"
+                )
+        else:
+            lines.append("پوزیشن باز Toobit پیدا نشد.")
+
+        lines.extend([
+            "",
+            f"📂 پوزیشن‌های داخلی ربات: {safe_int(data.get('local_open_total'), len(local_positions))}",
+            f"REAL داخلی: {safe_int(data.get('local_real_open'), 0)} | GHOST داخلی: {safe_int(data.get('local_ghost_open'), 0)}",
+        ])
+
+        if watchlist:
+            lines.extend(["", "🔎 ارزهای فعال:", ", ".join(str(x) for x in watchlist)])
+
+        errors = data.get("errors") or []
+        if errors:
+            lines.extend(["", "⚠️ هشدارها:", short_reasons(errors, limit=6)])
+        return "\n".join(lines)
+
     lines = [
         header("تنظیمات ترید"),
         f"مارجین: {fmt_usdt(data.get('margin_usdt'))}",
         f"لوریج: {safe_int(data.get('leverage'), 1)}x",
-        f"حداکثر پوزیشن: {safe_int(data.get('max_positions'), 0)}",
+        f"حداکثر پوزیشن: {safe_int(data.get('max_positions', data.get('max_concurrent_real_positions')), 0)}",
         f"وضعیت ترید واقعی: {'فعال ✅' if bool(data.get('real_trading_enabled')) else 'غیرفعال ⚠️'}",
     ]
     return "\n".join(lines)
+
+
+def render_ai_status(summary: Optional[Mapping[str, Any]] = None) -> str:
+    data = dict(summary or {})
+    lines = [
+        "🧠 وضعیت هوش مصنوعی و یادگیری",
+        f"Learning samples: {safe_int(data.get('total_records'), 0)}",
+        f"Coin buckets: {safe_int(data.get('coin_buckets'), 0)}",
+        f"Condition buckets: {safe_int(data.get('condition_buckets'), 0)}",
+        f"Wins: {safe_int(data.get('wins'), 0)} | Losses: {safe_int(data.get('losses'), 0)}",
+        f"WinRate: {fmt_pct(data.get('win_rate'))}",
+        f"TP2: {safe_int(data.get('tp2'), 0)}",
+        f"Updated: {safe_str(data.get('updated_at'), '-')}",
+        "",
+        "یادگیری بر اساس REAL و GHOST و به‌صورت coin/direction/condition ذخیره می‌شود.",
+    ]
+    return "\n".join(lines)
+
+
+def render_reset_stats_result(result: Any) -> str:
+    ok = bool(getattr(result, 'recorded', False)) or safe_str(getattr(result, 'status', '')).upper() == STATUS_OK
+    return "✅ آمار و حافظه یادگیری پاک شد. پوزیشن‌های باز حذف نشدند." if ok else "❌ حذف آمار انجام نشد."
 
 
 # =============================================================================
@@ -442,21 +522,41 @@ def render_stats_snapshot(snapshot: Optional[Mapping[str, Any]] = None) -> str:
 # =============================================================================
 
 def render_help() -> str:
-    return "\n".join([
-        "🤖 دستورات Level 4",
+    lines = [
+        "📚 راهنمای ربات Level 4",
         "",
-        "استراتژی",
-        "وضعیت استراتژی",
-        "استراتژی لول 4",
-        "ترید فعال",
-        "ترید غیرفعال",
-        "وضعیت",
-        "پوزیشن ها",
-        "آمار",
+        "وضعیت و کنترل ترید:",
+        "• ترید — نمایش کامل وضعیت Toobit، موجودی، پوزیشن‌ها، لوریج و تنظیمات",
+        "• وضعیت ترید — همان خروجی کامل ترید",
+        "• ترید فعال — روشن کردن ترید واقعی",
+        "• ترید خاموش — خاموش کردن ترید واقعی؛ سیگنال‌های بعدی GHOST می‌شوند",
+        "• ترید دلار 7 / دلار ترید 7 / حجم ترید 7 — تنظیم سرمایه هر ترید",
+        "• لوریج 10 — تنظیم لوریج",
+        "• حداکثر پوزیشن 3 — تنظیم سقف پوزیشن REAL",
+        "• ریست ترید — برگشت تنظیمات ترید به پیش‌فرض",
+        "• توقف فوری — خاموش کردن اضطراری ترید واقعی",
         "",
-        "نکته: Toobit و Real Trade در مرحله آخر وصل می‌شوند.",
-    ])
-
+        "استراتژی:",
+        "• استراتژی لول 4 — فعال‌سازی Level 4",
+        "• وضعیت استراتژی — نمایش سطح فعال",
+        "• لیست استراتژی — نمایش لول‌ها و وضعیت فعال/غیرفعال",
+        "",
+        "تحلیل و سیگنال:",
+        "• بررسی DOGEUSDT / تحلیل DOGEUSDT — تحلیل یک نماد",
+        "• اسکن / بررسی — اسکن واچ‌لیست Level 4",
+        "",
+        "آمار و هوش مصنوعی:",
+        "• آمار — آمار REAL/GHOST/TP/SL/AI Exit",
+        "• حذف آمار — پاک کردن آمار و حافظه یادگیری؛ پوزیشن باز حذف نمی‌شود",
+        "• هوش مصنوعی — وضعیت یادگیری AI",
+        "",
+        "پوزیشن:",
+        "• پوزیشن ها — نمایش پوزیشن‌های باز داخلی ربات",
+        "• بستن DOGEUSDT — بستن پوزیشن REAL همان نماد با تایید Toobit",
+        "",
+        "نکته: دستورات تنظیمی واقعی ذخیره و اجرا می‌شوند؛ نمایشی نیستند.",
+    ]
+    return "\n".join(lines)
 
 def render_error(message: str, *, title: str = "خطا") -> str:
     return f"❌ {title}\n{safe_str(message, 'خطای نامشخص')}"
@@ -498,6 +598,8 @@ __all__ = [
     "footer_time",
     "render_strategy_status",
     "render_trade_runtime",
+    "render_ai_status",
+    "render_reset_stats_result",
     "render_tp_sl",
     "render_ai_decision",
     "render_position",
