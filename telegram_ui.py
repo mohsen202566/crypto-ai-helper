@@ -350,11 +350,22 @@ def render_trade_runtime(runtime: Optional[Mapping[str, Any]] = None) -> str:
         else:
             lines.append("پوزیشن باز Toobit پیدا نشد.")
 
+        effective_real = safe_int(data.get('effective_real_open', data.get('toobit_open_total', data.get('local_real_open', 0))), 0) or 0
+        toobit_real = safe_int(data.get('toobit_open_total'), len(positions)) or 0
+        local_real = safe_int(data.get('local_real_open'), 0) or 0
+        local_ghost = safe_int(data.get('local_ghost_open'), 0) or 0
+        local_total = safe_int(data.get('local_open_total'), len(local_positions)) or 0
+
         lines.extend([
             "",
-            f"📂 پوزیشن‌های داخلی ربات: {safe_int(data.get('local_open_total'), len(local_positions))}",
-            f"REAL داخلی: {safe_int(data.get('local_real_open'), 0)} | GHOST داخلی: {safe_int(data.get('local_ghost_open'), 0)}",
+            "📂 وضعیت داخلی/واقعی پوزیشن‌ها",
+            f"REAL واقعی Toobit: {toobit_real}",
+            f"REAL موثر برای سقف اسلات: {effective_real} / {safe_int(max_real, 0)}",
+            f"پوزیشن‌های داخلی ربات: {local_total}",
+            f"REAL داخلی ربات: {local_real} | GHOST داخلی: {local_ghost}",
         ])
+        if toobit_real != local_real:
+            lines.append("⚠️ اختلاف داخلی/Toobit: برای REAL، عدد Toobit منبع اصلی است.")
 
         if watchlist:
             lines.extend(["", "🔎 ارزهای فعال:", ", ".join(str(x) for x in watchlist)])
@@ -602,11 +613,11 @@ def render_stats_snapshot(snapshot: Optional[Mapping[str, Any]] = None) -> str:
     if isinstance(positions, Mapping):
         lines.extend([
             "",
-            "📍 پوزیشن‌ها",
-            f"باز: {safe_int(positions.get('open_total'), 0)}",
-            f"REAL فعال: {safe_int(positions.get('active_real'), 0)}",
-            f"GHOST فعال: {safe_int(positions.get('active_ghost'), 0)}",
-            f"Partial TP1: {safe_int(positions.get('partial_tp1'), 0)}",
+            "📍 پوزیشن‌های داخلی ربات",
+            f"باز داخلی: {safe_int(positions.get('open_total'), 0)}",
+            f"REAL داخلی فعال: {safe_int(positions.get('active_real'), 0)}",
+            f"GHOST داخلی فعال: {safe_int(positions.get('active_ghost'), 0)}",
+            f"Partial TP1 داخلی: {safe_int(positions.get('partial_tp1'), 0)}",
         ])
 
     return "\n".join(lines)
