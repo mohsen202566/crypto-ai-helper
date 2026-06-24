@@ -34,6 +34,7 @@ from constants import (
     STATUS_FAILED,
     STATUS_OK,
     STRATEGY_LEVEL,
+    STRATEGY_CODE,
     SYSTEM_VERSION,
 )
 from command_router import CommandRoute, parse_command, validate_route
@@ -158,20 +159,104 @@ def _get_trade_runtime() -> dict[str, Any]:
 
 
 def _set_strategy_level(level: int) -> bool:
+    """Set the single active strategy level for new decisions.
+
+    Level 4 is fully implemented in this repository. Other levels can be selected
+    in state so old/open positions keep their original level, but this Level 4
+    process will refuse new analysis/trades unless Level 4 is active.
+    """
+    level = safe_int(level, STRATEGY_LEVEL) or STRATEGY_LEVEL
+    if not (1 <= level <= 9):
+        return False
+
     if level == STRATEGY_LEVEL:
-        result = _call_first(["set_strategy_level", "set_active_level", "switch_strategy_level", "set_level", "set_level4_active"], level)
-        if result is None:
-            result = _call_first(["set_level4_active"])
-        return _result_ok(result)
-    result = _call_first(["set_strategy_level", "set_active_level", "switch_strategy_level", "set_level"], level)
-    return _result_ok(result)
+        result = _call_first(["set_level4_active"])
+        if result is not None:
+            return _result_ok(result)
+
+    try:
+        state = strategy_manager.load_strategy_state()
+        state["active_level"] = level
+        state["active_strategy"] = STRATEGY_CODE if level == STRATEGY_LEVEL else f"LEVEL_{level}"
+        return bool(strategy_manager.save_strategy_state(state))
+    except Exception:
+        logger.exception("failed to set strategy level")
+        return False
+
+
+def _list_strategy_levels() -> list[dict[str, Any]]:
+    try:
+        state = strategy_manager.load_strategy_state()
+        active = safe_int(state.get("active_level"), STRATEGY_LEVEL) or STRATEGY_LEVEL
+    except Exception:
+        active = STRATEGY_LEVEL
+    levels: list[dict[str, Any]] = []
+    for level in range(1, 10):
+        levels.append({
+            "level": level,
+            "name": "Level 4 / 1H Smart Scalp" if level == STRATEGY_LEVEL else f"Level {level}",
+            "active": level == active,
+            "implemented": level == STRATEGY_LEVEL,
+            "new_signals_allowed": level == active == STRATEGY_LEVEL,
+        })
+    return levels
+
+
+def _render_strategy_list() -> str:
+    lines = ["📚 لیست استراتژی‌ها"]
+    for item in _list_strategy_levels():
+        active = "✅ فعال" if item.get("active") else "▫️ غیرفعال"
+        implemented = "آماده اجرا" if item.get("implemented") else "غیرفعال در این نسخه"
+        lines.append(f"Level {item['level']}: {item['name']} | {active} | {implemented}")
+    lines.append("")
+    lines.append("قانون: فقط Level انتخاب‌شده برای تصمیم‌های جدید فعال است؛ این فایل فقط منطق اجرایی Level 4 را دارد.")
+    return "\n".join(lines)
 
 
 def _update_runtime(**kwargs: Any) -> bool:
-    result = _call_first(["update_trade_runtime_config", "update_runtime_config", "update_trade_settings", "set_trade_settings"], **kwargs)
-    if result is None:
-        result = _call_first(["update_trade_runtime_config", "update_runtime_config", "update_trade_settings", "set_trade_settings"], kwargs)
-    return _result_ok(result)
+    """Persist real trading runtime settings; not a display-only update."""
+    try:
+        if "margin_usdt" in kwargs:
+            fn = getattr(strategy_manager, "set_margin_usdt", None)
+            if callable(fn):
+                return _result_ok(fn(kwargs["margin_usdt"]))
+            state = strategy_manager.load_strategy_state()
+            state["margin_usdt"] = safe_float(kwargs["margin_usdt"], state.get("margin_usdt"))
+            return bool(strategy_manager.save_strategy_state(state))
+
+        if "leverage" in kwargs:
+            fn = getattr(strategy_manager, "set_leverage", None)
+            if callable(fn):
+                return _result_ok(fn(kwargs["leverage"]))
+            state = strategy_manager.load_strategy_state()
+            state["leverage"] = safe_int(kwargs["leverage"], state.get("leverage"))
+            return bool(strategy_manager.save_strategy_state(state))
+
+        if "max_positions" in kwargs or "max_concurrent_real_positions" in kwargs or "max_concurrent_total_positions" in kwargs:
+            value = kwargs.get("max_positions", kwargs.get("max_concurrent_real_positions", kwargs.get("max_concurrent_total_positions")))
+            count = safe_int(value, None)
+            if count is None or count <= 0:
+                return False
+            state = strategy_manager.load_strategy_state()
+            state["max_concurrent_real_positions"] = count
+            state["max_concurrent_total_positions"] = max(count, safe_int(state.get("max_concurrent_total_positions"), count) or count)
+            return bool(strategy_manager.save_strategy_state(state))
+
+        if "real_trading_enabled" in kwargs:
+            return _result_ok(strategy_manager.set_real_trading(bool(kwargs["real_trading_enabled"])))
+    except Exception:
+        logger.exception("failed to update runtime")
+        return False
+    return False
+
+
+def _reset_trade_runtime() -> bool:
+    try:
+        result = strategy_manager.reset_strategy_state()
+        return _result_ok(result)
+    except Exception:
+        logger.exception("failed to reset trade runtime")
+        return False
 
 
 def _enable_trade() -> bool:
@@ -487,7 +572,15 @@ def execute_route(
             if not (1 <= level <= 9):
                 return make_bot_response(text=render_error("لول استراتژی نامعتبر است."), status=STATUS_FAILED, action=action)
             ok = _set_strategy_level(level)
-            return make_bot_response(text=render_ok(f"استراتژی روی Level {level} تنظیم شد.") if ok else render_error("تغییر استراتژی انجام نشد."), status=STATUS_OK if ok else STATUS_FAILED, action=action, data={"level": level})
+            extra = "" if level == STRATEGY_LEVEL else "\n⚠️ این فایل فعلی فقط اجرای Level 4 را دارد؛ تا وقتی Level 4 فعال نباشد اسکن/تحلیل جدید اجرا نمی‌شود."
+            return make_bot_response(text=(render_ok(f"استراتژی روی Level {level} تنظیم شد.") + extra) if ok else render_error("تغییر استراتژی انجام نشد."), status=STATUS_OK if ok else STATUS_FAILED, action=action, data={"level": level})
+
+        if action == "LIST_STRATEGIES":
+            return make_bot_response(text=_render_strategy_list(), action=action, data={"levels": _list_strategy_levels()})
+
+        if action == "RESET_TRADE_SETTINGS":
+            ok = _reset_trade_runtime()
+            return make_bot_response(text=render_ok("تنظیمات ترید به مقدار پیش‌فرض برگشت.") if ok else render_error("ریست تنظیمات ترید انجام نشد."), status=STATUS_OK if ok else STATUS_FAILED, action=action)
 
         if action == "ENABLE_REAL_TRADING":
             ok = _enable_trade()
@@ -540,6 +633,8 @@ def execute_route(
             return make_bot_response(text=render_stats_snapshot(snapshot), action=action, data={"stats": snapshot})
 
         if action == "ANALYZE_SYMBOL":
+            if not strategy_manager.is_level4_active():
+                return make_bot_response(text=render_error("Level 4 فعال نیست؛ برای تحلیل جدید اول بنویس: استراتژی لول 4"), status=STATUS_FAILED, action=action)
             symbol = normalize_symbol(args.get("symbol"))
             if not market_provider:
                 return make_bot_response(text=render_error("Market provider هنوز وصل نشده است."), status=STATUS_FAILED, action=action)
@@ -551,6 +646,8 @@ def execute_route(
             return make_bot_response(text=text, status=status, action=action, data={"validation": validation, "execution": execution})
 
         if action == "SCAN_MARKET":
+            if not strategy_manager.is_level4_active():
+                return make_bot_response(text=render_error("Level 4 فعال نیست؛ برای اسکن جدید اول بنویس: استراتژی لول 4"), status=STATUS_FAILED, action=action)
             if not market_provider:
                 return make_bot_response(text=render_error("Market provider هنوز وصل نشده است."), status=STATUS_FAILED, action=action)
             symbols = default_scan_symbols or list(LEVEL_4_SYMBOLS)
@@ -614,7 +711,7 @@ def handle_text_message(
 def validate_bot_wiring() -> dict[str, Any]:
     errors: list[str] = []
 
-    for text, key in [("راهنما", "HELP"), ("آمار", "STATS"), ("پوزیشن ها", "POSITIONS"), ("وضعیت", "STATUS")]:
+    for text, key in [("راهنما", "HELP"), ("آمار", "STATS"), ("پوزیشن ها", "POSITIONS"), ("وضعیت", "STATUS"), ("وضعیت ترید", "TRADE_STATUS"), ("لیست استراتژی", "STRATEGY_LIST"), ("ترید دلار 7", "SET_MARGIN"), ("لوریج 10", "SET_LEVERAGE"), ("حداکثر پوزیشن 3", "SET_MAX_POSITIONS")]:
         try:
             response = handle_text_message(text, auto_execute_real=False)
             if validate_bot_response(response).get("valid") is not True:
