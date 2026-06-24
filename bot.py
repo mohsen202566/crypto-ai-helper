@@ -30,6 +30,7 @@ from constants import (
     MODE_GHOST,
     MODE_REAL,
     MODE_REJECT,
+    POSITION_ACTIVE_GHOST,
     OKX_CANDLE_LIMIT_DEFAULT,
     PRIMARY_TIMEFRAME,
     STATUS_FAILED,
@@ -54,7 +55,14 @@ from telegram_ui import (
     validate_rendered_text,
 )
 import strategy_manager
-from position_manager import get_open_positions
+from position_manager import add_position, get_open_positions, has_open_position
+from signal_manager import (
+    mark_ghost_opened,
+    mark_real_open_failed,
+    mark_real_open_requested,
+    mark_rejected,
+    record_signal,
+)
 from stats_engine import build_stats_snapshot
 from models import AIDecision, Candle, MarketSnapshot, TradeCloseResult, TradePosition
 from market_data import fetch_market_snapshot, make_offline_snapshot
@@ -477,6 +485,155 @@ def scan_market_with_provider(symbols: list[str], provider: Any, *, timeframe: s
     return decisions[: max(1, safe_int(max_results, 5) or 5)]
 
 
+
+# =============================================================================
+# Signal / GHOST lifecycle persistence
+# =============================================================================
+
+def _tp_sl_payload(decision: AIDecision) -> dict[str, Any]:
+    """Return a safe TP/SL dict from AIDecision without changing the model."""
+    plan = decision.tp_sl
+    if plan is None:
+        return {}
+    if isinstance(plan, Mapping):
+        return dict(plan)
+    return {
+        "symbol": getattr(plan, "symbol", decision.symbol),
+        "direction": getattr(plan, "direction", decision.direction),
+        "entry": safe_float(getattr(plan, "entry", decision.entry), decision.entry),
+        "tp1": safe_float(getattr(plan, "tp1", 0.0), 0.0),
+        "tp2": safe_float(getattr(plan, "tp2", None), None),
+        "sl": safe_float(getattr(plan, "sl", 0.0), 0.0),
+        "rr": safe_float(getattr(plan, "rr", 0.0), 0.0),
+        "tp1_net_profit_estimate": safe_float(getattr(plan, "tp1_net_profit_estimate", 0.0), 0.0),
+        "valid": bool(getattr(plan, "valid", True)),
+        "reason_codes": list(getattr(plan, "reason_codes", []) or []),
+    }
+
+
+def _ghost_quantity_for_decision(decision: AIDecision) -> tuple[float, float, int]:
+    """Estimate GHOST quantity from runtime so virtual PnL is meaningful."""
+    runtime = _get_trade_runtime()
+    margin = safe_float(
+        runtime.get("margin_usdt")
+        or runtime.get("trade_margin_usdt")
+        or runtime.get("margin_per_trade")
+        or runtime.get("min_margin_usdt"),
+        0.0,
+    ) or 0.0
+    leverage = safe_int(runtime.get("leverage") or runtime.get("trade_leverage"), 1) or 1
+    entry = safe_float(decision.entry, 0.0) or 0.0
+    quantity = (margin * leverage / entry) if entry > 0 and margin > 0 and leverage > 0 else 0.0
+    return quantity, margin, leverage
+
+
+def _build_ghost_position(decision: AIDecision) -> Optional[TradePosition]:
+    """Build an ACTIVE_GHOST position from a GHOST decision for monitor/learning."""
+    plan = decision.tp_sl
+    if plan is None:
+        return None
+    entry = safe_float(getattr(plan, "entry", decision.entry), decision.entry) or safe_float(decision.entry, 0.0) or 0.0
+    tp1 = safe_float(getattr(plan, "tp1", 0.0), 0.0) or 0.0
+    tp2 = safe_float(getattr(plan, "tp2", None), None)
+    sl = safe_float(getattr(plan, "sl", 0.0), 0.0) or 0.0
+    if entry <= 0 or tp1 <= 0 or sl <= 0:
+        return None
+
+    quantity, margin, leverage = _ghost_quantity_for_decision(decision)
+    return TradePosition(
+        symbol=decision.symbol,
+        direction=decision.direction,
+        mode=MODE_GHOST,
+        entry=entry,
+        tp1=tp1,
+        tp2=tp2,
+        sl=sl,
+        status=POSITION_ACTIVE_GHOST,
+        signal_id=decision.signal_id,
+        quantity=quantity,
+        margin_usdt=margin,
+        leverage=leverage,
+        current_price=entry,
+        highest_price=entry,
+        lowest_price=entry,
+        decision_metadata={
+            "source": "bot.py",
+            "decision_score": decision.score,
+            "decision_confidence": decision.confidence,
+            "reason_codes": list(decision.reason_codes or []),
+            "reject_reason": decision.reject_reason,
+            "decision_metadata": dict(decision.metadata or {}),
+            "tp_sl": _tp_sl_payload(decision),
+        },
+        level=decision.level,
+    )
+
+
+def persist_signal_lifecycle(decision: AIDecision, *, execution: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
+    """Persist generated signal and create ACTIVE_GHOST position when needed."""
+    result: dict[str, Any] = {
+        "signal_recorded": False,
+        "signal_id": safe_str(getattr(decision, "signal_id", "")),
+        "mode": safe_str(getattr(decision, "mode", "")).upper(),
+        "position_recorded": False,
+        "position_id": "",
+        "errors": [],
+    }
+    try:
+        signal_result = record_signal(decision)
+        result["signal_recorded"] = bool(signal_result.recorded or signal_result.message == "signal_id_exists")
+        result["signal_result"] = {
+            "status": signal_result.status,
+            "recorded": signal_result.recorded,
+            "record_id": signal_result.record_id,
+            "message": signal_result.message,
+            "error": signal_result.error,
+        }
+        if signal_result.record_id:
+            result["signal_id"] = signal_result.record_id
+    except Exception as exc:
+        logger.exception("signal_record_failed")
+        result["errors"].append(f"signal_record_failed:{exc}")
+
+    mode = safe_str(decision.mode).upper()
+    try:
+        if mode == MODE_GHOST:
+            if has_open_position(decision.symbol, decision.direction):
+                result["position_skipped"] = "duplicate_open_position"
+                try:
+                    mark_ghost_opened(decision.signal_id, metadata={"skipped": "duplicate_open_position"})
+                except Exception:
+                    logger.exception("mark_ghost_opened_duplicate_failed")
+                return result
+            position = _build_ghost_position(decision)
+            if position is None:
+                result["errors"].append("ghost_position_build_failed")
+                return result
+            add_result = add_position(position, reject_duplicate=True)
+            result["position_recorded"] = bool(add_result.recorded)
+            result["position_id"] = add_result.record_id or position.position_id
+            result["position_result"] = {
+                "status": add_result.status,
+                "recorded": add_result.recorded,
+                "record_id": add_result.record_id,
+                "message": add_result.message,
+                "error": add_result.error,
+            }
+            mark_ghost_opened(decision.signal_id, metadata={"position_id": result["position_id"]})
+            logger.info("ghost_position_recorded symbol=%s direction=%s position_id=%s recorded=%s", decision.symbol, decision.direction, result["position_id"], result["position_recorded"])
+        elif mode == MODE_REAL:
+            meta = dict(execution or {})
+            if meta.get("status") == STATUS_FAILED:
+                mark_real_open_failed(decision.signal_id, metadata=meta)
+            else:
+                mark_real_open_requested(decision.signal_id, metadata=meta)
+        elif mode == MODE_REJECT:
+            mark_rejected(decision.signal_id, reason=decision.reject_reason or ",".join(decision.reason_codes or []))
+    except Exception as exc:
+        logger.exception("signal_lifecycle_persist_failed")
+        result["errors"].append(f"lifecycle_failed:{exc}")
+    return result
+
 # =============================================================================
 # RealTrade integration
 # =============================================================================
@@ -656,9 +813,10 @@ def execute_route(
             decision = analyze_symbol_with_provider(symbol, market_provider)
             validation = validate_ai_decision(decision)
             execution = maybe_execute_real_decision(decision) if auto_execute_real and validation.get("valid") else {"executed": False}
+            lifecycle = persist_signal_lifecycle(decision, execution=execution) if validation.get("valid") else {}
             text = render_ai_decision(decision) + render_real_execution_note(execution)
             status = STATUS_OK if validation.get("valid") and execution.get("status", STATUS_OK) != STATUS_FAILED else STATUS_FAILED
-            return make_bot_response(text=text, status=status, action=action, data={"validation": validation, "execution": execution})
+            return make_bot_response(text=text, status=status, action=action, data={"validation": validation, "execution": execution, "lifecycle": lifecycle})
 
         if action == "SCAN_MARKET":
             if not strategy_manager.is_level4_active():
@@ -671,15 +829,18 @@ def execute_route(
                 return make_bot_response(text="سیگنال مناسبی پیدا نشد.", action=action, data={"count": 0})
 
             executions: list[dict[str, Any]] = []
+            lifecycles: list[dict[str, Any]] = []
             rendered: list[str] = []
             for decision in decisions:
                 execution = maybe_execute_real_decision(decision) if auto_execute_real and decision.mode == MODE_REAL else {"executed": False, "status": STATUS_OK}
+                lifecycle = persist_signal_lifecycle(decision, execution=execution)
                 executions.append(execution)
+                lifecycles.append(lifecycle)
                 rendered.append(render_ai_decision(decision, compact=True) + render_real_execution_note(execution))
 
             text = "📡 نتیجه اسکن Level 4\n\n" + "\n\n".join(rendered)
             failed_exec = any(x.get("status") == STATUS_FAILED for x in executions)
-            return make_bot_response(text=text, status=STATUS_FAILED if failed_exec else STATUS_OK, action=action, data={"count": len(decisions), "executions": executions})
+            return make_bot_response(text=text, status=STATUS_FAILED if failed_exec else STATUS_OK, action=action, data={"count": len(decisions), "executions": executions, "lifecycles": lifecycles})
 
         if action == "REQUEST_CLOSE_POSITION":
             symbol = normalize_symbol(args.get("symbol"))
@@ -988,18 +1149,21 @@ async def auto_signal_loop(application: Any) -> None:
                     if sendable:
                         rendered: list[str] = []
                         executions: list[dict[str, Any]] = []
+                        lifecycles: list[dict[str, Any]] = []
                         for decision in sendable:
                             execution = (
                                 maybe_execute_real_decision(decision)
                                 if decision.mode == MODE_REAL
                                 else {"executed": False, "status": STATUS_OK}
                             )
+                            lifecycle = persist_signal_lifecycle(decision, execution=execution)
                             executions.append(execution)
+                            lifecycles.append(lifecycle)
                             rendered.append(render_ai_decision(decision, compact=True) + render_real_execution_note(execution))
 
                         text = "🤖 اتو سیگنال Level 4\n\n" + "\n\n".join(rendered)
                         await _send_long_text_to_chat(application, chat_id, text)
-                        logger.info("auto_signal_sent count=%s executions=%s", len(sendable), executions)
+                        logger.info("auto_signal_sent count=%s executions=%s lifecycles=%s", len(sendable), executions, lifecycles)
                     else:
                         logger.info("auto_signal_no_sendable_signal count=%s", len(decisions))
             else:
@@ -1068,6 +1232,7 @@ __all__ = [
     "render_real_execution_note",
     "find_open_position_for_symbol",
     "render_close_result",
+    "persist_signal_lifecycle",
     "execute_route",
     "handle_text_message",
     "validate_bot_wiring",
