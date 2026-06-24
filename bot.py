@@ -1569,19 +1569,63 @@ async def auto_signal_loop(application: Any) -> None:
                     if sendable:
                         executions: list[dict[str, Any]] = []
                         lifecycles: list[dict[str, Any]] = []
+                        sent_count = 0
+                        silent_count = 0
                         for decision in sendable:
                             execution = await asyncio.to_thread(maybe_execute_real_decision, decision)
                             lifecycle = await asyncio.to_thread(persist_signal_lifecycle, decision, execution=execution)
                             executions.append(execution)
                             lifecycles.append(lifecycle)
+
+                            # Auto-signal rule:
+                            # If AI wanted REAL but it was converted to GHOST because real trading
+                            # is OFF, REAL slots are full, duplicate/open-order guard blocked it,
+                            # or Toobit/preflight blocked it, keep the GHOST record for learning
+                            # but do NOT send a Telegram auto-signal. This prevents noisy GHOST
+                            # messages while preserving stats/learning.
+                            converted_to_ghost = bool(execution.get("converted_to_ghost"))
+                            original_mode = safe_str((decision.metadata or {}).get("original_mode")).upper()
+                            block_reason = safe_str(
+                                execution.get("real_block_reason")
+                                or (decision.metadata or {}).get("real_block_reason")
+                                or execution.get("reason")
+                            ).lower()
+
+                            silent_converted_ghost = (
+                                safe_str(decision.mode).upper() == MODE_GHOST
+                                and converted_to_ghost
+                                and (
+                                    original_mode == MODE_REAL
+                                    or "trade" in block_reason
+                                    or "slot" in block_reason
+                                    or "max" in block_reason
+                                    or "preflight" in block_reason
+                                    or "duplicate" in block_reason
+                                    or "open" in block_reason
+                                    or "toobit" in block_reason
+                                )
+                            )
+
+                            if silent_converted_ghost:
+                                silent_count += 1
+                                logger.info(
+                                    "auto_signal_silent_converted_ghost symbol=%s direction=%s reason=%s lifecycle=%s",
+                                    decision.symbol,
+                                    decision.direction,
+                                    block_reason,
+                                    lifecycle,
+                                )
+                                continue
+
                             text = "🤖 اتو سیگنال Level 4\n\n" + render_ai_decision(decision, compact=True) + render_real_execution_note(execution)
                             sent_messages = await _send_long_text_to_chat(application, chat_id, text)
+                            sent_count += 1
                             if sent_messages and lifecycle.get("position_id"):
                                 msg_id = getattr(sent_messages[0], "message_id", None)
                                 if msg_id:
                                     update_position(lifecycle["position_id"], {"signal_message_id": msg_id})
                                     logger.info("signal_message_id_saved position_id=%s message_id=%s", lifecycle["position_id"], msg_id)
-                        logger.info("auto_signal_sent count=%s executions=%s lifecycles=%s", len(sendable), executions, lifecycles)
+                        logger.info("auto_signal_sent count=%s silent_converted_ghost=%s executions=%s lifecycles=%s", sent_count, silent_count, executions, lifecycles)
                     else:
                         logger.info("auto_signal_no_sendable_signal count=%s", len(decisions))
             else:
