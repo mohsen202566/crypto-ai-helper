@@ -506,6 +506,76 @@ class ToobitClient:
     def get_open_positions(self, symbol: str = "") -> list[dict[str, Any]]:
         return [dict(r) for r in self.get_positions(symbol) if self._position_qty(r) > 0]
 
+    def _order_items(self, payload: Any) -> list[dict[str, Any]]:
+        """Extract possible open-order rows from Toobit order responses."""
+        data = payload.get("data", payload) if isinstance(payload, dict) else payload
+        out: list[dict[str, Any]] = []
+
+        def walk(value: Any) -> None:
+            if isinstance(value, dict):
+                if any(k in value for k in ("orderId", "order_id", "clientOrderId", "newClientOrderId", "side", "type", "priceType", "takeProfit", "stopLoss", "triggerPrice", "symbol", "contractCode")):
+                    out.append(dict(value))
+                for child in value.values():
+                    walk(child)
+            elif isinstance(value, list):
+                for child in value:
+                    walk(child)
+
+        walk(data)
+        return out
+
+    def get_open_orders(self, symbol: str = "") -> list[dict[str, Any]]:
+        """Best-effort read of open Toobit futures orders for duplicate safety.
+
+        This is used as a safety guard before opening a REAL position. If Toobit
+        returns no supported endpoint, the caller receives an empty list; hard
+        duplicate protection still comes from get_position().
+        """
+        params = {"symbol": self.normalize_futures_symbol(symbol)} if symbol else {}
+        response = self._request_first_ok(
+            "GET",
+            [
+                "/api/v1/futures/openOrders",
+                "/api/v1/futures/order/openOrders",
+                "/api/v1/futures/orders/open",
+                "/api/v1/futures/order",
+            ],
+            params=params,
+            signed=True,
+        )
+        if not response.ok:
+            return []
+        rows = self._order_items(response.data)
+        if not symbol:
+            return rows
+        target = normalize_symbol(symbol)
+        matched: list[dict[str, Any]] = []
+        for row in rows:
+            row_symbol = safe_str(row.get("symbol") or row.get("contractCode") or row.get("instrumentId") or row.get("instId"))
+            if row_symbol and self.normalize_bot_symbol(row_symbol) != target:
+                continue
+            matched.append(row)
+        return matched
+
+    def has_open_orders(self, symbol: str = "") -> bool:
+        return bool(self.get_open_orders(symbol))
+
+    def has_position_or_orders(self, symbol: str, direction: str = "") -> tuple[bool, str, dict[str, Any]]:
+        """Return True when opening a new order would duplicate exposure.
+
+        A REAL order may only be sent when Toobit has no active position for the
+        same symbol/direction and no pending open/TP/SL orders for that symbol.
+        """
+        bot_symbol = normalize_symbol(symbol)
+        d = normalize_direction(direction)
+        existing_position = self.get_position(bot_symbol, d)
+        if existing_position:
+            return True, "exchange_position_exists", {"position": existing_position}
+        open_orders = self.get_open_orders(bot_symbol)
+        if open_orders:
+            return True, "exchange_open_orders_exist", {"orders": open_orders}
+        return False, "OK", {}
+
     def get_margin_mode(self, symbol: str) -> str:
         return self._margin_mode_cache.get(normalize_symbol(symbol), MARGIN_ISOLATED)
 
@@ -601,6 +671,22 @@ class ToobitClient:
         bot_symbol = normalize_symbol(symbol)
         d = normalize_direction(direction or side)
         entry_price = safe_float(price, 0.0) or 0.0
+
+        # HARD SAFETY: one REAL order per symbol/direction. TP/SL must be attached
+        # to the same opening order below; never open another position while the
+        # exchange already shows a position or pending TP/SL/open order for symbol.
+        duplicate, duplicate_reason, duplicate_meta = self.has_position_or_orders(bot_symbol, d)
+        if duplicate:
+            return TradeOpenResult(
+                status=STATUS_FAILED,
+                symbol=bot_symbol,
+                direction=d,
+                entry=entry_price,
+                quantity=safe_float(quantity, 0.0) or 0.0,
+                error=duplicate_reason,
+                raw=duplicate_meta,
+            )
+
         if margin_mode.upper() != MARGIN_ISOLATED:
             return TradeOpenResult(status=STATUS_FAILED, symbol=bot_symbol, direction=d, error="cross_margin_blocked")
         ok, qty, reason, rules = self.validate_quantity(bot_symbol, quantity, entry_price)
@@ -610,6 +696,10 @@ class ToobitClient:
         if TRADE_CONFIG.get("require_leverage_verification", True) and not lev_ok:
             return TradeOpenResult(status=STATUS_FAILED, symbol=bot_symbol, direction=d, quantity=qty, entry=entry_price, error=f"leverage_not_verified:{lev_reason}")
         params = {"symbol": rules.exchange_symbol or self.normalize_futures_symbol(bot_symbol), "side": open_side_for_direction(d), "type": "LIMIT", "priceType": "MARKET" if order_type.upper() == "MARKET" else safe_str(order_type, "MARKET").upper(), "quantity": qty, "newClientOrderId": client_order_id or f"L4_{bot_symbol}_{d}_{now_ms()}"}
+        # Toobit must receive TP and SL together with the opening order.
+        # take_profit_2 is intentionally NOT sent here because sending a second
+        # full-size TP order can create duplicate close orders. TP2/runner logic
+        # stays internal until a safe partial-size endpoint is confirmed.
         if take_profit:
             params["takeProfit"] = round_price(take_profit, rules.price_tick)
             params["tpOrderType"] = "MARKET"
