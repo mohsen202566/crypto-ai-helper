@@ -116,7 +116,11 @@ def parse_symbol(text: str) -> str:
 def parse_runtime_update(text: str) -> Optional[CommandRoute]:
     normalized = normalize_text(text).lower()
 
-    if any(x in normalized for x in ["مارجین", "margin", "مبلغ"]):
+    if any(x in normalized for x in [
+        "مارجین", "margin", "مبلغ",
+        "ترید دلار", "دلار ترید", "حجم ترید", "trade dollar", "trade dollars",
+        "سرمایه ترید", "مقدار ترید",
+    ]):
         value = first_float(normalized)
         if value is not None and value > 0:
             return route("SET_MARGIN", text=text, args={"margin_usdt": value})
@@ -126,10 +130,16 @@ def parse_runtime_update(text: str) -> Optional[CommandRoute]:
         if value is not None and value > 0:
             return route("SET_LEVERAGE", text=text, args={"leverage": value})
 
-    if any(x in normalized for x in ["حداکثر پوزیشن", "max position", "max_positions", "مکس پوزیشن"]):
+    if any(x in normalized for x in [
+        "حداکثر پوزیشن", "max position", "max_positions", "مکس پوزیشن",
+        "حداکثر معامله", "حداکثر ترید", "max trades", "max positions",
+    ]):
         value = first_number(normalized)
         if value is not None and value > 0:
             return route("SET_MAX_POSITIONS", text=text, args={"max_positions": value})
+
+    if normalized in {"ریست ترید", "ریست تنظیمات ترید", "reset trade", "reset settings"}:
+        return route("RESET_TRADE_SETTINGS", text=text)
 
     return None
 
@@ -156,6 +166,9 @@ def parse_status_commands(text: str) -> Optional[CommandRoute]:
     if normalized in {"راهنما", "help", "/help", "دستورات", "/start", "start"}:
         return route("HELP", text=text, reply_text=render_help())
 
+    if normalized in {"لیست استراتژی", "لیست استراتژی ها", "لیست استراتژی‌ها", "strategy list", "list strategies"}:
+        return route("LIST_STRATEGIES", text=text)
+
     if normalized in {"استراتژی", "وضعیت استراتژی", "strategy", "strategy status"}:
         return route("SHOW_STRATEGY", text=text)
 
@@ -168,7 +181,10 @@ def parse_status_commands(text: str) -> Optional[CommandRoute]:
     if normalized in {"آمار", "امار", "stats", "statistics"}:
         return route("SHOW_STATS", text=text)
 
-    if normalized in {"تنظیمات", "تنظیمات ترید", "trade settings", "settings"}:
+    if normalized in {
+        "تنظیمات", "تنظیمات ترید", "وضعیت ترید", "trade settings",
+        "settings", "trade status", "وضعیت معامله",
+    }:
         return route("SHOW_TRADE_SETTINGS", text=text)
 
     return None
