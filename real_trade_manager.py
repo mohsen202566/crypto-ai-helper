@@ -502,6 +502,94 @@ def close_position_executor(position: TradePosition, reason: str, quantity: floa
     return close_real_position(position, reason=reason, quantity=quantity, current_price=current_price)
 
 
+def exchange_position_checker(position: TradePosition, *, client: Optional[ToobitClient] = None) -> dict[str, Any]:
+    """Adapter for position_monitor: check whether a REAL position still exists on Toobit.
+
+    This does not close or modify anything. It only reads Toobit state so
+    position_monitor can detect exchange-side TP/SL/manual closes.
+    """
+    try:
+        c = client or get_client()
+        row = c.get_position(position.symbol, position.direction)
+        exists = bool(row)
+        return {
+            "status": STATUS_OK,
+            "exists": exists,
+            "open": exists,
+            "position_exists": exists,
+            "found": exists,
+            "symbol": normalize_symbol(position.symbol),
+            "direction": normalize_direction(position.direction),
+            "row": dict(row) if isinstance(row, Mapping) else row,
+            "checked_at": utc_now_iso(),
+        }
+    except Exception as exc:
+        return {
+            "status": STATUS_FAILED,
+            "exists": False,
+            "open": False,
+            "position_exists": False,
+            "found": False,
+            "error": str(exc),
+            "symbol": normalize_symbol(getattr(position, "symbol", "")),
+            "direction": normalize_direction(getattr(position, "direction", "")),
+            "checked_at": utc_now_iso(),
+        }
+
+
+def closed_pnl_reader(position: TradePosition, *, client: Optional[ToobitClient] = None) -> dict[str, Any]:
+    """Adapter for position_monitor: read closed-position PnL after Toobit TP/SL/manual close.
+
+    It prefers Toobit closed-history helpers when available. The wait is kept
+    short so monitor loop and Telegram responses do not hang.
+    """
+    try:
+        c = client or get_client()
+        symbol = normalize_symbol(position.symbol)
+        direction = normalize_direction(position.direction)
+
+        fn_wait = getattr(c, "wait_for_closed_position_pnl", None)
+        if callable(fn_wait):
+            data = _client_call(
+                fn_wait,
+                symbol,
+                direction,
+                timeout_seconds=safe_int(TRADE_CONFIG.get("closed_pnl_wait_seconds"), 8) or 8,
+                poll_seconds=safe_int(TRADE_CONFIG.get("closed_pnl_poll_seconds"), 2) or 2,
+                default=None,
+            )
+            if isinstance(data, Mapping) and (data.get("confirmed") or data.get("pnl_usdt") is not None):
+                out = dict(data)
+                out.setdefault("status", STATUS_OK)
+                return out
+
+        fn_once = getattr(c, "get_closed_position_pnl", None)
+        if callable(fn_once):
+            data = _client_call(fn_once, symbol, direction, default=None)
+            if isinstance(data, Mapping):
+                out = dict(data)
+                out.setdefault("status", STATUS_OK if not out.get("error") else STATUS_FAILED)
+                return out
+
+        return {
+            "status": STATUS_FAILED,
+            "confirmed": False,
+            "pnl_usdt": None,
+            "error": "closed_pnl_reader_unavailable",
+            "symbol": symbol,
+            "direction": direction,
+        }
+    except Exception as exc:
+        return {
+            "status": STATUS_FAILED,
+            "confirmed": False,
+            "pnl_usdt": None,
+            "error": str(exc),
+            "symbol": normalize_symbol(getattr(position, "symbol", "")),
+            "direction": normalize_direction(getattr(position, "direction", "")),
+        }
+
+
 def emergency_disable_real_trading(reason: str = "emergency_stop") -> RecordResult:
     from strategy_manager import disable_real_trading
     res = disable_real_trading()
@@ -662,5 +750,6 @@ __all__ = [
     "REAL_TRADE_MANAGER_VERSION", "get_runtime", "estimate_quantity", "estimate_tp1_net_profit",
     "preflight_real_trade", "build_pending_position", "open_real_trade", "confirm_real_open",
     "wait_for_real_open_confirmation", "close_real_position", "close_position_executor",
+    "exchange_position_checker", "closed_pnl_reader",
     "emergency_disable_real_trading", "verify_or_repair_same_tp_sl_after_delay", "get_real_trade_status", "validate_real_trade_manager_light",
 ]
