@@ -79,6 +79,8 @@ from ai_brain import build_ai_decision, validate_ai_decision, evaluate_open_posi
 from real_trade_manager import (
     close_real_position,
     close_position_executor,
+    exchange_position_checker,
+    closed_pnl_reader,
     confirm_real_open,
     open_real_trade,
     preflight_real_trade,
@@ -776,6 +778,99 @@ def render_real_execution_note(execution: Mapping[str, Any]) -> str:
     return "\n\n✅ سفارش REAL ارسال شد\nPosition ID: " + safe_str(execution.get("position_id"))
 
 
+def _real_slots_available_now() -> tuple[bool, dict[str, Any]]:
+    """Return whether a new REAL auto signal may be attempted right now.
+
+    Exchange-first check is used so Toobit open positions count even if
+    positions.json is temporarily behind.
+    """
+    try:
+        status = get_real_trade_status(include_exchange=True)
+    except Exception as exc:
+        logger.exception("real_slots_available_check_failed")
+        return False, {"status": STATUS_FAILED, "error": str(exc)}
+
+    if not bool(status.get("real_trading_enabled")):
+        return False, status
+
+    max_real = safe_int(status.get("max_concurrent_real_positions"), 0) or 0
+    effective_real = safe_int(
+        status.get("effective_real_open", status.get("toobit_open_total", status.get("local_real_open", 0))),
+        0,
+    ) or 0
+
+    if max_real > 0 and effective_real >= max_real:
+        return False, status
+
+    available = safe_int(status.get("available_real_slots"), 0)
+    if max_real > 0 and available is not None and available <= 0:
+        return False, status
+
+    return True, status
+
+
+def _prepare_auto_decision_for_real_or_silent(decision: AIDecision, *, slot_status: Mapping[str, Any]) -> tuple[AIDecision, bool, str]:
+    """Apply the user's auto-signal rule.
+
+    - Trade OFF or REAL slots full: keep/convert to GHOST for learning only, no Telegram signal.
+    - Trade ON and REAL slot free: auto signal should be attempted as REAL, not displayed as GHOST.
+    """
+    can_real = bool(slot_status.get("_can_real", False))
+    trade_on = bool(slot_status.get("real_trading_enabled", False))
+    max_real = safe_int(slot_status.get("max_concurrent_real_positions"), 0) or 0
+    effective_real = safe_int(slot_status.get("effective_real_open", slot_status.get("toobit_open_total", 0)), 0) or 0
+
+    if not trade_on:
+        decision.mode = MODE_GHOST
+        meta = dict(decision.metadata or {})
+        meta["auto_silent_ghost_reason"] = "trade_off"
+        meta.setdefault("original_mode", safe_str(getattr(decision, "mode", "")).upper() or MODE_REAL)
+        decision.metadata = meta
+        if "AUTO_TRADE_OFF_GHOST_SILENT" not in decision.reason_codes:
+            decision.reason_codes.append("AUTO_TRADE_OFF_GHOST_SILENT")
+        return decision, True, "trade_off"
+
+    if not can_real or (max_real > 0 and effective_real >= max_real):
+        decision.mode = MODE_GHOST
+        meta = dict(decision.metadata or {})
+        meta["auto_silent_ghost_reason"] = "real_slots_full"
+        meta["real_slot_status"] = dict(slot_status)
+        meta.setdefault("original_mode", safe_str(getattr(decision, "mode", "")).upper() or MODE_REAL)
+        decision.metadata = meta
+        if "AUTO_REAL_SLOTS_FULL_GHOST_SILENT" not in decision.reason_codes:
+            decision.reason_codes.append("AUTO_REAL_SLOTS_FULL_GHOST_SILENT")
+        return decision, True, "real_slots_full"
+
+    # Slot is available and trade is ON: auto signal must attempt REAL.
+    if safe_str(decision.mode).upper() == MODE_GHOST:
+        meta = dict(decision.metadata or {})
+        meta["auto_promoted_ghost_to_real"] = True
+        meta["original_mode"] = MODE_GHOST
+        meta["real_slot_status"] = dict(slot_status)
+        decision.metadata = meta
+        if "AUTO_SLOT_AVAILABLE_PROMOTED_TO_REAL" not in decision.reason_codes:
+            decision.reason_codes.append("AUTO_SLOT_AVAILABLE_PROMOTED_TO_REAL")
+        decision.mode = MODE_REAL
+
+    return decision, False, "real_allowed"
+
+
+
+def _prepare_manual_decision_for_real_or_ghost(decision: AIDecision) -> tuple[AIDecision, dict[str, Any], str]:
+    """Apply the same REAL/GHOST mode rule for manual analysis/scan display.
+
+    Manual commands still show the result to the user, but the mode should be
+    consistent:
+    - trade ON + REAL slot free => try REAL
+    - trade OFF / REAL slots full => GHOST
+    """
+    can_real, slot_status = _real_slots_available_now()
+    slot_status = dict(slot_status or {})
+    slot_status["_can_real"] = can_real
+    decision, _silent, reason = _prepare_auto_decision_for_real_or_silent(decision, slot_status=slot_status)
+    return decision, slot_status, reason
+
+
 def find_open_position_for_symbol(symbol: str) -> Optional[TradePosition]:
     target = normalize_symbol(symbol)
     for position in get_open_positions():
@@ -965,13 +1060,15 @@ def execute_route(
             symbol = normalize_symbol(args.get("symbol"))
             if not market_provider:
                 return make_bot_response(text=render_error("Market provider هنوز وصل نشده است."), status=STATUS_FAILED, action=action)
-            decision = force_real_to_ghost_when_trade_off(analyze_symbol_with_provider(symbol, market_provider))
+            decision, slot_status, mode_reason = _prepare_manual_decision_for_real_or_ghost(
+                analyze_symbol_with_provider(symbol, market_provider)
+            )
             validation = validate_ai_decision(decision)
             execution = maybe_execute_real_decision(decision) if auto_execute_real and validation.get("valid") else {"executed": False, "status": STATUS_OK}
             lifecycle = persist_signal_lifecycle(decision, execution=execution) if validation.get("valid") else {}
             text = render_ai_decision(decision) + render_real_execution_note(execution)
             status = STATUS_OK if validation.get("valid") and execution.get("status", STATUS_OK) != STATUS_FAILED else STATUS_FAILED
-            return make_bot_response(text=text, status=status, action=action, data={"validation": validation, "execution": execution, "lifecycle": lifecycle})
+            return make_bot_response(text=text, status=status, action=action, data={"validation": validation, "execution": execution, "lifecycle": lifecycle, "slot_status": slot_status, "mode_reason": mode_reason})
 
         if action == "SCAN_MARKET":
             if not strategy_manager.is_level4_active():
@@ -979,14 +1076,19 @@ def execute_route(
             if not market_provider:
                 return make_bot_response(text=render_error("Market provider هنوز وصل نشده است."), status=STATUS_FAILED, action=action)
             symbols = default_scan_symbols or list(LEVEL_4_SYMBOLS)
-            decisions = [force_real_to_ghost_when_trade_off(d) for d in scan_market_with_provider(symbols, market_provider)]
+            decisions = scan_market_with_provider(symbols, market_provider)
             if not decisions:
                 return make_bot_response(text="سیگنال مناسبی پیدا نشد.", action=action, data={"count": 0})
 
             executions: list[dict[str, Any]] = []
             lifecycles: list[dict[str, Any]] = []
             rendered: list[str] = []
+            mode_reasons: list[str] = []
+            slot_statuses: list[dict[str, Any]] = []
             for decision in decisions:
+                decision, slot_status, mode_reason = _prepare_manual_decision_for_real_or_ghost(decision)
+                slot_statuses.append(slot_status)
+                mode_reasons.append(mode_reason)
                 execution = maybe_execute_real_decision(decision) if auto_execute_real else {"executed": False, "status": STATUS_OK}
                 lifecycle = persist_signal_lifecycle(decision, execution=execution)
                 executions.append(execution)
@@ -995,7 +1097,7 @@ def execute_route(
 
             text = "📡 نتیجه اسکن Level 4\n\n" + "\n\n".join(rendered)
             failed_exec = any(x.get("status") == STATUS_FAILED for x in executions)
-            return make_bot_response(text=text, status=STATUS_FAILED if failed_exec else STATUS_OK, action=action, data={"count": len(decisions), "executions": executions, "lifecycles": lifecycles})
+            return make_bot_response(text=text, status=STATUS_FAILED if failed_exec else STATUS_OK, action=action, data={"count": len(decisions), "executions": executions, "lifecycles": lifecycles, "mode_reasons": mode_reasons, "slot_statuses": slot_statuses})
 
         if action == "REQUEST_CLOSE_POSITION":
             symbol = normalize_symbol(args.get("symbol"))
@@ -1446,6 +1548,8 @@ async def position_monitor_loop(application: Any) -> None:
                 ai_decision_provider=_ai_monitor_decision_provider,
                 close_executor=close_position_executor,
                 open_confirm_checker=confirm_real_open,
+                exchange_position_checker=exchange_position_checker,
+                closed_pnl_reader=closed_pnl_reader,
             )
             if events:
                 logger.info("position_monitor_events count=%s events=%s", len(events), [e.event for e in events])
@@ -1564,38 +1668,45 @@ async def auto_signal_loop(application: Any) -> None:
                         [d.symbol for d in decisions],
                     )
 
-                    # Avoid spamming pure reject-only scans, but log them.
-                    sendable = [force_real_to_ghost_when_trade_off(d) for d in decisions if d.mode in {MODE_REAL, MODE_GHOST}]
+                    # Auto-signal rule:
+                    # - If trade is ON and a REAL slot is free, a valid auto signal should attempt REAL.
+                    # - If trade is OFF or REAL slots are full, keep GHOST for learning but do not send Telegram noise.
+                    sendable = [d for d in decisions if d.mode in {MODE_REAL, MODE_GHOST}]
                     if sendable:
                         executions: list[dict[str, Any]] = []
                         lifecycles: list[dict[str, Any]] = []
                         sent_count = 0
                         silent_count = 0
+
                         for decision in sendable:
+                            can_real, slot_status = await asyncio.to_thread(_real_slots_available_now)
+                            slot_status = dict(slot_status or {})
+                            slot_status["_can_real"] = can_real
+
+                            decision, silent_before_execution, silent_reason = _prepare_auto_decision_for_real_or_silent(
+                                decision,
+                                slot_status=slot_status,
+                            )
+
                             execution = await asyncio.to_thread(maybe_execute_real_decision, decision)
                             lifecycle = await asyncio.to_thread(persist_signal_lifecycle, decision, execution=execution)
                             executions.append(execution)
                             lifecycles.append(lifecycle)
 
-                            # Auto-signal rule:
-                            # If AI wanted REAL but it was converted to GHOST because real trading
-                            # is OFF, REAL slots are full, duplicate/open-order guard blocked it,
-                            # or Toobit/preflight blocked it, keep the GHOST record for learning
-                            # but do NOT send a Telegram auto-signal. This prevents noisy GHOST
-                            # messages while preserving stats/learning.
                             converted_to_ghost = bool(execution.get("converted_to_ghost"))
-                            original_mode = safe_str((decision.metadata or {}).get("original_mode")).upper()
                             block_reason = safe_str(
                                 execution.get("real_block_reason")
                                 or (decision.metadata or {}).get("real_block_reason")
+                                or (decision.metadata or {}).get("auto_silent_ghost_reason")
                                 or execution.get("reason")
+                                or silent_reason
                             ).lower()
 
                             silent_converted_ghost = (
                                 safe_str(decision.mode).upper() == MODE_GHOST
-                                and converted_to_ghost
                                 and (
-                                    original_mode == MODE_REAL
+                                    silent_before_execution
+                                    or converted_to_ghost
                                     or "trade" in block_reason
                                     or "slot" in block_reason
                                     or "max" in block_reason
@@ -1609,10 +1720,22 @@ async def auto_signal_loop(application: Any) -> None:
                             if silent_converted_ghost:
                                 silent_count += 1
                                 logger.info(
-                                    "auto_signal_silent_converted_ghost symbol=%s direction=%s reason=%s lifecycle=%s",
+                                    "auto_signal_silent_ghost symbol=%s direction=%s reason=%s lifecycle=%s",
                                     decision.symbol,
                                     decision.direction,
                                     block_reason,
+                                    lifecycle,
+                                )
+                                continue
+
+                            # Do not send original/pure GHOST auto messages. Auto Telegram signals are for REAL only.
+                            if safe_str(decision.mode).upper() != MODE_REAL:
+                                silent_count += 1
+                                logger.info(
+                                    "auto_signal_pure_ghost_silent symbol=%s direction=%s reason=%s lifecycle=%s",
+                                    decision.symbol,
+                                    decision.direction,
+                                    block_reason or "pure_ghost",
                                     lifecycle,
                                 )
                                 continue
@@ -1625,7 +1748,7 @@ async def auto_signal_loop(application: Any) -> None:
                                 if msg_id:
                                     update_position(lifecycle["position_id"], {"signal_message_id": msg_id})
                                     logger.info("signal_message_id_saved position_id=%s message_id=%s", lifecycle["position_id"], msg_id)
-                        logger.info("auto_signal_sent count=%s silent_converted_ghost=%s executions=%s lifecycles=%s", sent_count, silent_count, executions, lifecycles)
+                        logger.info("auto_signal_sent count=%s silent_ghost=%s executions=%s lifecycles=%s", sent_count, silent_count, executions, lifecycles)
                     else:
                         logger.info("auto_signal_no_sendable_signal count=%s", len(decisions))
             else:
