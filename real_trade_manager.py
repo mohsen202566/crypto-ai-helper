@@ -88,6 +88,22 @@ def _exchange_position_exists(client: ToobitClient, symbol: str, direction: str)
     return False, {}
 
 
+def _exchange_open_positions_snapshot(client: ToobitClient) -> tuple[list[dict[str, Any]], str]:
+    """Return all currently open Toobit futures positions.
+
+    This is used as the real source of truth for max REAL slots.  Internal
+    positions.json can lag or miss a position; Toobit open positions must
+    still block new REAL orders when the configured max is reached.
+    """
+    try:
+        rows = client.get_open_positions()
+        if not isinstance(rows, list):
+            return [], "exchange_open_positions_invalid_response"
+        return [dict(r) for r in rows if isinstance(r, Mapping)], ""
+    except Exception as exc:
+        return [], f"exchange_open_positions_check_failed:{exc}"
+
+
 def _normalize_exchange_order_symbol(client: ToobitClient, row: Mapping[str, Any]) -> str:
     raw = safe_str(
         row.get("symbol")
@@ -286,8 +302,18 @@ def preflight_real_trade(decision: AIDecision, *, client: Optional[ToobitClient]
         errors.append("stale_or_open_exchange_orders_exist")
 
     max_real = safe_int(runtime.get("max_concurrent_real_positions"), TRADE_CONFIG.get("max_concurrent_real_positions", 3)) or 3
-    if count_open_real_positions() >= max_real:
-        errors.append("max_real_positions_reached")
+
+    local_real_open = count_open_real_positions()
+    if local_real_open >= max_real:
+        errors.append(f"max_real_positions_reached:{local_real_open}>={max_real}")
+
+    exchange_open_positions, exchange_open_error = _exchange_open_positions_snapshot(c)
+    exchange_open_total = len(exchange_open_positions)
+    if exchange_open_error:
+        # Safety first: if we cannot read Toobit open positions, do not open a new REAL.
+        errors.append(exchange_open_error)
+    elif exchange_open_total >= max_real:
+        errors.append(f"max_exchange_real_positions_reached:{exchange_open_total}>={max_real}")
 
     margin_mode = safe_str(runtime.get("margin_mode"), MARGIN_ISOLATED).upper()
     if margin_mode != MARGIN_ISOLATED:
@@ -324,6 +350,11 @@ def preflight_real_trade(decision: AIDecision, *, client: Optional[ToobitClient]
         "exchange_position": exchange_position_row if exchange_position_exists else {},
         "exchange_open_orders_exist": exchange_orders_exist,
         "exchange_open_orders": exchange_orders[:5] if exchange_orders_exist else [],
+        "exchange_open_total": exchange_open_total,
+        "exchange_open_positions": exchange_open_positions[:10],
+        "exchange_open_error": exchange_open_error,
+        "local_real_open": local_real_open,
+        "max_real_positions": max_real,
         "entry": entry, "margin_usdt": margin, "leverage": leverage, "margin_mode": margin_mode,
         "quantity_estimate": quantity_est, "quantity": qty, "quantity_reason": qty_reason,
         "symbol_rules": rules.to_dict() if rules else {}, "tp1_gross_profit_estimate": gross,
