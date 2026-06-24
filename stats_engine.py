@@ -365,6 +365,19 @@ def get_daily_stats(days: int = 1, limit: int = DEFAULT_STATS_LIMIT) -> dict[str
 
 
 def get_position_stats() -> dict[str, Any]:
+    """Return position counters for the stats/status panel.
+
+    REAL open positions are exchange-first.  The internal positions.json file is
+    still useful for GHOST positions, message links, learning metadata, and local
+    lifecycle state, but it can lag Toobit after restart/API delays.  Therefore:
+    - active_real is the effective REAL count: max(Toobit open REAL, local REAL)
+    - local_active_real is shown separately for debugging/reconcile visibility
+    - active_ghost remains local because GHOST exists only inside the bot
+
+    The import of real_trade_manager is intentionally lazy to avoid startup/circular
+    import issues.  If the live exchange status cannot be read, the function
+    safely falls back to local positions.json counts.
+    """
     summary = get_positions_summary()
     open_positions = get_open_positions()
     closed_positions = get_closed_positions()
@@ -377,17 +390,60 @@ def get_position_stats() -> dict[str, Any]:
         by_status[status] = by_status.get(status, 0) + 1
         by_mode[mode] = by_mode.get(mode, 0) + 1
 
+    local_active_real = by_status.get(POSITION_ACTIVE_REAL, 0)
+    local_pending_real = by_status.get(POSITION_PENDING_REAL_CONFIRM, 0)
+    local_active_ghost = by_status.get(POSITION_ACTIVE_GHOST, 0)
+    local_partial_tp1 = by_status.get(POSITION_PARTIAL_TP1, 0)
+    local_open_total = len(open_positions)
+
+    toobit_open_total = 0
+    effective_real_open = local_active_real
+    available_real_slots = None
+    real_slots_over_limit = False
+    exchange_checked = False
+    exchange_error = ""
+
+    try:
+        from real_trade_manager import get_real_trade_status
+
+        live_status = get_real_trade_status(include_exchange=True)
+        if isinstance(live_status, Mapping):
+            exchange_checked = True
+            toobit_open_total = safe_int(live_status.get("toobit_open_total"), 0) or 0
+            effective_real_open = safe_int(
+                live_status.get("effective_real_open"),
+                max(local_active_real, toobit_open_total),
+            ) or max(local_active_real, toobit_open_total)
+            available_real_slots = safe_int(live_status.get("available_real_slots"), None)
+            real_slots_over_limit = bool(live_status.get("real_slots_over_limit", False))
+        else:
+            exchange_error = "invalid_real_trade_status"
+    except Exception as exc:
+        exchange_error = safe_str(exc)
+
+    # Total open display should include exchange-first REAL plus local GHOST/runner.
+    # This avoids showing 1 REAL when Toobit actually has 3 open REAL positions.
+    effective_open_total = effective_real_open + local_active_ghost + local_partial_tp1
+
     return {
         "system_version": SYSTEM_VERSION,
         "scope": "POSITIONS",
         "summary": summary,
-        "open_total": len(open_positions),
+        "open_total": effective_open_total,
+        "local_open_total": local_open_total,
         "closed_total": len(closed_positions),
-        "pending_real_confirm": by_status.get(POSITION_PENDING_REAL_CONFIRM, 0),
-        "active_real": by_status.get(POSITION_ACTIVE_REAL, 0),
-        "active_ghost": by_status.get(POSITION_ACTIVE_GHOST, 0),
-        "partial_tp1": by_status.get(POSITION_PARTIAL_TP1, 0),
+        "pending_real_confirm": local_pending_real,
+        "active_real": effective_real_open,
+        "active_ghost": local_active_ghost,
+        "partial_tp1": local_partial_tp1,
         "closed": by_status.get(POSITION_CLOSED, 0),
+        "local_active_real": local_active_real,
+        "toobit_open_total": toobit_open_total,
+        "effective_real_open": effective_real_open,
+        "available_real_slots": available_real_slots,
+        "real_slots_over_limit": real_slots_over_limit,
+        "exchange_checked": exchange_checked,
+        "exchange_error": exchange_error,
         "by_status": by_status,
         "by_mode": by_mode,
         "updated_at": utc_now_iso(),
