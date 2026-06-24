@@ -95,6 +95,79 @@ def _is_open_status(status: Any) -> bool:
     return safe_str(status).upper() in set(OPEN_POSITION_STATES)
 
 
+def _exchange_position_key(item: Any) -> tuple[str, str]:
+    """
+    Normalize one exchange-side open position into (symbol, direction).
+
+    This helper is intentionally permissive because Toobit client responses may use
+    different field names depending on endpoint/wrapper. It does not call exchange APIs.
+    """
+    if isinstance(item, str):
+        return normalize_symbol(item), ""
+
+    if not isinstance(item, Mapping):
+        return "", ""
+
+    symbol = normalize_symbol(
+        item.get("symbol")
+        or item.get("pair")
+        or item.get("instrument")
+        or item.get("instrument_id")
+        or item.get("instId")
+        or item.get("contractCode")
+    )
+
+    direction_raw = (
+        item.get("direction")
+        or item.get("position_side")
+        or item.get("positionSide")
+        or item.get("side")
+        or item.get("holdSide")
+        or item.get("posSide")
+    )
+    direction = normalize_direction(direction_raw)
+
+    # Some exchange payloads use BUY/SELL instead of LONG/SHORT for position side.
+    raw_upper = safe_str(direction_raw).upper()
+    if not direction and raw_upper == "BUY":
+        direction = "LONG"
+    elif not direction and raw_upper == "SELL":
+        direction = "SHORT"
+
+    return symbol, direction
+
+
+def _build_exchange_open_sets(exchange_open_positions: list[Any]) -> tuple[set[str], set[tuple[str, str]]]:
+    """Return symbol-only and symbol+direction sets from exchange open positions."""
+    open_symbols: set[str] = set()
+    open_symbol_dirs: set[tuple[str, str]] = set()
+
+    for item in exchange_open_positions or []:
+        symbol, direction = _exchange_position_key(item)
+        if not symbol:
+            continue
+        open_symbols.add(symbol)
+        if direction:
+            open_symbol_dirs.add((symbol, direction))
+
+    return open_symbols, open_symbol_dirs
+
+
+def _internal_real_matches_exchange(position: TradePosition, open_symbols: set[str], open_symbol_dirs: set[tuple[str, str]]) -> bool:
+    """Return True when an internal REAL position still exists on exchange."""
+    symbol = normalize_symbol(position.symbol)
+    direction = normalize_direction(position.direction)
+    if not symbol:
+        return False
+
+    # Prefer exact symbol+direction matching when the exchange payload has direction.
+    if open_symbol_dirs:
+        return (symbol, direction) in open_symbol_dirs
+
+    # Fallback for exchange wrappers that only return symbols.
+    return symbol in open_symbols
+
+
 # =============================================================================
 # Read operations
 # =============================================================================
@@ -502,6 +575,100 @@ def get_active_monitor_positions() -> list[TradePosition]:
 
 
 # =============================================================================
+# Exchange reconcile helpers
+# =============================================================================
+
+def reconcile_real_positions_with_exchange(
+    exchange_open_positions: list[Any],
+    *,
+    close_reason: str = "exchange_reconcile_missing",
+) -> dict[str, Any]:
+    """
+    Reconcile internal REAL open slots with exchange-side open positions.
+
+    Important rules:
+    - This function does NOT call Toobit/exchange APIs. Pass the latest open
+      exchange positions from real_trade_manager/tobit_client.
+    - If an internal REAL position is open but no matching exchange position
+      exists anymore, it is marked POSITION_CLOSED so the REAL slot is freed.
+    - It does NOT record learning/stats outcomes. Results should still be recorded
+      by position_monitor/result handlers when TP/SL/AI_EXIT is detected.
+    - GHOST positions are never touched.
+    """
+    try:
+        open_symbols, open_symbol_dirs = _build_exchange_open_sets(exchange_open_positions or [])
+
+        payload = _load_payload()
+        records = payload.get("positions", [])
+        changed = False
+        closed_ids: list[str] = []
+        kept_ids: list[str] = []
+        new_records: list[dict[str, Any]] = []
+
+        for item in records:
+            try:
+                position = _position_from_any(item)
+            except Exception:
+                new_records.append(item)
+                continue
+
+            is_open_real = position.mode == MODE_REAL and _is_open_status(position.status)
+            if not is_open_real:
+                new_records.append(item)
+                continue
+
+            if _internal_real_matches_exchange(position, open_symbols, open_symbol_dirs):
+                kept_ids.append(position.position_id)
+                new_records.append(item)
+                continue
+
+            record = to_dict(position)
+            metadata = dict(record.get("monitor_metadata") or {})
+            metadata.update(
+                {
+                    "close_reason": close_reason,
+                    "reconciled_at": utc_now_iso(),
+                    "exchange_missing": True,
+                    "slot_freed_by_reconcile": True,
+                }
+            )
+            record["status"] = POSITION_CLOSED
+            record["monitor_metadata"] = metadata
+            record["updated_at"] = utc_now_iso()
+            new_records.append(_normalize_record(record))
+            closed_ids.append(position.position_id)
+            changed = True
+
+        if changed:
+            payload["positions"] = new_records
+            ok = _save_payload(payload)
+        else:
+            ok = True
+
+        return {
+            "status": STATUS_OK if ok else STATUS_FAILED,
+            "changed": changed,
+            "closed_count": len(closed_ids),
+            "closed_position_ids": closed_ids,
+            "kept_real_open_ids": kept_ids,
+            "exchange_open_symbols": sorted(open_symbols),
+            "exchange_open_symbol_dirs": sorted([f"{s}:{d}" for s, d in open_symbol_dirs]),
+            "updated_at": utc_now_iso(),
+        }
+
+    except Exception as exc:
+        log_error(module="position_manager", function="reconcile_real_positions_with_exchange", error=exc)
+        return {
+            "status": STATUS_FAILED,
+            "changed": False,
+            "closed_count": 0,
+            "closed_position_ids": [],
+            "error": str(exc),
+            "updated_at": utc_now_iso(),
+        }
+
+
+# =============================================================================
 # Validation / summaries
 # =============================================================================
 
@@ -621,6 +788,7 @@ __all__ = [
     "get_recoverable_positions",
     "get_pending_real_confirm_positions",
     "get_active_monitor_positions",
+    "reconcile_real_positions_with_exchange",
     "validate_position_record",
     "validate_positions_file_light",
     "get_positions_summary",
