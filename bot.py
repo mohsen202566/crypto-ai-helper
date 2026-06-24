@@ -75,7 +75,7 @@ from market_context import build_market_context_from_snapshots
 from reversal_engine import build_reversal_snapshot
 from timing_engine import build_timing_snapshot
 from tp_sl_engine import build_tp_sl_plan
-from ai_brain import build_ai_decision, validate_ai_decision
+from ai_brain import build_ai_decision, validate_ai_decision, evaluate_open_position
 from real_trade_manager import (
     close_real_position,
     close_position_executor,
@@ -86,7 +86,7 @@ from real_trade_manager import (
     get_real_trade_status,
 )
 from learning_memory import get_learning_summary, reset_learning_memory
-from position_monitor import monitor_positions_once
+from position_monitor import monitor_positions_once, progress_to_tp1
 from utils import normalize_direction, normalize_symbol, safe_float, safe_int, safe_str, utc_now_iso
 
 
@@ -1339,8 +1339,64 @@ def _current_price_from_provider(provider: Any, symbol: str) -> float:
 
 
 def _ai_monitor_decision_provider(position: TradePosition, current_price: float) -> Any:
-    # Bot-level monitor keeps AI exit optional/safe for now. TP/SL and real close confirmation still run.
-    return None
+    """Build AI exit/hold decision for open positions.
+
+    Locked behavior:
+    - Before TP1, AI exit is allowed only when progress to TP1 is >= 70%
+      and weakness/reversal/trap risk is confirmed by ai_brain.
+    - After TP1, only the runner may be closed on meaningful weakness.
+    - This function only returns a decision; position_monitor still enforces
+      the 70% rule and real_trade_manager/Toobit must confirm the close.
+    """
+    price = safe_float(current_price, None)
+    if price is None or price <= 0:
+        return None
+
+    try:
+        provider = OKXMarketProvider()
+        candles = provider_get_candles(provider, position.symbol, timeframe=PRIMARY_TIMEFRAME, limit=OKX_CANDLE_LIMIT_DEFAULT)
+        if not candles:
+            # Fall back to faster candles so AI exit is not disabled when 1H data is temporarily unavailable.
+            for tf in ("15m", "5m", "3m", "1m"):
+                candles = provider_get_candles(provider, position.symbol, timeframe=tf, limit=OKX_CANDLE_LIMIT_DEFAULT)
+                if candles:
+                    break
+        if not candles:
+            return None
+
+        snapshot = make_offline_snapshot(normalize_symbol(position.symbol), PRIMARY_TIMEFRAME, candles)
+        sensor = build_sensor_snapshot(snapshot)
+        direction = normalize_direction(position.direction)
+
+        structure = build_structure_snapshot(snapshot, direction, sensor)
+        momentum = build_momentum_snapshot(sensor, direction)
+        liquidity = build_liquidity_snapshot(snapshot, direction, structure, sensor)
+        context = build_market_context_from_snapshots({normalize_symbol(position.symbol): snapshot}, direction)
+        reversal = build_reversal_snapshot(
+            sensor=sensor,
+            structure=structure,
+            momentum=momentum,
+            liquidity=liquidity,
+            context=context,
+            direction=direction,
+        )
+
+        after_tp1 = bool(getattr(position, "tp1_hit", False)) or safe_str(getattr(position, "status", "")).upper() == "PARTIAL_TP1"
+        progress = progress_to_tp1(position, price)
+
+        return evaluate_open_position(
+            position_direction=direction,
+            sensor=sensor,
+            momentum=momentum,
+            liquidity=liquidity,
+            reversal_snapshot=getattr(reversal, "__dict__", reversal),
+            progress_to_tp1=progress,
+            after_tp1=after_tp1,
+        )
+
+    except Exception:
+        logger.exception("ai_monitor_decision_failed symbol=%s position_id=%s", position.symbol, position.position_id)
+        return None
 
 
 def render_monitor_event(event: MonitorEvent) -> str:
