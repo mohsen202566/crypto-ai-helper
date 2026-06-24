@@ -35,6 +35,7 @@ from constants import (
     PRIMARY_TIMEFRAME,
     STATUS_FAILED,
     STATUS_OK,
+    STATUS_RECOVERED,
     STRATEGY_LEVEL,
     STRATEGY_CODE,
     SYSTEM_VERSION,
@@ -744,7 +745,7 @@ def maybe_execute_real_decision(decision: AIDecision) -> dict[str, Any]:
     # Only keep REAL when the exchange order was accepted/recovered. Any failed
     # open attempt becomes GHOST. This includes max-position guards, duplicate
     # guards, stale TP/SL guards, quantity errors, and Toobit-side rejects.
-    if result.status != STATUS_OK:
+    if result.status not in {STATUS_OK, STATUS_RECOVERED}:
         return _convert_real_failure_to_ghost(
             decision,
             reason="real_open_failed",
