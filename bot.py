@@ -1107,9 +1107,42 @@ def _monitor_interval_seconds() -> int:
 
 
 def _current_price_from_provider(provider: Any, symbol: str) -> float:
-    candles = provider_get_candles(provider, normalize_symbol(symbol), timeframe=PRIMARY_TIMEFRAME, limit=3)
-    if candles:
-        return safe_float(candles[-1].close, 0.0) or 0.0
+    """Return the freshest usable price for position monitoring.
+
+    The analysis engine may use PRIMARY_TIMEFRAME for Level 4 decisions, but
+    the monitor must not wait for a 1H candle close. GHOST/REAL TP-SL can be
+    touched intrabar, so we first try fast candles and use the latest close as
+    the current executable/mark-like price. If fast data is unavailable, we
+    fall back to PRIMARY_TIMEFRAME to keep the monitor alive.
+    """
+    normalized = normalize_symbol(symbol)
+    timeframes = ["1m", "3m", "5m", "15m", PRIMARY_TIMEFRAME]
+    seen: set[str] = set()
+
+    for timeframe in timeframes:
+        tf = safe_str(timeframe).strip()
+        if not tf or tf in seen:
+            continue
+        seen.add(tf)
+        try:
+            candles = provider_get_candles(provider, normalized, timeframe=tf, limit=3)
+        except Exception:
+            logger.exception("monitor_price_fetch_failed symbol=%s timeframe=%s", normalized, tf)
+            candles = []
+
+        if not candles:
+            continue
+
+        last = candles[-1]
+        for value in (
+            getattr(last, "close", None),
+            getattr(last, "price", None),
+            getattr(last, "last", None),
+        ):
+            price = safe_float(value, None)
+            if price is not None and price > 0:
+                return price
+
     return 0.0
 
 
