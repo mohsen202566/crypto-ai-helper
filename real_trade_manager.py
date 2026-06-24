@@ -16,6 +16,7 @@ from __future__ import annotations
 from typing import Any, Mapping, Optional
 import time
 import threading
+from datetime import datetime, timezone
 
 from constants import (
     DIRECTION_LONG, DIRECTION_SHORT, FEE_CONFIG, MODE_REAL, POSITION_PENDING_REAL_CONFIRM,
@@ -54,6 +55,26 @@ def estimate_tp1_net_profit(direction: str, entry: float, tp1: float, quantity: 
     fee_rate = safe_float(FEE_CONFIG.get("estimated_round_trip_fee_rate"), 0.0012) or 0.0012
     fees = fee_estimate(notional, fee_rate / 2.0, sides=2)
     return gross, fees, gross - fees
+
+
+def _seconds_since_iso(value: Any) -> float:
+    """Return age in seconds for an ISO timestamp; fail safe to a large age."""
+    raw = safe_str(value)
+    if not raw:
+        return 999999.0
+    try:
+        clean = raw.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(clean)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return max(0.0, (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds())
+    except Exception:
+        return 999999.0
+
+
+def _real_confirm_grace_seconds() -> int:
+    """How long a pending REAL must keep its slot before being allowed to fail."""
+    return max(1, safe_int(TRADE_CONFIG.get("real_confirm_timeout_seconds"), 70) or 70)
 
 
 
@@ -259,7 +280,7 @@ def _schedule_same_tp_sl_verification(position: TradePosition, plan: TPSLPlan, *
     """Non-blocking post-open TP/SL verification so Telegram/manual commands stay responsive."""
     def _runner() -> None:
         try:
-            verify_or_repair_same_tp_sl_after_delay(position, plan, delay_seconds=delay_seconds)
+            verify_or_repair_same_tp_sl_after_delay(position, plan, delay_seconds=0)
         except Exception:
             # Safety verifier must never crash the bot process.
             pass
@@ -410,10 +431,34 @@ def open_real_trade(decision: AIDecision, *, client: Optional[ToobitClient] = No
 
 
 def confirm_real_open(position: TradePosition, *, client: Optional[ToobitClient] = None) -> dict[str, Any]:
+    """Confirm a pending REAL without freeing its slot before the 70s grace window.
+
+    Locked behavior:
+    - After open_real_trade creates PENDING_REAL_CONFIRM, the slot stays occupied.
+    - Before ~70 seconds: if Toobit does not show the position yet, return no error.
+    - After ~70 seconds: if Toobit still does not show it, mark it failed so the slot is freed.
+    """
     c = client or get_client()
     row = c.get_position(position.symbol, position.direction)
     if not row:
-        return {"confirmed": False}
+        age_seconds = _seconds_since_iso(getattr(position, "opened_at", ""))
+        grace = _real_confirm_grace_seconds()
+        if age_seconds < grace:
+            return {
+                "confirmed": False,
+                "pending": True,
+                "age_seconds": age_seconds,
+                "grace_seconds": grace,
+                "slot_held": True,
+            }
+        return {
+            "confirmed": False,
+            "pending": False,
+            "age_seconds": age_seconds,
+            "grace_seconds": grace,
+            "error": "real_open_not_found_after_grace",
+            "slot_held": False,
+        }
     entry = safe_float(row.get("entryPrice") or row.get("avgPrice") or row.get("price"), position.entry) or position.entry
     qty = abs(safe_float(row.get("positionAmt") or row.get("qty") or row.get("volume"), position.quantity) or position.quantity)
     order_id = safe_str(row.get("orderId") or row.get("id") or position.exchange_order_id)
@@ -522,6 +567,9 @@ def get_real_trade_status(*, client: Optional[ToobitClient] = None, include_exch
         "toobit_open_positions": [],
         "toobit_open_total": 0,
         "toobit_pnl_usdt": 0.0,
+        "effective_real_open": len(real_positions),
+        "available_real_slots": max(0, (safe_int(runtime.get("max_concurrent_real_positions"), 0) or 0) - len(real_positions)),
+        "real_slots_over_limit": False,
         "errors": [],
     }
 
@@ -557,6 +605,13 @@ def get_real_trade_status(*, client: Optional[ToobitClient] = None, include_exch
         status["toobit_open_positions"] = exchange_positions
         status["toobit_open_total"] = len(exchange_positions)
         status["toobit_pnl_usdt"] = sum(safe_float(p.get("pnl_usdt"), 0.0) or 0.0 for p in exchange_positions)
+        # Effective REAL slot usage is exchange-first. Toobit can contain REAL
+        # positions that are missing from positions.json; those must still count
+        # against the configured REAL max to prevent over-opening.
+        max_real_slots = safe_int(status.get("max_concurrent_real_positions"), 0) or 0
+        status["effective_real_open"] = max(status.get("local_real_open", 0), status.get("toobit_open_total", 0))
+        status["available_real_slots"] = max(0, max_real_slots - safe_int(status.get("effective_real_open"), 0)) if max_real_slots > 0 else 0
+        status["real_slots_over_limit"] = bool(max_real_slots > 0 and safe_int(status.get("effective_real_open"), 0) > max_real_slots)
 
         # Keep local REAL slots aligned with the exchange before showing the panel.
         # If Toobit no longer has a REAL position but positions.json still marks it open,
@@ -575,6 +630,10 @@ def get_real_trade_status(*, client: Optional[ToobitClient] = None, include_exch
                 status["local_real_open"] = len(refreshed_real_positions)
                 status["local_ghost_open"] = len(refreshed_ghost_positions)
                 status["local_positions"] = [p.__dict__ for p in refreshed_local_positions]
+                max_real_slots = safe_int(status.get("max_concurrent_real_positions"), 0) or 0
+                status["effective_real_open"] = max(status.get("local_real_open", 0), status.get("toobit_open_total", 0))
+                status["available_real_slots"] = max(0, max_real_slots - safe_int(status.get("effective_real_open"), 0)) if max_real_slots > 0 else 0
+                status["real_slots_over_limit"] = bool(max_real_slots > 0 and safe_int(status.get("effective_real_open"), 0) > max_real_slots)
         else:
             status["reconcile"] = {
                 "status": STATUS_FAILED,
