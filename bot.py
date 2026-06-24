@@ -1487,22 +1487,85 @@ async def auto_signal_loop(application: Any) -> None:
 
 
 async def telegram_post_init(application: Any) -> None:
-    """Start background tasks after Telegram Application initialization."""
+    """Prepare runtime state after Telegram Application initialization.
+
+    Background loops are started from telegram_post_startup(), not here.
+    python-telegram-bot warns when Application.create_task() is called while
+    the application is not running; that warning was causing pending tasks to
+    survive/restart badly and made manual commands slow.
+    """
     application.bot_data["market_provider"] = application.bot_data.get("market_provider") or OKXMarketProvider()
-    application.create_task(position_monitor_loop(application), name="level4_position_monitor_loop")
-    logger.info("position_monitor_task_created")
+    application.bot_data.setdefault("background_tasks", {})
+    logger.info("telegram_post_init_ready")
+
+
+async def telegram_post_startup(application: Any) -> None:
+    """Start background tasks only after the Telegram application is running."""
+    application.bot_data["market_provider"] = application.bot_data.get("market_provider") or OKXMarketProvider()
+    tasks: dict[str, asyncio.Task] = application.bot_data.setdefault("background_tasks", {})
+
+    # Do not create duplicate tasks if startup is called again by the framework.
+    monitor_task = tasks.get("position_monitor")
+    if monitor_task is None or monitor_task.done():
+        tasks["position_monitor"] = asyncio.create_task(
+            position_monitor_loop(application),
+            name="level4_position_monitor_loop",
+        )
+        logger.info("position_monitor_task_created")
+    else:
+        logger.info("position_monitor_task_already_running")
+
+    auto_task = tasks.get("auto_signal")
     if _auto_signal_enabled():
-        application.create_task(auto_signal_loop(application), name="level4_auto_signal_loop")
-        logger.info("auto_signal_task_created")
+        if auto_task is None or auto_task.done():
+            tasks["auto_signal"] = asyncio.create_task(
+                auto_signal_loop(application),
+                name="level4_auto_signal_loop",
+            )
+            logger.info("auto_signal_task_created")
+        else:
+            logger.info("auto_signal_task_already_running")
     else:
         logger.info("auto_signal_task_not_created disabled")
+
+
+async def telegram_post_shutdown(application: Any) -> None:
+    """Cancel background tasks cleanly on restart/shutdown."""
+    tasks = dict(application.bot_data.get("background_tasks") or {})
+    if not tasks:
+        logger.info("background_tasks_none_to_cancel")
+        return
+
+    for name, task in tasks.items():
+        if task and not task.done():
+            logger.info("background_task_cancel_requested name=%s", name)
+            task.cancel()
+
+    for name, task in tasks.items():
+        if not task:
+            continue
+        try:
+            await task
+        except asyncio.CancelledError:
+            logger.info("background_task_cancelled name=%s", name)
+        except Exception as exc:
+            logger.exception("background_task_cancel_error name=%s error=%s", name, exc)
+
+    application.bot_data["background_tasks"] = {}
 
 
 def build_application(token: str) -> Any:
     # Lazy import keeps integration_check/import usable even where telegram package is absent.
     from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
 
-    application = ApplicationBuilder().token(token).post_init(telegram_post_init).build()
+    application = (
+        ApplicationBuilder()
+        .token(token)
+        .post_init(telegram_post_init)
+        .post_startup(telegram_post_startup)
+        .post_shutdown(telegram_post_shutdown)
+        .build()
+    )
     application.add_handler(CommandHandler(["start", "help"], telegram_start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, telegram_message_handler))
     application.add_error_handler(telegram_error_handler)
@@ -1556,6 +1619,8 @@ __all__ = [
     "_fast_trade_toggle_action",
     "auto_signal_loop",
     "telegram_post_init",
+    "telegram_post_startup",
+    "telegram_post_shutdown",
     "build_application",
     "main",
 ]
