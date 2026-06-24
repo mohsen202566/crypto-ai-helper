@@ -18,6 +18,7 @@ from typing import Any, Mapping, Optional
 import hashlib
 import hmac
 import os
+import re
 import time
 from urllib.parse import urlencode
 
@@ -90,9 +91,56 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def _load_dotenv_once() -> None:
+    """
+    Best-effort .env loader.
+    systemd Environment remains primary; .env is only fallback.
+    """
+    if os.environ.get("_L4_DOTENV_CHECKED") == "1":
+        return
+    os.environ["_L4_DOTENV_CHECKED"] = "1"
+    try:
+        from dotenv import load_dotenv  # type: ignore
+        load_dotenv(".env", override=False)
+    except Exception:
+        pass
+
+
+def _read_systemd_env_value(name: str) -> str:
+    """
+    Fallback for this VPS layout where credentials are stored in systemd service.
+    Used only when os.environ/.env do not provide the value.
+    """
+    service_paths = [
+        "/etc/systemd/system/crypto-bot.service",
+        "/etc/systemd/system/crypto-bot.service.d/override.conf",
+    ]
+    patterns = [
+        re.compile(r'^\s*Environment\s*=\s*["\']?' + re.escape(name) + r'=([^"\'\n]+)["\']?\s*$'),
+        re.compile(r'^\s*' + re.escape(name) + r'=([^\n]+)\s*$'),
+    ]
+    for path in service_paths:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    clean = line.strip()
+                    for pattern in patterns:
+                        match = pattern.match(clean)
+                        if match:
+                            return safe_str(match.group(1)).strip().strip('"').strip("'")
+        except Exception:
+            continue
+    return ""
+
+
 def env_first(*names: str, default: str = "") -> str:
+    _load_dotenv_once()
     for name in names:
         value = safe_str(os.getenv(name))
+        if value:
+            return value
+    for name in names:
+        value = _read_systemd_env_value(name)
         if value:
             return value
     return default
@@ -314,20 +362,112 @@ class ToobitClient:
         except Exception:
             return False
 
+    def _balance_candidates(self, payload: Any) -> list[dict[str, Any]]:
+        """
+        Extract possible balance rows from Toobit responses.
+
+        Toobit balance responses may be nested and may use fields such as
+        totalWalletBalance/accountEquity/totalMarginBalance instead of balance.
+        """
+        candidates: list[dict[str, Any]] = []
+        balance_keys = {
+            "asset", "coin", "currency", "ccy",
+            "balance", "walletBalance", "equity", "total", "totalBalance",
+            "available", "availableBalance", "free", "freeBalance",
+            "totalWalletBalance", "accountEquity", "marginBalance",
+            "totalMarginBalance", "availableMargin",
+            "usdtBalance", "cashBalance",
+        }
+
+        def walk(value: Any) -> None:
+            if isinstance(value, Mapping):
+                if any(k in value for k in balance_keys):
+                    candidates.append(dict(value))
+                for child in value.values():
+                    walk(child)
+            elif isinstance(value, list):
+                for child in value:
+                    walk(child)
+
+        walk(payload)
+        return candidates
+
     def get_account_balance(self, asset: str = "USDT") -> dict[str, Any]:
+        asset_u = safe_str(asset, "USDT").upper()
+
+        if not self.credentials.valid():
+            return {
+                "status": STATUS_FAILED,
+                "asset": asset_u,
+                "balance": None,
+                "available": None,
+                "error": "missing_toobit_credentials",
+                "credentials_loaded": False,
+                "raw": {},
+            }
+
         response = self._request("GET", "/api/v1/futures/balance", signed=True)
         if not response.ok:
-            return {"status": STATUS_FAILED, "asset": asset, "balance": 0.0, "available": 0.0, "error": response.error, "raw": response.to_dict()}
-        rows = self._flatten_items(response.data)
-        asset_u = safe_str(asset, "USDT").upper()
-        best = rows[0] if rows else response.data
+            return {
+                "status": STATUS_FAILED,
+                "asset": asset_u,
+                "balance": None,
+                "available": None,
+                "error": response.error,
+                "credentials_loaded": True,
+                "raw": response.to_dict(),
+            }
+
+        rows = self._balance_candidates(response.data)
+        best: Mapping[str, Any] = response.data
+
         for row in rows:
-            if safe_str(row.get("asset") or row.get("coin") or row.get("currency") or asset_u).upper() == asset_u:
+            row_asset = safe_str(row.get("asset") or row.get("coin") or row.get("currency") or row.get("ccy"))
+            if row_asset and row_asset.upper() == asset_u:
                 best = row
                 break
-        balance = safe_float(best.get("balance") or best.get("walletBalance") or best.get("equity") or best.get("total"), 0.0) or 0.0
-        available = safe_float(best.get("available") or best.get("availableBalance") or best.get("free") or balance, balance) or 0.0
-        return {"status": STATUS_OK, "asset": asset_u, "balance": balance, "available": available, "raw": response.data}
+        else:
+            if rows:
+                for row in rows:
+                    if asset_u in safe_str(row).upper():
+                        best = row
+                        break
+                else:
+                    best = rows[0]
+
+        balance = safe_float(
+            best.get("balance")
+            or best.get("walletBalance")
+            or best.get("equity")
+            or best.get("total")
+            or best.get("totalBalance")
+            or best.get("totalWalletBalance")
+            or best.get("accountEquity")
+            or best.get("marginBalance")
+            or best.get("totalMarginBalance")
+            or best.get("usdtBalance")
+            or best.get("cashBalance"),
+            None,
+        )
+        available = safe_float(
+            best.get("available")
+            or best.get("availableBalance")
+            or best.get("free")
+            or best.get("freeBalance")
+            or best.get("availableMargin")
+            or balance,
+            None,
+        )
+
+        return {
+            "status": STATUS_OK,
+            "asset": asset_u,
+            "balance": balance,
+            "available": available,
+            "error": "",
+            "credentials_loaded": True,
+            "raw": response.data,
+        }
 
     get_balance = get_account_balance
 
@@ -440,7 +580,7 @@ class ToobitClient:
             return ""
         return walk(payload)
 
-    def _recover_open_position_after_order_error(self, symbol: str, direction: str, wait_seconds: float = 1.2) -> Optional[dict[str, Any]]:
+    def _recover_open_position_after_order_error(self, symbol: str, direction: str, wait_seconds: float = 70.0) -> Optional[dict[str, Any]]:
         time.sleep(max(0.0, wait_seconds))
         return self.get_position(symbol, direction)
 
@@ -466,7 +606,7 @@ class ToobitClient:
         response = self._request("POST", "/api/v1/futures/order", params=params, signed=True)
         if response.ok:
             return TradeOpenResult(status=STATUS_OK, symbol=bot_symbol, direction=d, entry=entry_price, quantity=qty, exchange_order_id=self._order_response_id(response.data), message="order_submitted", raw=response.data)
-        recovered = self._recover_open_position_after_order_error(bot_symbol, d, wait_seconds=1.2)
+        recovered = self._recover_open_position_after_order_error(bot_symbol, d, wait_seconds=70.0)
         if recovered:
             recovered_entry = safe_float(recovered.get("entryPrice") or recovered.get("avgPrice") or recovered.get("price"), entry_price) or entry_price
             recovered_qty = self._position_qty(recovered) or qty
