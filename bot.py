@@ -47,6 +47,8 @@ from telegram_ui import (
     render_stats_snapshot,
     render_strategy_status,
     render_trade_runtime,
+    render_ai_status,
+    render_reset_stats_result,
     render_unknown_command,
     validate_rendered_text,
 )
@@ -69,7 +71,9 @@ from real_trade_manager import (
     open_real_trade,
     preflight_real_trade,
     validate_real_trade_manager_light,
+    get_real_trade_status,
 )
+from learning_memory import get_learning_summary, reset_learning_memory
 from utils import normalize_direction, normalize_symbol, safe_float, safe_int, safe_str, utc_now_iso
 
 
@@ -615,7 +619,17 @@ def execute_route(
             return make_bot_response(text=render_strategy_status(), action=action)
 
         if action == "SHOW_TRADE_SETTINGS":
-            return make_bot_response(text=render_trade_runtime(), action=action)
+            status_payload = get_real_trade_status(include_exchange=auto_execute_real)
+            status_payload["watchlist"] = list(LEVEL_4_SYMBOLS)
+            return make_bot_response(text=render_trade_runtime(status_payload), action=action, data={"trade_status": status_payload})
+
+        if action == "SHOW_AI_STATUS":
+            summary = get_learning_summary()
+            return make_bot_response(text=render_ai_status(summary), action=action, data={"learning_summary": summary})
+
+        if action == "RESET_STATS":
+            result = reset_learning_memory(reset_archives=True, reset_stats=True)
+            return make_bot_response(text=render_reset_stats_result(result), status=STATUS_OK if result.recorded else STATUS_FAILED, action=action, data={"reset": result.__dict__})
 
         if action == "SHOW_STATUS":
             snapshot = build_stats_snapshot()
@@ -714,14 +728,19 @@ def validate_bot_wiring() -> dict[str, Any]:
     route_tests = [
         ("راهنما", "HELP"),
         ("آمار", "SHOW_STATS"),
+        ("حذف آمار", "RESET_STATS"),
+        ("هوش مصنوعی", "SHOW_AI_STATUS"),
         ("پوزیشن ها", "SHOW_POSITIONS"),
         ("وضعیت", "SHOW_STATUS"),
+        ("ترید", "SHOW_TRADE_SETTINGS"),
         ("وضعیت ترید", "SHOW_TRADE_SETTINGS"),
         ("لیست استراتژی", "LIST_STRATEGIES"),
         ("استراتژی لول 4", "SET_STRATEGY_LEVEL"),
         ("ترید فعال", "ENABLE_REAL_TRADING"),
         ("ترید خاموش", "DISABLE_REAL_TRADING"),
         ("ترید دلار 7", "SET_MARGIN"),
+        ("دلار ترید 8", "SET_MARGIN"),
+        ("حجم ترید 9", "SET_MARGIN"),
         ("لوریج 10", "SET_LEVERAGE"),
         ("حداکثر پوزیشن 3", "SET_MAX_POSITIONS"),
         ("ریست ترید", "RESET_TRADE_SETTINGS"),
@@ -730,11 +749,27 @@ def validate_bot_wiring() -> dict[str, Any]:
         ("بستن DOGEUSDT", "REQUEST_CLOSE_POSITION"),
     ]
 
+    mutating_actions = {
+        "SET_STRATEGY_LEVEL",
+        "ENABLE_REAL_TRADING",
+        "DISABLE_REAL_TRADING",
+        "SET_MARGIN",
+        "SET_LEVERAGE",
+        "SET_MAX_POSITIONS",
+        "RESET_TRADE_SETTINGS",
+        "RESET_STATS",
+        "REQUEST_CLOSE_POSITION",
+        "EMERGENCY_STOP",
+    }
+
     for text, expected_action in route_tests:
         try:
             command_route = parse_command(text)
             if command_route.action != expected_action:
                 errors.append(f"ROUTE_MISMATCH:{text}:{command_route.action}!={expected_action}")
+                continue
+            if expected_action in mutating_actions:
+                # Do not mutate real strategy/learning/position state during health checks.
                 continue
             response = handle_text_message(text, auto_execute_real=False)
             if validate_bot_response(response).get("valid") is not True:
