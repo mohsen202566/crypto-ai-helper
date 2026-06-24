@@ -228,6 +228,29 @@ def render_trade_runtime(runtime: Optional[Mapping[str, Any]] = None) -> str:
         max_total = data.get("max_concurrent_total_positions", rt.get("max_concurrent_total_positions", max_real))
         watchlist = data.get("watchlist") or rt.get("watchlist") or []
 
+        # Closed REAL PnL/statistics for the trade status panel.
+        # render_trade_runtime() is a rendering layer only, so it reads the
+        # already aggregated snapshot from stats_engine and never writes state.
+        real_stats: dict[str, Any] = {}
+        try:
+            snapshot = build_stats_snapshot()
+            real_section = snapshot.get("real", {}) if isinstance(snapshot, Mapping) else {}
+            if isinstance(real_section, Mapping):
+                real_stats = dict(real_section)
+        except Exception:
+            real_stats = {}
+
+        real_closed_total = safe_int(real_stats.get("total"), 0) or 0
+        real_wins = safe_int(real_stats.get("wins"), 0) or 0
+        real_losses = safe_int(real_stats.get("losses"), 0) or 0
+        real_tp1 = safe_int(real_stats.get("tp1"), 0) or 0
+        real_tp2 = safe_int(real_stats.get("tp2"), 0) or 0
+        real_sl = safe_int(real_stats.get("sl"), 0) or 0
+        real_ai_exit = safe_int(real_stats.get("ai_exit"), 0) or 0
+        real_pnl = safe_float(real_stats.get("pnl_usdt"), 0.0) or 0.0
+        real_confirmed_pnl = safe_float(real_stats.get("confirmed_pnl_usdt"), None)
+        real_unconfirmed_pnl = safe_float(real_stats.get("unconfirmed_pnl_usdt"), None)
+
         lines = [
             "⚙️ وضعیت ترید و Toobit",
             f"اتصال Toobit: {'وصل ✅' if connected else 'قطع / نامشخص ❌'}",
@@ -247,6 +270,14 @@ def render_trade_runtime(runtime: Optional[Mapping[str, Any]] = None) -> str:
             "",
             f"📌 پوزیشن‌های باز Toobit: {safe_int(data.get('toobit_open_total'), len(positions))}",
             f"PnL باز Toobit: {fmt_usdt(data.get('toobit_pnl_usdt'))}",
+            "",
+            "📊 سود/ضرر بسته‌شده REAL",
+            f"PnL کل بسته‌شده: {fmt_usdt(real_pnl)}",
+            f"PnL تاییدشده: {fmt_usdt(real_confirmed_pnl)}" if real_confirmed_pnl is not None else "PnL تاییدشده: -",
+            f"PnL تخمینی/تاییدنشده: {fmt_usdt(real_unconfirmed_pnl)}" if real_unconfirmed_pnl is not None else "PnL تخمینی/تاییدنشده: -",
+            f"تعداد نتایج REAL: {real_closed_total}",
+            f"برد: {real_wins} | باخت: {real_losses} | WinRate: {fmt_pct(real_stats.get('win_rate'))}",
+            f"TP1: {real_tp1} | TP2: {real_tp2} | SL: {real_sl} | AI Exit: {real_ai_exit}",
         ]
         if positions:
             for p in positions[:10]:
