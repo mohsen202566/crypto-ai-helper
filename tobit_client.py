@@ -584,6 +584,19 @@ class ToobitClient:
         time.sleep(max(0.0, wait_seconds))
         return self.get_position(symbol, direction)
 
+    def _recover_close_after_order_error(self, symbol: str, direction: str, wait_seconds: float = 70.0, poll_seconds: float = 5.0) -> bool:
+        """
+        Toobit can accept/execute a close even when the API response is delayed or looks failed.
+        Re-check exchange open positions before leaving the internal slot locked.
+        """
+        deadline = time.time() + max(0.0, wait_seconds)
+        poll = max(1.0, poll_seconds)
+        while time.time() <= deadline:
+            if not self.get_position(symbol, direction):
+                return True
+            time.sleep(poll)
+        return not bool(self.get_position(symbol, direction))
+
     def open_futures_position(self, symbol: str, side: str = "", direction: str = "", quantity: Any = 0.0, price: Any = 0.0, order_type: str = "MARKET", margin_mode: str = MARGIN_ISOLATED, leverage: int = 1, take_profit: Any = None, take_profit_2: Any = None, stop_loss: Any = None, client_order_id: str = "") -> TradeOpenResult:
         bot_symbol = normalize_symbol(symbol)
         d = normalize_direction(direction or side)
@@ -617,31 +630,89 @@ class ToobitClient:
         bot_symbol = normalize_symbol(symbol)
         d = normalize_direction(direction)
         qty_raw = safe_float(quantity, 0.0) or 0.0
-        pos = self.get_position(bot_symbol, d)
-        if qty_raw <= 0 and pos:
-            qty_raw = self._position_qty(pos)
-        ok, qty, reason, rules = self.validate_quantity(bot_symbol, qty_raw, price)
         close_price = safe_float(price, 0.0) or 0.0
+        pos = self.get_position(bot_symbol, d)
+
+        # If exchange already closed it via TP/SL/manual close, confirm success instead of keeping the slot stuck.
+        if not pos:
+            pnl_data = self.wait_for_closed_position_pnl(bot_symbol, d, timeout_seconds=45, poll_seconds=5)
+            return TradeCloseResult(
+                status=STATUS_OK,
+                symbol=bot_symbol,
+                direction=d,
+                close_price=close_price,
+                closed_quantity=max(0.0, qty_raw),
+                pnl_usdt=safe_float(pnl_data.get("pnl_usdt"), None),
+                pnl_confirmed=bool(pnl_data.get("confirmed", False)),
+                close_confirmed=True,
+                message="already_closed_on_exchange",
+                raw={"pnl": pnl_data},
+            )
+
+        if qty_raw <= 0:
+            qty_raw = self._position_qty(pos)
+
+        ok, qty, reason, rules = self.validate_quantity(bot_symbol, qty_raw, price)
         if not ok:
             return TradeCloseResult(status=STATUS_FAILED, symbol=bot_symbol, direction=d, close_price=close_price, closed_quantity=qty, close_confirmed=False, error=reason)
-        params = {"symbol": rules.exchange_symbol or self.normalize_futures_symbol(bot_symbol), "side": close_side_for_direction(d), "type": "LIMIT", "priceType": "MARKET", "quantity": qty, "newClientOrderId": client_order_id or f"L4_CLOSE_{bot_symbol}_{d}_{now_ms()}"}
+
+        params = {
+            "symbol": rules.exchange_symbol or self.normalize_futures_symbol(bot_symbol),
+            "side": close_side_for_direction(d),
+            "type": "LIMIT",
+            "priceType": "MARKET",
+            "quantity": qty,
+            "newClientOrderId": client_order_id or f"L4_CLOSE_{bot_symbol}_{d}_{now_ms()}",
+        }
         response = self._request("POST", "/api/v1/futures/order", params=params, signed=True)
+
         if not response.ok:
+            recovered_closed = self._recover_close_after_order_error(bot_symbol, d, wait_seconds=70.0, poll_seconds=5.0)
+            if recovered_closed:
+                pnl_data = self.wait_for_closed_position_pnl(bot_symbol, d, timeout_seconds=50, poll_seconds=5)
+                return TradeCloseResult(
+                    status=STATUS_RECOVERED,
+                    symbol=bot_symbol,
+                    direction=d,
+                    close_price=close_price,
+                    closed_quantity=qty,
+                    pnl_usdt=safe_float(pnl_data.get("pnl_usdt"), None),
+                    pnl_confirmed=bool(pnl_data.get("confirmed", False)),
+                    close_confirmed=True,
+                    message="close_error_but_position_disappeared",
+                    error=response.error,
+                    raw={"order_error": response.to_dict(), "pnl": pnl_data},
+                )
             return TradeCloseResult(status=STATUS_FAILED, symbol=bot_symbol, direction=d, close_price=close_price, closed_quantity=qty, close_confirmed=False, error=response.error, raw=response.to_dict())
-        confirmed = self.verify_close(bot_symbol, d)
-        pnl_data = self.wait_for_closed_position_pnl(bot_symbol, d, timeout_seconds=45, poll_seconds=5)
-        return TradeCloseResult(status=STATUS_OK if confirmed else STATUS_FAILED, exchange_order_id=self._order_response_id(response.data), symbol=bot_symbol, direction=d, close_price=close_price, closed_quantity=qty, pnl_usdt=safe_float(pnl_data.get("pnl_usdt"), None), pnl_confirmed=bool(pnl_data.get("confirmed", False)), close_confirmed=confirmed, message="close_confirmed" if confirmed else "close_not_confirmed", error="" if confirmed else "close_not_confirmed", raw={"order": response.data, "pnl": pnl_data})
+
+        confirmed = self.verify_close(bot_symbol, d, attempts=14, sleep_seconds=5)
+        pnl_data = self.wait_for_closed_position_pnl(bot_symbol, d, timeout_seconds=50, poll_seconds=5)
+        return TradeCloseResult(
+            status=STATUS_OK if confirmed else STATUS_FAILED,
+            exchange_order_id=self._order_response_id(response.data),
+            symbol=bot_symbol,
+            direction=d,
+            close_price=close_price,
+            closed_quantity=qty,
+            pnl_usdt=safe_float(pnl_data.get("pnl_usdt"), None),
+            pnl_confirmed=bool(pnl_data.get("confirmed", False)),
+            close_confirmed=confirmed,
+            message="close_confirmed" if confirmed else "close_not_confirmed",
+            error="" if confirmed else "close_not_confirmed",
+            raw={"order": response.data, "pnl": pnl_data},
+        )
 
     close_futures_position = close_position
 
     def verify_close(self, symbol: str, direction: str = "", attempts: int | None = None, sleep_seconds: float | None = None) -> bool:
-        count = safe_int(attempts, TRADE_CONFIG.get("close_confirm_attempts", 5)) or 5
-        sleep = safe_float(sleep_seconds, TRADE_CONFIG.get("close_confirm_sleep_seconds", 2)) or 2.0
+        # Toobit close confirmation can lag. Check long enough so valid closes do not leave slots stuck.
+        count = safe_int(attempts, TRADE_CONFIG.get("close_confirm_attempts", 14)) or 14
+        sleep = safe_float(sleep_seconds, TRADE_CONFIG.get("close_confirm_sleep_seconds", 5)) or 5.0
         for _ in range(max(1, count)):
             if not self.get_position(symbol, direction):
                 return True
             time.sleep(max(0.0, sleep))
-        return False
+        return not bool(self.get_position(symbol, direction))
 
     def ensure_tp_sl(self, symbol: str, direction: str, take_profit: Any = None, stop_loss: Any = None, take_profit_2: Any = None) -> dict[str, Any]:
         return self.set_position_tp_sl(symbol, direction, take_profit=take_profit, stop_loss=stop_loss, take_profit_2=take_profit_2)
