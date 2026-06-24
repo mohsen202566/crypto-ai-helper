@@ -76,6 +76,8 @@ POSITION_MONITOR_VERSION: str = SYSTEM_VERSION
 PriceProvider = Callable[[str], float]
 CloseExecutor = Callable[[TradePosition, str, float, float], TradeCloseResult | Mapping[str, Any]]
 OpenConfirmChecker = Callable[[TradePosition], Mapping[str, Any] | bool]
+ExchangePositionChecker = Callable[[TradePosition], Mapping[str, Any] | bool]
+ClosedPnlReader = Callable[[TradePosition], Mapping[str, Any]]
 
 
 # =============================================================================
@@ -608,6 +610,191 @@ def handle_ai_exit(
     return handle_ghost_close(position, event=reason, current_price=current_price, quantity=qty)
 
 
+
+# =============================================================================
+# Exchange-side close recovery
+# =============================================================================
+
+def _exchange_position_exists(result: Mapping[str, Any] | bool | None) -> tuple[bool, str, dict[str, Any]]:
+    """
+    Normalize exchange position checker result.
+
+    Expected truth:
+    - True / {"exists": True} / {"open": True}  => position still exists on exchange
+    - False / {"exists": False} / {"open": False} => position no longer exists
+    """
+    if isinstance(result, Mapping):
+        exists = bool(
+            result.get("exists", result.get("open", result.get("position_exists", result.get("found", False))))
+        )
+        error = safe_str(result.get("error"))
+        return exists, error, dict(result)
+    return bool(result), "", {"raw": result}
+
+
+def _read_closed_pnl(position: TradePosition, closed_pnl_reader: Optional[ClosedPnlReader]) -> dict[str, Any]:
+    """Read closed-position history/PnL via injected adapter without crashing monitor loop."""
+    if closed_pnl_reader is None:
+        return {"status": STATUS_FAILED, "confirmed": False, "pnl_usdt": None, "error": "closed_pnl_reader_missing"}
+
+    try:
+        result = closed_pnl_reader(position)
+        return dict(result) if isinstance(result, Mapping) else {"status": STATUS_FAILED, "confirmed": False, "pnl_usdt": None, "raw": result}
+    except Exception as exc:
+        return {"status": STATUS_FAILED, "confirmed": False, "pnl_usdt": None, "error": str(exc)}
+
+
+def infer_external_close_event(position: TradePosition, pnl_data: Mapping[str, Any], current_price: float) -> str:
+    """
+    Infer why a REAL position disappeared from exchange.
+
+    Prefer TP/SL price logic when possible; otherwise use realized PnL:
+    positive/zero => TP1-style profitable close, negative => SL.
+    """
+    exit_price = safe_float(
+        pnl_data.get("close_price")
+        or pnl_data.get("exit_price")
+        or pnl_data.get("avg_close_price")
+        or (pnl_data.get("row", {}) or {}).get("closePrice") if isinstance(pnl_data.get("row"), Mapping) else None,
+        None,
+    )
+    price = exit_price if exit_price is not None and exit_price > 0 else current_price
+
+    if price and price > 0:
+        if is_sl_hit(position, price):
+            return EVENT_SL
+        if position.tp1_hit or position.status == POSITION_PARTIAL_TP1:
+            if is_tp_hit(position, price, tp_number=2):
+                return EVENT_TP2
+            return EVENT_TP1
+        if is_tp_hit(position, price, tp_number=1):
+            return EVENT_TP1
+
+    pnl = safe_float(pnl_data.get("pnl_usdt"), None)
+    if pnl is not None:
+        return EVENT_SL if pnl < 0 else EVENT_TP1
+
+    return EVENT_MANUAL_CLOSE
+
+
+def handle_real_exchange_disappeared(
+    position: TradePosition,
+    *,
+    current_price: float,
+    closed_pnl_reader: Optional[ClosedPnlReader],
+) -> MonitorEvent:
+    """
+    Recover a REAL position that is closed on Toobit but still open internally.
+
+    This handles exchange-side TP/SL, manual app close, or delayed close confirmation.
+    It reads closed history/PnL, closes the internal position, records learning/stats,
+    and returns an event that bot.py can reply to the original signal.
+    """
+    pnl_data = _read_closed_pnl(position, closed_pnl_reader)
+    event = infer_external_close_event(position, pnl_data, current_price)
+
+    row = pnl_data.get("row", {}) if isinstance(pnl_data.get("row"), Mapping) else {}
+    close_price = safe_float(
+        pnl_data.get("close_price")
+        or pnl_data.get("exit_price")
+        or pnl_data.get("avg_close_price")
+        or row.get("closePrice")
+        or row.get("avgClosePrice")
+        or row.get("price")
+        or current_price,
+        current_price,
+    ) or current_price
+
+    pnl_usdt = safe_float(pnl_data.get("pnl_usdt"), None)
+    pnl_confirmed = bool(pnl_data.get("confirmed", False))
+
+    outcome = make_outcome(
+        position,
+        event=event,
+        exit_price=close_price,
+        quantity=position.runner_quantity if position.runner_quantity > 0 else position.quantity,
+        pnl_usdt=pnl_usdt,
+        pnl_confirmed=pnl_confirmed,
+        metadata={
+            "exchange_position_missing": True,
+            "closed_history": dict(pnl_data),
+            "recovery_reason": "exchange_closed_position_detected",
+        },
+    )
+
+    close_position_record(
+        position.position_id,
+        close_price=close_price,
+        pnl_usdt=outcome.pnl_usdt,
+        pnl_confirmed=pnl_confirmed,
+        close_reason=event,
+    )
+    _record_outcome_safe(outcome, extra_metadata={"exchange_position_missing": True})
+
+    updated = get_position(position.position_id) or position
+    close_result = TradeCloseResult(
+        status=STATUS_OK,
+        position_id=position.position_id,
+        symbol=position.symbol,
+        direction=position.direction,
+        close_price=close_price,
+        closed_quantity=outcome.quantity,
+        pnl_usdt=outcome.pnl_usdt,
+        pnl_confirmed=pnl_confirmed,
+        close_confirmed=True,
+        message="exchange_position_closed_detected",
+        raw={"closed_history": dict(pnl_data)},
+    )
+    return make_monitor_event(
+        event=event,
+        position=updated,
+        outcome=outcome,
+        close_result=close_result,
+        metadata={"exchange_position_missing": True, "closed_history_confirmed": pnl_confirmed},
+    )
+
+
+def check_real_exchange_closed(
+    position: TradePosition,
+    *,
+    current_price: float,
+    exchange_position_checker: Optional[ExchangePositionChecker],
+    closed_pnl_reader: Optional[ClosedPnlReader],
+) -> Optional[MonitorEvent]:
+    """Return a recovery event if a REAL position is no longer open on exchange."""
+    if position.mode != MODE_REAL or position.status == POSITION_PENDING_REAL_CONFIRM:
+        return None
+    if exchange_position_checker is None:
+        return None
+
+    try:
+        exists, error, raw = _exchange_position_exists(exchange_position_checker(position))
+    except Exception as exc:
+        return make_monitor_event(
+            event="EXCHANGE_POSITION_CHECK_FAILED",
+            position=position,
+            status=STATUS_FAILED,
+            metadata={"error": str(exc)},
+        )
+
+    if error:
+        return make_monitor_event(
+            event="EXCHANGE_POSITION_CHECK_FAILED",
+            position=position,
+            status=STATUS_FAILED,
+            metadata={"error": error, "raw": raw},
+        )
+
+    if exists:
+        return None
+
+    return handle_real_exchange_disappeared(
+        position,
+        current_price=current_price,
+        closed_pnl_reader=closed_pnl_reader,
+    )
+
+
 # =============================================================================
 # Main monitor function
 # =============================================================================
@@ -619,6 +806,8 @@ def monitor_position_once(
     ai_monitor_decision: Optional[Any] = None,
     close_executor: Optional[CloseExecutor] = None,
     open_confirm_checker: Optional[OpenConfirmChecker] = None,
+    exchange_position_checker: Optional[ExchangePositionChecker] = None,
+    closed_pnl_reader: Optional[ClosedPnlReader] = None,
 ) -> list[MonitorEvent]:
     """
     Monitor one position once.
@@ -630,7 +819,12 @@ def monitor_position_once(
     if position.status == POSITION_PENDING_REAL_CONFIRM and position.mode == MODE_REAL:
         return handle_pending_real_confirmation(position, open_confirm_checker=open_confirm_checker)
 
-    if position.status in {POSITION_CLOSED, POSITION_CLOSING}:
+    if position.status == POSITION_CLOSED:
+        return []
+
+    # POSITION_CLOSING can happen after a previous close request. Keep monitoring REAL exchange state
+    # so delayed confirmations/TP-SL exchange closes do not leave slots stuck forever.
+    if position.status == POSITION_CLOSING and position.mode != MODE_REAL:
         return []
 
     price = safe_float(current_price, None)
@@ -646,6 +840,16 @@ def monitor_position_once(
 
     update_price_extremes(position.position_id, price)
     position = get_position(position.position_id) or position
+
+    exchange_closed_event = check_real_exchange_closed(
+        position,
+        current_price=price,
+        exchange_position_checker=exchange_position_checker,
+        closed_pnl_reader=closed_pnl_reader,
+    )
+    if exchange_closed_event is not None:
+        events.append(exchange_closed_event)
+        return events
 
     # SL has priority for risk accounting.
     if is_sl_hit(position, price):
@@ -695,6 +899,8 @@ def monitor_positions_once(
     ai_decision_provider: Optional[Callable[[TradePosition, float], Any]] = None,
     close_executor: Optional[CloseExecutor] = None,
     open_confirm_checker: Optional[OpenConfirmChecker] = None,
+    exchange_position_checker: Optional[ExchangePositionChecker] = None,
+    closed_pnl_reader: Optional[ClosedPnlReader] = None,
 ) -> list[MonitorEvent]:
     """Monitor all active positions once."""
     events: list[MonitorEvent] = []
@@ -709,6 +915,8 @@ def monitor_positions_once(
                 ai_monitor_decision=ai_decision,
                 close_executor=close_executor,
                 open_confirm_checker=open_confirm_checker,
+                exchange_position_checker=exchange_position_checker,
+                closed_pnl_reader=closed_pnl_reader,
             )
         )
 
@@ -746,6 +954,8 @@ __all__ = [
     "PriceProvider",
     "CloseExecutor",
     "OpenConfirmChecker",
+    "ExchangePositionChecker",
+    "ClosedPnlReader",
     "is_tp_hit",
     "is_sl_hit",
     "progress_to_tp1",
@@ -763,6 +973,9 @@ __all__ = [
     "handle_tp2",
     "handle_sl",
     "handle_ai_exit",
+    "infer_external_close_event",
+    "handle_real_exchange_disappeared",
+    "check_real_exchange_closed",
     "monitor_position_once",
     "monitor_positions_once",
     "validate_monitor_event",
