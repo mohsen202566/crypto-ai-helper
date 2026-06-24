@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Optional
 import time
+import threading
 
 from constants import (
     DIRECTION_LONG, DIRECTION_SHORT, FEE_CONFIG, MODE_REAL, POSITION_PENDING_REAL_CONFIRM,
@@ -55,6 +56,203 @@ def estimate_tp1_net_profit(direction: str, entry: float, tp1: float, quantity: 
     return gross, fees, gross - fees
 
 
+
+
+def _client_call(fn: Any, *args: Any, default: Any = None, **kwargs: Any) -> Any:
+    """Safely call optional Toobit client compatibility helpers."""
+    if not callable(fn):
+        return default
+    for call in (
+        lambda: fn(*args, **kwargs),
+        lambda: fn(*args),
+        lambda: fn(**kwargs),
+        lambda: fn(),
+    ):
+        try:
+            return call()
+        except TypeError:
+            continue
+        except Exception:
+            return default
+    return default
+
+
+def _exchange_position_exists(client: ToobitClient, symbol: str, direction: str) -> tuple[bool, dict[str, Any]]:
+    """Hard safety guard: never open a duplicate REAL when Toobit already has it."""
+    try:
+        row = client.get_position(symbol, direction)
+        if row:
+            return True, dict(row)
+    except Exception as exc:
+        return False, {"error": f"exchange_position_check_failed:{exc}"}
+    return False, {}
+
+
+def _normalize_exchange_order_symbol(client: ToobitClient, row: Mapping[str, Any]) -> str:
+    raw = safe_str(
+        row.get("symbol")
+        or row.get("contractCode")
+        or row.get("instrumentId")
+        or row.get("instId")
+        or row.get("exchange_symbol")
+    )
+    if not raw:
+        return ""
+    try:
+        if hasattr(client, "normalize_bot_symbol"):
+            return normalize_symbol(client.normalize_bot_symbol(raw))
+    except Exception:
+        pass
+    return normalize_symbol(raw)
+
+
+def _order_is_reduce_or_tpsl(row: Mapping[str, Any]) -> bool:
+    """Best-effort classifier for stale TP/SL/reduce orders on Toobit."""
+    text = safe_str(row).upper()
+    side = safe_str(row.get("side") or row.get("orderSide") or row.get("positionSide")).upper()
+    order_type = safe_str(row.get("type") or row.get("orderType") or row.get("priceType")).upper()
+    return (
+        "TAKE" in text
+        or "PROFIT" in text
+        or "STOP" in text
+        or "LOSS" in text
+        or "TP" in text
+        or "SL" in text
+        or "CLOSE" in side
+        or "TRIGGER" in order_type
+    )
+
+
+def _get_open_orders_for_symbol(client: ToobitClient, symbol: str) -> list[dict[str, Any]]:
+    """Read open orders only when the client supports it; fail closed in callers if needed."""
+    rows: Any = []
+    for name in ("get_open_orders", "get_current_orders", "get_active_orders", "open_orders"):
+        fn = getattr(client, name, None)
+        if callable(fn):
+            rows = _client_call(fn, symbol, default=[])
+            if rows is None:
+                rows = []
+            break
+    if not isinstance(rows, list):
+        return []
+    target = normalize_symbol(symbol)
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        row_symbol = _normalize_exchange_order_symbol(client, row)
+        if row_symbol and row_symbol != target:
+            continue
+        out.append(dict(row))
+    return out
+
+
+def _exchange_open_order_guard(client: ToobitClient, symbol: str) -> tuple[bool, list[dict[str, Any]]]:
+    """Block new REAL when stale TP/SL/open orders already exist for the symbol."""
+    # Prefer explicit client helper if available in newer tobit_client.py.
+    for name in ("has_open_order_for_symbol", "has_open_orders_for_symbol", "has_open_orders"):
+        fn = getattr(client, name, None)
+        if callable(fn):
+            value = _client_call(fn, symbol, default=None)
+            if isinstance(value, Mapping):
+                return bool(value.get("has_open_orders") or value.get("exists") or value.get("ok") is False), list(value.get("orders") or [])
+            if value is not None:
+                return bool(value), []
+    orders = _get_open_orders_for_symbol(client, symbol)
+    blocking = [row for row in orders if _order_is_reduce_or_tpsl(row)]
+    return bool(blocking), blocking
+
+
+def _same_tp_sl_payload(position: TradePosition, plan: TPSLPlan) -> dict[str, Any]:
+    """Keep one immutable TP/SL payload for exchange repair; never recalculate later."""
+    return {
+        "symbol": normalize_symbol(position.symbol),
+        "direction": normalize_direction(position.direction),
+        "take_profit": safe_float(plan.tp1, 0.0) or 0.0,
+        "take_profit_2": None,  # TP2 is internal/runner logic, not a separate Toobit order.
+        "stop_loss": safe_float(plan.sl, 0.0) or 0.0,
+    }
+
+
+def _tp_sl_orders_present(client: ToobitClient, symbol: str) -> tuple[bool, dict[str, Any]]:
+    """Best-effort check that at least one TP and one SL/reduce order exist for this symbol."""
+    orders = _get_open_orders_for_symbol(client, symbol)
+    if not orders:
+        return False, {"orders": [], "reason": "no_open_orders_reader_or_no_orders"}
+    text_items = [safe_str(row).upper() for row in orders]
+    has_tp = any("TAKE" in t or "PROFIT" in t or "TP" in t for t in text_items)
+    has_sl = any("STOP" in t or "LOSS" in t or "SL" in t for t in text_items)
+    # Some Toobit TP/SL attached at open may not be returned as normal open orders.
+    # If we can read orders and only see generic reduce/close trigger rows, count them as present conservatively.
+    reduce_count = sum(1 for row in orders if _order_is_reduce_or_tpsl(row))
+    present = (has_tp and has_sl) or reduce_count >= 2
+    return present, {"orders": orders, "has_tp": has_tp, "has_sl": has_sl, "reduce_count": reduce_count}
+
+
+def verify_or_repair_same_tp_sl_after_delay(position: TradePosition, plan: TPSLPlan, *, client: Optional[ToobitClient] = None, delay_seconds: int = 70) -> dict[str, Any]:
+    """
+    After Toobit has had time to materialize attached TP/SL, verify them.
+
+    Rule locked by user:
+    - TP/SL must be sent with the OPEN order first.
+    - Do NOT create separate TP/SL immediately after open.
+    - After ~70 seconds, if the REAL position exists but TP/SL is missing,
+      repair using the exact same TP1/SL from the original signal, never new values.
+    """
+    c = client or get_client()
+    wait = max(0, safe_int(delay_seconds, 70) or 70)
+    if wait:
+        time.sleep(wait)
+
+    exists, row = _exchange_position_exists(c, position.symbol, position.direction)
+    if not exists:
+        return {"status": STATUS_OK, "ok": True, "action": "skip_position_not_open", "position_id": position.position_id, "exchange_position": row}
+
+    present, detail = _tp_sl_orders_present(c, position.symbol)
+    if present:
+        return {"status": STATUS_OK, "ok": True, "action": "tp_sl_present", "position_id": position.position_id, "detail": detail}
+
+    payload = _same_tp_sl_payload(position, plan)
+    fn = getattr(c, "ensure_tp_sl", None) or getattr(c, "set_position_tp_sl", None)
+    if not callable(fn):
+        return {"status": STATUS_FAILED, "ok": False, "action": "repair_unavailable", "position_id": position.position_id, "payload": payload, "detail": detail}
+
+    repaired = _client_call(
+        fn,
+        payload["symbol"],
+        payload["direction"],
+        take_profit=payload["take_profit"],
+        stop_loss=payload["stop_loss"],
+        take_profit_2=None,
+        default={"status": STATUS_FAILED, "ok": False, "error": "ensure_tp_sl_call_failed"},
+    )
+    if not isinstance(repaired, Mapping):
+        repaired = {"status": STATUS_OK if repaired else STATUS_FAILED, "ok": bool(repaired)}
+    return {
+        "status": STATUS_OK if bool(repaired.get("ok", repaired.get("status") == STATUS_OK)) else STATUS_FAILED,
+        "ok": bool(repaired.get("ok", repaired.get("status") == STATUS_OK)),
+        "action": "repaired_same_tp_sl",
+        "position_id": position.position_id,
+        "payload": payload,
+        "repair_result": dict(repaired),
+        "detail": detail,
+    }
+
+
+def _schedule_same_tp_sl_verification(position: TradePosition, plan: TPSLPlan, *, delay_seconds: int = 70) -> None:
+    """Non-blocking post-open TP/SL verification so Telegram/manual commands stay responsive."""
+    def _runner() -> None:
+        try:
+            verify_or_repair_same_tp_sl_after_delay(position, plan, delay_seconds=delay_seconds)
+        except Exception:
+            # Safety verifier must never crash the bot process.
+            pass
+
+    timer = threading.Timer(max(0, safe_int(delay_seconds, 70) or 70), _runner)
+    timer.daemon = True
+    timer.start()
+
+
 def preflight_real_trade(decision: AIDecision, *, client: Optional[ToobitClient] = None, state: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
     c = client or get_client()
     runtime = get_runtime(state)
@@ -76,6 +274,17 @@ def preflight_real_trade(decision: AIDecision, *, client: Optional[ToobitClient]
         errors.append("invalid_tp_sl_plan")
     if has_open_position(symbol, direction, mode=MODE_REAL):
         errors.append("duplicate_real_position")
+
+    # HARD exchange-side duplicate guard.
+    # Internal positions.json can lag during API delays; Toobit is source of truth before opening REAL.
+    exchange_position_exists, exchange_position_row = _exchange_position_exists(c, symbol, direction)
+    if exchange_position_exists:
+        errors.append("duplicate_exchange_position")
+
+    exchange_orders_exist, exchange_orders = _exchange_open_order_guard(c, symbol)
+    if exchange_orders_exist:
+        errors.append("stale_or_open_exchange_orders_exist")
+
     max_real = safe_int(runtime.get("max_concurrent_real_positions"), TRADE_CONFIG.get("max_concurrent_real_positions", 3)) or 3
     if count_open_real_positions() >= max_real:
         errors.append("max_real_positions_reached")
@@ -111,6 +320,10 @@ def preflight_real_trade(decision: AIDecision, *, client: Optional[ToobitClient]
     return {
         "status": STATUS_OK if not errors else STATUS_FAILED,
         "ok": not errors, "errors": errors, "warnings": warnings, "symbol": symbol, "direction": direction,
+        "exchange_position_exists": exchange_position_exists,
+        "exchange_position": exchange_position_row if exchange_position_exists else {},
+        "exchange_open_orders_exist": exchange_orders_exist,
+        "exchange_open_orders": exchange_orders[:5] if exchange_orders_exist else [],
         "entry": entry, "margin_usdt": margin, "leverage": leverage, "margin_mode": margin_mode,
         "quantity_estimate": quantity_est, "quantity": qty, "quantity_reason": qty_reason,
         "symbol_rules": rules.to_dict() if rules else {}, "tp1_gross_profit_estimate": gross,
@@ -145,16 +358,24 @@ def open_real_trade(decision: AIDecision, *, client: Optional[ToobitClient] = No
     plan = decision.tp_sl
     if plan is None:
         return TradeOpenResult(status=STATUS_FAILED, symbol=decision.symbol, direction=decision.direction, entry=decision.entry, error="missing_tp_sl_plan", raw={"preflight": preflight})
-    result = c.open_futures_position(symbol=decision.symbol, direction=decision.direction, quantity=preflight["quantity"], price=preflight["entry"], order_type="MARKET", margin_mode=MARGIN_ISOLATED, leverage=safe_int(preflight.get("leverage"), 1) or 1, take_profit=plan.tp1, take_profit_2=plan.tp2, stop_loss=plan.sl, client_order_id=f"L4_OPEN_{normalize_symbol(decision.symbol)}_{normalize_direction(decision.direction)}_{int(time.time()*1000)}")
+    result = c.open_futures_position(symbol=decision.symbol, direction=decision.direction, quantity=preflight["quantity"], price=preflight["entry"], order_type="MARKET", margin_mode=MARGIN_ISOLATED, leverage=safe_int(preflight.get("leverage"), 1) or 1, take_profit=plan.tp1, take_profit_2=None, stop_loss=plan.sl, client_order_id=f"L4_OPEN_{normalize_symbol(decision.symbol)}_{normalize_direction(decision.direction)}_{int(time.time()*1000)}")
     if result.status not in {STATUS_OK, STATUS_RECOVERED}:
         return result
     pos = build_pending_position(decision, preflight, result)
     add_res = add_position(pos, reject_duplicate=True)
     if add_res.status != STATUS_OK:
         return TradeOpenResult(status=STATUS_FAILED, symbol=decision.symbol, direction=decision.direction, entry=pos.entry, quantity=pos.quantity, exchange_order_id=result.exchange_order_id, error=f"position_record_failed:{add_res.error or add_res.message}", raw={"open_result": result.raw, "preflight": preflight})
+    # TP/SL were already sent together with the OPEN order above.
+    # Do not send separate TP/SL here. Only verify after ~70 seconds and repair with
+    # the exact original TP1/SL if Toobit did not attach them.
+    _schedule_same_tp_sl_verification(
+        pos,
+        plan,
+        delay_seconds=safe_int(TRADE_CONFIG.get("tp_sl_verify_after_open_seconds"), 70) or 70,
+    )
     if result.status == STATUS_RECOVERED:
         mark_real_confirmed(pos.position_id, entry=result.entry or pos.entry, quantity=result.quantity or pos.quantity, exchange_order_id=result.exchange_order_id)
-    return TradeOpenResult(status=result.status, position_id=pos.position_id, exchange_order_id=result.exchange_order_id, symbol=pos.symbol, direction=pos.direction, entry=result.entry or pos.entry, quantity=result.quantity or pos.quantity, message="real_open_requested", recovered=result.recovered, raw={"open_result": result.raw, "preflight": preflight})
+    return TradeOpenResult(status=result.status, position_id=pos.position_id, exchange_order_id=result.exchange_order_id, symbol=pos.symbol, direction=pos.direction, entry=result.entry or pos.entry, quantity=result.quantity or pos.quantity, message="real_open_requested", recovered=result.recovered, raw={"open_result": result.raw, "preflight": preflight, "tp_sl_verify_scheduled": True})
 
 
 def confirm_real_open(position: TradePosition, *, client: Optional[ToobitClient] = None) -> dict[str, Any]:
@@ -351,5 +572,5 @@ __all__ = [
     "REAL_TRADE_MANAGER_VERSION", "get_runtime", "estimate_quantity", "estimate_tp1_net_profit",
     "preflight_real_trade", "build_pending_position", "open_real_trade", "confirm_real_open",
     "wait_for_real_open_confirmation", "close_real_position", "close_position_executor",
-    "emergency_disable_real_trading", "get_real_trade_status", "validate_real_trade_manager_light",
+    "emergency_disable_real_trading", "verify_or_repair_same_tp_sl_after_delay", "get_real_trade_status", "validate_real_trade_manager_light",
 ]
