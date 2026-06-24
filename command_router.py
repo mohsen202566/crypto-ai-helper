@@ -178,10 +178,20 @@ def parse_status_commands(text: str) -> Optional[CommandRoute]:
     if normalized in {"پوزیشن ها", "پوزیشن‌ها", "positions", "open positions", "پوزیشن"}:
         return route("SHOW_POSITIONS", text=text)
 
+    if normalized in {"حذف آمار", "حذف امار", "ریست آمار", "ریست امار", "reset stats"}:
+        return route("RESET_STATS", text=text)
+
     if normalized in {"آمار", "امار", "stats", "statistics"}:
         return route("SHOW_STATS", text=text)
 
     if normalized in {
+        "هوش مصنوعی", "ai", "ai status", "وضعیت هوش مصنوعی",
+        "آمار هوشمند", "امار هوشمند", "حافظه ربات",
+    }:
+        return route("SHOW_AI_STATUS", text=text)
+
+    if normalized in {
+        "ترید", "trade",
         "تنظیمات", "تنظیمات ترید", "وضعیت ترید", "trade settings",
         "settings", "trade status", "وضعیت معامله",
     }:
