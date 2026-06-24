@@ -94,6 +94,61 @@ def _safe_real_trading_enabled(state: Optional[Mapping[str, Any]] = None) -> boo
     return bool(data.get("real_trading_enabled", data.get("trade_enabled", False)))
 
 
+def _margin_range_payload(data: Mapping[str, Any]) -> dict[str, Any]:
+    """Return normalized AI margin range fields for display only."""
+    d = dict(data or {})
+    rt = dict(d.get("runtime") or {}) if isinstance(d.get("runtime"), Mapping) else {}
+
+    margin = d.get("margin_usdt", rt.get("margin_usdt"))
+    min_margin = d.get("min_margin_usdt", rt.get("min_margin_usdt", margin))
+    max_margin = d.get("max_margin_usdt", rt.get("max_margin_usdt", margin))
+
+    min_v = safe_float(min_margin, None)
+    max_v = safe_float(max_margin, None)
+    margin_v = safe_float(margin, None)
+
+    if min_v is None and margin_v is not None:
+        min_v = margin_v
+    if max_v is None and margin_v is not None:
+        max_v = margin_v
+    if min_v is None:
+        min_v = 0.0
+    if max_v is None:
+        max_v = min_v
+    if min_v > max_v:
+        max_v = min_v
+
+    mode = safe_str(d.get("position_sizing_mode", rt.get("position_sizing_mode", ""))).upper()
+    dynamic = d.get("dynamic_position_sizing_enabled", rt.get("dynamic_position_sizing_enabled", None))
+    if dynamic is None:
+        dynamic_bool = bool(max_v > min_v)
+    else:
+        dynamic_bool = bool(dynamic)
+    if not mode:
+        mode = "AI_DYNAMIC" if dynamic_bool else "FIXED"
+
+    return {
+        "min_margin_usdt": min_v,
+        "max_margin_usdt": max_v,
+        "dynamic_position_sizing_enabled": dynamic_bool,
+        "position_sizing_mode": mode,
+    }
+
+
+def render_margin_range_lines(data: Mapping[str, Any]) -> list[str]:
+    """Build Persian display lines for AI min/max margin range."""
+    payload = _margin_range_payload(data)
+    mode = safe_str(payload.get("position_sizing_mode")).upper()
+    dynamic = bool(payload.get("dynamic_position_sizing_enabled"))
+    mode_text = "AI_DYNAMIC ✅" if dynamic or mode == "AI_DYNAMIC" else "FIXED / ثابت"
+    return [
+        "🎯 مدیریت سرمایه AI",
+        f"حداقل مارجین: {fmt_usdt(payload.get('min_margin_usdt'))}",
+        f"حداکثر مارجین: {fmt_usdt(payload.get('max_margin_usdt'))}",
+        f"حالت حجم‌دهی: {mode_text}",
+    ]
+
+
 # =============================================================================
 # Generic formatting helpers
 # =============================================================================
@@ -198,13 +253,15 @@ def render_strategy_status(state: Optional[Mapping[str, Any]] = None) -> str:
     level = safe_int(state_data.get("active_level", state_data.get("level")), STRATEGY_LEVEL) or STRATEGY_LEVEL
     trade_on = _safe_real_trading_enabled(state_data)
 
+    margin_lines = render_margin_range_lines(runtime)
     lines = [
         header("وضعیت استراتژی Level 4"),
         f"سطح فعال: Level {level}",
         f"ترید واقعی: {'فعال ✅' if trade_on else 'غیرفعال / سیگنال‌ها GHOST می‌شوند ⚠️'}",
-        f"مارجین هر معامله: {fmt_usdt(runtime.get('margin_usdt'))}",
+        f"مارجین فعلی/پایه: {fmt_usdt(runtime.get('margin_usdt'))}",
+        *margin_lines,
         f"لوریج: {safe_int(runtime.get('leverage'), 1)}x",
-        f"حداکثر پوزیشن‌ها: {safe_int(runtime.get('max_positions'), 0)}",
+        f"حداکثر پوزیشن‌ها: {safe_int(runtime.get('max_positions', runtime.get('max_concurrent_real_positions')), 0)}",
         "",
         "قانون: فقط همین Level برای تصمیم‌های جدید فعال است.",
     ]
@@ -223,6 +280,7 @@ def render_trade_runtime(runtime: Optional[Mapping[str, Any]] = None) -> str:
         connected = bool(data.get("toobit_connected"))
         trade_on = bool(data.get("real_trading_enabled", rt.get("real_trading_enabled", False)))
         margin = data.get("margin_usdt", rt.get("margin_usdt"))
+        margin_range_lines = render_margin_range_lines(data)
         leverage = data.get("leverage", rt.get("leverage"))
         max_real = data.get("max_concurrent_real_positions", rt.get("max_concurrent_real_positions", rt.get("max_positions")))
         max_total = data.get("max_concurrent_total_positions", rt.get("max_concurrent_total_positions", max_real))
@@ -256,7 +314,8 @@ def render_trade_runtime(runtime: Optional[Mapping[str, Any]] = None) -> str:
             f"اتصال Toobit: {'وصل ✅' if connected else 'قطع / نامشخص ❌'}",
             f"ترید واقعی: {'روشن ✅' if trade_on else 'خاموش ❌'}",
             "سیگنال خودکار: روشن ✅",
-            f"سرمایه هر ترید: {fmt_usdt(margin)}",
+            f"سرمایه پایه/فعلی هر ترید: {fmt_usdt(margin)}",
+            *margin_range_lines,
             f"لوریج: {safe_int(leverage, 1)}x",
             f"حداکثر پوزیشن REAL: {safe_int(max_real, 0)}",
             f"حداکثر کل پوزیشن: {safe_int(max_total, 0)}",
@@ -303,9 +362,11 @@ def render_trade_runtime(runtime: Optional[Mapping[str, Any]] = None) -> str:
             lines.extend(["", "⚠️ هشدارها:", short_reasons(errors, limit=6)])
         return "\n".join(lines)
 
+    margin_lines = render_margin_range_lines(data)
     lines = [
         header("تنظیمات ترید"),
-        f"مارجین: {fmt_usdt(data.get('margin_usdt'))}",
+        f"مارجین پایه/فعلی: {fmt_usdt(data.get('margin_usdt'))}",
+        *margin_lines,
         f"لوریج: {safe_int(data.get('leverage'), 1)}x",
         f"حداکثر پوزیشن: {safe_int(data.get('max_positions', data.get('max_concurrent_real_positions')), 0)}",
         f"وضعیت ترید واقعی: {'فعال ✅' if bool(data.get('real_trading_enabled')) else 'غیرفعال ⚠️'}",
@@ -562,8 +623,11 @@ def render_help() -> str:
         "• وضعیت ترید — همان خروجی کامل ترید",
         "• ترید فعال — روشن کردن ترید واقعی",
         "• ترید خاموش — خاموش کردن ترید واقعی؛ سیگنال‌های بعدی GHOST می‌شوند",
-        "• ترید دلار 7 / دلار ترید 7 / حجم ترید 7 — تنظیم سرمایه هر ترید",
-        "• لوریج 10 — تنظیم لوریج",
+        "• ترید دلار 7 / دلار ترید 7 / حجم ترید 7 — تنظیم مارجین ثابت هر ترید",
+        "• حداقل 5 — تنظیم حداقل مارجین AI از 1 تا 1000 دلار",
+        "• حداکثر 15 — تنظیم حداکثر مارجین AI از 1 تا 1000 دلار",
+        "• ترید دلار حداقل 5 / ترید دلار حداکثر 15 — همان تنظیم بازه مارجین AI",
+        "• لوریج 10 — تنظیم لوریج ثابت",
         "• حداکثر پوزیشن 3 — تنظیم سقف پوزیشن REAL",
         "• ریست ترید — برگشت تنظیمات ترید به پیش‌فرض",
         "• توقف فوری — خاموش کردن اضطراری ترید واقعی",
@@ -629,6 +693,7 @@ __all__ = [
     "header",
     "footer_time",
     "render_strategy_status",
+    "render_margin_range_lines",
     "render_trade_runtime",
     "render_ai_status",
     "render_reset_stats_result",
