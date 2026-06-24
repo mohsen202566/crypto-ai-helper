@@ -2,7 +2,7 @@
 bot.py
 Level 4 / 1H Smart Scalp Bot
 
-Main orchestration layer without direct Toobit execution.
+Main orchestration layer with RealTrade/Toobit integration and Telegram runtime.
 
 Architecture lock:
 - Owns Telegram-style command execution orchestration.
@@ -10,16 +10,32 @@ Architecture lock:
 - Uses telegram_ui.py to build Persian texts.
 - Can call analysis engines for manual analysis/scan.
 - Can show status, stats, positions, and strategy settings.
-- Does not directly call Toobit.
-- Does not contain real order execution logic.
-- real_trade_manager.py and tobit_client.py will be added at the final stage.
+- Does not directly call Toobit low-level APIs.
+- Real execution is delegated only to real_trade_manager.py.
+- real_trade_manager.py delegates low-level exchange calls only to tobit_client.py.
 """
 
 from __future__ import annotations
 
+import logging
+import os
+from pathlib import Path
 from typing import Any, Mapping, Optional
 
-from constants import DIRECTION_LONG, DIRECTION_SHORT, MODE_REJECT, STATUS_FAILED, STATUS_OK, STRATEGY_LEVEL, SYSTEM_VERSION
+from constants import (
+    DIRECTION_LONG,
+    DIRECTION_SHORT,
+    LEVEL_4_SYMBOLS,
+    MODE_GHOST,
+    MODE_REAL,
+    MODE_REJECT,
+    OKX_CANDLE_LIMIT_DEFAULT,
+    PRIMARY_TIMEFRAME,
+    STATUS_FAILED,
+    STATUS_OK,
+    STRATEGY_LEVEL,
+    SYSTEM_VERSION,
+)
 from command_router import CommandRoute, parse_command, validate_route
 from telegram_ui import (
     render_ai_decision,
@@ -36,8 +52,8 @@ from telegram_ui import (
 import strategy_manager
 from position_manager import get_open_positions
 from stats_engine import build_stats_snapshot
-from models import AIDecision, Candle, MarketSnapshot
-from market_data import make_offline_snapshot
+from models import AIDecision, Candle, MarketSnapshot, TradeCloseResult, TradePosition
+from market_data import fetch_market_snapshot, make_offline_snapshot
 from technical_sensors import build_sensor_snapshot
 from structure_engine import build_structure_snapshot
 from momentum_engine import build_momentum_snapshot
@@ -47,11 +63,23 @@ from reversal_engine import build_reversal_snapshot
 from timing_engine import build_timing_snapshot
 from tp_sl_engine import build_tp_sl_plan
 from ai_brain import build_ai_decision, validate_ai_decision
+from real_trade_manager import (
+    close_real_position,
+    open_real_trade,
+    preflight_real_trade,
+    validate_real_trade_manager_light,
+)
 from utils import normalize_direction, normalize_symbol, safe_float, safe_int, safe_str, utc_now_iso
 
 
 BOT_VERSION: str = SYSTEM_VERSION
+LOGGER_NAME = "level4_bot"
+logger = logging.getLogger(LOGGER_NAME)
 
+
+# =============================================================================
+# Response helpers
+# =============================================================================
 
 def make_bot_response(
     *,
@@ -83,7 +111,12 @@ def validate_bot_response(response: Mapping[str, Any]) -> dict[str, Any]:
     text_validation = validate_rendered_text(safe_str(response.get("text")))
     if not text_validation.get("valid"):
         errors.extend(text_validation.get("errors", []))
-    return {"status": STATUS_OK if not errors else STATUS_FAILED, "valid": not errors, "errors": errors, "action": response.get("action")}
+    return {
+        "status": STATUS_OK if not errors else STATUS_FAILED,
+        "valid": not errors,
+        "errors": errors,
+        "action": response.get("action"),
+    }
 
 
 # =============================================================================
@@ -105,6 +138,7 @@ def _call_first(names: list[str], *args: Any, **kwargs: Any) -> Any:
                 except TypeError:
                     continue
                 except Exception:
+                    logger.exception("strategy_manager adapter failed: %s", name)
                     break
     return None
 
@@ -112,7 +146,7 @@ def _call_first(names: list[str], *args: Any, **kwargs: Any) -> Any:
 def _result_ok(result: Any) -> bool:
     if isinstance(result, Mapping):
         status = safe_str(result.get("status")).upper()
-        return status == STATUS_OK or bool(result.get("ok", False)) or bool(result.get("success", False))
+        return status == STATUS_OK or bool(result.get("ok", False)) or bool(result.get("success", False)) or bool(result.get("recorded", False))
     if result is None:
         return True
     return bool(result)
@@ -124,7 +158,13 @@ def _get_trade_runtime() -> dict[str, Any]:
 
 
 def _set_strategy_level(level: int) -> bool:
-    return _result_ok(_call_first(["set_strategy_level", "set_active_level", "switch_strategy_level", "set_level"], level))
+    if level == STRATEGY_LEVEL:
+        result = _call_first(["set_strategy_level", "set_active_level", "switch_strategy_level", "set_level", "set_level4_active"], level)
+        if result is None:
+            result = _call_first(["set_level4_active"])
+        return _result_ok(result)
+    result = _call_first(["set_strategy_level", "set_active_level", "switch_strategy_level", "set_level"], level)
+    return _result_ok(result)
 
 
 def _update_runtime(**kwargs: Any) -> bool:
@@ -142,20 +182,35 @@ def _disable_trade() -> bool:
     return _result_ok(_call_first(["disable_real_trading", "disable_trade", "set_trade_enabled"], False))
 
 
+def _real_trading_enabled() -> bool:
+    fn = getattr(strategy_manager, "is_real_trading_enabled", None)
+    if callable(fn):
+        try:
+            return bool(fn())
+        except Exception:
+            logger.exception("is_real_trading_enabled failed")
+    state = _call_first(["load_strategy_state", "get_strategy_state"])
+    if isinstance(state, Mapping):
+        return bool(state.get("real_trading_enabled", state.get("trade_enabled", False)))
+    return False
+
+
 # =============================================================================
 # Market provider adapter
 # =============================================================================
 
-def provider_get_candles(provider: Any, symbol: str, *, timeframe: str = "1H", limit: int = 120) -> list[Candle]:
-    """
-    Read candles from any lightweight provider.
+class OKXMarketProvider:
+    """Live OKX provider used by Telegram commands."""
 
-    Supported provider shapes:
-    - provider.get_candles(symbol, timeframe="1H", limit=120)
-    - provider.fetch_candles(...)
-    - callable provider(symbol, timeframe, limit)
-    - mapping symbol -> list[Candle/dict]
-    """
+    def get_candles(self, symbol: str, timeframe: str = PRIMARY_TIMEFRAME, limit: int = OKX_CANDLE_LIMIT_DEFAULT) -> list[Candle]:
+        result = fetch_market_snapshot(normalize_symbol(symbol), timeframe=timeframe, limit=limit)
+        snapshot = getattr(result, "snapshot", None)
+        if snapshot is not None and getattr(snapshot, "candles", None):
+            return list(snapshot.candles)
+        return []
+
+
+def provider_get_candles(provider: Any, symbol: str, *, timeframe: str = PRIMARY_TIMEFRAME, limit: int = OKX_CANDLE_LIMIT_DEFAULT) -> list[Candle]:
     raw: Any = None
 
     if isinstance(provider, Mapping):
@@ -217,13 +272,7 @@ def provider_get_candles(provider: Any, symbol: str, *, timeframe: str = "1H", l
     return candles
 
 
-def build_snapshots_from_provider(
-    provider: Any,
-    symbols: list[str],
-    *,
-    timeframe: str = "1H",
-    limit: int = 120,
-) -> dict[str, MarketSnapshot]:
+def build_snapshots_from_provider(provider: Any, symbols: list[str], *, timeframe: str = PRIMARY_TIMEFRAME, limit: int = OKX_CANDLE_LIMIT_DEFAULT) -> dict[str, MarketSnapshot]:
     snapshots: dict[str, MarketSnapshot] = {}
     for symbol in symbols:
         normalized = normalize_symbol(symbol)
@@ -245,6 +294,7 @@ def infer_direction_from_sensor(sensor: Any) -> str:
     macd_slope = safe_float(getattr(sensor, "macd_hist_slope", None), 0.0) or 0.0
     buy = safe_float(getattr(sensor, "buy_power", None), 50.0) or 50.0
     sell = safe_float(getattr(sensor, "sell_power", None), 50.0) or 50.0
+
     score = 0.0
     if ema20 is not None:
         score += 1.0 if price >= ema20 else -1.0
@@ -271,6 +321,7 @@ def analyze_market_snapshot(
     structure = build_structure_snapshot(snapshot, d, sensor)
     momentum = build_momentum_snapshot(sensor, d)
     liquidity = build_liquidity_snapshot(snapshot, d, structure, sensor)
+
     context_data = dict(context_snapshots or {}) or {symbol: snapshot}
     context = build_market_context_from_snapshots(context_data, d)
 
@@ -295,7 +346,7 @@ def analyze_market_snapshot(
     )
 
 
-def analyze_symbol_with_provider(symbol: str, provider: Any, *, timeframe: str = "1H", limit: int = 120, context_symbols: Optional[list[str]] = None) -> AIDecision:
+def analyze_symbol_with_provider(symbol: str, provider: Any, *, timeframe: str = PRIMARY_TIMEFRAME, limit: int = OKX_CANDLE_LIMIT_DEFAULT, context_symbols: Optional[list[str]] = None) -> AIDecision:
     normalized = normalize_symbol(symbol)
     symbols = [normalized]
     for item in context_symbols or ["BTCUSDT", "ETHUSDT"]:
@@ -320,7 +371,7 @@ def analyze_symbol_with_provider(symbol: str, provider: Any, *, timeframe: str =
     return analyze_market_snapshot(snapshots[normalized], context_snapshots=snapshots)
 
 
-def scan_market_with_provider(symbols: list[str], provider: Any, *, timeframe: str = "1H", limit: int = 120, max_results: int = 5) -> list[AIDecision]:
+def scan_market_with_provider(symbols: list[str], provider: Any, *, timeframe: str = PRIMARY_TIMEFRAME, limit: int = OKX_CANDLE_LIMIT_DEFAULT, max_results: int = 5) -> list[AIDecision]:
     normalized_symbols = [normalize_symbol(s) for s in symbols if normalize_symbol(s)]
     fetch_symbols = list(dict.fromkeys(normalized_symbols + ["BTCUSDT", "ETHUSDT"]))
     snapshots = build_snapshots_from_provider(provider, fetch_symbols, timeframe=timeframe, limit=limit)
@@ -337,10 +388,87 @@ def scan_market_with_provider(symbols: list[str], provider: Any, *, timeframe: s
 
 
 # =============================================================================
+# RealTrade integration
+# =============================================================================
+
+def maybe_execute_real_decision(decision: AIDecision) -> dict[str, Any]:
+    """
+    Execute REAL decision through real_trade_manager only.
+
+    If real trading is off, the decision is converted to GHOST output text only.
+    """
+    if decision.mode != MODE_REAL:
+        return {"executed": False, "status": STATUS_OK, "reason": "not_real_decision"}
+
+    if not _real_trading_enabled():
+        decision.mode = MODE_GHOST
+        decision.reason_codes.append("REAL_TRADE_OFF_CONVERTED_TO_GHOST")
+        return {"executed": False, "status": STATUS_OK, "reason": "real_trading_disabled_converted_to_ghost"}
+
+    pf = preflight_real_trade(decision)
+    if not pf.get("ok"):
+        return {"executed": False, "status": STATUS_FAILED, "reason": "preflight_failed", "preflight": pf}
+
+    result = open_real_trade(decision)
+    return {
+        "executed": result.status == STATUS_OK,
+        "status": result.status,
+        "position_id": result.position_id,
+        "exchange_order_id": result.exchange_order_id,
+        "error": result.error,
+        "message": result.message,
+        "raw": result.raw,
+    }
+
+
+def render_real_execution_note(execution: Mapping[str, Any]) -> str:
+    if not execution or not execution.get("executed"):
+        if execution.get("status") == STATUS_FAILED:
+            return "\n\n⚠️ اجرای REAL انجام نشد:\n" + safe_str(execution.get("reason")) + "\n" + safe_str(execution.get("error"))
+        return ""
+    return "\n\n✅ سفارش REAL ارسال شد\nPosition ID: " + safe_str(execution.get("position_id"))
+
+
+def find_open_position_for_symbol(symbol: str) -> Optional[TradePosition]:
+    target = normalize_symbol(symbol)
+    for position in get_open_positions():
+        if normalize_symbol(position.symbol) == target:
+            return position
+    return None
+
+
+def render_close_result(result: TradeCloseResult) -> str:
+    if result.close_confirmed:
+        pnl = result.pnl_usdt
+        pnl_text = "-" if pnl is None else f"{pnl:.2f}$"
+        confirmed = "تایید شده ✅" if result.pnl_confirmed else "تخمینی / تایید نشده ⚠️"
+        return "\n".join([
+            "✅ درخواست بستن پوزیشن تایید شد",
+            f"Symbol: {normalize_symbol(result.symbol)}",
+            f"Direction: {normalize_direction(result.direction)}",
+            f"Qty: {result.closed_quantity}",
+            f"PnL: {pnl_text}",
+            f"PnL واقعی: {confirmed}",
+        ])
+    return "\n".join([
+        "❌ بستن پوزیشن تایید نشد",
+        f"Symbol: {normalize_symbol(result.symbol)}",
+        f"Direction: {normalize_direction(result.direction)}",
+        f"Error: {result.error or result.message or '-'}",
+    ])
+
+
+# =============================================================================
 # Command execution
 # =============================================================================
 
-def execute_route(command_route: CommandRoute, *, market_provider: Optional[Any] = None, default_scan_symbols: Optional[list[str]] = None) -> dict[str, Any]:
+def execute_route(
+    command_route: CommandRoute,
+    *,
+    market_provider: Optional[Any] = None,
+    default_scan_symbols: Optional[list[str]] = None,
+    auto_execute_real: bool = True,
+) -> dict[str, Any]:
     validation = validate_route(command_route)
     if not validation.get("valid"):
         return make_bot_response(text=render_error("مسیر دستور نامعتبر است."), status=STATUS_FAILED, action=command_route.action, data={"validation": validation})
@@ -392,15 +520,21 @@ def execute_route(command_route: CommandRoute, *, market_provider: Optional[Any]
 
         if action == "SHOW_STRATEGY":
             return make_bot_response(text=render_strategy_status(), action=action)
+
         if action == "SHOW_TRADE_SETTINGS":
             return make_bot_response(text=render_trade_runtime(), action=action)
+
         if action == "SHOW_STATUS":
             snapshot = build_stats_snapshot()
+            rtm = validate_real_trade_manager_light()
             text = render_strategy_status() + "\n\n" + render_stats_snapshot(snapshot)
-            return make_bot_response(text=text, action=action, data={"stats": snapshot})
+            text += "\n\n🔌 RealTrade: " + ("OK ✅" if rtm.get("valid") else "FAILED ❌")
+            return make_bot_response(text=text, action=action, data={"stats": snapshot, "real_trade_manager": rtm})
+
         if action == "SHOW_POSITIONS":
             positions = get_open_positions()
             return make_bot_response(text=render_positions_list(positions), action=action, data={"count": len(positions)})
+
         if action == "SHOW_STATS":
             snapshot = build_stats_snapshot()
             return make_bot_response(text=render_stats_snapshot(snapshot), action=action, data={"stats": snapshot})
@@ -411,22 +545,43 @@ def execute_route(command_route: CommandRoute, *, market_provider: Optional[Any]
                 return make_bot_response(text=render_error("Market provider هنوز وصل نشده است."), status=STATUS_FAILED, action=action)
             decision = analyze_symbol_with_provider(symbol, market_provider)
             validation = validate_ai_decision(decision)
-            return make_bot_response(text=render_ai_decision(decision), status=STATUS_OK if validation.get("valid") else STATUS_FAILED, action=action, data={"validation": validation})
+            execution = maybe_execute_real_decision(decision) if auto_execute_real and validation.get("valid") else {"executed": False}
+            text = render_ai_decision(decision) + render_real_execution_note(execution)
+            status = STATUS_OK if validation.get("valid") and execution.get("status", STATUS_OK) != STATUS_FAILED else STATUS_FAILED
+            return make_bot_response(text=text, status=status, action=action, data={"validation": validation, "execution": execution})
 
         if action == "SCAN_MARKET":
             if not market_provider:
                 return make_bot_response(text=render_error("Market provider هنوز وصل نشده است."), status=STATUS_FAILED, action=action)
-            symbols = default_scan_symbols or ["DOGEUSDT", "XRPUSDT", "SOLUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT"]
+            symbols = default_scan_symbols or list(LEVEL_4_SYMBOLS)
             decisions = scan_market_with_provider(symbols, market_provider)
             if not decisions:
                 return make_bot_response(text="سیگنال مناسبی پیدا نشد.", action=action, data={"count": 0})
-            text = "📡 نتیجه اسکن Level 4\n\n" + "\n\n".join(render_ai_decision(d, compact=True) for d in decisions)
-            return make_bot_response(text=text, action=action, data={"count": len(decisions)})
+
+            executions: list[dict[str, Any]] = []
+            rendered: list[str] = []
+            for decision in decisions:
+                execution = maybe_execute_real_decision(decision) if auto_execute_real and decision.mode == MODE_REAL else {"executed": False, "status": STATUS_OK}
+                executions.append(execution)
+                rendered.append(render_ai_decision(decision, compact=True) + render_real_execution_note(execution))
+
+            text = "📡 نتیجه اسکن Level 4\n\n" + "\n\n".join(rendered)
+            failed_exec = any(x.get("status") == STATUS_FAILED for x in executions)
+            return make_bot_response(text=text, status=STATUS_FAILED if failed_exec else STATUS_OK, action=action, data={"count": len(decisions), "executions": executions})
 
         if action == "REQUEST_CLOSE_POSITION":
-            return make_bot_response(text=render_error("بستن واقعی پوزیشن بعد از اتصال real_trade_manager فعال می‌شود."), status=STATUS_FAILED, action=action)
+            symbol = normalize_symbol(args.get("symbol"))
+            position = find_open_position_for_symbol(symbol)
+            if not position:
+                return make_bot_response(text=render_error("پوزیشن فعالی برای این نماد پیدا نشد."), status=STATUS_FAILED, action=action)
+            if position.mode != MODE_REAL:
+                return make_bot_response(text=render_error("این پوزیشن REAL نیست؛ بستن واقعی فقط برای REAL انجام می‌شود."), status=STATUS_FAILED, action=action)
+            result = close_real_position(position, reason="USER_REQUEST")
+            return make_bot_response(text=render_close_result(result), status=STATUS_OK if result.close_confirmed else STATUS_FAILED, action=action, data={"close_result": result.__dict__})
+
         if action == "WATCH_POSITION":
-            return make_bot_response(text=render_ok("مانیتور پوزیشن در position_monitor آماده است؛ اتصال زنده در bot نهایی انجام می‌شود."), action=action)
+            return make_bot_response(text=render_ok("مانیتور پوزیشن فعال است و position_monitor پوزیشن‌های باز را بررسی می‌کند."), action=action)
+
         if action == "EMERGENCY_STOP":
             _disable_trade()
             return make_bot_response(text=render_ok("توقف اضطراری فعال شد و ترید واقعی خاموش شد."), action=action)
@@ -434,28 +589,177 @@ def execute_route(command_route: CommandRoute, *, market_provider: Optional[Any]
         return make_bot_response(text=render_unknown_command(), status=STATUS_FAILED, action=action)
 
     except Exception as exc:
+        logger.exception("execute_route failed")
         return make_bot_response(text=render_error(f"خطای اجرای دستور: {exc}"), status=STATUS_FAILED, action=action, data={"error": str(exc)})
 
 
-def handle_text_message(text: str, *, user_id: Optional[int] = None, chat_id: Optional[int] = None, market_provider: Optional[Any] = None, default_scan_symbols: Optional[list[str]] = None) -> dict[str, Any]:
+def handle_text_message(
+    text: str,
+    *,
+    user_id: Optional[int] = None,
+    chat_id: Optional[int] = None,
+    market_provider: Optional[Any] = None,
+    default_scan_symbols: Optional[list[str]] = None,
+    auto_execute_real: bool = True,
+) -> dict[str, Any]:
     command_route = parse_command(text, user_id=user_id, chat_id=chat_id)
-    return execute_route(command_route, market_provider=market_provider, default_scan_symbols=default_scan_symbols)
+    return execute_route(
+        command_route,
+        market_provider=market_provider,
+        default_scan_symbols=default_scan_symbols,
+        auto_execute_real=auto_execute_real,
+    )
 
 
 def validate_bot_wiring() -> dict[str, Any]:
     errors: list[str] = []
-    for text, key in [("راهنما", "HELP"), ("آمار", "STATS"), ("پوزیشن ها", "POSITIONS")]:
+
+    for text, key in [("راهنما", "HELP"), ("آمار", "STATS"), ("پوزیشن ها", "POSITIONS"), ("وضعیت", "STATUS")]:
         try:
-            response = handle_text_message(text)
+            response = handle_text_message(text, auto_execute_real=False)
             if validate_bot_response(response).get("valid") is not True:
                 errors.append(f"{key}_RESPONSE_INVALID")
         except Exception as exc:
             errors.append(f"{key}_RESPONSE_EXCEPTION:{exc}")
-    return {"system_version": SYSTEM_VERSION, "bot_version": BOT_VERSION, "status": STATUS_OK if not errors else STATUS_FAILED, "valid": not errors, "errors": errors, "checked_at": utc_now_iso()}
+
+    try:
+        rtm = validate_real_trade_manager_light()
+        if not rtm.get("valid"):
+            errors.append(f"REAL_TRADE_MANAGER_INVALID:{rtm.get('errors')}")
+    except Exception as exc:
+        errors.append(f"REAL_TRADE_MANAGER_EXCEPTION:{exc}")
+
+    return {
+        "system_version": SYSTEM_VERSION,
+        "bot_version": BOT_VERSION,
+        "status": STATUS_OK if not errors else STATUS_FAILED,
+        "valid": not errors,
+        "errors": errors,
+        "checked_at": utc_now_iso(),
+    }
+
+
+# =============================================================================
+# Telegram runtime
+# =============================================================================
+
+def load_env_file(path: str = ".env") -> None:
+    """Tiny .env loader, avoids python-dotenv stdin/assertion edge cases."""
+    env_path = Path(path)
+    if not env_path.exists():
+        return
+    try:
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+    except Exception:
+        logger.exception("failed to load .env")
+
+
+def get_bot_token() -> str:
+    load_env_file(".env")
+    return safe_str(os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN"))
+
+
+def is_user_allowed(user_id: Optional[int]) -> bool:
+    try:
+        from users import is_allowed, get_owner_id
+        if user_id is None:
+            return False
+        owner_id = get_owner_id(0)
+        if owner_id and int(user_id) == int(owner_id):
+            return True
+        return bool(is_allowed(user_id))
+    except Exception:
+        # If access module is unavailable, do not break the running bot.
+        return True
+
+
+async def send_long_text(message: Any, text: str) -> None:
+    msg = safe_str(text) or "-"
+    max_len = 3900
+    for i in range(0, len(msg), max_len):
+        await message.reply_text(msg[i:i + max_len])
+
+
+async def telegram_start(update: Any, context: Any) -> None:
+    user_id = getattr(getattr(update, "effective_user", None), "id", None)
+    if not is_user_allowed(user_id):
+        await update.effective_message.reply_text("⛔ دسترسی مجاز نیست.")
+        return
+    await send_long_text(update.effective_message, render_help())
+
+
+async def telegram_message_handler(update: Any, context: Any) -> None:
+    message = getattr(update, "effective_message", None)
+    if message is None:
+        return
+    text = safe_str(getattr(message, "text", ""))
+    user_id = getattr(getattr(update, "effective_user", None), "id", None)
+    chat_id = getattr(getattr(update, "effective_chat", None), "id", None)
+
+    if not is_user_allowed(user_id):
+        await message.reply_text("⛔ دسترسی مجاز نیست.")
+        return
+
+    provider = context.application.bot_data.setdefault("market_provider", OKXMarketProvider())
+    try:
+        response = handle_text_message(
+            text,
+            user_id=user_id,
+            chat_id=chat_id,
+            market_provider=provider,
+            default_scan_symbols=list(LEVEL_4_SYMBOLS),
+            auto_execute_real=True,
+        )
+        await send_long_text(message, response.get("text", "-"))
+    except Exception as exc:
+        logger.exception("telegram_message_handler failed")
+        await message.reply_text(render_error(f"خطای اجرای دستور: {exc}"))
+
+
+async def telegram_error_handler(update: object, context: Any) -> None:
+    logger.exception("Telegram error", exc_info=getattr(context, "error", None))
+
+
+def build_application(token: str) -> Any:
+    # Lazy import keeps integration_check/import usable even where telegram package is absent.
+    from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
+
+    application = ApplicationBuilder().token(token).build()
+    application.add_handler(CommandHandler(["start", "help"], telegram_start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, telegram_message_handler))
+    application.add_error_handler(telegram_error_handler)
+    application.bot_data["market_provider"] = OKXMarketProvider()
+    return application
+
+
+def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
+    )
+    token = get_bot_token()
+    if not token:
+        logger.error("BOT_TOKEN is missing. Set BOT_TOKEN in .env or systemd environment.")
+        raise SystemExit(1)
+    wiring = validate_bot_wiring()
+    if not wiring.get("valid"):
+        logger.warning("Bot wiring warnings: %s", wiring.get("errors"))
+    logger.info("Level 4 bot started. Version=%s", BOT_VERSION)
+    app = build_application(token)
+    app.run_polling(allowed_updates=None, drop_pending_updates=True)
 
 
 __all__ = [
     "BOT_VERSION",
+    "OKXMarketProvider",
     "make_bot_response",
     "validate_bot_response",
     "provider_get_candles",
@@ -464,7 +768,20 @@ __all__ = [
     "analyze_market_snapshot",
     "analyze_symbol_with_provider",
     "scan_market_with_provider",
+    "maybe_execute_real_decision",
+    "render_real_execution_note",
+    "find_open_position_for_symbol",
+    "render_close_result",
     "execute_route",
     "handle_text_message",
     "validate_bot_wiring",
+    "load_env_file",
+    "get_bot_token",
+    "is_user_allowed",
+    "build_application",
+    "main",
 ]
+
+
+if __name__ == "__main__":
+    main()
