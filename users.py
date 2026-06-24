@@ -1,111 +1,142 @@
+"""
+users.py
+Level 4 / 1H Smart Scalp Bot
+
+User access control without config.py.
+
+Architecture lock:
+- Owner-only access by default.
+- Reads OWNER_ID from environment.
+- Stores allowed users through state_store.py.
+- Does not import config.py, data_store.py, or diagnostics.py.
+"""
+
 from __future__ import annotations
 
-"""
-User access control.
+import os
+from typing import Any
 
-Responsibilities:
-- Owner-only access by default.
-- Allowed users list.
-- Commands: /id, /adduser, /removeuser, /listusers.
-"""
-
-import time
-from typing import Any, Dict, List
-
-from config import OWNER_ID, CORE_DATA_FILES
-from data_store import load_dict, save_json
-from diagnostics import safe
+from constants import STATUS_FAILED, STATUS_OK, SYSTEM_VERSION
+from models import RecordResult
+from state_store import load_json, save_json_atomic, log_error
+from utils import safe_int, safe_str, utc_now_iso
 
 
-USERS_FILE = "users"
+USERS_VERSION: str = SYSTEM_VERSION
+USERS_KEY: str = "users"
 
 
-def _ts() -> int:
-    return int(time.time())
+def get_owner_id(default: int = 0) -> int:
+    return safe_int(os.getenv("OWNER_ID") or os.getenv("TELEGRAM_OWNER_ID"), default) or default
 
 
-def _empty_state() -> Dict[str, Any]:
-    return {
-        "version": 1,
-        "owner_id": OWNER_ID,
-        "allowed_users": [],
-        "updated_at": _ts(),
-    }
+def default_users_state() -> dict[str, Any]:
+    return {"system_version": SYSTEM_VERSION, "owner_id": get_owner_id(0), "allowed_users": [], "updated_at": utc_now_iso()}
 
 
-@safe(default={})
-def load_users() -> Dict[str, Any]:
-    st = load_dict(USERS_FILE)
-    if not st:
-        st = _empty_state()
-        save_json(USERS_FILE, st)
-    for k, v in _empty_state().items():
-        st.setdefault(k, v)
-    if OWNER_ID and not st.get("owner_id"):
-        st["owner_id"] = OWNER_ID
-    return st
+def normalize_users_state(state: Any) -> dict[str, Any]:
+    if not isinstance(state, dict):
+        state = {}
+    data = default_users_state()
+    data.update(state)
+    data["system_version"] = safe_str(data.get("system_version"), SYSTEM_VERSION)
+    data["owner_id"] = safe_int(data.get("owner_id"), 0) or get_owner_id(0)
+    allowed: list[int] = []
+    for item in data.get("allowed_users", []):
+        uid = safe_int(item, None)
+        if uid is not None and uid > 0 and uid not in allowed:
+            allowed.append(uid)
+    data["allowed_users"] = sorted(allowed)
+    data["updated_at"] = safe_str(data.get("updated_at"), utc_now_iso())
+    return data
 
 
-@safe(default=False)
-def save_users(st: Dict[str, Any]) -> bool:
-    st["updated_at"] = _ts()
-    return save_json(USERS_FILE, st, make_backup=True)
+def load_users() -> dict[str, Any]:
+    state = load_json(USERS_KEY, default=default_users_state())
+    normalized = normalize_users_state(state)
+    if state != normalized:
+        save_users(normalized)
+    return normalized
 
 
-@safe(default=False)
-def is_owner(user_id: int) -> bool:
-    st = load_users()
-    return int(user_id or 0) == int(st.get("owner_id") or OWNER_ID or 0)
+def save_users(state: dict[str, Any]) -> bool:
+    data = normalize_users_state(state)
+    data["updated_at"] = utc_now_iso()
+    return save_json_atomic(USERS_KEY, data)
 
 
-@safe(default=False)
-def is_allowed(user_id: int) -> bool:
-    st = load_users()
-    uid = int(user_id or 0)
-    if uid == int(st.get("owner_id") or OWNER_ID or 0):
+def is_owner(user_id: Any) -> bool:
+    uid = safe_int(user_id, 0) or 0
+    owner = safe_int(load_users().get("owner_id"), 0) or get_owner_id(0)
+    return owner > 0 and uid == owner
+
+
+def is_allowed(user_id: Any) -> bool:
+    uid = safe_int(user_id, 0) or 0
+    if uid <= 0:
+        return False
+    if is_owner(uid):
         return True
-    return uid in [int(x) for x in st.get("allowed_users", [])]
+    return uid in [safe_int(x, 0) for x in load_users().get("allowed_users", [])]
 
 
-@safe(default=True)
-def add_user(user_id: int) -> bool:
-    st = load_users()
-    uid = int(user_id)
-    users = set(int(x) for x in st.get("allowed_users", []))
-    users.add(uid)
-    st["allowed_users"] = sorted(users)
-    save_users(st)
-    return True
+def add_user(user_id: Any) -> RecordResult:
+    try:
+        uid = safe_int(user_id, 0) or 0
+        if uid <= 0:
+            return RecordResult(status=STATUS_FAILED, recorded=False, message="invalid_user_id", error="user_id must be positive")
+        state = load_users()
+        users = set(safe_int(x, 0) or 0 for x in state.get("allowed_users", []))
+        users.add(uid)
+        users.discard(0)
+        state["allowed_users"] = sorted(users)
+        ok = save_users(state)
+        return RecordResult(status=STATUS_OK if ok else STATUS_FAILED, recorded=ok, message="user_added" if ok else "user_add_failed", metadata={"user_id": uid})
+    except Exception as exc:
+        log_error("users", "add_user", exc)
+        return RecordResult(status=STATUS_FAILED, recorded=False, message="user_add_exception", error=str(exc))
 
 
-@safe(default=True)
-def remove_user(user_id: int) -> bool:
-    st = load_users()
-    uid = int(user_id)
-    st["allowed_users"] = [int(x) for x in st.get("allowed_users", []) if int(x) != uid]
-    save_users(st)
-    return True
+def remove_user(user_id: Any) -> RecordResult:
+    try:
+        uid = safe_int(user_id, 0) or 0
+        state = load_users()
+        state["allowed_users"] = [safe_int(x, 0) for x in state.get("allowed_users", []) if safe_int(x, 0) != uid]
+        ok = save_users(state)
+        return RecordResult(status=STATUS_OK if ok else STATUS_FAILED, recorded=ok, message="user_removed" if ok else "user_remove_failed", metadata={"user_id": uid})
+    except Exception as exc:
+        log_error("users", "remove_user", exc)
+        return RecordResult(status=STATUS_FAILED, recorded=False, message="user_remove_exception", error=str(exc))
 
 
-@safe(default=[])
-def list_users() -> List[int]:
-    return [int(x) for x in load_users().get("allowed_users", [])]
+def list_users() -> list[int]:
+    return [safe_int(x, 0) or 0 for x in load_users().get("allowed_users", []) if safe_int(x, 0)]
 
 
-@safe(default="")
 def list_users_fa() -> str:
-    st = load_users()
-    allowed = list_users()
-    lines = [f"👤 مالک: {st.get('owner_id') or OWNER_ID or 'تنظیم نشده'}"]
-    if allowed:
-        lines.append("کاربران مجاز: " + "، ".join(str(x) for x in allowed))
-    else:
-        lines.append("کاربر مجاز اضافه نشده.")
+    state = load_users()
+    users = list_users()
+    lines = [f"👤 مالک: {state.get('owner_id') or 'تنظیم نشده'}"]
+    lines.append("کاربران مجاز: " + "، ".join(str(x) for x in users) if users else "کاربر مجاز اضافه نشده.")
     return "\n".join(lines)
 
 
-@safe(default=True)
 def initialize() -> bool:
-    st = load_users()
-    save_users(st)
-    return True
+    return save_users(load_users())
+
+
+def validate_users_light() -> dict[str, Any]:
+    state = load_users()
+    errors: list[str] = []
+    if state.get("system_version") != SYSTEM_VERSION:
+        errors.append("INVALID_SYSTEM_VERSION")
+    if not isinstance(state.get("allowed_users"), list):
+        errors.append("ALLOWED_USERS_NOT_LIST")
+    return {"status": STATUS_OK if not errors else STATUS_FAILED, "valid": not errors, "errors": errors, "checked_at": utc_now_iso()}
+
+
+__all__ = [
+    "USERS_VERSION", "USERS_KEY", "get_owner_id", "default_users_state", "normalize_users_state",
+    "load_users", "save_users", "is_owner", "is_allowed", "add_user", "remove_user", "list_users",
+    "list_users_fa", "initialize", "validate_users_light",
+]
