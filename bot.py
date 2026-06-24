@@ -711,13 +711,36 @@ def handle_text_message(
 def validate_bot_wiring() -> dict[str, Any]:
     errors: list[str] = []
 
-    for text, key in [("راهنما", "HELP"), ("آمار", "STATS"), ("پوزیشن ها", "POSITIONS"), ("وضعیت", "STATUS"), ("وضعیت ترید", "TRADE_STATUS"), ("لیست استراتژی", "STRATEGY_LIST"), ("ترید دلار 7", "SET_MARGIN"), ("لوریج 10", "SET_LEVERAGE"), ("حداکثر پوزیشن 3", "SET_MAX_POSITIONS")]:
+    route_tests = [
+        ("راهنما", "HELP"),
+        ("آمار", "SHOW_STATS"),
+        ("پوزیشن ها", "SHOW_POSITIONS"),
+        ("وضعیت", "SHOW_STATUS"),
+        ("وضعیت ترید", "SHOW_TRADE_SETTINGS"),
+        ("لیست استراتژی", "LIST_STRATEGIES"),
+        ("استراتژی لول 4", "SET_STRATEGY_LEVEL"),
+        ("ترید فعال", "ENABLE_REAL_TRADING"),
+        ("ترید خاموش", "DISABLE_REAL_TRADING"),
+        ("ترید دلار 7", "SET_MARGIN"),
+        ("لوریج 10", "SET_LEVERAGE"),
+        ("حداکثر پوزیشن 3", "SET_MAX_POSITIONS"),
+        ("ریست ترید", "RESET_TRADE_SETTINGS"),
+        ("تحلیل DOGEUSDT", "ANALYZE_SYMBOL"),
+        ("اسکن", "SCAN_MARKET"),
+        ("بستن DOGEUSDT", "REQUEST_CLOSE_POSITION"),
+    ]
+
+    for text, expected_action in route_tests:
         try:
+            command_route = parse_command(text)
+            if command_route.action != expected_action:
+                errors.append(f"ROUTE_MISMATCH:{text}:{command_route.action}!={expected_action}")
+                continue
             response = handle_text_message(text, auto_execute_real=False)
             if validate_bot_response(response).get("valid") is not True:
-                errors.append(f"{key}_RESPONSE_INVALID")
+                errors.append(f"{expected_action}_RESPONSE_INVALID")
         except Exception as exc:
-            errors.append(f"{key}_RESPONSE_EXCEPTION:{exc}")
+            errors.append(f"{expected_action}_RESPONSE_EXCEPTION:{exc}")
 
     try:
         rtm = validate_real_trade_manager_light()
