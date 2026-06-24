@@ -23,7 +23,6 @@ from typing import Any, Iterable, Mapping, Optional
 from constants import (
     DIRECTION_LONG,
     DIRECTION_SHORT,
-    MARKET_TYPE_LINEAR_USDT,
     SYSTEM_VERSION,
     TOOBIT_SPECIAL_SYMBOL_MAP,
 )
@@ -561,7 +560,7 @@ def validate_system_version(version: Any) -> bool:
 
 def validate_market_type(market_type: Any) -> bool:
     """Return True if market type is supported by this bot architecture."""
-    return safe_str(market_type).upper() == MARKET_TYPE_LINEAR_USDT
+    return safe_str(market_type).upper() in {"LINEAR_USDT", "SWAP"}
 
 
 __all__ = [
