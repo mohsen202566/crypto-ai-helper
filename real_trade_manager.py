@@ -279,18 +279,21 @@ def get_real_trade_status(*, client: Optional[ToobitClient] = None, include_exch
 
     try:
         c = client or get_client()
-        status["toobit_connected"] = bool(c.ping_private())
     except Exception as exc:
-        status["errors"].append(f"toobit_ping_error:{exc}")
-        status["toobit_connected"] = False
-        c = client or get_client()
+        status["errors"].append(f"toobit_client_error:{exc}")
+        c = None
 
-    try:
-        balance = c.get_account_balance("USDT")
-        status["balance"] = dict(balance)
-    except Exception as exc:
-        status["errors"].append(f"balance_error:{exc}")
-        status["balance"] = {"status": STATUS_FAILED, "asset": "USDT", "balance": 0.0, "available": 0.0, "error": str(exc)}
+    if c is not None:
+        try:
+            balance = c.get_account_balance("USDT")
+            status["balance"] = dict(balance)
+            status["toobit_connected"] = bool(balance.get("status") == STATUS_OK and balance.get("credentials_loaded", True))
+            if balance.get("error"):
+                status["errors"].append(f"balance_error:{balance.get('error')}")
+        except Exception as exc:
+            status["errors"].append(f"balance_error:{exc}")
+            status["balance"] = {"status": STATUS_FAILED, "asset": "USDT", "balance": None, "available": None, "error": str(exc)}
+
 
     try:
         rows = c.get_open_positions()
