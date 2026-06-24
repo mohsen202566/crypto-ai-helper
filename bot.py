@@ -55,7 +55,7 @@ from telegram_ui import (
     validate_rendered_text,
 )
 import strategy_manager
-from position_manager import add_position, get_open_positions, has_open_position
+from position_manager import add_position, get_open_positions, has_open_position, update_position
 from signal_manager import (
     mark_ghost_opened,
     mark_real_open_failed,
@@ -64,7 +64,7 @@ from signal_manager import (
     record_signal,
 )
 from stats_engine import build_stats_snapshot
-from models import AIDecision, Candle, MarketSnapshot, TradeCloseResult, TradePosition
+from models import AIDecision, Candle, MarketSnapshot, MonitorEvent, TradeCloseResult, TradePosition
 from market_data import fetch_market_snapshot, make_offline_snapshot
 from technical_sensors import build_sensor_snapshot
 from structure_engine import build_structure_snapshot
@@ -77,12 +77,15 @@ from tp_sl_engine import build_tp_sl_plan
 from ai_brain import build_ai_decision, validate_ai_decision
 from real_trade_manager import (
     close_real_position,
+    close_position_executor,
+    confirm_real_open,
     open_real_trade,
     preflight_real_trade,
     validate_real_trade_manager_light,
     get_real_trade_status,
 )
 from learning_memory import get_learning_summary, reset_learning_memory
+from position_monitor import monitor_positions_once
 from utils import normalize_direction, normalize_symbol, safe_float, safe_int, safe_str, utc_now_iso
 
 
@@ -638,19 +641,32 @@ def persist_signal_lifecycle(decision: AIDecision, *, execution: Optional[Mappin
 # RealTrade integration
 # =============================================================================
 
+def force_real_to_ghost_when_trade_off(decision: AIDecision) -> AIDecision:
+    """REAL signals are allowed only when real trading is ON.
+
+    If the AI marks a signal as REAL while trading is OFF, it must be converted
+    to GHOST before rendering, persistence, or execution. This prevents display-only
+    REAL messages and prevents accidental REAL lifecycle records when trading is disabled.
+    """
+    if safe_str(getattr(decision, "mode", "")).upper() == MODE_REAL and not _real_trading_enabled():
+        decision.mode = MODE_GHOST
+        if "REAL_TRADE_OFF_CONVERTED_TO_GHOST" not in decision.reason_codes:
+            decision.reason_codes.append("REAL_TRADE_OFF_CONVERTED_TO_GHOST")
+        metadata = dict(decision.metadata or {})
+        metadata["real_trade_off_converted_to_ghost"] = True
+        decision.metadata = metadata
+    return decision
+
 def maybe_execute_real_decision(decision: AIDecision) -> dict[str, Any]:
     """
     Execute REAL decision through real_trade_manager only.
 
     If real trading is off, the decision is converted to GHOST output text only.
     """
+    force_real_to_ghost_when_trade_off(decision)
     if decision.mode != MODE_REAL:
-        return {"executed": False, "status": STATUS_OK, "reason": "not_real_decision"}
-
-    if not _real_trading_enabled():
-        decision.mode = MODE_GHOST
-        decision.reason_codes.append("REAL_TRADE_OFF_CONVERTED_TO_GHOST")
-        return {"executed": False, "status": STATUS_OK, "reason": "real_trading_disabled_converted_to_ghost"}
+        reason = "real_trading_disabled_converted_to_ghost" if "REAL_TRADE_OFF_CONVERTED_TO_GHOST" in decision.reason_codes else "not_real_decision"
+        return {"executed": False, "status": STATUS_OK, "reason": reason}
 
     pf = preflight_real_trade(decision)
     if not pf.get("ok"):
@@ -810,9 +826,9 @@ def execute_route(
             symbol = normalize_symbol(args.get("symbol"))
             if not market_provider:
                 return make_bot_response(text=render_error("Market provider هنوز وصل نشده است."), status=STATUS_FAILED, action=action)
-            decision = analyze_symbol_with_provider(symbol, market_provider)
+            decision = force_real_to_ghost_when_trade_off(analyze_symbol_with_provider(symbol, market_provider))
             validation = validate_ai_decision(decision)
-            execution = maybe_execute_real_decision(decision) if auto_execute_real and validation.get("valid") else {"executed": False}
+            execution = maybe_execute_real_decision(decision) if auto_execute_real and validation.get("valid") else {"executed": False, "status": STATUS_OK}
             lifecycle = persist_signal_lifecycle(decision, execution=execution) if validation.get("valid") else {}
             text = render_ai_decision(decision) + render_real_execution_note(execution)
             status = STATUS_OK if validation.get("valid") and execution.get("status", STATUS_OK) != STATUS_FAILED else STATUS_FAILED
@@ -824,7 +840,7 @@ def execute_route(
             if not market_provider:
                 return make_bot_response(text=render_error("Market provider هنوز وصل نشده است."), status=STATUS_FAILED, action=action)
             symbols = default_scan_symbols or list(LEVEL_4_SYMBOLS)
-            decisions = scan_market_with_provider(symbols, market_provider)
+            decisions = [force_real_to_ghost_when_trade_off(d) for d in scan_market_with_provider(symbols, market_provider)]
             if not decisions:
                 return make_bot_response(text="سیگنال مناسبی پیدا نشد.", action=action, data={"count": 0})
 
@@ -832,7 +848,7 @@ def execute_route(
             lifecycles: list[dict[str, Any]] = []
             rendered: list[str] = []
             for decision in decisions:
-                execution = maybe_execute_real_decision(decision) if auto_execute_real and decision.mode == MODE_REAL else {"executed": False, "status": STATUS_OK}
+                execution = maybe_execute_real_decision(decision) if auto_execute_real else {"executed": False, "status": STATUS_OK}
                 lifecycle = persist_signal_lifecycle(decision, execution=execution)
                 executions.append(execution)
                 lifecycles.append(lifecycle)
@@ -866,6 +882,33 @@ def execute_route(
         return make_bot_response(text=render_error(f"خطای اجرای دستور: {exc}"), status=STATUS_FAILED, action=action, data={"error": str(exc)})
 
 
+def _bot_level_command_fallback(text: Any, *, user_id: Optional[int] = None, chat_id: Optional[int] = None) -> Optional[CommandRoute]:
+    """Small compatibility layer for locked Persian commands.
+
+    command_router.py remains the primary parser, but bot.py must not return
+    UNKNOWN for the key commands the user already locked.
+    """
+    normalized = safe_str(text).strip().replace("ي", "ی").replace("ك", "ک")
+    while "  " in normalized:
+        normalized = normalized.replace("  ", " ")
+    low = normalized.lower()
+    action = ""
+    if low in {"ترید", "وضعیت ترید", "تنظیمات ترید", "trade", "trade status"}:
+        action = "SHOW_TRADE_SETTINGS"
+    elif low in {"هوش مصنوعی", "هوش مصنوعی و یادگیری", "ai", "ai status"}:
+        action = "SHOW_AI_STATUS"
+    elif low in {"حذف آمار", "پاک کردن آمار", "ریست آمار", "reset stats"}:
+        action = "RESET_STATS"
+    if not action:
+        return None
+    args: dict[str, Any] = {}
+    if user_id is not None:
+        args["user_id"] = user_id
+    if chat_id is not None:
+        args["chat_id"] = chat_id
+    return CommandRoute(action=action, raw_text=safe_str(text), args=args)
+
+
 def handle_text_message(
     text: str,
     *,
@@ -876,6 +919,10 @@ def handle_text_message(
     auto_execute_real: bool = True,
 ) -> dict[str, Any]:
     command_route = parse_command(text, user_id=user_id, chat_id=chat_id)
+    if command_route.action == "UNKNOWN":
+        fallback = _bot_level_command_fallback(text, user_id=user_id, chat_id=chat_id)
+        if fallback is not None:
+            command_route = fallback
     return execute_route(
         command_route,
         market_provider=market_provider,
@@ -927,6 +974,8 @@ def validate_bot_wiring() -> dict[str, Any]:
     for text, expected_action in route_tests:
         try:
             command_route = parse_command(text)
+            if command_route.action == "UNKNOWN":
+                command_route = _bot_level_command_fallback(text) or command_route
             if command_route.action != expected_action:
                 errors.append(f"ROUTE_MISMATCH:{text}:{command_route.action}!={expected_action}")
                 continue
@@ -1047,6 +1096,94 @@ async def telegram_error_handler(update: object, context: Any) -> None:
 
 
 # =============================================================================
+# Position monitor background loop
+# =============================================================================
+
+def _monitor_interval_seconds() -> int:
+    load_env_file(".env")
+    raw = os.getenv("POSITION_MONITOR_INTERVAL_SECONDS") or os.getenv("MONITOR_INTERVAL_SECONDS")
+    value = safe_int(raw, 10) or 10
+    return max(5, value)
+
+
+def _current_price_from_provider(provider: Any, symbol: str) -> float:
+    candles = provider_get_candles(provider, normalize_symbol(symbol), timeframe=PRIMARY_TIMEFRAME, limit=3)
+    if candles:
+        return safe_float(candles[-1].close, 0.0) or 0.0
+    return 0.0
+
+
+def _ai_monitor_decision_provider(position: TradePosition, current_price: float) -> Any:
+    # Bot-level monitor keeps AI exit optional/safe for now. TP/SL and real close confirmation still run.
+    return None
+
+
+def render_monitor_event(event: MonitorEvent) -> str:
+    outcome = event.outcome
+    close_result = event.close_result
+    pnl = None
+    if outcome is not None:
+        pnl = outcome.pnl_usdt
+    if pnl is None and close_result is not None:
+        pnl = close_result.pnl_usdt
+    pnl_text = "-" if pnl is None else f"{pnl:+.4f}$"
+    exit_price = safe_float(getattr(outcome, "exit_price", None), None) if outcome is not None else None
+    if exit_price is None and close_result is not None:
+        exit_price = safe_float(close_result.close_price, None)
+    exit_text = "-" if exit_price is None else str(exit_price)
+    icon = "✅" if event.event in {"TP1", "TP2", "AI_EXIT", "MANUAL_CLOSE"} else "❌" if event.event == "SL" else "ℹ️"
+    mode = safe_str(event.mode).upper()
+    return "\n".join([
+        f"{icon} نتیجه پوزیشن {mode}",
+        f"Event: {event.event}",
+        f"Symbol: {normalize_symbol(event.symbol)}",
+        f"Direction: {normalize_direction(event.direction)}",
+        f"Exit: {exit_text}",
+        f"PnL: {pnl_text}",
+        f"Position ID: {safe_str(event.position_id)}",
+    ])
+
+
+async def _send_monitor_event(application: Any, chat_id: int, event: MonitorEvent) -> None:
+    text = render_monitor_event(event)
+    kwargs: dict[str, Any] = {"chat_id": chat_id, "text": text}
+    if event.reply_to_message_id:
+        kwargs["reply_to_message_id"] = event.reply_to_message_id
+    await application.bot.send_message(**kwargs)
+
+
+async def position_monitor_loop(application: Any) -> None:
+    interval = _monitor_interval_seconds()
+    logger.info("position_monitor_loop_started interval=%ss", interval)
+    await asyncio.sleep(5)
+    while True:
+        try:
+            chat_id = _owner_chat_id()
+            provider = application.bot_data.setdefault("market_provider", OKXMarketProvider())
+            events = monitor_positions_once(
+                price_provider=lambda symbol: _current_price_from_provider(provider, symbol),
+                ai_decision_provider=_ai_monitor_decision_provider,
+                close_executor=close_position_executor,
+                open_confirm_checker=confirm_real_open,
+            )
+            if events:
+                logger.info("position_monitor_events count=%s events=%s", len(events), [e.event for e in events])
+            if chat_id:
+                for event in events:
+                    if event.event in {"PRICE_UNAVAILABLE", "AI_EXIT_SKIPPED_EARLY"}:
+                        continue
+                    await _send_monitor_event(application, chat_id, event)
+            elif events:
+                logger.warning("position_monitor_events_not_sent owner_chat_id_missing count=%s", len(events))
+        except asyncio.CancelledError:
+            logger.info("position_monitor_loop_cancelled")
+            raise
+        except Exception as exc:
+            logger.exception("position_monitor_loop_error:%s", exc)
+        await asyncio.sleep(interval)
+
+
+# =============================================================================
 # Auto signal background loop
 # =============================================================================
 
@@ -1100,11 +1237,13 @@ def _owner_chat_id() -> Optional[int]:
     return None
 
 
-async def _send_long_text_to_chat(application: Any, chat_id: int, text: str) -> None:
+async def _send_long_text_to_chat(application: Any, chat_id: int, text: str) -> list[Any]:
     msg = safe_str(text) or "-"
     max_len = 3900
+    sent: list[Any] = []
     for i in range(0, len(msg), max_len):
-        await application.bot.send_message(chat_id=chat_id, text=msg[i:i + max_len])
+        sent.append(await application.bot.send_message(chat_id=chat_id, text=msg[i:i + max_len]))
+    return sent
 
 
 async def auto_signal_loop(application: Any) -> None:
@@ -1145,24 +1284,22 @@ async def auto_signal_loop(application: Any) -> None:
                     )
 
                     # Avoid spamming pure reject-only scans, but log them.
-                    sendable = [d for d in decisions if d.mode in {MODE_REAL, MODE_GHOST}]
+                    sendable = [force_real_to_ghost_when_trade_off(d) for d in decisions if d.mode in {MODE_REAL, MODE_GHOST}]
                     if sendable:
-                        rendered: list[str] = []
                         executions: list[dict[str, Any]] = []
                         lifecycles: list[dict[str, Any]] = []
                         for decision in sendable:
-                            execution = (
-                                maybe_execute_real_decision(decision)
-                                if decision.mode == MODE_REAL
-                                else {"executed": False, "status": STATUS_OK}
-                            )
+                            execution = maybe_execute_real_decision(decision)
                             lifecycle = persist_signal_lifecycle(decision, execution=execution)
                             executions.append(execution)
                             lifecycles.append(lifecycle)
-                            rendered.append(render_ai_decision(decision, compact=True) + render_real_execution_note(execution))
-
-                        text = "🤖 اتو سیگنال Level 4\n\n" + "\n\n".join(rendered)
-                        await _send_long_text_to_chat(application, chat_id, text)
+                            text = "🤖 اتو سیگنال Level 4\n\n" + render_ai_decision(decision, compact=True) + render_real_execution_note(execution)
+                            sent_messages = await _send_long_text_to_chat(application, chat_id, text)
+                            if sent_messages and lifecycle.get("position_id"):
+                                msg_id = getattr(sent_messages[0], "message_id", None)
+                                if msg_id:
+                                    update_position(lifecycle["position_id"], {"signal_message_id": msg_id})
+                                    logger.info("signal_message_id_saved position_id=%s message_id=%s", lifecycle["position_id"], msg_id)
                         logger.info("auto_signal_sent count=%s executions=%s lifecycles=%s", len(sendable), executions, lifecycles)
                     else:
                         logger.info("auto_signal_no_sendable_signal count=%s", len(decisions))
@@ -1181,6 +1318,8 @@ async def auto_signal_loop(application: Any) -> None:
 async def telegram_post_init(application: Any) -> None:
     """Start background tasks after Telegram Application initialization."""
     application.bot_data["market_provider"] = application.bot_data.get("market_provider") or OKXMarketProvider()
+    application.create_task(position_monitor_loop(application), name="level4_position_monitor_loop")
+    logger.info("position_monitor_task_created")
     if _auto_signal_enabled():
         application.create_task(auto_signal_loop(application), name="level4_auto_signal_loop")
         logger.info("auto_signal_task_created")
@@ -1235,7 +1374,11 @@ __all__ = [
     "persist_signal_lifecycle",
     "execute_route",
     "handle_text_message",
+    "_bot_level_command_fallback",
     "validate_bot_wiring",
+    "force_real_to_ghost_when_trade_off",
+    "position_monitor_loop",
+    "render_monitor_event",
     "load_env_file",
     "get_bot_token",
     "is_user_allowed",
