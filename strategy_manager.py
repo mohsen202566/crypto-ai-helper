@@ -34,6 +34,16 @@ from utils import safe_bool, safe_float, safe_int, safe_str, utc_now_iso
 
 STRATEGY_MANAGER_VERSION: str = SYSTEM_VERSION
 STRATEGY_STATE_KEY: str = "strategy_state"
+MIN_TRADE_MARGIN_USDT: float = 1.0
+MAX_TRADE_MARGIN_USDT: float = 1000.0
+
+
+def _clamp_margin_usdt(value: Any, default: float = 1.0) -> float:
+    """Clamp user-configurable trade margin to the locked 1-1000 USDT range."""
+    margin = safe_float(value, default)
+    if margin is None:
+        margin = default
+    return max(MIN_TRADE_MARGIN_USDT, min(MAX_TRADE_MARGIN_USDT, float(margin)))
 
 
 # =============================================================================
@@ -47,7 +57,11 @@ def default_strategy_state() -> dict[str, Any]:
         "active_level": STRATEGY_LEVEL,
         "active_strategy": STRATEGY_CODE,
         "real_trading_enabled": bool(TRADE_CONFIG.get("real_trading_default_enabled", False)),
+        # margin_usdt is kept for backward compatibility.
+        # min/max margin are the new AI position-sizing bounds; when equal, behavior is fixed-size.
         "margin_usdt": float(TRADE_CONFIG.get("default_margin_usdt", 7.0)),
+        "min_margin_usdt": float(TRADE_CONFIG.get("default_min_margin_usdt", TRADE_CONFIG.get("default_margin_usdt", 7.0))),
+        "max_margin_usdt": float(TRADE_CONFIG.get("default_max_margin_usdt", TRADE_CONFIG.get("default_margin_usdt", 7.0))),
         "leverage": int(TRADE_CONFIG.get("default_leverage", 10)),
         "max_concurrent_real_positions": int(TRADE_CONFIG.get("max_concurrent_real_positions", 3)),
         "max_concurrent_total_positions": int(TRADE_CONFIG.get("max_concurrent_total_positions", 6)),
@@ -69,8 +83,22 @@ def normalize_strategy_state(state: Any) -> dict[str, Any]:
     normalized["active_strategy"] = safe_str(normalized.get("active_strategy"), STRATEGY_CODE) or STRATEGY_CODE
     normalized["real_trading_enabled"] = safe_bool(normalized.get("real_trading_enabled"), False)
 
-    margin = safe_float(normalized.get("margin_usdt"), defaults["margin_usdt"]) or defaults["margin_usdt"]
-    normalized["margin_usdt"] = max(0.0, margin)
+    # Normalize margin settings. Old states only have margin_usdt, so default min=max=margin
+    # to preserve the previous fixed-margin behavior until the new commands are used.
+    legacy_margin = _clamp_margin_usdt(normalized.get("margin_usdt"), defaults["margin_usdt"])
+    min_margin = _clamp_margin_usdt(normalized.get("min_margin_usdt", legacy_margin), legacy_margin)
+    max_margin = _clamp_margin_usdt(normalized.get("max_margin_usdt", legacy_margin), legacy_margin)
+
+    if min_margin > max_margin:
+        # Self-heal corrupted/old state without crashing the bot.
+        max_margin = min_margin
+
+    active_margin = _clamp_margin_usdt(normalized.get("margin_usdt", min_margin), min_margin)
+    active_margin = max(min_margin, min(max_margin, active_margin))
+
+    normalized["min_margin_usdt"] = min_margin
+    normalized["max_margin_usdt"] = max_margin
+    normalized["margin_usdt"] = active_margin
 
     leverage = safe_int(normalized.get("leverage"), defaults["leverage"]) or defaults["leverage"]
     min_lev = safe_int(TRADE_CONFIG.get("min_leverage"), 1) or 1
@@ -260,12 +288,23 @@ def get_trade_runtime_config(state: Optional[Mapping[str, Any]] = None) -> dict[
     if state is None:
         state = load_strategy_state()
 
-    default_margin = safe_float(TRADE_CONFIG.get("default_margin_usdt"), 7.0) or 7.0
+    default_margin = _clamp_margin_usdt(TRADE_CONFIG.get("default_margin_usdt"), 7.0)
     default_leverage = safe_int(TRADE_CONFIG.get("default_leverage"), 10) or 10
+    min_margin = _clamp_margin_usdt(state.get("min_margin_usdt"), default_margin)
+    max_margin = _clamp_margin_usdt(state.get("max_margin_usdt"), default_margin)
+    if min_margin > max_margin:
+        max_margin = min_margin
+    margin = _clamp_margin_usdt(state.get("margin_usdt"), min_margin)
+    margin = max(min_margin, min(max_margin, margin))
+    dynamic_position_sizing = max_margin > min_margin
 
     return {
         "real_trading_enabled": is_real_trading_enabled(state),
-        "margin_usdt": safe_float(state.get("margin_usdt"), default_margin) or default_margin,
+        "margin_usdt": margin,
+        "min_margin_usdt": min_margin,
+        "max_margin_usdt": max_margin,
+        "dynamic_position_sizing_enabled": dynamic_position_sizing,
+        "position_sizing_mode": "AI_DYNAMIC" if dynamic_position_sizing else "FIXED",
         "leverage": safe_int(state.get("leverage"), default_leverage) or default_leverage,
         "margin_mode": safe_str(TRADE_CONFIG.get("margin_mode"), "ISOLATED"),
         "max_concurrent_real_positions": safe_int(
@@ -282,24 +321,100 @@ def get_trade_runtime_config(state: Optional[Mapping[str, Any]] = None) -> dict[
 
 
 def set_margin_usdt(margin_usdt: Any) -> RecordResult:
-    """Set runtime margin per trade."""
-    margin = safe_float(margin_usdt, None)
-    if margin is None or margin <= 0:
+    """
+    Set fixed runtime margin per trade.
+
+    Backward compatibility: the old command "ترید دلار 7" keeps working by
+    setting min=max=margin, which disables dynamic AI margin sizing.
+    """
+    margin_raw = safe_float(margin_usdt, None)
+    if margin_raw is None or margin_raw < MIN_TRADE_MARGIN_USDT or margin_raw > MAX_TRADE_MARGIN_USDT:
         return RecordResult(
             status=STATUS_FAILED,
             recorded=False,
             message="invalid_margin",
-            error="margin_usdt must be positive",
+            error="margin_usdt must be between 1 and 1000",
         )
 
+    margin = _clamp_margin_usdt(margin_raw, MIN_TRADE_MARGIN_USDT)
     state = load_strategy_state()
     state["margin_usdt"] = margin
+    state["min_margin_usdt"] = margin
+    state["max_margin_usdt"] = margin
     ok = save_strategy_state(state)
     return RecordResult(
         status=STATUS_OK if ok else STATUS_FAILED,
         recorded=ok,
         message="margin_updated" if ok else "margin_update_failed",
-        metadata={"margin_usdt": margin},
+        metadata={"margin_usdt": margin, "min_margin_usdt": margin, "max_margin_usdt": margin, "position_sizing_mode": "FIXED"},
+    )
+
+
+def set_min_margin_usdt(min_margin_usdt: Any) -> RecordResult:
+    """Set the minimum margin AI is allowed to use per REAL trade, 1-1000 USDT."""
+    value_raw = safe_float(min_margin_usdt, None)
+    if value_raw is None or value_raw < MIN_TRADE_MARGIN_USDT or value_raw > MAX_TRADE_MARGIN_USDT:
+        return RecordResult(
+            status=STATUS_FAILED,
+            recorded=False,
+            message="invalid_min_margin",
+            error="min_margin_usdt must be between 1 and 1000",
+        )
+
+    state = load_strategy_state()
+    value = _clamp_margin_usdt(value_raw, MIN_TRADE_MARGIN_USDT)
+    current_max = _clamp_margin_usdt(state.get("max_margin_usdt", state.get("margin_usdt", value)), value)
+    if value > current_max:
+        return RecordResult(
+            status=STATUS_FAILED,
+            recorded=False,
+            message="invalid_min_margin",
+            error="min_margin_usdt cannot be greater than max_margin_usdt",
+            metadata={"min_margin_usdt": value, "max_margin_usdt": current_max},
+        )
+
+    state["min_margin_usdt"] = value
+    state["margin_usdt"] = max(value, min(current_max, _clamp_margin_usdt(state.get("margin_usdt", value), value)))
+    ok = save_strategy_state(state)
+    return RecordResult(
+        status=STATUS_OK if ok else STATUS_FAILED,
+        recorded=ok,
+        message="min_margin_updated" if ok else "min_margin_update_failed",
+        metadata={"min_margin_usdt": value, "max_margin_usdt": current_max, "position_sizing_mode": "AI_DYNAMIC" if current_max > value else "FIXED"},
+    )
+
+
+def set_max_margin_usdt(max_margin_usdt: Any) -> RecordResult:
+    """Set the maximum margin AI is allowed to use per REAL trade, 1-1000 USDT."""
+    value_raw = safe_float(max_margin_usdt, None)
+    if value_raw is None or value_raw < MIN_TRADE_MARGIN_USDT or value_raw > MAX_TRADE_MARGIN_USDT:
+        return RecordResult(
+            status=STATUS_FAILED,
+            recorded=False,
+            message="invalid_max_margin",
+            error="max_margin_usdt must be between 1 and 1000",
+        )
+
+    state = load_strategy_state()
+    value = _clamp_margin_usdt(value_raw, MAX_TRADE_MARGIN_USDT)
+    current_min = _clamp_margin_usdt(state.get("min_margin_usdt", state.get("margin_usdt", value)), value)
+    if value < current_min:
+        return RecordResult(
+            status=STATUS_FAILED,
+            recorded=False,
+            message="invalid_max_margin",
+            error="max_margin_usdt cannot be less than min_margin_usdt",
+            metadata={"min_margin_usdt": current_min, "max_margin_usdt": value},
+        )
+
+    state["max_margin_usdt"] = value
+    state["margin_usdt"] = max(current_min, min(value, _clamp_margin_usdt(state.get("margin_usdt", current_min), current_min)))
+    ok = save_strategy_state(state)
+    return RecordResult(
+        status=STATUS_OK if ok else STATUS_FAILED,
+        recorded=ok,
+        message="max_margin_updated" if ok else "max_margin_update_failed",
+        metadata={"min_margin_usdt": current_min, "max_margin_usdt": value, "position_sizing_mode": "AI_DYNAMIC" if value > current_min else "FIXED"},
     )
 
 
@@ -346,6 +461,10 @@ def get_strategy_status() -> dict[str, Any]:
         "real_trading_enabled": runtime["real_trading_enabled"],
         "execution_when_trade_off": MODE_GHOST,
         "margin_usdt": runtime["margin_usdt"],
+        "min_margin_usdt": runtime["min_margin_usdt"],
+        "max_margin_usdt": runtime["max_margin_usdt"],
+        "dynamic_position_sizing_enabled": runtime["dynamic_position_sizing_enabled"],
+        "position_sizing_mode": runtime["position_sizing_mode"],
         "leverage": runtime["leverage"],
         "max_concurrent_real_positions": runtime["max_concurrent_real_positions"],
         "max_concurrent_total_positions": runtime["max_concurrent_total_positions"],
@@ -397,10 +516,15 @@ def validate_strategy_state_light() -> dict[str, Any]:
     """
     try:
         state = load_strategy_state()
+        min_margin = safe_float(state.get("min_margin_usdt"), 0.0) or 0.0
+        max_margin = safe_float(state.get("max_margin_usdt"), 0.0) or 0.0
         valid = (
             state.get("system_version") == SYSTEM_VERSION
             and safe_int(state.get("active_level"), 0) == STRATEGY_LEVEL
             and safe_str(state.get("active_strategy")) == STRATEGY_CODE
+            and MIN_TRADE_MARGIN_USDT <= min_margin <= MAX_TRADE_MARGIN_USDT
+            and MIN_TRADE_MARGIN_USDT <= max_margin <= MAX_TRADE_MARGIN_USDT
+            and min_margin <= max_margin
         )
 
         return {
@@ -430,6 +554,8 @@ def validate_strategy_state_light() -> dict[str, Any]:
 __all__ = [
     "STRATEGY_MANAGER_VERSION",
     "STRATEGY_STATE_KEY",
+    "MIN_TRADE_MARGIN_USDT",
+    "MAX_TRADE_MARGIN_USDT",
     "default_strategy_state",
     "normalize_strategy_state",
     "load_strategy_state",
@@ -447,6 +573,8 @@ __all__ = [
     "execution_mode_for_new_decision",
     "get_trade_runtime_config",
     "set_margin_usdt",
+    "set_min_margin_usdt",
+    "set_max_margin_usdt",
     "set_leverage",
     "get_strategy_status",
     "list_available_strategies",
