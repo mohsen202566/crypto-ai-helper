@@ -1153,6 +1153,32 @@ async def telegram_start(update: Any, context: Any) -> None:
     await send_long_text(update.effective_message, render_help())
 
 
+def _fast_trade_toggle_action(text: Any) -> str:
+    """Return ON/OFF for urgent trade toggle commands.
+
+    These commands must not wait behind Toobit status calls, market scans,
+    or other slow synchronous work. They only update local strategy state.
+    """
+    normalized = safe_str(text).strip().replace("ي", "ی").replace("ك", "ک")
+    while "  " in normalized:
+        normalized = normalized.replace("  ", " ")
+    low = normalized.lower()
+    if not low:
+        return ""
+
+    has_trade_word = "ترید" in low or "trade" in low
+    off_words = {"خاموش", "غیرفعال", "غيرفعال", "off", "disable", "disabled"}
+    on_words = {"فعال", "روشن", "on", "enable", "enabled"}
+
+    if has_trade_word and any(word in low for word in off_words):
+        return "OFF"
+    if has_trade_word and any(word in low for word in on_words) and not any(word in low for word in off_words):
+        return "ON"
+    if any(word in low for word in {"توقف فوری", "استاپ فوری", "emergency stop"}):
+        return "OFF"
+    return ""
+
+
 async def telegram_message_handler(update: Any, context: Any) -> None:
     message = getattr(update, "effective_message", None)
     if message is None:
@@ -1165,9 +1191,30 @@ async def telegram_message_handler(update: Any, context: Any) -> None:
         await message.reply_text("⛔ دسترسی مجاز نیست.")
         return
 
+    # Critical safety commands must answer immediately and must not wait for
+    # Toobit, market-data calls, auto-scan, or heavy status rendering.
+    fast_toggle = _fast_trade_toggle_action(text)
+    if fast_toggle == "OFF":
+        ok = _disable_trade()
+        await message.reply_text(
+            render_ok("ترید واقعی خاموش شد. سیگنال‌های جدید GHOST می‌شوند.")
+            if ok else render_error("خاموش کردن ترید واقعی انجام نشد.")
+        )
+        return
+    if fast_toggle == "ON":
+        ok = _enable_trade()
+        await message.reply_text(
+            render_ok("ترید واقعی روشن شد.")
+            if ok else render_error("روشن کردن ترید واقعی انجام نشد.")
+        )
+        return
+
     provider = context.application.bot_data.setdefault("market_provider", OKXMarketProvider())
     try:
-        response = handle_text_message(
+        # handle_text_message may call Toobit or market-data synchronously. Run it
+        # off the Telegram event loop so /start and trade ON/OFF stay responsive.
+        response = await asyncio.to_thread(
+            handle_text_message,
             text,
             user_id=user_id,
             chat_id=chat_id,
@@ -1396,7 +1443,7 @@ async def auto_signal_loop(application: Any) -> None:
                     logger.warning("auto_signal_skipped owner_chat_id_missing")
                 else:
                     provider = application.bot_data.setdefault("market_provider", OKXMarketProvider())
-                    decisions = scan_market_with_provider(list(LEVEL_4_SYMBOLS), provider)
+                    decisions = await asyncio.to_thread(scan_market_with_provider, list(LEVEL_4_SYMBOLS), provider)
                     mode_counts: dict[str, int] = {}
                     for decision in decisions:
                         mode_counts[decision.mode] = mode_counts.get(decision.mode, 0) + 1
@@ -1413,8 +1460,8 @@ async def auto_signal_loop(application: Any) -> None:
                         executions: list[dict[str, Any]] = []
                         lifecycles: list[dict[str, Any]] = []
                         for decision in sendable:
-                            execution = maybe_execute_real_decision(decision)
-                            lifecycle = persist_signal_lifecycle(decision, execution=execution)
+                            execution = await asyncio.to_thread(maybe_execute_real_decision, decision)
+                            lifecycle = await asyncio.to_thread(persist_signal_lifecycle, decision, execution=execution)
                             executions.append(execution)
                             lifecycles.append(lifecycle)
                             text = "🤖 اتو سیگنال Level 4\n\n" + render_ai_decision(decision, compact=True) + render_real_execution_note(execution)
@@ -1506,6 +1553,7 @@ __all__ = [
     "load_env_file",
     "get_bot_token",
     "is_user_allowed",
+    "_fast_trade_toggle_action",
     "auto_signal_loop",
     "telegram_post_init",
     "build_application",
