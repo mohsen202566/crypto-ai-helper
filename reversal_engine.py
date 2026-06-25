@@ -12,6 +12,12 @@ Architecture lock:
 - Uses already-built snapshots; no market fetching here.
 - Allowed project imports:
   constants.py, utils.py, models.py, momentum_engine.py only.
+
+Core rule:
+- Hunt the start of a pump/dump movement, not the middle/end of it.
+- Fresh start evidence from structure_engine and momentum_engine should support
+  continuation and reduce false reversal noise.
+- Late/chase/exhaustion evidence should cap continuation and raise reversal risk.
 """
 
 from __future__ import annotations
@@ -40,6 +46,108 @@ REVERSAL_ENGINE_VERSION: str = SYSTEM_VERSION
 
 
 # =============================================================================
+# Safe helpers
+# =============================================================================
+
+def _num(value: Any, default: float = 0.0) -> float:
+    """Return safe float while preserving real 0.0 values."""
+    parsed = safe_float(value, None)
+    if parsed is None:
+        return float(default)
+    return float(parsed)
+
+
+def _bool(value: Any, default: bool = False) -> bool:
+    """Read bool safely, including common string forms."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return bool(default)
+    text = safe_str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return bool(default)
+
+
+def _raw_mapping(obj: Any) -> Mapping[str, Any]:
+    raw = getattr(obj, "raw", None) or {}
+    if isinstance(raw, Mapping):
+        return raw
+    return {}
+
+
+def _nested_mapping(value: Any) -> Mapping[str, Any]:
+    if isinstance(value, Mapping):
+        return value
+    return {}
+
+
+def _structure_start_raw(structure: Optional[StructureSnapshot]) -> Mapping[str, Any]:
+    """Read structure_engine move_start_zone diagnostics safely."""
+    if structure is None:
+        return {}
+    raw = _raw_mapping(structure)
+    nested = _nested_mapping(raw.get("move_start_zone"))
+    if nested:
+        return nested
+    return raw
+
+
+def _momentum_raw(momentum: Optional[MomentumSnapshot]) -> Mapping[str, Any]:
+    if momentum is None:
+        return {}
+    return _raw_mapping(momentum)
+
+
+def _structure_start_active(structure: StructureSnapshot) -> bool:
+    raw = _structure_start_raw(structure)
+    return _bool(raw.get("active"), False)
+
+
+def _structure_start_score(structure: StructureSnapshot) -> float:
+    raw = _structure_start_raw(structure)
+    return _num(raw.get("score"), 0.0)
+
+
+def _structure_extended(structure: StructureSnapshot) -> bool:
+    raw = _structure_start_raw(structure)
+    return _bool(raw.get("move_already_extended"), False) or bool(getattr(structure, "is_late_move", False))
+
+
+def _structure_room_ok(structure: StructureSnapshot) -> bool:
+    raw = _structure_start_raw(structure)
+    return _bool(raw.get("room_to_target"), True)
+
+
+def _momentum_start_active(momentum: MomentumSnapshot) -> bool:
+    raw = _momentum_raw(momentum)
+    return _bool(raw.get("momentum_start_active"), False)
+
+
+def _momentum_start_score(momentum: MomentumSnapshot) -> float:
+    raw = _momentum_raw(momentum)
+    return _num(raw.get("start_pressure_score"), 0.0)
+
+
+def _fresh_momentum(momentum: MomentumSnapshot) -> float:
+    return _num(_momentum_raw(momentum).get("fresh_momentum_score"), 50.0)
+
+
+def _momentum_exhaustion(momentum: MomentumSnapshot) -> float:
+    return _num(_momentum_raw(momentum).get("exhaustion_score"), 0.0)
+
+
+def _move_age(momentum: MomentumSnapshot) -> float:
+    return _num(_momentum_raw(momentum).get("move_age_score"), 50.0)
+
+
+def _chase_pressure(momentum: MomentumSnapshot) -> float:
+    return _num(_momentum_raw(momentum).get("chase_pressure"), 0.0)
+
+
+# =============================================================================
 # Output contract
 # =============================================================================
 
@@ -56,12 +164,7 @@ def make_reversal_snapshot(
     reason_codes: list[str],
     raw: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, Any]:
-    """
-    Create a stable ReversalSnapshot-like dict.
-
-    Kept as a dict intentionally so models.py remains unchanged after being
-    created and checked earlier in the build sequence.
-    """
+    """Create a stable ReversalSnapshot-like dict without changing models.py."""
     return {
         "system_version": SYSTEM_VERSION,
         "created_at": utc_now_iso(),
@@ -73,7 +176,7 @@ def make_reversal_snapshot(
         "weakness_level": safe_str(weakness_level, "UNKNOWN").upper(),
         "continuation_score": clamp(continuation_score, 0.0, 100.0),
         "reversal_score": clamp(reversal_score, 0.0, 100.0),
-        "reason_codes": list(reason_codes),
+        "reason_codes": list(dict.fromkeys(reason_codes)),
         "raw": dict(raw or {}),
     }
 
@@ -88,13 +191,13 @@ def score_sensor_weakness(sensor: SensorSnapshot, direction: str) -> tuple[float
     score = 0.0
     reasons: list[str] = []
 
-    if not rsi_slope_ok(sensor, d, min_abs_slope=0.05):
+    if not rsi_slope_ok(sensor, d, min_abs_slope=0.04):
         score += 18.0
         reasons.append("REV_RSI_SLOPE_WEAK")
 
     if not macd_hist_slope_ok(sensor, d):
         score += 24.0
-        reasons.append("REV_MACD_SLOPE_WEAK")
+        reasons.append("REV_MACD_ACCEL_WEAK")
 
     if not power_shift_ok(sensor, d, min_gap=2.0):
         score += 18.0
@@ -108,7 +211,7 @@ def score_sensor_weakness(sensor: SensorSnapshot, direction: str) -> tuple[float
         score += 12.0
         reasons.append("REV_VWAP_LOST")
 
-    rsi = safe_float(sensor.rsi, None)
+    rsi = safe_float(getattr(sensor, "rsi", None), None)
     if rsi is not None:
         if d == DIRECTION_LONG and rsi >= 74:
             score += 10.0
@@ -117,28 +220,60 @@ def score_sensor_weakness(sensor: SensorSnapshot, direction: str) -> tuple[float
             score += 10.0
             reasons.append("REV_SHORT_RSI_OVERHEATED")
 
+    if not reasons:
+        reasons.append("REV_SENSOR_WEAKNESS_LOW")
+
     return clamp(score, 0.0, 100.0), reasons
 
 
 def score_structure_reversal_risk(structure: StructureSnapshot, direction: str) -> tuple[float, list[str]]:
-    """Score reversal risk from structure location."""
+    """Score reversal risk from structure location with start-zone awareness."""
     d = normalize_direction(direction)
     score = 0.0
     reasons: list[str] = []
 
-    if structure.is_late_move:
+    start_raw = _structure_start_raw(structure)
+    start_active = _bool(start_raw.get("active"), False)
+    start_score = _num(start_raw.get("score"), 0.0)
+    extended = _bool(start_raw.get("move_already_extended"), False) or bool(getattr(structure, "is_late_move", False))
+    room_ok = _bool(start_raw.get("room_to_target"), True)
+
+    if extended:
+        score += 36.0
+        reasons.append("REV_STRUCTURE_EXTENDED_MOVE")
+    elif bool(getattr(structure, "is_late_move", False)):
         score += 30.0
         reasons.append("REV_STRUCTURE_LATE_MOVE")
 
-    if structure.is_range:
-        score += 14.0
-        reasons.append("REV_STRUCTURE_RANGE")
+    # Range is not automatically bad if it is breaking out from a start zone.
+    if bool(getattr(structure, "is_range", False)):
+        if start_active:
+            score += 4.0
+            reasons.append("REV_RANGE_BREAK_START_ZONE")
+        else:
+            score += 14.0
+            reasons.append("REV_STRUCTURE_RANGE")
 
-    if safe_float(structure.fresh_zone_score, 50.0) <= 35:
-        score += 18.0
+    fresh_zone = _num(getattr(structure, "fresh_zone_score", 50.0), 50.0)
+    if fresh_zone <= 30:
+        score += 22.0
+        reasons.append("REV_FRESH_ZONE_VERY_WEAK")
+    elif fresh_zone <= 42 and not start_active:
+        score += 12.0
         reasons.append("REV_FRESH_ZONE_WEAK")
 
-    trend = safe_str(structure.trend).upper()
+    if not room_ok:
+        score += 16.0
+        reasons.append("REV_NO_ROOM_TO_TARGET")
+
+    if start_active and start_score >= 55 and not extended and room_ok:
+        score -= 14.0
+        reasons.append("REV_STRUCTURE_START_REDUCES_RISK")
+    elif start_score >= 55 and not extended:
+        score -= 6.0
+        reasons.append("REV_STRUCTURE_START_FORMING")
+
+    trend = safe_str(getattr(structure, "trend", "")).upper()
     if trend == "UPTREND" and d == DIRECTION_SHORT:
         score += 12.0
         reasons.append("REV_COUNTER_UPTREND")
@@ -146,7 +281,7 @@ def score_structure_reversal_risk(structure: StructureSnapshot, direction: str) 
         score += 12.0
         reasons.append("REV_COUNTER_DOWNTREND")
 
-    raw = structure.raw or {}
+    raw = _raw_mapping(structure)
     if d == DIRECTION_LONG:
         resistance_distance = safe_float(raw.get("resistance_distance_pct"), None)
         if resistance_distance is not None and resistance_distance <= 0.35:
@@ -158,34 +293,45 @@ def score_structure_reversal_risk(structure: StructureSnapshot, direction: str) 
             score += 12.0
             reasons.append("REV_NEAR_SUPPORT")
 
+    if not reasons:
+        reasons.append("REV_STRUCTURE_RISK_LOW")
+
     return clamp(score, 0.0, 100.0), reasons
 
 
 def score_momentum_reversal_risk(momentum: MomentumSnapshot) -> tuple[float, list[str]]:
-    """Score reversal risk from momentum snapshot, including late/chase pressure."""
+    """Score reversal risk from momentum snapshot, including start/chase separation."""
     score = 0.0
     reasons: list[str] = []
 
-    weakness = safe_float(momentum.weakness_score, 0.0) or 0.0
-    reversal = safe_float(momentum.reversal_risk_score, 0.0) or 0.0
-    continuation = safe_float(momentum.continuation_score, 50.0) or 50.0
-    acceleration = safe_float(momentum.acceleration_score, 50.0) or 50.0
+    weakness = _num(getattr(momentum, "weakness_score", 0.0), 0.0)
+    reversal = _num(getattr(momentum, "reversal_risk_score", 0.0), 0.0)
+    continuation = _num(getattr(momentum, "continuation_score", 50.0), 50.0)
+    acceleration = _num(getattr(momentum, "acceleration_score", 50.0), 50.0)
 
-    raw = momentum.raw or {}
-    fresh_momentum = safe_float(raw.get("fresh_momentum_score"), 50.0) or 50.0
-    exhaustion = safe_float(raw.get("exhaustion_score"), 0.0) or 0.0
-    chase_pressure = safe_float(raw.get("chase_pressure"), 0.0) or 0.0
+    fresh = _fresh_momentum(momentum)
+    exhaustion = _momentum_exhaustion(momentum)
+    chase = _chase_pressure(momentum)
+    age = _move_age(momentum)
+    start_pressure = _momentum_start_score(momentum)
+    start_active = _momentum_start_active(momentum)
 
-    # Base risk from the already-adjusted momentum engine.
-    score += weakness * 0.26
-    score += reversal * 0.22
+    score += weakness * 0.24
+    score += reversal * 0.18
     score += max(0.0, 52.0 - continuation) * 0.34
-    score += max(0.0, 52.0 - acceleration) * 0.26
+    score += max(0.0, 52.0 - acceleration) * 0.25
+    score += exhaustion * 0.28
+    score += chase * 0.30
+    score += max(0.0, age - 55.0) * 0.20
+    score += max(0.0, 55.0 - fresh) * 0.24
 
-    # New Level 4 late-entry controls.
-    score += exhaustion * 0.30
-    score += chase_pressure * 0.32
-    score += max(0.0, 55.0 - fresh_momentum) * 0.24
+    # Fresh start evidence should reduce false reversal alarms.
+    if start_active and start_pressure >= 60 and fresh >= 55 and exhaustion < 62 and chase < 62:
+        score -= 18.0
+        reasons.append("REV_MOMENTUM_START_REDUCES_RISK")
+    elif start_pressure >= 55 and fresh >= 52 and exhaustion < 65:
+        score -= 8.0
+        reasons.append("REV_MOMENTUM_START_FORMING")
 
     if weakness >= 65:
         reasons.append("REV_MOMENTUM_WEAKNESS_HIGH")
@@ -205,15 +351,23 @@ def score_momentum_reversal_risk(momentum: MomentumSnapshot) -> tuple[float, lis
     elif exhaustion >= 45:
         reasons.append("REV_MOMENTUM_EXHAUSTION_MEDIUM")
 
-    if chase_pressure >= 70:
+    if chase >= 70:
         reasons.append("REV_CHASE_PRESSURE_HIGH")
-    elif chase_pressure >= 52:
+    elif chase >= 52:
         reasons.append("REV_CHASE_PRESSURE_MEDIUM")
 
-    if fresh_momentum <= 42:
+    if age >= 72:
+        reasons.append("REV_MOVE_AGE_LATE")
+    elif age <= 38:
+        reasons.append("REV_MOVE_AGE_EARLY")
+
+    if fresh <= 42:
         reasons.append("REV_FRESH_MOMENTUM_LOW")
-    elif fresh_momentum >= 65:
+    elif fresh >= 65:
         reasons.append("REV_FRESH_MOMENTUM_OK")
+
+    if not reasons:
+        reasons.append("REV_MOMENTUM_RISK_LOW")
 
     return clamp(score, 0.0, 100.0), reasons
 
@@ -223,23 +377,23 @@ def score_liquidity_reversal_risk(liquidity: LiquiditySnapshot) -> tuple[float, 
     score = 0.0
     reasons: list[str] = []
 
-    trap = safe_float(liquidity.trap_risk_score, 0.0) or 0.0
-    sweep = safe_float(liquidity.liquidity_sweep_score, 0.0) or 0.0
-    fake = safe_float(liquidity.fake_break_risk, 0.0) or 0.0
-    wick = safe_float(liquidity.wick_rejection_score, 0.0) or 0.0
-    survival = safe_float(liquidity.breakout_survival_score, 50.0) or 50.0
+    trap = _num(getattr(liquidity, "trap_risk_score", 0.0), 0.0)
+    sweep = _num(getattr(liquidity, "liquidity_sweep_score", 0.0), 0.0)
+    fake = _num(getattr(liquidity, "fake_break_risk", 0.0), 0.0)
+    wick = _num(getattr(liquidity, "wick_rejection_score", 0.0), 0.0)
+    survival = _num(getattr(liquidity, "breakout_survival_score", 50.0), 50.0)
 
     score += trap * 0.35
-    score += sweep * 0.20
+    score += sweep * 0.18
     score += fake * 0.25
-    score += wick * 0.10
+    score += wick * 0.12
     score += max(0.0, 50.0 - survival) * 0.20
 
-    if liquidity.stop_hunt_detected:
+    if bool(getattr(liquidity, "stop_hunt_detected", False)):
         score += 10.0
         reasons.append("REV_STOP_HUNT_DETECTED")
 
-    if liquidity.likely_trap:
+    if bool(getattr(liquidity, "likely_trap", False)):
         score += 15.0
         reasons.append("REV_LIKELY_TRAP")
 
@@ -248,6 +402,9 @@ def score_liquidity_reversal_risk(liquidity: LiquiditySnapshot) -> tuple[float, 
 
     if survival <= 40:
         reasons.append("REV_BREAKOUT_SURVIVAL_WEAK")
+
+    if not reasons:
+        reasons.append("REV_LIQUIDITY_RISK_LOW")
 
     return clamp(score, 0.0, 100.0), reasons
 
@@ -258,21 +415,21 @@ def score_context_reversal_risk(context: MarketContextSnapshot, direction: str) 
     score = 0.0
     reasons: list[str] = []
 
-    context_score = safe_float(context.context_score, 50.0) or 50.0
-    market_risk = safe_float(context.market_risk_score, 50.0) or 50.0
+    context_score = _num(getattr(context, "context_score", 50.0), 50.0)
+    market_risk = _num(getattr(context, "market_risk_score", 50.0), 50.0)
 
     score += max(0.0, 50.0 - context_score) * 0.55
     score += max(0.0, market_risk - 45.0) * 0.35
 
-    if context.choppy:
+    if bool(getattr(context, "choppy", False)):
         score += 12.0
         reasons.append("REV_CONTEXT_CHOPPY")
 
-    if not context.aligned_with_direction:
+    if not bool(getattr(context, "aligned_with_direction", False)):
         score += 10.0
         reasons.append("REV_CONTEXT_NOT_ALIGNED")
 
-    mode = safe_str(context.market_mode).upper()
+    mode = safe_str(getattr(context, "market_mode", "")).upper()
     if mode == "BULLISH" and d == DIRECTION_SHORT:
         score += 8.0
         reasons.append("REV_SHORT_AGAINST_BULL_MARKET")
@@ -280,7 +437,124 @@ def score_context_reversal_risk(context: MarketContextSnapshot, direction: str) 
         score += 8.0
         reasons.append("REV_LONG_AGAINST_BEAR_MARKET")
 
+    if not reasons:
+        reasons.append("REV_CONTEXT_RISK_LOW")
+
     return clamp(score, 0.0, 100.0), reasons
+
+
+# =============================================================================
+# Start and late synergies
+# =============================================================================
+
+def calculate_early_start_synergy(
+    *,
+    structure: StructureSnapshot,
+    momentum: MomentumSnapshot,
+    liquidity: LiquiditySnapshot,
+    context: MarketContextSnapshot,
+) -> tuple[float, list[str]]:
+    """
+    Calculate nonlinear positive evidence for a fresh movement start.
+
+    Higher score = more reason to expect continuation rather than reversal.
+    """
+    reasons: list[str] = []
+
+    sraw = _structure_start_raw(structure)
+    structure_start = _bool(sraw.get("active"), False)
+    structure_start_score = _num(sraw.get("score"), 0.0)
+    atr_start = _bool(sraw.get("atr_expansion_start"), False)
+    micro_shift = _bool(sraw.get("micro_structure_shift"), False)
+    volume_structure = _bool(sraw.get("volume_pressure_start"), False)
+    sd_reaction = _bool(sraw.get("supply_demand_reaction"), False)
+    room_ok = _bool(sraw.get("room_to_target"), True)
+    structure_extended = _bool(sraw.get("move_already_extended"), False) or bool(getattr(structure, "is_late_move", False))
+
+    momentum_start = _momentum_start_active(momentum)
+    start_pressure = _momentum_start_score(momentum)
+    fresh = _fresh_momentum(momentum)
+    exhaustion = _momentum_exhaustion(momentum)
+    chase = _chase_pressure(momentum)
+    age = _move_age(momentum)
+
+    survival = _num(getattr(liquidity, "breakout_survival_score", 50.0), 50.0)
+    trap = _num(getattr(liquidity, "trap_risk_score", 0.0), 0.0)
+    context_aligned = bool(getattr(context, "aligned_with_direction", False))
+
+    synergy = 0.0
+
+    if structure_start:
+        synergy += 18.0
+        reasons.append("EARLY_STRUCTURE_START_ZONE")
+    elif structure_start_score >= 55:
+        synergy += 8.0
+        reasons.append("EARLY_STRUCTURE_START_FORMING")
+
+    if momentum_start:
+        synergy += 18.0
+        reasons.append("EARLY_MOMENTUM_START_ACTIVE")
+    elif start_pressure >= 60:
+        synergy += 10.0
+        reasons.append("EARLY_MOMENTUM_PRESSURE")
+
+    if atr_start:
+        synergy += 8.0
+        reasons.append("EARLY_ATR_EXPANSION")
+    if micro_shift:
+        synergy += 8.0
+        reasons.append("EARLY_MICRO_STRUCTURE_SHIFT")
+    if volume_structure:
+        synergy += 5.0
+        reasons.append("EARLY_STRUCTURE_VOLUME")
+    if sd_reaction:
+        synergy += 6.0
+        reasons.append("EARLY_SUPPLY_DEMAND_REACTION")
+
+    if fresh >= 65:
+        synergy += 10.0
+        reasons.append("EARLY_FRESH_MOMENTUM_HIGH")
+    elif fresh >= 55:
+        synergy += 5.0
+        reasons.append("EARLY_FRESH_MOMENTUM_OK")
+
+    if age <= 42:
+        synergy += 6.0
+        reasons.append("EARLY_MOVE_AGE_OK")
+
+    if survival >= 55 and trap <= 55:
+        synergy += 5.0
+        reasons.append("EARLY_LIQUIDITY_SURVIVAL_OK")
+
+    if context_aligned:
+        synergy += 4.0
+        reasons.append("EARLY_CONTEXT_ALIGNED")
+
+    if room_ok:
+        synergy += 4.0
+        reasons.append("EARLY_ROOM_TO_TARGET_OK")
+    else:
+        synergy -= 12.0
+        reasons.append("EARLY_ROOM_TO_TARGET_WEAK")
+
+    # Fresh start cannot override clear exhaustion/chase/extension.
+    if structure_extended:
+        synergy -= 28.0
+        reasons.append("EARLY_BLOCKED_BY_STRUCTURE_EXTENSION")
+    if exhaustion >= 65:
+        synergy -= 18.0
+        reasons.append("EARLY_BLOCKED_BY_EXHAUSTION")
+    if chase >= 68:
+        synergy -= 16.0
+        reasons.append("EARLY_BLOCKED_BY_CHASE")
+    if trap >= 70:
+        synergy -= 12.0
+        reasons.append("EARLY_BLOCKED_BY_TRAP")
+
+    if not reasons:
+        reasons.append("EARLY_START_SYNERGY_LOW")
+
+    return clamp(synergy, 0.0, 100.0), reasons
 
 
 def calculate_late_entry_synergy(
@@ -289,62 +563,57 @@ def calculate_late_entry_synergy(
     momentum: MomentumSnapshot,
     liquidity: LiquiditySnapshot,
 ) -> tuple[float, list[str]]:
-    """
-    Calculate nonlinear late-entry danger.
-
-    This catches the dangerous combination:
-    late structure + exhausted momentum + trap/liquidity risk.
-    """
+    """Calculate nonlinear late-entry danger."""
     reasons: list[str] = []
-    raw = momentum.raw or {}
 
-    chase_pressure = safe_float(raw.get("chase_pressure"), 0.0) or 0.0
-    fresh_momentum = safe_float(raw.get("fresh_momentum_score"), 50.0) or 50.0
-    momentum_exhaustion = safe_float(raw.get("exhaustion_score"), 0.0) or 0.0
-    weakness = safe_float(momentum.weakness_score, 0.0) or 0.0
+    chase = _chase_pressure(momentum)
+    fresh = _fresh_momentum(momentum)
+    exhaustion = _momentum_exhaustion(momentum)
+    age = _move_age(momentum)
+    weakness = _num(getattr(momentum, "weakness_score", 0.0), 0.0)
 
-    trap = safe_float(liquidity.trap_risk_score, 0.0) or 0.0
-    fake = safe_float(liquidity.fake_break_risk, 0.0) or 0.0
-    wick = safe_float(liquidity.wick_rejection_score, 0.0) or 0.0
-    survival = safe_float(liquidity.breakout_survival_score, 50.0) or 50.0
+    trap = _num(getattr(liquidity, "trap_risk_score", 0.0), 0.0)
+    fake = _num(getattr(liquidity, "fake_break_risk", 0.0), 0.0)
+    wick = _num(getattr(liquidity, "wick_rejection_score", 0.0), 0.0)
+    survival = _num(getattr(liquidity, "breakout_survival_score", 50.0), 50.0)
 
-    structure_late = 100.0 if structure.is_late_move else 0.0
-    fresh_zone_weak = max(0.0, 45.0 - (safe_float(structure.fresh_zone_score, 50.0) or 50.0)) * 1.7
+    structure_extended = _structure_extended(structure)
+    structure_late = 100.0 if structure_extended else 0.0
+    fresh_zone_weak = max(0.0, 45.0 - _num(getattr(structure, "fresh_zone_score", 50.0), 50.0)) * 1.7
     liquidity_danger = max(trap, fake, wick, max(0.0, 55.0 - survival))
 
     synergy = 0.0
 
-    # Late + exhausted move is the main "do not chase" condition.
-    if structure.is_late_move and (momentum_exhaustion >= 45 or chase_pressure >= 52):
-        synergy += 18.0
+    if structure_extended and (exhaustion >= 45 or chase >= 52 or age >= 64):
+        synergy += 22.0
         reasons.append("SYNERGY_LATE_EXHAUSTED")
 
-    # Trap plus late move should jump risk, not just add linearly.
-    if liquidity_danger >= 55 and (structure.is_late_move or chase_pressure >= 55):
+    if liquidity_danger >= 55 and (structure_extended or chase >= 55 or age >= 68):
         synergy += 18.0
         reasons.append("SYNERGY_TRAP_LATE")
 
-    # Weak/fading momentum around liquidity trap is dangerous.
     if liquidity_danger >= 50 and weakness >= 55:
         synergy += 14.0
         reasons.append("SYNERGY_TRAP_WEAKNESS")
 
-    # Low fresh momentum + high chase pressure means entry is probably late.
-    if fresh_momentum <= 42 and chase_pressure >= 55:
+    if fresh <= 42 and chase >= 55:
         synergy += 12.0
         reasons.append("SYNERGY_NOT_FRESH_CHASE")
 
-    # Weak fresh zone increases bad-entry probability.
-    if fresh_zone_weak >= 18 and (momentum_exhaustion >= 45 or liquidity_danger >= 50):
+    if age >= 72 and (fresh <= 50 or exhaustion >= 45):
+        synergy += 12.0
+        reasons.append("SYNERGY_MOVE_AGE_LATE")
+
+    if fresh_zone_weak >= 18 and (exhaustion >= 45 or liquidity_danger >= 50):
         synergy += 10.0
         reasons.append("SYNERGY_WEAK_ZONE_RISK")
 
-    # Soft continuous contribution.
     synergy += structure_late * 0.05
-    synergy += max(0.0, chase_pressure - 45.0) * 0.20
-    synergy += max(0.0, momentum_exhaustion - 45.0) * 0.18
+    synergy += max(0.0, chase - 45.0) * 0.20
+    synergy += max(0.0, exhaustion - 45.0) * 0.18
+    synergy += max(0.0, age - 58.0) * 0.18
     synergy += max(0.0, liquidity_danger - 45.0) * 0.14
-    synergy += max(0.0, 50.0 - fresh_momentum) * 0.12
+    synergy += max(0.0, 50.0 - fresh) * 0.12
 
     if not reasons:
         reasons.append("SYNERGY_LOW")
@@ -358,38 +627,39 @@ def adjust_reversal_probability_nonlinear(
     continuation_probability: float,
     exhaustion_probability: float,
     late_entry_synergy: float,
+    early_start_synergy: float,
     momentum: MomentumSnapshot,
+    structure: StructureSnapshot,
 ) -> float:
-    """
-    Nonlinear reversal boost for dangerous Level 4 entries.
+    """Nonlinear reversal adjustment for fresh starts vs dangerous late entries."""
+    probability = _num(base_probability, 0.0)
+    continuation = _num(continuation_probability, 50.0)
+    exhaustion = _num(exhaustion_probability, 0.0)
+    late = _num(late_entry_synergy, 0.0)
+    early = _num(early_start_synergy, 0.0)
 
-    Strong fresh momentum can reduce false reversal alarms, but only when
-    exhaustion/chase pressure is not high.
-    """
-    probability = safe_float(base_probability, 0.0) or 0.0
-    continuation = safe_float(continuation_probability, 50.0) or 50.0
-    exhaustion = safe_float(exhaustion_probability, 0.0) or 0.0
-    synergy = safe_float(late_entry_synergy, 0.0) or 0.0
+    fresh = _fresh_momentum(momentum)
+    chase = _chase_pressure(momentum)
+    mexh = _momentum_exhaustion(momentum)
+    age = _move_age(momentum)
+    start_active = _momentum_start_active(momentum) or _structure_start_active(structure)
+    extended = _structure_extended(structure)
 
-    raw = momentum.raw or {}
-    fresh_momentum = safe_float(raw.get("fresh_momentum_score"), 50.0) or 50.0
-    chase_pressure = safe_float(raw.get("chase_pressure"), 0.0) or 0.0
-    momentum_exhaustion = safe_float(raw.get("exhaustion_score"), 0.0) or 0.0
-
-    # Dangerous combinations should push reversal risk faster than a linear sum.
     danger = 0.0
-    danger += max(0.0, synergy - 20.0) * 0.46
+    danger += max(0.0, late - 20.0) * 0.46
     danger += max(0.0, exhaustion - 50.0) * 0.22
-    danger += max(0.0, chase_pressure - 50.0) * 0.24
+    danger += max(0.0, chase - 50.0) * 0.24
+    danger += max(0.0, age - 62.0) * 0.18
     danger += max(0.0, 48.0 - continuation) * 0.20
-
     probability += danger
 
-    # Do not over-penalize genuinely fresh, strong momentum.
-    if fresh_momentum >= 68 and chase_pressure <= 42 and momentum_exhaustion <= 38 and continuation >= 58:
-        probability -= 10.0
-    elif fresh_momentum >= 62 and chase_pressure <= 50 and momentum_exhaustion <= 45:
-        probability -= 5.0
+    # Fresh start reduces reversal noise only when late/chase evidence is not dangerous.
+    if start_active and early >= 50 and fresh >= 60 and chase <= 50 and mexh <= 48 and not extended:
+        probability -= 14.0
+    elif early >= 40 and fresh >= 58 and chase <= 55 and mexh <= 55 and not extended:
+        probability -= 8.0
+    elif fresh >= 65 and chase <= 45 and mexh <= 45 and continuation >= 58:
+        probability -= 6.0
 
     return clamp(probability, 0.0, 100.0)
 
@@ -399,24 +669,34 @@ def cap_continuation_for_late_risk(
     *,
     exhaustion_probability: float,
     late_entry_synergy: float,
+    early_start_synergy: float,
     momentum: MomentumSnapshot,
+    structure: StructureSnapshot,
 ) -> float:
-    """Cap continuation when late-entry/reversal risk is clearly elevated."""
-    continuation = safe_float(continuation_probability, 0.0) or 0.0
-    exhaustion = safe_float(exhaustion_probability, 0.0) or 0.0
-    synergy = safe_float(late_entry_synergy, 0.0) or 0.0
-    raw = momentum.raw or {}
-    chase_pressure = safe_float(raw.get("chase_pressure"), 0.0) or 0.0
+    """Cap continuation when late-entry risk is high, while allowing fresh starts."""
+    continuation = _num(continuation_probability, 0.0)
+    exhaustion = _num(exhaustion_probability, 0.0)
+    late = _num(late_entry_synergy, 0.0)
+    early = _num(early_start_synergy, 0.0)
+    chase = _chase_pressure(momentum)
+    age = _move_age(momentum)
+    extended = _structure_extended(structure)
 
     cap = 100.0
-    if synergy >= 70 or chase_pressure >= 75 or exhaustion >= 78:
+    if extended or late >= 70 or chase >= 75 or exhaustion >= 78 or age >= 82:
         cap = 38.0
-    elif synergy >= 55 or chase_pressure >= 65 or exhaustion >= 68:
+    elif late >= 55 or chase >= 65 or exhaustion >= 68 or age >= 72:
         cap = 48.0
-    elif synergy >= 42 or chase_pressure >= 55 or exhaustion >= 58:
+    elif late >= 42 or chase >= 55 or exhaustion >= 58 or age >= 64:
         cap = 58.0
-    elif synergy >= 30 or chase_pressure >= 48 or exhaustion >= 50:
+    elif late >= 30 or chase >= 48 or exhaustion >= 50 or age >= 58:
         cap = 68.0
+
+    # A genuine early start can loosen only the soft caps, not hard extension.
+    if not extended and early >= 55 and chase <= 55 and exhaustion <= 58 and age <= 62:
+        cap = max(cap, 72.0)
+    elif not extended and early >= 45 and chase <= 60 and exhaustion <= 62:
+        cap = max(cap, 66.0)
 
     return clamp(min(continuation, cap), 0.0, 100.0)
 
@@ -427,8 +707,8 @@ def cap_continuation_for_late_risk(
 
 def classify_weakness_level(reversal_probability: float, exhaustion_probability: float) -> str:
     """Classify weakness level."""
-    rev = safe_float(reversal_probability, 0.0) or 0.0
-    exh = safe_float(exhaustion_probability, 0.0) or 0.0
+    rev = _num(reversal_probability, 0.0)
+    exh = _num(exhaustion_probability, 0.0)
 
     if rev >= 75 or exh >= 80:
         return "VERY_HIGH"
@@ -447,23 +727,26 @@ def calculate_continuation_probability(
     liquidity: LiquiditySnapshot,
     context: MarketContextSnapshot,
     reversal_risk: float,
+    early_start_synergy: float = 0.0,
 ) -> float:
-    """Calculate continuation probability from aligned components."""
-    structure_score = safe_float(structure.structure_score, 50.0) or 50.0
-    momentum_score = safe_float(momentum.momentum_score, 50.0) or 50.0
-    continuation_score = safe_float(momentum.continuation_score, 50.0) or 50.0
-    survival_score = safe_float(liquidity.breakout_survival_score, 50.0) or 50.0
-    context_score = safe_float(context.context_score, 50.0) or 50.0
+    """Calculate continuation probability from aligned components and fresh-start evidence."""
+    structure_score = _num(getattr(structure, "structure_score", 50.0), 50.0)
+    momentum_score = _num(getattr(momentum, "momentum_score", 50.0), 50.0)
+    continuation_score = _num(getattr(momentum, "continuation_score", 50.0), 50.0)
+    survival_score = _num(getattr(liquidity, "breakout_survival_score", 50.0), 50.0)
+    context_score = _num(getattr(context, "context_score", 50.0), 50.0)
+    early = _num(early_start_synergy, 0.0)
 
     probability = (
-        structure_score * 0.22
-        + momentum_score * 0.27
-        + continuation_score * 0.20
-        + survival_score * 0.16
-        + context_score * 0.15
+        structure_score * 0.21
+        + momentum_score * 0.26
+        + continuation_score * 0.19
+        + survival_score * 0.14
+        + context_score * 0.13
+        + early * 0.07
     )
 
-    probability -= (safe_float(reversal_risk, 0.0) or 0.0) * 0.25
+    probability -= _num(reversal_risk, 0.0) * 0.24
 
     return clamp(probability, 0.0, 100.0)
 
@@ -474,30 +757,63 @@ def calculate_exhaustion_probability(
     momentum: MomentumSnapshot,
     liquidity: LiquiditySnapshot,
 ) -> tuple[float, list[str]]:
-    """Calculate move exhaustion probability."""
+    """Calculate move exhaustion probability with start-aware reduction."""
     score = 0.0
     reasons: list[str] = []
 
-    if structure.is_late_move:
-        score += 32.0
+    if _structure_extended(structure):
+        score += 34.0
         reasons.append("EXH_LATE_STRUCTURE")
 
-    if safe_float(momentum.acceleration_score, 50.0) <= 42:
+    acceleration = _num(getattr(momentum, "acceleration_score", 50.0), 50.0)
+    weakness = _num(getattr(momentum, "weakness_score", 0.0), 0.0)
+    mexh = _momentum_exhaustion(momentum)
+    age = _move_age(momentum)
+    chase = _chase_pressure(momentum)
+    fresh = _fresh_momentum(momentum)
+    start_active = _momentum_start_active(momentum) or _structure_start_active(structure)
+
+    if acceleration <= 42:
         score += 18.0
         reasons.append("EXH_ACCELERATION_FADING")
 
-    if safe_float(momentum.weakness_score, 0.0) >= 55:
+    if weakness >= 55:
         score += 20.0
         reasons.append("EXH_WEAKNESS_VISIBLE")
 
-    if safe_float(liquidity.wick_rejection_score, 0.0) >= 55:
+    if mexh >= 60:
+        score += 22.0
+        reasons.append("EXH_MOMENTUM_EXHAUSTION_HIGH")
+    elif mexh >= 45:
+        score += 12.0
+        reasons.append("EXH_MOMENTUM_EXHAUSTION_MEDIUM")
+
+    if age >= 72:
+        score += 20.0
+        reasons.append("EXH_MOVE_AGE_LATE")
+    elif age >= 62:
+        score += 10.0
+        reasons.append("EXH_MOVE_AGE_WARNING")
+
+    if chase >= 68:
+        score += 16.0
+        reasons.append("EXH_CHASE_PRESSURE_HIGH")
+    elif chase >= 55:
+        score += 8.0
+        reasons.append("EXH_CHASE_PRESSURE_MEDIUM")
+
+    if _num(getattr(liquidity, "wick_rejection_score", 0.0), 0.0) >= 55:
         score += 16.0
         reasons.append("EXH_WICK_REJECTION")
 
-    rsi = safe_float(sensor.rsi, None)
+    rsi = safe_float(getattr(sensor, "rsi", None), None)
     if rsi is not None and (rsi >= 76 or rsi <= 24):
         score += 12.0
         reasons.append("EXH_RSI_EXTREME")
+
+    if start_active and fresh >= 58 and mexh < 55 and chase < 60 and age < 65:
+        score -= 14.0
+        reasons.append("EXH_REDUCED_BY_FRESH_START")
 
     if not reasons:
         reasons.append("EXH_NORMAL")
@@ -528,38 +844,58 @@ def build_reversal_snapshot(
     liquidity_risk, liquidity_reasons = score_liquidity_reversal_risk(liquidity)
     context_risk, context_reasons = score_context_reversal_risk(context, d)
     exhaustion_probability, exhaustion_reasons = calculate_exhaustion_probability(sensor, structure, momentum, liquidity)
+    early_start_synergy, early_reasons = calculate_early_start_synergy(
+        structure=structure,
+        momentum=momentum,
+        liquidity=liquidity,
+        context=context,
+    )
     late_entry_synergy, synergy_reasons = calculate_late_entry_synergy(
         structure=structure,
         momentum=momentum,
         liquidity=liquidity,
     )
 
-    reason_codes.extend(sensor_reasons)
-    reason_codes.extend(structure_reasons)
-    reason_codes.extend(momentum_reasons)
-    reason_codes.extend(liquidity_reasons)
-    reason_codes.extend(context_reasons)
-    reason_codes.extend(exhaustion_reasons)
-    reason_codes.extend(synergy_reasons)
+    for codes in [
+        sensor_reasons,
+        structure_reasons,
+        momentum_reasons,
+        liquidity_reasons,
+        context_reasons,
+        exhaustion_reasons,
+        early_reasons,
+        synergy_reasons,
+    ]:
+        reason_codes.extend(codes)
 
-    raw_momentum = momentum.raw or {}
-    chase_pressure = safe_float(raw_momentum.get("chase_pressure"), 0.0) or 0.0
-    fresh_momentum_score = safe_float(raw_momentum.get("fresh_momentum_score"), 50.0) or 50.0
-    momentum_exhaustion_score = safe_float(raw_momentum.get("exhaustion_score"), 0.0) or 0.0
+    chase = _chase_pressure(momentum)
+    fresh = _fresh_momentum(momentum)
+    mexh = _momentum_exhaustion(momentum)
+    age = _move_age(momentum)
+    start_pressure = _momentum_start_score(momentum)
+    momentum_start_active = _momentum_start_active(momentum)
+    structure_start_active = _structure_start_active(structure)
+    structure_start_score = _structure_start_score(structure)
+    structure_extended = _structure_extended(structure)
 
     reversal_score = (
-        sensor_risk * 0.18
-        + structure_risk * 0.17
-        + momentum_risk * 0.28
-        + liquidity_risk * 0.20
-        + context_risk * 0.10
-        + late_entry_synergy * 0.07
+        sensor_risk * 0.16
+        + structure_risk * 0.16
+        + momentum_risk * 0.27
+        + liquidity_risk * 0.19
+        + context_risk * 0.09
+        + late_entry_synergy * 0.09
+        - early_start_synergy * 0.08
     )
+    reversal_score = clamp(reversal_score, 0.0, 100.0)
 
-    base_reversal_probability = (
-        reversal_score * 0.70
+    base_reversal_probability = clamp(
+        reversal_score * 0.68
         + exhaustion_probability * 0.18
         + late_entry_synergy * 0.12
+        - early_start_synergy * 0.10,
+        0.0,
+        100.0,
     )
 
     continuation_probability = calculate_continuation_probability(
@@ -568,25 +904,40 @@ def build_reversal_snapshot(
         liquidity=liquidity,
         context=context,
         reversal_risk=base_reversal_probability,
+        early_start_synergy=early_start_synergy,
     )
+
+    # Fresh-start boost before the late cap. This makes the engine a hunter,
+    # not merely a post-move reversal detector.
+    if early_start_synergy >= 55 and fresh >= 58 and chase <= 55 and mexh <= 58 and not structure_extended:
+        continuation_probability += 10.0
+        reason_codes.append("EARLY_START_BOOSTS_CONTINUATION")
+    elif early_start_synergy >= 42 and not structure_extended:
+        continuation_probability += 5.0
+        reason_codes.append("EARLY_START_SUPPORTS_CONTINUATION")
+
+    continuation_probability = clamp(continuation_probability, 0.0, 100.0)
 
     reversal_probability = adjust_reversal_probability_nonlinear(
         base_probability=base_reversal_probability,
         continuation_probability=continuation_probability,
         exhaustion_probability=exhaustion_probability,
         late_entry_synergy=late_entry_synergy,
+        early_start_synergy=early_start_synergy,
         momentum=momentum,
+        structure=structure,
     )
 
     continuation_probability = cap_continuation_for_late_risk(
         continuation_probability,
         exhaustion_probability=exhaustion_probability,
         late_entry_synergy=late_entry_synergy,
+        early_start_synergy=early_start_synergy,
         momentum=momentum,
+        structure=structure,
     )
 
-    # Final small correction: if reversal jumped after nonlinear adjustment,
-    # continuation must reflect that additional risk.
+    # If nonlinear reversal risk jumped, continuation should reflect it.
     continuation_probability = clamp(
         continuation_probability - max(0.0, reversal_probability - base_reversal_probability) * 0.25,
         0.0,
@@ -607,6 +958,13 @@ def build_reversal_snapshot(
     elif continuation_probability <= 40:
         reason_codes.append("CONTINUATION_PROBABILITY_WEAK")
 
+    if early_start_synergy >= 55:
+        reason_codes.append("EARLY_START_SYNERGY_HIGH")
+    elif early_start_synergy >= 35:
+        reason_codes.append("EARLY_START_SYNERGY_MEDIUM")
+    else:
+        reason_codes.append("EARLY_START_SYNERGY_LOW")
+
     if late_entry_synergy >= 55:
         reason_codes.append("LATE_ENTRY_SYNERGY_HIGH")
     elif late_entry_synergy >= 35:
@@ -614,14 +972,23 @@ def build_reversal_snapshot(
     else:
         reason_codes.append("LATE_ENTRY_SYNERGY_LOW")
 
-    if chase_pressure >= 60:
+    if chase >= 60:
         reason_codes.append("CHASE_PRESSURE_REVERSAL_RISK")
 
-    if fresh_momentum_score >= 65 and chase_pressure <= 45 and momentum_exhaustion_score <= 45:
-        reason_codes.append("FRESH_MOMENTUM_REDUCES_REVERSAL_NOISE")
+    if structure_extended:
+        reason_codes.append("EXTENDED_MOVE_REVERSAL_RISK")
+
+    if (momentum_start_active or structure_start_active) and fresh >= 58 and chase <= 55 and mexh <= 55:
+        reason_codes.append("FRESH_START_REDUCES_REVERSAL_NOISE")
+
+    symbol = (
+        safe_str(getattr(sensor, "symbol", ""))
+        or safe_str(getattr(structure, "symbol", ""))
+        or safe_str(getattr(liquidity, "symbol", ""))
+    )
 
     return make_reversal_snapshot(
-        symbol=sensor.symbol or structure.symbol or liquidity.symbol,
+        symbol=symbol,
         direction=d,
         continuation_probability=continuation_probability,
         reversal_probability=reversal_probability,
@@ -636,17 +1003,25 @@ def build_reversal_snapshot(
             "momentum_risk": momentum_risk,
             "liquidity_risk": liquidity_risk,
             "context_risk": context_risk,
+            "early_start_synergy": early_start_synergy,
             "late_entry_synergy": late_entry_synergy,
             "base_reversal_probability": base_reversal_probability,
-            "chase_pressure": chase_pressure,
-            "fresh_momentum_score": fresh_momentum_score,
-            "momentum_exhaustion_score": momentum_exhaustion_score,
+            "chase_pressure": chase,
+            "fresh_momentum_score": fresh,
+            "momentum_exhaustion_score": mexh,
+            "move_age_score": age,
+            "start_pressure_score": start_pressure,
+            "momentum_start_active": momentum_start_active,
+            "structure_start_active": structure_start_active,
+            "structure_start_score": structure_start_score,
+            "structure_extended": structure_extended,
+            "early_reasons": early_reasons,
             "synergy_reasons": synergy_reasons,
-            "sensor_created_at": sensor.created_at,
-            "structure_created_at": structure.created_at,
-            "momentum_created_at": momentum.created_at,
-            "liquidity_created_at": liquidity.created_at,
-            "context_created_at": context.created_at,
+            "sensor_created_at": getattr(sensor, "created_at", None),
+            "structure_created_at": getattr(structure, "created_at", None),
+            "momentum_created_at": getattr(momentum, "created_at", None),
+            "liquidity_created_at": getattr(liquidity, "created_at", None),
+            "context_created_at": getattr(context, "created_at", None),
         },
     )
 
@@ -678,6 +1053,16 @@ def validate_reversal_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     if safe_str(snapshot.get("weakness_level")).upper() not in {"VERY_LOW", "LOW", "MEDIUM", "HIGH", "VERY_HIGH"}:
         errors.append("invalid_weakness_level")
 
+    raw = snapshot.get("raw") or {}
+    if not isinstance(raw, Mapping):
+        errors.append("invalid_raw")
+    else:
+        for key in ["early_start_synergy", "late_entry_synergy", "chase_pressure", "fresh_momentum_score", "move_age_score"]:
+            if key in raw:
+                value = safe_float(raw.get(key), None)
+                if value is None or not (0.0 <= value <= 100.0):
+                    errors.append(f"invalid_raw_{key}")
+
     return {
         "valid": not errors,
         "errors": errors,
@@ -695,6 +1080,7 @@ __all__ = [
     "score_momentum_reversal_risk",
     "score_liquidity_reversal_risk",
     "score_context_reversal_risk",
+    "calculate_early_start_synergy",
     "calculate_late_entry_synergy",
     "adjust_reversal_probability_nonlinear",
     "cap_continuation_for_late_risk",
