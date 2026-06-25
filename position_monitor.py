@@ -6,13 +6,14 @@ Position monitor and lifecycle manager.
 
 Architecture lock:
 - Monitors existing REAL/GHOST positions.
-- Handles TP1, TP2, SL, AI_EXIT decision flow, runner/profit protection.
+- Handles TP1, TP2, SL, REAL close confirmation, exchange recovery, and result recording.
 - Does not fetch broad market scans or create new signals.
 - Does not send Telegram text.
 - Does not directly implement Toobit API calls; REAL open/close verification is injected
   through an execution adapter/callback so real_trade_manager.py remains exchange owner.
 - Writes position state only through position_manager.py.
 - Records outcomes through learning_memory.py.
+- AI/profit-exit is disabled here by design; the monitor only closes on TP/SL/exchange/manual recovery.
 """
 
 from __future__ import annotations
@@ -186,6 +187,88 @@ def protected_sl_after_tp1(position: TradePosition, current_price: float) -> flo
 # Outcome / events
 # =============================================================================
 
+def _position_metadata(position: TradePosition) -> dict[str, Any]:
+    """Return position metadata safely, regardless of model shape."""
+    raw = getattr(position, "metadata", {})
+    if isinstance(raw, Mapping):
+        return dict(raw)
+    return {}
+
+
+def _get_position_signal_message_id(position: TradePosition) -> int | None:
+    """Best-effort reply target for result messages.
+
+    Primary source is TradePosition.signal_message_id. Fallbacks are kept so
+    old position records created before the bot.py reply fix can still reply
+    when they carry a message id in metadata.
+    """
+    candidates = [
+        getattr(position, "signal_message_id", None),
+        getattr(position, "reply_to_message_id", None),
+        getattr(position, "telegram_message_id", None),
+        getattr(position, "message_id", None),
+    ]
+    meta = _position_metadata(position)
+    candidates.extend(
+        [
+            meta.get("signal_message_id"),
+            meta.get("reply_to_message_id"),
+            meta.get("telegram_message_id"),
+            meta.get("message_id"),
+        ]
+    )
+    for candidate in candidates:
+        value = safe_int(candidate, 0)
+        if value and value > 0:
+            return value
+    return None
+
+
+def _hunter_learning_metadata(position: TradePosition) -> dict[str, Any]:
+    """Preserve locked hunter/start/anti-chase fields in every outcome."""
+    meta = _position_metadata(position)
+    fields = [
+        "start_score",
+        "start_active",
+        "start_signal_count",
+        "start_reasons",
+        "chase_risk_score",
+        "chase_active",
+        "move_age_score",
+        "late_risk_score",
+        "fresh_momentum_score",
+        "exhaustion_score",
+        "start_pressure_score",
+        "structure_start_active",
+        "momentum_start_active",
+        "liquidity_start_active",
+        "fresh_context_active",
+        "early_start_synergy",
+        "selector_rank_score",
+        "selector_selected_for_real",
+        "selector_selection_reason",
+    ]
+    data: dict[str, Any] = {}
+    for field in fields:
+        if field in meta:
+            data[field] = meta.get(field)
+        elif hasattr(position, field):
+            data[field] = getattr(position, field)
+    return data
+
+
+def _ai_exit_disabled_event(position: TradePosition, *, current_price: float, reason: str = EVENT_AI_EXIT) -> MonitorEvent:
+    """Return a non-closing event when legacy code asks for AI/profit exit."""
+    return make_monitor_event(
+        event="AI_EXIT_DISABLED",
+        position=position,
+        metadata={
+            "requested_reason": safe_str(reason, EVENT_AI_EXIT),
+            "current_price": current_price,
+            "policy": "profit_exit_removed_monitor_only_tp_sl",
+        },
+    )
+
 def make_outcome(
     position: TradePosition,
     *,
@@ -225,10 +308,12 @@ def make_outcome(
         mae_pct=mae,
         reason_codes=[safe_str(event).upper()],
         metadata={
+            **_hunter_learning_metadata(position),
             **dict(metadata or {}),
             "signal_id": position.signal_id,
             "level": position.level,
             "status": position.status,
+            "signal_message_id": _get_position_signal_message_id(position),
         },
         level=position.level,
     )
@@ -252,7 +337,7 @@ def make_monitor_event(
         mode=position.mode,
         status=status,
         message_key=safe_str(event).lower(),
-        reply_to_message_id=position.signal_message_id,
+        reply_to_message_id=_get_position_signal_message_id(position),
         outcome=outcome,
         close_result=close_result,
         metadata=dict(metadata or {}),
@@ -597,17 +682,16 @@ def handle_ai_exit(
     close_executor: Optional[CloseExecutor] = None,
     reason: str = EVENT_AI_EXIT,
 ) -> MonitorEvent:
-    """Handle AI exit. REAL close must be verified."""
-    qty = position.runner_quantity if position.status == POSITION_PARTIAL_TP1 and position.runner_quantity > 0 else position.quantity
+    """AI/profit exit is intentionally disabled.
 
-    if position.mode == MODE_REAL:
-        event = handle_real_close(position, event=reason, current_price=current_price, quantity=qty, close_executor=close_executor)
-        if event.status == STATUS_OK:
-            mark_ai_exit_done(position.position_id)
-        return event
-
-    mark_ai_exit_done(position.position_id)
-    return handle_ghost_close(position, event=reason, current_price=current_price, quantity=qty)
+    The locked update removes automatic exit-in-profit behavior completely.
+    The monitor may close positions only through TP, SL, confirmed exchange-side
+    disappearance/recovery, or explicit manual/external close handling.
+    close_executor is accepted only for backward-compatible call signatures and
+    is not used here.
+    """
+    _ = close_executor
+    return _ai_exit_disabled_event(position, current_price=current_price, reason=reason)
 
 
 
@@ -866,29 +950,12 @@ def monitor_position_once(
         events.append(handle_tp1(position, current_price=price, close_executor=close_executor))
         return events
 
-    # AI exit: before TP1 must be conservative and should already be filtered by ai_brain,
-    # but we enforce the locked 70% progress rule here as a second safety.
-    if ai_monitor_decision is not None:
-        should_close = bool(getattr(ai_monitor_decision, "should_close", False))
-        close_reason = safe_str(getattr(ai_monitor_decision, "close_reason", EVENT_AI_EXIT), EVENT_AI_EXIT)
-        progress = progress_to_tp1(position, price)
-
-        if isinstance(ai_monitor_decision, Mapping):
-            should_close = bool(ai_monitor_decision.get("should_close", False))
-            close_reason = safe_str(ai_monitor_decision.get("close_reason"), EVENT_AI_EXIT)
-
-        if should_close:
-            after_tp1 = position.status == POSITION_PARTIAL_TP1 or position.tp1_hit
-            if after_tp1 or progress >= 0.70:
-                events.append(handle_ai_exit(position, current_price=price, close_executor=close_executor, reason=close_reason or EVENT_AI_EXIT))
-                return events
-            events.append(
-                make_monitor_event(
-                    event="AI_EXIT_SKIPPED_EARLY",
-                    position=position,
-                    metadata={"progress_to_tp1": progress, "required_progress": 0.70},
-                )
-            )
+    # AI/profit exit removed: monitor never closes just because AI reports
+    # weakness/reversal while the position is in profit. This avoids hidden
+    # early-profit exits and keeps lifecycle result logic limited to TP/SL or
+    # verified exchange/manual close recovery. ai_monitor_decision is accepted
+    # for backward-compatible function signatures but intentionally ignored.
+    _ = ai_monitor_decision
 
     return events
 
