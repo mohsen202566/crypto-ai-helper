@@ -13,6 +13,11 @@ Architecture lock:
 - Position creation still belongs to bot.py / position_manager.py flow.
 - Allowed project imports:
   constants.py, utils.py, models.py, strategy_manager.py, tp_sl_engine.py only.
+
+Core rule:
+- This brain must hunt the start of a move, not follow the middle/end of it.
+- REAL requires fresh/start evidence from the upstream engines.
+- Late/chase/exhaustion/trap can still become GHOST for learning, but not REAL.
 """
 
 from __future__ import annotations
@@ -56,6 +61,11 @@ DEFAULT_AI_CONFIG: dict[str, Any] = {
     "min_fresh_momentum_for_real": 45.0,
     "max_weakness_for_real": 58.0,
     "min_continuation_probability_for_real": 48.0,
+    "min_start_evidence_for_real": 52.0,
+    "min_start_signal_count_for_real": 2.0,
+    "max_move_age_for_real": 68.0,
+    "start_bonus_score": 7.0,
+    "anti_chase_penalty_score": 18.0,
     "tp_sl_required_for_real": True,
     "soft_ghost_when_trade_off": True,
 }
@@ -113,6 +123,232 @@ def _momentum_raw_value(momentum: MomentumSnapshot, key: str, default: float = 0
     return _num(raw.get(key), default)
 
 
+
+def _bool(value: Any, default: bool = False) -> bool:
+    """Return a safe bool from bool/int/string values."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return bool(default)
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = safe_str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return bool(default)
+
+
+def _raw_mapping(obj: Any) -> Mapping[str, Any]:
+    raw = getattr(obj, "raw", None)
+    return raw if isinstance(raw, Mapping) else {}
+
+
+def _nested_or_raw(raw: Mapping[str, Any], nested_key: str) -> Mapping[str, Any]:
+    nested = raw.get(nested_key)
+    if isinstance(nested, Mapping):
+        return nested
+    return raw
+
+
+def _structure_raw(structure: Optional[StructureSnapshot]) -> Mapping[str, Any]:
+    return _nested_or_raw(_raw_mapping(structure), "move_start_zone") if structure is not None else {}
+
+
+def _structure_raw_value(structure: Optional[StructureSnapshot], key: str, default: float = 0.0) -> float:
+    return _num(_structure_raw(structure).get(key), default)
+
+
+def _structure_raw_bool(structure: Optional[StructureSnapshot], key: str, default: bool = False) -> bool:
+    return _bool(_structure_raw(structure).get(key), default)
+
+
+def _liquidity_raw_value(liquidity: LiquiditySnapshot, key: str, default: float = 0.0) -> float:
+    return _num(_raw_mapping(liquidity).get(key), default)
+
+
+def _liquidity_raw_bool(liquidity: LiquiditySnapshot, key: str, default: bool = False) -> bool:
+    return _bool(_raw_mapping(liquidity).get(key), default)
+
+
+def _context_raw_value(context: MarketContextSnapshot, key: str, default: float = 0.0) -> float:
+    return _num(_raw_mapping(context).get(key), default)
+
+
+def _context_raw_bool(context: MarketContextSnapshot, key: str, default: bool = False) -> bool:
+    return _bool(_raw_mapping(context).get(key), default)
+
+
+def _timing_raw_bool(timing_snapshot: Optional[Mapping[str, Any]], key: str, default: bool = False) -> bool:
+    if not isinstance(timing_snapshot, Mapping):
+        return bool(default)
+    raw = timing_snapshot.get("raw")
+    if not isinstance(raw, Mapping):
+        return bool(default)
+    return _bool(raw.get(key), default)
+
+
+def _reversal_value(reversal_snapshot: Optional[Mapping[str, Any]], key: str, default: float = 0.0) -> float:
+    if not isinstance(reversal_snapshot, Mapping):
+        return float(default)
+    if key in reversal_snapshot:
+        return _num(reversal_snapshot.get(key), default)
+    raw = reversal_snapshot.get("raw")
+    if isinstance(raw, Mapping):
+        return _num(raw.get(key), default)
+    return float(default)
+
+
+def _reversal_bool(reversal_snapshot: Optional[Mapping[str, Any]], key: str, default: bool = False) -> bool:
+    if not isinstance(reversal_snapshot, Mapping):
+        return bool(default)
+    if key in reversal_snapshot:
+        return _bool(reversal_snapshot.get(key), default)
+    raw = reversal_snapshot.get("raw")
+    if isinstance(raw, Mapping):
+        return _bool(raw.get(key), default)
+    return bool(default)
+
+
+def start_evidence_profile(
+    *,
+    structure: StructureSnapshot,
+    momentum: MomentumSnapshot,
+    liquidity: LiquiditySnapshot,
+    context: MarketContextSnapshot,
+    reversal_snapshot: Optional[Mapping[str, Any]],
+    timing_snapshot: Optional[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Collect all start-of-move evidence from upstream engines.
+
+    Positive values mean this looks like the beginning of a move. Negative/low
+    values mean chase/late/exhaustion. This is the central anti-late-entry layer.
+    """
+    structure_start_active = _structure_raw_bool(structure, "active", False) or _structure_raw_bool(structure, "move_start_zone", False)
+    structure_start_score = _structure_raw_value(structure, "score", 0.0)
+    structure_extended = _structure_raw_bool(structure, "move_already_extended", False) or bool(getattr(structure, "is_late_move", False))
+    room_to_target = _structure_raw_bool(structure, "room_to_target", True)
+    atr_start = _structure_raw_bool(structure, "atr_expansion_start", False)
+    micro_shift = _structure_raw_bool(structure, "micro_structure_shift", False)
+    volume_start = _structure_raw_bool(structure, "volume_pressure_start", False)
+    sd_reaction = _structure_raw_bool(structure, "supply_demand_reaction", False)
+
+    momentum_start_active = _bool(_momentum_raw_value(momentum, "momentum_start_active", 0.0), False)
+    start_pressure_score = _momentum_raw_value(momentum, "start_pressure_score", 0.0)
+    fresh_momentum_score = _momentum_raw_value(momentum, "fresh_momentum_score", 50.0)
+    momentum_move_age = _momentum_raw_value(momentum, "move_age_score", 50.0)
+    momentum_exhaustion = _momentum_raw_value(momentum, "exhaustion_score", 0.0)
+
+    timing_score = _mapping_value(timing_snapshot, "timing_score", 50.0)
+    timing_quality = safe_str(timing_snapshot.get("entry_quality") if isinstance(timing_snapshot, Mapping) else "").upper()
+    wait_for_better_entry = bool(timing_snapshot.get("wait_for_better_entry")) if isinstance(timing_snapshot, Mapping) else False
+    late_risk_score = _mapping_value(timing_snapshot, "late_risk_score", 0.0)
+    timing_move_age = _raw_mapping_value(timing_snapshot, "move_age_score", momentum_move_age)
+    timing_fresh = _raw_mapping_value(timing_snapshot, "fresh_momentum_score", fresh_momentum_score)
+    timing_exhaustion = _raw_mapping_value(timing_snapshot, "exhaustion_score", momentum_exhaustion)
+    timing_start_active = _timing_raw_bool(timing_snapshot, "move_start_zone", False) or _timing_raw_bool(timing_snapshot, "timing_start_active", False)
+
+    liquidity_start_active = _liquidity_raw_bool(liquidity, "liquidity_start_active", False)
+    start_liquidity_score = _liquidity_raw_value(liquidity, "start_liquidity_score", 0.0)
+
+    fresh_context_active = _context_raw_bool(context, "fresh_context_active", False)
+    fresh_context_score = _context_raw_value(context, "fresh_context_score", 50.0)
+
+    early_start_synergy = _reversal_value(reversal_snapshot, "early_start_synergy", 0.0)
+    structure_start_from_reversal = _reversal_bool(reversal_snapshot, "structure_start_active", False)
+    momentum_start_from_reversal = _reversal_bool(reversal_snapshot, "momentum_start_active", False)
+
+    active_signals = 0
+    signal_reasons: list[str] = []
+    if structure_start_active or structure_start_from_reversal or structure_start_score >= 58:
+        active_signals += 1
+        signal_reasons.append("START_STRUCTURE")
+    if momentum_start_active or momentum_start_from_reversal or start_pressure_score >= 58 or fresh_momentum_score >= 62:
+        active_signals += 1
+        signal_reasons.append("START_MOMENTUM")
+    if timing_start_active or timing_quality in {"EXCELLENT", "GOOD"} and timing_score >= 62 and late_risk_score <= 45:
+        active_signals += 1
+        signal_reasons.append("START_TIMING")
+    if liquidity_start_active or start_liquidity_score >= 60:
+        active_signals += 1
+        signal_reasons.append("START_LIQUIDITY")
+    if fresh_context_active or fresh_context_score >= 62:
+        active_signals += 1
+        signal_reasons.append("START_CONTEXT")
+    if atr_start:
+        active_signals += 1
+        signal_reasons.append("START_ATR_EXPANSION")
+    if micro_shift:
+        active_signals += 1
+        signal_reasons.append("START_MICRO_SHIFT")
+    if volume_start:
+        active_signals += 1
+        signal_reasons.append("START_VOLUME_PRESSURE")
+    if sd_reaction:
+        active_signals += 1
+        signal_reasons.append("START_SUPPLY_DEMAND")
+    if early_start_synergy >= 55:
+        active_signals += 1
+        signal_reasons.append("START_REVERSAL_SYNERGY")
+
+    start_score = 0.0
+    start_score += min(100.0, max(structure_start_score, 65.0 if structure_start_active else 0.0)) * 0.18
+    start_score += max(start_pressure_score, fresh_momentum_score) * 0.22
+    start_score += max(0.0, 100.0 - late_risk_score) * 0.14
+    start_score += start_liquidity_score * 0.14
+    start_score += fresh_context_score * 0.10
+    start_score += max(0.0, early_start_synergy) * 0.10
+    start_score += (100.0 if atr_start else 45.0) * 0.04
+    start_score += (100.0 if micro_shift else 45.0) * 0.04
+    start_score += (100.0 if room_to_target else 15.0) * 0.04
+
+    move_age_score = max(timing_move_age, momentum_move_age)
+    exhaustion_score = max(timing_exhaustion, momentum_exhaustion, _reversal_value(reversal_snapshot, "exhaustion_probability", 0.0))
+    chase_risk_score = 0.0
+    chase_risk_score += late_risk_score * 0.35
+    chase_risk_score += move_age_score * 0.25
+    chase_risk_score += exhaustion_score * 0.20
+    chase_risk_score += _num(liquidity.trap_risk_score, 0.0) * 0.10
+    chase_risk_score += _num(momentum.weakness_score, 0.0) * 0.10
+    if structure_extended:
+        chase_risk_score += 18.0
+    if wait_for_better_entry:
+        chase_risk_score += 8.0
+    if not room_to_target:
+        chase_risk_score += 10.0
+
+    start_score = clamp(start_score - max(0.0, chase_risk_score - 62.0) * 0.25, 0.0, 100.0)
+    chase_risk_score = clamp(chase_risk_score, 0.0, 100.0)
+
+    start_active = start_score >= 52.0 and active_signals >= 2 and chase_risk_score <= 66.0 and room_to_target
+    chase_active = chase_risk_score >= 62.0 or structure_extended or (late_risk_score >= 55 and exhaustion_score >= 50)
+
+    return {
+        "start_score": start_score,
+        "start_active": bool(start_active),
+        "start_signal_count": float(active_signals),
+        "start_reasons": list(dict.fromkeys(signal_reasons)),
+        "chase_risk_score": chase_risk_score,
+        "chase_active": bool(chase_active),
+        "structure_start_active": bool(structure_start_active or structure_start_from_reversal),
+        "momentum_start_active": bool(momentum_start_active or momentum_start_from_reversal),
+        "timing_start_active": bool(timing_start_active),
+        "liquidity_start_active": bool(liquidity_start_active),
+        "fresh_context_active": bool(fresh_context_active),
+        "structure_start_score": structure_start_score,
+        "start_pressure_score": start_pressure_score,
+        "start_liquidity_score": start_liquidity_score,
+        "fresh_context_score": fresh_context_score,
+        "early_start_synergy": early_start_synergy,
+        "move_age_score": move_age_score,
+        "late_risk_score": late_risk_score,
+        "exhaustion_score": exhaustion_score,
+        "room_to_target": bool(room_to_target),
+        "wait_for_better_entry": bool(wait_for_better_entry),
+    }
+
+
 # =============================================================================
 # Scoring helpers
 # =============================================================================
@@ -124,17 +360,35 @@ def direction_valid(direction: str) -> bool:
 def score_structure(structure: StructureSnapshot) -> tuple[float, list[str]]:
     score = _num(structure.structure_score, 0.0)
     reasons: list[str] = []
+    start_active = _structure_raw_bool(structure, "active", False)
+    start_score = _structure_raw_value(structure, "score", 0.0)
+    extended = _structure_raw_bool(structure, "move_already_extended", False) or bool(getattr(structure, "is_late_move", False))
+
+    if start_active or start_score >= 62:
+        score += 6.0
+        reasons.append("AI_STRUCTURE_START_ZONE")
+    if _structure_raw_bool(structure, "atr_expansion_start", False):
+        score += 3.0
+        reasons.append("AI_STRUCTURE_ATR_EXPANSION_START")
+    if _structure_raw_bool(structure, "micro_structure_shift", False):
+        score += 3.0
+        reasons.append("AI_STRUCTURE_MICRO_SHIFT")
+    if not _structure_raw_bool(structure, "room_to_target", True):
+        score -= 10.0
+        reasons.append("AI_STRUCTURE_NO_TP_ROOM")
+    if extended:
+        score = min(score, 48.0)
+        reasons.append("AI_STRUCTURE_LATE_RISK")
+
     if score >= 70:
         reasons.append("AI_STRUCTURE_STRONG")
     elif score >= 55:
         reasons.append("AI_STRUCTURE_OK")
     else:
         reasons.append("AI_STRUCTURE_WEAK")
-    if structure.is_late_move:
-        reasons.append("AI_STRUCTURE_LATE_RISK")
     if structure.is_range:
         reasons.append("AI_STRUCTURE_RANGE")
-    return clamp(score, 0.0, 100.0), reasons
+    return clamp(score, 0.0, 100.0), list(dict.fromkeys(reasons))
 
 
 def score_momentum(momentum: MomentumSnapshot) -> tuple[float, list[str]]:
@@ -150,7 +404,13 @@ def score_momentum(momentum: MomentumSnapshot) -> tuple[float, list[str]]:
     weakness = _num(momentum.weakness_score, 0.0)
     fresh = _momentum_raw_value(momentum, "fresh_momentum_score", 50.0)
     exhaustion = _momentum_raw_value(momentum, "exhaustion_score", 0.0)
+    start_pressure = _momentum_raw_value(momentum, "start_pressure_score", 0.0)
+    start_active = _bool(_momentum_raw_value(momentum, "momentum_start_active", 0.0), False)
+    move_age = _momentum_raw_value(momentum, "move_age_score", 50.0)
 
+    if start_active or start_pressure >= 60:
+        score += 7.0
+        reasons.append("AI_MOMENTUM_START_ACTIVE")
     if weakness >= 60:
         reasons.append("AI_MOMENTUM_WEAKNESS_VISIBLE")
     if fresh <= 42:
@@ -158,39 +418,56 @@ def score_momentum(momentum: MomentumSnapshot) -> tuple[float, list[str]]:
     elif fresh >= 65:
         reasons.append("AI_FRESH_MOMENTUM_OK")
     if exhaustion >= 60:
+        score = min(score, 52.0)
         reasons.append("AI_MOMENTUM_EXHAUSTED")
+    if move_age >= 72:
+        score = min(score, 50.0)
+        reasons.append("AI_MOMENTUM_MOVE_AGE_LATE")
 
-    return clamp(score, 0.0, 100.0), reasons
+    return clamp(score, 0.0, 100.0), list(dict.fromkeys(reasons))
 
 
 def score_liquidity(liquidity: LiquiditySnapshot) -> tuple[float, list[str]]:
     trap = _num(liquidity.trap_risk_score, 0.0)
     survival = _num(liquidity.breakout_survival_score, 50.0)
-    score = (100.0 - trap) * 0.65 + survival * 0.35
+    start_score = _liquidity_raw_value(liquidity, "start_liquidity_score", 0.0)
+    start_active = _liquidity_raw_bool(liquidity, "liquidity_start_active", False)
+    score = (100.0 - trap) * 0.55 + survival * 0.30 + start_score * 0.15
     reasons: list[str] = []
+    if start_active or start_score >= 60:
+        reasons.append("AI_LIQUIDITY_START_GRAB")
     if trap >= 70 or liquidity.likely_trap:
+        score = min(score, 45.0)
         reasons.append("AI_LIQUIDITY_TRAP_HIGH")
     elif trap >= 50:
         reasons.append("AI_LIQUIDITY_TRAP_MEDIUM")
     else:
         reasons.append("AI_LIQUIDITY_ACCEPTABLE")
-    if liquidity.stop_hunt_detected:
+    if liquidity.stop_hunt_detected and not start_active:
         reasons.append("AI_STOP_HUNT_DETECTED")
-    return clamp(score, 0.0, 100.0), reasons
+    return clamp(score, 0.0, 100.0), list(dict.fromkeys(reasons))
 
 
 def score_context(context: MarketContextSnapshot) -> tuple[float, list[str]]:
     score = _num(context.context_score, 50.0)
+    fresh_score = _context_raw_value(context, "fresh_context_score", 50.0)
+    fresh_active = _context_raw_bool(context, "fresh_context_active", False)
     reasons: list[str] = []
+    if fresh_active or fresh_score >= 62:
+        score += 5.0
+        reasons.append("AI_CONTEXT_FRESH_START")
     if context.aligned_with_direction:
         reasons.append("AI_CONTEXT_ALIGNED")
     elif score <= 40:
         reasons.append("AI_CONTEXT_AGAINST")
     else:
         reasons.append("AI_CONTEXT_NEUTRAL")
-    if context.choppy:
+    if context.choppy and not fresh_active:
+        score -= 7.0
         reasons.append("AI_CONTEXT_CHOPPY")
-    return clamp(score, 0.0, 100.0), reasons
+    elif context.choppy:
+        reasons.append("AI_CONTEXT_CHOPPY_BUT_FRESH")
+    return clamp(score, 0.0, 100.0), list(dict.fromkeys(reasons))
 
 
 def score_reversal(reversal_snapshot: Optional[Mapping[str, Any]]) -> tuple[float, list[str]]:
@@ -198,14 +475,17 @@ def score_reversal(reversal_snapshot: Optional[Mapping[str, Any]]) -> tuple[floa
     if not reversal_snapshot:
         return 55.0, ["AI_REVERSAL_MISSING"]
 
-    reversal_prob = _mapping_value(reversal_snapshot, "reversal_probability", 50.0)
-    exhaustion_prob = _mapping_value(reversal_snapshot, "exhaustion_probability", 50.0)
-    continuation_prob = _mapping_value(reversal_snapshot, "continuation_probability", 50.0)
+    reversal_prob = _reversal_value(reversal_snapshot, "reversal_probability", 50.0)
+    exhaustion_prob = _reversal_value(reversal_snapshot, "exhaustion_probability", 50.0)
+    continuation_prob = _reversal_value(reversal_snapshot, "continuation_probability", 50.0)
+    early_start = _reversal_value(reversal_snapshot, "early_start_synergy", 0.0)
 
-    risk = reversal_prob * 0.60 + exhaustion_prob * 0.25 + max(0.0, 50.0 - continuation_prob) * 0.15
+    risk = reversal_prob * 0.58 + exhaustion_prob * 0.25 + max(0.0, 50.0 - continuation_prob) * 0.17
     score = 100.0 - risk
-
     reasons: list[str] = []
+    if early_start >= 60 and reversal_prob < 60 and exhaustion_prob < 60:
+        score += 6.0
+        reasons.append("AI_REVERSAL_EARLY_START_SUPPORT")
     if reversal_prob >= 70:
         reasons.append("AI_REVERSAL_HIGH")
     elif reversal_prob >= 55:
@@ -243,16 +523,28 @@ def score_timing(timing_snapshot: Optional[Mapping[str, Any]]) -> tuple[float, l
     else:
         reasons.append("AI_TIMING_WEAK")
 
+    move_age = _raw_mapping_value(timing_snapshot, "move_age_score", 50.0)
+    timing_start = _timing_raw_bool(timing_snapshot, "move_start_zone", False) or _timing_raw_bool(timing_snapshot, "timing_start_active", False)
+
+    if timing_start:
+        score += 6.0
+        reasons.append("AI_TIMING_START_ACTIVE")
     if wait:
+        score -= 8.0
         reasons.append("AI_TIMING_WAIT_SUGGESTED")
     if late >= 55:
+        score = min(score, 50.0)
         reasons.append("AI_TIMING_LATE_RISK")
     if fresh <= 42:
         reasons.append("AI_TIMING_FRESH_WEAK")
     if exhaustion >= 58:
+        score = min(score, 52.0)
         reasons.append("AI_TIMING_EXHAUSTED")
+    if move_age >= 72:
+        score = min(score, 50.0)
+        reasons.append("AI_TIMING_MOVE_AGE_LATE")
 
-    return clamp(score, 0.0, 100.0), reasons
+    return clamp(score, 0.0, 100.0), list(dict.fromkeys(reasons))
 
 
 def score_tp_sl(plan: Optional[TPSLPlan], quantity: float = 0.0) -> tuple[float, list[str]]:
@@ -289,13 +581,14 @@ def score_tp_sl(plan: Optional[TPSLPlan], quantity: float = 0.0) -> tuple[float,
 def combine_final_score(parts: Mapping[str, float]) -> float:
     """Weighted final score for Level 4 quality, not raw signal frequency."""
     weights = {
-        "structure": 0.17,
-        "momentum": 0.20,
-        "liquidity": 0.17,
-        "context": 0.10,
-        "reversal": 0.14,
-        "timing": 0.14,
-        "tp_sl": 0.08,
+        "start": 0.18,
+        "structure": 0.14,
+        "momentum": 0.18,
+        "liquidity": 0.14,
+        "context": 0.11,
+        "reversal": 0.11,
+        "timing": 0.10,
+        "tp_sl": 0.04,
     }
     total = 0.0
     wsum = 0.0
@@ -324,10 +617,12 @@ def confidence_from_score(score: float, parts: Mapping[str, float]) -> float:
 def adjusted_score_for_entry_quality(
     *,
     final_score: float,
+    structure: StructureSnapshot,
+    momentum: MomentumSnapshot,
     liquidity: LiquiditySnapshot,
+    context: MarketContextSnapshot,
     reversal_snapshot: Optional[Mapping[str, Any]],
     timing_snapshot: Optional[Mapping[str, Any]],
-    momentum: MomentumSnapshot,
 ) -> tuple[float, list[str]]:
     """Apply soft score penalties for late/chasing/reversal conditions.
 
@@ -338,9 +633,9 @@ def adjusted_score_for_entry_quality(
     reasons: list[str] = []
 
     trap = _num(liquidity.trap_risk_score, 0.0)
-    rev = _mapping_value(reversal_snapshot, "reversal_probability", 0.0)
-    rev_exhaustion = _mapping_value(reversal_snapshot, "exhaustion_probability", 0.0)
-    continuation = _mapping_value(reversal_snapshot, "continuation_probability", 50.0)
+    rev = _reversal_value(reversal_snapshot, "reversal_probability", 0.0)
+    rev_exhaustion = _reversal_value(reversal_snapshot, "exhaustion_probability", 0.0)
+    continuation = _reversal_value(reversal_snapshot, "continuation_probability", 50.0)
     late = _mapping_value(timing_snapshot, "late_risk_score", 0.0)
     wait = bool(timing_snapshot.get("wait_for_better_entry")) if isinstance(timing_snapshot, Mapping) else False
     timing_quality = safe_str(timing_snapshot.get("entry_quality") if isinstance(timing_snapshot, Mapping) else "").upper()
@@ -349,6 +644,26 @@ def adjusted_score_for_entry_quality(
     weakness = _num(momentum.weakness_score, 0.0)
     momentum_exhaustion = _momentum_raw_value(momentum, "exhaustion_score", timing_exhaustion)
     fresh = min(timing_fresh, _momentum_raw_value(momentum, "fresh_momentum_score", timing_fresh))
+    start_profile = start_evidence_profile(
+        structure=structure,
+        momentum=momentum,
+        liquidity=liquidity,
+        context=context,
+        reversal_snapshot=reversal_snapshot,
+        timing_snapshot=timing_snapshot,
+    )
+    start_score = _num(start_profile.get("start_score"), 0.0)
+    chase_risk = _num(start_profile.get("chase_risk_score"), 0.0)
+
+    if start_score >= 62 and chase_risk <= 55:
+        score += min(_cfg_float("start_bonus_score", 7.0), (start_score - 55.0) * 0.22)
+        reasons.append("SCORE_BONUS_START_EVIDENCE")
+    if chase_risk >= 62:
+        score -= min(_cfg_float("anti_chase_penalty_score", 18.0), (chase_risk - 55.0) * 0.45)
+        reasons.append("SCORE_PENALTY_CHASE_RISK")
+    if not _bool(start_profile.get("room_to_target"), True):
+        score -= 8.0
+        reasons.append("SCORE_PENALTY_NO_TP_ROOM")
 
     if wait:
         score -= 10.0
@@ -415,9 +730,9 @@ def hard_reject_reasons(
         reasons.append("LIKELY_FAKE_BREAK_TRAP")
 
     if reversal_snapshot:
-        if _mapping_value(reversal_snapshot, "reversal_probability", 0.0) >= 82:
+        if _reversal_value(reversal_snapshot, "reversal_probability", 0.0) >= 82:
             reasons.append("EXTREME_REVERSAL_PROBABILITY")
-        if _mapping_value(reversal_snapshot, "exhaustion_probability", 0.0) >= 85:
+        if _reversal_value(reversal_snapshot, "exhaustion_probability", 0.0) >= 85:
             reasons.append("EXTREME_EXHAUSTION_PROBABILITY")
 
     if timing_snapshot:
@@ -426,10 +741,23 @@ def hard_reject_reasons(
         if bool(timing_snapshot.get("wait_for_better_entry")) and _mapping_value(timing_snapshot, "late_risk_score", 0.0) >= 75:
             reasons.append("WAIT_AND_VERY_LATE_ENTRY")
 
+    start_profile = start_evidence_profile(
+        structure=structure,
+        momentum=momentum,
+        liquidity=liquidity,
+        context=context,
+        reversal_snapshot=reversal_snapshot,
+        timing_snapshot=timing_snapshot,
+    )
+    if _num(start_profile.get("chase_risk_score"), 0.0) >= 88:
+        reasons.append("EXTREME_CHASE_RISK")
+    if not _bool(start_profile.get("room_to_target"), True) and _mapping_value(timing_snapshot, "late_risk_score", 0.0) >= 55:
+        reasons.append("NO_TP_ROOM_AND_LATE")
+
     if _num(momentum.momentum_score, 0.0) < 35 and _num(structure.structure_score, 0.0) < 40:
         reasons.append("STRUCTURE_AND_MOMENTUM_TOO_WEAK")
 
-    return reasons
+    return list(dict.fromkeys(reasons))
 
 
 def _real_quality_block_reasons(
@@ -445,9 +773,9 @@ def _real_quality_block_reasons(
     reasons: list[str] = []
 
     trap = _num(liquidity.trap_risk_score, 0.0)
-    rev = _mapping_value(reversal_snapshot, "reversal_probability", 0.0)
-    rev_exhaustion = _mapping_value(reversal_snapshot, "exhaustion_probability", 0.0)
-    continuation = _mapping_value(reversal_snapshot, "continuation_probability", 50.0)
+    rev = _reversal_value(reversal_snapshot, "reversal_probability", 0.0)
+    rev_exhaustion = _reversal_value(reversal_snapshot, "exhaustion_probability", 0.0)
+    continuation = _reversal_value(reversal_snapshot, "continuation_probability", 50.0)
 
     timing_score = _mapping_value(timing_snapshot, "timing_score", 50.0)
     late = _mapping_value(timing_snapshot, "late_risk_score", 0.0)
@@ -460,6 +788,29 @@ def _real_quality_block_reasons(
     fresh = min(timing_fresh, _momentum_raw_value(momentum, "fresh_momentum_score", timing_fresh))
     exhaustion = max(timing_exhaustion, _momentum_raw_value(momentum, "exhaustion_score", timing_exhaustion), rev_exhaustion)
     weakness = _num(momentum.weakness_score, 0.0)
+    start_profile = start_evidence_profile(
+        structure=structure,
+        momentum=momentum,
+        liquidity=liquidity,
+        context=context,
+        reversal_snapshot=reversal_snapshot,
+        timing_snapshot=timing_snapshot,
+    )
+    start_score = _num(start_profile.get("start_score"), 0.0)
+    start_count = _num(start_profile.get("start_signal_count"), 0.0)
+    chase_risk = _num(start_profile.get("chase_risk_score"), 0.0)
+    start_active = _bool(start_profile.get("start_active"), False)
+
+    if not start_active or start_score < _cfg_float("min_start_evidence_for_real", 52.0):
+        reasons.append("REAL_BLOCK_NO_START_EVIDENCE")
+    if start_count < _cfg_float("min_start_signal_count_for_real", 2.0):
+        reasons.append("REAL_BLOCK_START_CONFIRMATIONS_LOW")
+    if chase_risk >= 62:
+        reasons.append("REAL_BLOCK_CHASE_RISK")
+    if move_age > _cfg_float("max_move_age_for_real", 68.0):
+        reasons.append("REAL_BLOCK_MOVE_TOO_OLD")
+    if not _bool(start_profile.get("room_to_target"), True):
+        reasons.append("REAL_BLOCK_NO_TP_ROOM")
 
     if trap > _cfg_float("max_trap_risk_for_real", 58.0):
         reasons.append("REAL_BLOCK_TRAP_RISK")
@@ -630,7 +981,24 @@ def build_ai_decision(
     reason_codes.extend(timing_reasons)
     reason_codes.extend(tp_sl_reasons)
 
+    start_profile = start_evidence_profile(
+        structure=structure,
+        momentum=momentum,
+        liquidity=liquidity,
+        context=context,
+        reversal_snapshot=reversal_snapshot,
+        timing_snapshot=timing_snapshot,
+    )
+    start_score = _num(start_profile.get("start_score"), 0.0)
+    if start_profile.get("start_reasons"):
+        reason_codes.extend([safe_str(r) for r in start_profile.get("start_reasons", [])])
+    if _bool(start_profile.get("chase_active"), False):
+        reason_codes.append("AI_CHASE_RISK_ACTIVE")
+    if _bool(start_profile.get("start_active"), False):
+        reason_codes.append("AI_START_EVIDENCE_ACTIVE")
+
     parts = {
+        "start": start_score,
         "structure": structure_score,
         "momentum": momentum_score,
         "liquidity": liquidity_score,
@@ -643,10 +1011,12 @@ def build_ai_decision(
     raw_final_score = combine_final_score(parts)
     final_score, score_penalty_reasons = adjusted_score_for_entry_quality(
         final_score=raw_final_score,
+        structure=structure,
+        momentum=momentum,
         liquidity=liquidity,
+        context=context,
         reversal_snapshot=reversal_snapshot,
         timing_snapshot=timing_snapshot,
-        momentum=momentum,
     )
     reason_codes.extend(score_penalty_reasons)
 
@@ -712,15 +1082,29 @@ def build_ai_decision(
     exhaustion_score = max(
         timing_exhaustion,
         momentum_exhaustion,
-        _mapping_value(reversal_snapshot, "exhaustion_probability", 0.0),
+        _reversal_value(reversal_snapshot, "exhaustion_probability", 0.0),
     )
     weakness_score = _num(momentum.weakness_score, 0.0)
-    reversal_probability = _mapping_value(reversal_snapshot, "reversal_probability", 0.0)
-    continuation_probability = _mapping_value(reversal_snapshot, "continuation_probability", 50.0)
-    exhaustion_probability = _mapping_value(reversal_snapshot, "exhaustion_probability", 0.0)
+    reversal_probability = _reversal_value(reversal_snapshot, "reversal_probability", 0.0)
+    continuation_probability = _reversal_value(reversal_snapshot, "continuation_probability", 50.0)
+    exhaustion_probability = _reversal_value(reversal_snapshot, "exhaustion_probability", 0.0)
 
     expected_net_profit = _num(getattr(tp_sl, "tp1_net_profit_estimate", 0.0), 0.0) if tp_sl is not None else 0.0
     rr = _num(getattr(tp_sl, "rr", 0.0), 0.0) if tp_sl is not None else 0.0
+
+    start_score = _num(start_profile.get("start_score"), 0.0)
+    start_signal_count = _num(start_profile.get("start_signal_count"), 0.0)
+    chase_risk_score = _num(start_profile.get("chase_risk_score"), 0.0)
+    start_active = _bool(start_profile.get("start_active"), False)
+    chase_active = _bool(start_profile.get("chase_active"), False)
+    structure_start_active = _bool(start_profile.get("structure_start_active"), False)
+    momentum_start_active = _bool(start_profile.get("momentum_start_active"), False)
+    liquidity_start_active = _bool(start_profile.get("liquidity_start_active"), False)
+    fresh_context_active = _bool(start_profile.get("fresh_context_active"), False)
+    start_pressure_score = _num(start_profile.get("start_pressure_score"), 0.0)
+    start_liquidity_score = _num(start_profile.get("start_liquidity_score"), 0.0)
+    fresh_context_score = _num(start_profile.get("fresh_context_score"), 50.0)
+    early_start_synergy = _num(start_profile.get("early_start_synergy"), 0.0)
 
     learning_features = {
         "symbol": normalized_symbol,
@@ -750,6 +1134,19 @@ def build_ai_decision(
         "wait_for_better_entry": wait_for_better_entry,
         "entry_quality": timing_quality,
         "move_age_score": move_age_score,
+        "start_score": start_score,
+        "start_active": start_active,
+        "start_signal_count": start_signal_count,
+        "chase_risk_score": chase_risk_score,
+        "chase_active": chase_active,
+        "structure_start_active": structure_start_active,
+        "momentum_start_active": momentum_start_active,
+        "liquidity_start_active": liquidity_start_active,
+        "fresh_context_active": fresh_context_active,
+        "start_pressure_score": start_pressure_score,
+        "start_liquidity_score": start_liquidity_score,
+        "fresh_context_score": fresh_context_score,
+        "early_start_synergy": early_start_synergy,
         "expected_net_profit": expected_net_profit,
         "rr": rr,
         "tp1": _num(getattr(tp_sl, "tp1", 0.0), 0.0) if tp_sl is not None else 0.0,
@@ -783,6 +1180,20 @@ def build_ai_decision(
             "wait_for_better_entry": wait_for_better_entry,
             "entry_quality": timing_quality,
             "move_age_score": move_age_score,
+            "start_score": start_score,
+            "start_active": start_active,
+            "start_signal_count": start_signal_count,
+            "start_reasons": start_profile.get("start_reasons", []),
+            "chase_risk_score": chase_risk_score,
+            "chase_active": chase_active,
+            "structure_start_active": structure_start_active,
+            "momentum_start_active": momentum_start_active,
+            "liquidity_start_active": liquidity_start_active,
+            "fresh_context_active": fresh_context_active,
+            "start_pressure_score": start_pressure_score,
+            "start_liquidity_score": start_liquidity_score,
+            "fresh_context_score": fresh_context_score,
+            "early_start_synergy": early_start_synergy,
             "expected_net_profit": expected_net_profit,
             "rr": rr,
             "learning_features": learning_features,
@@ -818,7 +1229,7 @@ def evaluate_open_position(
 
     weakness = _num(momentum.weakness_score, 0.0)
     trap = _num(liquidity.trap_risk_score, 0.0)
-    rev = _mapping_value(reversal_snapshot, "reversal_probability", 0.0)
+    rev = _reversal_value(reversal_snapshot, "reversal_probability", 0.0)
     progress = _num(progress_to_tp1, 0.0)
 
     should_close = False
@@ -905,6 +1316,7 @@ __all__ = [
     "score_tp_sl",
     "combine_final_score",
     "confidence_from_score",
+    "start_evidence_profile",
     "adjusted_score_for_entry_quality",
     "hard_reject_reasons",
     "choose_mode",
