@@ -14,6 +14,7 @@ Architecture lock:
 from __future__ import annotations
 
 from typing import Any, Callable, Mapping, Optional
+from datetime import datetime, timezone
 
 from constants import (
     MODE_GHOST,
@@ -29,6 +30,7 @@ from constants import (
     STATUS_FAILED,
     STATUS_OK,
     SYSTEM_VERSION,
+    TRADE_CONFIG,
 )
 from models import RecordResult, TradePosition, from_dict, to_dict
 from state_store import load_json, save_json_atomic, log_error
@@ -166,6 +168,46 @@ def _internal_real_matches_exchange(position: TradePosition, open_symbols: set[s
 
     # Fallback for exchange wrappers that only return symbols.
     return symbol in open_symbols
+
+
+def _seconds_since_iso(value: Any) -> float:
+    """Return age in seconds for an ISO timestamp; fail safe to a large age."""
+    raw = safe_str(value)
+    if not raw:
+        return 999999.0
+    try:
+        clean = raw.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(clean)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return max(0.0, (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds())
+    except Exception:
+        return 999999.0
+
+
+def _real_confirm_grace_seconds() -> int:
+    """Grace window during which pending REAL records must keep their slot."""
+    try:
+        return max(1, int(TRADE_CONFIG.get("real_confirm_timeout_seconds", 70) or 70))
+    except Exception:
+        return 70
+
+
+def _merge_mapping_fields(existing: Mapping[str, Any], updates: Mapping[str, Any]) -> dict[str, Any]:
+    """Merge metadata fields instead of replacing hunter/reply learning context."""
+    merged = dict(existing)
+    for key, value in dict(updates).items():
+        if key in {"monitor_metadata", "decision_metadata"}:
+            old = merged.get(key)
+            if isinstance(old, Mapping) and isinstance(value, Mapping):
+                combined = dict(old)
+                combined.update(dict(value))
+                merged[key] = combined
+            else:
+                merged[key] = value
+        else:
+            merged[key] = value
+    return merged
 
 
 # =============================================================================
@@ -356,8 +398,7 @@ def update_position(position_id: str, updates: Mapping[str, Any]) -> RecordResul
 
     for item in records:
         if safe_str(item.get("position_id")) == pid:
-            merged = dict(item)
-            merged.update(dict(updates))
+            merged = _merge_mapping_fields(item, updates)
             merged["updated_at"] = utc_now_iso()
             normalized = _normalize_record(merged)
             new_records.append(normalized)
@@ -488,11 +529,6 @@ def mark_sl_hit(position_id: str) -> RecordResult:
     return update_position(position_id, {"sl_hit": True})
 
 
-def mark_ai_exit_done(position_id: str) -> RecordResult:
-    """Mark AI exit completed."""
-    return update_position(position_id, {"ai_exit_done": True})
-
-
 def close_position_record(
     position_id: str,
     *,
@@ -592,7 +628,8 @@ def reconcile_real_positions_with_exchange(
     - If an internal REAL position is open but no matching exchange position
       exists anymore, it is marked POSITION_CLOSED so the REAL slot is freed.
     - It does NOT record learning/stats outcomes. Results should still be recorded
-      by position_monitor/result handlers when TP/SL/AI_EXIT is detected.
+      by position_monitor/result handlers when TP/SL/manual exchange close is detected.
+    - PENDING_REAL_CONFIRM records are not closed during the confirmation grace window.
     - GHOST positions are never touched.
     """
     try:
@@ -621,6 +658,13 @@ def reconcile_real_positions_with_exchange(
                 kept_ids.append(position.position_id)
                 new_records.append(item)
                 continue
+
+            if position.status == POSITION_PENDING_REAL_CONFIRM:
+                age_seconds = _seconds_since_iso(getattr(position, "opened_at", ""))
+                if age_seconds < _real_confirm_grace_seconds():
+                    kept_ids.append(position.position_id)
+                    new_records.append(item)
+                    continue
 
             record = to_dict(position)
             metadata = dict(record.get("monitor_metadata") or {})
@@ -677,6 +721,7 @@ def validate_position_record(position: TradePosition | dict[str, Any]) -> dict[s
     try:
         pos = _position_from_any(position)
         errors: list[str] = []
+        warnings: list[str] = []
 
         if not pos.position_id:
             errors.append("missing_position_id")
@@ -694,10 +739,15 @@ def validate_position_record(position: TradePosition | dict[str, Any]) -> dict[s
             errors.append("invalid_sl")
         if not pos.status:
             errors.append("missing_status")
+        if pos.mode == MODE_REAL and not safe_str(getattr(pos, "signal_message_id", "")):
+            warnings.append("missing_signal_message_id_for_real_reply")
+        if pos.mode == MODE_REAL and not isinstance(getattr(pos, "decision_metadata", {}), Mapping):
+            warnings.append("decision_metadata_not_mapping")
 
         return {
             "valid": not errors,
             "errors": errors,
+            "warnings": warnings,
             "position_id": pos.position_id,
             "symbol": pos.symbol,
             "direction": pos.direction,
@@ -709,6 +759,7 @@ def validate_position_record(position: TradePosition | dict[str, Any]) -> dict[s
         return {
             "valid": False,
             "errors": [str(exc)],
+            "warnings": [],
             "position_id": "",
         }
 
@@ -782,7 +833,6 @@ __all__ = [
     "mark_tp1_partial",
     "mark_tp2_hit",
     "mark_sl_hit",
-    "mark_ai_exit_done",
     "close_position_record",
     "update_price_extremes",
     "get_recoverable_positions",
