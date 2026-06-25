@@ -86,6 +86,109 @@ def _extract_tp_sl_payload(decision: AIDecision) -> dict[str, Any]:
     return {}
 
 
+
+def _as_mapping(value: Any) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
+
+
+def _record_metadata(record: Mapping[str, Any]) -> Mapping[str, Any]:
+    return _as_mapping(record.get("metadata"))
+
+
+def _metadata_source_value(record: Mapping[str, Any], key: str) -> Any:
+    """Read a value from top-level record, metadata, learning_features, or selector_metrics."""
+    if key in record:
+        return record.get(key)
+    metadata = _record_metadata(record)
+    if key in metadata:
+        return metadata.get(key)
+    learning = _as_mapping(metadata.get("learning_features"))
+    if key in learning:
+        return learning.get(key)
+    selector_metrics = _as_mapping(metadata.get("selector_metrics"))
+    if key in selector_metrics:
+        return selector_metrics.get(key)
+    return None
+
+
+def _metadata_float(record: Mapping[str, Any], key: str, default: float = 0.0) -> float:
+    value = _metadata_source_value(record, key)
+    parsed = safe_float(value, None)
+    return float(default if parsed is None else parsed)
+
+
+def _metadata_bool(record: Mapping[str, Any], key: str, default: bool = False) -> bool:
+    value = _metadata_source_value(record, key)
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return bool(default)
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = safe_str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return bool(default)
+
+
+def _append_reason(record: dict[str, Any], reason: str) -> None:
+    reasons = record.get("reason_codes")
+    if not isinstance(reasons, list):
+        reasons = []
+    reason_text = safe_str(reason).upper()
+    if reason_text and reason_text not in [safe_str(item).upper() for item in reasons]:
+        reasons.append(reason_text)
+    record["reason_codes"] = reasons
+
+
+def _apply_real_selector_guard(record: dict[str, Any]) -> dict[str, Any]:
+    """Prevent unsafe REAL records from bypassing AI/candidate selector checks."""
+    if record.get("mode") != MODE_REAL:
+        return record
+
+    selector_selected = _metadata_bool(record, "selector_selected_for_real", False)
+    selector_rank = _metadata_float(record, "selector_rank_score", 0.0)
+    start_score = _metadata_float(record, "start_score", 0.0)
+    start_signal_count = _metadata_float(record, "start_signal_count", 0.0)
+    chase_risk = _metadata_float(record, "chase_risk_score", 100.0)
+    move_age = _metadata_float(record, "move_age_score", 100.0)
+
+    guard_reasons: list[str] = []
+    if not selector_selected or selector_rank <= 0.0:
+        guard_reasons.append("SIGNAL_MANAGER_REAL_GUARD_SELECTOR_MISSING")
+    if start_score < 52.0:
+        guard_reasons.append("SIGNAL_MANAGER_REAL_GUARD_START_SCORE_LOW")
+    if start_signal_count < 2.0:
+        guard_reasons.append("SIGNAL_MANAGER_REAL_GUARD_START_CONFIRMATIONS_LOW")
+    if chase_risk > 62.0:
+        guard_reasons.append("SIGNAL_MANAGER_REAL_GUARD_CHASE_RISK_HIGH")
+    if move_age > 68.0:
+        guard_reasons.append("SIGNAL_MANAGER_REAL_GUARD_MOVE_TOO_OLD")
+
+    if guard_reasons:
+        record["mode"] = MODE_GHOST
+        record["status"] = "REAL_GUARD_DOWNGRADED_TO_GHOST"
+        metadata = dict(record.get("metadata") or {})
+        metadata["signal_manager_real_guard"] = {
+            "downgraded": True,
+            "reasons": guard_reasons,
+            "checked_at": utc_now_iso(),
+            "selector_selected_for_real": selector_selected,
+            "selector_rank_score": selector_rank,
+            "start_score": start_score,
+            "start_signal_count": start_signal_count,
+            "chase_risk_score": chase_risk,
+            "move_age_score": move_age,
+        }
+        record["metadata"] = metadata
+        for reason in guard_reasons:
+            _append_reason(record, reason)
+
+    return record
+
+
 def _normalize_signal_record(record: Mapping[str, Any]) -> dict[str, Any]:
     signal_id = safe_str(record.get("signal_id"))
     symbol = normalize_symbol(record.get("symbol"))
@@ -120,7 +223,22 @@ def _normalize_signal_record(record: Mapping[str, Any]) -> dict[str, Any]:
     normalized.setdefault("reason_codes", [])
     normalized.setdefault("metadata", {})
     normalized.setdefault("status", "CREATED")
-    return normalized
+
+    # Flatten key hunter/selector fields for fast stats, audits, and learning.
+    normalized["selector_selected_for_real"] = _metadata_bool(normalized, "selector_selected_for_real", False)
+    normalized["selector_rank_score"] = _metadata_float(normalized, "selector_rank_score", 0.0)
+    normalized["start_score"] = _metadata_float(normalized, "start_score", 0.0)
+    normalized["start_signal_count"] = _metadata_float(normalized, "start_signal_count", 0.0)
+    normalized["chase_risk_score"] = _metadata_float(normalized, "chase_risk_score", 0.0)
+    normalized["move_age_score"] = _metadata_float(normalized, "move_age_score", 0.0)
+    normalized["start_active"] = _metadata_bool(normalized, "start_active", False)
+    normalized["chase_active"] = _metadata_bool(normalized, "chase_active", False)
+    normalized["structure_start_active"] = _metadata_bool(normalized, "structure_start_active", False)
+    normalized["momentum_start_active"] = _metadata_bool(normalized, "momentum_start_active", False)
+    normalized["liquidity_start_active"] = _metadata_bool(normalized, "liquidity_start_active", False)
+    normalized["fresh_context_active"] = _metadata_bool(normalized, "fresh_context_active", False)
+
+    return _apply_real_selector_guard(normalized)
 
 
 def _record_from_decision(decision: AIDecision, *, signal_message_id: Optional[int] = None) -> dict[str, Any]:
@@ -159,7 +277,18 @@ def _record_from_decision(decision: AIDecision, *, signal_message_id: Optional[i
         "created_at": decision.created_at,
         "updated_at": utc_now_iso(),
     }
-    return _normalize_signal_record(record)
+    normalized = _normalize_signal_record(record)
+    # If the safety guard downgraded REAL to GHOST, keep the event history consistent.
+    if decision.mode == MODE_REAL and normalized.get("mode") == MODE_GHOST:
+        normalized["events"] = [
+            {
+                "event_id": make_event_id(EVENT_GHOST_OPENED),
+                "event": EVENT_GHOST_OPENED,
+                "created_at": utc_now_iso(),
+                "metadata": {"source": "signal_manager_real_guard"},
+            }
+        ]
+    return normalized
 
 
 def _find_index(records: list[dict[str, Any]], signal_id: str) -> int:
