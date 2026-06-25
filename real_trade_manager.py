@@ -290,6 +290,191 @@ def _schedule_same_tp_sl_verification(position: TradePosition, plan: TPSLPlan, *
     timer.start()
 
 
+
+def _mapping_from_obj(value: Any) -> dict[str, Any]:
+    """Best-effort mapping extraction without depending on model internals."""
+    if isinstance(value, Mapping):
+        return dict(value)
+    raw = getattr(value, "raw", None)
+    if isinstance(raw, Mapping):
+        return dict(raw)
+    meta = getattr(value, "metadata", None)
+    if isinstance(meta, Mapping):
+        return dict(meta)
+    return {}
+
+
+def _first_hunter_value(key: str, *sources: Any) -> Any:
+    """Return first non-None hunter/selector/timing value from mixed sources."""
+    for source in sources:
+        if source is None:
+            continue
+        if isinstance(source, Mapping) and key in source:
+            value = source.get(key)
+            if value is not None:
+                return value
+        if hasattr(source, key):
+            value = getattr(source, key)
+            if value is not None:
+                return value
+        mapped = _mapping_from_obj(source)
+        if key in mapped and mapped.get(key) is not None:
+            return mapped.get(key)
+        for nested_key in ("hunter_features", "start_evidence_profile", "selector", "timing", "entry_quality", "movement_state"):
+            nested = mapped.get(nested_key)
+            if isinstance(nested, Mapping) and key in nested and nested.get(key) is not None:
+                return nested.get(key)
+    return None
+
+
+def _bool_feature(value: Any) -> Optional[bool]:
+    """Stable optional bool parser. None means the feature was not provided."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "y", "on"}:
+            return True
+        if text in {"0", "false", "no", "n", "off", ""}:
+            return False
+    return bool(value)
+
+
+def extract_decision_hunter_features(decision: AIDecision) -> dict[str, Any]:
+    """Extract final safety features used before sending a REAL order.
+
+    This is not a signal engine. It is the last REAL-order guard so a stale
+    candidate cannot bypass the hunter/selector stack and open after the move
+    is already late, exhausted, or chasing.
+    """
+    metadata = _mapping_from_obj(getattr(decision, "metadata", {}))
+    plan = getattr(decision, "tp_sl", None)
+    plan_raw = _mapping_from_obj(plan)
+    plan_hunter = plan_raw.get("hunter_features") if isinstance(plan_raw.get("hunter_features"), Mapping) else {}
+    sources = (metadata, plan_hunter, plan_raw, decision)
+
+    alias_map = {
+        "start_score": ("start_score", "start_evidence_score", "hunter_start_score", "entry_start_score"),
+        "fresh_momentum_score": ("fresh_momentum_score", "fresh_score", "freshness_score"),
+        "chase_risk_score": ("chase_risk_score", "chase_risk", "anti_chase_risk"),
+        "late_risk_score": ("late_risk_score", "late_risk", "late_entry_risk"),
+        "move_age_score": ("move_age_score", "move_age", "move_age_risk"),
+        "exhaustion_score": ("exhaustion_score", "exhaustion_risk_score", "exhaustion_risk"),
+        "start_pressure_score": ("start_pressure_score", "start_pressure"),
+        "selector_rank_score": ("selector_rank_score", "rank_score", "selection_score"),
+        "start_signal_count": ("start_signal_count", "start_signals", "start_evidence_count"),
+        "structure_start_active": ("structure_start_active", "structure_start"),
+        "momentum_start_active": ("momentum_start_active", "momentum_start"),
+        "liquidity_start_active": ("liquidity_start_active", "liquidity_start"),
+        "fresh_context_active": ("fresh_context_active", "context_start_active", "fresh_context"),
+        "selector_selected_for_real": ("selector_selected_for_real", "selected_for_real", "selector_real_selected"),
+        "movement_state": ("movement_state", "state", "move_state"),
+        "market_regime": ("market_regime", "market_mode", "regime"),
+    }
+
+    features: dict[str, Any] = {}
+    for canonical, aliases in alias_map.items():
+        for alias in aliases:
+            value = _first_hunter_value(alias, *sources)
+            if value is not None:
+                features[canonical] = value
+                break
+    return features
+
+
+def real_hunter_safety_guard(decision: AIDecision) -> tuple[list[str], list[str], dict[str, Any]]:
+    """Return REAL-blocking hunter errors, warnings, and extracted features."""
+    features = extract_decision_hunter_features(decision)
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    start = safe_float(features.get("start_score"), None)
+    fresh = safe_float(features.get("fresh_momentum_score"), None)
+    chase = safe_float(features.get("chase_risk_score"), None)
+    late = safe_float(features.get("late_risk_score"), None)
+    age = safe_float(features.get("move_age_score"), None)
+    exhaustion = safe_float(features.get("exhaustion_score"), None)
+    selected_for_real = _bool_feature(features.get("selector_selected_for_real"))
+
+    min_start = safe_float(TRADE_CONFIG.get("real_hunter_min_start_score"), 50.0) or 50.0
+    max_chase = safe_float(TRADE_CONFIG.get("real_hunter_max_chase_risk"), 70.0) or 70.0
+    max_late = safe_float(TRADE_CONFIG.get("real_hunter_max_late_risk"), 65.0) or 65.0
+    max_age = safe_float(TRADE_CONFIG.get("real_hunter_max_move_age"), 70.0) or 70.0
+    max_exhaustion = safe_float(TRADE_CONFIG.get("real_hunter_max_exhaustion"), 75.0) or 75.0
+    min_fresh_when_weak_start = safe_float(TRADE_CONFIG.get("real_hunter_min_fresh_when_weak_start"), 45.0) or 45.0
+    require_hunter = bool(TRADE_CONFIG.get("require_hunter_preflight_guard", True))
+
+    if not features:
+        if require_hunter:
+            errors.append("hunter_features_missing_for_real")
+        else:
+            warnings.append("hunter_features_missing")
+        return errors, warnings, features
+
+    if selected_for_real is False:
+        errors.append("selector_not_selected_for_real")
+    if chase is not None and chase >= max_chase:
+        errors.append(f"hunter_chase_risk_high:{chase:.1f}>={max_chase:.1f}")
+    if late is not None and late >= max_late:
+        errors.append(f"hunter_late_risk_high:{late:.1f}>={max_late:.1f}")
+    if age is not None and age >= max_age:
+        errors.append(f"hunter_move_too_old:{age:.1f}>={max_age:.1f}")
+    if exhaustion is not None and exhaustion >= max_exhaustion:
+        errors.append(f"hunter_exhaustion_high:{exhaustion:.1f}>={max_exhaustion:.1f}")
+    if start is not None and start < min_start and (fresh is None or fresh < min_fresh_when_weak_start):
+        errors.append(f"hunter_start_too_weak:{start:.1f}<{min_start:.1f}")
+
+    start_flags = [
+        _bool_feature(features.get("structure_start_active")),
+        _bool_feature(features.get("momentum_start_active")),
+        _bool_feature(features.get("liquidity_start_active")),
+        _bool_feature(features.get("fresh_context_active")),
+    ]
+    if require_hunter and start is None and not any(v is True for v in start_flags):
+        errors.append("hunter_start_evidence_missing_for_real")
+
+    return errors, warnings, features
+
+
+def build_ai_decision_snapshot(decision: AIDecision, preflight: Optional[Mapping[str, Any]] = None, open_result: Optional[TradeOpenResult] = None) -> dict[str, Any]:
+    """Store a compact immutable snapshot for later learning/debugging."""
+    metadata = _mapping_from_obj(getattr(decision, "metadata", {}))
+    plan = getattr(decision, "tp_sl", None)
+    plan_raw = _mapping_from_obj(plan)
+    hunter = extract_decision_hunter_features(decision)
+    component_scores = metadata.get("component_scores") if isinstance(metadata.get("component_scores"), Mapping) else {}
+    return {
+        "system_version": SYSTEM_VERSION,
+        "signal_id": safe_str(getattr(decision, "signal_id", "")),
+        "symbol": normalize_symbol(getattr(decision, "symbol", "")),
+        "direction": normalize_direction(getattr(decision, "direction", "")),
+        "mode": safe_str(getattr(decision, "mode", "")).upper(),
+        "level": safe_int(getattr(decision, "level", 4), 4) or 4,
+        "score": safe_float(getattr(decision, "score", None), None),
+        "confidence": safe_float(getattr(decision, "confidence", None), None),
+        "entry": safe_float(getattr(decision, "entry", None), None),
+        "reason_codes": list(getattr(decision, "reason_codes", []) or []),
+        "reject_reason": safe_str(getattr(decision, "reject_reason", "")),
+        "hunter_features": hunter,
+        "component_scores": dict(component_scores),
+        "selector_rank_score": hunter.get("selector_rank_score"),
+        "movement_state": hunter.get("movement_state") or metadata.get("movement_state"),
+        "market_regime": hunter.get("market_regime") or metadata.get("market_regime") or metadata.get("market_mode"),
+        "tp_sl": {
+            "entry": safe_float(getattr(plan, "entry", 0.0), 0.0) if plan else 0.0,
+            "tp1": safe_float(getattr(plan, "tp1", 0.0), 0.0) if plan else 0.0,
+            "tp2": safe_float(getattr(plan, "tp2", 0.0), 0.0) if plan else None,
+            "sl": safe_float(getattr(plan, "sl", 0.0), 0.0) if plan else 0.0,
+            "rr": safe_float(getattr(plan, "rr", 0.0), 0.0) if plan else 0.0,
+            "valid": bool(getattr(plan, "valid", False)) if plan else False,
+            "reason_codes": list(getattr(plan, "reason_codes", []) or []) if plan else [],
+            "raw": dict(plan_raw),
+        },
+        "preflight": dict(preflight or {}),
+        "open_result": dict(getattr(open_result, "raw", {}) or {}) if open_result else {},
+        "created_at": utc_now_iso(),
+    }
+
 def preflight_real_trade(decision: AIDecision, *, client: Optional[ToobitClient] = None, state: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
     c = client or get_client()
     runtime = get_runtime(state)
@@ -298,6 +483,10 @@ def preflight_real_trade(decision: AIDecision, *, client: Optional[ToobitClient]
     plan = decision.tp_sl
     errors: list[str] = []
     warnings: list[str] = []
+
+    hunter_errors, hunter_warnings, hunter_features = real_hunter_safety_guard(decision)
+    errors.extend(hunter_errors)
+    warnings.extend(hunter_warnings)
 
     if decision.mode != MODE_REAL:
         errors.append("decision_not_real")
@@ -379,7 +568,14 @@ def preflight_real_trade(decision: AIDecision, *, client: Optional[ToobitClient]
         "entry": entry, "margin_usdt": margin, "leverage": leverage, "margin_mode": margin_mode,
         "quantity_estimate": quantity_est, "quantity": qty, "quantity_reason": qty_reason,
         "symbol_rules": rules.to_dict() if rules else {}, "tp1_gross_profit_estimate": gross,
-        "fee_estimate": fees, "tp1_net_profit_estimate": net, "checked_at": utc_now_iso(),
+        "fee_estimate": fees, "tp1_net_profit_estimate": net,
+        "hunter_features": dict(hunter_features),
+        "ai_decision_snapshot": build_ai_decision_snapshot(decision, preflight={
+            "hunter_errors": list(hunter_errors),
+            "hunter_warnings": list(hunter_warnings),
+            "hunter_features": dict(hunter_features),
+        }),
+        "checked_at": utc_now_iso(),
     }
 
 
@@ -397,7 +593,13 @@ def build_pending_position(decision: AIDecision, preflight: Mapping[str, Any], o
         margin_usdt=safe_float(preflight.get("margin_usdt"), 0.0) or 0.0, leverage=safe_int(preflight.get("leverage"), 1) or 1,
         exchange_symbol=safe_str((preflight.get("symbol_rules") or {}).get("exchange_symbol")),
         exchange_order_id=open_result.exchange_order_id if open_result else "",
-        decision_metadata={"decision": decision.metadata, "preflight": dict(preflight), "open_result": open_result.raw if open_result else {}},
+        decision_metadata={
+            "decision": _mapping_from_obj(getattr(decision, "metadata", {})),
+            "ai_snapshot": build_ai_decision_snapshot(decision, preflight=preflight, open_result=open_result),
+            "hunter_features": dict(preflight.get("hunter_features", {})) if isinstance(preflight.get("hunter_features"), Mapping) else {},
+            "preflight": dict(preflight),
+            "open_result": open_result.raw if open_result else {},
+        },
         level=decision.level,
     )
 
@@ -427,7 +629,7 @@ def open_real_trade(decision: AIDecision, *, client: Optional[ToobitClient] = No
     )
     if result.status == STATUS_RECOVERED:
         mark_real_confirmed(pos.position_id, entry=result.entry or pos.entry, quantity=result.quantity or pos.quantity, exchange_order_id=result.exchange_order_id)
-    return TradeOpenResult(status=result.status, position_id=pos.position_id, exchange_order_id=result.exchange_order_id, symbol=pos.symbol, direction=pos.direction, entry=result.entry or pos.entry, quantity=result.quantity or pos.quantity, message="real_open_requested", recovered=result.recovered, raw={"open_result": result.raw, "preflight": preflight, "tp_sl_verify_scheduled": True})
+    return TradeOpenResult(status=result.status, position_id=pos.position_id, exchange_order_id=result.exchange_order_id, symbol=pos.symbol, direction=pos.direction, entry=result.entry or pos.entry, quantity=result.quantity or pos.quantity, message="real_open_requested", recovered=result.recovered, raw={"open_result": result.raw, "preflight": preflight, "ai_snapshot": build_ai_decision_snapshot(decision, preflight=preflight, open_result=result), "tp_sl_verify_scheduled": True})
 
 
 def confirm_real_open(position: TradePosition, *, client: Optional[ToobitClient] = None) -> dict[str, Any]:
@@ -748,6 +950,7 @@ def validate_real_trade_manager_light() -> dict[str, Any]:
 
 __all__ = [
     "REAL_TRADE_MANAGER_VERSION", "get_runtime", "estimate_quantity", "estimate_tp1_net_profit",
+    "extract_decision_hunter_features", "real_hunter_safety_guard", "build_ai_decision_snapshot",
     "preflight_real_trade", "build_pending_position", "open_real_trade", "confirm_real_open",
     "wait_for_real_open_confirmation", "close_real_position", "close_position_executor",
     "exchange_position_checker", "closed_pnl_reader",
