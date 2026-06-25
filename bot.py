@@ -76,6 +76,7 @@ from reversal_engine import build_reversal_snapshot
 from timing_engine import build_timing_snapshot
 from tp_sl_engine import build_tp_sl_plan
 from ai_brain import build_ai_decision, validate_ai_decision, evaluate_open_position
+from candidate_selector import select_best_real_candidates, summarize_selection, validate_selection
 from real_trade_manager import (
     close_real_position,
     close_position_executor,
@@ -506,6 +507,14 @@ def analyze_symbol_with_provider(symbol: str, provider: Any, *, timeframe: str =
 
 
 def scan_market_with_provider(symbols: list[str], provider: Any, *, timeframe: str = PRIMARY_TIMEFRAME, limit: int = OKX_CANDLE_LIMIT_DEFAULT, max_results: int = 5) -> list[AIDecision]:
+    """Scan symbols and run cross-candidate REAL selection.
+
+    Important Level 4 rule:
+    - ai_brain.py decides each candidate independently.
+    - candidate_selector.py then arbitrates across all candidates.
+    - Only the best / safest / highest expected-profit candidate may remain REAL.
+    - Other REAL candidates are downgraded to GHOST for learning, not execution.
+    """
     normalized_symbols = [normalize_symbol(s) for s in symbols if normalize_symbol(s)]
     fetch_symbols = list(dict.fromkeys(normalized_symbols + ["BTCUSDT", "ETHUSDT"]))
     snapshots = build_snapshots_from_provider(provider, fetch_symbols, timeframe=timeframe, limit=limit)
@@ -517,8 +526,27 @@ def scan_market_with_provider(symbols: list[str], provider: Any, *, timeframe: s
             continue
         decisions.append(analyze_market_snapshot(snapshot, context_snapshots=snapshots))
 
-    decisions.sort(key=lambda d: (safe_float(d.score, 0.0) or 0.0, safe_float(d.confidence, 0.0) or 0.0), reverse=True)
-    return decisions[: max(1, safe_int(max_results, 5) or 5)]
+    if not decisions:
+        return []
+
+    # Apply selector before cutting results so a slightly lower raw AI score with
+    # better expected profit/timing/safety can still become the selected REAL.
+    selected = select_best_real_candidates(decisions, max_real=1)
+
+    try:
+        selection_validation = validate_selection(selected, max_real=1)
+        if not selection_validation.get("valid"):
+            logger.warning(
+                "candidate_selection_invalid errors=%s summary=%s",
+                selection_validation.get("errors"),
+                summarize_selection(selected),
+            )
+        else:
+            logger.info("candidate_selection_summary=%s", summarize_selection(selected))
+    except Exception:
+        logger.exception("candidate_selection_validation_failed")
+
+    return selected[: max(1, safe_int(max_results, 5) or 5)]
 
 
 
@@ -841,16 +869,19 @@ def _prepare_auto_decision_for_real_or_silent(decision: AIDecision, *, slot_stat
             decision.reason_codes.append("AUTO_REAL_SLOTS_FULL_GHOST_SILENT")
         return decision, True, "real_slots_full"
 
-    # Slot is available and trade is ON: auto signal must attempt REAL.
+    # Slot is available and trade is ON.
+    # Do NOT promote ordinary GHOST to REAL here. Cross-candidate selection is
+    # now the owner of "which signal is allowed to stay REAL". Promoting GHOSTs
+    # here would undo candidate_selector.py and could execute weaker/late setups.
     if safe_str(decision.mode).upper() == MODE_GHOST:
         meta = dict(decision.metadata or {})
-        meta["auto_promoted_ghost_to_real"] = True
-        meta["original_mode"] = MODE_GHOST
+        meta["auto_not_promoted_to_real"] = True
         meta["real_slot_status"] = dict(slot_status)
+        meta.setdefault("original_mode", MODE_GHOST)
         decision.metadata = meta
-        if "AUTO_SLOT_AVAILABLE_PROMOTED_TO_REAL" not in decision.reason_codes:
-            decision.reason_codes.append("AUTO_SLOT_AVAILABLE_PROMOTED_TO_REAL")
-        decision.mode = MODE_REAL
+        if "AUTO_GHOST_NOT_PROMOTED_SELECTOR_REQUIRED" not in decision.reason_codes:
+            decision.reason_codes.append("AUTO_GHOST_NOT_PROMOTED_SELECTOR_REQUIRED")
+        return decision, False, "ghost_not_selected_for_real"
 
     return decision, False, "real_allowed"
 
