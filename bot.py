@@ -64,6 +64,11 @@ from signal_manager import (
     mark_rejected,
     record_signal,
 )
+
+try:
+    from signal_manager import attach_message_id as _signal_attach_message_id
+except Exception:
+    _signal_attach_message_id = None
 from stats_engine import build_stats_snapshot
 from models import AIDecision, Candle, MarketSnapshot, MonitorEvent, TradeCloseResult, TradePosition
 from market_data import fetch_market_snapshot, make_offline_snapshot
@@ -698,6 +703,132 @@ def persist_signal_lifecycle(decision: AIDecision, *, execution: Optional[Mappin
         result["errors"].append(f"lifecycle_failed:{exc}")
     return result
 
+
+def _attach_signal_message_id(signal_id: Any, message_id: Any) -> bool:
+    """Attach Telegram message id to signal record if signal_manager supports it."""
+    sid = safe_str(signal_id)
+    mid = safe_int(message_id, None)
+    if not sid or mid is None or mid <= 0:
+        return False
+
+    fn = _signal_attach_message_id
+    if not callable(fn):
+        logger.warning("attach_message_id_unavailable signal_id=%s message_id=%s", sid, mid)
+        return False
+
+    for call in (
+        lambda: fn(sid, mid),
+        lambda: fn(signal_id=sid, message_id=mid),
+        lambda: fn(sid, {"message_id": mid}),
+        lambda: fn(signal_id=sid, metadata={"message_id": mid}),
+    ):
+        try:
+            result = call()
+            if isinstance(result, Mapping):
+                return bool(result.get("recorded", result.get("ok", result.get("success", True))))
+            return True if result is None else bool(result)
+        except TypeError:
+            continue
+        except Exception:
+            logger.exception("attach_message_id_failed signal_id=%s message_id=%s", sid, mid)
+            return False
+    logger.warning("attach_message_id_signature_unsupported signal_id=%s message_id=%s", sid, mid)
+    return False
+
+
+def _extract_signal_id_from_lifecycle(decision: Optional[AIDecision], lifecycle: Optional[Mapping[str, Any]]) -> str:
+    lifecycle = dict(lifecycle or {})
+    signal_result = lifecycle.get("signal_result")
+    for value in (
+        lifecycle.get("signal_id"),
+        signal_result.get("record_id") if isinstance(signal_result, Mapping) else None,
+        getattr(decision, "signal_id", "") if decision is not None else "",
+    ):
+        sid = safe_str(value)
+        if sid:
+            return sid
+    return ""
+
+
+def _extract_position_id_for_message_link(
+    lifecycle: Optional[Mapping[str, Any]] = None,
+    execution: Optional[Mapping[str, Any]] = None,
+) -> str:
+    """Prefer GHOST lifecycle position id, then REAL execution position id."""
+    lifecycle = dict(lifecycle or {})
+    execution = dict(execution or {})
+    position_result = lifecycle.get("position_result")
+    for value in (
+        lifecycle.get("position_id"),
+        position_result.get("record_id") if isinstance(position_result, Mapping) else None,
+        execution.get("position_id"),
+    ):
+        pid = safe_str(value)
+        if pid:
+            return pid
+    return ""
+
+
+def _save_signal_message_link(
+    *,
+    decision: Optional[AIDecision] = None,
+    lifecycle: Optional[Mapping[str, Any]] = None,
+    execution: Optional[Mapping[str, Any]] = None,
+    message_id: Any = None,
+) -> dict[str, Any]:
+    """Save Telegram signal message id to both signal record and position record.
+
+    This is required so TP/SL/AI_EXIT events can reply to the original signal,
+    especially for REAL positions whose position_id comes from execution rather
+    than lifecycle.
+    """
+    mid = safe_int(message_id, None)
+    result = {"message_id": mid, "signal_attached": False, "position_updated": False, "signal_id": "", "position_id": ""}
+    if mid is None or mid <= 0:
+        return result
+
+    signal_id = _extract_signal_id_from_lifecycle(decision, lifecycle)
+    position_id = _extract_position_id_for_message_link(lifecycle, execution)
+    result["signal_id"] = signal_id
+    result["position_id"] = position_id
+
+    if signal_id:
+        result["signal_attached"] = _attach_signal_message_id(signal_id, mid)
+
+    if position_id:
+        try:
+            update_position(position_id, {"signal_message_id": mid})
+            result["position_updated"] = True
+            logger.info("signal_message_id_saved position_id=%s signal_id=%s message_id=%s", position_id, signal_id, mid)
+        except Exception:
+            logger.exception("position_signal_message_id_update_failed position_id=%s signal_id=%s message_id=%s", position_id, signal_id, mid)
+
+    if not signal_id and not position_id:
+        logger.warning("signal_message_id_not_saved missing_signal_and_position message_id=%s lifecycle=%s execution=%s", mid, lifecycle, execution)
+    return result
+
+
+def _save_response_message_links(response: Mapping[str, Any], message_id: Any) -> list[dict[str, Any]]:
+    """Attach message id for manual command responses that created signals."""
+    data = dict(response.get("data", {}) or {})
+    saved: list[dict[str, Any]] = []
+
+    lifecycle = data.get("lifecycle")
+    execution = data.get("execution")
+    if isinstance(lifecycle, Mapping) or isinstance(execution, Mapping):
+        saved.append(_save_signal_message_link(lifecycle=lifecycle if isinstance(lifecycle, Mapping) else {}, execution=execution if isinstance(execution, Mapping) else {}, message_id=message_id))
+
+    lifecycles = data.get("lifecycles")
+    executions = data.get("executions")
+    if isinstance(lifecycles, list):
+        for idx, item in enumerate(lifecycles):
+            if not isinstance(item, Mapping):
+                continue
+            ex = executions[idx] if isinstance(executions, list) and idx < len(executions) and isinstance(executions[idx], Mapping) else {}
+            saved.append(_save_signal_message_link(lifecycle=item, execution=ex, message_id=message_id))
+
+    return saved
+
 # =============================================================================
 # RealTrade integration
 # =============================================================================
@@ -753,6 +884,68 @@ def _convert_real_failure_to_ghost(decision: AIDecision, *, reason: str, metadat
     }
 
 
+
+
+def _decision_metadata_value(decision: AIDecision, key: str, default: Any = None) -> Any:
+    """Read selector/AI metadata from flattened metadata or nested selector_metrics."""
+    metadata = getattr(decision, "metadata", {}) or {}
+    if isinstance(metadata, Mapping):
+        if key in metadata:
+            return metadata.get(key)
+        learning = metadata.get("learning_features")
+        if isinstance(learning, Mapping) and key in learning:
+            return learning.get(key)
+        selector_metrics = metadata.get("selector_metrics")
+        if isinstance(selector_metrics, Mapping) and key in selector_metrics:
+            return selector_metrics.get(key)
+    return default
+
+
+def _metadata_bool_value(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return bool(default)
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = safe_str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on", "فعال", "روشن"}:
+        return True
+    if text in {"0", "false", "no", "n", "off", "خاموش", "غیرفعال", "غيرفعال"}:
+        return False
+    return bool(default)
+
+
+def _selector_real_guard_blocks(decision: AIDecision) -> list[str]:
+    """Final bot-level safety guard: REAL must come from candidate_selector.py.
+
+    This prevents any future module from bypassing candidate_selector.py and
+    sending an ordinary/late REAL directly to real_trade_manager.py.
+    """
+    if safe_str(getattr(decision, "mode", "")).upper() != MODE_REAL:
+        return []
+
+    selected = _metadata_bool_value(_decision_metadata_value(decision, "selector_selected_for_real", False), False)
+    rank = safe_float(_decision_metadata_value(decision, "selector_rank_score", 0.0), 0.0) or 0.0
+    start_score = safe_float(_decision_metadata_value(decision, "start_score", 0.0), 0.0) or 0.0
+    start_count = safe_float(_decision_metadata_value(decision, "start_signal_count", 0.0), 0.0) or 0.0
+    chase_risk = safe_float(_decision_metadata_value(decision, "chase_risk_score", 100.0), 100.0) or 100.0
+    move_age = safe_float(_decision_metadata_value(decision, "move_age_score", 100.0), 100.0) or 100.0
+
+    blocks: list[str] = []
+    if not selected or rank <= 0.0:
+        blocks.append("BOT_REAL_GUARD_SELECTOR_MISSING")
+    if start_score < 52.0:
+        blocks.append("BOT_REAL_GUARD_START_SCORE_LOW")
+    if start_count < 2.0:
+        blocks.append("BOT_REAL_GUARD_START_CONFIRMATIONS_LOW")
+    if chase_risk > 62.0:
+        blocks.append("BOT_REAL_GUARD_CHASE_RISK_HIGH")
+    if move_age > 68.0:
+        blocks.append("BOT_REAL_GUARD_MOVE_TOO_OLD")
+    return blocks
+
+
 def maybe_execute_real_decision(decision: AIDecision) -> dict[str, Any]:
     """
     Execute REAL decision through real_trade_manager only.
@@ -765,6 +958,22 @@ def maybe_execute_real_decision(decision: AIDecision) -> dict[str, Any]:
     if decision.mode != MODE_REAL:
         reason = "real_trading_disabled_converted_to_ghost" if "REAL_TRADE_OFF_CONVERTED_TO_GHOST" in decision.reason_codes else "not_real_decision"
         return {"executed": False, "status": STATUS_OK, "reason": reason, "converted_to_ghost": decision.mode == MODE_GHOST}
+
+    selector_blocks = _selector_real_guard_blocks(decision)
+    if selector_blocks:
+        return _convert_real_failure_to_ghost(
+            decision,
+            reason="selector_guard_failed",
+            metadata={
+                "selector_guard_blocks": selector_blocks,
+                "selector_selected_for_real": _decision_metadata_value(decision, "selector_selected_for_real", False),
+                "selector_rank_score": _decision_metadata_value(decision, "selector_rank_score", 0.0),
+                "start_score": _decision_metadata_value(decision, "start_score", 0.0),
+                "start_signal_count": _decision_metadata_value(decision, "start_signal_count", 0.0),
+                "chase_risk_score": _decision_metadata_value(decision, "chase_risk_score", 100.0),
+                "move_age_score": _decision_metadata_value(decision, "move_age_score", 100.0),
+            },
+        )
 
     pf = preflight_real_trade(decision)
     if not pf.get("ok"):
@@ -1325,11 +1534,13 @@ def is_user_allowed(user_id: Optional[int]) -> bool:
         return True
 
 
-async def send_long_text(message: Any, text: str) -> None:
+async def send_long_text(message: Any, text: str) -> list[Any]:
     msg = safe_str(text) or "-"
     max_len = 3900
+    sent_messages: list[Any] = []
     for i in range(0, len(msg), max_len):
-        await message.reply_text(msg[i:i + max_len])
+        sent_messages.append(await message.reply_text(msg[i:i + max_len]))
+    return sent_messages
 
 
 async def telegram_start(update: Any, context: Any) -> None:
@@ -1409,7 +1620,11 @@ async def telegram_message_handler(update: Any, context: Any) -> None:
             default_scan_symbols=list(LEVEL_4_SYMBOLS),
             auto_execute_real=True,
         )
-        await send_long_text(message, response.get("text", "-"))
+        sent_messages = await send_long_text(message, response.get("text", "-"))
+        if sent_messages:
+            msg_id = getattr(sent_messages[0], "message_id", None)
+            if msg_id:
+                await asyncio.to_thread(_save_response_message_links, response, msg_id)
     except Exception as exc:
         logger.exception("telegram_message_handler failed")
         await message.reply_text(render_error(f"خطای اجرای دستور: {exc}"))
@@ -1784,11 +1999,16 @@ async def auto_signal_loop(application: Any) -> None:
                             text = "🤖 اتو سیگنال Level 4\n\n" + render_ai_decision(decision, compact=True) + render_real_execution_note(execution) + warning_note
                             sent_messages = await _send_long_text_to_chat(application, chat_id, text)
                             sent_count += 1
-                            if sent_messages and lifecycle.get("position_id"):
+                            if sent_messages:
                                 msg_id = getattr(sent_messages[0], "message_id", None)
                                 if msg_id:
-                                    update_position(lifecycle["position_id"], {"signal_message_id": msg_id})
-                                    logger.info("signal_message_id_saved position_id=%s message_id=%s", lifecycle["position_id"], msg_id)
+                                    await asyncio.to_thread(
+                                        _save_signal_message_link,
+                                        decision=decision,
+                                        lifecycle=lifecycle,
+                                        execution=execution,
+                                        message_id=msg_id,
+                                    )
                         logger.info("auto_signal_sent count=%s silent_ghost=%s executions=%s lifecycles=%s", sent_count, silent_count, executions, lifecycles)
                     else:
                         logger.info("auto_signal_no_sendable_signal count=%s", len(decisions))
