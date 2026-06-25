@@ -20,7 +20,6 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, Mapping, Optional
 
 from constants import (
-    EVENT_AI_EXIT,
     EVENT_MANUAL_CLOSE,
     EVENT_SL,
     EVENT_TP1,
@@ -64,7 +63,6 @@ def _empty_counter() -> dict[str, Any]:
         "tp1": 0,
         "tp2": 0,
         "sl": 0,
-        "ai_exit": 0,
         "manual_close": 0,
         "real": 0,
         "ghost": 0,
@@ -181,8 +179,6 @@ def _add_record(counter: dict[str, Any], record: Mapping[str, Any]) -> dict[str,
         counter["tp2"] = safe_int(counter.get("tp2"), 0) + 1
     elif event == EVENT_SL:
         counter["sl"] = safe_int(counter.get("sl"), 0) + 1
-    elif event == EVENT_AI_EXIT:
-        counter["ai_exit"] = safe_int(counter.get("ai_exit"), 0) + 1
     elif event == EVENT_MANUAL_CLOSE:
         counter["manual_close"] = safe_int(counter.get("manual_close"), 0) + 1
 
@@ -242,6 +238,119 @@ def _counter_from_records(records: list[dict[str, Any]]) -> dict[str, Any]:
 
 def _all_learning_records(limit: int = DEFAULT_STATS_LIMIT) -> list[dict[str, Any]]:
     return get_learning_records(limit=limit)
+
+
+# =============================================================================
+# Hunter/start-quality stats
+# =============================================================================
+
+def _record_metadata(record: Mapping[str, Any]) -> dict[str, Any]:
+    meta = record.get("metadata")
+    return dict(meta) if isinstance(meta, Mapping) else {}
+
+
+def _hunter_features(record: Mapping[str, Any]) -> dict[str, Any]:
+    meta = _record_metadata(record)
+    nested = meta.get("hunter_features")
+    data: dict[str, Any] = dict(nested) if isinstance(nested, Mapping) else {}
+    for key in [
+        "start_score",
+        "start_active",
+        "start_signal_count",
+        "chase_risk_score",
+        "chase_active",
+        "move_age_score",
+        "late_risk_score",
+        "fresh_momentum_score",
+        "exhaustion_score",
+        "start_pressure_score",
+        "structure_start_active",
+        "momentum_start_active",
+        "liquidity_start_active",
+        "fresh_context_active",
+        "early_start_synergy",
+        "selector_rank_score",
+        "selector_selected_for_real",
+    ]:
+        if key not in data and key in meta:
+            data[key] = meta.get(key)
+        if key not in data and key in record:
+            data[key] = record.get(key)
+    return data
+
+
+def _is_truthy(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
+def _hunter_bucket_label(features: Mapping[str, Any]) -> str:
+    start = safe_float(features.get("start_score"), None)
+    chase = safe_float(features.get("chase_risk_score"), None)
+    age = safe_float(features.get("move_age_score"), None)
+    late = safe_float(features.get("late_risk_score"), None)
+    fresh = safe_float(features.get("fresh_momentum_score"), None)
+
+    if start is not None and start >= 70 and (chase is None or chase <= 30) and (late is None or late <= 30):
+        return "STRONG_START"
+    if start is not None and start >= 55 and (chase is None or chase <= 45):
+        return "VALID_START"
+    if chase is not None and chase >= 60:
+        return "CHASE_RISK"
+    if late is not None and late >= 55:
+        return "LATE_RISK"
+    if age is not None and age >= 60:
+        return "OLD_MOVE"
+    if fresh is not None and fresh >= 55:
+        return "FRESH_MOMENTUM"
+    return "UNKNOWN"
+
+
+def get_hunter_stats(limit: int = DEFAULT_STATS_LIMIT, *, mode: str = "", level: Optional[int] = None) -> dict[str, Any]:
+    """Return start-of-move vs chase/late-entry learning statistics."""
+    records = _filter_records(_all_learning_records(limit), mode=mode, level=level)
+    buckets: dict[str, dict[str, Any]] = {}
+    totals = {
+        "records_with_hunter_features": 0,
+        "start_active": 0,
+        "structure_start_active": 0,
+        "momentum_start_active": 0,
+        "liquidity_start_active": 0,
+        "fresh_context_active": 0,
+        "selector_selected_for_real": 0,
+    }
+
+    for record in records:
+        features = _hunter_features(record)
+        if features:
+            totals["records_with_hunter_features"] += 1
+        for key in [
+            "start_active",
+            "structure_start_active",
+            "momentum_start_active",
+            "liquidity_start_active",
+            "fresh_context_active",
+            "selector_selected_for_real",
+        ]:
+            if _is_truthy(features.get(key)):
+                totals[key] += 1
+
+        label = _hunter_bucket_label(features)
+        bucket = buckets.setdefault(label, _empty_counter())
+        _add_record(bucket, record)
+
+    finalized = {name: _finalize_counter(bucket) for name, bucket in buckets.items()}
+    return {
+        "system_version": SYSTEM_VERSION,
+        "scope": "HUNTER",
+        "mode": safe_str(mode).upper(),
+        "level": level,
+        "total_records": len(records),
+        **totals,
+        "buckets": finalized,
+        "updated_at": utc_now_iso(),
+    }
 
 
 # =============================================================================
@@ -324,30 +433,24 @@ def get_coin_rankings(limit: int = DEFAULT_STATS_LIMIT, *, min_total: int = 1, l
     return ranked
 
 
-def get_ai_exit_stats(limit: int = DEFAULT_STATS_LIMIT) -> dict[str, Any]:
-    records = [r for r in _all_learning_records(limit) if _record_event(r) == EVENT_AI_EXIT]
-    data = _counter_from_records(records)
+def get_profit_exit_stats_disabled(limit: int = DEFAULT_STATS_LIMIT) -> dict[str, Any]:
+    """Return disabled profit-exit stats for backwards-compatible UI snapshots.
 
-    profit_count = 0
-    loss_count = 0
-    flat_count = 0
-    for record in records:
-        pnl = safe_float(record.get("pnl_usdt"), 0.0) or 0.0
-        if pnl > 0:
-            profit_count += 1
-        elif pnl < 0:
-            loss_count += 1
-        else:
-            flat_count += 1
-
+    AI/profit-exit has been removed from the active monitor. This section is
+    intentionally always zero and is kept only so older UI code does not crash.
+    """
+    _ = limit
+    data = _finalize_counter(_empty_counter())
     data.update(
         {
-            "scope": "AI_EXIT",
-            "ai_exit_count": len(records),
-            "ai_exit_profit_count": profit_count,
-            "ai_exit_loss_count": loss_count,
-            "ai_exit_flat_count": flat_count,
-            "ai_exit_profit_rate": (profit_count / len(records) * 100.0) if records else 0.0,
+            "scope": "PROFIT_EXIT_DISABLED",
+            "enabled": False,
+            "ai_exit_count": 0,
+            "ai_exit_profit_count": 0,
+            "ai_exit_loss_count": 0,
+            "ai_exit_flat_count": 0,
+            "ai_exit_profit_rate": 0.0,
+            "note": "AI/profit exit is disabled; monitor records only TP/SL/exchange/manual recovery.",
         }
     )
     return data
@@ -443,6 +546,7 @@ def get_position_stats() -> dict[str, Any]:
         "available_real_slots": available_real_slots,
         "real_slots_over_limit": real_slots_over_limit,
         "exchange_checked": exchange_checked,
+        "exchange_available": exchange_checked and not bool(exchange_error),
         "exchange_error": exchange_error,
         "by_status": by_status,
         "by_mode": by_mode,
@@ -460,7 +564,8 @@ def build_stats_snapshot(limit: int = DEFAULT_STATS_LIMIT) -> dict[str, Any]:
         "real": get_real_stats(limit),
         "ghost": get_ghost_stats(limit),
         "level": get_level_stats(STRATEGY_LEVEL, limit),
-        "ai_exit": get_ai_exit_stats(limit),
+        "profit_exit": get_profit_exit_stats_disabled(limit),
+        "hunter": get_hunter_stats(limit, level=STRATEGY_LEVEL),
         "positions": get_position_stats(),
         "daily": {
             "today": get_daily_stats(1, limit),
@@ -476,7 +581,7 @@ def validate_stats_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     if safe_str(snapshot.get("system_version")) != SYSTEM_VERSION:
         errors.append("INVALID_SYSTEM_VERSION")
 
-    for key in ["global", "real", "ghost", "level", "ai_exit", "positions", "daily"]:
+    for key in ["global", "real", "ghost", "level", "profit_exit", "hunter", "positions", "daily"]:
         if key not in snapshot:
             errors.append(f"MISSING_{key.upper()}")
 
@@ -506,7 +611,8 @@ __all__ = [
     "get_level_stats",
     "get_coin_stats",
     "get_coin_rankings",
-    "get_ai_exit_stats",
+    "get_profit_exit_stats_disabled",
+    "get_hunter_stats",
     "get_daily_stats",
     "get_position_stats",
     "build_stats_snapshot",
