@@ -12,6 +12,8 @@ Architecture lock:
 - Keeps AI Brain as the per-candidate REAL/GHOST/REJECT decision maker.
 - This layer only arbitrates between multiple candidates so only the strongest
   opportunity can remain REAL.
+- Core rule: prefer the candidate closest to the start of a move, not the one
+  with the largest late/extended target. Fresh start evidence must beat chase.
 - Allowed project imports: constants.py, utils.py, models.py only.
 """
 
@@ -44,17 +46,23 @@ DEFAULT_SELECTOR_CONFIG: dict[str, Any] = {
     "max_selected_reversal": 55.0,
     "max_selected_trap": 58.0,
     "max_selected_exhaustion": 58.0,
+    "min_selected_start_score": 52.0,
+    "min_selected_start_signal_count": 2.0,
+    "max_selected_chase_risk": 62.0,
+    "max_selected_move_age": 68.0,
 
     # Ranking weights. Final rank is not the same as AI score; it prefers
     # high-quality + high expected net profit without accepting late/chasing risk.
-    "weight_ai_score": 0.28,
-    "weight_confidence": 0.20,
-    "weight_profit_quality": 0.16,
-    "weight_relative_profit_quality": 0.12,
-    "weight_rr_quality": 0.10,
-    "weight_timing_quality": 0.12,
-    "weight_safety_quality": 0.10,
-    "weight_learning_quality": 0.10,
+    "weight_ai_score": 0.16,
+    "weight_confidence": 0.11,
+    "weight_start_quality": 0.22,
+    "weight_chase_safety": 0.16,
+    "weight_profit_quality": 0.09,
+    "weight_relative_profit_quality": 0.06,
+    "weight_rr_quality": 0.05,
+    "weight_timing_quality": 0.07,
+    "weight_safety_quality": 0.05,
+    "weight_learning_quality": 0.03,
 }
 
 
@@ -126,13 +134,29 @@ def _metadata_num(decision: AIDecision, key: str, default: float = 0.0) -> float
     return float(default)
 
 
+def _bool(value: Any, default: bool = False) -> bool:
+    """Read booleans safely, including string forms like 'false'."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return bool(default)
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = safe_str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return bool(default)
+
+
 def _metadata_bool(decision: AIDecision, key: str, default: bool = False) -> bool:
     metadata = _decision_metadata(decision)
     if key in metadata:
-        return bool(metadata.get(key))
+        return _bool(metadata.get(key), default)
     learning = _as_mapping(metadata.get("learning_features"))
     if key in learning:
-        return bool(learning.get(key))
+        return _bool(learning.get(key), default)
     return bool(default)
 
 
@@ -264,7 +288,116 @@ def trap_risk_score(decision: AIDecision) -> float:
 def has_wait_flag(decision: AIDecision) -> bool:
     if "wait_for_better_entry" in _decision_metadata(decision):
         return _metadata_bool(decision, "wait_for_better_entry", False)
-    return bool(_timing_snapshot(decision).get("wait_for_better_entry"))
+    return _bool(_timing_snapshot(decision).get("wait_for_better_entry"), False)
+
+
+def start_score(decision: AIDecision) -> float:
+    """Start-of-move evidence score produced by ai_brain."""
+    return _metadata_num(decision, "start_score", 0.0)
+
+
+def start_signal_count(decision: AIDecision) -> float:
+    """Number of independent start confirmations from upstream engines."""
+    return _metadata_num(decision, "start_signal_count", 0.0)
+
+
+def chase_risk_score(decision: AIDecision) -> float:
+    """Risk that the candidate is chasing the middle/end of a move."""
+    # ai_brain stores this flattened. Fall back to late/exhaustion/move-age blend.
+    direct = _metadata_num(decision, "chase_risk_score", -1.0)
+    if direct >= 0.0:
+        return clamp(direct, 0.0, 100.0)
+    return clamp(
+        late_risk_score(decision) * 0.38
+        + move_age_score(decision) * 0.28
+        + exhaustion_score(decision) * 0.22
+        + trap_risk_score(decision) * 0.12,
+        0.0,
+        100.0,
+    )
+
+
+def move_age_score(decision: AIDecision) -> float:
+    return _metadata_num(decision, "move_age_score", _num(_timing_raw(decision).get("move_age_score"), 50.0))
+
+
+def start_active(decision: AIDecision) -> bool:
+    return _metadata_bool(decision, "start_active", False)
+
+
+def chase_active(decision: AIDecision) -> bool:
+    return _metadata_bool(decision, "chase_active", False)
+
+
+def structure_start_active(decision: AIDecision) -> bool:
+    return _metadata_bool(decision, "structure_start_active", False)
+
+
+def momentum_start_active(decision: AIDecision) -> bool:
+    return _metadata_bool(decision, "momentum_start_active", False)
+
+
+def liquidity_start_active(decision: AIDecision) -> bool:
+    return _metadata_bool(decision, "liquidity_start_active", False)
+
+
+def fresh_context_active(decision: AIDecision) -> bool:
+    return _metadata_bool(decision, "fresh_context_active", False)
+
+
+def start_pressure_score(decision: AIDecision) -> float:
+    return _metadata_num(decision, "start_pressure_score", 0.0)
+
+
+def start_liquidity_score(decision: AIDecision) -> float:
+    return _metadata_num(decision, "start_liquidity_score", 0.0)
+
+
+def fresh_context_score(decision: AIDecision) -> float:
+    return _metadata_num(decision, "fresh_context_score", 50.0)
+
+
+def early_start_synergy(decision: AIDecision) -> float:
+    return _metadata_num(decision, "early_start_synergy", 0.0)
+
+
+def start_quality(decision: AIDecision) -> float:
+    """Rank quality for hunting the beginning of the move."""
+    active_bonus = 0.0
+    active_bonus += 8.0 if start_active(decision) else 0.0
+    active_bonus += 4.0 if structure_start_active(decision) else 0.0
+    active_bonus += 5.0 if momentum_start_active(decision) else 0.0
+    active_bonus += 4.0 if liquidity_start_active(decision) else 0.0
+    active_bonus += 3.0 if fresh_context_active(decision) else 0.0
+    score = (
+        start_score(decision) * 0.44
+        + start_pressure_score(decision) * 0.18
+        + start_liquidity_score(decision) * 0.12
+        + fresh_context_score(decision) * 0.10
+        + early_start_synergy(decision) * 0.08
+        + min(100.0, start_signal_count(decision) * 18.0) * 0.08
+        + active_bonus
+    )
+    score -= max(0.0, chase_risk_score(decision) - 55.0) * 0.35
+    if has_wait_flag(decision):
+        score -= 10.0
+    return clamp(score, 0.0, 100.0)
+
+
+def chase_safety_quality(decision: AIDecision) -> float:
+    """High value means the candidate is not late/chasing."""
+    score = 100.0 - chase_risk_score(decision)
+    if chase_active(decision):
+        score -= 16.0
+    if move_age_score(decision) >= 70.0:
+        score -= 10.0
+    if late_risk_score(decision) >= 55.0:
+        score -= 8.0
+    if exhaustion_score(decision) >= 58.0:
+        score -= 8.0
+    if has_wait_flag(decision):
+        score -= 10.0
+    return clamp(score, 0.0, 100.0)
 
 
 # =============================================================================
@@ -346,7 +479,15 @@ def timing_quality(decision: AIDecision) -> float:
     fresh = fresh_momentum_score(decision)
     exhaustion = exhaustion_score(decision)
     wait_penalty = 18.0 if has_wait_flag(decision) else 0.0
-    score = timing * 0.55 + fresh * 0.25 + (100.0 - late) * 0.12 + (100.0 - exhaustion) * 0.08 - wait_penalty
+    score = (
+        timing * 0.46
+        + fresh * 0.18
+        + start_quality(decision) * 0.18
+        + chase_safety_quality(decision) * 0.10
+        + (100.0 - late) * 0.05
+        + (100.0 - exhaustion) * 0.03
+        - wait_penalty
+    )
     return clamp(score, 0.0, 100.0)
 
 
@@ -357,11 +498,12 @@ def safety_quality(decision: AIDecision) -> float:
     exhaustion = exhaustion_score(decision)
     continuation = continuation_probability(decision)
     score = (
-        (100.0 - late) * 0.24
-        + (100.0 - trap) * 0.22
-        + (100.0 - rev) * 0.24
-        + (100.0 - exhaustion) * 0.18
-        + continuation * 0.12
+        chase_safety_quality(decision) * 0.26
+        + (100.0 - late) * 0.16
+        + (100.0 - trap) * 0.16
+        + (100.0 - rev) * 0.18
+        + (100.0 - exhaustion) * 0.14
+        + continuation * 0.10
     )
     return clamp(score, 0.0, 100.0)
 
@@ -370,27 +512,39 @@ def selector_rank_score(decision: AIDecision, config: Optional[Mapping[str, Any]
     """Rank candidate by quality + expected profitability + safety."""
     cfg = _cfg(config)
     score = (
-        _num(decision.score, 0.0) * _cfg_float(cfg, "weight_ai_score", 0.28)
-        + _num(decision.confidence, 0.0) * _cfg_float(cfg, "weight_confidence", 0.20)
-        + profit_quality(decision) * _cfg_float(cfg, "weight_profit_quality", 0.16)
-        + relative_profit_quality(decision) * _cfg_float(cfg, "weight_relative_profit_quality", 0.12)
-        + rr_quality(decision) * _cfg_float(cfg, "weight_rr_quality", 0.10)
-        + timing_quality(decision) * _cfg_float(cfg, "weight_timing_quality", 0.12)
+        _num(decision.score, 0.0) * _cfg_float(cfg, "weight_ai_score", 0.22)
+        + _num(decision.confidence, 0.0) * _cfg_float(cfg, "weight_confidence", 0.16)
+        + start_quality(decision) * _cfg_float(cfg, "weight_start_quality", 0.22)
+        + chase_safety_quality(decision) * _cfg_float(cfg, "weight_chase_safety", 0.16)
+        + profit_quality(decision) * _cfg_float(cfg, "weight_profit_quality", 0.12)
+        + relative_profit_quality(decision) * _cfg_float(cfg, "weight_relative_profit_quality", 0.08)
+        + rr_quality(decision) * _cfg_float(cfg, "weight_rr_quality", 0.07)
+        + timing_quality(decision) * _cfg_float(cfg, "weight_timing_quality", 0.10)
         + safety_quality(decision) * _cfg_float(cfg, "weight_safety_quality", 0.10)
-        + learning_quality(decision) * _cfg_float(cfg, "weight_learning_quality", 0.10)
+        + learning_quality(decision) * _cfg_float(cfg, "weight_learning_quality", 0.08)
     )
 
     # Strong anti-chase penalty. A late high-profit target should not beat a clean setup.
+    if start_active(decision) and start_score(decision) >= 60 and chase_risk_score(decision) <= 55:
+        score += 6.0
+    if start_signal_count(decision) >= 3 and chase_risk_score(decision) <= 58:
+        score += 3.0
+    if chase_active(decision):
+        score -= 14.0
     if has_wait_flag(decision):
         score -= 10.0
     if late_risk_score(decision) >= 60:
         score -= 10.0
+    if move_age_score(decision) >= 70:
+        score -= 9.0
     if exhaustion_score(decision) >= 60:
         score -= 8.0
     if reversal_probability(decision) >= 60:
         score -= 8.0
     if continuation_probability(decision) < 45:
         score -= 7.0
+    if start_score(decision) < 45 and late_risk_score(decision) >= 45:
+        score -= 8.0
 
     return clamp(score, 0.0, 100.0)
 
@@ -402,6 +556,17 @@ def real_eligibility_blocks(decision: AIDecision, config: Optional[Mapping[str, 
 
     if getattr(decision, "mode", "") != MODE_REAL:
         reasons.append("SELECTOR_NOT_REAL_FROM_AI")
+
+    if not start_active(decision) or start_score(decision) < _cfg_float(cfg, "min_selected_start_score", 52.0):
+        reasons.append("SELECTOR_NO_START_EVIDENCE")
+    if start_signal_count(decision) < _cfg_float(cfg, "min_selected_start_signal_count", 2.0):
+        reasons.append("SELECTOR_START_CONFIRMATIONS_LOW")
+    if chase_risk_score(decision) > _cfg_float(cfg, "max_selected_chase_risk", 62.0):
+        reasons.append("SELECTOR_CHASE_RISK_HIGH")
+    if chase_active(decision):
+        reasons.append("SELECTOR_CHASE_ACTIVE")
+    if move_age_score(decision) > _cfg_float(cfg, "max_selected_move_age", 68.0):
+        reasons.append("SELECTOR_MOVE_TOO_OLD")
 
     if _num(decision.score, 0.0) < _cfg_float(cfg, "min_selected_score", 76.0):
         reasons.append("SELECTOR_SCORE_LOW")
@@ -471,10 +636,26 @@ def _with_selector_metadata(decision: AIDecision, *, mode: Optional[str] = None,
             "reversal_probability": reversal_probability(decision),
             "continuation_probability": continuation_probability(decision),
             "trap_risk_score": trap_risk_score(decision),
+            "start_score": start_score(decision),
+            "start_active": start_active(decision),
+            "start_signal_count": start_signal_count(decision),
+            "chase_risk_score": chase_risk_score(decision),
+            "chase_active": chase_active(decision),
+            "move_age_score": move_age_score(decision),
+            "structure_start_active": structure_start_active(decision),
+            "momentum_start_active": momentum_start_active(decision),
+            "liquidity_start_active": liquidity_start_active(decision),
+            "fresh_context_active": fresh_context_active(decision),
+            "start_pressure_score": start_pressure_score(decision),
+            "start_liquidity_score": start_liquidity_score(decision),
+            "fresh_context_score": fresh_context_score(decision),
+            "early_start_synergy": early_start_synergy(decision),
             "profit_quality": profit_quality(decision),
             "relative_profit_quality": relative_profit_quality(decision),
             "rr_quality": rr_quality(decision),
             "learning_quality": learning_quality(decision),
+            "start_quality": start_quality(decision),
+            "chase_safety_quality": chase_safety_quality(decision),
             "timing_quality": timing_quality(decision),
             "safety_quality": safety_quality(decision),
         },
@@ -523,6 +704,9 @@ def select_best_real_candidates(
             item[0],
             _num(item[2].score, 0.0),
             _num(item[2].confidence, 0.0),
+            start_quality(item[2]),
+            chase_safety_quality(item[2]),
+            start_signal_count(item[2]),
             relative_profit_quality(item[2]),
             learning_quality(item[2]),
             expected_net_profit(item[2]),
@@ -543,7 +727,7 @@ def select_best_real_candidates(
                 reason_codes=["SELECTOR_SELECTED_BEST_REAL"],
                 selected=True,
                 selector_rank=rank,
-                selector_reason="BEST_REAL_BY_SCORE_PROFIT_AND_SAFETY",
+                selector_reason="BEST_REAL_BY_START_SCORE_PROFIT_AND_SAFETY",
             ))
             continue
 
@@ -574,6 +758,8 @@ def select_best_real_candidates(
         key=lambda d: (
             2 if d.mode == MODE_REAL else 1 if d.mode == MODE_GHOST else 0,
             _num(_decision_metadata(d).get("selector_rank_score"), 0.0),
+            start_quality(d),
+            chase_safety_quality(d),
             _num(d.score, 0.0),
             _num(d.confidence, 0.0),
         ),
@@ -613,6 +799,11 @@ def summarize_selection(decisions: Sequence[AIDecision]) -> dict[str, Any]:
                 "expected_move_percent": expected_move_percent(d),
                 "profit_percent": profit_percent(d),
                 "rr": reward_risk(d),
+                "start_score": start_score(d),
+                "start_signal_count": start_signal_count(d),
+                "chase_risk_score": chase_risk_score(d),
+                "start_quality": start_quality(d),
+                "chase_safety_quality": chase_safety_quality(d),
                 "learning_quality": learning_quality(d),
             }
             for d in items
@@ -662,12 +853,28 @@ __all__ = [
     "reversal_probability",
     "continuation_probability",
     "trap_risk_score",
+    "start_score",
+    "start_signal_count",
+    "chase_risk_score",
+    "move_age_score",
+    "start_active",
+    "chase_active",
+    "structure_start_active",
+    "momentum_start_active",
+    "liquidity_start_active",
+    "fresh_context_active",
+    "start_pressure_score",
+    "start_liquidity_score",
+    "fresh_context_score",
+    "early_start_synergy",
     "profit_quality",
     "relative_profit_quality",
     "learning_quality",
     "rr_quality",
     "timing_quality",
     "safety_quality",
+    "start_quality",
+    "chase_safety_quality",
     "selector_rank_score",
     "real_eligibility_blocks",
     "select_best_real_candidates",
