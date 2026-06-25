@@ -304,7 +304,6 @@ def render_trade_runtime(runtime: Optional[Mapping[str, Any]] = None) -> str:
         real_tp1 = safe_int(real_stats.get("tp1"), 0) or 0
         real_tp2 = safe_int(real_stats.get("tp2"), 0) or 0
         real_sl = safe_int(real_stats.get("sl"), 0) or 0
-        real_ai_exit = safe_int(real_stats.get("ai_exit"), 0) or 0
         real_pnl = safe_float(real_stats.get("pnl_usdt"), 0.0) or 0.0
         real_confirmed_pnl = safe_float(real_stats.get("confirmed_pnl_usdt"), None)
         real_unconfirmed_pnl = safe_float(real_stats.get("unconfirmed_pnl_usdt"), None)
@@ -338,7 +337,7 @@ def render_trade_runtime(runtime: Optional[Mapping[str, Any]] = None) -> str:
             f"PnL تخمینی/تاییدنشده: {fmt_usdt(real_unconfirmed_pnl)}" if real_unconfirmed_pnl is not None else "PnL تخمینی/تاییدنشده: -",
             f"تعداد نتایج REAL: {real_closed_total}",
             f"برد: {real_wins} | باخت: {real_losses} | WinRate: {fmt_pct(real_stats.get('win_rate'))}",
-            f"TP1: {real_tp1} | TP2: {real_tp2} | SL: {real_sl} | AI Exit: {real_ai_exit}",
+            f"TP1: {real_tp1} | TP2: {real_tp2} | SL: {real_sl}",
         ]
         if positions:
             for p in positions[:10]:
@@ -399,7 +398,7 @@ def render_ai_status(summary: Optional[Mapping[str, Any]] = None) -> str:
         f"TP2: {safe_int(data.get('tp2'), 0)}",
         f"Updated: {safe_str(data.get('updated_at'), '-')}",
         "",
-        "یادگیری بر اساس REAL و GHOST و به‌صورت coin/direction/condition ذخیره می‌شود.",
+        "یادگیری بر اساس REAL و GHOST و به‌صورت coin/direction/condition و کیفیت شروع حرکت ذخیره می‌شود.",
     ]
     return "\n".join(lines)
 
@@ -526,9 +525,6 @@ def render_outcome(outcome: TradeOutcome) -> str:
     elif event == "SL":
         icon = "❌"
         title = "STOP LOSS"
-    elif "AI_EXIT" in event:
-        icon = "🧠"
-        title = "AI EXIT"
     else:
         icon = "ℹ️"
         title = event
@@ -585,6 +581,45 @@ def render_stats_block(stats: Mapping[str, Any], title: str) -> str:
     return "\n".join(lines)
 
 
+def _hunter_bucket_line(buckets: Mapping[str, Any], key: str, title: str) -> str:
+    bucket = buckets.get(key, {}) if isinstance(buckets, Mapping) else {}
+    if not isinstance(bucket, Mapping):
+        bucket = {}
+    return (
+        f"{title}: {safe_int(bucket.get('total'), 0)} | "
+        f"WR {fmt_pct(bucket.get('win_rate'))} | "
+        f"TP1 {safe_int(bucket.get('tp1'), 0)} | SL {safe_int(bucket.get('sl'), 0)}"
+    )
+
+
+def render_hunter_stats_block(hunter: Mapping[str, Any]) -> str:
+    buckets = hunter.get("buckets", {}) if isinstance(hunter, Mapping) else {}
+    if not isinstance(buckets, Mapping):
+        buckets = {}
+    lines = [
+        "🎯 آمار شکار شروع حرکت",
+        f"نمونه‌های دارای داده شکارچی: {safe_int(hunter.get('records_with_hunter_features'), 0)} / {safe_int(hunter.get('total_records'), 0)}",
+        f"Start Active: {safe_int(hunter.get('start_active'), 0)} | Selector REAL: {safe_int(hunter.get('selector_selected_for_real'), 0)}",
+        _hunter_bucket_line(buckets, "STRONG_START", "شروع قوی"),
+        _hunter_bucket_line(buckets, "VALID_START", "شروع معتبر"),
+        _hunter_bucket_line(buckets, "FRESH_MOMENTUM", "مومنتوم تازه"),
+        _hunter_bucket_line(buckets, "CHASE_RISK", "ریسک دنبال‌کردن"),
+        _hunter_bucket_line(buckets, "LATE_RISK", "ورود دیر"),
+        _hunter_bucket_line(buckets, "OLD_MOVE", "حرکت مصرف‌شده"),
+    ]
+    return "\n".join(lines)
+
+
+def render_profit_exit_disabled_block(profit_exit: Mapping[str, Any]) -> str:
+    enabled = bool(profit_exit.get("enabled", False)) if isinstance(profit_exit, Mapping) else False
+    status = "غیرفعال ✅" if not enabled else "فعال ⚠️"
+    return "\n".join([
+        "🚫 خروج در سود",
+        f"وضعیت: {status}",
+        "مانیتور فقط TP/SL یا بسته‌شدن تأییدشده صرافی را ثبت می‌کند.",
+    ])
+
+
 def render_stats_snapshot(snapshot: Optional[Mapping[str, Any]] = None) -> str:
     snap = dict(snapshot or build_stats_snapshot())
 
@@ -598,16 +633,13 @@ def render_stats_snapshot(snapshot: Optional[Mapping[str, Any]] = None) -> str:
         render_stats_block(snap.get("ghost", {}), "GHOST"),
     ]
 
-    ai_exit = snap.get("ai_exit", {})
-    if isinstance(ai_exit, Mapping):
-        lines.extend([
-            "",
-            "🧠 AI Exit",
-            f"تعداد: {safe_int(ai_exit.get('ai_exit_count'), 0)}",
-            f"خروج در سود: {safe_int(ai_exit.get('ai_exit_profit_count'), 0)}",
-            f"خروج در ضرر: {safe_int(ai_exit.get('ai_exit_loss_count'), 0)}",
-            f"درصد خروج سودده: {fmt_pct(ai_exit.get('ai_exit_profit_rate'))}",
-        ])
+    hunter = snap.get("hunter", {})
+    if isinstance(hunter, Mapping):
+        lines.extend(["", render_hunter_stats_block(hunter)])
+
+    profit_exit = snap.get("profit_exit", {})
+    if isinstance(profit_exit, Mapping):
+        lines.extend(["", render_profit_exit_disabled_block(profit_exit)])
 
     positions = snap.get("positions", {})
     if isinstance(positions, Mapping):
@@ -655,7 +687,7 @@ def render_help() -> str:
         "• اسکن / بررسی — اسکن واچ‌لیست Level 4",
         "",
         "آمار و هوش مصنوعی:",
-        "• آمار — آمار REAL/GHOST/TP/SL/AI Exit",
+        "• آمار — آمار REAL/GHOST/TP/SL و کیفیت شکار شروع حرکت",
         "• حذف آمار — پاک کردن آمار و حافظه یادگیری؛ پوزیشن باز حذف نمی‌شود",
         "• هوش مصنوعی — وضعیت یادگیری AI",
         "",
@@ -717,6 +749,8 @@ __all__ = [
     "render_outcome",
     "render_monitor_event",
     "render_stats_block",
+    "render_hunter_stats_block",
+    "render_profit_exit_disabled_block",
     "render_stats_snapshot",
     "render_help",
     "render_error",
