@@ -103,7 +103,65 @@ def condition_bucket(value: Any, step: float = 5.0, default: str = "UNKNOWN") ->
     if step <= 0:
         step = 5.0
     bucket = round(v / step) * step
+    if step < 1:
+        return f"{bucket:.4f}".rstrip("0").rstrip(".")
     return f"{bucket:.0f}"
+
+
+def bool_bucket(value: Any) -> str:
+    """Stable boolean bucket for condition keys."""
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "y", "on"}:
+            return "1"
+        if text in {"0", "false", "no", "n", "off", ""}:
+            return "0"
+    return "1" if bool(value) else "0"
+
+
+def _first_present(*maps: Optional[Mapping[str, Any]], key: str, default: Any = None) -> Any:
+    """Return first present key from mapping inputs."""
+    for item in maps:
+        if isinstance(item, Mapping) and key in item:
+            return item.get(key)
+    return default
+
+
+def hunter_condition_features(
+    *,
+    indicators: Optional[Mapping[str, Any]] = None,
+    structure: Optional[Mapping[str, Any]] = None,
+    momentum: Optional[Mapping[str, Any]] = None,
+    liquidity: Optional[Mapping[str, Any]] = None,
+    market_context: Optional[Mapping[str, Any]] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> dict[str, Any]:
+    """Extract locked hunter/start/anti-chase features for learning.
+
+    These are the fields that separate a true start-of-move entry from a
+    late/chasing entry. They are stored and also used in condition keys so the
+    bot can learn which start patterns work instead of learning only broad
+    coin+direction behavior.
+    """
+    maps = (metadata, indicators, structure, momentum, liquidity, market_context)
+    data = {
+        "start_score": _first_present(*maps, key="start_score"),
+        "chase_risk_score": _first_present(*maps, key="chase_risk_score"),
+        "move_age_score": _first_present(*maps, key="move_age_score"),
+        "late_risk_score": _first_present(*maps, key="late_risk_score"),
+        "fresh_momentum_score": _first_present(*maps, key="fresh_momentum_score"),
+        "exhaustion_score": _first_present(*maps, key="exhaustion_score"),
+        "start_pressure_score": _first_present(*maps, key="start_pressure_score"),
+        "start_signal_count": _first_present(*maps, key="start_signal_count"),
+        "structure_start_active": _first_present(*maps, key="structure_start_active"),
+        "momentum_start_active": _first_present(*maps, key="momentum_start_active"),
+        "liquidity_start_active": _first_present(*maps, key="liquidity_start_active"),
+        "fresh_context_active": _first_present(*maps, key="fresh_context_active"),
+        "early_start_synergy": _first_present(*maps, key="early_start_synergy"),
+        "selector_rank_score": _first_present(*maps, key="selector_rank_score"),
+        "selector_selected_for_real": _first_present(*maps, key="selector_selected_for_real"),
+    }
+    return {k: v for k, v in data.items() if v is not None}
 
 
 def build_condition_key(
@@ -112,16 +170,30 @@ def build_condition_key(
     direction: str,
     level: int,
     indicators: Optional[Mapping[str, Any]] = None,
+    structure: Optional[Mapping[str, Any]] = None,
+    momentum: Optional[Mapping[str, Any]] = None,
+    liquidity: Optional[Mapping[str, Any]] = None,
     market_context: Optional[Mapping[str, Any]] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
 ) -> str:
     """
     Build condition key.
 
     Important: learning is conditional, not broad. This avoids globally marking
-    DOGE LONG/SHORT as good/bad without context.
+    DOGE LONG/SHORT as good/bad without context. The key also includes locked
+    hunter/start/anti-chase buckets so learning separates early starts from
+    late/chasing entries.
     """
     ind = dict(indicators or {})
     ctx = dict(market_context or {})
+    hunter = hunter_condition_features(
+        indicators=indicators,
+        structure=structure,
+        momentum=momentum,
+        liquidity=liquidity,
+        market_context=market_context,
+        metadata=metadata,
+    )
     parts = [
         market_symbol_key(symbol, direction, level),
         f"rsi:{condition_bucket(ind.get('rsi'))}",
@@ -129,6 +201,21 @@ def build_condition_key(
         f"atr:{condition_bucket(ind.get('atr_pct'), step=0.25)}",
         f"macd:{condition_bucket(ind.get('macd_hist'), step=0.0005)}",
         f"power:{condition_bucket(ind.get('buy_power'))}-{condition_bucket(ind.get('sell_power'))}",
+        f"start:{condition_bucket(hunter.get('start_score'))}",
+        f"chase:{condition_bucket(hunter.get('chase_risk_score'))}",
+        f"age:{condition_bucket(hunter.get('move_age_score'))}",
+        f"late:{condition_bucket(hunter.get('late_risk_score'))}",
+        f"fresh:{condition_bucket(hunter.get('fresh_momentum_score'))}",
+        f"exhaust:{condition_bucket(hunter.get('exhaustion_score'))}",
+        f"pressure:{condition_bucket(hunter.get('start_pressure_score'))}",
+        f"signals:{condition_bucket(hunter.get('start_signal_count'), step=1.0)}",
+        f"s_start:{bool_bucket(hunter.get('structure_start_active'))}",
+        f"m_start:{bool_bucket(hunter.get('momentum_start_active'))}",
+        f"l_start:{bool_bucket(hunter.get('liquidity_start_active'))}",
+        f"ctx_start:{bool_bucket(hunter.get('fresh_context_active'))}",
+        f"synergy:{condition_bucket(hunter.get('early_start_synergy'))}",
+        f"selector:{condition_bucket(hunter.get('selector_rank_score'))}",
+        f"selected:{bool_bucket(hunter.get('selector_selected_for_real'))}",
         f"market:{safe_str(ctx.get('market_mode'), 'UNKNOWN').upper()}",
         f"btc:{safe_str(ctx.get('btc_bias'), 'UNKNOWN').upper()}",
     ]
@@ -147,6 +234,15 @@ def learning_record_from_outcome(
     metadata: Optional[Mapping[str, Any]] = None,
 ) -> LearningRecord:
     """Create LearningRecord from closed/partial outcome."""
+    merged_metadata = {**dict(outcome.metadata or {}), **dict(metadata or {})}
+    hunter_features = hunter_condition_features(
+        indicators=indicators,
+        structure=structure,
+        momentum=momentum,
+        liquidity=liquidity,
+        market_context=market_context,
+        metadata=merged_metadata,
+    )
     return LearningRecord(
         record_id=make_event_id("learning"),
         symbol=outcome.symbol,
@@ -154,7 +250,7 @@ def learning_record_from_outcome(
         level=outcome.level,
         event=outcome.event,
         result=outcome_result_label(outcome.event),
-        indicators=dict(indicators or {}),
+        indicators={**dict(indicators or {}), **{k: v for k, v in hunter_features.items() if k not in dict(indicators or {})}},
         structure=dict(structure or {}),
         momentum=dict(momentum or {}),
         liquidity=dict(liquidity or {}),
@@ -164,7 +260,8 @@ def learning_record_from_outcome(
         mae_pct=outcome.mae_pct,
         pnl_usdt=outcome.pnl_usdt,
         metadata={
-            **dict(metadata or {}),
+            **merged_metadata,
+            "hunter_features": hunter_features,
             "mode": outcome.mode,
             "position_id": outcome.position_id,
             "pnl_confirmed": outcome.pnl_confirmed,
@@ -173,7 +270,11 @@ def learning_record_from_outcome(
                 direction=outcome.direction,
                 level=outcome.level,
                 indicators=indicators,
+                structure=structure,
+                momentum=momentum,
+                liquidity=liquidity,
                 market_context=market_context,
+                metadata=merged_metadata,
             ),
         },
     )
@@ -212,6 +313,7 @@ def learning_record_from_position(
                 direction=position.direction,
                 level=position.level,
                 indicators=indicators,
+                metadata=metadata,
             ),
         },
     )
@@ -538,6 +640,8 @@ __all__ = [
     "default_learning_payload",
     "outcome_result_label",
     "condition_bucket",
+    "bool_bucket",
+    "hunter_condition_features",
     "build_condition_key",
     "learning_record_from_outcome",
     "learning_record_from_position",
