@@ -23,7 +23,6 @@ from typing import Any, Callable, Mapping, Optional
 from constants import (
     DIRECTION_LONG,
     DIRECTION_SHORT,
-    EVENT_AI_EXIT,
     EVENT_MANUAL_CLOSE,
     EVENT_SL,
     EVENT_TP1,
@@ -45,7 +44,6 @@ from position_manager import (
     close_position_record,
     get_active_monitor_positions,
     get_position,
-    mark_ai_exit_done,
     mark_closing,
     mark_real_confirmed,
     mark_real_failed,
@@ -257,17 +255,6 @@ def _hunter_learning_metadata(position: TradePosition) -> dict[str, Any]:
     return data
 
 
-def _ai_exit_disabled_event(position: TradePosition, *, current_price: float, reason: str = EVENT_AI_EXIT) -> MonitorEvent:
-    """Return a non-closing event when legacy code asks for AI/profit exit."""
-    return make_monitor_event(
-        event="AI_EXIT_DISABLED",
-        position=position,
-        metadata={
-            "requested_reason": safe_str(reason, EVENT_AI_EXIT),
-            "current_price": current_price,
-            "policy": "profit_exit_removed_monitor_only_tp_sl",
-        },
-    )
 
 def make_outcome(
     position: TradePosition,
@@ -675,25 +662,6 @@ def handle_sl(position: TradePosition, *, current_price: float, close_executor: 
     return handle_ghost_close(position, event=EVENT_SL, current_price=current_price, quantity=qty)
 
 
-def handle_ai_exit(
-    position: TradePosition,
-    *,
-    current_price: float,
-    close_executor: Optional[CloseExecutor] = None,
-    reason: str = EVENT_AI_EXIT,
-) -> MonitorEvent:
-    """AI/profit exit is intentionally disabled.
-
-    The locked update removes automatic exit-in-profit behavior completely.
-    The monitor may close positions only through TP, SL, confirmed exchange-side
-    disappearance/recovery, or explicit manual/external close handling.
-    close_executor is accepted only for backward-compatible call signatures and
-    is not used here.
-    """
-    _ = close_executor
-    return _ai_exit_disabled_event(position, current_price=current_price, reason=reason)
-
-
 
 # =============================================================================
 # Exchange-side close recovery
@@ -1039,7 +1007,6 @@ __all__ = [
     "handle_tp1",
     "handle_tp2",
     "handle_sl",
-    "handle_ai_exit",
     "infer_external_close_event",
     "handle_real_exchange_disappeared",
     "check_real_exchange_closed",
