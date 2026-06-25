@@ -328,6 +328,256 @@ def score_weakness(sensor: SensorSnapshot, direction: str) -> tuple[float, list[
     return clamp(score, 0.0, 100.0), reasons
 
 
+def _directional_power_gap(sensor: SensorSnapshot, direction: str) -> float:
+    """Return buy/sell power gap in the requested direction."""
+    d = normalize_direction(direction)
+    buy = safe_float(sensor.buy_power, 50.0) or 50.0
+    sell = safe_float(sensor.sell_power, 50.0) or 50.0
+    if d == DIRECTION_LONG:
+        return buy - sell
+    if d == DIRECTION_SHORT:
+        return sell - buy
+    return 0.0
+
+
+def _directional_rsi_slope(sensor: SensorSnapshot, direction: str) -> float:
+    """Return RSI slope normalized so positive means aligned with direction."""
+    d = normalize_direction(direction)
+    value = safe_float(sensor.rsi_slope, 0.0) or 0.0
+    return value if d == DIRECTION_LONG else -value if d == DIRECTION_SHORT else 0.0
+
+
+def _directional_macd_slope(sensor: SensorSnapshot, direction: str) -> float:
+    """Return MACD histogram slope normalized so positive means aligned with direction."""
+    d = normalize_direction(direction)
+    value = safe_float(sensor.macd_hist_slope, 0.0) or 0.0
+    return value if d == DIRECTION_LONG else -value if d == DIRECTION_SHORT else 0.0
+
+
+def score_fresh_momentum(sensor: SensorSnapshot, direction: str) -> tuple[float, list[str]]:
+    """
+    Score whether momentum is fresh and still developing.
+
+    Higher score = better start/continuation quality for a Level 4 entry.
+    This is intentionally not a final decision; ai_brain/timing use it as context.
+    """
+    d = normalize_direction(direction)
+    score = 50.0
+    reasons: list[str] = []
+
+    rsi = safe_float(sensor.rsi, None)
+    rsi_dir_slope = _directional_rsi_slope(sensor, d)
+    macd_dir_slope = _directional_macd_slope(sensor, d)
+    power_gap = _directional_power_gap(sensor, d)
+    volume = safe_float(sensor.volume_ratio, None)
+    body = safe_float(sensor.candle_body_pct, 0.0) or 0.0
+
+    if rsi_dir_slope >= 0.20:
+        score += 14.0
+        reasons.append("FRESH_RSI_SLOPE_STRONG")
+    elif rsi_dir_slope >= 0.05:
+        score += 8.0
+        reasons.append("FRESH_RSI_SLOPE_OK")
+    else:
+        score -= 10.0
+        reasons.append("FRESH_RSI_SLOPE_WEAK")
+
+    if macd_dir_slope > 0:
+        score += 16.0
+        reasons.append("FRESH_MACD_ACCEL_OK")
+    else:
+        score -= 14.0
+        reasons.append("FRESH_MACD_ACCEL_WEAK")
+
+    if power_gap >= 12:
+        score += 14.0
+        reasons.append("FRESH_POWER_STRONG")
+    elif power_gap >= 4:
+        score += 8.0
+        reasons.append("FRESH_POWER_OK")
+    elif power_gap <= -6:
+        score -= 14.0
+        reasons.append("FRESH_POWER_AGAINST")
+    else:
+        score -= 4.0
+        reasons.append("FRESH_POWER_NEUTRAL")
+
+    if volume is not None:
+        if volume >= 1.20:
+            score += 8.0
+            reasons.append("FRESH_VOLUME_EXPANDING")
+        elif volume >= 0.85:
+            score += 3.0
+            reasons.append("FRESH_VOLUME_ACCEPTABLE")
+        else:
+            score -= 8.0
+            reasons.append("FRESH_VOLUME_WEAK")
+    else:
+        score -= 3.0
+        reasons.append("FRESH_VOLUME_MISSING")
+
+    if price_ema_alignment_ok(sensor, d):
+        score += 4.0
+        reasons.append("FRESH_EMA_ALIGNED")
+    else:
+        score -= 6.0
+        reasons.append("FRESH_EMA_NOT_ALIGNED")
+
+    if price_vwap_alignment_ok(sensor, d):
+        score += 3.0
+        reasons.append("FRESH_VWAP_ALIGNED")
+    else:
+        score -= 5.0
+        reasons.append("FRESH_VWAP_NOT_ALIGNED")
+
+    if body >= 0.55 and power_gap > 0 and macd_dir_slope > 0:
+        score += 4.0
+        reasons.append("FRESH_CANDLE_QUALITY_OK")
+
+    if rsi is not None:
+        if d == DIRECTION_LONG and rsi >= 74 and rsi_dir_slope <= 0.10:
+            score -= 16.0
+            reasons.append("FRESH_LONG_OVERHEATED_FADING")
+        elif d == DIRECTION_SHORT and rsi <= 26 and rsi_dir_slope <= 0.10:
+            score -= 16.0
+            reasons.append("FRESH_SHORT_OVERHEATED_FADING")
+
+    return clamp(score, 0.0, 100.0), reasons
+
+
+def score_exhaustion(sensor: SensorSnapshot, direction: str) -> tuple[float, list[str]]:
+    """
+    Score exhaustion/chase risk in the requested direction.
+
+    Higher score = more risk that the bot is entering after the move is consumed.
+    """
+    d = normalize_direction(direction)
+    score = 0.0
+    reasons: list[str] = []
+
+    rsi = safe_float(sensor.rsi, None)
+    rsi_dir_slope = _directional_rsi_slope(sensor, d)
+    macd_dir_slope = _directional_macd_slope(sensor, d)
+    power_gap = _directional_power_gap(sensor, d)
+    volume = safe_float(sensor.volume_ratio, None)
+    body = safe_float(sensor.candle_body_pct, 0.0) or 0.0
+    upper_wick = safe_float(sensor.upper_wick_pct, 0.0) or 0.0
+    lower_wick = safe_float(sensor.lower_wick_pct, 0.0) or 0.0
+
+    if rsi is not None:
+        if d == DIRECTION_LONG and rsi >= 74:
+            score += 18.0
+            reasons.append("EXH_LONG_RSI_OVERHEATED")
+        elif d == DIRECTION_SHORT and rsi <= 26:
+            score += 18.0
+            reasons.append("EXH_SHORT_RSI_OVERHEATED")
+
+    if rsi_dir_slope < 0:
+        score += 16.0
+        reasons.append("EXH_RSI_SLOPE_FADING")
+    elif rsi_dir_slope < 0.05:
+        score += 8.0
+        reasons.append("EXH_RSI_SLOPE_FLAT")
+
+    if macd_dir_slope <= 0:
+        score += 22.0
+        reasons.append("EXH_MACD_FADING")
+
+    if power_gap <= -6:
+        score += 18.0
+        reasons.append("EXH_POWER_REVERSING")
+    elif power_gap < 3:
+        score += 8.0
+        reasons.append("EXH_POWER_NOT_CONFIRMED")
+
+    if volume is not None and volume < 0.75:
+        score += 8.0
+        reasons.append("EXH_VOLUME_DRY")
+
+    if not price_ema_alignment_ok(sensor, d):
+        score += 10.0
+        reasons.append("EXH_EMA_LOST")
+    if not price_vwap_alignment_ok(sensor, d):
+        score += 8.0
+        reasons.append("EXH_VWAP_LOST")
+
+    if d == DIRECTION_LONG and upper_wick >= 0.45:
+        score += 10.0
+        reasons.append("EXH_UPPER_WICK_REJECTION")
+    elif d == DIRECTION_SHORT and lower_wick >= 0.45:
+        score += 10.0
+        reasons.append("EXH_LOWER_WICK_REJECTION")
+
+    if body <= 0.25 and (rsi_dir_slope < 0.05 or macd_dir_slope <= 0):
+        score += 6.0
+        reasons.append("EXH_WEAK_CANDLE_BODY")
+
+    if not reasons:
+        reasons.append("EXH_NORMAL")
+
+    return clamp(score, 0.0, 100.0), reasons
+
+
+def calculate_chase_pressure(
+    *,
+    weakness_score: float,
+    exhaustion_score: float,
+    fresh_momentum_score: float,
+) -> float:
+    """
+    Calculate late/chase pressure.
+
+    Higher score = the move is more likely already consumed.
+    This does not decide REAL/GHOST; it only weakens momentum quality.
+    """
+    weakness = safe_float(weakness_score, 0.0) or 0.0
+    exhaustion = safe_float(exhaustion_score, 0.0) or 0.0
+    fresh = safe_float(fresh_momentum_score, 50.0) or 50.0
+
+    pressure = (
+        exhaustion * 0.52
+        + weakness * 0.30
+        + max(0.0, 55.0 - fresh) * 0.38
+    )
+    return clamp(pressure, 0.0, 100.0)
+
+
+def apply_chase_pressure_to_component(component_score: float, chase_pressure: float, strength: float) -> float:
+    """
+    Reduce an individual momentum component when chase/late pressure is high.
+
+    strength controls how sensitive that component is to late-entry risk.
+    """
+    base = safe_float(component_score, 50.0) or 50.0
+    pressure = safe_float(chase_pressure, 0.0) or 0.0
+    penalty = max(0.0, pressure - 35.0) * strength
+    return clamp(base - penalty, 0.0, 100.0)
+
+
+def cap_late_momentum_score(score: float, chase_pressure: float, exhaustion_score: float) -> float:
+    """
+    Cap momentum/continuation when move is clearly late or exhausted.
+
+    This prevents strong old RSI/MACD/Power readings from keeping a consumed
+    move attractive for Level 4 entries.
+    """
+    value = safe_float(score, 0.0) or 0.0
+    chase = safe_float(chase_pressure, 0.0) or 0.0
+    exhaustion = safe_float(exhaustion_score, 0.0) or 0.0
+
+    cap = 100.0
+    if exhaustion >= 75 or chase >= 75:
+        cap = 48.0
+    elif exhaustion >= 65 or chase >= 65:
+        cap = 55.0
+    elif exhaustion >= 55 or chase >= 55:
+        cap = 64.0
+    elif exhaustion >= 45 or chase >= 45:
+        cap = 72.0
+
+    return clamp(min(value, cap), 0.0, 100.0)
+
+
 # =============================================================================
 # Combined momentum snapshot
 # =============================================================================
@@ -361,6 +611,18 @@ def build_momentum_snapshot(sensor: SensorSnapshot, direction: str) -> MomentumS
     ema_vwap_score, ema_vwap_reasons = score_ema_vwap(sensor, d)
     acceleration_score, acceleration_reasons = score_acceleration(sensor, d)
     weakness_score, weakness_reasons = score_weakness(sensor, d)
+    fresh_momentum_score, fresh_reasons = score_fresh_momentum(sensor, d)
+    exhaustion_score, exhaustion_reasons = score_exhaustion(sensor, d)
+
+    chase_pressure = calculate_chase_pressure(
+        weakness_score=weakness_score,
+        exhaustion_score=exhaustion_score,
+        fresh_momentum_score=fresh_momentum_score,
+    )
+
+    adjusted_macd_score = apply_chase_pressure_to_component(macd_score, chase_pressure, strength=0.34)
+    adjusted_power_score = apply_chase_pressure_to_component(power_score, chase_pressure, strength=0.28)
+    adjusted_acceleration_score = apply_chase_pressure_to_component(acceleration_score, chase_pressure, strength=0.38)
 
     reason_codes.extend(rsi_reasons)
     reason_codes.extend(macd_reasons)
@@ -368,6 +630,8 @@ def build_momentum_snapshot(sensor: SensorSnapshot, direction: str) -> MomentumS
     reason_codes.extend(volume_reasons)
     reason_codes.extend(ema_vwap_reasons)
     reason_codes.extend(acceleration_reasons)
+    reason_codes.extend(fresh_reasons)
+    reason_codes.extend(exhaustion_reasons)
 
     if weakness_score >= 60:
         reason_codes.append("WEAKNESS_HIGH")
@@ -376,23 +640,71 @@ def build_momentum_snapshot(sensor: SensorSnapshot, direction: str) -> MomentumS
     else:
         reason_codes.append("WEAKNESS_LOW")
 
+    if fresh_momentum_score >= 65:
+        reason_codes.append("FRESH_MOMENTUM_HIGH")
+    elif fresh_momentum_score <= 42:
+        reason_codes.append("FRESH_MOMENTUM_LOW")
+    else:
+        reason_codes.append("FRESH_MOMENTUM_MEDIUM")
+
+    if exhaustion_score >= 60:
+        reason_codes.append("EXHAUSTION_HIGH")
+    elif exhaustion_score >= 40:
+        reason_codes.append("EXHAUSTION_MEDIUM")
+    else:
+        reason_codes.append("EXHAUSTION_LOW")
+
+    if chase_pressure >= 70:
+        reason_codes.append("CHASE_PRESSURE_HIGH")
+    elif chase_pressure >= 52:
+        reason_codes.append("CHASE_PRESSURE_MEDIUM")
+    else:
+        reason_codes.append("CHASE_PRESSURE_LOW")
+
     continuation_score = combine_momentum_score([
-        macd_score,
-        power_score,
+        adjusted_macd_score,
+        adjusted_power_score,
         volume_score,
         ema_vwap_score,
     ])
+    continuation_score = clamp(
+        continuation_score
+        + max(0.0, fresh_momentum_score - 55.0) * 0.16
+        - max(0.0, exhaustion_score - 42.0) * 0.32
+        - max(0.0, weakness_score - 48.0) * 0.16
+        - max(0.0, chase_pressure - 45.0) * 0.24,
+        0.0,
+        100.0,
+    )
+    continuation_score = cap_late_momentum_score(continuation_score, chase_pressure, exhaustion_score)
 
-    momentum_score = combine_momentum_score([
+    base_momentum_score = combine_momentum_score([
         rsi_score,
-        macd_score,
-        power_score,
+        adjusted_macd_score,
+        adjusted_power_score,
         volume_score,
         ema_vwap_score,
-        acceleration_score,
+        adjusted_acceleration_score,
     ])
 
-    reversal_risk_score = weakness_score
+    momentum_score = clamp(
+        base_momentum_score
+        + max(0.0, fresh_momentum_score - 55.0) * 0.20
+        - max(0.0, exhaustion_score - 42.0) * 0.38
+        - max(0.0, weakness_score - 52.0) * 0.22
+        - max(0.0, chase_pressure - 45.0) * 0.28,
+        0.0,
+        100.0,
+    )
+    momentum_score = cap_late_momentum_score(momentum_score, chase_pressure, exhaustion_score)
+
+    reversal_risk_score = clamp(
+        weakness_score * 0.58
+        + exhaustion_score * 0.28
+        + chase_pressure * 0.14,
+        0.0,
+        100.0,
+    )
 
     return MomentumSnapshot(
         symbol=sensor.symbol,
@@ -400,7 +712,7 @@ def build_momentum_snapshot(sensor: SensorSnapshot, direction: str) -> MomentumS
         momentum_score=momentum_score,
         continuation_score=continuation_score,
         reversal_risk_score=reversal_risk_score,
-        acceleration_score=acceleration_score,
+        acceleration_score=adjusted_acceleration_score,
         weakness_score=weakness_score,
         rsi_slope_ok=rsi_slope_ok(sensor, d),
         macd_hist_slope_ok=macd_hist_slope_ok(sensor, d),
@@ -413,7 +725,20 @@ def build_momentum_snapshot(sensor: SensorSnapshot, direction: str) -> MomentumS
             "power_score": power_score,
             "volume_score": volume_score,
             "ema_vwap_score": ema_vwap_score,
+            "acceleration_score": acceleration_score,
+            "adjusted_macd_score": adjusted_macd_score,
+            "adjusted_power_score": adjusted_power_score,
+            "adjusted_acceleration_score": adjusted_acceleration_score,
+            "base_momentum_score": base_momentum_score,
+            "fresh_momentum_score": fresh_momentum_score,
+            "exhaustion_score": exhaustion_score,
+            "chase_pressure": chase_pressure,
+            "fresh_reasons": fresh_reasons,
+            "exhaustion_reasons": exhaustion_reasons,
             "weakness_reasons": weakness_reasons,
+            "directional_power_gap": _directional_power_gap(sensor, d),
+            "directional_rsi_slope": _directional_rsi_slope(sensor, d),
+            "directional_macd_slope": _directional_macd_slope(sensor, d),
             "sensor_created_at": sensor.created_at,
         },
     )
@@ -465,6 +790,11 @@ __all__ = [
     "score_ema_vwap",
     "score_acceleration",
     "score_weakness",
+    "score_fresh_momentum",
+    "score_exhaustion",
+    "calculate_chase_pressure",
+    "apply_chase_pressure_to_component",
+    "cap_late_momentum_score",
     "combine_momentum_score",
     "build_momentum_snapshot",
     "build_momentum_snapshot_from_market",
