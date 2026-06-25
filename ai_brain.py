@@ -40,33 +40,77 @@ AI_BRAIN_VERSION: str = SYSTEM_VERSION
 
 
 DEFAULT_AI_CONFIG: dict[str, Any] = {
-    "real_min_score": 76.0,
-    "real_min_confidence": 70.0,
+    # Level 4 / 1H Smart Scalp should prefer fewer but cleaner REAL entries.
+    "real_min_score": 78.0,
+    "real_min_confidence": 72.0,
     "ghost_min_score": 55.0,
     "reject_below_score": 45.0,
-    "max_trap_risk_for_real": 62.0,
-    "max_reversal_probability_for_real": 58.0,
-    "max_late_risk_for_real": 62.0,
-    "min_timing_score_for_real": 58.0,
-    "min_structure_score_for_real": 55.0,
-    "min_momentum_score_for_real": 58.0,
+    "max_trap_risk_for_real": 58.0,
+    "max_reversal_probability_for_real": 55.0,
+    "max_late_risk_for_real": 55.0,
+    "min_timing_score_for_real": 62.0,
+    "min_structure_score_for_real": 58.0,
+    "min_momentum_score_for_real": 60.0,
     "min_context_score_for_real": 38.0,
+    "max_exhaustion_for_real": 58.0,
+    "min_fresh_momentum_for_real": 45.0,
+    "max_weakness_for_real": 58.0,
+    "min_continuation_probability_for_real": 48.0,
     "tp_sl_required_for_real": True,
     "soft_ghost_when_trade_off": True,
 }
 
 
+# =============================================================================
+# Safe numeric helpers
+# =============================================================================
+
+def _num(value: Any, default: float = 0.0) -> float:
+    """Return safe float while preserving a valid real 0.0.
+
+    Important: never use `safe_float(... ) or default` for decision values here.
+    A real 0.0 reversal/late/fresh value must remain 0.0, not become 50.0.
+    """
+    parsed = safe_float(value, None)
+    if parsed is None:
+        return float(default)
+    return float(parsed)
+
+
 def _ai_config() -> Mapping[str, Any]:
     """Return AI config from constants if available, otherwise safe fallback."""
-    return getattr(constants, "AI_DECISION_CONFIG", DEFAULT_AI_CONFIG)
+    config = getattr(constants, "AI_DECISION_CONFIG", DEFAULT_AI_CONFIG)
+    return config if isinstance(config, Mapping) else DEFAULT_AI_CONFIG
 
 
 def _cfg_float(key: str, default: float) -> float:
-    return safe_float(_ai_config().get(key), default) or default
+    return _num(_ai_config().get(key), default)
 
 
 def _cfg_bool(key: str, default: bool) -> bool:
     return safe_bool(_ai_config().get(key), default)
+
+
+def _mapping_value(data: Optional[Mapping[str, Any]], key: str, default: float = 0.0) -> float:
+    if not isinstance(data, Mapping):
+        return float(default)
+    return _num(data.get(key), default)
+
+
+def _raw_mapping_value(data: Optional[Mapping[str, Any]], key: str, default: float = 0.0) -> float:
+    if not isinstance(data, Mapping):
+        return float(default)
+    raw = data.get("raw")
+    if not isinstance(raw, Mapping):
+        return float(default)
+    return _num(raw.get(key), default)
+
+
+def _momentum_raw_value(momentum: MomentumSnapshot, key: str, default: float = 0.0) -> float:
+    raw = getattr(momentum, "raw", None)
+    if not isinstance(raw, Mapping):
+        return float(default)
+    return _num(raw.get(key), default)
 
 
 # =============================================================================
@@ -78,7 +122,7 @@ def direction_valid(direction: str) -> bool:
 
 
 def score_structure(structure: StructureSnapshot) -> tuple[float, list[str]]:
-    score = safe_float(structure.structure_score, 0.0) or 0.0
+    score = _num(structure.structure_score, 0.0)
     reasons: list[str] = []
     if score >= 70:
         reasons.append("AI_STRUCTURE_STRONG")
@@ -94,7 +138,7 @@ def score_structure(structure: StructureSnapshot) -> tuple[float, list[str]]:
 
 
 def score_momentum(momentum: MomentumSnapshot) -> tuple[float, list[str]]:
-    score = safe_float(momentum.momentum_score, 0.0) or 0.0
+    score = _num(momentum.momentum_score, 0.0)
     reasons: list[str] = []
     if score >= 72:
         reasons.append("AI_MOMENTUM_STRONG")
@@ -102,14 +146,26 @@ def score_momentum(momentum: MomentumSnapshot) -> tuple[float, list[str]]:
         reasons.append("AI_MOMENTUM_OK")
     else:
         reasons.append("AI_MOMENTUM_WEAK")
-    if safe_float(momentum.weakness_score, 0.0) >= 60:
+
+    weakness = _num(momentum.weakness_score, 0.0)
+    fresh = _momentum_raw_value(momentum, "fresh_momentum_score", 50.0)
+    exhaustion = _momentum_raw_value(momentum, "exhaustion_score", 0.0)
+
+    if weakness >= 60:
         reasons.append("AI_MOMENTUM_WEAKNESS_VISIBLE")
+    if fresh <= 42:
+        reasons.append("AI_FRESH_MOMENTUM_WEAK")
+    elif fresh >= 65:
+        reasons.append("AI_FRESH_MOMENTUM_OK")
+    if exhaustion >= 60:
+        reasons.append("AI_MOMENTUM_EXHAUSTED")
+
     return clamp(score, 0.0, 100.0), reasons
 
 
 def score_liquidity(liquidity: LiquiditySnapshot) -> tuple[float, list[str]]:
-    trap = safe_float(liquidity.trap_risk_score, 0.0) or 0.0
-    survival = safe_float(liquidity.breakout_survival_score, 50.0) or 50.0
+    trap = _num(liquidity.trap_risk_score, 0.0)
+    survival = _num(liquidity.breakout_survival_score, 50.0)
     score = (100.0 - trap) * 0.65 + survival * 0.35
     reasons: list[str] = []
     if trap >= 70 or liquidity.likely_trap:
@@ -124,7 +180,7 @@ def score_liquidity(liquidity: LiquiditySnapshot) -> tuple[float, list[str]]:
 
 
 def score_context(context: MarketContextSnapshot) -> tuple[float, list[str]]:
-    score = safe_float(context.context_score, 50.0) or 50.0
+    score = _num(context.context_score, 50.0)
     reasons: list[str] = []
     if context.aligned_with_direction:
         reasons.append("AI_CONTEXT_ALIGNED")
@@ -142,9 +198,9 @@ def score_reversal(reversal_snapshot: Optional[Mapping[str, Any]]) -> tuple[floa
     if not reversal_snapshot:
         return 55.0, ["AI_REVERSAL_MISSING"]
 
-    reversal_prob = safe_float(reversal_snapshot.get("reversal_probability"), 50.0) or 50.0
-    exhaustion_prob = safe_float(reversal_snapshot.get("exhaustion_probability"), 50.0) or 50.0
-    continuation_prob = safe_float(reversal_snapshot.get("continuation_probability"), 50.0) or 50.0
+    reversal_prob = _mapping_value(reversal_snapshot, "reversal_probability", 50.0)
+    exhaustion_prob = _mapping_value(reversal_snapshot, "exhaustion_probability", 50.0)
+    continuation_prob = _mapping_value(reversal_snapshot, "continuation_probability", 50.0)
 
     risk = reversal_prob * 0.60 + exhaustion_prob * 0.25 + max(0.0, 50.0 - continuation_prob) * 0.15
     score = 100.0 - risk
@@ -159,6 +215,11 @@ def score_reversal(reversal_snapshot: Optional[Mapping[str, Any]]) -> tuple[floa
 
     if exhaustion_prob >= 70:
         reasons.append("AI_EXHAUSTION_HIGH")
+    elif exhaustion_prob >= 55:
+        reasons.append("AI_EXHAUSTION_MEDIUM")
+
+    if continuation_prob < 45:
+        reasons.append("AI_CONTINUATION_WEAK")
 
     return clamp(score, 0.0, 100.0), reasons
 
@@ -167,9 +228,12 @@ def score_timing(timing_snapshot: Optional[Mapping[str, Any]]) -> tuple[float, l
     if not timing_snapshot:
         return 55.0, ["AI_TIMING_MISSING"]
 
-    score = safe_float(timing_snapshot.get("timing_score"), 50.0) or 50.0
+    score = _mapping_value(timing_snapshot, "timing_score", 50.0)
     quality = safe_str(timing_snapshot.get("entry_quality")).upper()
     wait = bool(timing_snapshot.get("wait_for_better_entry"))
+    late = _mapping_value(timing_snapshot, "late_risk_score", 0.0)
+    fresh = _raw_mapping_value(timing_snapshot, "fresh_momentum_score", 50.0)
+    exhaustion = _raw_mapping_value(timing_snapshot, "exhaustion_score", 0.0)
 
     reasons: list[str] = []
     if quality in {"EXCELLENT", "GOOD"}:
@@ -181,6 +245,12 @@ def score_timing(timing_snapshot: Optional[Mapping[str, Any]]) -> tuple[float, l
 
     if wait:
         reasons.append("AI_TIMING_WAIT_SUGGESTED")
+    if late >= 55:
+        reasons.append("AI_TIMING_LATE_RISK")
+    if fresh <= 42:
+        reasons.append("AI_TIMING_FRESH_WEAK")
+    if exhaustion >= 58:
+        reasons.append("AI_TIMING_EXHAUSTED")
 
     return clamp(score, 0.0, 100.0), reasons
 
@@ -194,8 +264,8 @@ def score_tp_sl(plan: Optional[TPSLPlan], quantity: float = 0.0) -> tuple[float,
         return 25.0, ["AI_TP_SL_INVALID", *errors]
 
     score = 55.0
-    rr = safe_float(plan.rr, 0.0) or 0.0
-    net = safe_float(plan.tp1_net_profit_estimate, 0.0) or 0.0
+    rr = _num(plan.rr, 0.0)
+    net = _num(plan.tp1_net_profit_estimate, 0.0)
 
     if rr >= 1.1:
         score += 18.0
@@ -217,7 +287,7 @@ def score_tp_sl(plan: Optional[TPSLPlan], quantity: float = 0.0) -> tuple[float,
 
 
 def combine_final_score(parts: Mapping[str, float]) -> float:
-    """Weighted final score."""
+    """Weighted final score for Level 4 quality, not raw signal frequency."""
     weights = {
         "structure": 0.17,
         "momentum": 0.20,
@@ -230,7 +300,7 @@ def combine_final_score(parts: Mapping[str, float]) -> float:
     total = 0.0
     wsum = 0.0
     for key, weight in weights.items():
-        total += (safe_float(parts.get(key), 0.0) or 0.0) * weight
+        total += _num(parts.get(key), 0.0) * weight
         wsum += weight
     if wsum <= 0:
         return 0.0
@@ -238,12 +308,8 @@ def combine_final_score(parts: Mapping[str, float]) -> float:
 
 
 def confidence_from_score(score: float, parts: Mapping[str, float]) -> float:
-    """
-    Estimate confidence from score and consistency.
-
-    If components are highly inconsistent, confidence is reduced.
-    """
-    values = [safe_float(v, 0.0) or 0.0 for v in parts.values()]
+    """Estimate confidence from final score and component consistency."""
+    values = [_num(v, 0.0) for v in parts.values()]
     if not values:
         return 0.0
 
@@ -251,8 +317,68 @@ def confidence_from_score(score: float, parts: Mapping[str, float]) -> float:
     variance = sum((v - mean) ** 2 for v in values) / len(values)
     spread_penalty = min(18.0, variance ** 0.5 * 0.35)
 
-    confidence = (safe_float(score, 0.0) or 0.0) - spread_penalty
+    confidence = _num(score, 0.0) - spread_penalty
     return clamp(confidence, 0.0, 100.0)
+
+
+def adjusted_score_for_entry_quality(
+    *,
+    final_score: float,
+    liquidity: LiquiditySnapshot,
+    reversal_snapshot: Optional[Mapping[str, Any]],
+    timing_snapshot: Optional[Mapping[str, Any]],
+    momentum: MomentumSnapshot,
+) -> tuple[float, list[str]]:
+    """Apply soft score penalties for late/chasing/reversal conditions.
+
+    This does not make the final mode directly; it prevents late pump-chasing from
+    retaining a high final score just because older structure/context still look good.
+    """
+    score = _num(final_score, 0.0)
+    reasons: list[str] = []
+
+    trap = _num(liquidity.trap_risk_score, 0.0)
+    rev = _mapping_value(reversal_snapshot, "reversal_probability", 0.0)
+    rev_exhaustion = _mapping_value(reversal_snapshot, "exhaustion_probability", 0.0)
+    continuation = _mapping_value(reversal_snapshot, "continuation_probability", 50.0)
+    late = _mapping_value(timing_snapshot, "late_risk_score", 0.0)
+    wait = bool(timing_snapshot.get("wait_for_better_entry")) if isinstance(timing_snapshot, Mapping) else False
+    timing_quality = safe_str(timing_snapshot.get("entry_quality") if isinstance(timing_snapshot, Mapping) else "").upper()
+    timing_exhaustion = _raw_mapping_value(timing_snapshot, "exhaustion_score", 0.0)
+    timing_fresh = _raw_mapping_value(timing_snapshot, "fresh_momentum_score", 50.0)
+    weakness = _num(momentum.weakness_score, 0.0)
+    momentum_exhaustion = _momentum_raw_value(momentum, "exhaustion_score", timing_exhaustion)
+    fresh = min(timing_fresh, _momentum_raw_value(momentum, "fresh_momentum_score", timing_fresh))
+
+    if wait:
+        score -= 10.0
+        reasons.append("SCORE_PENALTY_WAIT_FOR_BETTER_ENTRY")
+    if timing_quality in {"WEAK", "BAD"}:
+        score -= 8.0
+        reasons.append("SCORE_PENALTY_WEAK_TIMING")
+    if late >= 55:
+        score -= (late - 50.0) * 0.22
+        reasons.append("SCORE_PENALTY_LATE_ENTRY")
+    if max(timing_exhaustion, momentum_exhaustion, rev_exhaustion) >= 55:
+        score -= (max(timing_exhaustion, momentum_exhaustion, rev_exhaustion) - 50.0) * 0.18
+        reasons.append("SCORE_PENALTY_EXHAUSTION")
+    if rev >= 55:
+        score -= (rev - 50.0) * 0.16
+        reasons.append("SCORE_PENALTY_REVERSAL")
+    if continuation < 45:
+        score -= (45.0 - continuation) * 0.18
+        reasons.append("SCORE_PENALTY_CONTINUATION_WEAK")
+    if weakness >= 58:
+        score -= (weakness - 52.0) * 0.16
+        reasons.append("SCORE_PENALTY_WEAKNESS")
+    if trap >= 58:
+        score -= (trap - 52.0) * 0.14
+        reasons.append("SCORE_PENALTY_TRAP")
+    if fresh <= 42 and late >= 45:
+        score -= 9.0
+        reasons.append("SCORE_PENALTY_NOT_FRESH_AND_LATE")
+
+    return clamp(score, 0.0, 100.0), reasons
 
 
 # =============================================================================
@@ -276,30 +402,114 @@ def hard_reject_reasons(
     if not direction_valid(direction):
         reasons.append("INVALID_DIRECTION")
 
+    # No TP/SL plan means this opportunity cannot be managed safely.
     if tp_sl is None:
         reasons.append("TP_SL_MISSING")
-    elif _cfg_bool("tp_sl_required_for_real", True):
-        if not tp_sl.valid:
-            reasons.append("TP_SL_INVALID")
+    elif _cfg_bool("tp_sl_required_for_real", True) and not tp_sl.valid:
+        reasons.append("TP_SL_INVALID")
 
-    if safe_float(liquidity.trap_risk_score, 0.0) >= 82:
+    if _num(liquidity.trap_risk_score, 0.0) >= 82:
         reasons.append("EXTREME_TRAP_RISK")
 
-    if liquidity.likely_trap and safe_float(liquidity.fake_break_risk, 0.0) >= 75:
+    if liquidity.likely_trap and _num(liquidity.fake_break_risk, 0.0) >= 75:
         reasons.append("LIKELY_FAKE_BREAK_TRAP")
 
     if reversal_snapshot:
-        if safe_float(reversal_snapshot.get("reversal_probability"), 0.0) >= 82:
+        if _mapping_value(reversal_snapshot, "reversal_probability", 0.0) >= 82:
             reasons.append("EXTREME_REVERSAL_PROBABILITY")
+        if _mapping_value(reversal_snapshot, "exhaustion_probability", 0.0) >= 85:
+            reasons.append("EXTREME_EXHAUSTION_PROBABILITY")
 
     if timing_snapshot:
-        if safe_float(timing_snapshot.get("late_risk_score"), 0.0) >= 85:
+        if _mapping_value(timing_snapshot, "late_risk_score", 0.0) >= 85:
             reasons.append("EXTREME_LATE_ENTRY_RISK")
+        if bool(timing_snapshot.get("wait_for_better_entry")) and _mapping_value(timing_snapshot, "late_risk_score", 0.0) >= 75:
+            reasons.append("WAIT_AND_VERY_LATE_ENTRY")
 
-    if safe_float(momentum.momentum_score, 0.0) < 35 and safe_float(structure.structure_score, 0.0) < 40:
+    if _num(momentum.momentum_score, 0.0) < 35 and _num(structure.structure_score, 0.0) < 40:
         reasons.append("STRUCTURE_AND_MOMENTUM_TOO_WEAK")
 
     return reasons
+
+
+def _real_quality_block_reasons(
+    *,
+    liquidity: LiquiditySnapshot,
+    reversal_snapshot: Optional[Mapping[str, Any]],
+    timing_snapshot: Optional[Mapping[str, Any]],
+    structure: StructureSnapshot,
+    momentum: MomentumSnapshot,
+    context: MarketContextSnapshot,
+) -> list[str]:
+    """Reasons that block REAL but still allow GHOST learning when score is enough."""
+    reasons: list[str] = []
+
+    trap = _num(liquidity.trap_risk_score, 0.0)
+    rev = _mapping_value(reversal_snapshot, "reversal_probability", 0.0)
+    rev_exhaustion = _mapping_value(reversal_snapshot, "exhaustion_probability", 0.0)
+    continuation = _mapping_value(reversal_snapshot, "continuation_probability", 50.0)
+
+    timing_score = _mapping_value(timing_snapshot, "timing_score", 50.0)
+    late = _mapping_value(timing_snapshot, "late_risk_score", 0.0)
+    wait = bool(timing_snapshot.get("wait_for_better_entry")) if isinstance(timing_snapshot, Mapping) else False
+    quality = safe_str(timing_snapshot.get("entry_quality") if isinstance(timing_snapshot, Mapping) else "").upper()
+    timing_fresh = _raw_mapping_value(timing_snapshot, "fresh_momentum_score", 50.0)
+    timing_exhaustion = _raw_mapping_value(timing_snapshot, "exhaustion_score", 0.0)
+    move_age = _raw_mapping_value(timing_snapshot, "move_age_score", 50.0)
+
+    fresh = min(timing_fresh, _momentum_raw_value(momentum, "fresh_momentum_score", timing_fresh))
+    exhaustion = max(timing_exhaustion, _momentum_raw_value(momentum, "exhaustion_score", timing_exhaustion), rev_exhaustion)
+    weakness = _num(momentum.weakness_score, 0.0)
+
+    if trap > _cfg_float("max_trap_risk_for_real", 58.0):
+        reasons.append("REAL_BLOCK_TRAP_RISK")
+    if rev > _cfg_float("max_reversal_probability_for_real", 55.0):
+        reasons.append("REAL_BLOCK_REVERSAL_RISK")
+    if late > _cfg_float("max_late_risk_for_real", 55.0):
+        reasons.append("REAL_BLOCK_LATE_RISK")
+    if timing_score < _cfg_float("min_timing_score_for_real", 62.0):
+        reasons.append("REAL_BLOCK_TIMING_LOW")
+    if _num(structure.structure_score, 0.0) < _cfg_float("min_structure_score_for_real", 58.0):
+        reasons.append("REAL_BLOCK_STRUCTURE_LOW")
+    if _num(momentum.momentum_score, 0.0) < _cfg_float("min_momentum_score_for_real", 60.0):
+        reasons.append("REAL_BLOCK_MOMENTUM_LOW")
+    if _num(context.context_score, 50.0) < _cfg_float("min_context_score_for_real", 38.0):
+        reasons.append("REAL_BLOCK_CONTEXT_LOW")
+    if wait:
+        reasons.append("REAL_BLOCK_WAIT_FOR_BETTER_ENTRY")
+    if quality in {"WEAK", "BAD"}:
+        reasons.append("REAL_BLOCK_WEAK_TIMING_QUALITY")
+    if exhaustion > _cfg_float("max_exhaustion_for_real", 58.0):
+        reasons.append("REAL_BLOCK_EXHAUSTION")
+    if fresh < _cfg_float("min_fresh_momentum_for_real", 45.0) and late >= 40:
+        reasons.append("REAL_BLOCK_NOT_FRESH")
+    if weakness > _cfg_float("max_weakness_for_real", 58.0):
+        reasons.append("REAL_BLOCK_WEAKNESS")
+    if continuation < _cfg_float("min_continuation_probability_for_real", 48.0):
+        reasons.append("REAL_BLOCK_CONTINUATION_LOW")
+
+    # Anti-chase rule: do not REAL a direction after the move is already consumed.
+    if structure.is_late_move and (late >= 45 or exhaustion >= 50 or fresh <= 50):
+        reasons.append("REAL_BLOCK_STRUCTURE_LATE_CHASE")
+    if move_age >= 70 and (late >= 45 or exhaustion >= 50):
+        reasons.append("REAL_BLOCK_MOVE_AGE_LATE")
+    if late >= 50 and exhaustion >= 50:
+        reasons.append("REAL_BLOCK_LATE_AND_EXHAUSTED")
+    if late >= 45 and weakness >= 55:
+        reasons.append("REAL_BLOCK_LATE_WITH_WEAKNESS")
+    if rev >= 50 and continuation < 45:
+        reasons.append("REAL_BLOCK_REVERSAL_OVER_CONTINUATION")
+    if liquidity.likely_trap and trap >= 50:
+        reasons.append("REAL_BLOCK_LIKELY_TRAP")
+
+    # De-duplicate while preserving order.
+    seen: set[str] = set()
+    out: list[str] = []
+    for reason in reasons:
+        if reason not in seen:
+            out.append(reason)
+            seen.add(reason)
+    return out
 
 
 def choose_mode(
@@ -316,49 +526,28 @@ def choose_mode(
     trade_state: Optional[Mapping[str, Any]] = None,
 ) -> tuple[str, list[str]]:
     """Choose REAL/GHOST/REJECT before trade-off downgrade."""
-    reasons: list[str] = []
-
     if hard_rejects:
         return MODE_REJECT, hard_rejects
 
-    real_min_score = _cfg_float("real_min_score", 76.0)
-    real_min_conf = _cfg_float("real_min_confidence", 70.0)
+    real_min_score = _cfg_float("real_min_score", 78.0)
+    real_min_conf = _cfg_float("real_min_confidence", 72.0)
     ghost_min_score = _cfg_float("ghost_min_score", 55.0)
 
-    trap = safe_float(liquidity.trap_risk_score, 0.0) or 0.0
-    rev = safe_float((reversal_snapshot or {}).get("reversal_probability"), 0.0) or 0.0
-    timing_score = safe_float((timing_snapshot or {}).get("timing_score"), 50.0) or 50.0
-    late = safe_float((timing_snapshot or {}).get("late_risk_score"), 0.0) or 0.0
+    real_blocks = _real_quality_block_reasons(
+        liquidity=liquidity,
+        reversal_snapshot=reversal_snapshot,
+        timing_snapshot=timing_snapshot,
+        structure=structure,
+        momentum=momentum,
+        context=context,
+    )
 
-    real_allowed = True
-    if trap > _cfg_float("max_trap_risk_for_real", 62.0):
-        real_allowed = False
-        reasons.append("REAL_BLOCK_TRAP_RISK")
-    if rev > _cfg_float("max_reversal_probability_for_real", 58.0):
-        real_allowed = False
-        reasons.append("REAL_BLOCK_REVERSAL_RISK")
-    if late > _cfg_float("max_late_risk_for_real", 62.0):
-        real_allowed = False
-        reasons.append("REAL_BLOCK_LATE_RISK")
-    if timing_score < _cfg_float("min_timing_score_for_real", 58.0):
-        real_allowed = False
-        reasons.append("REAL_BLOCK_TIMING_LOW")
-    if safe_float(structure.structure_score, 0.0) < _cfg_float("min_structure_score_for_real", 55.0):
-        real_allowed = False
-        reasons.append("REAL_BLOCK_STRUCTURE_LOW")
-    if safe_float(momentum.momentum_score, 0.0) < _cfg_float("min_momentum_score_for_real", 58.0):
-        real_allowed = False
-        reasons.append("REAL_BLOCK_MOMENTUM_LOW")
-    if safe_float(context.context_score, 50.0) < _cfg_float("min_context_score_for_real", 38.0):
-        real_allowed = False
-        reasons.append("REAL_BLOCK_CONTEXT_LOW")
-
-    if final_score >= real_min_score and confidence >= real_min_conf and real_allowed:
+    if final_score >= real_min_score and confidence >= real_min_conf and not real_blocks:
         return MODE_REAL, ["AI_MODE_REAL"]
 
     if final_score >= ghost_min_score:
-        if reasons:
-            return MODE_GHOST, ["AI_MODE_GHOST_INSTEAD_OF_REAL", *reasons]
+        if real_blocks:
+            return MODE_GHOST, ["AI_MODE_GHOST_INSTEAD_OF_REAL", *real_blocks]
         return MODE_GHOST, ["AI_MODE_GHOST_SCORE"]
 
     if final_score < _cfg_float("reject_below_score", 45.0):
@@ -418,9 +607,9 @@ def build_ai_decision(
 
     quantity = 0.0
     if tp_sl is not None:
-        margin = safe_float(runtime.get("margin_usdt"), 0.0) or 0.0
-        lev = safe_float(runtime.get("leverage"), 1.0) or 1.0
-        if tp_sl.entry > 0:
+        margin = _num(runtime.get("margin_usdt"), 0.0)
+        lev = _num(runtime.get("leverage"), 1.0)
+        if _num(tp_sl.entry, 0.0) > 0:
             quantity = (margin * lev) / tp_sl.entry
 
     reason_codes: list[str] = []
@@ -451,7 +640,16 @@ def build_ai_decision(
         "tp_sl": tp_sl_score,
     }
 
-    final_score = combine_final_score(parts)
+    raw_final_score = combine_final_score(parts)
+    final_score, score_penalty_reasons = adjusted_score_for_entry_quality(
+        final_score=raw_final_score,
+        liquidity=liquidity,
+        reversal_snapshot=reversal_snapshot,
+        timing_snapshot=timing_snapshot,
+        momentum=momentum,
+    )
+    reason_codes.extend(score_penalty_reasons)
+
     confidence = confidence_from_score(final_score, parts)
 
     rejects = hard_reject_reasons(
@@ -488,7 +686,76 @@ def build_ai_decision(
     if mode == MODE_REJECT:
         reject_reason = ",".join(mode_reasons or rejects or ["AI_REJECT"])
 
-    entry = safe_float(sensor.price, 0.0) or (tp_sl.entry if tp_sl else 0.0)
+    entry = _num(sensor.price, 0.0)
+    if entry <= 0 and tp_sl is not None:
+        entry = _num(tp_sl.entry, 0.0)
+
+    # Flatten the most important decision features into metadata so downstream
+    # components such as candidate_selector.py, learning_memory.py, and future
+    # Pattern Memory do not need to guess or reverse-engineer values from nested
+    # snapshots. Keep 0.0 values intact by using _num(), never `or default`.
+    trap_risk_score = _num(liquidity.trap_risk_score, 0.0)
+    fake_break_risk = _num(getattr(liquidity, "fake_break_risk", 0.0), 0.0)
+    breakout_survival_score = _num(getattr(liquidity, "breakout_survival_score", 50.0), 50.0)
+
+    late_risk_score = _mapping_value(timing_snapshot, "late_risk_score", 0.0)
+    timing_quality = safe_str(timing_snapshot.get("entry_quality") if isinstance(timing_snapshot, Mapping) else "").upper()
+    wait_for_better_entry = bool(timing_snapshot.get("wait_for_better_entry")) if isinstance(timing_snapshot, Mapping) else False
+    move_age_score = _raw_mapping_value(timing_snapshot, "move_age_score", 50.0)
+
+    timing_fresh = _raw_mapping_value(timing_snapshot, "fresh_momentum_score", 50.0)
+    timing_exhaustion = _raw_mapping_value(timing_snapshot, "exhaustion_score", 0.0)
+    momentum_fresh = _momentum_raw_value(momentum, "fresh_momentum_score", timing_fresh)
+    momentum_exhaustion = _momentum_raw_value(momentum, "exhaustion_score", timing_exhaustion)
+
+    fresh_momentum_score = min(timing_fresh, momentum_fresh)
+    exhaustion_score = max(
+        timing_exhaustion,
+        momentum_exhaustion,
+        _mapping_value(reversal_snapshot, "exhaustion_probability", 0.0),
+    )
+    weakness_score = _num(momentum.weakness_score, 0.0)
+    reversal_probability = _mapping_value(reversal_snapshot, "reversal_probability", 0.0)
+    continuation_probability = _mapping_value(reversal_snapshot, "continuation_probability", 50.0)
+    exhaustion_probability = _mapping_value(reversal_snapshot, "exhaustion_probability", 0.0)
+
+    expected_net_profit = _num(getattr(tp_sl, "tp1_net_profit_estimate", 0.0), 0.0) if tp_sl is not None else 0.0
+    rr = _num(getattr(tp_sl, "rr", 0.0), 0.0) if tp_sl is not None else 0.0
+
+    learning_features = {
+        "symbol": normalized_symbol,
+        "direction": d,
+        "level": 4,
+        "entry": entry,
+        "mode": mode,
+        "score": final_score,
+        "confidence": confidence,
+        "structure_score": structure_score,
+        "momentum_score": momentum_score,
+        "liquidity_score": liquidity_score,
+        "context_score": context_score,
+        "reversal_score": reversal_score,
+        "timing_score": timing_score,
+        "tp_sl_score": tp_sl_score,
+        "trap_risk_score": trap_risk_score,
+        "fake_break_risk": fake_break_risk,
+        "breakout_survival_score": breakout_survival_score,
+        "late_risk_score": late_risk_score,
+        "fresh_momentum_score": fresh_momentum_score,
+        "exhaustion_score": exhaustion_score,
+        "weakness_score": weakness_score,
+        "reversal_probability": reversal_probability,
+        "continuation_probability": continuation_probability,
+        "exhaustion_probability": exhaustion_probability,
+        "wait_for_better_entry": wait_for_better_entry,
+        "entry_quality": timing_quality,
+        "move_age_score": move_age_score,
+        "expected_net_profit": expected_net_profit,
+        "rr": rr,
+        "tp1": _num(getattr(tp_sl, "tp1", 0.0), 0.0) if tp_sl is not None else 0.0,
+        "tp2": _num(getattr(tp_sl, "tp2", 0.0), 0.0) if tp_sl is not None else 0.0,
+        "sl": _num(getattr(tp_sl, "sl", 0.0), 0.0) if tp_sl is not None else 0.0,
+    }
 
     return AIDecision(
         symbol=normalized_symbol,
@@ -503,7 +770,25 @@ def build_ai_decision(
         metadata={
             "system_version": SYSTEM_VERSION,
             "created_at": utc_now_iso(),
+            "trap_risk_score": trap_risk_score,
+            "fake_break_risk": fake_break_risk,
+            "breakout_survival_score": breakout_survival_score,
+            "late_risk_score": late_risk_score,
+            "fresh_momentum_score": fresh_momentum_score,
+            "exhaustion_score": exhaustion_score,
+            "weakness_score": weakness_score,
+            "reversal_probability": reversal_probability,
+            "continuation_probability": continuation_probability,
+            "exhaustion_probability": exhaustion_probability,
+            "wait_for_better_entry": wait_for_better_entry,
+            "entry_quality": timing_quality,
+            "move_age_score": move_age_score,
+            "expected_net_profit": expected_net_profit,
+            "rr": rr,
+            "learning_features": learning_features,
             "component_scores": parts,
+            "raw_final_score": raw_final_score,
+            "adjusted_final_score": final_score,
             "runtime": runtime,
             "reversal_snapshot": dict(reversal_snapshot or {}),
             "timing_snapshot": dict(timing_snapshot or {}),
@@ -531,10 +816,10 @@ def evaluate_open_position(
     d = normalize_direction(position_direction)
     reasons: list[str] = []
 
-    weakness = safe_float(momentum.weakness_score, 0.0) or 0.0
-    trap = safe_float(liquidity.trap_risk_score, 0.0) or 0.0
-    rev = safe_float((reversal_snapshot or {}).get("reversal_probability"), 0.0) or 0.0
-    progress = safe_float(progress_to_tp1, 0.0) or 0.0
+    weakness = _num(momentum.weakness_score, 0.0)
+    trap = _num(liquidity.trap_risk_score, 0.0)
+    rev = _mapping_value(reversal_snapshot, "reversal_probability", 0.0)
+    progress = _num(progress_to_tp1, 0.0)
 
     should_close = False
     action = "HOLD"
@@ -547,7 +832,7 @@ def evaluate_open_position(
             confidence = clamp(max(weakness, rev, trap), 0.0, 100.0)
             reasons.append("AI_CLOSE_RUNNER_WEAKNESS")
     else:
-        # Before TP1, do not be too nervous: require progress and weakness.
+        # Before TP1, do not be too nervous: require progress and confirmed weakness.
         if progress >= 0.70 and (weakness >= 65 or rev >= 68 or trap >= 75):
             should_close = True
             action = "AI_EXIT"
@@ -589,9 +874,9 @@ def validate_ai_decision(decision: AIDecision) -> dict[str, Any]:
         errors.append("INVALID_DIRECTION")
     if decision.mode not in {MODE_REAL, MODE_GHOST, MODE_REJECT}:
         errors.append("INVALID_MODE")
-    if not (0.0 <= safe_float(decision.score, -1.0) <= 100.0):
+    if not (0.0 <= _num(decision.score, -1.0) <= 100.0):
         errors.append("INVALID_SCORE")
-    if not (0.0 <= safe_float(decision.confidence, -1.0) <= 100.0):
+    if not (0.0 <= _num(decision.confidence, -1.0) <= 100.0):
         errors.append("INVALID_CONFIDENCE")
     if decision.mode != MODE_REJECT and decision.entry <= 0:
         errors.append("INVALID_ENTRY")
@@ -620,6 +905,7 @@ __all__ = [
     "score_tp_sl",
     "combine_final_score",
     "confidence_from_score",
+    "adjusted_score_for_entry_quality",
     "hard_reject_reasons",
     "choose_mode",
     "make_reject_decision",
