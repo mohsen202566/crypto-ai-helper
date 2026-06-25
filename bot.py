@@ -778,7 +778,7 @@ def _save_signal_message_link(
 ) -> dict[str, Any]:
     """Save Telegram signal message id to both signal record and position record.
 
-    This is required so TP/SL/AI_EXIT events can reply to the original signal,
+    This is required so TP/SL events can reply to the original signal,
     especially for REAL positions whose position_id comes from execution rather
     than lifecycle.
     """
@@ -1760,7 +1760,7 @@ def render_monitor_event(event: MonitorEvent) -> str:
     if exit_price is None and close_result is not None:
         exit_price = safe_float(close_result.close_price, None)
     exit_text = "-" if exit_price is None else str(exit_price)
-    icon = "✅" if event.event in {"TP1", "TP2", "AI_EXIT", "MANUAL_CLOSE"} else "❌" if event.event == "SL" else "ℹ️"
+    icon = "✅" if event.event in {"TP1", "TP2", "MANUAL_CLOSE"} else "❌" if event.event == "SL" else "ℹ️"
     mode = safe_str(event.mode).upper()
     return "\n".join([
         f"{icon} نتیجه پوزیشن {mode}",
@@ -1801,7 +1801,7 @@ async def position_monitor_loop(application: Any) -> None:
                 logger.info("position_monitor_events count=%s events=%s", len(events), [e.event for e in events])
             if chat_id:
                 for event in events:
-                    if event.event in {"PRICE_UNAVAILABLE", "AI_EXIT_SKIPPED_EARLY"}:
+                    if event.event in {"PRICE_UNAVAILABLE"}:
                         continue
                     await _send_monitor_event(application, chat_id, event)
             elif events:
