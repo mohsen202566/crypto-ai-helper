@@ -551,6 +551,57 @@ def _build_market_data_provider() -> MarketDataProvider:
     return OKXMarketDataProvider()
 
 
+def _strip_env_value(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1]
+    return value
+
+
+def _load_env_file(path: str) -> bool:
+    """Load simple KEY=VALUE pairs from a .env file without overriding real env vars."""
+    try:
+        with open(path, "r", encoding="utf-8") as env_file:
+            for raw_line in env_file:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                if not key:
+                    continue
+                os.environ.setdefault(key, _strip_env_value(value))
+        return True
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return False
+
+
+def _load_project_env() -> None:
+    """Load .env from the working directory and from the bot.py directory."""
+    candidates = [
+        os.path.join(os.getcwd(), ".env"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"),
+    ]
+    seen: set[str] = set()
+    for path in candidates:
+        if path in seen:
+            continue
+        seen.add(path)
+        _load_env_file(path)
+
+
+def _env_first(*names: str) -> str:
+    for name in names:
+        value = os.getenv(name)
+        if value:
+            value = value.strip()
+            if value:
+                return value
+    return ""
+
+
 def create_runtime(
     *,
     store: StateStore | None = None,
@@ -664,15 +715,19 @@ def _start_runtime_thread(runtime: BotRuntime) -> threading.Thread:
 
 
 def build_telegram_application(runtime: BotRuntime) -> Application:
+    _load_project_env()
+
     if ApplicationBuilder is None or MessageHandler is None or CommandHandler is None or filters is None:
         raise RuntimeError("python-telegram-bot is not installed. Install requirements.txt first.")
 
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    token = _env_first("TELEGRAM_BOT_TOKEN", "BOT_TOKEN")
     if not token:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is missing in .env")
+        raise RuntimeError("Telegram bot token is missing. Set TELEGRAM_BOT_TOKEN or BOT_TOKEN in .env")
+
+    default_chat_id = _env_first("TELEGRAM_CHAT_ID", "OWNER_ID") or None
 
     application = ApplicationBuilder().token(token).build()
-    notifier = TelegramNotifier(application, default_chat_id=os.getenv("TELEGRAM_CHAT_ID") or None)
+    notifier = TelegramNotifier(application, default_chat_id=default_chat_id)
     application.bot_data["runtime"] = runtime
     application.bot_data["notifier"] = notifier
     runtime.notifier = notifier
@@ -723,6 +778,7 @@ __all__ = [
     "OKXMarketDataProvider",
     "TelegramNotifier",
     "build_telegram_application",
+    "_load_project_env",
     "create_runtime",
     "main",
 ]
