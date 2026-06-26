@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import signal
 import threading
@@ -97,6 +98,8 @@ except Exception:  # pragma: no cover - py_compile must work even before require
 BOT_VERSION = "level4_main_loop_v2_telegram_okx"
 DEFAULT_SCAN_INTERVAL_SECONDS = 5.0
 DEFAULT_HTTP_TIMEOUT_SECONDS = 10.0
+LOGGER = logging.getLogger("crypto_bot")
+
 
 
 class MarketDataProvider(Protocol):
@@ -166,12 +169,39 @@ class OKXMarketDataProvider:
             return 0.0
         return _safe_price(data[0].get("last"))
 
+    def get_candles(self, symbol: str, *, bar: str = "1H", limit: int = 100) -> list[list[str]]:
+        """Return OKX candles for strategy_manager.
+
+        strategy_manager Level 4 refuses to trade without at least 40 candles.
+        The runtime therefore must provide candles, not just a last price.
+        """
+        clean_symbol = str(symbol).upper().strip()
+        if not clean_symbol:
+            return []
+        for inst_id in _okx_inst_id_candidates(clean_symbol):
+            query = urllib.parse.urlencode({"instId": inst_id, "bar": bar, "limit": int(limit)})
+            url = f"{self.base_url}/api/v5/market/candles?{query}"
+            req = urllib.request.Request(url, headers={"User-Agent": f"CryptoAIHelper/{BOT_VERSION}"})
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+            except Exception as exc:
+                LOGGER.warning("okx_candles_error symbol=%s inst_id=%s error=%s", clean_symbol, inst_id, exc)
+                continue
+            data = payload.get("data") or [] if isinstance(payload, Mapping) else []
+            if data:
+                return data
+        return []
+
 
 class EmptyMarketDataProvider:
     """Safe placeholder used only if OKX is explicitly disabled or unavailable."""
 
     def get_prices(self, symbols: Iterable[str]) -> Mapping[str, float]:
         return {}
+
+    def get_candles(self, symbol: str, *, bar: str = "1H", limit: int = 100) -> list[list[str]]:
+        return []
 
 
 class BotRuntime:
@@ -222,11 +252,19 @@ class BotRuntime:
     def run_once(self) -> CycleReport:
         report = CycleReport(cycle_started_at=time.time())
         symbols = self._active_watchlist()
+        settings = self.store.snapshot().settings
+        LOGGER.info(
+            "cycle_start symbols=%d auto_signal=%s real_trade=%s",
+            len(symbols),
+            getattr(settings, "auto_signal_enabled", DEFAULT_AUTO_SIGNAL_ENABLED),
+            getattr(settings, "real_trade_enabled", DEFAULT_REAL_TRADE_ENABLED),
+        )
 
         try:
             prices = dict(self.market_data.get_prices(symbols))
         except Exception as exc:
             report.errors.append(f"market_data_error:{exc}")
+            LOGGER.exception("market_data_error")
             if self.config.stop_on_error:
                 raise
             prices = {}
@@ -234,13 +272,15 @@ class BotRuntime:
         monitor_results = self._monitor_positions(prices)
         report.monitor_results = len(monitor_results)
 
+        shared_market = self._shared_strategy_market()
         for symbol in symbols:
             report.scanned_symbols.append(symbol)
             price = _safe_price(prices.get(symbol))
             if price <= 0:
+                LOGGER.info("scan_skip symbol=%s reason=price_missing", symbol)
                 continue
             try:
-                handled = self._handle_symbol(symbol, price, prices)
+                handled = self._handle_symbol(symbol, price, prices, shared_market)
                 if handled == "REAL":
                     report.real_requested += 1
                 elif handled == "SIGNAL":
@@ -249,8 +289,18 @@ class BotRuntime:
                     report.decisions += 1
             except Exception as exc:
                 report.errors.append(f"{symbol}:{exc}")
+                LOGGER.exception("symbol_error symbol=%s", symbol)
                 if self.config.stop_on_error:
                     raise
+        LOGGER.info(
+            "cycle_done scanned=%d decisions=%d signals=%d real=%d monitor=%d errors=%d",
+            len(report.scanned_symbols),
+            report.decisions,
+            report.signal_registered,
+            report.real_requested,
+            report.monitor_results,
+            len(report.errors),
+        )
         return report
 
     def _active_watchlist(self) -> list[str]:
@@ -271,31 +321,87 @@ class BotRuntime:
             return list(self.monitor.check_once(prices))
         except Exception as exc:
             self.last_error = f"position_monitor_error:{exc}"
+            LOGGER.exception("position_monitor_error")
             return []
 
-    def _handle_symbol(self, symbol: str, price: float, prices: Mapping[str, float]) -> str:
+    def _shared_strategy_market(self) -> dict[str, Any]:
+        candles_getter = getattr(self.market_data, "get_candles", None)
+        if not callable(candles_getter):
+            return {}
+        try:
+            btc_candles = candles_getter("BTCUSDT", bar="1H", limit=100)
+        except Exception as exc:
+            LOGGER.warning("btc_candles_error error=%s", exc)
+            btc_candles = []
+        return {"btc_candles": btc_candles}
+
+    def _symbol_strategy_market(
+        self,
+        *,
+        symbol: str,
+        price: float,
+        prices: Mapping[str, float],
+        shared_market: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        settings = self.store.snapshot().settings
+        market: dict[str, Any] = {
+            "price": price,
+            "prices": dict(prices),
+            "symbol": symbol,
+            "real_trade_enabled": bool(getattr(settings, "real_trade_enabled", DEFAULT_REAL_TRADE_ENABLED)),
+            "trade_dollar_usdt": float(getattr(settings, "trade_dollar_usdt", 0.0) or 0.0),
+            "trade_margin_usdt": float(getattr(settings, "trade_dollar_usdt", 0.0) or 0.0),
+            "leverage": int(getattr(settings, "leverage", 1) or 1),
+            "min_net_profit_usdt": float(getattr(settings, "min_net_profit_usdt", 0.0) or 0.0),
+            **dict(shared_market),
+        }
+        candles_getter = getattr(self.market_data, "get_candles", None)
+        if callable(candles_getter):
+            try:
+                market["candles"] = candles_getter(symbol, bar="1H", limit=100)
+            except Exception as exc:
+                LOGGER.warning("symbol_candles_error symbol=%s error=%s", symbol, exc)
+                market["candles"] = []
+        return market
+
+    def _handle_symbol(self, symbol: str, price: float, prices: Mapping[str, float], shared_market: Mapping[str, Any] | None = None) -> str:
         settings = self.store.snapshot().settings
         if not getattr(settings, "auto_signal_enabled", DEFAULT_AUTO_SIGNAL_ENABLED):
+            LOGGER.info("scan_skip symbol=%s reason=auto_signal_off", symbol)
             return ""
         if self.store.has_active_symbol(symbol):
+            LOGGER.info("scan_skip symbol=%s reason=active_signal_exists", symbol)
             return ""
 
-        decision = self.decision_provider(symbol, {"price": price, "prices": dict(prices), "symbol": symbol})
+        market = self._symbol_strategy_market(symbol=symbol, price=price, prices=prices, shared_market=shared_market or {})
+        decision = self.decision_provider(symbol, market)
         if not _decision_is_actionable(decision):
+            LOGGER.info(
+                "no_trade symbol=%s action=%s reason=%s candles=%d btc_candles=%d",
+                symbol,
+                getattr(decision, "action", getattr(decision, "decision", None)),
+                getattr(decision, "reason", ""),
+                len(market.get("candles") or []),
+                len(market.get("btc_candles") or []),
+            )
             return ""
 
         requested_real = _decision_requests_real(decision)
         can_open_real = bool(requested_real and self.store.can_open_real(symbol))
 
         if can_open_real:
+            LOGGER.info("real_request symbol=%s direction=%s confidence=%s", symbol, _direction(decision), getattr(decision, "confidence", ""))
             result = _open_real(decision)
             if _open_result_ok(result):
                 self._notify_signal(decision, mode="TOOBIT", raw_result=result)
+                LOGGER.info("real_opened symbol=%s", symbol)
                 return "REAL"
+            LOGGER.warning("real_failed symbol=%s result=%s", symbol, result)
             return ""
 
         record = self._register_signal_only(decision, symbol=symbol, price=price)
         self._notify_signal(decision, mode="SIGNAL", raw_result=record)
+        LOGGER.info("signal_registered symbol=%s direction=%s confidence=%s", symbol, _direction(decision), getattr(decision, "confidence", ""))
         return "SIGNAL"
 
     def _register_signal_only(self, decision: Any, *, symbol: str, price: float) -> Any:
@@ -813,7 +919,18 @@ async def _telegram_error_handler(update: object, context: Any) -> None:
         runtime.last_error = "telegram_error:" + "".join(traceback.format_exception_only(type(context.error), context.error)).strip()
 
 
+def _configure_logging() -> None:
+    level_name = str(os.getenv("BOT_LOG_LEVEL", "INFO")).upper().strip()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
+    )
+
+
 def main() -> None:
+    _load_project_env()
+    _configure_logging()
     runtime = create_runtime()
     application = build_telegram_application(runtime)
     notifier: TelegramNotifier = application.bot_data["notifier"]
@@ -847,6 +964,7 @@ __all__ = [
     "build_telegram_application",
     "_load_project_env",
     "_build_status_provider",
+    "_configure_logging",
     "create_runtime",
     "main",
 ]
