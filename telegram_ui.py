@@ -15,7 +15,7 @@ Design lock:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 from config import (
     LONG_LABEL,
@@ -228,6 +228,90 @@ def _on_off(value: bool) -> str:
     return "فعال" if value else "غیرفعال"
 
 
+def build_signal_payload(decision: Any, mode: SignalMode | str = "SIGNAL", result: Any = None) -> str:
+    """Build a clean Telegram signal message from StrategyDecision/SignalRecord objects.
+
+    bot.py calls this adapter with raw runtime objects. Keep conversion here so
+    bot.py does not leak dataclass repr/JSON fallback into Telegram.
+    """
+    normalized_mode = _signal_mode(mode)
+    symbol = str(_get(decision, "symbol", _get(result, "symbol", "")) or "").upper()
+    direction = _direction(_get(decision, "direction", _get(result, "direction", "LONG")))
+    tp_sl = _get(decision, "tp_sl", None)
+    metadata = _get(decision, "metadata", {}) or {}
+
+    data = SignalMessageData(
+        mode=normalized_mode,
+        fa_name=_fa_name_from_decision(decision, symbol),
+        symbol=symbol,
+        direction=direction,
+        confidence_pct=_safe_float(_get(decision, "confidence", 0.0)),
+        estimated_profit_usdt=_safe_float(
+            _get(metadata, "net_profit_usdt", _get(tp_sl, "net_profit_usdt", 0.0))
+        ),
+        estimated_move_pct=_safe_float(
+            _get(tp_sl, "estimated_move_pct", _get(metadata, "estimated_move_pct", 0.0))
+        ),
+        entry=_safe_float(_get(decision, "entry", _get(result, "entry", 0.0))),
+        tp=_safe_float(_get(decision, "tp", _get(result, "tp", 0.0))),
+        sl=_safe_float(_get(decision, "sl", _get(result, "sl", 0.0))),
+    )
+    return render_signal(data)
+
+
+def build_result_payload(result_payload: Any) -> str:
+    """Build a clean Telegram result message from ResultPanelPayload/MonitorResult-like objects."""
+    if isinstance(result_payload, ResultMessageData):
+        return render_result(result_payload)
+
+    result = _get(result_payload, "result", "TP")
+    data = ResultMessageData(
+        mode=_signal_mode(_get(result_payload, "mode", "SIGNAL")),
+        fa_name=str(_get(result_payload, "fa_name", _get(result_payload, "symbol", "")) or ""),
+        symbol=str(_get(result_payload, "symbol", "") or "").upper(),
+        direction=_direction(_get(result_payload, "direction", "LONG")),
+        result="TP" if str(result).upper() == "TP" else "SL",
+        entry=_safe_float(_get(result_payload, "entry", 0.0)),
+        exit_price=_safe_float(_get(result_payload, "exit_price", 0.0)),
+        pnl_usdt=_safe_float(_get(result_payload, "pnl_usdt", 0.0)),
+        move_pct=_safe_float(_get(result_payload, "move_pct", 0.0)),
+        duration_minutes=int(_safe_float(_get(result_payload, "duration_minutes", 0.0))),
+        close_reason=str(_get(result_payload, "reason", _get(result_payload, "close_reason", "")) or ""),
+    )
+    return render_result(data)
+
+
+def _signal_mode(value: Any) -> SignalMode:
+    text = str(value or "SIGNAL").upper().strip()
+    return "TOOBIT" if text in {"TOOBIT", "REAL"} else "SIGNAL"
+
+
+def _direction(value: Any) -> Direction:
+    text = str(value or "LONG").upper().strip()
+    return "SHORT" if text in {"SHORT", "SELL"} else "LONG"
+
+
+def _fa_name_from_decision(decision: Any, symbol: str) -> str:
+    analysis = _get(decision, "analysis", None)
+    value = _get(analysis, "fa_name", None) or _get(decision, "fa_name", None)
+    return str(value or symbol)
+
+
+def _get(obj: Any, key: str, default: Any = None) -> Any:
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
 __all__ = [
     "TradePanelData",
     "StatsPanelData",
@@ -237,6 +321,8 @@ __all__ = [
     "render_stats_panel",
     "render_signal",
     "render_result",
+    "build_signal_payload",
+    "build_result_payload",
     "render_signal_status",
     "render_invalid_value",
 ]
