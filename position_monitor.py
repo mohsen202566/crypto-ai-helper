@@ -1,1016 +1,380 @@
-"""
-position_monitor.py
-Level 4 / 1H Smart Scalp Bot
+"""Position monitor for Crypto AI Helper bot.
 
-Position monitor and lifecycle manager.
+Locked responsibility:
+- Monitors active TOOBIT and SIGNAL signals until TP/SL result.
+- For SIGNAL mode, decides result only from supplied market price.
+- For TOOBIT mode, uses injected exchange status / PnL adapters and never calls
+  Toobit directly.
+- Marks results in StateStore so slots and stats are released immediately after
+  a confirmed result.
+- Can build Telegram UI result payloads, but does not send Telegram messages.
 
-Architecture lock:
-- Monitors existing REAL/GHOST positions.
-- Handles TP1, TP2, SL, REAL close confirmation, exchange recovery, and result recording.
-- Does not fetch broad market scans or create new signals.
-- Does not send Telegram text.
-- Does not directly implement Toobit API calls; REAL open/close verification is injected
-  through an execution adapter/callback so real_trade_manager.py remains exchange owner.
-- Writes position state only through position_manager.py.
-- Records outcomes through learning_memory.py.
-- AI/profit-exit is disabled here by design; the monitor only closes on TP/SL/exchange/manual recovery.
+Design lock:
+- Small, simple, strong.
+- No market analysis, no AI decision, no order execution, no TP/SL calculation.
+- No hidden REAL opening or closing.
 """
 
 from __future__ import annotations
 
-from typing import Any, Callable, Mapping, Optional
+from dataclasses import dataclass
+from time import time
+from typing import Any, Callable, Iterable, Literal, Mapping
 
-from constants import (
-    DIRECTION_LONG,
-    DIRECTION_SHORT,
-    EVENT_MANUAL_CLOSE,
-    EVENT_SL,
-    EVENT_TP1,
-    EVENT_TP2,
-    MODE_GHOST,
-    MODE_REAL,
-    POSITION_ACTIVE_GHOST,
-    POSITION_ACTIVE_REAL,
-    POSITION_CLOSED,
-    POSITION_CLOSING,
-    POSITION_PARTIAL_TP1,
-    POSITION_PENDING_REAL_CONFIRM,
-    STATUS_FAILED,
-    STATUS_OK,
-    SYSTEM_VERSION,
-)
-from models import MonitorEvent, TradeCloseResult, TradeOutcome, TradePosition, to_dict
-from position_manager import (
-    close_position_record,
-    get_active_monitor_positions,
-    get_position,
-    mark_closing,
-    mark_real_confirmed,
-    mark_real_failed,
-    mark_sl_hit,
-    mark_tp1_partial,
-    mark_tp2_hit,
-    update_price_extremes,
-    upsert_position,
-)
-from learning_memory import record_outcome
-from utils import (
-    direction_price_move,
-    normalize_direction,
-    profit_usdt,
-    safe_float,
-    safe_int,
-    safe_str,
-    utc_now_iso,
-)
+try:
+    from state_store import ResultKind, SignalMode, SignalRecord, StateStore
+except Exception:  # pragma: no cover - allows isolated compile during file checks.
+    ResultKind = Literal["TP", "SL"]  # type: ignore
+    SignalMode = Literal["TOOBIT", "SIGNAL"]  # type: ignore
+    SignalRecord = Any  # type: ignore
+    StateStore = Any  # type: ignore
+
+Direction = Literal["LONG", "SHORT"]
+MonitorStatus = Literal["NO_RESULT", "RESULT_RECORDED", "WAITING_REAL_CONFIRM", "ERROR"]
+ExchangeChecker = Callable[[Any], Mapping[str, Any]]
+ClosedPnlReader = Callable[[Any], Mapping[str, Any]]
+ResultCallback = Callable[["MonitorResult"], None]
 
 
-POSITION_MONITOR_VERSION: str = SYSTEM_VERSION
+@dataclass(frozen=True)
+class PriceTick:
+    symbol: str
+    price: float
+    timestamp: float = 0.0
 
 
-# =============================================================================
-# Adapter contracts
-# =============================================================================
-
-PriceProvider = Callable[[str], float]
-CloseExecutor = Callable[[TradePosition, str, float, float], TradeCloseResult | Mapping[str, Any]]
-OpenConfirmChecker = Callable[[TradePosition], Mapping[str, Any] | bool]
-ExchangePositionChecker = Callable[[TradePosition], Mapping[str, Any] | bool]
-ClosedPnlReader = Callable[[TradePosition], Mapping[str, Any]]
-
-
-# =============================================================================
-# Price / trigger helpers
-# =============================================================================
-
-def is_tp_hit(position: TradePosition, current_price: float, tp_number: int = 1) -> bool:
-    """Return True if TP1/TP2 is hit."""
-    d = normalize_direction(position.direction)
-    target = position.tp1 if tp_number == 1 else position.tp2
-    target_f = safe_float(target, None)
-    if target_f is None or target_f <= 0:
-        return False
-
-    if d == DIRECTION_LONG:
-        return current_price >= target_f
-    if d == DIRECTION_SHORT:
-        return current_price <= target_f
-    return False
+@dataclass(frozen=True)
+class MonitorResult:
+    status: MonitorStatus
+    signal_id: str
+    symbol: str
+    mode: SignalMode
+    direction: Direction
+    result: ResultKind | None
+    entry: float
+    exit_price: float | None
+    pnl_usdt: float | None
+    move_pct: float | None
+    duration_minutes: int
+    reason: str
+    raw: dict[str, Any]
 
 
-def is_sl_hit(position: TradePosition, current_price: float) -> bool:
-    """Return True if SL/protected SL is hit."""
-    d = normalize_direction(position.direction)
-    sl = safe_float(position.protected_sl, None)
-    if sl is None or sl <= 0:
-        sl = safe_float(position.sl, 0.0) or 0.0
-    if sl <= 0:
-        return False
-
-    if d == DIRECTION_LONG:
-        return current_price <= sl
-    if d == DIRECTION_SHORT:
-        return current_price >= sl
-    return False
+@dataclass(frozen=True)
+class ResultPanelPayload:
+    mode: SignalMode
+    fa_name: str
+    symbol: str
+    direction: Direction
+    result: ResultKind
+    entry: float
+    exit_price: float
+    pnl_usdt: float
+    move_pct: float
+    duration_minutes: int
 
 
-def progress_to_tp1(position: TradePosition, current_price: float) -> float:
-    """Return progress from entry to TP1. 1.0 means TP1 reached."""
-    d = normalize_direction(position.direction)
-    entry = safe_float(position.entry, 0.0) or 0.0
-    tp1 = safe_float(position.tp1, 0.0) or 0.0
-    price = safe_float(current_price, 0.0) or 0.0
+class PositionMonitor:
+    """Monitors active records owned by StateStore.
 
-    if entry <= 0 or tp1 <= 0 or price <= 0:
+    The monitor intentionally receives prices and exchange adapters from outside.
+    It does not fetch OKX data, does not talk to Toobit directly, and does not
+    execute orders. Its only write action is StateStore.mark_result().
+    """
+
+    def __init__(
+        self,
+        store: StateStore,
+        *,
+        exchange_checker: ExchangeChecker | None = None,
+        closed_pnl_reader: ClosedPnlReader | None = None,
+        result_callback: ResultCallback | None = None,
+    ) -> None:
+        self.store = store
+        self.exchange_checker = exchange_checker
+        self.closed_pnl_reader = closed_pnl_reader
+        self.result_callback = result_callback
+
+    def check_once(self, prices: Mapping[str, float] | Iterable[PriceTick]) -> list[MonitorResult]:
+        price_map = _normalize_prices(prices)
+        active = list(self.store.snapshot().active_signals.values())
+        results: list[MonitorResult] = []
+        for record in active:
+            price = price_map.get(str(record.symbol).upper())
+            try:
+                result = self.check_record(record, price)
+            except Exception as exc:
+                result = _error_result(record, str(exc))
+            if result.status != "NO_RESULT":
+                results.append(result)
+                if result.status == "RESULT_RECORDED" and self.result_callback is not None:
+                    self.result_callback(result)
+        return results
+
+    def check_record(self, record: SignalRecord, price: float | None) -> MonitorResult:
+        mode = str(record.mode).upper()
+        if mode == "SIGNAL":
+            return self._check_signal_only(record, price)
+        if mode == "TOOBIT":
+            return self._check_real(record, price)
+        return _error_result(record, f"unknown_signal_mode:{mode}")
+
+    def _check_signal_only(self, record: SignalRecord, price: float | None) -> MonitorResult:
+        if price is None or price <= 0:
+            return _no_result(record, "price_missing")
+        hit = detect_tp_sl(record.direction, price=price, tp=record.tp, sl=record.sl)
+        if hit is None:
+            return _no_result(record, "tp_sl_not_hit")
+        pnl = estimate_pnl_usdt(record, price)
+        return self._record_result(record, result=hit, exit_price=price, pnl_usdt=pnl, reason="signal_tp_sl_hit")
+
+    def _check_real(self, record: SignalRecord, price: float | None) -> MonitorResult:
+        if self.exchange_checker is None:
+            return _no_result(record, "exchange_checker_missing")
+
+        exchange = dict(self.exchange_checker(record))
+        if exchange.get("error"):
+            return MonitorResult(
+                status="ERROR",
+                signal_id=record.signal_id,
+                symbol=record.symbol,
+                mode=record.mode,
+                direction=record.direction,
+                result=None,
+                entry=record.entry,
+                exit_price=None,
+                pnl_usdt=None,
+                move_pct=None,
+                duration_minutes=_duration_minutes(record),
+                reason=str(exchange.get("error")),
+                raw={"exchange": exchange},
+            )
+
+        is_open = _truthy_any(exchange, "exists", "open", "position_exists", "found")
+        if is_open:
+            return _no_result(record, "real_position_still_open", raw={"exchange": exchange})
+
+        exit_price = _extract_exit_price(exchange, fallback=price or 0.0)
+        pnl_data: dict[str, Any] = {}
+        if self.closed_pnl_reader is not None:
+            pnl_data = dict(self.closed_pnl_reader(record))
+            if pnl_data.get("error") and exit_price <= 0:
+                return MonitorResult(
+                    status="ERROR",
+                    signal_id=record.signal_id,
+                    symbol=record.symbol,
+                    mode=record.mode,
+                    direction=record.direction,
+                    result=None,
+                    entry=record.entry,
+                    exit_price=None,
+                    pnl_usdt=None,
+                    move_pct=None,
+                    duration_minutes=_duration_minutes(record),
+                    reason=str(pnl_data.get("error")),
+                    raw={"exchange": exchange, "pnl": pnl_data},
+                )
+            exit_price = _extract_exit_price(pnl_data, fallback=exit_price)
+
+        if exit_price <= 0:
+            return _no_result(record, "real_closed_but_exit_price_missing", raw={"exchange": exchange, "pnl": pnl_data})
+
+        result_kind = infer_result_kind(record, exit_price)
+        pnl_usdt = _extract_pnl(pnl_data)
+        if pnl_usdt is None:
+            pnl_usdt = estimate_pnl_usdt(record, exit_price)
+
+        return self._record_result(
+            record,
+            result=result_kind,
+            exit_price=exit_price,
+            pnl_usdt=pnl_usdt,
+            reason="real_position_closed_confirmed",
+            raw={"exchange": exchange, "pnl": pnl_data},
+        )
+
+    def _record_result(
+        self,
+        record: SignalRecord,
+        *,
+        result: ResultKind,
+        exit_price: float,
+        pnl_usdt: float,
+        reason: str,
+        raw: dict[str, Any] | None = None,
+    ) -> MonitorResult:
+        self.store.mark_result(record.signal_id, result=result, exit_price=exit_price, pnl_usdt=pnl_usdt)
+        return MonitorResult(
+            status="RESULT_RECORDED",
+            signal_id=record.signal_id,
+            symbol=record.symbol,
+            mode=record.mode,
+            direction=record.direction,
+            result=result,
+            entry=record.entry,
+            exit_price=exit_price,
+            pnl_usdt=pnl_usdt,
+            move_pct=move_pct(record.direction, record.entry, exit_price),
+            duration_minutes=_duration_minutes(record),
+            reason=reason,
+            raw=raw or {},
+        )
+
+
+def detect_tp_sl(direction: Direction, *, price: float, tp: float, sl: float) -> ResultKind | None:
+    if direction == "LONG":
+        if price >= tp:
+            return "TP"
+        if price <= sl:
+            return "SL"
+        return None
+    if direction == "SHORT":
+        if price <= tp:
+            return "TP"
+        if price >= sl:
+            return "SL"
+        return None
+    raise ValueError("direction باید LONG یا SHORT باشد.")
+
+
+def infer_result_kind(record: SignalRecord, exit_price: float) -> ResultKind:
+    direct = detect_tp_sl(record.direction, price=exit_price, tp=record.tp, sl=record.sl)
+    if direct is not None:
+        return direct
+    tp_distance = abs(exit_price - record.tp)
+    sl_distance = abs(exit_price - record.sl)
+    return "TP" if tp_distance <= sl_distance else "SL"
+
+
+def estimate_pnl_usdt(record: SignalRecord, exit_price: float) -> float:
+    quantity = float(getattr(record, "quantity", 0.0) or 0.0)
+    if quantity <= 0:
+        # SIGNAL_ONLY records in state_store do not own quantity. Keep PnL neutral
+        # instead of inventing leverage or margin inside the monitor.
         return 0.0
-
-    if d == DIRECTION_LONG:
-        denom = tp1 - entry
-        num = price - entry
-    elif d == DIRECTION_SHORT:
-        denom = entry - tp1
-        num = entry - price
-    else:
-        return 0.0
-
-    if denom <= 0:
-        return 0.0
-    return max(0.0, num / denom)
+    if record.direction == "LONG":
+        return (exit_price - record.entry) * quantity
+    if record.direction == "SHORT":
+        return (record.entry - exit_price) * quantity
+    return 0.0
 
 
-def calculate_mfe_mae(position: TradePosition) -> tuple[float, float]:
-    """Calculate MFE/MAE percent from stored high/low."""
-    entry = safe_float(position.entry, 0.0) or 0.0
-    high = safe_float(position.highest_price, entry) or entry
-    low = safe_float(position.lowest_price, entry) or entry
+def move_pct(direction: Direction, entry: float, exit_price: float) -> float:
     if entry <= 0:
-        return 0.0, 0.0
-
-    if position.direction == DIRECTION_LONG:
-        mfe = ((high - entry) / entry) * 100.0
-        mae = ((entry - low) / entry) * 100.0
-    else:
-        mfe = ((entry - low) / entry) * 100.0
-        mae = ((high - entry) / entry) * 100.0
-
-    return max(0.0, mfe), max(0.0, mae)
+        return 0.0
+    raw = (exit_price - entry) / entry * 100.0
+    return raw if direction == "LONG" else -raw
 
 
-def partial_tp1_quantities(position: TradePosition, close_ratio: float = 0.75) -> tuple[float, float]:
-    """Return TP1 closed quantity and runner quantity."""
-    qty = safe_float(position.quantity, 0.0) or 0.0
-    ratio = max(0.0, min(1.0, safe_float(close_ratio, 0.75) or 0.75))
-    closed = qty * ratio
-    runner = max(0.0, qty - closed)
-    return closed, runner
-
-
-def protected_sl_after_tp1(position: TradePosition, current_price: float) -> float:
-    """
-    Conservative protected SL after TP1.
-
-    It protects around entry/slightly profitable side instead of over-tightening.
-    """
-    entry = safe_float(position.entry, 0.0) or 0.0
-    tp1 = safe_float(position.tp1, 0.0) or 0.0
-    if entry <= 0 or tp1 <= 0:
-        return entry
-
-    if position.direction == DIRECTION_LONG:
-        return entry + abs(tp1 - entry) * 0.10
-    return entry - abs(entry - tp1) * 0.10
-
-
-# =============================================================================
-# Outcome / events
-# =============================================================================
-
-def _position_metadata(position: TradePosition) -> dict[str, Any]:
-    """Return position metadata safely, regardless of model shape."""
-    raw = getattr(position, "metadata", {})
-    if isinstance(raw, Mapping):
-        return dict(raw)
-    return {}
-
-
-def _get_position_signal_message_id(position: TradePosition) -> int | None:
-    """Best-effort reply target for result messages.
-
-    Primary source is TradePosition.signal_message_id. Fallbacks are kept so
-    old position records created before the bot.py reply fix can still reply
-    when they carry a message id in metadata.
-    """
-    candidates = [
-        getattr(position, "signal_message_id", None),
-        getattr(position, "reply_to_message_id", None),
-        getattr(position, "telegram_message_id", None),
-        getattr(position, "message_id", None),
-    ]
-    meta = _position_metadata(position)
-    candidates.extend(
-        [
-            meta.get("signal_message_id"),
-            meta.get("reply_to_message_id"),
-            meta.get("telegram_message_id"),
-            meta.get("message_id"),
-        ]
+def build_result_panel_payload(result: MonitorResult, fa_name: str = "") -> ResultPanelPayload:
+    if result.result is None or result.exit_price is None or result.pnl_usdt is None or result.move_pct is None:
+        raise ValueError("MonitorResult هنوز نتیجه کامل ندارد.")
+    return ResultPanelPayload(
+        mode=result.mode,
+        fa_name=fa_name or result.symbol,
+        symbol=result.symbol,
+        direction=result.direction,
+        result=result.result,
+        entry=result.entry,
+        exit_price=result.exit_price,
+        pnl_usdt=result.pnl_usdt,
+        move_pct=result.move_pct,
+        duration_minutes=result.duration_minutes,
     )
-    for candidate in candidates:
-        value = safe_int(candidate, 0)
-        if value and value > 0:
-            return value
+
+
+def _normalize_prices(prices: Mapping[str, float] | Iterable[PriceTick]) -> dict[str, float]:
+    if isinstance(prices, Mapping):
+        return {str(symbol).upper(): float(price) for symbol, price in prices.items() if float(price) > 0}
+    out: dict[str, float] = {}
+    for tick in prices:
+        if tick.price > 0:
+            out[tick.symbol.upper()] = float(tick.price)
+    return out
+
+
+def _duration_minutes(record: SignalRecord) -> int:
+    started = float(getattr(record, "opened_at", None) or getattr(record, "created_at", time()) or time())
+    return max(0, int((time() - started) // 60))
+
+
+def _no_result(record: SignalRecord, reason: str, raw: dict[str, Any] | None = None) -> MonitorResult:
+    return MonitorResult(
+        status="NO_RESULT",
+        signal_id=record.signal_id,
+        symbol=record.symbol,
+        mode=record.mode,
+        direction=record.direction,
+        result=None,
+        entry=record.entry,
+        exit_price=None,
+        pnl_usdt=None,
+        move_pct=None,
+        duration_minutes=_duration_minutes(record),
+        reason=reason,
+        raw=raw or {},
+    )
+
+
+def _error_result(record: SignalRecord, reason: str) -> MonitorResult:
+    return MonitorResult(
+        status="ERROR",
+        signal_id=record.signal_id,
+        symbol=record.symbol,
+        mode=record.mode,
+        direction=record.direction,
+        result=None,
+        entry=record.entry,
+        exit_price=None,
+        pnl_usdt=None,
+        move_pct=None,
+        duration_minutes=_duration_minutes(record),
+        reason=reason,
+        raw={},
+    )
+
+
+def _truthy_any(data: Mapping[str, Any], *keys: str) -> bool:
+    for key in keys:
+        if key in data:
+            return bool(data.get(key))
+    return False
+
+
+def _extract_exit_price(data: Mapping[str, Any], *, fallback: float = 0.0) -> float:
+    for key in ("exit_price", "close_price", "closed_price", "avgExitPrice", "price", "mark", "lastPrice"):
+        value = data.get(key)
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if number > 0:
+            return number
+    return float(fallback or 0.0)
+
+
+def _extract_pnl(data: Mapping[str, Any]) -> float | None:
+    for key in ("pnl_usdt", "realizedPnl", "realizedPNL", "realizedProfit", "pnl", "profit"):
+        if key not in data:
+            continue
+        try:
+            return float(data.get(key))
+        except (TypeError, ValueError):
+            continue
     return None
 
 
-def _hunter_learning_metadata(position: TradePosition) -> dict[str, Any]:
-    """Preserve locked hunter/start/anti-chase fields in every outcome."""
-    meta = _position_metadata(position)
-    fields = [
-        "start_score",
-        "start_active",
-        "start_signal_count",
-        "start_reasons",
-        "chase_risk_score",
-        "chase_active",
-        "move_age_score",
-        "late_risk_score",
-        "fresh_momentum_score",
-        "exhaustion_score",
-        "start_pressure_score",
-        "structure_start_active",
-        "momentum_start_active",
-        "liquidity_start_active",
-        "fresh_context_active",
-        "early_start_synergy",
-        "selector_rank_score",
-        "selector_selected_for_real",
-        "selector_selection_reason",
-    ]
-    data: dict[str, Any] = {}
-    for field in fields:
-        if field in meta:
-            data[field] = meta.get(field)
-        elif hasattr(position, field):
-            data[field] = getattr(position, field)
-    return data
-
-
-
-def make_outcome(
-    position: TradePosition,
-    *,
-    event: str,
-    exit_price: float,
-    quantity: Optional[float] = None,
-    pnl_usdt: Optional[float] = None,
-    pnl_confirmed: bool = False,
-    metadata: Optional[Mapping[str, Any]] = None,
-) -> TradeOutcome:
-    """Build TradeOutcome from position."""
-    qty = safe_float(quantity, None)
-    if qty is None or qty <= 0:
-        qty = safe_float(position.quantity, 0.0) or 0.0
-
-    exit_f = safe_float(exit_price, position.current_price) or position.current_price
-    gross = profit_usdt(position.direction, position.entry, exit_f, qty)
-    pnl = safe_float(pnl_usdt, gross)
-    mfe, mae = calculate_mfe_mae(position)
-
-    entry = safe_float(position.entry, 0.0) or 0.0
-    pnl_pct = direction_price_move(position.direction, entry, exit_f) if entry > 0 else 0.0
-
-    return TradeOutcome(
-        position_id=position.position_id,
-        symbol=position.symbol,
-        direction=position.direction,
-        event=safe_str(event).upper(),
-        mode=position.mode,
-        entry=position.entry,
-        exit_price=exit_f,
-        quantity=qty,
-        pnl_usdt=pnl,
-        pnl_pct=pnl_pct,
-        pnl_confirmed=bool(pnl_confirmed),
-        mfe_pct=mfe,
-        mae_pct=mae,
-        reason_codes=[safe_str(event).upper()],
-        metadata={
-            **_hunter_learning_metadata(position),
-            **dict(metadata or {}),
-            "signal_id": position.signal_id,
-            "level": position.level,
-            "status": position.status,
-            "signal_message_id": _get_position_signal_message_id(position),
-        },
-        level=position.level,
-    )
-
-
-def make_monitor_event(
-    *,
-    event: str,
-    position: TradePosition,
-    status: str = STATUS_OK,
-    outcome: Optional[TradeOutcome] = None,
-    close_result: Optional[TradeCloseResult] = None,
-    metadata: Optional[Mapping[str, Any]] = None,
-) -> MonitorEvent:
-    """Build MonitorEvent. bot.py/telegram_ui.py decides message text."""
-    return MonitorEvent(
-        event=event,
-        position_id=position.position_id,
-        symbol=position.symbol,
-        direction=position.direction,
-        mode=position.mode,
-        status=status,
-        message_key=safe_str(event).lower(),
-        reply_to_message_id=_get_position_signal_message_id(position),
-        outcome=outcome,
-        close_result=close_result,
-        metadata=dict(metadata or {}),
-    )
-
-
-def _record_outcome_safe(outcome: TradeOutcome, extra_metadata: Optional[Mapping[str, Any]] = None) -> bool:
-    """Record outcome without crashing monitor loop."""
-    result = record_outcome(outcome, metadata=extra_metadata)
-    return result.recorded
-
-
-# =============================================================================
-# REAL close / confirm helpers
-# =============================================================================
-
-def normalize_close_result(result: TradeCloseResult | Mapping[str, Any] | None, position: TradePosition) -> TradeCloseResult:
-    """Normalize close executor result."""
-    if isinstance(result, TradeCloseResult):
-        return result
-
-    if isinstance(result, Mapping):
-        return TradeCloseResult(
-            status=safe_str(result.get("status"), STATUS_FAILED),
-            position_id=safe_str(result.get("position_id"), position.position_id),
-            exchange_order_id=safe_str(result.get("exchange_order_id")),
-            symbol=safe_str(result.get("symbol"), position.symbol),
-            direction=safe_str(result.get("direction"), position.direction),
-            close_price=safe_float(result.get("close_price"), position.current_price) or position.current_price,
-            closed_quantity=safe_float(result.get("closed_quantity"), position.quantity) or position.quantity,
-            pnl_usdt=safe_float(result.get("pnl_usdt"), None),
-            pnl_confirmed=bool(result.get("pnl_confirmed", False)),
-            close_confirmed=bool(result.get("close_confirmed", False)),
-            message=safe_str(result.get("message")),
-            error=safe_str(result.get("error")),
-            raw=dict(result.get("raw", {})) if isinstance(result.get("raw", {}), Mapping) else {},
-        )
-
-    return TradeCloseResult(
-        status=STATUS_FAILED,
-        position_id=position.position_id,
-        symbol=position.symbol,
-        direction=position.direction,
-        close_price=position.current_price,
-        closed_quantity=position.quantity,
-        close_confirmed=False,
-        error="missing_close_executor_result",
-    )
-
-
-def close_real_position_verified(
-    position: TradePosition,
-    *,
-    reason: str,
-    quantity: float,
-    current_price: float,
-    close_executor: Optional[CloseExecutor],
-) -> TradeCloseResult:
-    """
-    Request REAL close via injected executor and require close_confirmed=True.
-
-    This preserves the locked rule:
-    close request != closed. It is closed only after exchange verification.
-    """
-    if close_executor is None:
-        return TradeCloseResult(
-            status=STATUS_FAILED,
-            position_id=position.position_id,
-            symbol=position.symbol,
-            direction=position.direction,
-            close_price=current_price,
-            closed_quantity=quantity,
-            close_confirmed=False,
-            error="close_executor_missing",
-        )
-
-    mark_closing(position.position_id, reason=reason)
-    raw_result = close_executor(position, reason, quantity, current_price)
-    result = normalize_close_result(raw_result, position)
-
-    if result.close_confirmed:
-        return result
-
-    return TradeCloseResult(
-        status=STATUS_FAILED,
-        position_id=position.position_id,
-        exchange_order_id=result.exchange_order_id,
-        symbol=position.symbol,
-        direction=position.direction,
-        close_price=result.close_price,
-        closed_quantity=result.closed_quantity,
-        pnl_usdt=result.pnl_usdt,
-        pnl_confirmed=result.pnl_confirmed,
-        close_confirmed=False,
-        message=result.message,
-        error=result.error or "close_not_confirmed",
-        raw=result.raw,
-    )
-
-
-# =============================================================================
-# Pending REAL confirmation
-# =============================================================================
-
-def handle_pending_real_confirmation(
-    position: TradePosition,
-    *,
-    open_confirm_checker: Optional[OpenConfirmChecker] = None,
-) -> list[MonitorEvent]:
-    """Confirm pending REAL open without freeing slot prematurely."""
-    if position.status != POSITION_PENDING_REAL_CONFIRM or position.mode != MODE_REAL:
-        return []
-
-    if open_confirm_checker is None:
-        return []
-
-    result = open_confirm_checker(position)
-
-    confirmed = False
-    entry = position.entry
-    quantity = position.quantity
-    exchange_order_id = position.exchange_order_id
-    error = ""
-
-    if isinstance(result, Mapping):
-        confirmed = bool(result.get("confirmed", False))
-        entry = safe_float(result.get("entry"), position.entry) or position.entry
-        quantity = safe_float(result.get("quantity"), position.quantity) or position.quantity
-        exchange_order_id = safe_str(result.get("exchange_order_id"), position.exchange_order_id)
-        error = safe_str(result.get("error"))
-    else:
-        confirmed = bool(result)
-
-    if confirmed:
-        mark_real_confirmed(position.position_id, entry=entry, quantity=quantity, exchange_order_id=exchange_order_id)
-        updated = get_position(position.position_id) or position
-        return [
-            make_monitor_event(
-                event="REAL_OPEN_CONFIRMED",
-                position=updated,
-                metadata={"entry": entry, "quantity": quantity, "exchange_order_id": exchange_order_id},
-            )
-        ]
-
-    if error:
-        mark_real_failed(position.position_id, reason=error)
-        failed = get_position(position.position_id) or position
-        return [
-            make_monitor_event(
-                event="REAL_OPEN_FAILED",
-                position=failed,
-                status=STATUS_FAILED,
-                metadata={"error": error},
-            )
-        ]
-
-    return []
-
-
-# =============================================================================
-# TP/SL handlers
-# =============================================================================
-
-def handle_ghost_close(position: TradePosition, *, event: str, current_price: float, quantity: Optional[float] = None) -> MonitorEvent:
-    """Close GHOST position locally and record outcome."""
-    qty = safe_float(quantity, None)
-    if qty is None or qty <= 0:
-        qty = position.quantity
-
-    outcome = make_outcome(position, event=event, exit_price=current_price, quantity=qty, pnl_confirmed=False)
-    close_position_record(
-        position.position_id,
-        close_price=current_price,
-        pnl_usdt=outcome.pnl_usdt,
-        pnl_confirmed=False,
-        close_reason=event,
-    )
-    _record_outcome_safe(outcome)
-    updated = get_position(position.position_id) or position
-    return make_monitor_event(event=event, position=updated, outcome=outcome)
-
-
-def handle_real_close(
-    position: TradePosition,
-    *,
-    event: str,
-    current_price: float,
-    quantity: Optional[float],
-    close_executor: Optional[CloseExecutor],
-) -> MonitorEvent:
-    """Close REAL position only after executor confirms close."""
-    qty = safe_float(quantity, None)
-    if qty is None or qty <= 0:
-        qty = position.quantity
-
-    close_result = close_real_position_verified(
-        position,
-        reason=event,
-        quantity=qty,
-        current_price=current_price,
-        close_executor=close_executor,
-    )
-
-    if not close_result.close_confirmed:
-        updated = get_position(position.position_id) or position
-        return make_monitor_event(
-            event=f"{event}_CLOSE_NOT_CONFIRMED",
-            position=updated,
-            status=STATUS_FAILED,
-            close_result=close_result,
-            metadata={"error": close_result.error},
-        )
-
-    outcome = make_outcome(
-        position,
-        event=event,
-        exit_price=close_result.close_price or current_price,
-        quantity=close_result.closed_quantity or qty,
-        pnl_usdt=close_result.pnl_usdt,
-        pnl_confirmed=close_result.pnl_confirmed,
-        metadata={"close_confirmed": True, "exchange_order_id": close_result.exchange_order_id},
-    )
-
-    close_position_record(
-        position.position_id,
-        close_price=close_result.close_price or current_price,
-        pnl_usdt=outcome.pnl_usdt,
-        pnl_confirmed=close_result.pnl_confirmed,
-        close_reason=event,
-    )
-    _record_outcome_safe(outcome)
-    updated = get_position(position.position_id) or position
-    return make_monitor_event(event=event, position=updated, outcome=outcome, close_result=close_result)
-
-
-def handle_tp1(
-    position: TradePosition,
-    *,
-    current_price: float,
-    close_executor: Optional[CloseExecutor] = None,
-) -> MonitorEvent:
-    """
-    Handle TP1.
-
-    REAL: close about 75%, require verification, keep runner.
-    GHOST: mark partial locally and record TP1.
-    """
-    closed_qty, runner_qty = partial_tp1_quantities(position, close_ratio=0.75)
-    protected_sl = protected_sl_after_tp1(position, current_price)
-
-    if position.mode == MODE_REAL:
-        close_result = close_real_position_verified(
-            position,
-            reason=EVENT_TP1,
-            quantity=closed_qty,
-            current_price=current_price,
-            close_executor=close_executor,
-        )
-        if not close_result.close_confirmed:
-            updated = get_position(position.position_id) or position
-            return make_monitor_event(
-                event="TP1_CLOSE_NOT_CONFIRMED",
-                position=updated,
-                status=STATUS_FAILED,
-                close_result=close_result,
-                metadata={"error": close_result.error},
-            )
-
-        actual_closed = close_result.closed_quantity or closed_qty
-        actual_runner = max(0.0, position.quantity - actual_closed)
-        mark_tp1_partial(
-            position.position_id,
-            closed_quantity=actual_closed,
-            runner_quantity=actual_runner,
-            protected_sl=protected_sl,
-        )
-        outcome = make_outcome(
-            position,
-            event=EVENT_TP1,
-            exit_price=close_result.close_price or current_price,
-            quantity=actual_closed,
-            pnl_usdt=close_result.pnl_usdt,
-            pnl_confirmed=close_result.pnl_confirmed,
-            metadata={"close_confirmed": True, "runner_quantity": actual_runner, "protected_sl": protected_sl},
-        )
-        _record_outcome_safe(outcome)
-        updated = get_position(position.position_id) or position
-        return make_monitor_event(event=EVENT_TP1, position=updated, outcome=outcome, close_result=close_result)
-
-    # GHOST partial TP1.
-    mark_tp1_partial(
-        position.position_id,
-        closed_quantity=closed_qty,
-        runner_quantity=runner_qty,
-        protected_sl=protected_sl,
-    )
-    outcome = make_outcome(
-        position,
-        event=EVENT_TP1,
-        exit_price=current_price,
-        quantity=closed_qty,
-        pnl_confirmed=False,
-        metadata={"runner_quantity": runner_qty, "protected_sl": protected_sl},
-    )
-    _record_outcome_safe(outcome)
-    updated = get_position(position.position_id) or position
-    return make_monitor_event(event=EVENT_TP1, position=updated, outcome=outcome)
-
-
-def handle_tp2(position: TradePosition, *, current_price: float, close_executor: Optional[CloseExecutor] = None) -> MonitorEvent:
-    """Handle TP2 for remaining runner/full quantity."""
-    qty = position.runner_quantity if position.runner_quantity > 0 else position.quantity
-
-    if position.mode == MODE_REAL:
-        event = handle_real_close(position, event=EVENT_TP2, current_price=current_price, quantity=qty, close_executor=close_executor)
-        if event.status == STATUS_OK:
-            mark_tp2_hit(position.position_id)
-        return event
-
-    mark_tp2_hit(position.position_id)
-    return handle_ghost_close(position, event=EVENT_TP2, current_price=current_price, quantity=qty)
-
-
-def handle_sl(position: TradePosition, *, current_price: float, close_executor: Optional[CloseExecutor] = None) -> MonitorEvent:
-    """Handle SL/protected SL."""
-    qty = position.runner_quantity if position.status == POSITION_PARTIAL_TP1 and position.runner_quantity > 0 else position.quantity
-
-    if position.mode == MODE_REAL:
-        event = handle_real_close(position, event=EVENT_SL, current_price=current_price, quantity=qty, close_executor=close_executor)
-        if event.status == STATUS_OK:
-            mark_sl_hit(position.position_id)
-        return event
-
-    mark_sl_hit(position.position_id)
-    return handle_ghost_close(position, event=EVENT_SL, current_price=current_price, quantity=qty)
-
-
-
-# =============================================================================
-# Exchange-side close recovery
-# =============================================================================
-
-def _exchange_position_exists(result: Mapping[str, Any] | bool | None) -> tuple[bool, str, dict[str, Any]]:
-    """
-    Normalize exchange position checker result.
-
-    Expected truth:
-    - True / {"exists": True} / {"open": True}  => position still exists on exchange
-    - False / {"exists": False} / {"open": False} => position no longer exists
-    """
-    if isinstance(result, Mapping):
-        exists = bool(
-            result.get("exists", result.get("open", result.get("position_exists", result.get("found", False))))
-        )
-        error = safe_str(result.get("error"))
-        return exists, error, dict(result)
-    return bool(result), "", {"raw": result}
-
-
-def _read_closed_pnl(position: TradePosition, closed_pnl_reader: Optional[ClosedPnlReader]) -> dict[str, Any]:
-    """Read closed-position history/PnL via injected adapter without crashing monitor loop."""
-    if closed_pnl_reader is None:
-        return {"status": STATUS_FAILED, "confirmed": False, "pnl_usdt": None, "error": "closed_pnl_reader_missing"}
-
-    try:
-        result = closed_pnl_reader(position)
-        return dict(result) if isinstance(result, Mapping) else {"status": STATUS_FAILED, "confirmed": False, "pnl_usdt": None, "raw": result}
-    except Exception as exc:
-        return {"status": STATUS_FAILED, "confirmed": False, "pnl_usdt": None, "error": str(exc)}
-
-
-def infer_external_close_event(position: TradePosition, pnl_data: Mapping[str, Any], current_price: float) -> str:
-    """
-    Infer why a REAL position disappeared from exchange.
-
-    Prefer TP/SL price logic when possible; otherwise use realized PnL:
-    positive/zero => TP1-style profitable close, negative => SL.
-    """
-    exit_price = safe_float(
-        pnl_data.get("close_price")
-        or pnl_data.get("exit_price")
-        or pnl_data.get("avg_close_price")
-        or (pnl_data.get("row", {}) or {}).get("closePrice") if isinstance(pnl_data.get("row"), Mapping) else None,
-        None,
-    )
-    price = exit_price if exit_price is not None and exit_price > 0 else current_price
-
-    if price and price > 0:
-        if is_sl_hit(position, price):
-            return EVENT_SL
-        if position.tp1_hit or position.status == POSITION_PARTIAL_TP1:
-            if is_tp_hit(position, price, tp_number=2):
-                return EVENT_TP2
-            return EVENT_TP1
-        if is_tp_hit(position, price, tp_number=1):
-            return EVENT_TP1
-
-    pnl = safe_float(pnl_data.get("pnl_usdt"), None)
-    if pnl is not None:
-        return EVENT_SL if pnl < 0 else EVENT_TP1
-
-    return EVENT_MANUAL_CLOSE
-
-
-def handle_real_exchange_disappeared(
-    position: TradePosition,
-    *,
-    current_price: float,
-    closed_pnl_reader: Optional[ClosedPnlReader],
-) -> MonitorEvent:
-    """
-    Recover a REAL position that is closed on Toobit but still open internally.
-
-    This handles exchange-side TP/SL, manual app close, or delayed close confirmation.
-    It reads closed history/PnL, closes the internal position, records learning/stats,
-    and returns an event that bot.py can reply to the original signal.
-    """
-    pnl_data = _read_closed_pnl(position, closed_pnl_reader)
-    event = infer_external_close_event(position, pnl_data, current_price)
-
-    row = pnl_data.get("row", {}) if isinstance(pnl_data.get("row"), Mapping) else {}
-    close_price = safe_float(
-        pnl_data.get("close_price")
-        or pnl_data.get("exit_price")
-        or pnl_data.get("avg_close_price")
-        or row.get("closePrice")
-        or row.get("avgClosePrice")
-        or row.get("price")
-        or current_price,
-        current_price,
-    ) or current_price
-
-    pnl_usdt = safe_float(pnl_data.get("pnl_usdt"), None)
-    pnl_confirmed = bool(pnl_data.get("confirmed", False))
-
-    outcome = make_outcome(
-        position,
-        event=event,
-        exit_price=close_price,
-        quantity=position.runner_quantity if position.runner_quantity > 0 else position.quantity,
-        pnl_usdt=pnl_usdt,
-        pnl_confirmed=pnl_confirmed,
-        metadata={
-            "exchange_position_missing": True,
-            "closed_history": dict(pnl_data),
-            "recovery_reason": "exchange_closed_position_detected",
-        },
-    )
-
-    close_position_record(
-        position.position_id,
-        close_price=close_price,
-        pnl_usdt=outcome.pnl_usdt,
-        pnl_confirmed=pnl_confirmed,
-        close_reason=event,
-    )
-    _record_outcome_safe(outcome, extra_metadata={"exchange_position_missing": True})
-
-    updated = get_position(position.position_id) or position
-    close_result = TradeCloseResult(
-        status=STATUS_OK,
-        position_id=position.position_id,
-        symbol=position.symbol,
-        direction=position.direction,
-        close_price=close_price,
-        closed_quantity=outcome.quantity,
-        pnl_usdt=outcome.pnl_usdt,
-        pnl_confirmed=pnl_confirmed,
-        close_confirmed=True,
-        message="exchange_position_closed_detected",
-        raw={"closed_history": dict(pnl_data)},
-    )
-    return make_monitor_event(
-        event=event,
-        position=updated,
-        outcome=outcome,
-        close_result=close_result,
-        metadata={"exchange_position_missing": True, "closed_history_confirmed": pnl_confirmed},
-    )
-
-
-def check_real_exchange_closed(
-    position: TradePosition,
-    *,
-    current_price: float,
-    exchange_position_checker: Optional[ExchangePositionChecker],
-    closed_pnl_reader: Optional[ClosedPnlReader],
-) -> Optional[MonitorEvent]:
-    """Return a recovery event if a REAL position is no longer open on exchange."""
-    if position.mode != MODE_REAL or position.status == POSITION_PENDING_REAL_CONFIRM:
-        return None
-    if exchange_position_checker is None:
-        return None
-
-    try:
-        exists, error, raw = _exchange_position_exists(exchange_position_checker(position))
-    except Exception as exc:
-        return make_monitor_event(
-            event="EXCHANGE_POSITION_CHECK_FAILED",
-            position=position,
-            status=STATUS_FAILED,
-            metadata={"error": str(exc)},
-        )
-
-    if error:
-        return make_monitor_event(
-            event="EXCHANGE_POSITION_CHECK_FAILED",
-            position=position,
-            status=STATUS_FAILED,
-            metadata={"error": error, "raw": raw},
-        )
-
-    if exists:
-        return None
-
-    return handle_real_exchange_disappeared(
-        position,
-        current_price=current_price,
-        closed_pnl_reader=closed_pnl_reader,
-    )
-
-
-# =============================================================================
-# Main monitor function
-# =============================================================================
-
-def monitor_position_once(
-    position: TradePosition,
-    *,
-    current_price: float,
-    ai_monitor_decision: Optional[Any] = None,
-    close_executor: Optional[CloseExecutor] = None,
-    open_confirm_checker: Optional[OpenConfirmChecker] = None,
-    exchange_position_checker: Optional[ExchangePositionChecker] = None,
-    closed_pnl_reader: Optional[ClosedPnlReader] = None,
-) -> list[MonitorEvent]:
-    """
-    Monitor one position once.
-
-    ai_monitor_decision may be MonitorDecision, dict-like, or None.
-    """
-    events: list[MonitorEvent] = []
-
-    if position.status == POSITION_PENDING_REAL_CONFIRM and position.mode == MODE_REAL:
-        return handle_pending_real_confirmation(position, open_confirm_checker=open_confirm_checker)
-
-    if position.status == POSITION_CLOSED:
-        return []
-
-    # POSITION_CLOSING can happen after a previous close request. Keep monitoring REAL exchange state
-    # so delayed confirmations/TP-SL exchange closes do not leave slots stuck forever.
-    if position.status == POSITION_CLOSING and position.mode != MODE_REAL:
-        return []
-
-    price = safe_float(current_price, None)
-    if price is None or price <= 0:
-        return [
-            make_monitor_event(
-                event="PRICE_UNAVAILABLE",
-                position=position,
-                status=STATUS_FAILED,
-                metadata={"current_price": current_price},
-            )
-        ]
-
-    update_price_extremes(position.position_id, price)
-    position = get_position(position.position_id) or position
-
-    exchange_closed_event = check_real_exchange_closed(
-        position,
-        current_price=price,
-        exchange_position_checker=exchange_position_checker,
-        closed_pnl_reader=closed_pnl_reader,
-    )
-    if exchange_closed_event is not None:
-        events.append(exchange_closed_event)
-        return events
-
-    # SL has priority for risk accounting.
-    if is_sl_hit(position, price):
-        events.append(handle_sl(position, current_price=price, close_executor=close_executor))
-        return events
-
-    # TP2 for runner/position.
-    if position.status == POSITION_PARTIAL_TP1 and is_tp_hit(position, price, tp_number=2):
-        events.append(handle_tp2(position, current_price=price, close_executor=close_executor))
-        return events
-
-    # TP1 only once.
-    if not position.tp1_hit and is_tp_hit(position, price, tp_number=1):
-        events.append(handle_tp1(position, current_price=price, close_executor=close_executor))
-        return events
-
-    # AI/profit exit removed: monitor never closes just because AI reports
-    # weakness/reversal while the position is in profit. This avoids hidden
-    # early-profit exits and keeps lifecycle result logic limited to TP/SL or
-    # verified exchange/manual close recovery. ai_monitor_decision is accepted
-    # for backward-compatible function signatures but intentionally ignored.
-    _ = ai_monitor_decision
-
-    return events
-
-
-def monitor_positions_once(
-    *,
-    price_provider: PriceProvider,
-    ai_decision_provider: Optional[Callable[[TradePosition, float], Any]] = None,
-    close_executor: Optional[CloseExecutor] = None,
-    open_confirm_checker: Optional[OpenConfirmChecker] = None,
-    exchange_position_checker: Optional[ExchangePositionChecker] = None,
-    closed_pnl_reader: Optional[ClosedPnlReader] = None,
-) -> list[MonitorEvent]:
-    """Monitor all active positions once."""
-    events: list[MonitorEvent] = []
-
-    for position in get_active_monitor_positions():
-        price = safe_float(price_provider(position.symbol), None)
-        ai_decision = ai_decision_provider(position, price) if ai_decision_provider and price is not None else None
-        events.extend(
-            monitor_position_once(
-                position,
-                current_price=price or 0.0,
-                ai_monitor_decision=ai_decision,
-                close_executor=close_executor,
-                open_confirm_checker=open_confirm_checker,
-                exchange_position_checker=exchange_position_checker,
-                closed_pnl_reader=closed_pnl_reader,
-            )
-        )
-
-    return events
-
-
-# =============================================================================
-# Validation
-# =============================================================================
-
-def validate_monitor_event(event: MonitorEvent) -> dict[str, Any]:
-    """Lightweight validation for monitor event."""
-    errors: list[str] = []
-    if event.system_version != SYSTEM_VERSION:
-        errors.append("INVALID_SYSTEM_VERSION")
-    if not event.position_id:
-        errors.append("MISSING_POSITION_ID")
-    if not event.symbol:
-        errors.append("MISSING_SYMBOL")
-    if normalize_direction(event.direction) not in {DIRECTION_LONG, DIRECTION_SHORT}:
-        errors.append("INVALID_DIRECTION")
-    if event.status not in {STATUS_OK, STATUS_FAILED}:
-        errors.append("INVALID_STATUS")
-    return {
-        "valid": not errors,
-        "errors": errors,
-        "event": event.event,
-        "position_id": event.position_id,
-        "status": event.status,
-    }
-
-
 __all__ = [
-    "POSITION_MONITOR_VERSION",
-    "PriceProvider",
-    "CloseExecutor",
-    "OpenConfirmChecker",
-    "ExchangePositionChecker",
     "ClosedPnlReader",
-    "is_tp_hit",
-    "is_sl_hit",
-    "progress_to_tp1",
-    "calculate_mfe_mae",
-    "partial_tp1_quantities",
-    "protected_sl_after_tp1",
-    "make_outcome",
-    "make_monitor_event",
-    "normalize_close_result",
-    "close_real_position_verified",
-    "handle_pending_real_confirmation",
-    "handle_ghost_close",
-    "handle_real_close",
-    "handle_tp1",
-    "handle_tp2",
-    "handle_sl",
-    "infer_external_close_event",
-    "handle_real_exchange_disappeared",
-    "check_real_exchange_closed",
-    "monitor_position_once",
-    "monitor_positions_once",
-    "validate_monitor_event",
+    "ExchangeChecker",
+    "MonitorResult",
+    "PositionMonitor",
+    "PriceTick",
+    "ResultCallback",
+    "ResultPanelPayload",
+    "build_result_panel_payload",
+    "detect_tp_sl",
+    "estimate_pnl_usdt",
+    "infer_result_kind",
+    "move_pct",
 ]
