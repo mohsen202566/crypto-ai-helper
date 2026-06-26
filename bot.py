@@ -2,9 +2,9 @@
 
 Locked responsibility:
 - Owns the lightweight 5-second runtime loop.
-- Pulls market prices from OKX by default, or from an injected market adapter in tests.
-- Sends market snapshots to the existing strategy layer for the final decision.
-- Registers SIGNAL_ONLY when real trading is off, slots are full, or the strategy/TP-SL
+- Pulls market data from OKX by default, or from an injected market adapter in tests.
+- Sends 1H market snapshots to strategy_manager.py for the final Level 4 decision.
+- Registers SIGNAL when real trading is off, slots are full, or the strategy/TP-SL
   result says the trade should be monitored only.
 - Sends REAL requests only through real_trade_manager.py.
 - Runs position_monitor.py every cycle so TP/SL results are detected and recorded fast.
@@ -12,10 +12,11 @@ Locked responsibility:
 
 Design lock:
 - Small, simple, strong.
-- OKX price feed is the default; EmptyMarketDataProvider is only a test fallback.
+- OKX market feed is the default; EmptyMarketDataProvider is only a test fallback.
 - No Toobit direct calls here.
 - No TP/SL calculation here.
 - No indicator/AI/probability logic here.
+- Uses only one TP label and one SL label.
 - No extra runtime coordinator files.
 """
 
@@ -46,11 +47,9 @@ except Exception:  # pragma: no cover
     StateStore = Any  # type: ignore
 
 try:
-    from position_monitor import PositionMonitor, PriceTick, MonitorResult, build_result_panel_payload
+    from position_monitor import PositionMonitor, build_result_panel_payload
 except Exception:  # pragma: no cover
     PositionMonitor = Any  # type: ignore
-    PriceTick = Any  # type: ignore
-    MonitorResult = Any  # type: ignore
 
     def build_result_panel_payload(result: Any, fa_name: str = "") -> Any:  # type: ignore
         return result
@@ -71,9 +70,11 @@ except Exception:  # pragma: no cover
     real_trade_manager = None  # type: ignore
 
 
-BOT_VERSION = "simple_okx_level4_loop_v2"
+BOT_VERSION = "simple_okx_level4_loop_v3"
 DEFAULT_SCAN_INTERVAL_SECONDS = 5.0
 DEFAULT_OKX_BASE_URL = "https://www.okx.com"
+DEFAULT_CANDLE_LIMIT = 120
+DEFAULT_CANDLE_BAR = "1H"
 
 
 class MarketDataProvider(Protocol):
@@ -109,16 +110,20 @@ class CycleReport:
 
 
 class OKXMarketDataProvider:
-    """Small OKX public price adapter for USDT perpetual symbols.
+    """Small OKX public market adapter for USDT perpetual symbols.
 
-    It intentionally uses only stdlib urllib so the bot does not need a new
-    dependency on the VPS.  Input/output symbols stay in project format:
+    Input/output symbols stay in project format:
     DOGEUSDT -> OKX DOGE-USDT-SWAP -> DOGEUSDT.
+
+    For Level 4 the strategy needs 1H candles, not price-only ticks.  The bot
+    therefore asks this provider for a full market snapshot when available.
     """
 
     def __init__(self, *, base_url: str | None = None, timeout_seconds: float = 6.0) -> None:
         self.base_url = (base_url or os.getenv("OKX_BASE_URL") or DEFAULT_OKX_BASE_URL).rstrip("/")
         self.timeout_seconds = max(1.0, float(timeout_seconds))
+        self.candle_limit = int(_safe_float(os.getenv("OKX_CANDLE_LIMIT"), DEFAULT_CANDLE_LIMIT))
+        self.candle_bar = os.getenv("OKX_CANDLE_BAR", DEFAULT_CANDLE_BAR).strip() or DEFAULT_CANDLE_BAR
 
     def get_prices(self, symbols: Iterable[str]) -> Mapping[str, float]:
         wanted = [_normalize_symbol(symbol) for symbol in symbols]
@@ -133,6 +138,51 @@ class OKXMarketDataProvider:
             if price > 0:
                 prices[symbol] = price
         return prices
+
+    def get_market_snapshots(self, symbols: Iterable[str]) -> dict[str, dict[str, Any]]:
+        wanted = [_normalize_symbol(symbol) for symbol in symbols]
+        wanted = [symbol for symbol in wanted if symbol]
+        prices = dict(self.get_prices(wanted))
+        btc_candles = self.get_candles("BTCUSDT")
+
+        snapshots: dict[str, dict[str, Any]] = {}
+        for symbol in wanted:
+            candles = self.get_candles(symbol)
+            price = _safe_price(prices.get(symbol))
+            if price <= 0 and candles:
+                price = _safe_price(candles[-1].get("close"))
+            snapshots[symbol] = {
+                "symbol": symbol,
+                "source": "OKX",
+                "timeframe": self.candle_bar,
+                "price": price,
+                "candles": candles,
+                "btc_candles": btc_candles,
+            }
+        return snapshots
+
+    def get_candles(self, symbol: str) -> list[dict[str, float]]:
+        inst_id = _okx_swap_inst_id(symbol)
+        query = urllib.parse.urlencode({"instId": inst_id, "bar": self.candle_bar, "limit": self.candle_limit})
+        url = f"{self.base_url}/api/v5/market/candles?{query}"
+        payload = self._read_json(url)
+        rows = payload.get("data", []) if isinstance(payload, Mapping) else []
+        candles: list[dict[str, float]] = []
+        # OKX returns newest first. Strategy wants chronological oldest -> newest.
+        for row in reversed(rows):
+            if not isinstance(row, list) or len(row) < 6:
+                continue
+            candle = {
+                "timestamp": _safe_float(row[0], 0.0),
+                "open": _safe_price(row[1]),
+                "high": _safe_price(row[2]),
+                "low": _safe_price(row[3]),
+                "close": _safe_price(row[4]),
+                "volume": _safe_float(row[5], 0.0),
+            }
+            if candle["open"] > 0 and candle["high"] > 0 and candle["low"] > 0 and candle["close"] > 0:
+                candles.append(candle)
+        return candles
 
     def _get_swap_tickers(self, wanted: list[str]) -> dict[str, float]:
         url = f"{self.base_url}/api/v5/market/tickers?instType=SWAP"
@@ -218,11 +268,13 @@ class BotRuntime:
         symbols = self._active_watchlist()
 
         try:
-            prices = dict(self.market_data.get_prices(symbols))
+            snapshots = self._get_market_snapshots(symbols)
+            prices = {symbol: _safe_price(data.get("price")) for symbol, data in snapshots.items()}
         except Exception as exc:
             report.errors.append(f"market_data_error:{exc}")
             if self.config.stop_on_error:
                 raise
+            snapshots = {}
             prices = {}
 
         monitor_results = self._monitor_positions(prices)
@@ -230,11 +282,16 @@ class BotRuntime:
 
         for symbol in symbols:
             report.scanned_symbols.append(symbol)
-            price = _safe_price(prices.get(symbol))
+            market = dict(snapshots.get(symbol, {}))
+            price = _safe_price(market.get("price") or prices.get(symbol))
             if price <= 0:
                 continue
+            market["price"] = price
+            market.setdefault("prices", dict(prices))
+            market.setdefault("symbol", symbol)
+            market.setdefault("source", "OKX")
             try:
-                handled = self._handle_symbol(symbol, price, prices)
+                handled = self._handle_symbol(symbol, market)
                 if handled == "REAL":
                     report.real_requested += 1
                 elif handled == "SIGNAL":
@@ -246,6 +303,25 @@ class BotRuntime:
                 if self.config.stop_on_error:
                     raise
         return report
+
+    def _get_market_snapshots(self, symbols: Iterable[str]) -> dict[str, dict[str, Any]]:
+        provider_fn = getattr(self.market_data, "get_market_snapshots", None)
+        if callable(provider_fn):
+            raw = provider_fn(symbols)
+            if isinstance(raw, Mapping):
+                return {str(k).upper(): dict(v) for k, v in raw.items() if isinstance(v, Mapping)}
+        prices = dict(self.market_data.get_prices(symbols))
+        return {
+            _normalize_symbol(symbol): {
+                "symbol": _normalize_symbol(symbol),
+                "source": "OKX",
+                "price": _safe_price(prices.get(_normalize_symbol(symbol))),
+                "prices": prices,
+                "candles": [],
+                "btc_candles": [],
+            }
+            for symbol in symbols
+        }
 
     def _active_watchlist(self) -> list[str]:
         symbols: list[str] = []
@@ -266,7 +342,7 @@ class BotRuntime:
         except Exception:
             return []
 
-    def _handle_symbol(self, symbol: str, price: float, prices: Mapping[str, float]) -> str:
+    def _handle_symbol(self, symbol: str, market: Mapping[str, Any]) -> str:
         snapshot = self.store.snapshot()
         settings = getattr(snapshot, "settings", None)
         if not _setting_bool(settings, "auto_signal_enabled", DEFAULT_AUTO_SIGNAL_ENABLED):
@@ -274,8 +350,8 @@ class BotRuntime:
         if self.store.has_active_symbol(symbol):
             return ""
 
-        market = {"price": price, "prices": dict(prices), "symbol": symbol, "source": "OKX"}
-        decision = self.decision_provider(symbol, market)
+        market_for_strategy = _with_runtime_settings(market, settings)
+        decision = self.decision_provider(symbol, market_for_strategy)
         if not _decision_is_actionable(decision):
             return ""
 
@@ -284,13 +360,13 @@ class BotRuntime:
         can_open_real = bool(real_enabled and requested_real and self.store.can_open_real(symbol))
 
         if can_open_real:
-            result = _open_real(decision)
+            result = _open_real(decision, store=self.store, state=snapshot)
             if _open_result_ok(result):
-                self._notify_signal(decision, mode="REAL", raw_result=result)
+                self._notify_signal(decision, mode="TOOBIT", raw_result=result)
                 return "REAL"
             return ""
 
-        record = self._register_signal_only(decision, symbol=symbol, price=price)
+        record = self._register_signal_only(decision, symbol=symbol, price=_safe_price(market.get("price")))
         self._notify_signal(decision, mode="SIGNAL", raw_result=record)
         return "SIGNAL"
 
@@ -354,13 +430,16 @@ def _default_closed_pnl_reader(record: Any) -> Mapping[str, Any]:
     return fn(record)
 
 
-def _open_real(decision: Any) -> Any:
+def _open_real(decision: Any, *, store: StateStore | None = None, state: Any = None) -> Any:
     if real_trade_manager is None:
         return {"status": "FAILED", "error": "real_trade_manager_missing"}
     fn = getattr(real_trade_manager, "open_real_trade", None)
     if not callable(fn):
         return {"status": "FAILED", "error": "open_real_trade_missing"}
-    return fn(decision)
+    try:
+        return fn(decision, store=store, state=state)
+    except TypeError:
+        return fn(decision)
 
 
 def _open_result_ok(result: Any) -> bool:
@@ -410,11 +489,11 @@ def _entry(decision: Any, *, fallback: float) -> float:
 def _tp_sl(decision: Any) -> tuple[float, float]:
     plan = _get_value(decision, "tp_sl", None)
     if plan is not None:
-        tp = _safe_price(_get_value(plan, "tp1", 0.0) or _get_value(plan, "tp", 0.0))
+        tp = _safe_price(_get_value(plan, "tp", 0.0))
         sl = _safe_price(_get_value(plan, "sl", 0.0))
         if tp > 0 and sl > 0:
             return tp, sl
-    tp = _safe_price(_get_value(decision, "tp", 0.0) or _get_value(decision, "tp1", 0.0))
+    tp = _safe_price(_get_value(decision, "tp", 0.0))
     sl = _safe_price(_get_value(decision, "sl", 0.0) or _get_value(decision, "stop_loss", 0.0))
     if tp <= 0 or sl <= 0:
         raise ValueError("decision TP/SL missing")
@@ -434,10 +513,20 @@ def _get_value(obj: Any, key: str, default: Any = None) -> Any:
     return getattr(obj, key, default)
 
 
+def _with_runtime_settings(market: Mapping[str, Any], settings: Any) -> dict[str, Any]:
+    data = dict(market)
+    data.setdefault("real_trade_enabled", _setting_bool(settings, "real_trade_enabled", DEFAULT_REAL_TRADE_ENABLED))
+    data.setdefault("trade_dollar_usdt", _safe_float(_get_value(settings, "trade_dollar_usdt", 0.0), 0.0))
+    data.setdefault("trade_margin_usdt", data.get("trade_dollar_usdt"))
+    data.setdefault("leverage", int(_safe_float(_get_value(settings, "leverage", 1), 1)))
+    data.setdefault("min_net_profit_usdt", _safe_float(_get_value(settings, "min_net_profit_usdt", 0.10), 0.10))
+    return data
+
+
 def _setting_bool(settings: Any, name: str, default: bool) -> bool:
     value = _get_value(settings, name, default)
     if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "on", "enabled"}
+        return value.strip().lower() in {"1", "true", "yes", "on", "enabled", "فعال"}
     return bool(value)
 
 
@@ -480,31 +569,88 @@ def _fa_name(symbol: str) -> str:
         return symbol
 
 
+def _confidence_pct(decision: Any) -> float:
+    value = _safe_float(_get_value(decision, "confidence", 0.0), 0.0)
+    return value if value > 1.0 else value * 100.0
+
+
+def _estimated_profit(decision: Any) -> float:
+    metadata = _get_value(decision, "metadata", {})
+    if isinstance(metadata, Mapping):
+        value = _safe_float(metadata.get("net_profit_usdt"), 0.0)
+        if value != 0:
+            return value
+    entry = _entry(decision, fallback=0.0)
+    tp, _sl = _tp_sl(decision)
+    if entry <= 0:
+        return 0.0
+    return abs(tp - entry)
+
+
+def _estimated_move_pct(decision: Any) -> float:
+    entry = _entry(decision, fallback=0.0)
+    tp, _sl = _tp_sl(decision)
+    if entry <= 0:
+        return 0.0
+    if _direction(decision, allow_empty=True) == "SHORT":
+        return (entry - tp) / entry * 100.0
+    return (tp - entry) / entry * 100.0
+
+
 def _build_signal_payload(decision: Any, *, mode: str, raw_result: Any) -> Any:
     if telegram_ui is not None:
-        for name in ("build_signal_payload", "format_signal", "render_signal"):
-            fn = getattr(telegram_ui, name, None)
-            if callable(fn):
-                try:
-                    return fn(decision=decision, mode=mode, result=raw_result)
-                except TypeError:
-                    try:
-                        return fn(decision, mode, raw_result)
-                    except TypeError:
-                        pass
+        data_cls = getattr(telegram_ui, "SignalMessageData", None)
+        render = getattr(telegram_ui, "render_signal", None)
+        if callable(data_cls) and callable(render):
+            symbol = _normalize_symbol(_get_value(decision, "symbol", _get_value(raw_result, "symbol", "")))
+            tp, sl = _tp_sl(decision)
+            data = data_cls(
+                mode="TOOBIT" if str(mode).upper() in {"REAL", "TOOBIT"} else "SIGNAL",
+                fa_name=_fa_name(symbol),
+                symbol=symbol,
+                direction=_direction(decision),
+                confidence_pct=_confidence_pct(decision),
+                estimated_profit_usdt=_estimated_profit(decision),
+                estimated_move_pct=_estimated_move_pct(decision),
+                entry=_entry(decision, fallback=_safe_price(_get_value(raw_result, "entry", 0.0))),
+                tp=tp,
+                sl=sl,
+            )
+            return render(data)
     return {"type": "signal", "mode": mode, "decision": decision, "result": raw_result}
 
 
 def _build_result_payload(result_payload: Any) -> Any:
     if telegram_ui is not None:
-        for name in ("build_result_payload", "format_result", "render_result"):
-            fn = getattr(telegram_ui, name, None)
-            if callable(fn):
-                try:
-                    return fn(result_payload)
-                except TypeError:
-                    pass
+        render = getattr(telegram_ui, "render_result", None)
+        result_cls = getattr(telegram_ui, "ResultMessageData", None)
+        if callable(render):
+            if _looks_like_result_message_data(result_payload):
+                return render(result_payload)
+            if callable(result_cls):
+                result_kind = _get_value(result_payload, "result", None)
+                if result_kind in {"TP", "SL"}:
+                    symbol = _normalize_symbol(_get_value(result_payload, "symbol", ""))
+                    data = result_cls(
+                        mode=_get_value(result_payload, "mode", "SIGNAL"),
+                        fa_name=_get_value(result_payload, "fa_name", "") or _fa_name(symbol),
+                        symbol=symbol,
+                        direction=_direction(result_payload),
+                        result=result_kind,
+                        entry=_safe_price(_get_value(result_payload, "entry", 0.0)),
+                        exit_price=_safe_price(_get_value(result_payload, "exit_price", 0.0)),
+                        pnl_usdt=_safe_float(_get_value(result_payload, "pnl_usdt", 0.0), 0.0),
+                        move_pct=_safe_float(_get_value(result_payload, "move_pct", 0.0), 0.0),
+                        duration_minutes=int(_safe_float(_get_value(result_payload, "duration_minutes", 0), 0.0)),
+                        close_reason=str(_get_value(result_payload, "reason", "") or _get_value(result_payload, "close_reason", "")),
+                    )
+                    return render(data)
     return {"type": "result", "result": result_payload}
+
+
+def _looks_like_result_message_data(value: Any) -> bool:
+    required = ("mode", "symbol", "direction", "result", "entry", "exit_price", "pnl_usdt", "move_pct", "duration_minutes")
+    return all(hasattr(value, item) for item in required)
 
 
 def _default_notifier(payload: Any) -> None:
