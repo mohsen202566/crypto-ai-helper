@@ -45,6 +45,9 @@ class TradePanelData:
     max_slots: int
     open_positions: int
     free_slots: int
+    pending_real_slots: int = 0
+    active_real_slots: int = 0
+    cancelled_signals: int = 0
 
 
 @dataclass(frozen=True)
@@ -87,6 +90,7 @@ class ResultMessageData:
     pnl_usdt: float
     move_pct: float
     duration_minutes: int
+    close_reason: str = ""
 
 
 def render_trade_panel(data: TradePanelData) -> str:
@@ -107,7 +111,10 @@ def render_trade_panel(data: TradePanelData) -> str:
             "",
             f"📦 حداکثر اسلات: {data.max_slots}",
             f"📂 پوزیشن‌های باز: {data.open_positions}",
+            f"⏳ در انتظار تایید: {data.pending_real_slots}",
+            f"🟢 REAL فعال: {data.active_real_slots}",
             f"📭 اسلات خالی: {data.free_slots}",
+            f"🚫 لغوشده‌ها: {data.cancelled_signals}",
         ]
     )
 
@@ -149,7 +156,7 @@ def render_signal(data: SignalMessageData) -> str:
             f"{move_icon} حرکت تخمینی: {data.estimated_move_pct:+.2f}%",
             "",
             f"💵 ورود: {_price(data.entry)}",
-            f"🎯 TP1: {_price(data.tp)}",
+            f"🎯 TP: {_price(data.tp)}",
             f"🛑 SL: {_price(data.sl)}",
         ]
     )
@@ -174,8 +181,30 @@ def render_result(data: ResultMessageData) -> str:
             f"💰 سود/ضرر: {data.pnl_usdt:+.2f} USDT {pnl_icon}",
             f"📊 حرکت: {data.move_pct:+.2f}%",
             f"⏱️ زمان: {data.duration_minutes} دقیقه",
+            *_optional_reason(data.close_reason),
         ]
     )
+
+
+def render_signal_status(status: str, close_reason: str = "") -> str:
+    normalized = str(status or "").upper().strip()
+    if normalized == "PENDING_OPEN":
+        return "⏳ در انتظار تایید پوزیشن واقعی"
+    if normalized == "MONITORING":
+        return "🟢 در حال مانیتورینگ"
+    if normalized == "CLOSED":
+        return "✅ بسته شده"
+    if normalized == "CANCELLED":
+        reason = str(close_reason or "").strip()
+        return "🚫 لغو شد" + (f" — {reason}" if reason else "")
+    return "ℹ️ وضعیت نامشخص"
+
+
+def _optional_reason(reason: str) -> list[str]:
+    text = str(reason or "").strip()
+    if not text:
+        return []
+    return [f"📝 دلیل: {text}"]
 
 
 def render_invalid_value(command_name: str, min_value: float | int, max_value: float | int) -> str:
@@ -187,7 +216,7 @@ def _direction_label(direction: Direction) -> str:
 
 
 def _result_label(result: ResultKind) -> str:
-    return "✅ TP1 خورد" if result == "TP" else "❌ SL خورد"
+    return "✅ TP خورد" if result == "TP" else "❌ SL خورد"
 
 
 def _price(value: float) -> str:
@@ -208,5 +237,6 @@ __all__ = [
     "render_stats_panel",
     "render_signal",
     "render_result",
+    "render_signal_status",
     "render_invalid_value",
 ]
