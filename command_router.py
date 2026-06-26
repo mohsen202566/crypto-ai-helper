@@ -1,333 +1,470 @@
-"""
-command_router.py
-Level 4 / 1H Smart Scalp Bot
+"""Telegram command router for Crypto AI Helper bot.
 
-Telegram command routing layer.
+Locked responsibility:
+- Parses user commands and updates/reads StateStore settings.
+- Renders command responses through telegram_ui.py data models/renderers.
+- May call injected status/reset hooks, but never talks to OKX or Toobit directly.
+- Does not analyze markets, decide entries, calculate TP/SL, open/close orders, or manage learning.
 
-Architecture lock:
-- Parses user text and returns a lightweight CommandRoute.
-- Does not execute trades, make AI decisions, fetch market data, monitor positions,
-  write JSON state, call Toobit, or send Telegram messages.
-- bot.py is responsible for executing the route.
-- Allowed project imports:
-  constants.py, utils.py, telegram_ui.py only.
+Design lock:
+- Small, simple, strong.
+- Persian commands are the public interface.
+- Level 4 / 1H Smart Scalp is the only active strategy command here.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Mapping, Optional
+from dataclasses import dataclass
+from typing import Any, Callable, Mapping
 
-from constants import STATUS_FAILED, STATUS_OK, STRATEGY_LEVEL, SYSTEM_VERSION
-from telegram_ui import render_help, render_unknown_command
-from utils import normalize_symbol, safe_float, safe_int, safe_str, utc_now_iso
+from config import (
+    CMD_AI,
+    CMD_COINS,
+    CMD_MAX_POSITIONS,
+    CMD_MIN_NET_PROFIT,
+    CMD_POSITIONS,
+    CMD_SETTINGS,
+    CMD_STATS,
+    CMD_TRADE,
+    CMD_TRADE_CAPITAL,
+    CMD_TRADE_DOLLAR,
+    CMD_TRADE_LEVERAGE,
+    CMD_TRADE_OFF,
+    CMD_TRADE_ON,
+    LEVERAGE_MAX,
+    LEVERAGE_MIN,
+    MAX_POSITIONS_MAX,
+    MAX_POSITIONS_MIN,
+    MIN_NET_PROFIT_MAX,
+    MIN_NET_PROFIT_MIN,
+    TARGET_HOLD_MINUTES,
+    TIMEFRAME,
+    TRADE_CAPITAL_MAX,
+    TRADE_CAPITAL_MIN,
+    TRADE_DOLLAR_MAX,
+    TRADE_DOLLAR_MIN,
+    WATCHLIST,
+)
+from state_store import StateStore
+from telegram_ui import StatsPanelData, TradePanelData, render_invalid_value, render_stats_panel, render_trade_panel
 
-
-COMMAND_ROUTER_VERSION: str = SYSTEM_VERSION
-
-
-@dataclass
-class CommandRoute:
-    action: str
-    status: str = STATUS_OK
-    args: dict[str, Any] = field(default_factory=dict)
-    raw_text: str = ""
-    reply_text: str = ""
-    reason: str = ""
-    created_at: str = field(default_factory=utc_now_iso)
-    system_version: str = SYSTEM_VERSION
-
-
-def normalize_text(text: Any) -> str:
-    t = safe_str(text).strip()
-    replacements = {"ي": "ی", "ك": "ک", "\u200c": " ", "\n": " ", "\t": " "}
-    for old, new in replacements.items():
-        t = t.replace(old, new)
-    while "  " in t:
-        t = t.replace("  ", " ")
-    return t.strip()
-
-
-def text_tokens(text: str) -> list[str]:
-    return [x for x in normalize_text(text).split(" ") if x]
-
-
-def contains_any(text: str, words: set[str]) -> bool:
-    normalized = normalize_text(text).lower()
-    return any(w.lower() in normalized for w in words)
+try:
+    import strategy_manager
+except Exception:  # pragma: no cover - router must compile without optional project layer.
+    strategy_manager = None  # type: ignore
 
 
-def first_number(text: str) -> Optional[int]:
-    for token in text_tokens(text):
-        cleaned = token.replace("x", "").replace("X", "")
-        value = safe_int(cleaned, None)
+CommandStatus = str
+StatusProvider = Callable[[], Mapping[str, Any]]
+ResetHook = Callable[[str], Mapping[str, Any] | None]
+ReplySender = Callable[[str], None]
+
+
+@dataclass(frozen=True)
+class CommandResult:
+    status: CommandStatus
+    handled: bool
+    text: str
+    command: str = ""
+    metadata: dict[str, Any] | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.status == "OK"
+
+
+class CommandRouter:
+    """Small Telegram command parser.
+
+    The router owns commands only.  It writes settings through StateStore and
+    reads status either from StateStore or from an injected status_provider.
+    """
+
+    def __init__(
+        self,
+        store: StateStore,
+        *,
+        status_provider: StatusProvider | None = None,
+        reset_hook: ResetHook | None = None,
+        reply_sender: ReplySender | None = None,
+    ) -> None:
+        self.store = store
+        self.status_provider = status_provider
+        self.reset_hook = reset_hook
+        self.reply_sender = reply_sender
+
+    def handle(self, text: str) -> CommandResult:
+        raw = _clean(text)
+        normalized = _normalize_command(raw)
+        if not normalized:
+            return CommandResult(status="IGNORED", handled=False, text="", command="")
+
+        try:
+            result = self._handle_normalized(normalized, raw)
+        except ValueError as exc:
+            result = CommandResult(status="FAILED", handled=True, text=f"❌ {exc}", command=normalized)
+        except Exception as exc:
+            result = CommandResult(status="FAILED", handled=True, text=f"❌ خطای دستور: {exc}", command=normalized)
+
+        if result.handled and result.text and self.reply_sender is not None:
+            self.reply_sender(result.text)
+        return result
+
+    def _handle_normalized(self, normalized: str, raw: str) -> CommandResult:
+        if normalized in {"راهنما", "help", "/start", "start"}:
+            return _ok(normalized, render_help())
+
+        if normalized in {_normalize_command(CMD_TRADE_ON), "trade on", "real on"}:
+            self.store.set_real_trade_enabled(True)
+            return _ok(normalized, "✅ ترید واقعی فعال شد.\nاز این به بعد اگر همه شروط قفل‌شده پاس شود، مسیر REAL مجاز است.")
+
+        if normalized in {_normalize_command(CMD_TRADE_OFF), "trade off", "real off"}:
+            self.store.set_real_trade_enabled(False)
+            return _ok(normalized, "✅ ترید واقعی خاموش شد.\nسیگنال‌ها فقط به حالت SIGNAL ذخیره و مانیتور می‌شوند.")
+
+        if normalized in {"اتو سیگنال فعال", "auto on", "signal on"}:
+            self.store.set_auto_signal_enabled(True)
+            return _ok(normalized, "✅ اتو سیگنال فعال شد.")
+
+        if normalized in {"اتو سیگنال خاموش", "auto off", "signal off"}:
+            self.store.set_auto_signal_enabled(False)
+            return _ok(normalized, "✅ اتو سیگنال خاموش شد.")
+
+        if normalized in {_normalize_command(CMD_TRADE), _normalize_command(CMD_SETTINGS), "پنل", "وضعیت", "status"}:
+            return _ok(normalized, self.render_trade_panel())
+
+        if normalized in {_normalize_command(CMD_STATS), "stats"}:
+            return _ok(normalized, self.render_stats_panel())
+
+        if normalized in {_normalize_command(CMD_COINS), "coins", "واچ لیست", "واچ‌لیست"}:
+            return _ok(normalized, render_coin_list())
+
+        if normalized in {_normalize_command(CMD_POSITIONS), "positions", "پوزیشن ها", "پوزیشن‌ها"}:
+            return _ok(normalized, self.render_positions())
+
+        if normalized in {_normalize_command(CMD_AI), "ai"}:
+            return _ok(normalized, render_ai_status())
+
+        if normalized in {"استراتژی", "وضعیت استراتژی", "لیست استراتژی"}:
+            return _ok(normalized, render_strategy_status())
+
+        if normalized.startswith("استراتژی لول") or normalized.startswith("strategy level"):
+            level = _last_int(raw)
+            if level != 4:
+                return CommandResult(
+                    status="FAILED",
+                    handled=True,
+                    text="❌ فقط استراتژی لول 4 قفل و فعال است.\nدستور درست: استراتژی لول 4",
+                    command=normalized,
+                )
+            _set_strategy_level_4()
+            return _ok(normalized, "✅ استراتژی روی لول 4 تنظیم شد.\n⏱️ تایم‌فریم: 1H\n🎯 هدف: Smart Scalp با کیفیت ورود، نه دنبال‌کردن حرکت")
+
+        # Numeric setting commands.  Persian command name + one numeric value.
+        if normalized.startswith(_normalize_command(CMD_TRADE_DOLLAR)):
+            value = _required_float(raw, CMD_TRADE_DOLLAR)
+            self.store.set_trade_dollar(value)
+            return _ok(normalized, f"✅ دلار هر پوزیشن روی {value:.2f} USDT تنظیم شد.")
+
+        if normalized.startswith(_normalize_command(CMD_TRADE_LEVERAGE)):
+            value = _required_int(raw, CMD_TRADE_LEVERAGE)
+            self.store.set_leverage(value)
+            return _ok(normalized, f"✅ لوریج روی {value}x تنظیم شد.")
+
+        if normalized.startswith(_normalize_command(CMD_TRADE_CAPITAL)):
+            value = _required_float(raw, CMD_TRADE_CAPITAL)
+            self.store.set_trade_capital(value)
+            return _ok(normalized, f"✅ سرمایه مجاز ربات روی {value:.2f} USDT تنظیم شد.")
+
+        if normalized.startswith(_normalize_command(CMD_MAX_POSITIONS)):
+            value = _required_int(raw, CMD_MAX_POSITIONS)
+            self.store.set_max_slots(value)
+            return _ok(normalized, f"✅ حداکثر پوزیشن همزمان روی {value} تنظیم شد.")
+
+        if normalized.startswith(_normalize_command(CMD_MIN_NET_PROFIT)):
+            value = _required_float(raw, CMD_MIN_NET_PROFIT)
+            self.store.set_min_net_profit(value)
+            return _ok(normalized, f"✅ حداقل سود خالص روی {value:.2f} USDT تنظیم شد.")
+
+        if normalized in {"ریست آمار", "reset stats"}:
+            return self._reset("stats")
+
+        if normalized in {"ریست سیگنال", "ریست سیگنال‌ها", "reset signals"}:
+            return self._reset("signals")
+
+        return CommandResult(status="IGNORED", handled=False, text="", command=normalized)
+
+    def _reset(self, kind: str) -> CommandResult:
+        if self.reset_hook is not None:
+            data = self.reset_hook(kind) or {}
+            if data.get("error"):
+                return CommandResult(status="FAILED", handled=True, text=f"❌ ریست انجام نشد: {data.get('error')}", command=f"reset:{kind}")
+        else:
+            _local_reset(self.store, kind)
+        label = "آمار" if kind == "stats" else "سیگنال‌ها"
+        return _ok(f"reset:{kind}", f"✅ ریست {label} انجام شد.")
+
+    def render_trade_panel(self) -> str:
+        snapshot = self.store.snapshot()
+        settings = snapshot.settings
+        live_status = self._status_snapshot()
+        toobit_margin = _first_not_none(live_status.get("toobit_margin_usdt"), live_status.get("margin_usdt"), snapshot.toobit_margin_usdt)
+        open_positions = int(_first_not_none(live_status.get("toobit_open_total"), live_status.get("open_positions"), snapshot.used_slots) or 0)
+        free_slots = max(0, int(settings.max_slots) - open_positions)
+        data = TradePanelData(
+            auto_signal_enabled=bool(settings.auto_signal_enabled),
+            real_trade_enabled=bool(settings.real_trade_enabled),
+            toobit_margin_usdt=None if toobit_margin is None else float(toobit_margin),
+            trade_capital_usdt=float(settings.trade_capital_usdt),
+            trade_dollar_usdt=float(settings.trade_dollar_usdt),
+            leverage=int(settings.leverage),
+            min_net_profit_usdt=float(settings.min_net_profit_usdt),
+            max_slots=int(settings.max_slots),
+            open_positions=open_positions,
+            free_slots=free_slots,
+        )
+        return render_trade_panel(data)
+
+    def render_stats_panel(self) -> str:
+        stats = self.store.snapshot().stats
+        return render_stats_panel(
+            StatsPanelData(
+                real_signals=int(stats.real_signals),
+                real_monitoring=int(stats.real_monitoring),
+                real_tp=int(stats.real_tp),
+                real_sl=int(stats.real_sl),
+                real_win_rate=float(stats.real_win_rate),
+                real_pnl_usdt=float(stats.real_pnl_usdt),
+                signal_only_total=int(stats.signal_only_total),
+                signal_only_tp=int(stats.signal_only_tp),
+                signal_only_sl=int(stats.signal_only_sl),
+                signal_only_win_rate=float(stats.signal_only_win_rate),
+            )
+        )
+
+    def render_positions(self) -> str:
+        active = list(self.store.snapshot().active_signals.values())
+        if not active:
+            return "📭 پوزیشن/سیگنال فعالی وجود ندارد."
+        lines = ["📂 پوزیشن‌ها و سیگنال‌های فعال", ""]
+        for item in active:
+            mode = "🏦 توبیت" if item.mode == "TOOBIT" else "📊 سیگنال"
+            direction = "لانگ 🟢" if item.direction == "LONG" else "شورت 🔴"
+            lines.extend([
+                f"{mode} | {item.symbol}",
+                f"جهت: {direction}",
+                f"ورود: {item.entry}",
+                f"TP: {item.tp}",
+                f"SL: {item.sl}",
+                f"وضعیت: {item.status}",
+                "",
+            ])
+        return "\n".join(lines).strip()
+
+    def _status_snapshot(self) -> dict[str, Any]:
+        if self.status_provider is None:
+            return {}
+        try:
+            data = self.status_provider()
+            return dict(data) if isinstance(data, Mapping) else {}
+        except Exception:
+            return {}
+
+
+def handle_command(
+    text: str,
+    *,
+    store: StateStore | None = None,
+    status_provider: StatusProvider | None = None,
+    reset_hook: ResetHook | None = None,
+    reply_sender: ReplySender | None = None,
+) -> CommandResult:
+    router = CommandRouter(store or StateStore(), status_provider=status_provider, reset_hook=reset_hook, reply_sender=reply_sender)
+    return router.handle(text)
+
+
+def render_help() -> str:
+    return "\n".join([
+        "📌 دستورات ربات",
+        "",
+        "ترید / وضعیت / تنظیمات",
+        "ترید فعال",
+        "ترید خاموش",
+        "اتو سیگنال فعال",
+        "اتو سیگنال خاموش",
+        "",
+        "ترید دلار 7",
+        "ترید لوریج 10",
+        "سرمایه ترید 100",
+        "حداکثر پوزیشن 1",
+        "حداقل سود خالص 0.10",
+        "",
+        "استراتژی لول 4",
+        "آمار",
+        "پوزیشن",
+        "کوین‌ها",
+        "ریست آمار",
+        "ریست سیگنال‌ها",
+    ])
+
+
+def render_coin_list() -> str:
+    lines = ["🪙 کوین‌های قفل‌شده Level 4 / 1H", ""]
+    for symbol, coin in WATCHLIST.items():
+        lines.append(f"• {coin.fa_name} | {symbol}")
+    return "\n".join(lines)
+
+
+def render_ai_status() -> str:
+    return "\n".join([
+        "🧠 وضعیت تصمیم‌گیری",
+        "لول فعال: 4",
+        f"تایم‌فریم: {TIMEFRAME}",
+        f"هدف نگهداری: {TARGET_HOLD_MINUTES[0]} تا {TARGET_HOLD_MINUTES[1]} دقیقه",
+        "ورود: کیفیت محور، نه دنبال‌کردن حرکت",
+    ])
+
+
+def render_strategy_status() -> str:
+    return "\n".join([
+        "📌 استراتژی فعال",
+        "Level 4 / 1H Smart Scalp",
+        "فقط همین لول برای سیگنال‌های جدید فعال است.",
+        "دستور تغییر: استراتژی لول 4",
+    ])
+
+
+def _set_strategy_level_4() -> None:
+    if strategy_manager is None:
+        return
+    for name in ("set_strategy_level", "set_active_strategy", "activate_strategy_level"):
+        fn = getattr(strategy_manager, name, None)
+        if callable(fn):
+            try:
+                fn(4)
+                return
+            except TypeError:
+                try:
+                    fn(level=4)
+                    return
+                except TypeError:
+                    continue
+
+
+def _local_reset(store: StateStore, kind: str) -> None:
+    state = store.snapshot()
+    if kind == "stats":
+        # Preserve active records; reset closed counters only.
+        from state_store import StatsState
+
+        state.stats = StatsState()
+        for record in state.active_signals.values():
+            if record.mode == "TOOBIT":
+                state.stats.real_signals += 1
+                state.stats.real_monitoring += 1
+            else:
+                state.stats.signal_only_total += 1
+                state.stats.signal_only_monitoring += 1
+        store.save()
+        return
+    if kind == "signals":
+        state.active_signals.clear()
+        store._recalculate_monitoring_counts()  # noqa: SLF001 - command-level maintenance hook.
+        store.save()
+        return
+    raise ValueError("نوع ریست نامعتبر است.")
+
+
+def _required_float(raw: str, command_name: str) -> float:
+    values = _numbers(raw)
+    if not values:
+        raise ValueError(f"برای دستور «{command_name}» عدد وارد کن.")
+    value = float(values[-1])
+    _validate_command_range(command_name, value)
+    return value
+
+
+def _required_int(raw: str, command_name: str) -> int:
+    value = int(_required_float(raw, command_name))
+    _validate_command_range(command_name, value)
+    return value
+
+
+def _validate_command_range(command_name: str, value: float | int) -> None:
+    ranges: dict[str, tuple[float | int, float | int]] = {
+        CMD_TRADE_DOLLAR: (TRADE_DOLLAR_MIN, TRADE_DOLLAR_MAX),
+        CMD_TRADE_LEVERAGE: (LEVERAGE_MIN, LEVERAGE_MAX),
+        CMD_TRADE_CAPITAL: (TRADE_CAPITAL_MIN, TRADE_CAPITAL_MAX),
+        CMD_MAX_POSITIONS: (MAX_POSITIONS_MIN, MAX_POSITIONS_MAX),
+        CMD_MIN_NET_PROFIT: (MIN_NET_PROFIT_MIN, MIN_NET_PROFIT_MAX),
+    }
+    if command_name not in ranges:
+        return
+    lo, hi = ranges[command_name]
+    if not float(lo) <= float(value) <= float(hi):
+        raise ValueError(render_invalid_value(command_name, lo, hi))
+
+
+def _numbers(raw: str) -> list[float]:
+    normalized = _persian_digits_to_english(raw).replace(",", ".")
+    out: list[float] = []
+    token = ""
+    for char in normalized:
+        if char.isdigit() or char in {".", "-"}:
+            token += char
+        else:
+            if token not in {"", ".", "-"}:
+                try:
+                    out.append(float(token))
+                except ValueError:
+                    pass
+            token = ""
+    if token not in {"", ".", "-"}:
+        try:
+            out.append(float(token))
+        except ValueError:
+            pass
+    return out
+
+
+def _last_int(raw: str) -> int | None:
+    values = _numbers(raw)
+    return None if not values else int(values[-1])
+
+
+def _clean(text: str) -> str:
+    return str(text or "").strip()
+
+
+def _normalize_command(text: str) -> str:
+    text = _persian_digits_to_english(text)
+    text = text.replace("\u200c", " ").replace("_", " ").replace("-", " ")
+    text = " ".join(text.strip().split())
+    return text.lower()
+
+
+def _persian_digits_to_english(text: str) -> str:
+    table = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+    return text.translate(table)
+
+
+def _first_not_none(*values: Any) -> Any:
+    for value in values:
         if value is not None:
             return value
     return None
 
 
-def first_float(text: str) -> Optional[float]:
-    for token in text_tokens(text):
-        cleaned = token.replace("$", "").replace(",", ".")
-        value = safe_float(cleaned, None)
-        if value is not None:
-            return value
-    return None
-
-
-def route(action: str, *, text: str = "", args: Optional[Mapping[str, Any]] = None, reply_text: str = "", reason: str = "", status: str = STATUS_OK) -> CommandRoute:
-    return CommandRoute(action=action, status=status, args=dict(args or {}), raw_text=text, reply_text=reply_text, reason=reason)
-
-
-def route_unknown(text: str = "") -> CommandRoute:
-    return route("UNKNOWN", text=text, reply_text=render_unknown_command(), reason="unknown_command", status=STATUS_FAILED)
-
-
-def _attach_context(command_route: CommandRoute, *, user_id: Optional[int] = None, chat_id: Optional[int] = None) -> CommandRoute:
-    if user_id is not None:
-        command_route.args["user_id"] = user_id
-    if chat_id is not None:
-        command_route.args["chat_id"] = chat_id
-    return command_route
-
-
-def parse_strategy_level(text: str) -> Optional[int]:
-    normalized = normalize_text(text).lower()
-    if "استراتژی" not in normalized and "strategy" not in normalized:
-        return None
-    if "لول" not in normalized and "level" not in normalized:
-        return None
-    value = first_number(normalized)
-    if value is None:
-        return None
-    if 1 <= value <= 9:
-        return value
-    return None
-
-
-def parse_symbol(text: str) -> str:
-    for token in text_tokens(text):
-        upper = token.upper().replace("/", "").replace("-", "")
-        if upper.endswith("USDT") and len(upper) >= 6:
-            return normalize_symbol(upper)
-    return ""
-
-
-def parse_runtime_update(text: str) -> Optional[CommandRoute]:
-    normalized = normalize_text(text).lower()
-
-    # Position-count commands must be parsed before the short "حداکثر" margin command.
-    if any(x in normalized for x in [
-        "حداکثر پوزیشن", "max position", "max_positions", "مکس پوزیشن",
-        "حداکثر معامله", "max trades", "max positions",
-    ]):
-        value = first_number(normalized)
-        if value is not None and value > 0:
-            return route("SET_MAX_POSITIONS", text=text, args={"max_positions": value})
-
-    # AI dynamic margin range:
-    # User-facing simple commands:
-    #   حداقل 5
-    #   حداکثر 15
-    # Also accepts explicit forms such as:
-    #   ترید دلار حداقل 5
-    #   ترید دلار حداکثر 15
-    if any(x in normalized for x in [
-        "حداقل", "مینیمم", "کمترین",
-        "min margin", "minimum margin", "min trade", "minimum trade",
-    ]):
-        value = first_float(normalized)
-        if value is not None:
-            return route("SET_MIN_MARGIN", text=text, args={"min_margin_usdt": value})
-
-    if any(x in normalized for x in [
-        "حداکثر", "ماکزیمم", "بیشترین",
-        "max margin", "maximum margin", "max trade", "maximum trade",
-    ]):
-        value = first_float(normalized)
-        if value is not None:
-            return route("SET_MAX_MARGIN", text=text, args={"max_margin_usdt": value})
-
-    if any(x in normalized for x in [
-        "مارجین", "margin", "مبلغ",
-        "ترید دلار", "دلار ترید", "حجم ترید", "trade dollar", "trade dollars",
-        "سرمایه ترید", "مقدار ترید",
-    ]):
-        value = first_float(normalized)
-        if value is not None and value > 0:
-            return route("SET_MARGIN", text=text, args={"margin_usdt": value})
-
-    if any(x in normalized for x in ["لوریج", "leverage", "اهرم"]):
-        value = first_number(normalized)
-        if value is not None and value > 0:
-            return route("SET_LEVERAGE", text=text, args={"leverage": value})
-
-    if normalized in {"ریست ترید", "ریست تنظیمات ترید", "reset trade", "reset settings"}:
-        return route("RESET_TRADE_SETTINGS", text=text)
-
-    return None
-
-
-def parse_trade_toggle(text: str) -> Optional[CommandRoute]:
-    normalized = normalize_text(text).lower()
-
-    if "ترید" in normalized or "trade" in normalized:
-        if any(x in normalized for x in ["فعال", "روشن", "on", "enable", "enabled"]):
-            if not any(x in normalized for x in ["غیرفعال", "خاموش", "off", "disable", "disabled"]):
-                return route("ENABLE_REAL_TRADING", text=text)
-        if any(x in normalized for x in ["غیرفعال", "خاموش", "off", "disable", "disabled"]):
-            return route("DISABLE_REAL_TRADING", text=text)
-
-    if any(x in normalized for x in ["emergency", "اضطراری", "توقف فوری", "استاپ فوری"]):
-        return route("EMERGENCY_STOP", text=text)
-
-    return None
-
-
-def parse_status_commands(text: str) -> Optional[CommandRoute]:
-    normalized = normalize_text(text).lower()
-
-    if normalized in {"راهنما", "help", "/help", "دستورات", "/start", "start"}:
-        return route("HELP", text=text, reply_text=render_help())
-
-    if normalized in {"لیست استراتژی", "لیست استراتژی ها", "لیست استراتژی‌ها", "strategy list", "list strategies"}:
-        return route("LIST_STRATEGIES", text=text)
-
-    if normalized in {"استراتژی", "وضعیت استراتژی", "strategy", "strategy status"}:
-        return route("SHOW_STRATEGY", text=text)
-
-    if normalized in {"وضعیت", "status", "/status"}:
-        return route("SHOW_STATUS", text=text)
-
-    if normalized in {"پوزیشن ها", "پوزیشن‌ها", "positions", "open positions", "پوزیشن"}:
-        return route("SHOW_POSITIONS", text=text)
-
-    if normalized in {"حذف آمار", "حذف امار", "ریست آمار", "ریست امار", "reset stats"}:
-        return route("RESET_STATS", text=text)
-
-    if normalized in {"آمار", "امار", "stats", "statistics"}:
-        return route("SHOW_STATS", text=text)
-
-    if normalized in {
-        "هوش مصنوعی", "ai", "ai status", "وضعیت هوش مصنوعی",
-        "آمار هوشمند", "امار هوشمند", "حافظه ربات",
-    }:
-        return route("SHOW_AI_STATUS", text=text)
-
-    if normalized in {
-        "ترید", "trade",
-        "تنظیمات", "تنظیمات ترید", "وضعیت ترید", "trade settings",
-        "settings", "trade status", "وضعیت معامله",
-    }:
-        return route("SHOW_TRADE_SETTINGS", text=text)
-
-    return None
-
-
-def parse_analysis_command(text: str) -> Optional[CommandRoute]:
-    normalized = normalize_text(text).lower()
-
-    if any(x in normalized for x in ["تحلیل", "بررسی", "analyze", "analysis"]):
-        symbol = parse_symbol(text)
-        if symbol:
-            return route("ANALYZE_SYMBOL", text=text, args={"symbol": symbol})
-        return route("SCAN_MARKET", text=text)
-
-    if any(x in normalized for x in ["اسکن", "scan", "بازار"]):
-        return route("SCAN_MARKET", text=text)
-
-    return None
-
-
-def parse_position_action(text: str) -> Optional[CommandRoute]:
-    normalized = normalize_text(text).lower()
-    symbol = parse_symbol(text)
-
-    if any(x in normalized for x in ["بستن", "close", "خروج"]) and symbol:
-        return route("REQUEST_CLOSE_POSITION", text=text, args={"symbol": symbol})
-
-    if any(x in normalized for x in ["زیر نظر", "مانیتور", "monitor"]) and symbol:
-        return route("WATCH_POSITION", text=text, args={"symbol": symbol})
-
-    return None
-
-
-def parse_command(text: Any, *, user_id: Optional[int] = None, chat_id: Optional[int] = None) -> CommandRoute:
-    raw = safe_str(text)
-    normalized = normalize_text(raw)
-
-    if not normalized:
-        return _attach_context(route_unknown(raw), user_id=user_id, chat_id=chat_id)
-
-    level = parse_strategy_level(normalized)
-    if level is not None:
-        return _attach_context(route("SET_STRATEGY_LEVEL", text=raw, args={"level": level}), user_id=user_id, chat_id=chat_id)
-
-    for parser in (
-        parse_trade_toggle,
-        parse_runtime_update,
-        parse_status_commands,
-        parse_analysis_command,
-        parse_position_action,
-    ):
-        result = parser(normalized)
-        if result is not None:
-            result.raw_text = raw
-            return _attach_context(result, user_id=user_id, chat_id=chat_id)
-
-    return _attach_context(route_unknown(raw), user_id=user_id, chat_id=chat_id)
-
-
-def validate_route(command_route: CommandRoute) -> dict[str, Any]:
-    errors: list[str] = []
-    if command_route.system_version != SYSTEM_VERSION:
-        errors.append("INVALID_SYSTEM_VERSION")
-    if not command_route.action:
-        errors.append("MISSING_ACTION")
-    if command_route.status not in {STATUS_OK, STATUS_FAILED}:
-        errors.append("INVALID_STATUS")
-    if not isinstance(command_route.args, dict):
-        errors.append("ARGS_NOT_DICT")
-    return {
-        "status": STATUS_OK if not errors else STATUS_FAILED,
-        "valid": not errors,
-        "errors": errors,
-        "action": command_route.action,
-        "args": command_route.args,
-    }
-
-
-def route_to_dict(command_route: CommandRoute) -> dict[str, Any]:
-    return {
-        "system_version": command_route.system_version,
-        "created_at": command_route.created_at,
-        "action": command_route.action,
-        "status": command_route.status,
-        "args": dict(command_route.args),
-        "raw_text": command_route.raw_text,
-        "reply_text": command_route.reply_text,
-        "reason": command_route.reason,
-    }
+def _ok(command: str, text: str, metadata: dict[str, Any] | None = None) -> CommandResult:
+    return CommandResult(status="OK", handled=True, text=text, command=command, metadata=metadata)
 
 
 __all__ = [
-    "COMMAND_ROUTER_VERSION",
-    "CommandRoute",
-    "normalize_text",
-    "text_tokens",
-    "contains_any",
-    "first_number",
-    "first_float",
-    "route",
-    "route_unknown",
-    "parse_strategy_level",
-    "parse_symbol",
-    "parse_runtime_update",
-    "parse_trade_toggle",
-    "parse_status_commands",
-    "parse_analysis_command",
-    "parse_position_action",
-    "parse_command",
-    "validate_route",
-    "route_to_dict",
+    "CommandResult",
+    "CommandRouter",
+    "handle_command",
+    "render_ai_status",
+    "render_coin_list",
+    "render_help",
+    "render_strategy_status",
 ]
