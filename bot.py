@@ -2,30 +2,32 @@
 
 Locked responsibility:
 - Owns the lightweight 5-second runtime loop.
-- Pulls market data from OKX by default, or from an injected market adapter in tests.
-- Sends 1H market snapshots to strategy_manager.py for the final Level 4 decision.
-- Registers SIGNAL when real trading is off, slots are full, or the strategy/TP-SL
+- Pulls market prices from OKX by default.
+- Sends market snapshots to the existing strategy layer for the final decision.
+- Registers SIGNAL_ONLY when real trading is off, slots are full, or the strategy/TP-SL
   result says the trade should be monitored only.
 - Sends REAL requests only through real_trade_manager.py.
 - Runs position_monitor.py every cycle so TP/SL results are detected and recorded fast.
 - Builds Telegram/UI payloads through telegram_ui.py only.
+- Connects Telegram messages to command_router.py.
 
 Design lock:
 - Small, simple, strong.
-- OKX market feed is the default; EmptyMarketDataProvider is only a test fallback.
 - No Toobit direct calls here.
 - No TP/SL calculation here.
 - No indicator/AI/probability logic here.
-- Uses only one TP label and one SL label.
 - No extra runtime coordinator files.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import signal
+import threading
 import time
+import traceback
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
@@ -69,17 +71,32 @@ try:
 except Exception:  # pragma: no cover
     real_trade_manager = None  # type: ignore
 
+try:
+    import command_router
+except Exception:  # pragma: no cover
+    command_router = None  # type: ignore
 
-BOT_VERSION = "simple_okx_level4_loop_v3"
+try:
+    from telegram import Update
+    from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+except Exception:  # pragma: no cover - py_compile must work even before requirements install.
+    Update = Any  # type: ignore
+    Application = Any  # type: ignore
+    ApplicationBuilder = None  # type: ignore
+    CommandHandler = None  # type: ignore
+    ContextTypes = Any  # type: ignore
+    MessageHandler = None  # type: ignore
+    filters = None  # type: ignore
+
+
+BOT_VERSION = "level4_main_loop_v2_telegram_okx"
 DEFAULT_SCAN_INTERVAL_SECONDS = 5.0
-DEFAULT_OKX_BASE_URL = "https://www.okx.com"
-DEFAULT_CANDLE_LIMIT = 120
-DEFAULT_CANDLE_BAR = "1H"
+DEFAULT_HTTP_TIMEOUT_SECONDS = 10.0
 
 
 class MarketDataProvider(Protocol):
     def get_prices(self, symbols: Iterable[str]) -> Mapping[str, float]:
-        """Return latest prices keyed by project symbols such as DOGEUSDT."""
+        """Return latest prices keyed by symbol."""
 
 
 Notifier = Callable[[Any], None]
@@ -110,114 +127,43 @@ class CycleReport:
 
 
 class OKXMarketDataProvider:
-    """Small OKX public market adapter for USDT perpetual symbols.
+    """Small OKX public ticker adapter.
 
-    Input/output symbols stay in project format:
-    DOGEUSDT -> OKX DOGE-USDT-SWAP -> DOGEUSDT.
-
-    For Level 4 the strategy needs 1H candles, not price-only ticks.  The bot
-    therefore asks this provider for a full market snapshot when available.
+    It intentionally returns only latest prices. Strategy/indicator work remains in
+    strategy_manager.py and downstream files.
     """
 
-    def __init__(self, *, base_url: str | None = None, timeout_seconds: float = 6.0) -> None:
-        self.base_url = (base_url or os.getenv("OKX_BASE_URL") or DEFAULT_OKX_BASE_URL).rstrip("/")
-        self.timeout_seconds = max(1.0, float(timeout_seconds))
-        self.candle_limit = int(_safe_float(os.getenv("OKX_CANDLE_LIMIT"), DEFAULT_CANDLE_LIMIT))
-        self.candle_bar = os.getenv("OKX_CANDLE_BAR", DEFAULT_CANDLE_BAR).strip() or DEFAULT_CANDLE_BAR
+    def __init__(self, base_url: str | None = None, timeout: float = DEFAULT_HTTP_TIMEOUT_SECONDS) -> None:
+        self.base_url = (base_url or os.getenv("OKX_BASE_URL") or "https://www.okx.com").rstrip("/")
+        self.timeout = timeout
 
     def get_prices(self, symbols: Iterable[str]) -> Mapping[str, float]:
-        wanted = [_normalize_symbol(symbol) for symbol in symbols]
-        wanted = [symbol for symbol in wanted if symbol]
-        if not wanted:
-            return {}
-
-        prices = self._get_swap_tickers(wanted)
-        missing = [symbol for symbol in wanted if symbol not in prices]
-        for symbol in missing:
-            price = self._get_one_ticker(symbol)
-            if price > 0:
-                prices[symbol] = price
-        return prices
-
-    def get_market_snapshots(self, symbols: Iterable[str]) -> dict[str, dict[str, Any]]:
-        wanted = [_normalize_symbol(symbol) for symbol in symbols]
-        wanted = [symbol for symbol in wanted if symbol]
-        prices = dict(self.get_prices(wanted))
-        btc_candles = self.get_candles("BTCUSDT")
-
-        snapshots: dict[str, dict[str, Any]] = {}
-        for symbol in wanted:
-            candles = self.get_candles(symbol)
-            price = _safe_price(prices.get(symbol))
-            if price <= 0 and candles:
-                price = _safe_price(candles[-1].get("close"))
-            snapshots[symbol] = {
-                "symbol": symbol,
-                "source": "OKX",
-                "timeframe": self.candle_bar,
-                "price": price,
-                "candles": candles,
-                "btc_candles": btc_candles,
-            }
-        return snapshots
-
-    def get_candles(self, symbol: str) -> list[dict[str, float]]:
-        inst_id = _okx_swap_inst_id(symbol)
-        query = urllib.parse.urlencode({"instId": inst_id, "bar": self.candle_bar, "limit": self.candle_limit})
-        url = f"{self.base_url}/api/v5/market/candles?{query}"
-        payload = self._read_json(url)
-        rows = payload.get("data", []) if isinstance(payload, Mapping) else []
-        candles: list[dict[str, float]] = []
-        # OKX returns newest first. Strategy wants chronological oldest -> newest.
-        for row in reversed(rows):
-            if not isinstance(row, list) or len(row) < 6:
-                continue
-            candle = {
-                "timestamp": _safe_float(row[0], 0.0),
-                "open": _safe_price(row[1]),
-                "high": _safe_price(row[2]),
-                "low": _safe_price(row[3]),
-                "close": _safe_price(row[4]),
-                "volume": _safe_float(row[5], 0.0),
-            }
-            if candle["open"] > 0 and candle["high"] > 0 and candle["low"] > 0 and candle["close"] > 0:
-                candles.append(candle)
-        return candles
-
-    def _get_swap_tickers(self, wanted: list[str]) -> dict[str, float]:
-        url = f"{self.base_url}/api/v5/market/tickers?instType=SWAP"
-        payload = self._read_json(url)
-        wanted_set = set(wanted)
         prices: dict[str, float] = {}
-        for row in payload.get("data", []) if isinstance(payload, Mapping) else []:
-            symbol = _project_symbol_from_okx_inst_id(str(row.get("instId", "")))
-            if symbol in wanted_set:
-                price = _safe_price(row.get("last") or row.get("markPx") or row.get("askPx") or row.get("bidPx"))
+        for symbol in symbols:
+            clean_symbol = str(symbol).upper().strip()
+            if not clean_symbol:
+                continue
+            for inst_id in _okx_inst_id_candidates(clean_symbol):
+                price = self._fetch_last_price(inst_id)
                 if price > 0:
-                    prices[symbol] = price
+                    prices[clean_symbol] = price
+                    break
         return prices
 
-    def _get_one_ticker(self, symbol: str) -> float:
-        inst_id = _okx_swap_inst_id(symbol)
+    def _fetch_last_price(self, inst_id: str) -> float:
         query = urllib.parse.urlencode({"instId": inst_id})
         url = f"{self.base_url}/api/v5/market/ticker?{query}"
-        payload = self._read_json(url)
-        rows = payload.get("data", []) if isinstance(payload, Mapping) else []
-        if not rows:
+        req = urllib.request.Request(url, headers={"User-Agent": f"CryptoAIHelper/{BOT_VERSION}"})
+        with urllib.request.urlopen(req, timeout=self.timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        data = payload.get("data") or []
+        if not data:
             return 0.0
-        row = rows[0]
-        return _safe_price(row.get("last") or row.get("markPx") or row.get("askPx") or row.get("bidPx"))
-
-    def _read_json(self, url: str) -> Mapping[str, Any]:
-        request = urllib.request.Request(url, headers={"User-Agent": "crypto-ai-helper/1.0"})
-        with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:  # noqa: S310 - OKX public HTTPS endpoint.
-            raw = response.read().decode("utf-8")
-        data = json.loads(raw)
-        return data if isinstance(data, Mapping) else {}
+        return _safe_price(data[0].get("last"))
 
 
 class EmptyMarketDataProvider:
-    """Test fallback only. Production create_runtime() uses OKXMarketDataProvider."""
+    """Safe placeholder used only if OKX is explicitly disabled or unavailable."""
 
     def get_prices(self, symbols: Iterable[str]) -> Mapping[str, float]:
         return {}
@@ -248,13 +194,18 @@ class BotRuntime:
         )
         self.config = config or LoopConfig.from_env()
         self._running = False
+        self.last_report: CycleReport | None = None
+        self.last_error: str = ""
 
     def run_forever(self) -> None:
         self._running = True
         _install_stop_handlers(lambda: self.stop())
         while self._running:
             started = time.time()
-            self.run_once()
+            report = self.run_once()
+            self.last_report = report
+            if report.errors:
+                self.last_error = "; ".join(report.errors[-5:])
             elapsed = time.time() - started
             sleep_for = max(0.0, self.config.scan_interval_seconds - elapsed)
             if sleep_for:
@@ -268,13 +219,11 @@ class BotRuntime:
         symbols = self._active_watchlist()
 
         try:
-            snapshots = self._get_market_snapshots(symbols)
-            prices = {symbol: _safe_price(data.get("price")) for symbol, data in snapshots.items()}
+            prices = dict(self.market_data.get_prices(symbols))
         except Exception as exc:
             report.errors.append(f"market_data_error:{exc}")
             if self.config.stop_on_error:
                 raise
-            snapshots = {}
             prices = {}
 
         monitor_results = self._monitor_positions(prices)
@@ -282,16 +231,11 @@ class BotRuntime:
 
         for symbol in symbols:
             report.scanned_symbols.append(symbol)
-            market = dict(snapshots.get(symbol, {}))
-            price = _safe_price(market.get("price") or prices.get(symbol))
+            price = _safe_price(prices.get(symbol))
             if price <= 0:
                 continue
-            market["price"] = price
-            market.setdefault("prices", dict(prices))
-            market.setdefault("symbol", symbol)
-            market.setdefault("source", "OKX")
             try:
-                handled = self._handle_symbol(symbol, market)
+                handled = self._handle_symbol(symbol, price, prices)
                 if handled == "REAL":
                     report.real_requested += 1
                 elif handled == "SIGNAL":
@@ -304,29 +248,10 @@ class BotRuntime:
                     raise
         return report
 
-    def _get_market_snapshots(self, symbols: Iterable[str]) -> dict[str, dict[str, Any]]:
-        provider_fn = getattr(self.market_data, "get_market_snapshots", None)
-        if callable(provider_fn):
-            raw = provider_fn(symbols)
-            if isinstance(raw, Mapping):
-                return {str(k).upper(): dict(v) for k, v in raw.items() if isinstance(v, Mapping)}
-        prices = dict(self.market_data.get_prices(symbols))
-        return {
-            _normalize_symbol(symbol): {
-                "symbol": _normalize_symbol(symbol),
-                "source": "OKX",
-                "price": _safe_price(prices.get(_normalize_symbol(symbol))),
-                "prices": prices,
-                "candles": [],
-                "btc_candles": [],
-            }
-            for symbol in symbols
-        }
-
     def _active_watchlist(self) -> list[str]:
         symbols: list[str] = []
         for raw in self.config.watchlist:
-            symbol = _normalize_symbol(raw)
+            symbol = str(raw).upper().strip()
             if not symbol:
                 continue
             try:
@@ -339,34 +264,32 @@ class BotRuntime:
     def _monitor_positions(self, prices: Mapping[str, float]) -> list[Any]:
         try:
             return list(self.monitor.check_once(prices))
-        except Exception:
+        except Exception as exc:
+            self.last_error = f"position_monitor_error:{exc}"
             return []
 
-    def _handle_symbol(self, symbol: str, market: Mapping[str, Any]) -> str:
-        snapshot = self.store.snapshot()
-        settings = getattr(snapshot, "settings", None)
-        if not _setting_bool(settings, "auto_signal_enabled", DEFAULT_AUTO_SIGNAL_ENABLED):
+    def _handle_symbol(self, symbol: str, price: float, prices: Mapping[str, float]) -> str:
+        settings = self.store.snapshot().settings
+        if not getattr(settings, "auto_signal_enabled", DEFAULT_AUTO_SIGNAL_ENABLED):
             return ""
         if self.store.has_active_symbol(symbol):
             return ""
 
-        market_for_strategy = _with_runtime_settings(market, settings)
-        decision = self.decision_provider(symbol, market_for_strategy)
+        decision = self.decision_provider(symbol, {"price": price, "prices": dict(prices), "symbol": symbol})
         if not _decision_is_actionable(decision):
             return ""
 
         requested_real = _decision_requests_real(decision)
-        real_enabled = _setting_bool(settings, "real_trade_enabled", DEFAULT_REAL_TRADE_ENABLED)
-        can_open_real = bool(real_enabled and requested_real and self.store.can_open_real(symbol))
+        can_open_real = bool(requested_real and self.store.can_open_real(symbol))
 
         if can_open_real:
-            result = _open_real(decision, store=self.store, state=snapshot)
+            result = _open_real(decision)
             if _open_result_ok(result):
                 self._notify_signal(decision, mode="TOOBIT", raw_result=result)
                 return "REAL"
             return ""
 
-        record = self._register_signal_only(decision, symbol=symbol, price=_safe_price(market.get("price")))
+        record = self._register_signal_only(decision, symbol=symbol, price=price)
         self._notify_signal(decision, mode="SIGNAL", raw_result=record)
         return "SIGNAL"
 
@@ -390,7 +313,7 @@ class BotRuntime:
 
     def _on_monitor_result(self, result: Any) -> None:
         try:
-            payload = build_result_panel_payload(result, fa_name=_fa_name(str(_get_value(result, "symbol", ""))))
+            payload = build_result_panel_payload(result, fa_name=_fa_name(str(result.symbol)))
         except Exception:
             payload = result
         self.notifier(_build_result_payload(payload))
@@ -430,27 +353,24 @@ def _default_closed_pnl_reader(record: Any) -> Mapping[str, Any]:
     return fn(record)
 
 
-def _open_real(decision: Any, *, store: StateStore | None = None, state: Any = None) -> Any:
+def _open_real(decision: Any) -> Any:
     if real_trade_manager is None:
         return {"status": "FAILED", "error": "real_trade_manager_missing"}
     fn = getattr(real_trade_manager, "open_real_trade", None)
     if not callable(fn):
         return {"status": "FAILED", "error": "open_real_trade_missing"}
-    try:
-        return fn(decision, store=store, state=state)
-    except TypeError:
-        return fn(decision)
+    return fn(decision)
 
 
 def _open_result_ok(result: Any) -> bool:
-    status = str(_get_value(result, "status", "")).upper()
+    status = str(getattr(result, "status", "") or (result.get("status") if isinstance(result, Mapping) else "")).upper()
     return status in {"OK", "RECOVERED", "SUCCESS"}
 
 
 def _decision_is_actionable(decision: Any) -> bool:
     if decision is None:
         return False
-    action = str(_get_value(decision, "action", _get_value(decision, "decision", ""))).upper()
+    action = str(getattr(decision, "action", "") or getattr(decision, "decision", "") or "").upper()
     if action in {"NO_TRADE", "HOLD", "REJECT", "NONE"}:
         return False
     direction = _direction(decision, allow_empty=True)
@@ -464,14 +384,14 @@ def _decision_is_actionable(decision: Any) -> bool:
 
 
 def _decision_requests_real(decision: Any) -> bool:
-    mode = str(_get_value(decision, "mode", "")).upper()
-    if mode in {"REAL", "TOOBIT"}:
+    mode = str(getattr(decision, "mode", "") or "").upper()
+    if mode in {"TOOBIT", "REAL"}:
         return True
-    return bool(_get_value(decision, "real", False) or _get_value(decision, "is_real", False))
+    return bool(getattr(decision, "real", False) or getattr(decision, "is_real", False))
 
 
 def _direction(decision: Any, *, allow_empty: bool = False) -> str:
-    value = str(_get_value(decision, "direction", "")).upper()
+    value = str(getattr(decision, "direction", "") or "").upper()
     if value in {"LONG", "BUY"}:
         return "LONG"
     if value in {"SHORT", "SELL"}:
@@ -482,59 +402,36 @@ def _direction(decision: Any, *, allow_empty: bool = False) -> str:
 
 
 def _entry(decision: Any, *, fallback: float) -> float:
-    value = _safe_price(_get_value(decision, "entry", 0.0))
+    value = _safe_price(getattr(decision, "entry", 0.0))
     return value if value > 0 else fallback
 
 
 def _tp_sl(decision: Any) -> tuple[float, float]:
-    plan = _get_value(decision, "tp_sl", None)
+    plan = getattr(decision, "tp_sl", None)
     if plan is not None:
-        tp = _safe_price(_get_value(plan, "tp", 0.0))
-        sl = _safe_price(_get_value(plan, "sl", 0.0))
+        tp = _safe_price(getattr(plan, "tp1", 0.0) or getattr(plan, "tp", 0.0))
+        sl = _safe_price(getattr(plan, "sl", 0.0))
         if tp > 0 and sl > 0:
             return tp, sl
-    tp = _safe_price(_get_value(decision, "tp", 0.0))
-    sl = _safe_price(_get_value(decision, "sl", 0.0) or _get_value(decision, "stop_loss", 0.0))
+    tp = _safe_price(getattr(decision, "tp", 0.0) or getattr(decision, "tp1", 0.0))
+    sl = _safe_price(getattr(decision, "sl", 0.0) or getattr(decision, "stop_loss", 0.0))
     if tp <= 0 or sl <= 0:
         raise ValueError("decision TP/SL missing")
     return tp, sl
 
 
 def _signal_id(decision: Any, symbol: str) -> str:
-    raw = str(_get_value(decision, "signal_id", "")).strip()
+    raw = str(getattr(decision, "signal_id", "") or "").strip()
     if raw:
         return raw
     return f"{symbol}_{int(time.time() * 1000)}"
 
 
-def _get_value(obj: Any, key: str, default: Any = None) -> Any:
-    if isinstance(obj, Mapping):
-        return obj.get(key, default)
-    return getattr(obj, key, default)
-
-
-def _with_runtime_settings(market: Mapping[str, Any], settings: Any) -> dict[str, Any]:
-    data = dict(market)
-    data.setdefault("real_trade_enabled", _setting_bool(settings, "real_trade_enabled", DEFAULT_REAL_TRADE_ENABLED))
-    data.setdefault("trade_dollar_usdt", _safe_float(_get_value(settings, "trade_dollar_usdt", 0.0), 0.0))
-    data.setdefault("trade_margin_usdt", data.get("trade_dollar_usdt"))
-    data.setdefault("leverage", int(_safe_float(_get_value(settings, "leverage", 1), 1)))
-    data.setdefault("min_net_profit_usdt", _safe_float(_get_value(settings, "min_net_profit_usdt", 0.10), 0.10))
-    return data
-
-
-def _setting_bool(settings: Any, name: str, default: bool) -> bool:
-    value = _get_value(settings, name, default)
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "on", "enabled", "فعال"}
-    return bool(value)
-
-
-def _safe_float(value: Any, default: float) -> float:
+def _safe_float(value: Any, fallback: float = 0.0) -> float:
     try:
         return float(value)
     except (TypeError, ValueError):
-        return float(default)
+        return fallback
 
 
 def _safe_price(value: Any) -> float:
@@ -542,120 +439,86 @@ def _safe_price(value: Any) -> float:
     return number if number > 0 else 0.0
 
 
-def _normalize_symbol(symbol: Any) -> str:
-    return str(symbol).upper().replace("-", "").replace("_", "").strip()
-
-
-def _okx_swap_inst_id(symbol: str) -> str:
-    normalized = _normalize_symbol(symbol)
-    if normalized.endswith("USDT"):
-        base = normalized[:-4]
-        return f"{base}-USDT-SWAP"
-    return normalized
-
-
-def _project_symbol_from_okx_inst_id(inst_id: str) -> str:
-    parts = inst_id.upper().split("-")
-    if len(parts) >= 2 and parts[1] == "USDT":
-        return f"{parts[0]}USDT"
-    return _normalize_symbol(inst_id)
-
-
 def _fa_name(symbol: str) -> str:
     try:
         coin = get_coin(symbol)
-        return str(_get_value(coin, "fa_name", "") or _get_value(coin, "name_fa", "") or symbol)
+        return str(getattr(coin, "fa_name", "") or getattr(coin, "name_fa", "") or symbol)
     except Exception:
         return symbol
 
 
-def _confidence_pct(decision: Any) -> float:
-    value = _safe_float(_get_value(decision, "confidence", 0.0), 0.0)
-    return value if value > 1.0 else value * 100.0
-
-
-def _estimated_profit(decision: Any) -> float:
-    metadata = _get_value(decision, "metadata", {})
-    if isinstance(metadata, Mapping):
-        value = _safe_float(metadata.get("net_profit_usdt"), 0.0)
-        if value != 0:
-            return value
-    entry = _entry(decision, fallback=0.0)
-    tp, _sl = _tp_sl(decision)
-    if entry <= 0:
-        return 0.0
-    return abs(tp - entry)
-
-
-def _estimated_move_pct(decision: Any) -> float:
-    entry = _entry(decision, fallback=0.0)
-    tp, _sl = _tp_sl(decision)
-    if entry <= 0:
-        return 0.0
-    if _direction(decision, allow_empty=True) == "SHORT":
-        return (entry - tp) / entry * 100.0
-    return (tp - entry) / entry * 100.0
-
-
 def _build_signal_payload(decision: Any, *, mode: str, raw_result: Any) -> Any:
     if telegram_ui is not None:
-        data_cls = getattr(telegram_ui, "SignalMessageData", None)
-        render = getattr(telegram_ui, "render_signal", None)
-        if callable(data_cls) and callable(render):
-            symbol = _normalize_symbol(_get_value(decision, "symbol", _get_value(raw_result, "symbol", "")))
-            tp, sl = _tp_sl(decision)
-            data = data_cls(
-                mode="TOOBIT" if str(mode).upper() in {"REAL", "TOOBIT"} else "SIGNAL",
-                fa_name=_fa_name(symbol),
-                symbol=symbol,
-                direction=_direction(decision),
-                confidence_pct=_confidence_pct(decision),
-                estimated_profit_usdt=_estimated_profit(decision),
-                estimated_move_pct=_estimated_move_pct(decision),
-                entry=_entry(decision, fallback=_safe_price(_get_value(raw_result, "entry", 0.0))),
-                tp=tp,
-                sl=sl,
-            )
-            return render(data)
+        for name in ("build_signal_payload", "format_signal", "render_signal"):
+            fn = getattr(telegram_ui, name, None)
+            if callable(fn):
+                try:
+                    return fn(decision=decision, mode=mode, result=raw_result)
+                except TypeError:
+                    try:
+                        return fn(decision, mode, raw_result)
+                    except TypeError:
+                        pass
     return {"type": "signal", "mode": mode, "decision": decision, "result": raw_result}
 
 
 def _build_result_payload(result_payload: Any) -> Any:
     if telegram_ui is not None:
-        render = getattr(telegram_ui, "render_result", None)
-        result_cls = getattr(telegram_ui, "ResultMessageData", None)
-        if callable(render):
-            if _looks_like_result_message_data(result_payload):
-                return render(result_payload)
-            if callable(result_cls):
-                result_kind = _get_value(result_payload, "result", None)
-                if result_kind in {"TP", "SL"}:
-                    symbol = _normalize_symbol(_get_value(result_payload, "symbol", ""))
-                    data = result_cls(
-                        mode=_get_value(result_payload, "mode", "SIGNAL"),
-                        fa_name=_get_value(result_payload, "fa_name", "") or _fa_name(symbol),
-                        symbol=symbol,
-                        direction=_direction(result_payload),
-                        result=result_kind,
-                        entry=_safe_price(_get_value(result_payload, "entry", 0.0)),
-                        exit_price=_safe_price(_get_value(result_payload, "exit_price", 0.0)),
-                        pnl_usdt=_safe_float(_get_value(result_payload, "pnl_usdt", 0.0), 0.0),
-                        move_pct=_safe_float(_get_value(result_payload, "move_pct", 0.0), 0.0),
-                        duration_minutes=int(_safe_float(_get_value(result_payload, "duration_minutes", 0), 0.0)),
-                        close_reason=str(_get_value(result_payload, "reason", "") or _get_value(result_payload, "close_reason", "")),
-                    )
-                    return render(data)
+        for name in ("build_result_payload", "format_result", "render_result"):
+            fn = getattr(telegram_ui, name, None)
+            if callable(fn):
+                try:
+                    return fn(result_payload)
+                except TypeError:
+                    pass
     return {"type": "result", "result": result_payload}
 
 
-def _looks_like_result_message_data(value: Any) -> bool:
-    required = ("mode", "symbol", "direction", "result", "entry", "exit_price", "pnl_usdt", "move_pct", "duration_minutes")
-    return all(hasattr(value, item) for item in required)
+def _payload_to_text(payload: Any) -> str:
+    if payload is None:
+        return ""
+    if isinstance(payload, str):
+        return payload
+    if isinstance(payload, Mapping):
+        for key in ("text", "message", "body", "caption"):
+            value = payload.get(key)
+            if value:
+                return str(value)
+        try:
+            return json.dumps(payload, ensure_ascii=False, default=str, indent=2)
+        except Exception:
+            return str(payload)
+    return str(payload)
+
+
+class TelegramNotifier:
+    """Thread-safe Telegram sender used by the runtime loop."""
+
+    def __init__(self, application: Application, default_chat_id: str | int | None = None) -> None:
+        self.application = application
+        self.default_chat_id = default_chat_id
+        self.last_chat_id: str | int | None = default_chat_id
+        self.loop: asyncio.AbstractEventLoop | None = None
+
+    def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        self.loop = loop
+
+    def set_chat_id(self, chat_id: str | int) -> None:
+        self.last_chat_id = chat_id
+
+    def __call__(self, payload: Any) -> None:
+        chat_id = self.last_chat_id or self.default_chat_id
+        if not chat_id:
+            return
+        text = _payload_to_text(payload).strip()
+        if not text:
+            return
+        text = text[:3900]
+        if self.loop and self.loop.is_running():
+            asyncio.run_coroutine_threadsafe(self.application.bot.send_message(chat_id=chat_id, text=text), self.loop)
 
 
 def _default_notifier(payload: Any) -> None:
-    # Telegram sending is intentionally not owned by this file.
-    # The real bot should inject a notifier from its existing telegram layer.
     return None
 
 
@@ -670,6 +533,24 @@ def _install_stop_handlers(stop: Callable[[], None]) -> None:
         pass
 
 
+def _okx_inst_id_candidates(symbol: str) -> list[str]:
+    clean = symbol.upper().replace("-", "").replace("_", "").strip()
+    if clean.endswith("USDT") and len(clean) > 4:
+        base = clean[:-4]
+        return [f"{base}-USDT-SWAP", f"{base}-USDT"]
+    if clean.endswith("USD") and len(clean) > 3:
+        base = clean[:-3]
+        return [f"{base}-USD-SWAP", f"{base}-USD"]
+    return [symbol]
+
+
+def _build_market_data_provider() -> MarketDataProvider:
+    provider_name = str(os.getenv("MARKET_DATA_PROVIDER", "OKX")).upper().strip()
+    if provider_name in {"EMPTY", "NONE", "DISABLED"}:
+        return EmptyMarketDataProvider()
+    return OKXMarketDataProvider()
+
+
 def create_runtime(
     *,
     store: StateStore | None = None,
@@ -682,7 +563,7 @@ def create_runtime(
     if store is None:
         store = StateStore()
     if market_data is None:
-        market_data = OKXMarketDataProvider()
+        market_data = _build_market_data_provider()
     return BotRuntime(
         store=store,
         market_data=market_data,
@@ -693,9 +574,138 @@ def create_runtime(
     )
 
 
+def _runtime_status_text(runtime: BotRuntime) -> str:
+    settings = runtime.store.snapshot().settings
+    report = runtime.last_report
+    lines = [
+        "✅ ربات روشن است",
+        f"نسخه: {BOT_VERSION}",
+        f"Auto Signal: {getattr(settings, 'auto_signal_enabled', DEFAULT_AUTO_SIGNAL_ENABLED)}",
+        f"Real Trade: {getattr(settings, 'real_trade_enabled', DEFAULT_REAL_TRADE_ENABLED)}",
+        f"Watchlist: {', '.join(runtime.config.watchlist)}",
+    ]
+    if report:
+        lines.extend(
+            [
+                f"آخرین اسکن: {len(report.scanned_symbols)} کوین",
+                f"سیگنال‌ها: {report.signal_registered}",
+                f"REAL: {report.real_requested}",
+                f"Monitor: {report.monitor_results}",
+            ]
+        )
+        if report.errors:
+            lines.append("خطاهای آخر: " + " | ".join(report.errors[-3:]))
+    if runtime.last_error:
+        lines.append("آخرین خطا: " + runtime.last_error)
+    return "\n".join(lines)
+
+
+async def _call_command_router(update: Update, context: Any, runtime: BotRuntime) -> Any:
+    if command_router is None:
+        return None
+
+    text = getattr(getattr(update, "message", None), "text", "") or ""
+    candidates = ("handle_command", "handle_message", "route", "dispatch")
+    for name in candidates:
+        fn = getattr(command_router, name, None)
+        if not callable(fn):
+            continue
+        attempts = (
+            lambda: fn(update=update, context=context, runtime=runtime),
+            lambda: fn(update, context),
+            lambda: fn(text, runtime=runtime),
+            lambda: fn(text),
+        )
+        for attempt in attempts:
+            try:
+                result = attempt()
+                if asyncio.iscoroutine(result):
+                    result = await result
+                return result
+            except TypeError:
+                continue
+    return None
+
+
+async def _telegram_message_handler(update: Update, context: Any) -> None:
+    runtime: BotRuntime = context.application.bot_data["runtime"]
+    notifier: TelegramNotifier = context.application.bot_data["notifier"]
+    if update.effective_chat:
+        notifier.set_chat_id(update.effective_chat.id)
+
+    text = (getattr(getattr(update, "message", None), "text", "") or "").strip()
+    normalized = text.replace("/", "").strip().lower()
+
+    try:
+        router_result = await _call_command_router(update, context, runtime)
+        response_text = _payload_to_text(router_result).strip()
+        if response_text:
+            await update.message.reply_text(response_text[:3900])
+            return
+
+        if normalized in {"start", "وضعیت", "status"}:
+            await update.message.reply_text(_runtime_status_text(runtime))
+            return
+
+        if normalized in {"ping", "تست"}:
+            await update.message.reply_text("✅ ربات جواب می‌دهد")
+            return
+
+        await update.message.reply_text("دستور دریافت شد، اما command_router پاسخی برنگرداند. دستور «وضعیت» را بفرست.")
+    except Exception as exc:
+        runtime.last_error = f"telegram_handler_error:{exc}"
+        await update.message.reply_text("❌ خطا در پردازش دستور:\n" + str(exc))
+
+
+def _start_runtime_thread(runtime: BotRuntime) -> threading.Thread:
+    thread = threading.Thread(target=runtime.run_forever, name="bot-runtime-loop", daemon=True)
+    thread.start()
+    return thread
+
+
+def build_telegram_application(runtime: BotRuntime) -> Application:
+    if ApplicationBuilder is None or MessageHandler is None or CommandHandler is None or filters is None:
+        raise RuntimeError("python-telegram-bot is not installed. Install requirements.txt first.")
+
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is missing in .env")
+
+    application = ApplicationBuilder().token(token).build()
+    notifier = TelegramNotifier(application, default_chat_id=os.getenv("TELEGRAM_CHAT_ID") or None)
+    application.bot_data["runtime"] = runtime
+    application.bot_data["notifier"] = notifier
+    runtime.notifier = notifier
+
+    application.add_handler(CommandHandler("start", _telegram_message_handler))
+    application.add_handler(CommandHandler("status", _telegram_message_handler))
+    application.add_handler(CommandHandler("ping", _telegram_message_handler))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _telegram_message_handler))
+    application.add_error_handler(_telegram_error_handler)
+    return application
+
+
+async def _telegram_error_handler(update: object, context: Any) -> None:
+    runtime: BotRuntime | None = context.application.bot_data.get("runtime")
+    if runtime is not None:
+        runtime.last_error = "telegram_error:" + "".join(traceback.format_exception_only(type(context.error), context.error)).strip()
+
+
 def main() -> None:
     runtime = create_runtime()
-    runtime.run_forever()
+    application = build_telegram_application(runtime)
+    notifier: TelegramNotifier = application.bot_data["notifier"]
+    runtime_thread = _start_runtime_thread(runtime)
+
+    async def _post_init(app: Application) -> None:
+        notifier.bind_loop(asyncio.get_running_loop())
+
+    application.post_init = _post_init
+    try:
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
+    finally:
+        runtime.stop()
+        runtime_thread.join(timeout=5)
 
 
 if __name__ == "__main__":
@@ -711,6 +721,8 @@ __all__ = [
     "LoopConfig",
     "MarketDataProvider",
     "OKXMarketDataProvider",
+    "TelegramNotifier",
+    "build_telegram_application",
     "create_runtime",
     "main",
 ]
