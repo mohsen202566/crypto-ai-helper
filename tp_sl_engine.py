@@ -239,3 +239,102 @@ def _signal_only_plan(
 
 
 __all__ = ["TPSLPlan", "build_tp_sl_plan"]
+
+# =========================
+# Level 4 structural TP/SL helper
+# =========================
+# This helper keeps SL construction inside the TP/SL/risk layer instead of
+# strategy_manager.py.  strategy_manager only coordinates decision flow.
+
+def build_level4_tp_sl_plan(
+    symbol: str,
+    direction: Direction,
+    entry: float,
+    candles: object,
+    move_strength: MoveStrength,
+    trade_margin_usdt: float = DEFAULT_TRADE_DOLLAR,
+    leverage: int = DEFAULT_LEVERAGE,
+    min_net_profit_usdt: float = DEFAULT_MIN_NET_PROFIT_USDT,
+    open_fee_rate: float = DEFAULT_OPEN_FEE_RATE,
+    close_fee_rate: float = DEFAULT_CLOSE_FEE_RATE,
+) -> TPSLPlan:
+    """Build the locked Level 4 plan from candles without exposing SL logic to strategy_manager.
+
+    Rules:
+    - one TP and one SL only;
+    - SL is structural from recent 1H candles;
+    - TP is derived only from locked R:R by build_tp_sl_plan();
+    - no order/exchange side effects.
+    """
+    suggested_sl = suggest_level4_structural_sl(direction=direction, entry=entry, candles=candles)
+    if suggested_sl <= 0:
+        raise ValueError("SL منطقی برای Level 4 از ساختار کندل‌ها ساخته نشد.")
+    return build_tp_sl_plan(
+        symbol=symbol,
+        direction=direction,
+        entry=entry,
+        suggested_sl=suggested_sl,
+        move_strength=move_strength,
+        trade_margin_usdt=trade_margin_usdt,
+        leverage=leverage,
+        min_net_profit_usdt=min_net_profit_usdt,
+        open_fee_rate=open_fee_rate,
+        close_fee_rate=close_fee_rate,
+    )
+
+
+def suggest_level4_structural_sl(direction: Direction, entry: float, candles: object) -> float:
+    """Return a conservative structural SL from recent 1H candles.
+
+    Kept in tp_sl_engine because it is risk/TP-SL construction, not strategy
+    decision logic.  Accepts Candle objects, dicts, or OKX-like arrays.
+    """
+    recent = _coerce_level4_candles(candles)[-12:]
+    if len(recent) < 6 or entry <= 0:
+        return 0.0
+    buffer = entry * 0.0015
+    if direction == "LONG":
+        swing = min(c[2] for c in recent[-8:])  # low
+        sl = swing - buffer
+        return round(sl, 8) if 0 < sl < entry else 0.0
+    if direction == "SHORT":
+        swing = max(c[1] for c in recent[-8:])  # high
+        sl = swing + buffer
+        return round(sl, 8) if sl > entry else 0.0
+    return 0.0
+
+
+def _coerce_level4_candles(value: object) -> list[tuple[int, float, float, float, float, float]]:
+    """Return candles as (timestamp, high, low, open, close, volume), sorted oldest-first."""
+    if value is None or isinstance(value, (str, bytes, bytearray)):
+        return []
+    try:
+        iterator = list(value)  # type: ignore[arg-type]
+    except TypeError:
+        return []
+    out: list[tuple[int, float, float, float, float, float]] = []
+    for row in iterator:
+        try:
+            if hasattr(row, "timestamp") and hasattr(row, "high") and hasattr(row, "low"):
+                out.append((int(float(row.timestamp)), float(row.high), float(row.low), float(row.open), float(row.close), float(getattr(row, "volume", 0.0))))
+            elif isinstance(row, dict):
+                out.append((
+                    int(float(row.get("timestamp") or row.get("ts") or row.get("time") or 0)),
+                    float(row.get("high")),
+                    float(row.get("low")),
+                    float(row.get("open")),
+                    float(row.get("close")),
+                    float(row.get("volume") or row.get("vol") or 0.0),
+                ))
+            else:
+                seq = list(row)  # type: ignore[arg-type]
+                if len(seq) >= 6:
+                    # OKX/canonical array: ts, open, high, low, close, volume
+                    out.append((int(float(seq[0])), float(seq[2]), float(seq[3]), float(seq[1]), float(seq[4]), float(seq[5])))
+        except Exception:
+            continue
+    out.sort(key=lambda item: item[0])
+    return out
+
+
+__all__ = ["TPSLPlan", "build_tp_sl_plan", "build_level4_tp_sl_plan", "suggest_level4_structural_sl"]
