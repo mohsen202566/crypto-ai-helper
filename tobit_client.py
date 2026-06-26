@@ -35,6 +35,9 @@ import requests
 Direction = Literal["LONG", "SHORT"]
 MarginMode = Literal["isolated"]
 
+MARGIN_ISOLATED = "isolated"
+_CLIENT: "ToobitClient | None" = None
+
 
 @dataclass(frozen=True)
 class ToobitConfig:
@@ -73,6 +76,15 @@ class SymbolRules:
     price_tick: Decimal
     min_quantity: Decimal
     min_notional: Decimal
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "symbol": self.symbol,
+            "quantity_step": _decimal_to_api(self.quantity_step),
+            "price_tick": _decimal_to_api(self.price_tick),
+            "min_quantity": _decimal_to_api(self.min_quantity),
+            "min_notional": _decimal_to_api(self.min_notional),
+        }
 
 
 @dataclass(frozen=True)
@@ -584,6 +596,21 @@ class ToobitClient:
         raise ToobitAPIError(str(message))
 
 
+def get_client(config: ToobitConfig | None = None, session: requests.Session | None = None) -> ToobitClient:
+    """Return a Toobit client compatible with real_trade_manager.py.
+
+    - With explicit config/session: return a fresh client (useful for tests).
+    - Without arguments: reuse one process-local client so callers share the same
+      configured HTTP session and do not rebuild it on every trade/status call.
+    """
+    global _CLIENT
+    if config is not None or session is not None:
+        return ToobitClient(config=config, session=session)
+    if _CLIENT is None:
+        _CLIENT = ToobitClient()
+    return _CLIENT
+
+
 class ToobitAPIError(RuntimeError):
     """Raised for Toobit HTTP/API errors."""
 
@@ -664,6 +691,7 @@ def _extract_order_id(payload: Any) -> str | None:
 __all__ = [
     "Direction",
     "MarginMode",
+    "MARGIN_ISOLATED",
     "OpenOrderInfo",
     "OpenOrderResult",
     "PositionInfo",
@@ -671,4 +699,5 @@ __all__ = [
     "ToobitAPIError",
     "ToobitClient",
     "ToobitConfig",
+    "get_client",
 ]
