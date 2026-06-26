@@ -1,563 +1,354 @@
 """
-state_store.py
-Level 4 / 1H Smart Scalp Bot
+State store for Crypto AI Helper bot.
 
-Safe JSON persistence layer.
+Locked responsibility:
+- Stores bot settings, slots, active signals, and stats.
+- No analysis, no OKX API, no Toobit API, no Telegram rendering, no order execution.
 
-Architecture lock:
-- This file is the only owner of low-level JSON read/write helpers.
-- No AI decision logic, market analysis, order execution, or Telegram message creation here.
-- Allowed project imports: constants.py and utils.py only.
+Design lock:
+- Small, simple, strong.
+- Trade OFF must still allow SIGNAL monitoring/results but never REAL execution.
+- One coin can have only one active signal until TP/SL/cancel.
+- REAL slots are reserved immediately, then confirmed/released by the trade manager.
 """
 
 from __future__ import annotations
 
 import json
-import os
-import shutil
-import tempfile
-import traceback
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional
+from time import time
+from typing import Literal
 
-from constants import (
-    DATA_DIR,
-    DATA_FILES,
-    ERROR_SEVERITY_ERROR,
-    ERROR_SEVERITY_INFO,
-    ERROR_SEVERITY_WARNING,
-    EVENT_ERROR,
-    STATUS_FAILED,
-    STATUS_OK,
-    SYSTEM_VERSION,
+from config import (
+    DEFAULT_AUTO_SIGNAL_ENABLED,
+    DEFAULT_LEVERAGE,
+    DEFAULT_MAX_POSITIONS,
+    DEFAULT_MIN_NET_PROFIT_USDT,
+    DEFAULT_REAL_TRADE_ENABLED,
+    DEFAULT_TRADE_CAPITAL,
+    DEFAULT_TRADE_DOLLAR,
+    validate_leverage,
+    validate_max_positions,
+    validate_min_net_profit,
+    validate_trade_capital,
+    validate_trade_dollar,
+    get_coin,
 )
-from utils import make_event_id, safe_str, utc_now_iso, utc_now_ms
+
+SignalMode = Literal["TOOBIT", "SIGNAL"]
+Direction = Literal["LONG", "SHORT"]
+SignalStatus = Literal["PENDING_OPEN", "MONITORING", "CLOSED", "CANCELLED"]
+ResultKind = Literal["TP", "SL"]
+
+DEFAULT_STATE_PATH = Path("state_store.json")
 
 
-STATE_STORE_VERSION: str = SYSTEM_VERSION
+@dataclass
+class BotSettings:
+    auto_signal_enabled: bool = DEFAULT_AUTO_SIGNAL_ENABLED
+    real_trade_enabled: bool = DEFAULT_REAL_TRADE_ENABLED
+    trade_capital_usdt: float = DEFAULT_TRADE_CAPITAL
+    trade_dollar_usdt: float = DEFAULT_TRADE_DOLLAR
+    leverage: int = DEFAULT_LEVERAGE
+    max_slots: int = DEFAULT_MAX_POSITIONS
+    min_net_profit_usdt: float = DEFAULT_MIN_NET_PROFIT_USDT
+    margin_mode: str = "isolated"
 
 
-def default_data_for_key(file_key: str) -> Any:
-    """Return the initial JSON structure for a known data file key."""
-    key = safe_str(file_key)
-
-    defaults = {
-        "strategy_state": {
-            "system_version": SYSTEM_VERSION,
-            "active_level": 4,
-            "active_strategy": "LEVEL_4_1H_SMART_SCALP",
-            "real_trading_enabled": False,
-            "updated_at": utc_now_iso(),
-        },
-        "positions": {
-            "system_version": SYSTEM_VERSION,
-            "positions": [],
-            "updated_at": utc_now_iso(),
-        },
-        "signals": {
-            "system_version": SYSTEM_VERSION,
-            "signals": [],
-            "updated_at": utc_now_iso(),
-        },
-        "learning_memory": {
-            "system_version": SYSTEM_VERSION,
-            "records": [],
-            "coin_stats": {},
-            "condition_stats": {},
-            "updated_at": utc_now_iso(),
-        },
-        "ghost_records": {
-            "system_version": SYSTEM_VERSION,
-            "records": [],
-            "updated_at": utc_now_iso(),
-        },
-        "real_records": {
-            "system_version": SYSTEM_VERSION,
-            "records": [],
-            "updated_at": utc_now_iso(),
-        },
-        "stats": {
-            "system_version": SYSTEM_VERSION,
-            "events": [],
-            "summary": {},
-            "updated_at": utc_now_iso(),
-        },
-        "errors": {
-            "system_version": SYSTEM_VERSION,
-            "errors": [],
-            "updated_at": utc_now_iso(),
-        },
-    }
-
-    return defaults.get(
-        key,
-        {
-            "system_version": SYSTEM_VERSION,
-            "records": [],
-            "updated_at": utc_now_iso(),
-        },
-    )
+@dataclass
+class SignalRecord:
+    signal_id: str
+    symbol: str
+    direction: Direction
+    mode: SignalMode
+    entry: float
+    tp: float
+    sl: float
+    status: SignalStatus = "MONITORING"
+    created_at: float = field(default_factory=time)
+    opened_at: float | None = None
+    closed_at: float | None = None
+    result: ResultKind | None = None
+    exit_price: float | None = None
+    pnl_usdt: float = 0.0
 
 
-def resolve_data_path(file_key_or_path: Any) -> Path:
-    """Resolve a DATA_FILES key or raw path to Path."""
-    if isinstance(file_key_or_path, Path):
-        return file_key_or_path
+@dataclass
+class StatsState:
+    real_signals: int = 0
+    real_monitoring: int = 0
+    real_tp: int = 0
+    real_sl: int = 0
+    real_pnl_usdt: float = 0.0
+    signal_only_total: int = 0
+    signal_only_monitoring: int = 0
+    signal_only_tp: int = 0
+    signal_only_sl: int = 0
 
-    key = safe_str(file_key_or_path)
-    if key in DATA_FILES:
-        return Path(DATA_FILES[key])
+    @property
+    def real_win_rate(self) -> float:
+        closed = self.real_tp + self.real_sl
+        return 0.0 if closed <= 0 else self.real_tp / closed * 100.0
 
-    return Path(key)
-
-
-def get_file_key_for_path(path: Path) -> str:
-    """Return DATA_FILES key for a path when known, otherwise stem."""
-    p = Path(path).resolve()
-    for key, value in DATA_FILES.items():
-        try:
-            if Path(value).resolve() == p:
-                return key
-        except OSError:
-            continue
-    return p.stem
-
-
-def ensure_data_dir() -> Path:
-    """Create data directory if missing and return it."""
-    Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
-    return Path(DATA_DIR)
+    @property
+    def signal_only_win_rate(self) -> float:
+        closed = self.signal_only_tp + self.signal_only_sl
+        return 0.0 if closed <= 0 else self.signal_only_tp / closed * 100.0
 
 
-def ensure_parent_dir(path: Any) -> Path:
-    """Create parent directory for path if missing."""
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    return p
+@dataclass
+class BotState:
+    settings: BotSettings = field(default_factory=BotSettings)
+    active_signals: dict[str, SignalRecord] = field(default_factory=dict)
+    closed_signals: dict[str, SignalRecord] = field(default_factory=dict)
+    stats: StatsState = field(default_factory=StatsState)
+    toobit_margin_usdt: float | None = None
+    toobit_open_positions: int = 0
 
+    @property
+    def reserved_real_slots(self) -> int:
+        return sum(1 for item in self.active_signals.values() if item.mode == "TOOBIT")
 
-def read_text_safe(path: Any, default: str = "") -> str:
-    """Read text safely. Return default on failure."""
-    p = Path(path)
-    try:
-        return p.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
-        return default
-
-
-def write_text_atomic(path: Any, text: str) -> bool:
-    """
-    Atomically write text to path.
-
-    Uses a temporary file in the same directory and os.replace to avoid partial
-    writes corrupting JSON files.
-    """
-    p = ensure_parent_dir(path)
-    tmp_path: Optional[Path] = None
-
-    try:
-        fd, tmp_name = tempfile.mkstemp(prefix=f".{p.name}.", suffix=".tmp", dir=str(p.parent))
-        tmp_path = Path(tmp_name)
-
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-
-        os.replace(tmp_path, p)
-        return True
-
-    except OSError:
-        if tmp_path is not None:
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-        return False
-
-
-def backup_corrupt_file(path: Any) -> Optional[Path]:
-    """Move corrupt/unreadable JSON aside with a timestamped .corrupt suffix."""
-    p = Path(path)
-    if not p.exists():
-        return None
-
-    backup = p.with_name(f"{p.name}.corrupt.{utc_now_ms()}")
-    try:
-        shutil.move(str(p), str(backup))
-        return backup
-    except OSError:
-        return None
-
-
-def load_json(
-    file_key_or_path: Any,
-    default: Any = None,
-    *,
-    create_if_missing: bool = True,
-    backup_on_corrupt: bool = True,
-) -> Any:
-    """
-    Load JSON from a known data file key or path.
-
-    If missing and create_if_missing=True, create a default JSON file.
-    If corrupt and backup_on_corrupt=True, move corrupt file aside and recreate.
-    """
-    path = resolve_data_path(file_key_or_path)
-    file_key = get_file_key_for_path(path)
-
-    if default is None:
-        default = default_data_for_key(file_key)
-
-    if not path.exists():
-        if create_if_missing:
-            save_json_atomic(path, default)
-        return default
-
-    try:
-        with path.open("r", encoding="utf-8") as handle:
-            return json.load(handle)
-
-    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
-        if backup_on_corrupt:
-            backup_corrupt_file(path)
-        if create_if_missing:
-            save_json_atomic(path, default)
-        return default
-
-
-def save_json_atomic(file_key_or_path: Any, data: Any) -> bool:
-    """
-    Save JSON atomically.
-
-    This function owns actual JSON writes. Other modules should use this
-    instead of writing JSON directly.
-    """
-    path = resolve_data_path(file_key_or_path)
-
-    try:
-        if isinstance(data, dict):
-            data = dict(data)
-            data.setdefault("system_version", SYSTEM_VERSION)
-            data["updated_at"] = utc_now_iso()
-
-        text = json.dumps(data, ensure_ascii=False, indent=2, sort_keys=False)
-        text += "\n"
-        return write_text_atomic(path, text)
-
-    except (TypeError, ValueError, OSError):
-        return False
-
-
-def ensure_json_file(file_key_or_path: Any, default: Any = None) -> bool:
-    """Ensure one JSON file exists and is readable."""
-    path = resolve_data_path(file_key_or_path)
-    file_key = get_file_key_for_path(path)
-    if default is None:
-        default = default_data_for_key(file_key)
-
-    if not path.exists():
-        return save_json_atomic(path, default)
-
-    _ = load_json(path, default=default, create_if_missing=True, backup_on_corrupt=True)
-    return path.exists()
-
-
-def ensure_all_data_files() -> dict[str, bool]:
-    """Ensure data directory and all DATA_FILES exist."""
-    ensure_data_dir()
-    return {key: ensure_json_file(key) for key in DATA_FILES}
-
-
-def append_record(
-    file_key_or_path: Any,
-    record: Mapping[str, Any],
-    *,
-    list_key: str = "records",
-    max_records: Optional[int] = None,
-) -> bool:
-    """
-    Append one record to a list inside a JSON file.
-
-    The record receives timestamp/system_version if missing.
-    """
-    path = resolve_data_path(file_key_or_path)
-    file_key = get_file_key_for_path(path)
-    data = load_json(path, default=default_data_for_key(file_key))
-
-    if not isinstance(data, dict):
-        data = default_data_for_key(file_key)
-
-    items = data.get(list_key)
-    if not isinstance(items, list):
-        items = []
-
-    new_record = dict(record)
-    new_record.setdefault("id", make_event_id(list_key))
-    new_record.setdefault("system_version", SYSTEM_VERSION)
-    new_record.setdefault("created_at", utc_now_iso())
-
-    items.append(new_record)
-
-    if max_records is not None and max_records > 0 and len(items) > max_records:
-        items = items[-max_records:]
-
-    data[list_key] = items
-    return save_json_atomic(path, data)
-
-
-def update_json(
-    file_key_or_path: Any,
-    updater: Callable[[Any], Any],
-    *,
-    default: Any = None,
-) -> bool:
-    """
-    Load JSON, pass it to updater, then save returned value atomically.
-
-    updater may mutate and return the same object, or return a new one.
-    """
-    path = resolve_data_path(file_key_or_path)
-    file_key = get_file_key_for_path(path)
-    if default is None:
-        default = default_data_for_key(file_key)
-
-    data = load_json(path, default=default)
-    try:
-        updated = updater(data)
-        if updated is None:
-            updated = data
-        return save_json_atomic(path, updated)
-    except Exception as exc:
-        log_error(
-            module="state_store",
-            function="update_json",
-            error=exc,
-            severity=ERROR_SEVERITY_ERROR,
-            context={"path": str(path)},
+    @property
+    def pending_real_slots(self) -> int:
+        return sum(
+            1
+            for item in self.active_signals.values()
+            if item.mode == "TOOBIT" and item.status == "PENDING_OPEN"
         )
-        return False
+
+    @property
+    def used_slots(self) -> int:
+        # Exchange open positions are the source of truth for confirmed REAL slots.
+        # Pending REAL orders are not visible on the exchange yet, but must already
+        # reserve a slot during the delayed verification window.
+        return self.toobit_open_positions + self.pending_real_slots
+
+    @property
+    def free_slots(self) -> int:
+        return max(0, self.settings.max_slots - self.used_slots)
 
 
-def set_key(file_key_or_path: Any, key: str, value: Any) -> bool:
-    """Set one top-level key in a JSON dict."""
-    def _updater(data: Any) -> Any:
-        if not isinstance(data, dict):
-            data = {}
-        data[key] = value
-        return data
+class StateStore:
+    def __init__(self, path: str | Path = DEFAULT_STATE_PATH) -> None:
+        self.path = Path(path)
+        self.state = self._load()
+        self._recalculate_monitoring_counts()
 
-    return update_json(file_key_or_path, _updater)
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = _state_to_dict(self.state)
+        self.path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
 
+    def snapshot(self) -> BotState:
+        return self.state
 
-def get_key(file_key_or_path: Any, key: str, default: Any = None) -> Any:
-    """Read one top-level key from a JSON dict."""
-    data = load_json(file_key_or_path)
-    if isinstance(data, dict):
-        return data.get(key, default)
-    return default
+    def set_auto_signal_enabled(self, enabled: bool) -> None:
+        self.state.settings.auto_signal_enabled = bool(enabled)
+        self.save()
 
+    def set_real_trade_enabled(self, enabled: bool) -> None:
+        self.state.settings.real_trade_enabled = bool(enabled)
+        self.save()
 
-def make_error_record(
-    *,
-    module: str,
-    function: str,
-    error: Any,
-    severity: str = ERROR_SEVERITY_ERROR,
-    context: Optional[Mapping[str, Any]] = None,
-) -> dict[str, Any]:
-    """Create a standard lightweight error record."""
-    if isinstance(error, BaseException):
-        error_type = type(error).__name__
-        error_message = str(error)
-        short_trace = "".join(traceback.format_exception_only(type(error), error)).strip()
-    else:
-        error_type = "Message"
-        error_message = safe_str(error)
-        short_trace = error_message
+    def set_trade_dollar(self, value: float) -> None:
+        self.state.settings.trade_dollar_usdt = validate_trade_dollar(value)
+        self.save()
 
-    return {
-        "id": make_event_id(EVENT_ERROR),
-        "event": EVENT_ERROR,
-        "system_version": SYSTEM_VERSION,
-        "severity": severity,
-        "module": safe_str(module, "unknown"),
-        "function": safe_str(function, "unknown"),
-        "error_type": error_type,
-        "message": error_message,
-        "short_trace": short_trace,
-        "context": dict(context or {}),
-        "created_at": utc_now_iso(),
-    }
+    def set_leverage(self, value: int) -> None:
+        self.state.settings.leverage = validate_leverage(value)
+        self.save()
 
+    def set_trade_capital(self, value: float) -> None:
+        self.state.settings.trade_capital_usdt = validate_trade_capital(value)
+        self.save()
 
-def log_error(
-    *,
-    module: str,
-    function: str,
-    error: Any,
-    severity: str = ERROR_SEVERITY_ERROR,
-    context: Optional[Mapping[str, Any]] = None,
-) -> bool:
-    """Append an error record to errors.json."""
-    record = make_error_record(
-        module=module,
-        function=function,
-        error=error,
-        severity=severity,
-        context=context,
-    )
-    return append_record("errors", record, list_key="errors", max_records=1000)
+    def set_max_slots(self, value: int) -> None:
+        self.state.settings.max_slots = validate_max_positions(value)
+        self.save()
 
+    def set_min_net_profit(self, value: float) -> None:
+        self.state.settings.min_net_profit_usdt = validate_min_net_profit(value)
+        self.save()
 
-def log_info(module: str, function: str, message: str, context: Optional[Mapping[str, Any]] = None) -> bool:
-    """Append an informational diagnostic event to errors.json."""
-    return log_error(
-        module=module,
-        function=function,
-        error=message,
-        severity=ERROR_SEVERITY_INFO,
-        context=context,
-    )
+    def sync_toobit_status(self, *, margin_usdt: float | None, open_positions: int) -> None:
+        if margin_usdt is not None and margin_usdt < 0:
+            raise ValueError("مارجین توبیت نمی‌تواند منفی باشد.")
+        if open_positions < 0:
+            raise ValueError("تعداد پوزیشن باز نمی‌تواند منفی باشد.")
+        self.state.toobit_margin_usdt = margin_usdt
+        self.state.toobit_open_positions = int(open_positions)
+        self.save()
 
+    def has_active_symbol(self, symbol: str) -> bool:
+        key = symbol.upper()
+        get_coin(key)
+        return any(item.symbol == key and item.status in ("PENDING_OPEN", "MONITORING") for item in self.state.active_signals.values())
 
-def log_warning(module: str, function: str, message: str, context: Optional[Mapping[str, Any]] = None) -> bool:
-    """Append a warning diagnostic event to errors.json."""
-    return log_error(
-        module=module,
-        function=function,
-        error=message,
-        severity=ERROR_SEVERITY_WARNING,
-        context=context,
-    )
+    def can_create_signal(self, symbol: str) -> bool:
+        return self.state.settings.auto_signal_enabled and not self.has_active_symbol(symbol)
 
+    def can_open_real(self, symbol: str) -> bool:
+        return self.can_create_signal(symbol) and self.state.settings.real_trade_enabled and self.state.free_slots > 0
 
-def safe_execute(
-    func: Callable[..., Any],
-    *args: Any,
-    module: str = "unknown",
-    function: Optional[str] = None,
-    default: Any = None,
-    severity: str = ERROR_SEVERITY_ERROR,
-    context: Optional[Mapping[str, Any]] = None,
-    **kwargs: Any,
-) -> Any:
-    """
-    Execute a callable and log any exception.
+    def register_signal(
+        self,
+        *,
+        signal_id: str,
+        symbol: str,
+        direction: Direction,
+        requested_mode: SignalMode,
+        entry: float,
+        tp: float,
+        sl: float,
+    ) -> SignalRecord:
+        key = symbol.upper()
+        get_coin(key)
+        if direction not in ("LONG", "SHORT"):
+            raise ValueError("جهت سیگنال باید LONG یا SHORT باشد.")
+        if requested_mode not in ("TOOBIT", "SIGNAL"):
+            raise ValueError("حالت سیگنال باید TOOBIT یا SIGNAL باشد.")
+        if not self.state.settings.auto_signal_enabled:
+            raise RuntimeError("اتو سیگنال خاموش است.")
+        if signal_id in self.state.active_signals or signal_id in self.state.closed_signals:
+            raise RuntimeError("شناسه سیگنال تکراری است.")
+        if self.has_active_symbol(key):
+            raise RuntimeError("برای این کوین هنوز سیگنال فعال وجود دارد.")
+        if entry <= 0 or tp <= 0 or sl <= 0:
+            raise ValueError("Entry/TP/SL باید مثبت باشند.")
 
-    Use for non-critical safe wrappers. Do not hide errors where the caller must
-    explicitly handle failure.
-    """
-    fn_name = function or getattr(func, "__name__", "unknown")
-    try:
-        return func(*args, **kwargs)
-    except Exception as exc:
-        log_error(
-            module=module,
-            function=fn_name,
-            error=exc,
-            severity=severity,
-            context=context,
+        mode: SignalMode = "TOOBIT" if requested_mode == "TOOBIT" and self.state.settings.real_trade_enabled and self.state.free_slots > 0 else "SIGNAL"
+        status: SignalStatus = "PENDING_OPEN" if mode == "TOOBIT" else "MONITORING"
+        record = SignalRecord(
+            signal_id=signal_id,
+            symbol=key,
+            direction=direction,
+            mode=mode,
+            entry=float(entry),
+            tp=float(tp),
+            sl=float(sl),
+            status=status,
+            opened_at=time() if mode == "SIGNAL" else None,
         )
-        return default
+        self.state.active_signals[signal_id] = record
+        if mode == "TOOBIT":
+            self.state.stats.real_signals += 1
+            self.state.stats.real_monitoring += 1
+        else:
+            self.state.stats.signal_only_total += 1
+            self.state.stats.signal_only_monitoring += 1
+        self.save()
+        return record
+
+    def confirm_real_open(self, signal_id: str) -> SignalRecord:
+        record = self._active(signal_id)
+        if record.mode != "TOOBIT":
+            raise ValueError("فقط سیگنال توبیت نیاز به تایید باز شدن دارد.")
+        record.status = "MONITORING"
+        record.opened_at = time()
+        self.save()
+        return record
+
+    def cancel_unconfirmed_real(self, signal_id: str, reason: str = "پوزیشن در توبیت تایید نشد") -> SignalRecord:
+        record = self._active(signal_id)
+        if record.mode != "TOOBIT" or record.status != "PENDING_OPEN":
+            raise ValueError("فقط پوزیشن توبیت تاییدنشده قابل آزادسازی است.")
+        record.status = "CANCELLED"
+        record.closed_at = time()
+        record.result = None
+        record.pnl_usdt = 0.0
+        self.state.active_signals.pop(signal_id, None)
+        self.state.closed_signals[signal_id] = record
+        self.state.stats.real_monitoring = max(0, self.state.stats.real_monitoring - 1)
+        self.save()
+        return record
+
+    def mark_result(self, signal_id: str, *, result: ResultKind, exit_price: float, pnl_usdt: float) -> SignalRecord:
+        record = self._active(signal_id)
+        if result not in ("TP", "SL"):
+            raise ValueError("نتیجه باید TP یا SL باشد.")
+        if exit_price <= 0:
+            raise ValueError("قیمت خروج باید مثبت باشد.")
+
+        record.status = "CLOSED"
+        record.result = result
+        record.exit_price = float(exit_price)
+        record.pnl_usdt = float(pnl_usdt)
+        record.closed_at = time()
+        self.state.active_signals.pop(signal_id, None)
+        self.state.closed_signals[signal_id] = record
+
+        if record.mode == "TOOBIT":
+            self.state.stats.real_monitoring = max(0, self.state.stats.real_monitoring - 1)
+            if result == "TP":
+                self.state.stats.real_tp += 1
+            else:
+                self.state.stats.real_sl += 1
+            self.state.stats.real_pnl_usdt += float(pnl_usdt)
+        else:
+            self.state.stats.signal_only_monitoring = max(0, self.state.stats.signal_only_monitoring - 1)
+            if result == "TP":
+                self.state.stats.signal_only_tp += 1
+            else:
+                self.state.stats.signal_only_sl += 1
+        self.save()
+        return record
+
+    def _active(self, signal_id: str) -> SignalRecord:
+        if signal_id not in self.state.active_signals:
+            raise KeyError(f"سیگنال فعال پیدا نشد: {signal_id}")
+        return self.state.active_signals[signal_id]
+
+    def _load(self) -> BotState:
+        if not self.path.exists():
+            return BotState()
+        payload = json.loads(self.path.read_text(encoding="utf-8"))
+        return _state_from_dict(payload)
+
+    def _recalculate_monitoring_counts(self) -> None:
+        real = 0
+        signal = 0
+        for item in self.state.active_signals.values():
+            if item.mode == "TOOBIT":
+                real += 1
+            else:
+                signal += 1
+        self.state.stats.real_monitoring = real
+        self.state.stats.signal_only_monitoring = signal
 
 
-def validate_json_readable(file_key_or_path: Any) -> bool:
-    """Return True if a JSON file can be loaded into a valid object."""
-    path = resolve_data_path(file_key_or_path)
-    try:
-        if not path.exists():
-            return False
-        with path.open("r", encoding="utf-8") as handle:
-            json.load(handle)
-        return True
-    except Exception:
-        return False
-
-
-def validate_system_version_in_data(data: Any) -> bool:
-    """Return True if dict has matching system_version, or no version yet."""
-    if not isinstance(data, dict):
-        return False
-    version = data.get("system_version")
-    return version in (None, "", SYSTEM_VERSION)
-
-
-def check_data_files_light() -> dict[str, Any]:
-    """
-    Lightweight data-file check for startup preflight.
-
-    Does not call market APIs, does not scan symbols, and does not run analysis.
-    """
-    ensure_data_dir()
-    files: dict[str, Any] = {}
-
-    for key, path in DATA_FILES.items():
-        p = Path(path)
-        ok = ensure_json_file(key)
-        data = load_json(key)
-        files[key] = {
-            "path": str(p),
-            "exists": p.exists(),
-            "readable": ok,
-            "version_ok": validate_system_version_in_data(data),
-        }
-
+def _state_to_dict(state: BotState) -> dict[str, object]:
     return {
-        "status": STATUS_OK,
-        "system_version": SYSTEM_VERSION,
-        "files": files,
-        "checked_at": utc_now_iso(),
+        "settings": asdict(state.settings),
+        "active_signals": {key: asdict(value) for key, value in state.active_signals.items()},
+        "closed_signals": {key: asdict(value) for key, value in state.closed_signals.items()},
+        "stats": asdict(state.stats),
+        "toobit_margin_usdt": state.toobit_margin_usdt,
+        "toobit_open_positions": state.toobit_open_positions,
     }
 
 
-def make_result(status: str, message: str = "", **extra: Any) -> dict[str, Any]:
-    """Small standard result dict for storage-layer functions."""
-    result = {
-        "status": status,
-        "message": message,
-        "system_version": SYSTEM_VERSION,
-        "created_at": utc_now_iso(),
-    }
-    result.update(extra)
-    return result
-
-
-def failed_result(message: str, **extra: Any) -> dict[str, Any]:
-    return make_result(STATUS_FAILED, message, **extra)
-
-
-def ok_result(message: str = "", **extra: Any) -> dict[str, Any]:
-    return make_result(STATUS_OK, message, **extra)
+def _state_from_dict(payload: dict[str, object]) -> BotState:
+    settings = BotSettings(**dict(payload.get("settings", {})))
+    active = {key: SignalRecord(**value) for key, value in dict(payload.get("active_signals", {})).items()}
+    closed = {key: SignalRecord(**value) for key, value in dict(payload.get("closed_signals", {})).items()}
+    stats = StatsState(**dict(payload.get("stats", {})))
+    return BotState(
+        settings=settings,
+        active_signals=active,
+        closed_signals=closed,
+        stats=stats,
+        toobit_margin_usdt=payload.get("toobit_margin_usdt"),
+        toobit_open_positions=int(payload.get("toobit_open_positions", 0)),
+    )
 
 
 __all__ = [
-    "STATE_STORE_VERSION",
-    "default_data_for_key",
-    "resolve_data_path",
-    "get_file_key_for_path",
-    "ensure_data_dir",
-    "ensure_parent_dir",
-    "read_text_safe",
-    "write_text_atomic",
-    "backup_corrupt_file",
-    "load_json",
-    "save_json_atomic",
-    "ensure_json_file",
-    "ensure_all_data_files",
-    "append_record",
-    "update_json",
-    "set_key",
-    "get_key",
-    "make_error_record",
-    "log_error",
-    "log_info",
-    "log_warning",
-    "safe_execute",
-    "validate_json_readable",
-    "validate_system_version_in_data",
-    "check_data_files_light",
-    "make_result",
-    "failed_result",
-    "ok_result",
+    "BotSettings",
+    "SignalRecord",
+    "StatsState",
+    "BotState",
+    "StateStore",
+    "DEFAULT_STATE_PATH",
 ]
