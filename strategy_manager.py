@@ -1,525 +1,453 @@
-"""
-strategy_manager.py
-Level 4 / 1H Smart Scalp Bot
+"""Strategy manager for Crypto AI Helper bot.
 
-Strategy state manager.
+Level 4 / 1H Smart Scalp decision coordinator.
 
-Architecture lock:
-- Owns active strategy/level state and trade on/off flag.
-- Blocks all non-Level-4 new signals while Level 4 is active.
-- Does not analyze market, run AI, place orders, monitor positions, or build Telegram text.
-- Allowed project imports: constants.py, state_store.py, models.py, utils.py only.
+Locked responsibility:
+- Owns only the strategy decision flow for the active Level 4 profile.
+- Connects market_context, coin_analyzer, probability_engine, ai_decision, and tp_sl_engine.
+- Returns one simple decision object for bot.py / real_trade_manager.py.
+- No OKX HTTP calls, no Toobit calls, no Telegram sending, no order execution, no slot accounting.
+
+Design lock:
+- Only Level 4 is active for new signals.
+- One TP and one SL only.
+- Quality entry over fast/late chase entry.
+- Prefer NO_TRADE over weak, conflicted, late, or fee-invalid setups.
 """
 
 from __future__ import annotations
 
-from typing import Any, Mapping, Optional
+from dataclasses import dataclass, field
+from time import time
+from typing import Any, Literal, Mapping, Sequence
 
-from constants import (
-    DATA_FILES,
-    CMD_SET_LEVEL_4,
-    MODE_GHOST,
-    MODE_REAL,
-    STATUS_FAILED,
-    STATUS_OK,
-    STRATEGY_CODE,
-    STRATEGY_LEVEL,
-    SYSTEM_VERSION,
-    TRADE_CONFIG,
+from ai_decision import AIDecision, make_ai_decision
+from coin_analyzer import CoinAnalysis, analyze_coin
+from config import (
+    DEFAULT_LEVERAGE,
+    DEFAULT_MIN_NET_PROFIT_USDT,
+    DEFAULT_REAL_TRADE_ENABLED,
+    DEFAULT_TRADE_DOLLAR,
+    MIN_CONFIDENCE,
+    TARGET_HOLD_MINUTES,
+    TIMEFRAME,
+    WATCHLIST,
+    get_coin,
 )
-from models import RecordResult, to_dict
-from state_store import load_json, save_json_atomic, log_error, log_info
-from utils import safe_bool, safe_float, safe_int, safe_str, utc_now_iso
+from market_context import Candle, MarketContext, build_market_context
+from probability_engine import ProbabilityResult, calculate_probabilities
+from tp_sl_engine import TPSLPlan, build_level4_tp_sl_plan
+
+Direction = Literal["LONG", "SHORT", "NONE"]
+Action = Literal["ENTER_LONG", "ENTER_SHORT", "NO_TRADE"]
+ExecutionMode = Literal["REAL", "SIGNAL", "NO_TRADE"]
+
+ACTIVE_STRATEGY_LEVEL = 4
+STRATEGY_NAME = "Level 4 / 1H Smart Scalp"
+STRATEGY_TIMEFRAME = TIMEFRAME
+
+_real_trading_enabled_override: bool | None = None
+_active_strategy_level: int = ACTIVE_STRATEGY_LEVEL
 
 
-STRATEGY_MANAGER_VERSION: str = SYSTEM_VERSION
-STRATEGY_STATE_KEY: str = "strategy_state"
+@dataclass(frozen=True)
+class StrategyDecision:
+    symbol: str
+    action: Action
+    decision: Action
+    direction: Direction
+    mode: ExecutionMode
+    real: bool
+    entry: float
+    tp: float
+    sl: float
+    confidence: float
+    reason: str
+    signal_id: str
+    strategy_level: int = ACTIVE_STRATEGY_LEVEL
+    strategy_name: str = STRATEGY_NAME
+    timeframe: str = STRATEGY_TIMEFRAME
+    tp_sl: TPSLPlan | None = None
+    probability: ProbabilityResult | None = None
+    ai: AIDecision | None = None
+    context: MarketContext | None = None
+    analysis: CoinAnalysis | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def is_real(self) -> bool:
+        return self.real
 
 
-# =============================================================================
-# Default state
-# =============================================================================
-
-def default_strategy_state() -> dict[str, Any]:
-    """Return default strategy state for this Level 4 architecture."""
-    return {
-        "system_version": SYSTEM_VERSION,
-        "active_level": STRATEGY_LEVEL,
-        "active_strategy": STRATEGY_CODE,
-        "real_trading_enabled": bool(TRADE_CONFIG.get("real_trading_default_enabled", False)),
-        "margin_usdt": float(TRADE_CONFIG.get("default_margin_usdt", 7.0)),
-        "min_margin_usdt": float(TRADE_CONFIG.get("default_min_margin_usdt", TRADE_CONFIG.get("default_margin_usdt", 7.0))),
-        "max_margin_usdt": float(TRADE_CONFIG.get("default_max_margin_usdt", TRADE_CONFIG.get("default_margin_usdt", 7.0))),
-        "dynamic_position_sizing_enabled": bool(TRADE_CONFIG.get("dynamic_position_sizing_enabled", True)),
-        "position_sizing_mode": "AI_DYNAMIC",
-        "leverage": int(TRADE_CONFIG.get("default_leverage", 10)),
-        "max_concurrent_real_positions": int(TRADE_CONFIG.get("max_concurrent_real_positions", 3)),
-        "max_concurrent_total_positions": int(TRADE_CONFIG.get("max_concurrent_total_positions", 6)),
-        "updated_at": utc_now_iso(),
-    }
+@dataclass(frozen=True)
+class StrategyRuntimeConfig:
+    active_level: int = ACTIVE_STRATEGY_LEVEL
+    name: str = STRATEGY_NAME
+    timeframe: str = STRATEGY_TIMEFRAME
+    target_hold_minutes: tuple[int, int] = TARGET_HOLD_MINUTES
+    real_trading_enabled: bool = DEFAULT_REAL_TRADE_ENABLED
 
 
-def normalize_strategy_state(state: Any) -> dict[str, Any]:
-    """Normalize old/missing strategy state into the Level 4 contract."""
-    if not isinstance(state, dict):
-        state = {}
+def decide(symbol: str, market: Mapping[str, Any] | None = None, **kwargs: Any) -> StrategyDecision:
+    """Build one final Level 4 decision for a symbol.
 
-    defaults = default_strategy_state()
-    normalized = dict(defaults)
-    normalized.update(state)
+    Expected market keys when available:
+    - price: latest entry/reference price.
+    - candles: 1H candles for the symbol, as Candle objects, dicts, or OKX arrays.
+    - btc_candles: 1H BTC candles for market context.
+    - alt_market_candles: optional broad alt-market proxy candles.
+    - fear_greed_value: optional integer 0..100.
+    - real_trade_enabled/trade_margin_usdt/leverage/min_net_profit_usdt: optional runtime settings.
 
-    normalized["system_version"] = safe_str(normalized.get("system_version"), SYSTEM_VERSION)
-    normalized["active_level"] = safe_int(normalized.get("active_level"), STRATEGY_LEVEL) or STRATEGY_LEVEL
-    normalized["active_strategy"] = safe_str(normalized.get("active_strategy"), STRATEGY_CODE) or STRATEGY_CODE
-    normalized["real_trading_enabled"] = safe_bool(normalized.get("real_trading_enabled"), False)
-
-    margin = safe_float(normalized.get("margin_usdt"), defaults["margin_usdt"]) or defaults["margin_usdt"]
-    normalized["margin_usdt"] = max(0.0, margin)
-
-    min_margin = safe_float(normalized.get("min_margin_usdt"), normalized["margin_usdt"]) or normalized["margin_usdt"]
-    max_margin = safe_float(normalized.get("max_margin_usdt"), normalized["margin_usdt"]) or normalized["margin_usdt"]
-    min_margin = max(1.0, min(1000.0, min_margin))
-    max_margin = max(1.0, min(1000.0, max_margin))
-    if min_margin > max_margin:
-        max_margin = min_margin
-    normalized["min_margin_usdt"] = min_margin
-    normalized["max_margin_usdt"] = max_margin
-    normalized["margin_usdt"] = max(min_margin, min(max_margin, normalized["margin_usdt"]))
-    normalized["dynamic_position_sizing_enabled"] = safe_bool(
-        normalized.get("dynamic_position_sizing_enabled"),
-        max_margin > min_margin,
-    )
-    normalized["position_sizing_mode"] = safe_str(
-        normalized.get("position_sizing_mode"),
-        "AI_DYNAMIC" if normalized["dynamic_position_sizing_enabled"] else "FIXED",
-    ) or ("AI_DYNAMIC" if normalized["dynamic_position_sizing_enabled"] else "FIXED")
-
-    leverage = safe_int(normalized.get("leverage"), defaults["leverage"]) or defaults["leverage"]
-    min_lev = safe_int(TRADE_CONFIG.get("min_leverage"), 1) or 1
-    max_lev = safe_int(TRADE_CONFIG.get("max_leverage"), 20) or 20
-    normalized["leverage"] = max(min_lev, min(max_lev, leverage))
-
-    normalized["max_concurrent_real_positions"] = max(
-        0,
-        safe_int(
-            normalized.get("max_concurrent_real_positions"),
-            defaults["max_concurrent_real_positions"],
-        ) or defaults["max_concurrent_real_positions"],
-    )
-    normalized["max_concurrent_total_positions"] = max(
-        0,
-        safe_int(
-            normalized.get("max_concurrent_total_positions"),
-            defaults["max_concurrent_total_positions"],
-        ) or defaults["max_concurrent_total_positions"],
-    )
-
-    normalized["updated_at"] = safe_str(normalized.get("updated_at"), utc_now_iso())
-    return normalized
-
-
-# =============================================================================
-# State IO
-# =============================================================================
-
-def load_strategy_state() -> dict[str, Any]:
-    """Load and normalize strategy state from data/strategy_state.json."""
-    state = load_json(STRATEGY_STATE_KEY, default=default_strategy_state())
-    normalized = normalize_strategy_state(state)
-
-    # Save back only if missing/old shape was normalized.
-    if state != normalized:
-        save_strategy_state(normalized)
-
-    return normalized
-
-
-def save_strategy_state(state: Mapping[str, Any]) -> bool:
-    """Save normalized strategy state."""
-    normalized = normalize_strategy_state(dict(state))
-    normalized["updated_at"] = utc_now_iso()
-    return save_json_atomic(STRATEGY_STATE_KEY, normalized)
-
-
-def reset_strategy_state() -> RecordResult:
-    """Reset strategy state to default Level 4 values."""
-    ok = save_strategy_state(default_strategy_state())
-    return RecordResult(
-        status=STATUS_OK if ok else STATUS_FAILED,
-        recorded=ok,
-        message="strategy_state_reset" if ok else "strategy_state_reset_failed",
-    )
-
-
-# =============================================================================
-# Strategy / level control
-# =============================================================================
-
-def is_level4_active(state: Optional[Mapping[str, Any]] = None) -> bool:
-    """Return True if Level 4 is active for new scans/signals."""
-    if state is None:
-        state = load_strategy_state()
-
-    level = safe_int(state.get("active_level"), 0) or 0
-    code = safe_str(state.get("active_strategy"))
-    return level == STRATEGY_LEVEL and code == STRATEGY_CODE
-
-
-def set_level4_active() -> RecordResult:
+    If candle data is missing, this function fails closed with NO_TRADE.  The
+    strategy layer must not invent analysis from price-only ticks.
     """
-    Activate Level 4 for new opportunities.
+    market_map: Mapping[str, Any] = market or kwargs
+    key = _normalize_symbol(symbol)
+    if _active_strategy_level != 4:
+        return _no_trade(key, "فقط Level 4 برای سیگنال جدید مجاز است")
+    try:
+        get_coin(key)
+    except Exception as exc:
+        return _no_trade(key, f"کوین خارج از واچ‌لیست قفل‌شده است: {exc}")
 
-    Open positions from any previous level are not deleted or modified here.
-    position_monitor keeps managing existing positions according to their stored level.
-    """
-    state = load_strategy_state()
-    state["active_level"] = STRATEGY_LEVEL
-    state["active_strategy"] = STRATEGY_CODE
-    ok = save_strategy_state(state)
+    entry = _safe_price(market_map.get("price") or market_map.get("entry"))
+    candles = _coerce_candles(market_map.get("candles") or market_map.get("symbol_candles"))
+    if entry <= 0 and candles:
+        entry = candles[-1].close
+    if entry <= 0:
+        return _no_trade(key, "قیمت ورود معتبر نیست")
+    if len(candles) < 40:
+        return _no_trade(key, "برای Level 4 حداقل ۴۰ کندل 1H لازم است", entry=entry)
 
-    if ok:
-        log_info(
-            "strategy_manager",
-            "set_level4_active",
-            "Level 4 strategy activated.",
-            {"active_level": STRATEGY_LEVEL, "active_strategy": STRATEGY_CODE},
+    btc_candles = _coerce_candles(market_map.get("btc_candles") or market_map.get("market_candles"))
+    alt_candles = _coerce_candles(market_map.get("alt_market_candles"))
+    context = _context_from_market(market_map, btc_candles, alt_candles)
+
+    try:
+        analysis = analyze_coin(key, candles)
+        probability = calculate_probabilities(analysis, context)
+        ai = make_ai_decision(probability, context)
+    except Exception as exc:
+        return _no_trade(key, f"خطای تحلیل استراتژی: {exc}", entry=entry, context=context)
+
+    if ai.decision == "NO_TRADE" or ai.direction not in ("LONG", "SHORT"):
+        return _no_trade(
+            key,
+            ai.reason,
+            entry=entry,
+            confidence=ai.confidence,
+            context=context,
+            analysis=analysis,
+            probability=probability,
+            ai=ai,
         )
 
-    return RecordResult(
-        status=STATUS_OK if ok else STATUS_FAILED,
-        recorded=ok,
-        message="level4_active" if ok else "level4_activation_failed",
-        metadata={"active_level": STRATEGY_LEVEL, "active_strategy": STRATEGY_CODE},
-    )
+    direction: Literal["LONG", "SHORT"] = ai.direction  # type: ignore[assignment]
+    trade_margin = _safe_float(market_map.get("trade_margin_usdt") or market_map.get("trade_dollar_usdt"), DEFAULT_TRADE_DOLLAR)
+    leverage = int(_safe_float(market_map.get("leverage"), DEFAULT_LEVERAGE))
+    min_net = _safe_float(market_map.get("min_net_profit_usdt"), DEFAULT_MIN_NET_PROFIT_USDT)
 
-
-def can_scan_new_opportunities(state: Optional[Mapping[str, Any]] = None) -> bool:
-    """Return True if this process is allowed to scan for new Level 4 signals."""
-    return is_level4_active(state)
-
-
-def can_create_signal_for_level(level: Any, state: Optional[Mapping[str, Any]] = None) -> bool:
-    """
-    Enforce single-active-level rule for new signals.
-
-    Only active Level 4 may create new signals in this architecture.
-    """
-    if state is None:
-        state = load_strategy_state()
-
-    requested_level = safe_int(level, 0) or 0
-    return requested_level == STRATEGY_LEVEL and is_level4_active(state)
-
-
-def block_reason_for_level(level: Any, state: Optional[Mapping[str, Any]] = None) -> str:
-    """Return a stable reason code when a level is blocked."""
-    if can_create_signal_for_level(level, state):
-        return ""
-    return "LEVEL_NOT_ACTIVE"
-
-
-# =============================================================================
-# Trade on/off control
-# =============================================================================
-
-def is_real_trading_enabled(state: Optional[Mapping[str, Any]] = None) -> bool:
-    """Return True if REAL trading is enabled in strategy state."""
-    if state is None:
-        state = load_strategy_state()
-    return safe_bool(state.get("real_trading_enabled"), False)
-
-
-def set_real_trading(enabled: bool) -> RecordResult:
-    """Set real trading on/off."""
-    state = load_strategy_state()
-    state["real_trading_enabled"] = bool(enabled)
-    ok = save_strategy_state(state)
-
-    if ok:
-        log_info(
-            "strategy_manager",
-            "set_real_trading",
-            "Real trading flag changed.",
-            {"enabled": bool(enabled)},
+    try:
+        # SL/TP construction belongs to tp_sl_engine.  strategy_manager only
+        # coordinates the already-approved direction, market analysis, and runtime mode.
+        plan = build_level4_tp_sl_plan(
+            symbol=key,
+            direction=direction,
+            entry=entry,
+            candles=candles,
+            move_strength=analysis.move_strength,
+            trade_margin_usdt=trade_margin,
+            leverage=leverage,
+            min_net_profit_usdt=min_net,
+        )
+    except Exception as exc:
+        return _no_trade(
+            key,
+            f"TP/SL معتبر ساخته نشد: {exc}",
+            entry=entry,
+            confidence=ai.confidence,
+            context=context,
+            analysis=analysis,
+            probability=probability,
+            ai=ai,
         )
 
-    return RecordResult(
-        status=STATUS_OK if ok else STATUS_FAILED,
-        recorded=ok,
-        message="real_trading_enabled" if enabled and ok else "real_trading_disabled" if ok else "real_trading_update_failed",
-        metadata={"real_trading_enabled": bool(enabled)},
+    if plan.execution_mode != "REAL_ALLOWED":
+        mode: ExecutionMode = "SIGNAL"
+        real = False
+    else:
+        real_enabled = _runtime_real_enabled(market_map)
+        mode = "REAL" if real_enabled else "SIGNAL"
+        real = bool(real_enabled)
+
+    action: Action = "ENTER_LONG" if direction == "LONG" else "ENTER_SHORT"
+    return StrategyDecision(
+        symbol=key,
+        action=action,
+        decision=action,
+        direction=direction,
+        mode=mode,
+        real=real,
+        entry=round(entry, 8),
+        tp=plan.tp,
+        sl=plan.sl,
+        confidence=round(ai.confidence, 2),
+        reason=_entry_reason(ai, probability, plan, mode),
+        signal_id=f"L4_{key}_{int(time() * 1000)}",
+        tp_sl=plan,
+        probability=probability,
+        ai=ai,
+        context=context,
+        analysis=analysis,
+        metadata={
+            "move_strength": analysis.move_strength,
+            "risk_reward": plan.risk_reward,
+            "net_profit_usdt": plan.net_profit_usdt,
+            "estimated_fee_usdt": plan.estimated_fee_usdt,
+            "target_hold_minutes": TARGET_HOLD_MINUTES,
+        },
     )
 
 
-def enable_real_trading() -> RecordResult:
-    """Enable REAL trading."""
-    return set_real_trading(True)
+# Compatibility aliases expected by bot.py.
+analyze_symbol = decide
+build_decision = decide
+evaluate_symbol = decide
+get_decision = decide
 
 
-def disable_real_trading() -> RecordResult:
-    """Disable REAL trading. New REAL decisions must be downgraded to GHOST by bot/AI flow."""
-    return set_real_trading(False)
+def set_strategy_level(level: int) -> dict[str, Any]:
+    global _active_strategy_level
+    if int(level) != 4:
+        raise ValueError("فقط استراتژی لول 4 قفل و فعال است.")
+    _active_strategy_level = 4
+    return {"ok": True, "active_level": 4, "name": STRATEGY_NAME}
 
 
-def execution_mode_for_new_decision(requested_mode: str, state: Optional[Mapping[str, Any]] = None) -> str:
-    """
-    Return executable mode for a new AI decision.
-
-    If AI requests REAL but trade is OFF, downgrade to GHOST.
-    """
-    mode = safe_str(requested_mode).upper()
-    if mode == MODE_REAL and not is_real_trading_enabled(state):
-        return MODE_GHOST
-    return mode
+set_active_strategy = set_strategy_level
+activate_strategy_level = set_strategy_level
 
 
-# =============================================================================
-# Trade config control
-# =============================================================================
+def get_active_strategy_level() -> int:
+    return _active_strategy_level
 
-def get_trade_runtime_config(state: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
-    """Return current runtime trade config merged from constants + strategy state."""
-    if state is None:
-        state = load_strategy_state()
-
-    default_margin = safe_float(TRADE_CONFIG.get("default_margin_usdt"), 7.0) or 7.0
-    default_leverage = safe_int(TRADE_CONFIG.get("default_leverage"), 10) or 10
-
-    return {
-        "real_trading_enabled": is_real_trading_enabled(state),
-        "margin_usdt": safe_float(state.get("margin_usdt"), default_margin) or default_margin,
-        "min_margin_usdt": safe_float(state.get("min_margin_usdt"), state.get("margin_usdt", default_margin)) or default_margin,
-        "max_margin_usdt": safe_float(state.get("max_margin_usdt"), state.get("margin_usdt", default_margin)) or default_margin,
-        "dynamic_position_sizing_enabled": safe_bool(state.get("dynamic_position_sizing_enabled"), True),
-        "position_sizing_mode": safe_str(state.get("position_sizing_mode"), "AI_DYNAMIC"),
-        "leverage": safe_int(state.get("leverage"), default_leverage) or default_leverage,
-        "margin_mode": safe_str(TRADE_CONFIG.get("margin_mode"), "ISOLATED"),
-        "max_concurrent_real_positions": safe_int(
-            state.get("max_concurrent_real_positions"),
-            TRADE_CONFIG.get("max_concurrent_real_positions", 3),
-        ) or 3,
-        "max_concurrent_total_positions": safe_int(
-            state.get("max_concurrent_total_positions"),
-            TRADE_CONFIG.get("max_concurrent_total_positions", 6),
-        ) or 6,
-        "require_leverage_verification": safe_bool(TRADE_CONFIG.get("require_leverage_verification"), True),
-        "require_position_confirmation": safe_bool(TRADE_CONFIG.get("require_position_confirmation"), True),
-    }
-
-
-def set_margin_usdt(margin_usdt: Any) -> RecordResult:
-    """Set runtime margin per trade."""
-    margin = safe_float(margin_usdt, None)
-    if margin is None or margin <= 0:
-        return RecordResult(
-            status=STATUS_FAILED,
-            recorded=False,
-            message="invalid_margin",
-            error="margin_usdt must be positive",
-        )
-
-    state = load_strategy_state()
-    state["margin_usdt"] = margin
-    ok = save_strategy_state(state)
-    return RecordResult(
-        status=STATUS_OK if ok else STATUS_FAILED,
-        recorded=ok,
-        message="margin_updated" if ok else "margin_update_failed",
-        metadata={"margin_usdt": margin},
-    )
-
-
-def set_min_margin_usdt(min_margin_usdt: Any) -> RecordResult:
-    """Set AI dynamic minimum margin per trade, allowed range 1..1000 USDT."""
-    value = safe_float(min_margin_usdt, None)
-    if value is None or value < 1 or value > 1000:
-        return RecordResult(status=STATUS_FAILED, recorded=False, message="invalid_min_margin", error="min_margin_usdt must be between 1 and 1000")
-
-    state = load_strategy_state()
-    current_max = safe_float(state.get("max_margin_usdt"), state.get("margin_usdt", value)) or value
-    if value > current_max:
-        return RecordResult(status=STATUS_FAILED, recorded=False, message="invalid_min_margin", error="min_margin_usdt cannot be greater than max_margin_usdt")
-
-    state["min_margin_usdt"] = value
-    state["margin_usdt"] = max(value, min(current_max, safe_float(state.get("margin_usdt"), value) or value))
-    state["dynamic_position_sizing_enabled"] = bool(current_max > value)
-    state["position_sizing_mode"] = "AI_DYNAMIC" if state["dynamic_position_sizing_enabled"] else "FIXED"
-    ok = save_strategy_state(state)
-    return RecordResult(status=STATUS_OK if ok else STATUS_FAILED, recorded=ok, message="min_margin_updated" if ok else "min_margin_update_failed", metadata={"min_margin_usdt": value, "max_margin_usdt": current_max})
-
-
-def set_max_margin_usdt(max_margin_usdt: Any) -> RecordResult:
-    """Set AI dynamic maximum margin per trade, allowed range 1..1000 USDT."""
-    value = safe_float(max_margin_usdt, None)
-    if value is None or value < 1 or value > 1000:
-        return RecordResult(status=STATUS_FAILED, recorded=False, message="invalid_max_margin", error="max_margin_usdt must be between 1 and 1000")
-
-    state = load_strategy_state()
-    current_min = safe_float(state.get("min_margin_usdt"), state.get("margin_usdt", value)) or value
-    if value < current_min:
-        return RecordResult(status=STATUS_FAILED, recorded=False, message="invalid_max_margin", error="max_margin_usdt cannot be less than min_margin_usdt")
-
-    state["max_margin_usdt"] = value
-    state["margin_usdt"] = max(current_min, min(value, safe_float(state.get("margin_usdt"), current_min) or current_min))
-    state["dynamic_position_sizing_enabled"] = bool(value > current_min)
-    state["position_sizing_mode"] = "AI_DYNAMIC" if state["dynamic_position_sizing_enabled"] else "FIXED"
-    ok = save_strategy_state(state)
-    return RecordResult(status=STATUS_OK if ok else STATUS_FAILED, recorded=ok, message="max_margin_updated" if ok else "max_margin_update_failed", metadata={"min_margin_usdt": current_min, "max_margin_usdt": value})
-
-
-def set_leverage(leverage: Any) -> RecordResult:
-    """Set runtime leverage, clamped to configured min/max."""
-    lev = safe_int(leverage, None)
-    if lev is None:
-        return RecordResult(
-            status=STATUS_FAILED,
-            recorded=False,
-            message="invalid_leverage",
-            error="leverage must be an integer",
-        )
-
-    min_lev = safe_int(TRADE_CONFIG.get("min_leverage"), 1) or 1
-    max_lev = safe_int(TRADE_CONFIG.get("max_leverage"), 20) or 20
-    lev = max(min_lev, min(max_lev, lev))
-
-    state = load_strategy_state()
-    state["leverage"] = lev
-    ok = save_strategy_state(state)
-    return RecordResult(
-        status=STATUS_OK if ok else STATUS_FAILED,
-        recorded=ok,
-        message="leverage_updated" if ok else "leverage_update_failed",
-        metadata={"leverage": lev},
-    )
-
-
-# =============================================================================
-# Status helpers for bot / telegram_ui
-# =============================================================================
 
 def get_strategy_status() -> dict[str, Any]:
-    """Return status payload. telegram_ui.py turns this into Persian text."""
-    state = load_strategy_state()
-    runtime = get_trade_runtime_config(state)
-
     return {
-        "system_version": SYSTEM_VERSION,
-        "active_level": state.get("active_level"),
-        "active_strategy": state.get("active_strategy"),
-        "level4_active": is_level4_active(state),
-        "real_trading_enabled": runtime["real_trading_enabled"],
-        "execution_when_trade_off": MODE_GHOST,
-        "margin_usdt": runtime["margin_usdt"],
-        "min_margin_usdt": runtime.get("min_margin_usdt", runtime["margin_usdt"]),
-        "max_margin_usdt": runtime.get("max_margin_usdt", runtime["margin_usdt"]),
-        "dynamic_position_sizing_enabled": runtime.get("dynamic_position_sizing_enabled", False),
-        "position_sizing_mode": runtime.get("position_sizing_mode", "FIXED"),
-        "leverage": runtime["leverage"],
-        "max_concurrent_real_positions": runtime["max_concurrent_real_positions"],
-        "max_concurrent_total_positions": runtime["max_concurrent_total_positions"],
-        "updated_at": state.get("updated_at"),
+        "active_level": _active_strategy_level,
+        "name": STRATEGY_NAME,
+        "timeframe": STRATEGY_TIMEFRAME,
+        "target_hold_minutes": TARGET_HOLD_MINUTES,
+        "only_level_4_active": _active_strategy_level == 4,
     }
 
 
-def list_available_strategies() -> list[dict[str, Any]]:
-    """
-    Return available strategies.
+def get_trade_runtime_config(state: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    settings = _extract_settings(state)
+    real_enabled = _runtime_real_enabled(settings)
+    return {
+        "strategy_level": _active_strategy_level,
+        "strategy_name": STRATEGY_NAME,
+        "timeframe": STRATEGY_TIMEFRAME,
+        "target_hold_minutes": TARGET_HOLD_MINUTES,
+        "real_trading_enabled": real_enabled,
+        "trade_margin_usdt": _safe_float(_get(settings, "trade_dollar_usdt", DEFAULT_TRADE_DOLLAR), DEFAULT_TRADE_DOLLAR),
+        "leverage": int(_safe_float(_get(settings, "leverage", DEFAULT_LEVERAGE), DEFAULT_LEVERAGE)),
+        "min_net_profit_usdt": _safe_float(_get(settings, "min_net_profit_usdt", DEFAULT_MIN_NET_PROFIT_USDT), DEFAULT_MIN_NET_PROFIT_USDT),
+        "margin_mode": "isolated",
+        "tp_count": 1,
+        "sl_count": 1,
+    }
 
-    For this implementation only Level 4 is enabled for new opportunities.
-    Other levels may exist in old code, but are inactive under single-level rule.
-    """
-    return [
-        {
-            "level": STRATEGY_LEVEL,
-            "code": STRATEGY_CODE,
-            "name": "Level 4 / 1H Smart Scalp",
-            "active": True,
-            "new_signals_allowed": True,
-        }
-    ]
+
+def is_real_trading_enabled(state: Mapping[str, Any] | None = None) -> bool:
+    return bool(get_trade_runtime_config(state).get("real_trading_enabled"))
 
 
-def handle_strategy_command(text: str) -> Optional[RecordResult]:
-    """
-    Handle only strategy/trade state-changing commands.
+def enable_real_trading() -> None:
+    global _real_trading_enabled_override
+    _real_trading_enabled_override = True
 
-    bot.py may use this helper, but telegram_ui.py still owns message text.
-    """
-    cmd = safe_str(text)
 
-    if cmd == CMD_SET_LEVEL_4:
-        return set_level4_active()
+def disable_real_trading() -> None:
+    global _real_trading_enabled_override
+    _real_trading_enabled_override = False
 
+
+def _runtime_real_enabled(source: Mapping[str, Any] | Any | None) -> bool:
+    if _real_trading_enabled_override is not None:
+        return bool(_real_trading_enabled_override)
+    value = _get(source, "real_trade_enabled", DEFAULT_REAL_TRADE_ENABLED)
+    return _truthy(value)
+
+
+def _context_from_market(market: Mapping[str, Any], btc_candles: list[Candle], alt_candles: list[Candle]) -> MarketContext:
+    explicit = market.get("context") or market.get("market_context")
+    if isinstance(explicit, MarketContext):
+        return explicit
+    if btc_candles:
+        return build_market_context(
+            btc_candles,
+            alt_market_candles=alt_candles or None,
+            fear_greed_value=_optional_int(market.get("fear_greed_value")),
+        )
+    return MarketContext(
+        btc_direction="neutral",
+        market_direction="neutral",
+        volatility_state="caution",
+        sentiment_state="normal",
+        trade_permission="caution",
+        long_bias=0.0,
+        short_bias=0.0,
+        reason="BTC context candles missing; cautious mode",
+    )
+
+
+def _entry_reason(ai: AIDecision, probability: ProbabilityResult, plan: TPSLPlan, mode: ExecutionMode) -> str:
+    return (
+        f"{STRATEGY_NAME} | {mode} | {ai.reason} | "
+        f"Preferred={probability.preferred_direction} | "
+        f"RR={plan.risk_reward:.1f} | Net={plan.net_profit_usdt:.4f} | "
+        f"Fee={plan.estimated_fee_usdt:.4f} | {plan.reason}"
+    )
+
+
+def _no_trade(
+    symbol: str,
+    reason: str,
+    *,
+    entry: float = 0.0,
+    confidence: float = 0.0,
+    context: MarketContext | None = None,
+    analysis: CoinAnalysis | None = None,
+    probability: ProbabilityResult | None = None,
+    ai: AIDecision | None = None,
+) -> StrategyDecision:
+    return StrategyDecision(
+        symbol=_normalize_symbol(symbol),
+        action="NO_TRADE",
+        decision="NO_TRADE",
+        direction="NONE",
+        mode="NO_TRADE",
+        real=False,
+        entry=round(entry, 8) if entry > 0 else 0.0,
+        tp=0.0,
+        sl=0.0,
+        confidence=round(confidence, 2),
+        reason=reason,
+        signal_id=f"L4_{_normalize_symbol(symbol)}_NO_TRADE_{int(time() * 1000)}",
+        context=context,
+        analysis=analysis,
+        probability=probability,
+        ai=ai,
+        metadata={"min_confidence": MIN_CONFIDENCE, "target_hold_minutes": TARGET_HOLD_MINUTES},
+    )
+
+
+def _coerce_candles(value: Any) -> list[Candle]:
+    if value is None:
+        return []
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return []
+    candles: list[Candle] = []
+    for row in value:
+        candle = _coerce_one_candle(row)
+        if candle is not None:
+            candles.append(candle)
+    candles.sort(key=lambda c: c.timestamp)
+    return candles
+
+
+def _coerce_one_candle(row: Any) -> Candle | None:
+    if isinstance(row, Candle):
+        return row
+    if isinstance(row, Mapping):
+        try:
+            return Candle(
+                timestamp=int(float(row.get("timestamp") or row.get("ts") or row.get("time") or 0)),
+                open=float(row.get("open")),
+                high=float(row.get("high")),
+                low=float(row.get("low")),
+                close=float(row.get("close")),
+                volume=float(row.get("volume") or row.get("vol") or 0.0),
+            )
+        except Exception:
+            return None
+    if isinstance(row, Sequence) and not isinstance(row, (str, bytes, bytearray)) and len(row) >= 6:
+        try:
+            return Candle(
+                timestamp=int(float(row[0])),
+                open=float(row[1]),
+                high=float(row[2]),
+                low=float(row[3]),
+                close=float(row[4]),
+                volume=float(row[5]),
+            )
+        except Exception:
+            return None
     return None
 
 
-# =============================================================================
-# Startup validation
-# =============================================================================
+def _extract_settings(state: Mapping[str, Any] | Any | None) -> Mapping[str, Any] | Any | None:
+    return _get(state, "settings", state)
 
-def validate_strategy_state_light() -> dict[str, Any]:
-    """
-    Lightweight startup check for strategy state.
 
-    Does not touch market APIs, Toobit, AI, or positions.
-    """
+def _get(obj: Any, key: str, default: Any = None) -> Any:
+    if obj is None:
+        return default
+    if isinstance(obj, Mapping):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on", "enabled", "active", "فعال"}
+    return bool(value)
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
-        state = load_strategy_state()
-        valid = (
-            state.get("system_version") == SYSTEM_VERSION
-            and safe_int(state.get("active_level"), 0) == STRATEGY_LEVEL
-            and safe_str(state.get("active_strategy")) == STRATEGY_CODE
-        )
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
 
-        return {
-            "status": STATUS_OK if valid else STATUS_FAILED,
-            "valid": valid,
-            "system_version": SYSTEM_VERSION,
-            "level4_active": is_level4_active(state),
-            "real_trading_enabled": is_real_trading_enabled(state),
-            "checked_at": utc_now_iso(),
-        }
 
-    except Exception as exc:
-        log_error(
-            module="strategy_manager",
-            function="validate_strategy_state_light",
-            error=exc,
-        )
-        return {
-            "status": STATUS_FAILED,
-            "valid": False,
-            "system_version": SYSTEM_VERSION,
-            "error": str(exc),
-            "checked_at": utc_now_iso(),
-        }
+def _optional_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_price(value: Any) -> float:
+    price = _safe_float(value, 0.0)
+    return price if price > 0 else 0.0
+
+
+def _normalize_symbol(symbol: Any) -> str:
+    return str(symbol).upper().replace("-", "").replace("_", "").replace("SWAP", "").strip()
 
 
 __all__ = [
-    "STRATEGY_MANAGER_VERSION",
-    "STRATEGY_STATE_KEY",
-    "default_strategy_state",
-    "normalize_strategy_state",
-    "load_strategy_state",
-    "save_strategy_state",
-    "reset_strategy_state",
-    "is_level4_active",
-    "set_level4_active",
-    "can_scan_new_opportunities",
-    "can_create_signal_for_level",
-    "block_reason_for_level",
+    "ACTIVE_STRATEGY_LEVEL",
+    "STRATEGY_NAME",
+    "STRATEGY_TIMEFRAME",
+    "StrategyDecision",
+    "StrategyRuntimeConfig",
+    "decide",
+    "analyze_symbol",
+    "build_decision",
+    "evaluate_symbol",
+    "get_decision",
+    "set_strategy_level",
+    "set_active_strategy",
+    "activate_strategy_level",
+    "get_active_strategy_level",
+    "get_strategy_status",
+    "get_trade_runtime_config",
     "is_real_trading_enabled",
-    "set_real_trading",
     "enable_real_trading",
     "disable_real_trading",
-    "execution_mode_for_new_decision",
-    "get_trade_runtime_config",
-    "set_margin_usdt",
-    "set_min_margin_usdt",
-    "set_max_margin_usdt",
-    "set_leverage",
-    "get_strategy_status",
-    "list_available_strategies",
-    "handle_strategy_command",
-    "validate_strategy_state_light",
 ]
