@@ -1,876 +1,674 @@
-"""
-tobit_client.py
-Level 4 / 1H Smart Scalp Bot
+"""Toobit client for Crypto AI Helper bot.
 
-Low-level Toobit client.
+Locked responsibility:
+- Exchange HTTP client only.
+- Reads wallet/margin and open positions accurately for the trade panel/state sync.
+- Checks open orders and existing positions before any real order to prevent duplicates.
+- Ensures isolated margin mode and leverage before any real order, then reads them back
+  and verifies the exchange accepted the values.
+- Opens one market position using the configured margin amount with TP/SL attached.
+- Rounds quantity by quantity step and TP/SL by tick size.
+- Verifies the real margin used after quantity rounding is close to configured margin.
+- After every order attempt, waits 70 seconds and then verifies whether the position exists.
+- Does not analyze markets, render Telegram messages, manage learning, decide AI entries,
+  calculate TP/SL, or own slot accounting.
 
-Architecture lock:
-- This is the ONLY low-level Toobit API layer.
-- No AI decision, no Telegram, no command routing, no JSON ownership.
-- Reads API keys from environment only.
-- Uses Toobit futures v1-compatible routes from the locked working behavior.
+Design lock:
+- Small, simple, strong.
+- One responsibility only.
+- No hidden fallback from real execution to signal mode; callers decide mode before using this client.
 """
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
-from typing import Any, Mapping, Optional
 import hashlib
 import hmac
 import os
-import re
 import time
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
+from typing import Any, Literal
 from urllib.parse import urlencode
 
 import requests
 
-from constants import (
-    DIRECTION_LONG, DIRECTION_SHORT, STATUS_FAILED, STATUS_OK, STATUS_RECOVERED,
-    SYSTEM_VERSION, TOOBIT_API_KEY_ENV, TOOBIT_BASE_URL_ENV, TOOBIT_REQUEST_TIMEOUT_SECONDS,
-    TOOBIT_SECRET_KEY_ENV, TOOBIT_SPECIAL_SYMBOL_MAP, TRADE_CONFIG,
-)
-from models import TradeCloseResult, TradeOpenResult
-from utils import (
-    normalize_direction, normalize_symbol, profit_usdt, round_price, round_quantity,
-    safe_float, safe_int, safe_str,
-)
-
-
-TOBIT_CLIENT_VERSION: str = SYSTEM_VERSION
-DEFAULT_TOOBIT_BASE_URL: str = "https://api.toobit.com"
-MARGIN_ISOLATED: str = "ISOLATED"
-MARGIN_CROSS: str = "CROSS"
-
-SIDE_BUY_OPEN: str = "BUY_OPEN"
-SIDE_SELL_OPEN: str = "SELL_OPEN"
-SIDE_BUY_CLOSE: str = "BUY_CLOSE"
-SIDE_SELL_CLOSE: str = "SELL_CLOSE"
-
-
-class ToobitAPIError(RuntimeError):
-    pass
+Direction = Literal["LONG", "SHORT"]
+MarginMode = Literal["isolated"]
 
 
 @dataclass(frozen=True)
-class ToobitCredentials:
-    api_key: str = ""
-    api_secret: str = ""
+class ToobitConfig:
+    api_key: str
+    secret_key: str
+    base_url: str
+    recv_window: int = 5000
+    timeout_seconds: int = 12
+    verify_after_error_seconds: int = 70
+    margin_tolerance_pct: float = 1.0
 
-    def valid(self) -> bool:
-        return bool(self.api_key and self.api_secret)
+    @classmethod
+    def from_env(cls) -> "ToobitConfig":
+        api_key = os.getenv("TOBIT_API_KEY", "").strip()
+        secret_key = os.getenv("TOBIT_SECRET_KEY", "").strip()
+        base_url = os.getenv("TOBIT_BASE_URL", "https://api.toobit.com").strip().rstrip("/")
+        if not api_key:
+            raise RuntimeError("TOBIT_API_KEY تنظیم نشده است.")
+        if not secret_key:
+            raise RuntimeError("TOBIT_SECRET_KEY تنظیم نشده است.")
+        return cls(
+            api_key=api_key,
+            secret_key=secret_key,
+            base_url=base_url,
+            recv_window=int(os.getenv("TOBIT_RECV_WINDOW", "5000")),
+            timeout_seconds=int(os.getenv("TOBIT_TIMEOUT_SECONDS", "12")),
+            verify_after_error_seconds=int(os.getenv("TOBIT_VERIFY_AFTER_ERROR_SECONDS", "70")),
+            margin_tolerance_pct=float(os.getenv("TOBIT_MARGIN_TOLERANCE_PCT", "1.0")),
+        )
 
 
-@dataclass
-class ToobitResponse:
-    ok: bool
-    status_code: int = 0
-    data: dict[str, Any] = field(default_factory=dict)
-    error: str = ""
-    raw_text: str = ""
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-
-@dataclass
+@dataclass(frozen=True)
 class SymbolRules:
     symbol: str
-    exchange_symbol: str = ""
-    min_qty: float = 0.001
-    qty_step: float = 0.001
-    min_notional: float = 5.0
-    price_tick: float = 0.0001
-    quantity_precision: int = 6
-    price_precision: int = 6
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+    quantity_step: Decimal
+    price_tick: Decimal
+    min_quantity: Decimal
+    min_notional: Decimal
 
 
-def now_ms() -> int:
-    return int(time.time() * 1000)
+@dataclass(frozen=True)
+class PositionInfo:
+    symbol: str
+    side: Direction
+    quantity: float
+    entry_price: float
+    unrealized_pnl: float
+    raw: dict[str, Any]
 
 
-def _load_dotenv_once() -> None:
-    """
-    Best-effort .env loader.
-    systemd Environment remains primary; .env is only fallback.
-    """
-    if os.environ.get("_L4_DOTENV_CHECKED") == "1":
-        return
-    os.environ["_L4_DOTENV_CHECKED"] = "1"
-    try:
-        from dotenv import load_dotenv  # type: ignore
-        load_dotenv(".env", override=False)
-    except Exception:
-        pass
+@dataclass(frozen=True)
+class OpenOrderInfo:
+    symbol: str
+    side: Direction | None
+    order_id: str | None
+    raw: dict[str, Any]
 
 
-def _read_systemd_env_value(name: str) -> str:
-    """
-    Fallback for this VPS layout where credentials are stored in systemd service.
-    Used only when os.environ/.env do not provide the value.
-    """
-    service_paths = [
-        "/etc/systemd/system/crypto-bot.service",
-        "/etc/systemd/system/crypto-bot.service.d/override.conf",
-    ]
-    patterns = [
-        re.compile(r'^\s*Environment\s*=\s*["\']?' + re.escape(name) + r'=([^"\'\n]+)["\']?\s*$'),
-        re.compile(r'^\s*' + re.escape(name) + r'=([^\n]+)\s*$'),
-    ]
-    for path in service_paths:
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                for line in fh:
-                    clean = line.strip()
-                    for pattern in patterns:
-                        match = pattern.match(clean)
-                        if match:
-                            return safe_str(match.group(1)).strip().strip('"').strip("'")
-        except Exception:
-            continue
-    return ""
-
-
-def env_first(*names: str, default: str = "") -> str:
-    _load_dotenv_once()
-    for name in names:
-        value = safe_str(os.getenv(name))
-        if value:
-            return value
-    for name in names:
-        value = _read_systemd_env_value(name)
-        if value:
-            return value
-    return default
-
-
-def get_toobit_api_key(default: str = "") -> str:
-    return env_first(TOOBIT_API_KEY_ENV, "TOOBIT_API_KEY", "TOBIT_API_KEY", default=default)
-
-
-def get_toobit_api_secret(default: str = "") -> str:
-    return env_first(TOOBIT_SECRET_KEY_ENV, "TOOBIT_API_SECRET", "TOOBIT_SECRET_KEY", "TOBIT_API_SECRET", "TOBIT_SECRET_KEY", default=default)
-
-
-def get_toobit_base_url(default: str = DEFAULT_TOOBIT_BASE_URL) -> str:
-    return env_first(TOOBIT_BASE_URL_ENV, "TOOBIT_BASE_URL", default=default).rstrip("/")
-
-
-def normalize_toobit_plain_symbol(symbol: str) -> str:
-    raw = safe_str(symbol).upper().replace("/", "").replace("_", "").replace("-", "")
-    raw = raw.replace("SWAP", "")
-    if raw.endswith("USDT"):
-        return TOOBIT_SPECIAL_SYMBOL_MAP.get(raw, raw)
-    if raw.endswith("USDC"):
-        return raw
-    return TOOBIT_SPECIAL_SYMBOL_MAP.get(raw, raw)
-
-
-def normalize_bot_plain_symbol(symbol: str) -> str:
-    plain = normalize_toobit_plain_symbol(symbol)
-    reverse = {v: k for k, v in TOOBIT_SPECIAL_SYMBOL_MAP.items()}
-    return reverse.get(plain, plain)
-
-
-def normalize_futures_symbol(symbol: str) -> str:
-    plain = normalize_toobit_plain_symbol(symbol)
-    if plain.endswith("USDT"):
-        return f"{plain[:-4]}-SWAP-USDT"
-    if plain.endswith("USDC"):
-        return f"{plain[:-4]}-SWAP-USDC"
-    return plain
-
-
-def open_side_for_direction(direction: str) -> str:
-    return SIDE_BUY_OPEN if normalize_direction(direction) == DIRECTION_LONG else SIDE_SELL_OPEN
-
-
-def close_side_for_direction(direction: str) -> str:
-    return SIDE_SELL_CLOSE if normalize_direction(direction) == DIRECTION_LONG else SIDE_BUY_CLOSE
-
-
-def _clean_params(params: Optional[Mapping[str, Any]]) -> dict[str, Any]:
-    out: dict[str, Any] = {}
-    for key, value in dict(params or {}).items():
-        if value is None:
-            continue
-        out[key] = "true" if value is True else "false" if value is False else value
-    return out
-
-
-class ToobitSigner:
-    def __init__(self, credentials: ToobitCredentials):
-        self.credentials = credentials
-
-    def sign_params(self, params: Mapping[str, Any]) -> dict[str, Any]:
-        if not self.credentials.valid():
-            raise ToobitAPIError("missing_toobit_credentials")
-        signed = dict(params)
-        signed.setdefault("recvWindow", 5000)
-        signed.setdefault("timestamp", now_ms())
-        query = urlencode(signed, doseq=True)
-        signed["signature"] = hmac.new(
-            self.credentials.api_secret.encode("utf-8"),
-            query.encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
-        return signed
+@dataclass(frozen=True)
+class OpenOrderResult:
+    symbol: str
+    direction: Direction
+    requested_margin_usdt: float
+    actual_margin_usdt: float
+    leverage: int
+    quantity: float
+    entry_price: float
+    tp_price: float
+    sl_price: float
+    opened: bool
+    order_id: str | None
+    position: PositionInfo | None
+    reason: str
+    raw: dict[str, Any] | None = None
 
 
 class ToobitClient:
-    def __init__(self, api_key: str | None = None, api_secret: str | None = None, base_url: str | None = None, timeout: int | None = None, session: Any = None):
-        self.base_url = (base_url or get_toobit_base_url()).rstrip("/")
-        self.timeout = int(timeout or TOOBIT_REQUEST_TIMEOUT_SECONDS or 10)
-        self.credentials = ToobitCredentials(api_key or get_toobit_api_key(), api_secret or get_toobit_api_secret())
-        self.signer = ToobitSigner(self.credentials)
+    """Small Toobit REST client.
+
+    Endpoint paths and TP/SL parameter names are environment-configurable so this
+    client can stay stable if the Toobit account/API variant uses different names.
+    """
+
+    def __init__(self, config: ToobitConfig | None = None, session: requests.Session | None = None) -> None:
+        self.config = config or ToobitConfig.from_env()
         self.session = session or requests.Session()
-        self._exchange_info_cache: dict[str, Any] = {}
-        self._symbol_rules_cache: dict[str, SymbolRules] = {}
-        self._leverage_cache: dict[str, int] = {}
-        self._margin_mode_cache: dict[str, str] = {}
-        if self.credentials.api_key:
-            self.session.headers.update({"X-BB-APIKEY": self.credentials.api_key, "User-Agent": "level4-smart-scalp/1.0", "Content-Type": "application/x-www-form-urlencoded"})
 
-    def _request(self, method: str, path: str, params: Optional[Mapping[str, Any]] = None, *, signed: bool = False) -> ToobitResponse:
-        method = safe_str(method).upper()
-        clean = _clean_params(params)
-        if signed:
-            clean = self.signer.sign_params(clean)
-        url = self.base_url + path
-        try:
-            if method == "GET":
-                response = self.session.get(url, params=clean, timeout=self.timeout)
-            elif method == "POST":
-                response = self.session.post(url, data=clean, timeout=self.timeout)
-            elif method == "DELETE":
-                response = self.session.delete(url, params=clean, timeout=self.timeout)
-            else:
-                return ToobitResponse(ok=False, error=f"unsupported_method:{method}")
-            raw = safe_str(getattr(response, "text", ""))
-            try:
-                data = response.json()
-            except Exception:
-                data = {"raw": raw}
-            status_code = safe_int(getattr(response, "status_code", 0), 0) or 0
-            ok = status_code < 400
-            error = ""
-            if isinstance(data, dict):
-                code = data.get("code", data.get("retCode", data.get("status")))
-                msg = data.get("msg", data.get("message", data.get("error", "")))
-                if code not in {None, "", 0, 200, "0", "200", "OK", "ok"}:
-                    ok = False
-                    error = f"{code}:{msg}"
-                if data.get("success", None) is False:
-                    ok = False
-                    error = error or safe_str(msg, "success_false")
-            if not ok and not error:
-                error = safe_str(data, "request_failed")
-            return ToobitResponse(ok=ok, status_code=status_code, data=data if isinstance(data, dict) else {"data": data}, error=error, raw_text=raw)
-        except Exception as exc:
-            return ToobitResponse(ok=False, status_code=0, data={}, error=str(exc), raw_text="")
+        self.path_balance = os.getenv("TOBIT_PATH_BALANCE", "/api/v1/futures/balance")
+        self.path_positions = os.getenv("TOBIT_PATH_POSITIONS", "/api/v1/futures/positions")
+        self.path_open_orders = os.getenv("TOBIT_PATH_OPEN_ORDERS", "/api/v1/futures/openOrders")
+        self.path_margin_mode = os.getenv("TOBIT_PATH_MARGIN_MODE", "/api/v1/futures/marginType")
+        self.path_leverage = os.getenv("TOBIT_PATH_LEVERAGE", "/api/v1/futures/leverage")
+        self.path_position_settings = os.getenv("TOBIT_PATH_POSITION_SETTINGS", "/api/v1/futures/positionRisk")
+        self.path_order = os.getenv("TOBIT_PATH_ORDER", "/api/v1/futures/order")
+        self.path_mark_price = os.getenv("TOBIT_PATH_MARK_PRICE", "/api/v1/futures/markPrice")
+        self.path_exchange_info = os.getenv("TOBIT_PATH_EXCHANGE_INFO", "/api/v1/futures/exchangeInfo")
 
-    def _request_first_ok(self, method: str, paths: list[str], params: Optional[Mapping[str, Any]] = None, *, signed: bool = False) -> ToobitResponse:
-        last = ToobitResponse(ok=False, error="no_paths")
-        for path in paths:
-            last = self._request(method, path, params=params, signed=signed)
-            if last.ok:
-                return last
-        return last
+        self.param_tp = os.getenv("TOBIT_PARAM_TP", "takeProfit")
+        self.param_sl = os.getenv("TOBIT_PARAM_SL", "stopLoss")
+        self.param_quantity = os.getenv("TOBIT_PARAM_QUANTITY", "quantity")
 
-    def normalize_futures_symbol(self, symbol: str) -> str:
-        return normalize_futures_symbol(symbol)
-
-    def normalize_bot_symbol(self, symbol: str) -> str:
-        return normalize_symbol(normalize_bot_plain_symbol(symbol))
-
-    def _flatten_items(self, payload: Any) -> list[dict[str, Any]]:
-        data = payload.get("data", payload) if isinstance(payload, dict) else payload
-        out: list[dict[str, Any]] = []
-        def walk(value: Any) -> None:
-            if isinstance(value, dict):
-                if any(k in value for k in ("symbol", "contractCode", "instrumentId", "minQty", "quantityPrecision", "positionAmt", "realizedPnl")):
-                    out.append(value)
-                for child in value.values():
-                    walk(child)
-            elif isinstance(value, list):
-                for child in value:
-                    walk(child)
-        walk(data)
-        return out
-
-    def get_exchange_info(self, *, force: bool = False) -> dict[str, Any]:
-        if self._exchange_info_cache and not force:
-            age = time.time() - safe_float(self._exchange_info_cache.get("_ts"), 0.0)
-            if 0 <= age <= 3600:
-                return dict(self._exchange_info_cache.get("payload", {}))
-        response = self._request_first_ok("GET", ["/api/v1/futures/exchangeInfo", "/api/v1/futures/symbols", "/api/v1/exchangeInfo"], signed=False)
-        if response.ok:
-            self._exchange_info_cache = {"_ts": time.time(), "payload": response.data}
-            return response.data
-        return {}
-
-    def _parse_rules_item(self, item: Mapping[str, Any], bot_symbol: str) -> Optional[SymbolRules]:
-        symbol_raw = safe_str(item.get("symbol") or item.get("contractCode") or item.get("instrumentId") or item.get("name"))
-        if not symbol_raw:
-            return None
-        candidates = {normalize_toobit_plain_symbol(symbol_raw), normalize_bot_plain_symbol(symbol_raw), self.normalize_futures_symbol(symbol_raw), normalize_symbol(symbol_raw)}
-        bot_plain = normalize_toobit_plain_symbol(bot_symbol)
-        if bot_plain not in candidates and normalize_symbol(bot_symbol) not in candidates:
-            return None
-        min_qty = safe_float(item.get("minQty") or item.get("min_quantity") or item.get("minTradeQty") or item.get("minVolume"), 0.001) or 0.001
-        qty_step = safe_float(item.get("stepSize") or item.get("qtyStep") or item.get("quantityStep") or item.get("minQty"), 0.001) or 0.001
-        min_notional = safe_float(item.get("minNotional") or item.get("minValue") or item.get("minTradeAmount"), 5.0) or 5.0
-        price_tick = safe_float(item.get("tickSize") or item.get("priceTick") or item.get("priceStep"), 0.0001) or 0.0001
-        return SymbolRules(
-            symbol=normalize_symbol(bot_symbol), exchange_symbol=self.normalize_futures_symbol(bot_symbol),
-            min_qty=min_qty, qty_step=qty_step, min_notional=min_notional, price_tick=price_tick,
-            quantity_precision=safe_int(item.get("quantityPrecision") or item.get("qtyPrecision"), 6) or 6,
-            price_precision=safe_int(item.get("pricePrecision"), 6) or 6,
-        )
-
-    def get_symbol_rules(self, symbol: str, *, force: bool = False) -> SymbolRules:
-        bot_symbol = normalize_symbol(symbol)
-        if bot_symbol in self._symbol_rules_cache and not force:
-            return self._symbol_rules_cache[bot_symbol]
-        info = self.get_exchange_info(force=force)
-        for item in self._flatten_items(info):
-            parsed = self._parse_rules_item(item, bot_symbol)
-            if parsed:
-                self._symbol_rules_cache[bot_symbol] = parsed
-                return parsed
-        fallback = SymbolRules(symbol=bot_symbol, exchange_symbol=self.normalize_futures_symbol(bot_symbol))
-        self._symbol_rules_cache[bot_symbol] = fallback
-        return fallback
-
-    def validate_quantity(self, symbol: str, quantity: Any, price: Any = 0.0) -> tuple[bool, float, str, SymbolRules]:
-        rules = self.get_symbol_rules(symbol)
-        qty = round_quantity(safe_float(quantity, 0.0) or 0.0, rules.qty_step)
-        if qty <= 0:
-            return False, qty, "quantity_zero", rules
-        if qty < rules.min_qty:
-            return False, qty, f"quantity_below_min_qty:{qty}<{rules.min_qty}", rules
-        price_f = safe_float(price, 0.0) or 0.0
-        if price_f > 0 and qty * price_f < rules.min_notional:
-            return False, qty, f"notional_below_min:{qty * price_f}<{rules.min_notional}", rules
-        return True, qty, "OK", rules
-
-    def ping_private(self) -> bool:
-        try:
-            return self._request("GET", "/api/v1/futures/balance", signed=True).ok
-        except Exception:
-            return False
-
-    def _balance_candidates(self, payload: Any) -> list[dict[str, Any]]:
-        """
-        Extract possible balance rows from Toobit responses.
-
-        Toobit balance responses may be nested and may use fields such as
-        totalWalletBalance/accountEquity/totalMarginBalance instead of balance.
-        """
-        candidates: list[dict[str, Any]] = []
-        balance_keys = {
-            "asset", "coin", "currency", "ccy",
-            "balance", "walletBalance", "equity", "total", "totalBalance",
-            "available", "availableBalance", "free", "freeBalance",
-            "totalWalletBalance", "accountEquity", "marginBalance",
-            "totalMarginBalance", "availableMargin",
-            "usdtBalance", "cashBalance",
-        }
-
-        def walk(value: Any) -> None:
-            if isinstance(value, Mapping):
-                if any(k in value for k in balance_keys):
-                    candidates.append(dict(value))
-                for child in value.values():
-                    walk(child)
-            elif isinstance(value, list):
-                for child in value:
-                    walk(child)
-
-        walk(payload)
-        return candidates
-
-    def get_account_balance(self, asset: str = "USDT") -> dict[str, Any]:
-        asset_u = safe_str(asset, "USDT").upper()
-
-        if not self.credentials.valid():
-            return {
-                "status": STATUS_FAILED,
-                "asset": asset_u,
-                "balance": None,
-                "available": None,
-                "error": "missing_toobit_credentials",
-                "credentials_loaded": False,
-                "raw": {},
-            }
-
-        response = self._request("GET", "/api/v1/futures/balance", signed=True)
-        if not response.ok:
-            return {
-                "status": STATUS_FAILED,
-                "asset": asset_u,
-                "balance": None,
-                "available": None,
-                "error": response.error,
-                "credentials_loaded": True,
-                "raw": response.to_dict(),
-            }
-
-        rows = self._balance_candidates(response.data)
-        best: Mapping[str, Any] = response.data
-
-        for row in rows:
-            row_asset = safe_str(row.get("asset") or row.get("coin") or row.get("currency") or row.get("ccy"))
-            if row_asset and row_asset.upper() == asset_u:
-                best = row
-                break
-        else:
-            if rows:
-                for row in rows:
-                    if asset_u in safe_str(row).upper():
-                        best = row
-                        break
-                else:
-                    best = rows[0]
-
-        balance = safe_float(
-            best.get("balance")
-            or best.get("walletBalance")
-            or best.get("equity")
-            or best.get("total")
-            or best.get("totalBalance")
-            or best.get("totalWalletBalance")
-            or best.get("accountEquity")
-            or best.get("marginBalance")
-            or best.get("totalMarginBalance")
-            or best.get("usdtBalance")
-            or best.get("cashBalance"),
-            None,
-        )
-        available = safe_float(
-            best.get("available")
-            or best.get("availableBalance")
-            or best.get("free")
-            or best.get("freeBalance")
-            or best.get("availableMargin")
-            or balance,
-            None,
-        )
-
-        return {
-            "status": STATUS_OK,
-            "asset": asset_u,
-            "balance": balance,
-            "available": available,
-            "error": "",
-            "credentials_loaded": True,
-            "raw": response.data,
-        }
-
-    get_balance = get_account_balance
-
-    def get_positions(self, symbol: str = "") -> list[dict[str, Any]]:
-        params = {"symbol": self.normalize_futures_symbol(symbol)} if symbol else {}
-        response = self._request("GET", "/api/v1/futures/positions", params=params, signed=True)
-        return self._flatten_items(response.data) if response.ok else []
-
-    def _position_qty(self, row: Mapping[str, Any]) -> float:
-        return abs(safe_float(row.get("positionAmt") or row.get("positionAmount") or row.get("qty") or row.get("volume") or row.get("available"), 0.0) or 0.0)
-
-    def _position_direction(self, row: Mapping[str, Any]) -> str:
-        side = safe_str(row.get("side") or row.get("positionSide") or row.get("direction")).upper()
-        if side in {"LONG", "BUY", "BUY_OPEN"}:
-            return DIRECTION_LONG
-        if side in {"SHORT", "SELL", "SELL_OPEN"}:
-            return DIRECTION_SHORT
-        qty = safe_float(row.get("positionAmt"), 0.0) or 0.0
-        return DIRECTION_SHORT if qty < 0 else DIRECTION_LONG
-
-    def _position_matches(self, row: Mapping[str, Any], symbol: str, direction: str = "", *, require_qty: bool = True) -> bool:
-        if symbol:
-            row_symbol = safe_str(row.get("symbol") or row.get("contractCode") or row.get("instrumentId"))
-            if row_symbol and self.normalize_bot_symbol(row_symbol) != normalize_symbol(symbol):
-                return False
-        if direction and self._position_direction(row) != normalize_direction(direction):
-            return False
-        return self._position_qty(row) > 0 if require_qty else True
-
-    def get_position(self, symbol: str, direction: str = "") -> Optional[dict[str, Any]]:
-        for row in self.get_positions(symbol):
-            if self._position_matches(row, symbol, direction):
-                return dict(row)
-        return None
-
-    def get_open_positions(self, symbol: str = "") -> list[dict[str, Any]]:
-        return [dict(r) for r in self.get_positions(symbol) if self._position_qty(r) > 0]
-
-    def _order_items(self, payload: Any) -> list[dict[str, Any]]:
-        """Extract possible open-order rows from Toobit order responses."""
-        data = payload.get("data", payload) if isinstance(payload, dict) else payload
-        out: list[dict[str, Any]] = []
-
-        def walk(value: Any) -> None:
-            if isinstance(value, dict):
-                if any(k in value for k in ("orderId", "order_id", "clientOrderId", "newClientOrderId", "side", "type", "priceType", "takeProfit", "stopLoss", "triggerPrice", "symbol", "contractCode")):
-                    out.append(dict(value))
-                for child in value.values():
-                    walk(child)
-            elif isinstance(value, list):
-                for child in value:
-                    walk(child)
-
-        walk(data)
-        return out
-
-    def get_open_orders(self, symbol: str = "") -> list[dict[str, Any]]:
-        """Best-effort read of open Toobit futures orders for duplicate safety.
-
-        This is used as a safety guard before opening a REAL position. If Toobit
-        returns no supported endpoint, the caller receives an empty list; hard
-        duplicate protection still comes from get_position().
-        """
-        params = {"symbol": self.normalize_futures_symbol(symbol)} if symbol else {}
-        response = self._request_first_ok(
-            "GET",
-            [
-                "/api/v1/futures/openOrders",
-                "/api/v1/futures/order/openOrders",
-                "/api/v1/futures/orders/open",
-                "/api/v1/futures/order",
-            ],
-            params=params,
-            signed=True,
-        )
-        if not response.ok:
-            return []
-        rows = self._order_items(response.data)
-        if not symbol:
-            return rows
-        target = normalize_symbol(symbol)
-        matched: list[dict[str, Any]] = []
-        for row in rows:
-            row_symbol = safe_str(row.get("symbol") or row.get("contractCode") or row.get("instrumentId") or row.get("instId"))
-            if row_symbol and self.normalize_bot_symbol(row_symbol) != target:
+    def get_wallet_margin_usdt(self) -> float:
+        payload = self._request("GET", self.path_balance, signed=True)
+        for item in _extract_dicts(payload):
+            asset = str(item.get("asset") or item.get("coin") or item.get("currency") or "").upper()
+            if asset and asset != "USDT":
                 continue
-            matched.append(row)
-        return matched
+            value = _first_decimal(item, "availableBalance", "available", "balance", "walletBalance", "marginBalance")
+            if value is not None and value >= 0:
+                return float(value)
+        raise RuntimeError("موجودی/مارجین USDT از پاسخ توبیت قابل خواندن نیست.")
 
-    def has_open_orders(self, symbol: str = "") -> bool:
+    def get_open_positions(self, symbol: str | None = None) -> list[PositionInfo]:
+        params: dict[str, Any] = {}
+        if symbol:
+            params["symbol"] = symbol.upper()
+        payload = self._request("GET", self.path_positions, params=params, signed=True)
+        positions: list[PositionInfo] = []
+        for item in _extract_dicts(payload):
+            parsed = self._parse_position(item)
+            if parsed is None:
+                continue
+            if symbol and parsed.symbol != symbol.upper():
+                continue
+            positions.append(parsed)
+        return positions
+
+    def get_open_orders(self, symbol: str | None = None) -> list[OpenOrderInfo]:
+        params: dict[str, Any] = {}
+        if symbol:
+            params["symbol"] = symbol.upper()
+        payload = self._request("GET", self.path_open_orders, params=params, signed=True)
+        orders: list[OpenOrderInfo] = []
+        for item in _extract_dicts(payload):
+            parsed = self._parse_open_order(item)
+            if parsed is None:
+                continue
+            if symbol and parsed.symbol != symbol.upper():
+                continue
+            orders.append(parsed)
+        return orders
+
+    def has_open_position(self, symbol: str) -> bool:
+        return bool(self.get_open_positions(symbol))
+
+    def has_open_order(self, symbol: str) -> bool:
         return bool(self.get_open_orders(symbol))
 
-    def has_position_or_orders(self, symbol: str, direction: str = "") -> tuple[bool, str, dict[str, Any]]:
-        """Return True when opening a new order would duplicate exposure.
+    def ensure_no_open_order(self, symbol: str) -> None:
+        orders = self.get_open_orders(symbol)
+        if orders:
+            ids = ", ".join(order.order_id or "unknown" for order in orders)
+            raise RuntimeError(f"برای {symbol.upper()} سفارش باز وجود دارد و سفارش جدید بلاک شد: {ids}")
 
-        A REAL order may only be sent when Toobit has no active position for the
-        same symbol/direction and no pending open/TP/SL orders for that symbol.
-        """
-        bot_symbol = normalize_symbol(symbol)
-        d = normalize_direction(direction)
-        existing_position = self.get_position(bot_symbol, d)
-        if existing_position:
-            return True, "exchange_position_exists", {"position": existing_position}
-        open_orders = self.get_open_orders(bot_symbol)
-        if open_orders:
-            return True, "exchange_open_orders_exist", {"orders": open_orders}
-        return False, "OK", {}
+    def ensure_no_open_position(self, symbol: str) -> None:
+        positions = self.get_open_positions(symbol)
+        if positions:
+            raise RuntimeError(f"برای {symbol.upper()} پوزیشن باز وجود دارد و سفارش جدید بلاک شد.")
 
-    def get_margin_mode(self, symbol: str) -> str:
-        return self._margin_mode_cache.get(normalize_symbol(symbol), MARGIN_ISOLATED)
+    def ensure_isolated_margin(self, symbol: str) -> None:
+        symbol = symbol.upper()
+        params = {"symbol": symbol, "marginType": "ISOLATED"}
+        try:
+            self._request("POST", self.path_margin_mode, params=params, signed=True)
+        except ToobitAPIError as exc:
+            message = str(exc).lower()
+            already_isolated = "no need" in message or "already" in message or "isolated" in message
+            if not already_isolated:
+                raise
+        verified = self._read_margin_mode(symbol)
+        if verified != "isolated":
+            raise RuntimeError(f"حالت مارجین {symbol} بعد از تنظیم تایید نشد. actual={verified!r}")
 
-    def set_margin_mode(self, symbol: str, margin_mode: str = MARGIN_ISOLATED) -> dict[str, Any]:
-        mode = safe_str(margin_mode, MARGIN_ISOLATED).upper()
-        if mode != MARGIN_ISOLATED:
-            return {"status": STATUS_FAILED, "ok": False, "error": "cross_margin_blocked"}
-        self._margin_mode_cache[normalize_symbol(symbol)] = MARGIN_ISOLATED
-        return {"status": STATUS_OK, "ok": True, "symbol": normalize_symbol(symbol), "margin_mode": MARGIN_ISOLATED}
+    def ensure_leverage(self, symbol: str, leverage: int) -> None:
+        symbol = symbol.upper()
+        if leverage <= 0:
+            raise ValueError("لوریج باید مثبت باشد.")
+        params = {"symbol": symbol, "leverage": int(leverage)}
+        self._request("POST", self.path_leverage, params=params, signed=True)
+        actual = self._read_leverage(symbol)
+        if actual != int(leverage):
+            raise RuntimeError(f"لوریج {symbol} تایید نشد. requested={leverage} actual={actual}")
 
-    change_margin_mode = set_margin_mode
-    change_symbol_margin_mode = set_margin_mode
-    set_futures_margin_mode = set_margin_mode
+    def prepare_symbol_for_trade(self, symbol: str, leverage: int) -> None:
+        self.ensure_no_open_position(symbol)
+        self.ensure_no_open_order(symbol)
+        self.ensure_isolated_margin(symbol)
+        self.ensure_leverage(symbol, leverage)
 
-    def get_leverage(self, symbol: str) -> int:
-        bot_symbol = normalize_symbol(symbol)
-        if bot_symbol in self._leverage_cache:
-            return self._leverage_cache[bot_symbol]
-        pos = self.get_position(bot_symbol)
-        if pos:
-            lev = safe_int(pos.get("leverage") or pos.get("lever"), 0) or 0
-            if lev > 0:
-                self._leverage_cache[bot_symbol] = lev
-                return lev
-        return 0
+    def open_position_with_tp_sl(
+        self,
+        *,
+        symbol: str,
+        direction: Direction,
+        margin_usdt: float,
+        leverage: int,
+        tp_price: float,
+        sl_price: float,
+        price: float | None = None,
+    ) -> OpenOrderResult:
+        symbol = symbol.upper()
+        _validate_direction(direction)
+        if margin_usdt <= 0:
+            raise ValueError("مارجین معامله باید مثبت باشد.")
+        if leverage <= 0:
+            raise ValueError("لوریج باید مثبت باشد.")
 
-    def set_leverage(self, symbol: str, leverage: int) -> dict[str, Any]:
-        lev = safe_int(leverage, 0) or 0
-        if lev <= 0:
-            return {"status": STATUS_FAILED, "ok": False, "error": "invalid_leverage"}
-        response = self._request("POST", "/api/v1/futures/leverage", params={"symbol": self.normalize_futures_symbol(symbol), "leverage": lev}, signed=True)
-        if response.ok:
-            self._leverage_cache[normalize_symbol(symbol)] = lev
-            return {"status": STATUS_OK, "ok": True, "symbol": normalize_symbol(symbol), "leverage": lev, "raw": response.data}
-        return {"status": STATUS_FAILED, "ok": False, "symbol": normalize_symbol(symbol), "leverage": lev, "error": response.error, "raw": response.to_dict()}
+        self.prepare_symbol_for_trade(symbol, leverage)
 
-    change_leverage = set_leverage
-    change_symbol_leverage = set_leverage
-    set_symbol_leverage = set_leverage
-    set_futures_leverage = set_leverage
+        entry_price = Decimal(str(price if price is not None else self.get_mark_price(symbol)))
+        if entry_price <= 0:
+            raise ValueError("قیمت ورود/مارک باید مثبت باشد.")
 
-    def verify_leverage(self, symbol: str, leverage: int) -> tuple[bool, str]:
-        desired = safe_int(leverage, 0) or 0
-        if desired <= 0:
-            return False, "invalid_leverage"
-        current = self.get_leverage(symbol)
-        if current == desired:
-            return True, "OK"
-        result = self.set_leverage(symbol, desired)
-        if result.get("ok"):
-            current2 = self.get_leverage(symbol)
-            if current2 in {0, desired}:
-                return True, "OK"
-        return False, safe_str(result.get("error"), "leverage_not_verified")
+        rules = self.get_symbol_rules(symbol)
+        tp_decimal = _round_price_to_tick(Decimal(str(tp_price)), rules.price_tick, direction, is_tp=True)
+        sl_decimal = _round_price_to_tick(Decimal(str(sl_price)), rules.price_tick, direction, is_tp=False)
+        self._validate_prices(direction, tp_price=tp_decimal, sl_price=sl_decimal, reference_price=entry_price)
 
-    def _order_response_id(self, payload: Mapping[str, Any]) -> str:
-        def walk(value: Any) -> str:
-            if isinstance(value, Mapping):
-                for key in ("orderId", "order_id", "clientOrderId", "newClientOrderId", "id"):
-                    found = safe_str(value.get(key))
-                    if found:
-                        return found
-                for child in value.values():
-                    found = walk(child)
-                    if found:
-                        return found
-            elif isinstance(value, list):
-                for child in value:
-                    found = walk(child)
-                    if found:
-                        return found
-            return ""
-        return walk(payload)
+        quantity_decimal = self.quantity_from_margin_decimal(
+            symbol=symbol,
+            margin_usdt=Decimal(str(margin_usdt)),
+            leverage=int(leverage),
+            price=entry_price,
+            rules=rules,
+        )
+        actual_margin = self._actual_margin_usdt(quantity_decimal, entry_price, int(leverage))
+        self._validate_actual_margin(requested_margin=Decimal(str(margin_usdt)), actual_margin=actual_margin)
 
-    def _recover_open_position_after_order_error(self, symbol: str, direction: str, wait_seconds: float = 70.0) -> Optional[dict[str, Any]]:
-        time.sleep(max(0.0, wait_seconds))
-        return self.get_position(symbol, direction)
-
-    def _recover_close_after_order_error(self, symbol: str, direction: str, wait_seconds: float = 70.0, poll_seconds: float = 5.0) -> bool:
-        """
-        Toobit can accept/execute a close even when the API response is delayed or looks failed.
-        Re-check exchange open positions before leaving the internal slot locked.
-        """
-        deadline = time.time() + max(0.0, wait_seconds)
-        poll = max(1.0, poll_seconds)
-        while time.time() <= deadline:
-            if not self.get_position(symbol, direction):
-                return True
-            time.sleep(poll)
-        return not bool(self.get_position(symbol, direction))
-
-    def open_futures_position(self, symbol: str, side: str = "", direction: str = "", quantity: Any = 0.0, price: Any = 0.0, order_type: str = "MARKET", margin_mode: str = MARGIN_ISOLATED, leverage: int = 1, take_profit: Any = None, take_profit_2: Any = None, stop_loss: Any = None, client_order_id: str = "") -> TradeOpenResult:
-        bot_symbol = normalize_symbol(symbol)
-        d = normalize_direction(direction or side)
-        entry_price = safe_float(price, 0.0) or 0.0
-
-        # HARD SAFETY: one REAL order per symbol/direction. TP/SL must be attached
-        # to the same opening order below; never open another position while the
-        # exchange already shows a position or pending TP/SL/open order for symbol.
-        duplicate, duplicate_reason, duplicate_meta = self.has_position_or_orders(bot_symbol, d)
-        if duplicate:
-            return TradeOpenResult(
-                status=STATUS_FAILED,
-                symbol=bot_symbol,
-                direction=d,
-                entry=entry_price,
-                quantity=safe_float(quantity, 0.0) or 0.0,
-                error=duplicate_reason,
-                raw=duplicate_meta,
-            )
-
-        if margin_mode.upper() != MARGIN_ISOLATED:
-            return TradeOpenResult(status=STATUS_FAILED, symbol=bot_symbol, direction=d, error="cross_margin_blocked")
-        ok, qty, reason, rules = self.validate_quantity(bot_symbol, quantity, entry_price)
-        if not ok:
-            return TradeOpenResult(status=STATUS_FAILED, symbol=bot_symbol, direction=d, quantity=qty, entry=entry_price, error=reason)
-        lev_ok, lev_reason = self.verify_leverage(bot_symbol, leverage)
-        if TRADE_CONFIG.get("require_leverage_verification", True) and not lev_ok:
-            return TradeOpenResult(status=STATUS_FAILED, symbol=bot_symbol, direction=d, quantity=qty, entry=entry_price, error=f"leverage_not_verified:{lev_reason}")
-        params = {"symbol": rules.exchange_symbol or self.normalize_futures_symbol(bot_symbol), "side": open_side_for_direction(d), "type": "LIMIT", "priceType": "MARKET" if order_type.upper() == "MARKET" else safe_str(order_type, "MARKET").upper(), "quantity": qty, "newClientOrderId": client_order_id or f"L4_{bot_symbol}_{d}_{now_ms()}"}
-        # Toobit must receive TP and SL together with the opening order.
-        # take_profit_2 is intentionally NOT sent here because sending a second
-        # full-size TP order can create duplicate close orders. TP2/runner logic
-        # stays internal until a safe partial-size endpoint is confirmed.
-        if take_profit:
-            params["takeProfit"] = round_price(take_profit, rules.price_tick)
-            params["tpOrderType"] = "MARKET"
-        if stop_loss:
-            params["stopLoss"] = round_price(stop_loss, rules.price_tick)
-            params["slOrderType"] = "MARKET"
-        response = self._request("POST", "/api/v1/futures/order", params=params, signed=True)
-        if response.ok:
-            return TradeOpenResult(status=STATUS_OK, symbol=bot_symbol, direction=d, entry=entry_price, quantity=qty, exchange_order_id=self._order_response_id(response.data), message="order_submitted", raw=response.data)
-        recovered = self._recover_open_position_after_order_error(bot_symbol, d, wait_seconds=70.0)
-        if recovered:
-            recovered_entry = safe_float(recovered.get("entryPrice") or recovered.get("avgPrice") or recovered.get("price"), entry_price) or entry_price
-            recovered_qty = self._position_qty(recovered) or qty
-            return TradeOpenResult(status=STATUS_RECOVERED, symbol=bot_symbol, direction=d, entry=recovered_entry, quantity=recovered_qty, recovered=True, message="order_error_but_position_found", error=response.error, raw={"order_error": response.to_dict(), "position": recovered})
-        return TradeOpenResult(status=STATUS_FAILED, symbol=bot_symbol, direction=d, entry=entry_price, quantity=qty, error=response.error, raw=response.to_dict())
-
-    def close_position(self, symbol: str, direction: str, quantity: Any = 0.0, price: Any = 0.0, client_order_id: str = "") -> TradeCloseResult:
-        bot_symbol = normalize_symbol(symbol)
-        d = normalize_direction(direction)
-        qty_raw = safe_float(quantity, 0.0) or 0.0
-        close_price = safe_float(price, 0.0) or 0.0
-        pos = self.get_position(bot_symbol, d)
-
-        # If exchange already closed it via TP/SL/manual close, confirm success instead of keeping the slot stuck.
-        if not pos:
-            pnl_data = self.wait_for_closed_position_pnl(bot_symbol, d, timeout_seconds=45, poll_seconds=5)
-            return TradeCloseResult(
-                status=STATUS_OK,
-                symbol=bot_symbol,
-                direction=d,
-                close_price=close_price,
-                closed_quantity=max(0.0, qty_raw),
-                pnl_usdt=safe_float(pnl_data.get("pnl_usdt"), None),
-                pnl_confirmed=bool(pnl_data.get("confirmed", False)),
-                close_confirmed=True,
-                message="already_closed_on_exchange",
-                raw={"pnl": pnl_data},
-            )
-
-        if qty_raw <= 0:
-            qty_raw = self._position_qty(pos)
-
-        ok, qty, reason, rules = self.validate_quantity(bot_symbol, qty_raw, price)
-        if not ok:
-            return TradeCloseResult(status=STATUS_FAILED, symbol=bot_symbol, direction=d, close_price=close_price, closed_quantity=qty, close_confirmed=False, error=reason)
-
+        side = "BUY" if direction == "LONG" else "SELL"
         params = {
-            "symbol": rules.exchange_symbol or self.normalize_futures_symbol(bot_symbol),
-            "side": close_side_for_direction(d),
-            "type": "LIMIT",
-            "priceType": "MARKET",
-            "quantity": qty,
-            "newClientOrderId": client_order_id or f"L4_CLOSE_{bot_symbol}_{d}_{now_ms()}",
+            "symbol": symbol,
+            "side": side,
+            "type": "MARKET",
+            self.param_quantity: _decimal_to_api(quantity_decimal),
+            self.param_tp: _decimal_to_api(tp_decimal),
+            self.param_sl: _decimal_to_api(sl_decimal),
+            "marginType": "ISOLATED",
+            "leverage": int(leverage),
         }
-        response = self._request("POST", "/api/v1/futures/order", params=params, signed=True)
 
-        if not response.ok:
-            recovered_closed = self._recover_close_after_order_error(bot_symbol, d, wait_seconds=70.0, poll_seconds=5.0)
-            if recovered_closed:
-                pnl_data = self.wait_for_closed_position_pnl(bot_symbol, d, timeout_seconds=50, poll_seconds=5)
-                return TradeCloseResult(
-                    status=STATUS_RECOVERED,
-                    symbol=bot_symbol,
-                    direction=d,
-                    close_price=close_price,
-                    closed_quantity=qty,
-                    pnl_usdt=safe_float(pnl_data.get("pnl_usdt"), None),
-                    pnl_confirmed=bool(pnl_data.get("confirmed", False)),
-                    close_confirmed=True,
-                    message="close_error_but_position_disappeared",
-                    error=response.error,
-                    raw={"order_error": response.to_dict(), "pnl": pnl_data},
+        try:
+            raw = self._request("POST", self.path_order, params=params, signed=True)
+        except Exception as exc:
+            position = self._verify_position_after_order(symbol, direction)
+            if position is not None:
+                return OpenOrderResult(
+                    symbol=symbol,
+                    direction=direction,
+                    requested_margin_usdt=float(margin_usdt),
+                    actual_margin_usdt=float(actual_margin),
+                    leverage=int(leverage),
+                    quantity=float(quantity_decimal),
+                    entry_price=float(entry_price),
+                    tp_price=float(tp_decimal),
+                    sl_price=float(sl_decimal),
+                    opened=True,
+                    order_id=None,
+                    position=position,
+                    reason=f"سفارش خطا داد ولی بعد از تایید {self.config.verify_after_error_seconds} ثانیه‌ای پوزیشن باز پیدا شد: {exc}",
+                    raw=None,
                 )
-            return TradeCloseResult(status=STATUS_FAILED, symbol=bot_symbol, direction=d, close_price=close_price, closed_quantity=qty, close_confirmed=False, error=response.error, raw=response.to_dict())
+            return OpenOrderResult(
+                symbol=symbol,
+                direction=direction,
+                requested_margin_usdt=float(margin_usdt),
+                actual_margin_usdt=float(actual_margin),
+                leverage=int(leverage),
+                quantity=float(quantity_decimal),
+                entry_price=float(entry_price),
+                tp_price=float(tp_decimal),
+                sl_price=float(sl_decimal),
+                opened=False,
+                order_id=None,
+                position=None,
+                reason=f"سفارش خطا داد و بعد از تایید {self.config.verify_after_error_seconds} ثانیه‌ای پوزیشن باز نشد: {exc}",
+                raw=None,
+            )
 
-        confirmed = self.verify_close(bot_symbol, d, attempts=14, sleep_seconds=5)
-        pnl_data = self.wait_for_closed_position_pnl(bot_symbol, d, timeout_seconds=50, poll_seconds=5)
-        return TradeCloseResult(
-            status=STATUS_OK if confirmed else STATUS_FAILED,
-            exchange_order_id=self._order_response_id(response.data),
-            symbol=bot_symbol,
-            direction=d,
-            close_price=close_price,
-            closed_quantity=qty,
-            pnl_usdt=safe_float(pnl_data.get("pnl_usdt"), None),
-            pnl_confirmed=bool(pnl_data.get("confirmed", False)),
-            close_confirmed=confirmed,
-            message="close_confirmed" if confirmed else "close_not_confirmed",
-            error="" if confirmed else "close_not_confirmed",
-            raw={"order": response.data, "pnl": pnl_data},
+        order_id = _extract_order_id(raw)
+        position = self._verify_position_after_order(symbol, direction)
+        return OpenOrderResult(
+            symbol=symbol,
+            direction=direction,
+            requested_margin_usdt=float(margin_usdt),
+            actual_margin_usdt=float(actual_margin),
+            leverage=int(leverage),
+            quantity=float(quantity_decimal),
+            entry_price=float(entry_price),
+            tp_price=float(tp_decimal),
+            sl_price=float(sl_decimal),
+            opened=position is not None,
+            order_id=order_id,
+            position=position,
+            reason=f"سفارش ارسال شد و بعد از تایید {self.config.verify_after_error_seconds} ثانیه‌ای وضعیت پوزیشن بررسی شد.",
+            raw=raw if isinstance(raw, dict) else {"response": raw},
+        )
+    def get_mark_price(self, symbol: str) -> float:
+        payload = self._request("GET", self.path_mark_price, params={"symbol": symbol.upper()}, signed=False)
+        for item in _extract_dicts(payload):
+            value = _first_decimal(item, "markPrice", "price", "lastPrice", "indexPrice")
+            if value is not None and value > 0:
+                return float(value)
+        raise RuntimeError(f"قیمت مارک برای {symbol} قابل خواندن نیست.")
+
+    def get_symbol_rules(self, symbol: str) -> SymbolRules:
+        symbol = symbol.upper()
+        fallback_qty = Decimal(os.getenv("TOBIT_DEFAULT_QUANTITY_STEP", "0.0001"))
+        fallback_tick = Decimal(os.getenv("TOBIT_DEFAULT_PRICE_TICK", "0.0001"))
+        fallback_min_qty = Decimal(os.getenv("TOBIT_DEFAULT_MIN_QTY", "0"))
+        fallback_min_notional = Decimal(os.getenv("TOBIT_DEFAULT_MIN_NOTIONAL", "0"))
+
+        try:
+            payload = self._request("GET", self.path_exchange_info, params={"symbol": symbol}, signed=False)
+        except Exception:
+            return SymbolRules(symbol, fallback_qty, fallback_tick, fallback_min_qty, fallback_min_notional)
+
+        qty_step = fallback_qty
+        price_tick = fallback_tick
+        min_qty = fallback_min_qty
+        min_notional = fallback_min_notional
+
+        for item in _extract_dicts(payload):
+            item_symbol = str(item.get("symbol") or item.get("contractCode") or "").upper()
+            if item_symbol and item_symbol != symbol:
+                continue
+            qty_step = _first_decimal(item, "stepSize", "quantityStep", "qtyStep", "lotSize") or qty_step
+            price_tick = _first_decimal(item, "tickSize", "priceTick", "pricePrecisionStep") or price_tick
+            min_qty = _first_decimal(item, "minQty", "minQuantity") or min_qty
+            min_notional = _first_decimal(item, "minNotional", "minOrderValue") or min_notional
+            filters = item.get("filters", [])
+            if isinstance(filters, list):
+                for filter_item in filters:
+                    if not isinstance(filter_item, dict):
+                        continue
+                    qty_step = _first_decimal(filter_item, "stepSize", "quantityStep", "qtyStep") or qty_step
+                    price_tick = _first_decimal(filter_item, "tickSize", "priceTick") or price_tick
+                    min_qty = _first_decimal(filter_item, "minQty", "minQuantity") or min_qty
+                    min_notional = _first_decimal(filter_item, "minNotional", "minOrderValue") or min_notional
+
+        return SymbolRules(
+            symbol=symbol,
+            quantity_step=qty_step if qty_step > 0 else fallback_qty,
+            price_tick=price_tick if price_tick > 0 else fallback_tick,
+            min_quantity=min_qty if min_qty > 0 else fallback_min_qty,
+            min_notional=min_notional if min_notional > 0 else fallback_min_notional,
         )
 
-    close_futures_position = close_position
+    def quantity_from_margin(self, *, symbol: str, margin_usdt: float, leverage: int, price: float) -> float:
+        quantity = self.quantity_from_margin_decimal(
+            symbol=symbol,
+            margin_usdt=Decimal(str(margin_usdt)),
+            leverage=leverage,
+            price=Decimal(str(price)),
+            rules=self.get_symbol_rules(symbol),
+        )
+        return float(quantity)
 
-    def verify_close(self, symbol: str, direction: str = "", attempts: int | None = None, sleep_seconds: float | None = None) -> bool:
-        # Toobit close confirmation can lag. Check long enough so valid closes do not leave slots stuck.
-        count = safe_int(attempts, TRADE_CONFIG.get("close_confirm_attempts", 14)) or 14
-        sleep = safe_float(sleep_seconds, TRADE_CONFIG.get("close_confirm_sleep_seconds", 5)) or 5.0
-        for _ in range(max(1, count)):
-            if not self.get_position(symbol, direction):
-                return True
-            time.sleep(max(0.0, sleep))
-        return not bool(self.get_position(symbol, direction))
+    def quantity_from_margin_decimal(
+        self,
+        *,
+        symbol: str,
+        margin_usdt: Decimal,
+        leverage: int,
+        price: Decimal,
+        rules: SymbolRules | None = None,
+    ) -> Decimal:
+        if margin_usdt <= 0:
+            raise ValueError("مارجین معامله باید مثبت باشد.")
+        if leverage <= 0:
+            raise ValueError("لوریج باید مثبت باشد.")
+        if price <= 0:
+            raise ValueError("قیمت برای محاسبه quantity باید مثبت باشد.")
 
-    def ensure_tp_sl(self, symbol: str, direction: str, take_profit: Any = None, stop_loss: Any = None, take_profit_2: Any = None) -> dict[str, Any]:
-        return self.set_position_tp_sl(symbol, direction, take_profit=take_profit, stop_loss=stop_loss, take_profit_2=take_profit_2)
+        rules = rules or self.get_symbol_rules(symbol)
+        notional = margin_usdt * Decimal(str(leverage))
+        quantity = _floor_to_step(notional / price, rules.quantity_step)
+        if quantity <= 0:
+            raise ValueError("quantity بعد از گرد کردن صفر شد؛ مارجین/لوریج برای این کوین کافی نیست.")
+        if rules.min_quantity > 0 and quantity < rules.min_quantity:
+            raise ValueError(f"quantity کمتر از حداقل مجاز صرافی است: {quantity} < {rules.min_quantity}")
+        actual_notional = quantity * price
+        if rules.min_notional > 0 and actual_notional < rules.min_notional:
+            raise ValueError(f"notional کمتر از حداقل مجاز صرافی است: {actual_notional} < {rules.min_notional}")
+        return quantity
 
-    def set_position_tp_sl(self, symbol: str, direction: str, take_profit: Any = None, stop_loss: Any = None, take_profit_2: Any = None) -> dict[str, Any]:
-        # Safety: TP/SL must normally be attached to the original OPEN order in
-        # open_futures_position().  Until the exact Toobit endpoint for editing
-        # an existing position's TP/SL is verified, do not pretend repair worked
-        # and do not create extra standalone TP/SL orders that could duplicate.
-        return {
-            "status": STATUS_FAILED,
-            "ok": False,
-            "symbol": normalize_symbol(symbol),
-            "direction": normalize_direction(direction),
-            "take_profit": take_profit,
-            "take_profit_2": None,
-            "stop_loss": stop_loss,
-            "error": "tp_sl_repair_endpoint_not_confirmed",
-            "note": "no_extra_tp_sl_order_created",
-        }
+    def _verify_position(self, symbol: str, direction: Direction) -> PositionInfo | None:
+        for position in self.get_open_positions(symbol):
+            if position.side == direction and position.quantity > 0:
+                return position
+        return None
 
-    def get_closed_position_pnl(self, symbol: str = "", direction: str = "", since_ms: Any = None) -> dict[str, Any]:
-        params = {"symbol": self.normalize_futures_symbol(symbol)} if symbol else {}
-        if since_ms:
-            params["startTime"] = safe_int(since_ms, 0) or 0
-        response = self._request_first_ok("GET", ["/api/v1/futures/closedPosition", "/api/v1/futures/history/positions", "/api/v1/futures/userTrades"], params=params, signed=True)
-        if not response.ok:
-            return {"status": STATUS_FAILED, "confirmed": False, "pnl_usdt": None, "error": response.error, "raw": response.to_dict()}
-        rows = self._flatten_items(response.data)
-        for row in rows:
-            row_symbol = safe_str(row.get("symbol") or row.get("contractCode") or row.get("instrumentId"))
-            if symbol and row_symbol and self.normalize_bot_symbol(row_symbol) != normalize_symbol(symbol):
+    def _verify_position_after_order(self, symbol: str, direction: Direction) -> PositionInfo | None:
+        wait_seconds = max(0.0, float(self.config.verify_after_error_seconds))
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
+        return self._verify_position(symbol, direction)
+
+
+    def _read_margin_mode(self, symbol: str) -> str:
+        payload = self._request("GET", self.path_position_settings, params={"symbol": symbol.upper()}, signed=True)
+        for item in _extract_dicts(payload):
+            item_symbol = str(item.get("symbol") or item.get("contractCode") or "").upper()
+            if item_symbol and item_symbol != symbol.upper():
                 continue
-            for key in ("realizedPnl", "realizedPNL", "realizedProfit", "pnl", "profit"):
-                if key in row:
-                    return {"status": STATUS_OK, "confirmed": True, "pnl_usdt": safe_float(row.get(key), 0.0) or 0.0, "row": dict(row), "raw": response.data}
-        return {"status": STATUS_OK, "confirmed": False, "pnl_usdt": None, "raw": response.data}
+            raw_mode = item.get("marginType", item.get("marginMode", None))
+            if raw_mode is not None and str(raw_mode).strip():
+                mode = str(raw_mode).strip().lower()
+                if mode in {"isolated", "isolate", "true", "1"}:
+                    return "isolated"
+                if mode in {"cross", "crossed", "false", "0"}:
+                    return "cross"
+            isolated_flag = item.get("isolated", None)
+            if isolated_flag is not None:
+                return "isolated" if str(isolated_flag).lower() in {"true", "1", "yes"} else "cross"
+        raise RuntimeError(f"وضعیت margin mode برای {symbol.upper()} از صرافی قابل خواندن نیست.")
 
-    def wait_for_closed_position_pnl(self, symbol: str = "", direction: str = "", timeout_seconds: int = 45, poll_seconds: int = 5) -> dict[str, Any]:
-        deadline = time.time() + max(0, safe_int(timeout_seconds, 45) or 45)
-        poll = max(1, safe_int(poll_seconds, 5) or 5)
-        last = {"status": STATUS_FAILED, "confirmed": False, "pnl_usdt": None}
-        while time.time() <= deadline:
-            last = self.get_closed_position_pnl(symbol, direction)
-            if last.get("confirmed"):
-                return last
-            time.sleep(poll)
-        return last
+    def _read_leverage(self, symbol: str) -> int:
+        payload = self._request("GET", self.path_position_settings, params={"symbol": symbol.upper()}, signed=True)
+        for item in _extract_dicts(payload):
+            item_symbol = str(item.get("symbol") or item.get("contractCode") or "").upper()
+            if item_symbol and item_symbol != symbol.upper():
+                continue
+            value = _first_decimal(item, "leverage", "isolatedLeverage", "crossLeverage")
+            if value is not None and value > 0:
+                return int(value)
+        raise RuntimeError(f"لوریج {symbol.upper()} از صرافی قابل خواندن نیست.")
+
+    def _parse_position(self, item: dict[str, Any]) -> PositionInfo | None:
+        symbol = str(item.get("symbol") or item.get("contractCode") or "").upper()
+        if not symbol:
+            return None
+        quantity = _first_decimal(item, "positionAmt", "positionAmount", "size", "quantity", "qty")
+        if quantity is None or quantity == 0:
+            return None
+        raw_side = str(item.get("side") or item.get("positionSide") or item.get("direction") or "").upper()
+        if raw_side in {"LONG", "BUY"}:
+            side: Direction = "LONG"
+        elif raw_side in {"SHORT", "SELL"}:
+            side = "SHORT"
+        else:
+            side = "LONG" if quantity > 0 else "SHORT"
+        entry = _first_decimal(item, "entryPrice", "avgPrice", "averagePrice") or Decimal("0")
+        pnl = _first_decimal(item, "unrealizedPnl", "unrealizedProfit", "pnl") or Decimal("0")
+        return PositionInfo(
+            symbol=symbol,
+            side=side,
+            quantity=float(abs(quantity)),
+            entry_price=float(entry),
+            unrealized_pnl=float(pnl),
+            raw=item,
+        )
+
+    def _parse_open_order(self, item: dict[str, Any]) -> OpenOrderInfo | None:
+        symbol = str(item.get("symbol") or item.get("contractCode") or "").upper()
+        if not symbol:
+            return None
+        status = str(item.get("status") or item.get("orderStatus") or "").upper()
+        if status in {"FILLED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED"}:
+            return None
+        raw_side = str(item.get("side") or item.get("positionSide") or "").upper()
+        side: Direction | None
+        if raw_side in {"BUY", "LONG"}:
+            side = "LONG"
+        elif raw_side in {"SELL", "SHORT"}:
+            side = "SHORT"
+        else:
+            side = None
+        return OpenOrderInfo(symbol=symbol, side=side, order_id=_extract_order_id(item), raw=item)
+
+    def _validate_prices(
+        self,
+        direction: Direction,
+        *,
+        tp_price: Decimal,
+        sl_price: Decimal,
+        reference_price: Decimal,
+    ) -> None:
+        if tp_price <= 0 or sl_price <= 0:
+            raise ValueError("TP و SL باید مثبت باشند.")
+        if reference_price <= 0:
+            raise ValueError("قیمت مرجع باید مثبت باشد.")
+        if direction == "LONG" and not (tp_price > reference_price > sl_price):
+            raise ValueError("برای LONG باید TP بالاتر از ورود و SL پایین‌تر از ورود باشد.")
+        if direction == "SHORT" and not (tp_price < reference_price < sl_price):
+            raise ValueError("برای SHORT باید TP پایین‌تر از ورود و SL بالاتر از ورود باشد.")
+
+    def _actual_margin_usdt(self, quantity: Decimal, price: Decimal, leverage: int) -> Decimal:
+        return (quantity * price) / Decimal(str(leverage))
+
+    def _validate_actual_margin(self, *, requested_margin: Decimal, actual_margin: Decimal) -> None:
+        if requested_margin <= 0 or actual_margin <= 0:
+            raise ValueError("مارجین واقعی/درخواستی باید مثبت باشد.")
+        diff_pct = abs(requested_margin - actual_margin) / requested_margin * Decimal("100")
+        max_diff = Decimal(str(self.config.margin_tolerance_pct))
+        if diff_pct > max_diff:
+            raise ValueError(
+                "مارجین واقعی بعد از محاسبه quantity با مقدار تنظیم‌شده نمی‌خواند: "
+                f"requested={requested_margin}, actual={actual_margin}, diff={diff_pct:.4f}%"
+            )
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        signed: bool,
+    ) -> Any:
+        params = dict(params or {})
+        headers = {"X-BB-APIKEY": self.config.api_key} if signed else {}
+        if signed:
+            params.setdefault("recvWindow", self.config.recv_window)
+            params.setdefault("timestamp", int(time.time() * 1000))
+            query = urlencode(params, doseq=True)
+            params["signature"] = hmac.new(
+                self.config.secret_key.encode("utf-8"),
+                query.encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
+
+        url = f"{self.config.base_url}{path}"
+        if method.upper() == "GET":
+            response = self.session.get(url, params=params, headers=headers, timeout=self.config.timeout_seconds)
+        elif method.upper() == "POST":
+            response = self.session.post(url, data=params, headers=headers, timeout=self.config.timeout_seconds)
+        else:
+            raise ValueError(f"HTTP method پشتیبانی نمی‌شود: {method}")
+
+        if response.status_code >= 400:
+            raise ToobitAPIError(f"HTTP {response.status_code}: {response.text[:500]}")
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise ToobitAPIError("پاسخ توبیت JSON معتبر نیست.") from exc
+        self._raise_if_api_error(payload)
+        return payload
+
+    @staticmethod
+    def _raise_if_api_error(payload: Any) -> None:
+        if not isinstance(payload, dict):
+            return
+        code = payload.get("code") or payload.get("retCode") or payload.get("status")
+        success_values = {None, 0, "0", "OK", "ok", "success", "SUCCESS", True}
+        if code in success_values:
+            return
+        message = payload.get("msg") or payload.get("message") or payload.get("error") or payload
+        raise ToobitAPIError(str(message))
 
 
-ToBitClient = ToobitClient
-_client: Optional[ToobitClient] = None
+class ToobitAPIError(RuntimeError):
+    """Raised for Toobit HTTP/API errors."""
 
 
-def get_client() -> ToobitClient:
-    global _client
-    if _client is None:
-        _client = ToobitClient()
-    return _client
+def _validate_direction(direction: str) -> None:
+    if direction not in ("LONG", "SHORT"):
+        raise ValueError("direction باید LONG یا SHORT باشد.")
 
 
-def toobit_client() -> ToobitClient:
-    return get_client()
+def _extract_dicts(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if not isinstance(payload, dict):
+        return []
+    result: list[dict[str, Any]] = []
+    for key in ("data", "result", "balances", "positions", "rows", "list"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            result.append(value)
+            result.extend(_extract_dicts(value))
+        elif isinstance(value, list):
+            result.extend(item for item in value if isinstance(item, dict))
+    if not result:
+        result.append(payload)
+    return result
+
+
+def _first_decimal(item: dict[str, Any], *keys: str) -> Decimal | None:
+    for key in keys:
+        if key not in item or item[key] in (None, ""):
+            continue
+        try:
+            return Decimal(str(item[key]))
+        except (InvalidOperation, ValueError):
+            continue
+    return None
+
+
+def _floor_to_step(value: Decimal, step: Decimal) -> Decimal:
+    if step <= 0:
+        return value
+    return (value / step).to_integral_value(rounding=ROUND_DOWN) * step
+
+
+def _round_price_to_tick(value: Decimal, tick: Decimal, direction: Direction, *, is_tp: bool) -> Decimal:
+    if tick <= 0:
+        return value
+    units = value / tick
+    if direction == "LONG":
+        rounding = ROUND_DOWN if is_tp else ROUND_UP
+    else:
+        rounding = ROUND_UP if is_tp else ROUND_DOWN
+    rounded = units.to_integral_value(rounding=rounding) * tick
+    if rounded <= 0:
+        rounded = units.to_integral_value(rounding=ROUND_HALF_UP) * tick
+    return rounded
+
+
+def _decimal_to_api(value: float | Decimal) -> str:
+    decimal_value = Decimal(str(value)).normalize()
+    return format(decimal_value, "f")
+
+
+def _extract_order_id(payload: Any) -> str | None:
+    if isinstance(payload, dict):
+        for key in ("orderId", "order_id", "id", "clientOrderId"):
+            value = payload.get(key)
+            if value not in (None, ""):
+                return str(value)
+    for item in _extract_dicts(payload):
+        for key in ("orderId", "order_id", "id", "clientOrderId"):
+            value = item.get(key)
+            if value not in (None, ""):
+                return str(value)
+    return None
 
 
 __all__ = [
-    "TOBIT_CLIENT_VERSION", "MARGIN_ISOLATED", "MARGIN_CROSS", "ToobitAPIError", "ToobitCredentials",
-    "ToobitResponse", "SymbolRules", "ToobitClient", "ToBitClient", "get_client", "toobit_client",
-    "get_toobit_api_key", "get_toobit_api_secret", "get_toobit_base_url", "normalize_toobit_plain_symbol",
-    "normalize_bot_plain_symbol", "normalize_futures_symbol", "open_side_for_direction", "close_side_for_direction",
+    "Direction",
+    "MarginMode",
+    "OpenOrderInfo",
+    "OpenOrderResult",
+    "PositionInfo",
+    "SymbolRules",
+    "ToobitAPIError",
+    "ToobitClient",
+    "ToobitConfig",
 ]
