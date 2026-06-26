@@ -72,6 +72,11 @@ except Exception:  # pragma: no cover
     real_trade_manager = None  # type: ignore
 
 try:
+    import tobit_client
+except Exception:  # pragma: no cover - status panel must still work without Toobit deps.
+    tobit_client = None  # type: ignore
+
+try:
     import command_router
 except Exception:  # pragma: no cover
     command_router = None  # type: ignore
@@ -659,6 +664,57 @@ def _runtime_status_text(runtime: BotRuntime) -> str:
     return "\n".join(lines)
 
 
+def _build_status_provider(runtime: BotRuntime) -> Callable[[], Mapping[str, Any]]:
+    """Build live status for command_router panels.
+
+    command_router.render_trade_panel() already knows how to consume a
+    status_provider, but bot.py must inject it. This provider reads live Toobit
+    wallet/open-position data when available and falls back safely to StateStore.
+    """
+
+    def _provider() -> Mapping[str, Any]:
+        snapshot = runtime.store.snapshot()
+        settings = snapshot.settings
+        data: dict[str, Any] = {
+            "margin_usdt": getattr(snapshot, "toobit_margin_usdt", None),
+            "open_positions": getattr(snapshot, "used_slots", 0),
+        }
+
+        client = None
+        if tobit_client is not None:
+            try:
+                client = tobit_client.get_client()
+            except Exception as exc:
+                data["toobit_status_error"] = str(exc)
+
+        if client is not None:
+            try:
+                margin = client.get_wallet_margin_usdt()
+                if margin is not None:
+                    data["toobit_margin_usdt"] = float(margin)
+                    try:
+                        runtime.store.update_toobit_margin(float(margin))
+                    except Exception:
+                        pass
+            except Exception as exc:
+                data["toobit_margin_error"] = str(exc)
+
+            try:
+                positions = client.get_open_positions()
+                data["toobit_open_total"] = len(positions)
+            except Exception as exc:
+                data["toobit_positions_error"] = str(exc)
+
+        if data.get("toobit_margin_usdt") is None and data.get("margin_usdt") is None:
+            # Last-resort display fallback: avoid "نامشخص" when live Toobit is
+            # unavailable, while keeping the real configured wallet read separate.
+            data["margin_usdt"] = float(getattr(settings, "trade_capital_usdt", 0.0) or 0.0)
+
+        return data
+
+    return _provider
+
+
 async def _call_command_router(update: Update, context: Any, runtime: BotRuntime) -> Any:
     if command_router is None:
         return None
@@ -669,7 +725,10 @@ async def _call_command_router(update: Update, context: Any, runtime: BotRuntime
         fn = getattr(command_router, name, None)
         if not callable(fn):
             continue
+        status_provider = _build_status_provider(runtime)
         attempts = (
+            lambda: fn(update=update, context=context, runtime=runtime, store=runtime.store, status_provider=status_provider),
+            lambda: fn(text, store=runtime.store, status_provider=status_provider),
             lambda: fn(update=update, context=context, runtime=runtime),
             lambda: fn(update, context),
             lambda: fn(text, runtime=runtime),
@@ -787,6 +846,7 @@ __all__ = [
     "TelegramNotifier",
     "build_telegram_application",
     "_load_project_env",
+    "_build_status_provider",
     "create_runtime",
     "main",
 ]
