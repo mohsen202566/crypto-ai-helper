@@ -475,10 +475,17 @@ def _build_result_payload(result_payload: Any) -> Any:
 
 
 def _payload_to_text(payload: Any) -> str:
+    """Return the clean Telegram text from strings, dict payloads, or command result objects."""
     if payload is None:
         return ""
     if isinstance(payload, str):
         return payload
+
+    for attr in ("text", "message", "body", "caption"):
+        value = getattr(payload, attr, None)
+        if value:
+            return str(value)
+
     if isinstance(payload, Mapping):
         for key in ("text", "message", "body", "caption"):
             value = payload.get(key)
@@ -488,6 +495,7 @@ def _payload_to_text(payload: Any) -> str:
             return json.dumps(payload, ensure_ascii=False, default=str, indent=2)
         except Exception:
             return str(payload)
+
     return str(payload)
 
 
