@@ -72,6 +72,7 @@ class SignalRecord:
     result: ResultKind | None = None
     exit_price: float | None = None
     pnl_usdt: float = 0.0
+    close_reason: str = ""
 
 
 @dataclass
@@ -119,11 +120,22 @@ class BotState:
         )
 
     @property
+    def confirmed_real_slots(self) -> int:
+        return sum(
+            1
+            for item in self.active_signals.values()
+            if item.mode == "TOOBIT" and item.status == "MONITORING"
+        )
+
+    @property
     def used_slots(self) -> int:
-        # Exchange open positions are the source of truth for confirmed REAL slots.
-        # Pending REAL orders are not visible on the exchange yet, but must already
-        # reserve a slot during the delayed verification window.
-        return self.toobit_open_positions + self.pending_real_slots
+        # Toobit open positions are the source of truth when recently synced.
+        # Local confirmed REAL records are also counted as a safety floor so a
+        # delayed/failed exchange sync cannot briefly free a slot that is still
+        # active locally. Pending REAL records always reserve a slot during the
+        # delayed verification window.
+        confirmed_slots = max(int(self.toobit_open_positions), self.confirmed_real_slots)
+        return confirmed_slots + self.pending_real_slots
 
     @property
     def free_slots(self) -> int:
@@ -137,9 +149,12 @@ class StateStore:
         self._recalculate_monitoring_counts()
 
     def save(self) -> None:
+        self._recalculate_monitoring_counts()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = _state_to_dict(self.state)
-        self.path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+        tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+        tmp_path.replace(self.path)
 
     def snapshot(self) -> BotState:
         return self.state
@@ -234,10 +249,8 @@ class StateStore:
         self.state.active_signals[signal_id] = record
         if mode == "TOOBIT":
             self.state.stats.real_signals += 1
-            self.state.stats.real_monitoring += 1
         else:
             self.state.stats.signal_only_total += 1
-            self.state.stats.signal_only_monitoring += 1
         self.save()
         return record
 
@@ -258,9 +271,9 @@ class StateStore:
         record.closed_at = time()
         record.result = None
         record.pnl_usdt = 0.0
+        record.close_reason = str(reason or "")
         self.state.active_signals.pop(signal_id, None)
         self.state.closed_signals[signal_id] = record
-        self.state.stats.real_monitoring = max(0, self.state.stats.real_monitoring - 1)
         self.save()
         return record
 
@@ -275,19 +288,18 @@ class StateStore:
         record.result = result
         record.exit_price = float(exit_price)
         record.pnl_usdt = float(pnl_usdt)
+        record.close_reason = str(result)
         record.closed_at = time()
         self.state.active_signals.pop(signal_id, None)
         self.state.closed_signals[signal_id] = record
 
         if record.mode == "TOOBIT":
-            self.state.stats.real_monitoring = max(0, self.state.stats.real_monitoring - 1)
             if result == "TP":
                 self.state.stats.real_tp += 1
             else:
                 self.state.stats.real_sl += 1
             self.state.stats.real_pnl_usdt += float(pnl_usdt)
         else:
-            self.state.stats.signal_only_monitoring = max(0, self.state.stats.signal_only_monitoring - 1)
             if result == "TP":
                 self.state.stats.signal_only_tp += 1
             else:
@@ -310,6 +322,8 @@ class StateStore:
         real = 0
         signal = 0
         for item in self.state.active_signals.values():
+            if item.status not in ("PENDING_OPEN", "MONITORING"):
+                continue
             if item.mode == "TOOBIT":
                 real += 1
             else:
