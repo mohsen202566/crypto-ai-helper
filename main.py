@@ -30,6 +30,8 @@ async def scanner_loop(okx: OkxDataClient, scorer: TechnicalScorer, trade_manage
                 if not decision.accepted:
                     continue
                 created = await trade_manager.create_signal(symbol, decision)
+                if created is None:
+                    continue
                 await ui.send_signal(symbol_name=symbol.name, decision=decision, created=created)
             except Exception as exc:
                 LOGGER.warning("scan error for %s: %s", symbol.name, exc)
