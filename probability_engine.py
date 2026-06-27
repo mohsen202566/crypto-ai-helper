@@ -23,6 +23,12 @@ from market_context import MarketContext
 
 
 @dataclass(frozen=True)
+class _NeutralSection:
+    direction: str = "neutral"
+    score: float = 0.0
+
+
+@dataclass(frozen=True)
 class ProbabilityResult:
     symbol: str
     long_probability: float
@@ -42,12 +48,47 @@ _SECTION_NAMES = (
     "volatility_atr",
     "candle_price_action",
     "liquidity",
+    # Optional 15m/30m sections. They stay neutral until coin_analyzer provides them.
+    "ema_slope",
+    "rsi_slope",
+    "market_structure",
+    "breakout_confirmation",
+    "consolidation",
+    "liquidity_sweep",
 )
 
-_CORE_SECTIONS = ("structure", "momentum", "acceleration", "candle_price_action")
-_MIN_TRADE_PROBABILITY = 52.0
-_MIN_CONFIDENCE = 50.0
-_MIN_DIRECTION_EDGE = 7.0
+_CORE_SECTIONS = (
+    "structure",
+    "market_structure",
+    "ema_slope",
+    "rsi_slope",
+    "momentum",
+    "acceleration",
+    "breakout_confirmation",
+    "candle_price_action",
+)
+_CONFIRMATION_SECTIONS = ("volume", "volatility_atr")
+_BLOCK_SECTIONS = ("consolidation", "liquidity_sweep")
+_MIN_TRADE_PROBABILITY = 62.0
+_MIN_CONFIDENCE = 75.0
+_MIN_DIRECTION_EDGE = 8.0
+_MIN_AGREEMENT = 70.0
+
+_FALLBACK_WEIGHTS = {
+    "structure": 18.0,
+    "market_structure": 18.0,
+    "ema_slope": 16.0,
+    "rsi_slope": 14.0,
+    "momentum": 10.0,
+    "acceleration": 8.0,
+    "breakout_confirmation": 10.0,
+    "candle_price_action": 6.0,
+    "liquidity": 6.0,
+    "volume": 5.0,
+    "volatility_atr": 5.0,
+    "consolidation": 0.0,
+    "liquidity_sweep": 0.0,
+}
 
 
 def calculate_probabilities(analysis: CoinAnalysis, context: MarketContext) -> ProbabilityResult:
@@ -104,6 +145,7 @@ def calculate_probabilities(analysis: CoinAnalysis, context: MarketContext) -> P
         short_probability=short_probability,
         no_trade_probability=no_trade,
         confidence=confidence,
+        agreement=agreement,
         edge=edge,
         context=context,
     )
@@ -125,7 +167,8 @@ def calculate_probabilities(analysis: CoinAnalysis, context: MarketContext) -> P
 
 
 def _sections(analysis: CoinAnalysis) -> dict[str, Any]:
-    return {name: getattr(analysis, name) for name in _SECTION_NAMES}
+    neutral = _NeutralSection()
+    return {name: getattr(analysis, name, neutral) for name in _SECTION_NAMES}
 
 
 def _permission_adjusted_raw(value: float, trade_permission: str) -> float:
@@ -145,11 +188,14 @@ def _direction_quality(
     direction: str,
     sections: dict[str, Any],
 ) -> float:
-    quality = raw_score * 0.55 + own_alignment * 0.55
-    quality -= opposite_alignment * 0.45
-    quality -= neutral_alignment * 0.15
+    # 15m/30m mode: direction alignment is more important than raw score.
+    quality = raw_score * 0.35 + own_alignment * 0.70
+    quality -= opposite_alignment * 0.60
+    quality -= neutral_alignment * 0.25
     quality -= _late_or_exhaustion_penalty(direction, sections)
     quality -= _core_conflict_penalty(direction, sections)
+    quality -= _confirmation_penalty(direction, sections)
+    quality -= _range_or_sweep_penalty(direction, sections)
     return _clamp(quality, 0.0, 100.0)
 
 
@@ -167,20 +213,36 @@ def _late_or_exhaustion_penalty(direction: str, sections: dict[str, Any]) -> flo
     acceleration = sections["acceleration"]
     candle = sections["candle_price_action"]
     liquidity = sections["liquidity"]
+    ema_slope = sections["ema_slope"]
+    rsi_slope = sections["rsi_slope"]
+    market_structure = sections["market_structure"]
+    breakout = sections["breakout_confirmation"]
 
     if _section_direction(momentum) != wanted:
-        penalty += 9.0
-    if _section_direction(acceleration) != wanted:
-        penalty += 11.0
-    if _section_direction(candle) == opposite and _section_score(candle) >= 55.0:
         penalty += 8.0
-    if _section_direction(liquidity) == opposite and _section_score(liquidity) >= 60.0:
+    if _section_direction(acceleration) != wanted:
+        penalty += 9.0
+    if _section_direction(ema_slope) == opposite and _section_score(ema_slope) >= 55.0:
+        penalty += 12.0
+    if _section_direction(rsi_slope) == opposite and _section_score(rsi_slope) >= 55.0:
         penalty += 10.0
+    if _section_direction(market_structure) == opposite and _section_score(market_structure) >= 55.0:
+        penalty += 14.0
+    if _section_direction(breakout) == opposite and _section_score(breakout) >= 55.0:
+        penalty += 12.0
+    if _section_direction(candle) == opposite and _section_score(candle) >= 55.0:
+        penalty += 7.0
+    if _section_direction(liquidity) == opposite and _section_score(liquidity) >= 60.0:
+        penalty += 8.0
 
     if _section_direction(momentum) == wanted and _section_score(momentum) < 45.0:
         penalty += 5.0
     if _section_direction(acceleration) == wanted and _section_score(acceleration) < 45.0:
-        penalty += 7.0
+        penalty += 6.0
+    if _section_direction(ema_slope) == wanted and _section_score(ema_slope) < 50.0:
+        penalty += 5.0
+    if _section_direction(rsi_slope) == wanted and _section_score(rsi_slope) < 50.0:
+        penalty += 5.0
 
     return penalty
 
@@ -198,13 +260,51 @@ def _core_conflict_penalty(direction: str, sections: dict[str, Any]) -> float:
         elif section_direction == opposite:
             conflicted += 1
 
+    if conflicted >= 4:
+        return 24.0
     if conflicted >= 3:
         return 18.0
     if conflicted >= 2 and aligned <= 1:
-        return 12.0
+        return 14.0
     if conflicted >= 1 and aligned == 0:
-        return 8.0
+        return 10.0
     return 0.0
+
+
+def _confirmation_penalty(direction: str, sections: dict[str, Any]) -> float:
+    """ATR and volume confirm quality; they must not create direction alone."""
+    wanted = "bullish" if direction == "LONG" else "bearish"
+    penalty = 0.0
+    for name in _CONFIRMATION_SECTIONS:
+        section = sections[name]
+        section_direction = _section_direction(section)
+        score = _section_score(section)
+        if section_direction == "neutral" or score < 45.0:
+            penalty += 5.0
+        elif section_direction != wanted and score >= 55.0:
+            penalty += 7.0
+    return penalty
+
+
+def _range_or_sweep_penalty(direction: str, sections: dict[str, Any]) -> float:
+    """Strong range or liquidity-sweep warnings should push the setup to NO_TRADE."""
+    wanted = "bullish" if direction == "LONG" else "bearish"
+    opposite = "bearish" if direction == "LONG" else "bullish"
+    penalty = 0.0
+
+    consolidation = sections["consolidation"]
+    if _section_direction(consolidation) == "neutral" and _section_score(consolidation) >= 60.0:
+        penalty += 18.0
+
+    liquidity_sweep = sections["liquidity_sweep"]
+    sweep_direction = _section_direction(liquidity_sweep)
+    sweep_score = _section_score(liquidity_sweep)
+    if sweep_direction == opposite and sweep_score >= 55.0:
+        penalty += 16.0
+    elif sweep_direction != wanted and sweep_score >= 70.0:
+        penalty += 10.0
+
+    return penalty
 
 
 def _agreement_score(analysis: CoinAnalysis) -> float:
@@ -233,7 +333,7 @@ def _direction_alignment(sections: dict[str, Any], direction: str) -> float:
 
 
 def _section_weight(name: str) -> float:
-    return float(ANALYZER_WEIGHTS.get(name, 0.0))
+    return float(ANALYZER_WEIGHTS.get(name, _FALLBACK_WEIGHTS.get(name, 0.0)))
 
 
 def _section_direction(section: Any) -> str:
@@ -282,8 +382,8 @@ def _no_trade_probability(
 
     if confidence < _MIN_CONFIDENCE:
         no_trade += (_MIN_CONFIDENCE - confidence) * 0.80
-    if agreement < 35.0:
-        no_trade += (35.0 - agreement) * 0.45
+    if agreement < _MIN_AGREEMENT:
+        no_trade += (_MIN_AGREEMENT - agreement) * 0.60
     if edge < _MIN_DIRECTION_EDGE:
         no_trade += (_MIN_DIRECTION_EDGE - edge) * 1.60
 
@@ -296,6 +396,7 @@ def _preferred_direction(
     short_probability: float,
     no_trade_probability: float,
     confidence: float,
+    agreement: float,
     edge: float,
     context: MarketContext,
 ) -> str:
@@ -303,7 +404,12 @@ def _preferred_direction(
         return "NO_TRADE"
 
     best = max(long_probability, short_probability)
-    if best < _MIN_TRADE_PROBABILITY or confidence < _MIN_CONFIDENCE or edge < _MIN_DIRECTION_EDGE:
+    if (
+        best < _MIN_TRADE_PROBABILITY
+        or confidence < _MIN_CONFIDENCE
+        or agreement < _MIN_AGREEMENT
+        or edge < _MIN_DIRECTION_EDGE
+    ):
         return "NO_TRADE"
     if no_trade_probability >= best:
         return "NO_TRADE"
@@ -329,10 +435,16 @@ def _reason(
     edge: float,
     context: MarketContext,
 ) -> str:
+    gates = (
+        f"Gates: MinProb={_MIN_TRADE_PROBABILITY:.0f} | "
+        f"MinConfidence={_MIN_CONFIDENCE:.0f} | "
+        f"MinAgreement={_MIN_AGREEMENT:.0f} | "
+        f"MinEdge={_MIN_DIRECTION_EDGE:.0f}"
+    )
     return (
         f"Preferred={preferred} | Long={long_p:.2f}% | Short={short_p:.2f}% | "
         f"NoTrade={no_trade_p:.2f}% | Confidence={confidence:.2f}% | "
-        f"Agreement={agreement:.2f}% | Edge={edge:.2f}% | {context.reason}"
+        f"Agreement={agreement:.2f}% | Edge={edge:.2f}% | {gates} | {context.reason}"
     )
 
 
