@@ -6,6 +6,8 @@ from config import TELEGRAM_CHAT_ID
 from storage import Storage, StoredSignal
 from trade_manager import CreatedSignal, PanelData, TradeManager
 
+_DIGIT_TRANS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+
 
 def fmt_price(value: float) -> str:
     if value >= 100:
@@ -19,6 +21,30 @@ def fmt_money(value: float | None) -> str:
     if value is None:
         return "نامشخص"
     return f"{value:.2f} USDT"
+
+
+def _normalize_command(text: str) -> str:
+    command = text.strip().translate(_DIGIT_TRANS)
+    if not command:
+        return ""
+    command = command.replace("ي", "ی").replace("ك", "ک").replace("‌", " ")
+    command = command.replace("ـ", "").replace("_", " ")
+    if command.startswith("/"):
+        command = command[1:]
+    if "@" in command:
+        command = command.split("@", 1)[0]
+    return " ".join(command.split())
+
+
+def _last_float(command: str) -> float:
+    parts = command.split()
+    if not parts:
+        raise ValueError("عدد وارد نشده است.")
+    return float(parts[-1])
+
+
+def _last_int(command: str) -> int:
+    return int(float(str(_last_float(command))))
 
 
 class BotUI:
@@ -88,34 +114,50 @@ class BotUI:
         if update.message is None or update.message.text is None:
             return
         chat_id = update.message.chat_id
-        text = update.message.text.strip()
+        command = _normalize_command(update.message.text)
+        if not command:
+            return
         try:
-            if text in {"/پنل", "پنل"}:
+            if command in {"پنل", "ترید", "وضعیت", "سرمایه", "پوزیشنها", "پوزیشن ها"}:
                 await self.send_panel(chat_id)
-            elif text in {"/ترید_فعال", "ترید فعال"}:
+            elif command in {"راهنما", "help", "start", "شروع"}:
+                await self._send_text(chat_id, self.help_text())
+            elif command in {"ترید فعال", "فعال ترید", "ترید روشن", "روشن ترید", "روشن"}:
                 self.storage.set_trade_enabled(True)
                 await self._send_text(chat_id, "ترید فعال شد.")
-            elif text in {"/ترید_خاموش", "ترید خاموش"}:
+            elif command in {"ترید خاموش", "خاموش ترید", "ترید غیرفعال", "غیرفعال ترید", "خاموش"}:
                 self.storage.set_trade_enabled(False)
                 await self._send_text(chat_id, "ترید خاموش شد. همه سیگنال‌ها عادی می‌شوند.")
-            elif text.startswith("/ترید_دلار") or text.startswith("ترید دلار"):
-                value = float(text.split()[-1])
+            elif command.startswith("ترید دلار") or command.startswith("تنظیم دلار") or command.startswith("دلار "):
+                value = _last_float(command)
                 self.storage.set_margin_usdt(value)
                 await self._send_text(chat_id, f"دلار هر پوزیشن تنظیم شد: {value:.2f} USDT")
-            elif text.startswith("/ترید_لوریج") or text.startswith("ترید لوریج"):
-                value = int(float(text.split()[-1]))
+            elif command.startswith("ترید لوریج") or command.startswith("تنظیم لوریج") or command.startswith("لوریج "):
+                value = _last_int(command)
                 self.storage.set_leverage(value)
                 await self._send_text(chat_id, f"لوریج تنظیم شد: {value}")
-            elif text.startswith("/حداکثر_پوزیشن") or text.startswith("حداکثر پوزیشن"):
-                value = int(float(text.split()[-1]))
+            elif command.startswith("حداکثر پوزیشن") or command.startswith("ترید اسلات") or command.startswith("اسلات "):
+                value = _last_int(command)
                 self.storage.set_max_positions(value)
                 await self._send_text(chat_id, f"حداکثر پوزیشن تنظیم شد: {value}")
-            elif text.startswith("/آمار") or text.startswith("آمار"):
-                parts = text.split()
+            elif command.startswith("آمار") or command.startswith("امار") or command in {"امروز", "سود", "تاریخچه"}:
+                parts = command.split()
                 days = int(parts[-1]) if len(parts) > 1 and parts[-1].isdigit() else 7
                 await self._send_text(chat_id, self.stats_text(days))
         except Exception as exc:
             await self._send_text(chat_id, f"خطا: {exc}")
+
+    def help_text(self) -> str:
+        return (
+            "راهنمای دستورها:\n\n"
+            "پنل یا ترید\n"
+            "آمار یا آمار 7\n"
+            "ترید فعال\n"
+            "ترید خاموش\n"
+            "ترید دلار 10\n"
+            "ترید لوریج 5\n"
+            "حداکثر پوزیشن 3"
+        )
 
     def stats_text(self, days: int) -> str:
         days = max(1, min(days, 7))
