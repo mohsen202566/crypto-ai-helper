@@ -34,9 +34,13 @@ class TradeManager:
         self.storage = storage
         self.toobit = toobit
 
-    async def create_signal(self, symbol: MarketSymbol, decision: SignalDecision) -> CreatedSignal:
+    async def create_signal(self, symbol: MarketSymbol, decision: SignalDecision) -> CreatedSignal | None:
         if decision.direction is None:
             raise ValueError("جهت سیگنال مشخص نیست.")
+
+        if self.storage.active_symbol_exists(symbol.toobit_symbol):
+            return None
+
         signal_type, reason = await self._select_signal_type(symbol)
         signal_id = self.storage.add_signal(
             okx_symbol=symbol.okx_inst_id,
