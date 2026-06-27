@@ -76,6 +76,11 @@ except Exception:  # pragma: no cover
     strategy_manager = None  # type: ignore
 
 try:
+    import strategy
+except Exception:  # pragma: no cover
+    strategy = None  # type: ignore
+
+try:
     import real_trade_manager
 except Exception:  # pragma: no cover
     real_trade_manager = None  # type: ignore
@@ -385,7 +390,7 @@ class OKXMarketDataProvider:
     """Small OKX public ticker adapter.
 
     It intentionally returns only latest prices. Strategy/indicator work remains in
-    strategy_manager.py and downstream files.
+    strategy.py (or strategy_manager.py if present) and downstream files.
     """
 
     def __init__(self, base_url: str | None = None, timeout: float = DEFAULT_HTTP_TIMEOUT_SECONDS) -> None:
@@ -637,7 +642,7 @@ class BotRuntime:
             LOGGER.info(
                 "no_trade symbol=%s action=%s reason=%s candles=%d btc_candles=%d",
                 symbol,
-                getattr(decision, "action", getattr(decision, "decision", None)),
+                getattr(decision, "action", getattr(decision, "decision", getattr(decision, "direction", None))),
                 getattr(decision, "reason", ""),
                 len(market.get("candles") or []),
                 len(market.get("btc_candles") or []),
@@ -688,20 +693,143 @@ class BotRuntime:
         self.notifier(_build_result_payload(payload))
 
 
+@dataclass(frozen=True)
+class StrategyDecisionAdapter:
+    symbol: str
+    action: str
+    direction: str
+    entry: float
+    tp: float
+    sl: float
+    tp1: float
+    confidence: float
+    reason: str
+    mode: str
+    raw_strategy_result: Any = None
+
+
 def _default_decision_provider(symbol: str, market: Mapping[str, Any]) -> Any:
-    if strategy_manager is None:
-        return None
-    for name in ("decide", "analyze_symbol", "build_decision", "evaluate_symbol", "get_decision"):
-        fn = getattr(strategy_manager, name, None)
-        if callable(fn):
-            try:
-                return fn(symbol=symbol, market=market)
-            except TypeError:
+    # Prefer a real strategy_manager when the project has one, but this bot must
+    # also work with the current project layout where strategy.py is the only
+    # strategy file.
+    if strategy_manager is not None:
+        for name in ("decide", "analyze_symbol", "build_decision", "evaluate_symbol", "get_decision"):
+            fn = getattr(strategy_manager, name, None)
+            if callable(fn):
                 try:
-                    return fn(symbol, market)
+                    return fn(symbol=symbol, market=market)
                 except TypeError:
-                    return fn(symbol)
-    return None
+                    try:
+                        return fn(symbol, market)
+                    except TypeError:
+                        return fn(symbol)
+
+    if strategy is None:
+        return None
+
+    analyze = getattr(strategy, "analyze_strategy", None)
+    if not callable(analyze):
+        return None
+
+    candles_main = _candles_for_strategy(market.get("candles_30m") or market.get("candles") or [])
+    candles_entry = _candles_for_strategy(market.get("candles_15m") or market.get("entry_candles") or [])
+    try:
+        result = analyze(symbol, candles_main, candles_entry)
+    except TypeError:
+        result = analyze(symbol=symbol, candles_5m=candles_main, candles_15m=candles_entry)
+
+    direction = str(getattr(result, "direction", "") or "").upper()
+    if direction in {"NO_TRADE", "HOLD", "REJECT", "NONE", ""}:
+        return StrategyDecisionAdapter(
+            symbol=symbol,
+            action="NO_TRADE",
+            direction="NO_TRADE",
+            entry=_safe_price(getattr(result, "entry_price", 0.0) or market.get("price")),
+            tp=0.0,
+            sl=0.0,
+            tp1=0.0,
+            confidence=0.0,
+            reason=str(getattr(result, "reason", "") or "strategy_no_trade"),
+            mode="SIGNAL",
+            raw_strategy_result=result,
+        )
+
+    entry = _safe_price(getattr(result, "entry_price", 0.0) or market.get("price"))
+    atr = _safe_price(getattr(result, "atr", 0.0))
+    tp, sl = _strategy_tp_sl_fallback(direction, entry=entry, atr=atr)
+    confidence = max(
+        _safe_float(getattr(result, "long_score", 0.0), 0.0),
+        _safe_float(getattr(result, "short_score", 0.0), 0.0),
+    ) + _safe_float(getattr(result, "strength_score", 0.0), 0.0)
+
+    return StrategyDecisionAdapter(
+        symbol=symbol,
+        action=direction,
+        direction=direction,
+        entry=entry,
+        tp=tp,
+        sl=sl,
+        tp1=tp,
+        confidence=round(confidence, 2),
+        reason=str(getattr(result, "reason", "") or "strategy_signal"),
+        mode="TOOBIT" if bool(market.get("real_trade_enabled")) else "SIGNAL",
+        raw_strategy_result=result,
+    )
+
+
+def _candles_for_strategy(raw_candles: Any) -> list[dict[str, float]]:
+    """Convert OKX raw candles or dict candles to chronological dict candles."""
+    if not isinstance(raw_candles, list):
+        return []
+    cleaned: list[dict[str, float]] = []
+    for item in raw_candles:
+        try:
+            if isinstance(item, Mapping):
+                cleaned.append(
+                    {
+                        "open": float(item.get("open", item.get("o"))),
+                        "high": float(item.get("high", item.get("h"))),
+                        "low": float(item.get("low", item.get("l"))),
+                        "close": float(item.get("close", item.get("c"))),
+                        "volume": float(item.get("volume", item.get("v", 0.0))),
+                    }
+                )
+            elif isinstance(item, (list, tuple)) and len(item) >= 6:
+                # OKX format: [ts, open, high, low, close, volume, ...]
+                cleaned.append(
+                    {
+                        "open": float(item[1]),
+                        "high": float(item[2]),
+                        "low": float(item[3]),
+                        "close": float(item[4]),
+                        "volume": float(item[5]),
+                    }
+                )
+        except (TypeError, ValueError):
+            continue
+
+    # OKX returns newest first. Strategy indicators need oldest -> newest.
+    if len(raw_candles) >= 2 and isinstance(raw_candles[0], (list, tuple)) and isinstance(raw_candles[1], (list, tuple)):
+        try:
+            if float(raw_candles[0][0]) > float(raw_candles[1][0]):
+                cleaned.reverse()
+        except Exception:
+            cleaned.reverse()
+    return cleaned
+
+
+def _strategy_tp_sl_fallback(direction: str, *, entry: float, atr: float) -> tuple[float, float]:
+    if entry <= 0:
+        return 0.0, 0.0
+    tp_mult = max(0.1, _safe_float(os.getenv("STRATEGY_TP_ATR_MULT"), 1.2))
+    sl_mult = max(0.1, _safe_float(os.getenv("STRATEGY_SL_ATR_MULT"), 0.8))
+    atr_value = atr if atr > 0 else entry * max(0.001, _safe_float(os.getenv("STRATEGY_FALLBACK_ATR_PCT"), 0.006))
+    direction = str(direction or "").upper()
+    if direction == "LONG":
+        return round(entry + atr_value * tp_mult, 10), round(max(entry - atr_value * sl_mult, entry * 0.001), 10)
+    if direction == "SHORT":
+        return round(max(entry - atr_value * tp_mult, entry * 0.001), 10), round(entry + atr_value * sl_mult, 10)
+    return 0.0, 0.0
 
 
 def _default_exchange_checker(record: Any) -> Mapping[str, Any]:
@@ -784,7 +912,7 @@ def _direction(decision: Any, *, allow_empty: bool = False) -> str:
 
 
 def _entry(decision: Any, *, fallback: float) -> float:
-    value = _safe_price(getattr(decision, "entry", 0.0))
+    value = _safe_price(getattr(decision, "entry", 0.0) or getattr(decision, "entry_price", 0.0))
     return value if value > 0 else fallback
 
 
