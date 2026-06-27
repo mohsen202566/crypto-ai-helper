@@ -6,7 +6,7 @@ Locked responsibility:
 - Sends market snapshots to the existing strategy layer for the final decision.
 - Registers SIGNAL_ONLY when real trading is off, slots are full, or the strategy/TP-SL
   result says the trade should be monitored only.
-- Sends REAL requests only through the project trade/exchange layer when available.
+- Sends REAL requests directly through toobit_client.py when real trading is enabled.
 - Reads active monitoring records from StateStore every cycle and closes TP/SL hits.
 - Reads Telegram command names from config.py and applies them directly to StateStore.
 - Reads Telegram command names from config.py and handles them directly.
@@ -83,9 +83,12 @@ except Exception:  # pragma: no cover
     strategy_manager = None  # type: ignore
 
 try:
-    import real_trade_manager
-except Exception:  # pragma: no cover
-    real_trade_manager = None  # type: ignore
+    import tp_sl_engine
+except Exception as exc:  # pragma: no cover
+    tp_sl_engine = None  # type: ignore
+    TP_SL_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
+else:
+    TP_SL_IMPORT_ERROR = ""
 
 try:
     import toobit_client as tobit_client
@@ -235,7 +238,7 @@ class StateStoreMonitor:
         if status != "MONITORING":
             return None
 
-        # First use an explicit closed-PNL reader if real_trade_manager provides one.
+        # First use an explicit closed-PNL reader if one is provided.
         pnl_payload = self._safe_closed_pnl(record)
         confirmed = self._payload_bool(pnl_payload, "confirmed")
         if confirmed is True:
@@ -656,13 +659,22 @@ class BotRuntime:
 
         if can_open_real:
             LOGGER.info("real_request symbol=%s direction=%s confidence=%s", symbol, _direction(decision), getattr(decision, "confidence", ""))
-            result = _open_real(decision)
+            result = _open_real(decision, symbol=symbol, price=price, settings=settings)
             if _open_result_ok(result):
-                self._notify_signal(decision, mode="TOOBIT", raw_result=result)
-                LOGGER.info("real_opened symbol=%s", symbol)
+                record = self._register_toobit_signal(decision, symbol=symbol, price=price, open_result=result)
+                self._notify_signal(decision, mode="TOOBIT", raw_result={"record": record, "open_result": result})
+                LOGGER.info("real_opened symbol=%s direction=%s", symbol, _direction(decision))
                 return "REAL"
-            LOGGER.warning("real_failed symbol=%s result=%s", symbol, result)
-            return ""
+
+            LOGGER.warning("real_failed_fallback_signal symbol=%s result=%s", symbol, result)
+            record = self._register_signal_only(decision, symbol=symbol, price=price)
+            self._notify_signal(
+                decision,
+                mode="SIGNAL",
+                raw_result={"record": record, "real_attempt_failed": True, "open_result": result},
+            )
+            LOGGER.info("signal_registered symbol=%s direction=%s confidence=%s fallback=real_failed", symbol, _direction(decision), getattr(decision, "confidence", ""))
+            return "SIGNAL"
 
         record = self._register_signal_only(decision, symbol=symbol, price=price)
         self._notify_signal(decision, mode="SIGNAL", raw_result=record)
@@ -682,6 +694,23 @@ class BotRuntime:
             tp=tp,
             sl=sl,
         )
+
+    def _register_toobit_signal(self, decision: Any, *, symbol: str, price: float, open_result: Any) -> Any:
+        direction = _direction(decision)
+        decision_tp, decision_sl = _tp_sl(decision)
+        signal_id = _signal_id(decision, symbol)
+        record = self.store.register_signal(
+            signal_id=signal_id,
+            symbol=symbol,
+            direction=direction,
+            requested_mode="TOOBIT",
+            entry=_safe_price(_result_value(open_result, "entry_price")) or _entry(decision, fallback=price),
+            tp=_safe_price(_result_value(open_result, "tp_price")) or decision_tp,
+            sl=_safe_price(_result_value(open_result, "sl_price")) or decision_sl,
+        )
+        if str(getattr(record, "status", "")).upper() == "PENDING_OPEN":
+            record = self.store.confirm_real_open(signal_id)
+        return record
 
     def _notify_signal(self, decision: Any, *, mode: str, raw_result: Any) -> None:
         payload = _build_signal_payload(decision, mode=mode, raw_result=raw_result)
@@ -708,6 +737,7 @@ class StrategyDecisionAdapter:
     reason: str
     mode: str
     raw_strategy_result: Any = None
+    tp_sl_plan: Any = None
 
 
 def _default_decision_provider(symbol: str, market: Mapping[str, Any]) -> Any:
@@ -789,14 +819,29 @@ def _adapt_strategy_result(symbol: str, market: Mapping[str, Any], result: Any) 
             reason=reason if result is not None else "strategy_returned_none",
             mode="SIGNAL",
             raw_strategy_result=result,
+            tp_sl_plan=None,
         )
 
     atr = _safe_price(getattr(result, "atr", 0.0))
-    tp, sl = _strategy_tp_sl_fallback(direction, entry=entry, atr=atr)
+    strength = _move_strength(getattr(result, "strength", "normal"))
+    tp, sl, plan = _build_strategy_tp_sl_plan(
+        symbol=symbol,
+        direction=direction,
+        entry=entry,
+        atr=atr,
+        strength=strength,
+        market=market,
+    )
+
     confidence = max(
         _safe_float(getattr(result, "long_score", 0.0), 0.0),
         _safe_float(getattr(result, "short_score", 0.0), 0.0),
     ) + _safe_float(getattr(result, "strength_score", 0.0), 0.0)
+
+    execution_mode = str(getattr(plan, "execution_mode", "") or "").upper()
+    wants_real = bool(market.get("real_trade_enabled")) and plan is not None and execution_mode == "REAL_ALLOWED"
+    if plan is not None:
+        reason = f"{reason} | TP/SL={getattr(plan, 'reason', '')} | Mode={getattr(plan, 'execution_mode', '')}"
 
     return StrategyDecisionAdapter(
         symbol=symbol,
@@ -808,8 +853,9 @@ def _adapt_strategy_result(symbol: str, market: Mapping[str, Any], result: Any) 
         tp1=tp,
         confidence=round(confidence, 2),
         reason=reason,
-        mode="TOOBIT" if bool(market.get("real_trade_enabled")) else "SIGNAL",
+        mode="TOOBIT" if wants_real else "SIGNAL",
         raw_strategy_result=result,
+        tp_sl_plan=plan,
     )
 
 def _candles_for_strategy(raw_candles: Any) -> list[dict[str, float]]:
@@ -869,11 +915,64 @@ def _strategy_tp_sl_fallback(direction: str, *, entry: float, atr: float) -> tup
         return round(max(entry - atr_value * tp_mult, entry * 0.001), 10), round(entry + atr_value * sl_mult, 10)
     return 0.0, 0.0
 
+def _move_strength(value: Any) -> str:
+    text = str(value or "").lower().strip()
+    if text in {"weak", "normal", "strong"}:
+        return text
+    return "normal"
+
+
+def _build_strategy_tp_sl_plan(
+    *,
+    symbol: str,
+    direction: str,
+    entry: float,
+    atr: float,
+    strength: str,
+    market: Mapping[str, Any],
+) -> tuple[float, float, Any]:
+    fallback_tp, fallback_sl = _strategy_tp_sl_fallback(direction, entry=entry, atr=atr)
+    if fallback_tp <= 0 or fallback_sl <= 0:
+        return fallback_tp, fallback_sl, None
+
+    if tp_sl_engine is None:
+        if TP_SL_IMPORT_ERROR:
+            LOGGER.warning("tp_sl_engine_import_failed error=%s", TP_SL_IMPORT_ERROR)
+        return fallback_tp, fallback_sl, None
+
+    build = getattr(tp_sl_engine, "build_tp_sl_plan", None)
+    if not callable(build):
+        return fallback_tp, fallback_sl, None
+
+    try:
+        plan = build(
+            symbol=symbol,
+            direction=direction,
+            entry=entry,
+            suggested_sl=fallback_sl,
+            move_strength=_move_strength(strength),
+            trade_margin_usdt=_safe_float(
+                market.get("trade_margin_usdt"),
+                _safe_float(getattr(bot_config, "DEFAULT_TRADE_DOLLAR", 5.0) if bot_config is not None else 5.0, 5.0),
+            ),
+            leverage=max(1, int(_safe_float(
+                market.get("leverage"),
+                _safe_float(getattr(bot_config, "DEFAULT_LEVERAGE", 10) if bot_config is not None else 10, 10),
+            ))),
+            min_net_profit_usdt=_safe_float(
+                market.get("min_net_profit_usdt"),
+                _safe_float(getattr(bot_config, "DEFAULT_MIN_NET_PROFIT_USDT", 0.10) if bot_config is not None else 0.10, 0.10),
+            ),
+        )
+        tp = _safe_price(getattr(plan, "tp", 0.0)) or fallback_tp
+        sl = _safe_price(getattr(plan, "sl", 0.0)) or fallback_sl
+        return tp, sl, plan
+    except Exception as exc:
+        LOGGER.warning("tp_sl_plan_error symbol=%s direction=%s error=%s", symbol, direction, exc)
+        return fallback_tp, fallback_sl, None
+
+
 def _default_exchange_checker(record: Any) -> Mapping[str, Any]:
-    if real_trade_manager is not None:
-        fn = getattr(real_trade_manager, "exchange_position_checker", None)
-        if callable(fn):
-            return fn(record)
     return _toobit_position_exists(record)
 
 
@@ -885,32 +984,48 @@ def _toobit_position_exists(record: Any) -> Mapping[str, Any]:
         return {"exists": None, "error": "toobit_client_missing"}
     try:
         client = tobit_client.get_client()
-        positions = client.get_open_positions(symbol)
+        positions = client.get_open_positions(_toobit_symbol(symbol))
         return {"exists": bool(positions), "open_positions": len(positions)}
     except Exception as exc:
         return {"exists": None, "error": str(exc)}
 
 
 def _default_closed_pnl_reader(record: Any) -> Mapping[str, Any]:
-    if real_trade_manager is None:
-        return {"confirmed": False, "pnl_usdt": None, "error": "real_trade_manager_missing"}
-    fn = getattr(real_trade_manager, "closed_pnl_reader", None)
-    if not callable(fn):
-        return {"confirmed": False, "pnl_usdt": None, "error": "closed_pnl_reader_missing"}
-    return fn(record)
+    # Real position existence is checked from toobit_client.py; closed PNL is left unconfirmed
+    # unless Toobit position status plus local TP/SL can safely infer the result.
+    return {"confirmed": False, "pnl_usdt": None, "reason": "closed_pnl_reader_unavailable"}
 
 
-def _open_real(decision: Any) -> Any:
-    if real_trade_manager is None:
-        return {"status": "FAILED", "error": "real_trade_manager_missing"}
-    fn = getattr(real_trade_manager, "open_real_trade", None)
-    if not callable(fn):
-        return {"status": "FAILED", "error": "open_real_trade_missing"}
-    return fn(decision)
+def _open_real(decision: Any, *, symbol: str, price: float, settings: Any) -> Any:
+    if tobit_client is None:
+        return {"status": "FAILED", "error": "toobit_client_missing"}
+
+    try:
+        client = tobit_client.get_client()
+        tp, sl = _tp_sl(decision)
+        return client.open_position_with_tp_sl(
+            symbol=_toobit_symbol(symbol),
+            direction=_direction(decision),
+            margin_usdt=float(getattr(settings, "trade_dollar_usdt", 0.0) or 0.0),
+            leverage=int(getattr(settings, "leverage", 1) or 1),
+            tp_price=tp,
+            sl_price=sl,
+            price=_entry(decision, fallback=price),
+        )
+    except Exception as exc:
+        return {"status": "FAILED", "error": str(exc), "error_type": type(exc).__name__}
 
 
 def _open_result_ok(result: Any) -> bool:
-    status = str(getattr(result, "status", "") or (result.get("status") if isinstance(result, Mapping) else "")).upper()
+    opened = getattr(result, "opened", None)
+    if isinstance(opened, bool):
+        return opened
+    if isinstance(result, Mapping):
+        if isinstance(result.get("opened"), bool):
+            return bool(result.get("opened"))
+        status = str(result.get("status") or "").upper()
+    else:
+        status = str(getattr(result, "status", "") or "").upper()
     return status in {"OK", "RECOVERED", "SUCCESS"}
 
 
@@ -967,6 +1082,27 @@ def _tp_sl(decision: Any) -> tuple[float, float]:
     return tp, sl
 
 
+def _result_value(result: Any, *names: str) -> Any:
+    if isinstance(result, Mapping):
+        for name in names:
+            if name in result and result.get(name) is not None:
+                return result.get(name)
+    for name in names:
+        value = getattr(result, name, None)
+        if value is not None:
+            return value
+    return None
+
+
+def _toobit_symbol(symbol: str) -> str:
+    clean = str(symbol or "").upper().strip()
+    try:
+        coin = get_coin(clean)
+        return str(getattr(coin, "toobit_symbol", "") or clean).upper()
+    except Exception:
+        return clean
+
+
 def _signal_id(decision: Any, symbol: str) -> str:
     raw = str(getattr(decision, "signal_id", "") or "").strip()
     if raw:
@@ -1006,7 +1142,48 @@ def _build_signal_payload(decision: Any, *, mode: str, raw_result: Any) -> Any:
                         return fn(decision, mode, raw_result)
                     except TypeError:
                         pass
-    return {"type": "signal", "mode": mode, "decision": decision, "result": raw_result}
+    return _fallback_signal_text(decision, mode=mode, raw_result=raw_result)
+
+
+def _fallback_signal_text(decision: Any, *, mode: str, raw_result: Any) -> dict[str, Any]:
+    direction = _direction(decision, allow_empty=True) or str(getattr(decision, "direction", "") or "")
+    symbol = str(getattr(decision, "symbol", "") or "").upper()
+    tp, sl = (0.0, 0.0)
+    try:
+        tp, sl = _tp_sl(decision)
+    except Exception:
+        pass
+    entry = _entry(decision, fallback=_safe_price(getattr(decision, "entry_price", 0.0)))
+    title = _cmd("TITLE_TOOBIT_SIGNAL", "🏦 سیگنال توبیت") if mode == "TOOBIT" else _cmd("TITLE_NORMAL_SIGNAL", "📊 سیگنال")
+    if mode == "TOOBIT":
+        mode_line = "نوع: رئال توبیت ✅"
+    elif isinstance(raw_result, Mapping) and raw_result.get("real_attempt_failed"):
+        mode_line = "نوع: سیگنال معمولی برای مانیتورینگ ⚠️ (باز کردن توبیت ناموفق بود)"
+    else:
+        mode_line = "نوع: سیگنال معمولی / مانیتورینگ بدون پوزیشن واقعی"
+
+    result_reason = ""
+    open_result = raw_result.get("open_result") if isinstance(raw_result, Mapping) else raw_result
+    if open_result is not None:
+        result_reason = str(_result_value(open_result, "reason", "error") or "")
+
+    text = "\n".join(
+        line
+        for line in [
+            title,
+            mode_line,
+            f"کوین: {_fa_name(symbol)} ({symbol})" if symbol else "",
+            f"جهت: {direction}",
+            f"Entry: {entry:.8g}" if entry > 0 else "",
+            f"TP: {tp:.8g}" if tp > 0 else "",
+            f"SL: {sl:.8g}" if sl > 0 else "",
+            f"Confidence: {_safe_float(getattr(decision, 'confidence', 0.0), 0.0):.2f}",
+            f"دلیل: {str(getattr(decision, 'reason', '') or '')[:700]}",
+            f"وضعیت اجرا: {result_reason[:500]}" if result_reason else "",
+        ]
+        if line
+    )
+    return {"type": "signal", "mode": mode, "text": text, "decision": decision, "result": raw_result}
 
 
 def _build_result_payload(result_payload: Any) -> Any:
