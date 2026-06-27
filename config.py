@@ -4,6 +4,15 @@ import os
 from dataclasses import dataclass
 
 
+def _env_first(*names: str, default: str = "") -> str:
+    """Return the first non-empty environment variable value."""
+    for name in names:
+        value = os.getenv(name)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return default
+
+
 @dataclass(frozen=True)
 class MarketSymbol:
     name: str
@@ -36,15 +45,16 @@ DEFAULT_TRADE_ENABLED = False
 DEFAULT_MARGIN_USDT = 10.0
 DEFAULT_LEVERAGE = 5
 DEFAULT_MAX_POSITIONS = 3
-DATA_DIR = os.getenv("BOT_DATA_DIR", "data")
-DB_PATH = os.getenv("BOT_DB_PATH", os.path.join(DATA_DIR, "bot.sqlite3"))
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-OKX_BASE_URL = os.getenv("OKX_BASE_URL", "https://www.okx.com").rstrip("/")
+DATA_DIR = _env_first("BOT_DATA_DIR", default="data")
+DB_PATH = _env_first("BOT_DB_PATH", default=os.path.join(DATA_DIR, "bot.sqlite3"))
+
+TELEGRAM_BOT_TOKEN = _env_first("TELEGRAM_BOT_TOKEN", "BOT_TOKEN")
+TELEGRAM_CHAT_ID = _env_first("TELEGRAM_CHAT_ID", "OWNER_ID", "CHAT_ID", "TELEGRAM_OWNER_ID")
+OKX_BASE_URL = _env_first("OKX_BASE_URL", default="https://www.okx.com").rstrip("/")
 
 
 def ensure_runtime_config() -> None:
     if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN داخل .env تنظیم نشده است.")
+        raise RuntimeError("TELEGRAM_BOT_TOKEN یا BOT_TOKEN داخل .env تنظیم نشده است.")
     if not TELEGRAM_CHAT_ID:
-        raise RuntimeError("TELEGRAM_CHAT_ID داخل .env تنظیم نشده است.")
+        raise RuntimeError("TELEGRAM_CHAT_ID یا OWNER_ID داخل .env تنظیم نشده است.")
