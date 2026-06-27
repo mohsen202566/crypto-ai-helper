@@ -6,17 +6,16 @@ Locked responsibility:
 - Sends market snapshots to the existing strategy layer for the final decision.
 - Registers SIGNAL_ONLY when real trading is off, slots are full, or the strategy/TP-SL
   result says the trade should be monitored only.
-- Sends REAL requests only through real_trade_manager.py.
-- Runs the internal PositionMonitor every cycle so TP/SL results are detected and recorded fast.
-- Builds Telegram/UI payloads through telegram_ui.py only.
-- Connects Telegram messages to command_router.py.
+- Sends REAL requests only through the project trade/exchange layer when available.
+- Reads active monitoring records from StateStore every cycle and closes TP/SL hits.
+- Reads Telegram command names from config.py and applies them directly to StateStore.
+- Reads Telegram command names from config.py and handles them directly.
 
 Design lock:
 - Small, simple, strong.
-- No Toobit direct calls here.
 - No TP/SL calculation here.
 - No indicator/AI/probability logic here.
-- No extra runtime coordinator files.
+- No command_router.py or position_monitor.py dependency.
 """
 
 from __future__ import annotations
@@ -35,6 +34,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping, Protocol
 
 try:
+    import config as bot_config
     from config import (
         DEFAULT_AUTO_SIGNAL_ENABLED,
         DEFAULT_REAL_TRADE_ENABLED,
@@ -45,6 +45,7 @@ try:
         get_coin,
     )
 except Exception:  # pragma: no cover - keeps isolated compile checks possible.
+    bot_config = None  # type: ignore
     DEFAULT_AUTO_SIGNAL_ENABLED = True
     DEFAULT_REAL_TRADE_ENABLED = False
     WATCHLIST = ("DOGEUSDT", "XRPUSDT", "SOLUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "INJUSDT")
@@ -61,9 +62,8 @@ except Exception:  # pragma: no cover
     StateStore = Any  # type: ignore
 
 # NOTE:
-# There is no required position_monitor.py dependency in this cleaned build.
-# Monitoring is handled below by PositionMonitor using StateStore records and
-# Toobit/price data already provided by the other project files.
+# Monitoring is handled below using StateStore records and current prices.
+# No external position_monitor.py file is imported or required.
 
 try:
     import telegram_ui
@@ -84,11 +84,6 @@ try:
     import toobit_client as tobit_client
 except Exception:  # pragma: no cover - status panel must still work without Toobit deps.
     tobit_client = None  # type: ignore
-
-try:
-    import command_router
-except Exception:  # pragma: no cover
-    command_router = None  # type: ignore
 
 try:
     from telegram import Update
@@ -157,8 +152,8 @@ class MonitorResult:
     close_reason: str
 
 
-class PositionMonitor:
-    """Monitor active StateStore records without a separate position_monitor.py file.
+class StateStoreMonitor:
+    """Monitor active StateStore records without any external monitor file.
 
     SIGNAL records are closed by latest OKX price hitting local TP/SL.
     TOOBIT records are synced from exchange callbacks/toobit_client state and only
@@ -199,7 +194,7 @@ class PositionMonitor:
                     self._emit(result)
             except Exception as exc:
                 self.last_error = f"{signal_id}:{exc}"
-                LOGGER.exception("position_monitor_record_error signal_id=%s", signal_id)
+                LOGGER.exception("state_monitor_record_error signal_id=%s", signal_id)
         return results
 
     def _check_signal(self, signal_id: str, record: Any, prices: Mapping[str, Any]) -> MonitorResult | None:
@@ -467,14 +462,14 @@ class BotRuntime:
         market_data: MarketDataProvider,
         decision_provider: DecisionProvider | None = None,
         notifier: Notifier | None = None,
-        monitor: PositionMonitor | None = None,
+        monitor: StateStoreMonitor | None = None,
         config: LoopConfig | None = None,
     ) -> None:
         self.store = store
         self.market_data = market_data
         self.decision_provider = decision_provider or _default_decision_provider
         self.notifier = notifier or _default_notifier
-        self.monitor = monitor or PositionMonitor(
+        self.monitor = monitor or StateStoreMonitor(
             store,
             exchange_checker=_default_exchange_checker,
             closed_pnl_reader=_default_closed_pnl_reader,
@@ -573,8 +568,8 @@ class BotRuntime:
         try:
             return list(self.monitor.check_once(prices))
         except Exception as exc:
-            self.last_error = f"position_monitor_error:{exc}"
-            LOGGER.exception("position_monitor_error")
+            self.last_error = f"state_monitor_error:{exc}"
+            LOGGER.exception("state_monitor_error")
             return []
 
     def _shared_strategy_market(self) -> dict[str, Any]:
@@ -1016,7 +1011,7 @@ def create_runtime(
     market_data: MarketDataProvider | None = None,
     decision_provider: DecisionProvider | None = None,
     notifier: Notifier | None = None,
-    monitor: PositionMonitor | None = None,
+    monitor: StateStoreMonitor | None = None,
     config: LoopConfig | None = None,
 ) -> BotRuntime:
     if store is None:
@@ -1060,11 +1055,10 @@ def _runtime_status_text(runtime: BotRuntime) -> str:
 
 
 def _build_status_provider(runtime: BotRuntime) -> Callable[[], Mapping[str, Any]]:
-    """Build live status for command_router panels.
+    """Build live status for Telegram command panels.
 
-    command_router.render_trade_panel() already knows how to consume a
-    status_provider, but bot.py must inject it. This provider reads live Toobit
-    wallet/open-position data when available and falls back safely to StateStore.
+    The provider reads live Toobit wallet/open-position data when available and
+    falls back safely to StateStore.
     """
 
     def _provider() -> Mapping[str, Any]:
@@ -1083,26 +1077,32 @@ def _build_status_provider(runtime: BotRuntime) -> Callable[[], Mapping[str, Any
                 data["toobit_status_error"] = str(exc)
 
         if client is not None:
+            live_margin = None
+            live_positions = None
             try:
                 margin = client.get_wallet_margin_usdt()
                 if margin is not None:
-                    data["toobit_margin_usdt"] = float(margin)
-                    # StateStore exposes sync_toobit_status(), not update_toobit_margin().
-                    try:
-                        runtime.store.sync_toobit_status(
-                            margin_usdt=float(margin),
-                            open_positions=int(data.get("toobit_open_total") or getattr(snapshot, "toobit_open_positions", 0) or 0),
-                        )
-                    except Exception:
-                        pass
+                    live_margin = float(margin)
+                    data["toobit_margin_usdt"] = live_margin
             except Exception as exc:
                 data["toobit_margin_error"] = str(exc)
 
             try:
                 positions = client.get_open_positions()
-                data["toobit_open_total"] = len(positions)
+                live_positions = len(positions)
+                data["toobit_open_total"] = live_positions
+                data["open_positions"] = live_positions
             except Exception as exc:
                 data["toobit_positions_error"] = str(exc)
+
+            if live_margin is not None or live_positions is not None:
+                try:
+                    runtime.store.sync_toobit_status(
+                        margin_usdt=live_margin if live_margin is not None else getattr(snapshot, "toobit_margin_usdt", None),
+                        open_positions=int(live_positions if live_positions is not None else getattr(snapshot, "toobit_open_positions", 0) or 0),
+                    )
+                except Exception as exc:
+                    data["state_sync_error"] = str(exc)
 
         if data.get("toobit_margin_usdt") is None and data.get("margin_usdt") is None:
             # Last-resort display fallback: avoid "نامشخص" when live Toobit is
@@ -1114,34 +1114,187 @@ def _build_status_provider(runtime: BotRuntime) -> Callable[[], Mapping[str, Any
     return _provider
 
 
-async def _call_command_router(update: Update, context: Any, runtime: BotRuntime) -> Any:
-    if command_router is None:
-        return None
 
-    text = getattr(getattr(update, "message", None), "text", "") or ""
-    candidates = ("handle_command", "handle_message", "route", "dispatch")
-    for name in candidates:
-        fn = getattr(command_router, name, None)
-        if not callable(fn):
-            continue
-        status_provider = _build_status_provider(runtime)
-        attempts = (
-            lambda: fn(update=update, context=context, runtime=runtime, store=runtime.store, status_provider=status_provider),
-            lambda: fn(text, store=runtime.store, status_provider=status_provider),
-            lambda: fn(update=update, context=context, runtime=runtime),
-            lambda: fn(update, context),
-            lambda: fn(text, runtime=runtime),
-            lambda: fn(text),
+# Telegram command handling ---------------------------------------------------
+
+def _cmd(name: str, fallback: str) -> str:
+    return str(getattr(bot_config, name, fallback) if bot_config is not None else fallback)
+
+
+def _normalize_command_text(text: str) -> str:
+    value = (text or "").strip()
+    while value.startswith("/"):
+        value = value[1:].strip()
+    return " ".join(value.split()).lower()
+
+
+def _parse_command_number(text: str, prefix: str) -> str:
+    raw = (text or "").strip()
+    variants = {prefix, "/" + prefix}
+    for item in variants:
+        if raw.startswith(item):
+            return raw[len(item):].strip()
+    return ""
+
+
+def _format_bool(value: Any) -> str:
+    return "روشن ✅" if bool(value) else "خاموش ❌"
+
+
+def _format_settings_panel(runtime: BotRuntime) -> str:
+    snapshot = runtime.store.snapshot()
+    settings = snapshot.settings
+    return "\n".join([
+        _cmd("TITLE_TRADE_PANEL", "⚙️ وضعیت ربات"),
+        f"Auto Signal: {_format_bool(getattr(settings, 'auto_signal_enabled', DEFAULT_AUTO_SIGNAL_ENABLED))}",
+        f"Real Trade: {_format_bool(getattr(settings, 'real_trade_enabled', DEFAULT_REAL_TRADE_ENABLED))}",
+        f"سرمایه ترید: {float(getattr(settings, 'trade_capital_usdt', 0.0) or 0.0):.4g} USDT",
+        f"مارجین هر معامله: {float(getattr(settings, 'trade_dollar_usdt', 0.0) or 0.0):.4g} USDT",
+        f"لوریج: {int(getattr(settings, 'leverage', 1) or 1)}x",
+        f"حداکثر پوزیشن: {int(getattr(settings, 'max_slots', 0) or 0)}",
+        f"اسلات استفاده‌شده: {int(getattr(snapshot, 'used_slots', 0) or 0)}",
+        f"اسلات آزاد: {int(getattr(snapshot, 'free_slots', 0) or 0)}",
+        f"حداقل سود خالص: {float(getattr(settings, 'min_net_profit_usdt', 0.0) or 0.0):.4g} USDT",
+    ])
+
+
+def _format_stats_panel(runtime: BotRuntime) -> str:
+    stats = runtime.store.snapshot().stats
+    return "\n".join([
+        _cmd("TITLE_STATS_PANEL", "📊 آمار ربات"),
+        f"Real TP/SL: {int(getattr(stats, 'real_tp', 0))}/{int(getattr(stats, 'real_sl', 0))}",
+        f"Real WinRate: {float(getattr(stats, 'real_win_rate', 0.0)):.2f}%",
+        f"Real PNL: {float(getattr(stats, 'real_pnl_usdt', 0.0)):.4f} USDT",
+        f"Signal TP/SL: {int(getattr(stats, 'signal_only_tp', 0))}/{int(getattr(stats, 'signal_only_sl', 0))}",
+        f"Signal WinRate: {float(getattr(stats, 'signal_only_win_rate', 0.0)):.2f}%",
+        f"Signal Monitoring: {int(getattr(stats, 'signal_only_monitoring', 0))}",
+        f"Real Monitoring: {int(getattr(stats, 'real_monitoring', 0))}",
+    ])
+
+
+def _format_positions_panel(runtime: BotRuntime) -> str:
+    active = dict(getattr(runtime.store.snapshot(), "active_signals", {}) or {})
+    if not active:
+        return "پوزیشن/سیگنال فعال نداریم."
+    lines = ["📌 پوزیشن‌های فعال"]
+    for item in active.values():
+        lines.append(
+            f"{getattr(item, 'symbol', '')} | {getattr(item, 'direction', '')} | "
+            f"{getattr(item, 'mode', '')}/{getattr(item, 'status', '')} | "
+            f"Entry={_safe_float(getattr(item, 'entry', 0.0), 0.0):.8g} | "
+            f"TP={_safe_float(getattr(item, 'tp', 0.0), 0.0):.8g} | "
+            f"SL={_safe_float(getattr(item, 'sl', 0.0), 0.0):.8g}"
         )
-        for attempt in attempts:
-            try:
-                result = attempt()
-                if asyncio.iscoroutine(result):
-                    result = await result
-                return result
-            except TypeError:
-                continue
-    return None
+    return "\n".join(lines)
+
+
+def _format_coins_panel() -> str:
+    watchlist = getattr(bot_config, "WATCHLIST", WATCHLIST) if bot_config is not None else WATCHLIST
+    symbols = list(watchlist.keys()) if isinstance(watchlist, Mapping) else [str(x) for x in watchlist]
+    lines = ["🪙 کوین‌های فعال"]
+    for symbol in symbols:
+        try:
+            coin = get_coin(symbol)
+            fa = str(getattr(coin, "fa_name", "") or symbol)
+            lines.append(f"{symbol} - {fa}")
+        except Exception:
+            lines.append(str(symbol))
+    return "\n".join(lines)
+
+
+def _format_help_panel() -> str:
+    return "\n".join([
+        "📋 دستورات ربات",
+        f"{_cmd('CMD_TRADE', 'ترید')} : نمایش پنل ترید",
+        f"{_cmd('CMD_TRADE_ON', 'ترید فعال')} / {_cmd('CMD_TRADE_OFF', 'ترید خاموش')}",
+        f"{_cmd('CMD_TRADE_DOLLAR', 'ترید دلار')} 5",
+        f"{_cmd('CMD_TRADE_LEVERAGE', 'ترید لوریج')} 10",
+        f"{_cmd('CMD_TRADE_CAPITAL', 'سرمایه ترید')} 100",
+        f"{_cmd('CMD_MAX_POSITIONS', 'حداکثر پوزیشن')} 1",
+        f"{_cmd('CMD_MIN_NET_PROFIT', 'حداقل سود خالص')} 0.1",
+        f"{_cmd('CMD_STATS', 'آمار')} | {_cmd('CMD_POSITIONS', 'پوزیشن')} | {_cmd('CMD_COINS', 'کوین‌ها')} | {_cmd('CMD_SETTINGS', 'تنظیمات')}",
+        "هوش مصنوعی فعال / هوش مصنوعی خاموش",
+    ])
+
+
+def _handle_config_command_text(text: str, runtime: BotRuntime) -> str:
+    raw = (text or "").strip()
+    normalized = _normalize_command_text(raw)
+    if not normalized:
+        return ""
+
+    cmd_trade = _cmd("CMD_TRADE", "ترید").lower()
+    cmd_trade_on = _cmd("CMD_TRADE_ON", "ترید فعال").lower()
+    cmd_trade_off = _cmd("CMD_TRADE_OFF", "ترید خاموش").lower()
+    cmd_trade_dollar = _cmd("CMD_TRADE_DOLLAR", "ترید دلار")
+    cmd_trade_leverage = _cmd("CMD_TRADE_LEVERAGE", "ترید لوریج")
+    cmd_trade_capital = _cmd("CMD_TRADE_CAPITAL", "سرمایه ترید")
+    cmd_max_positions = _cmd("CMD_MAX_POSITIONS", "حداکثر پوزیشن")
+    cmd_min_net_profit = _cmd("CMD_MIN_NET_PROFIT", "حداقل سود خالص")
+    cmd_stats = _cmd("CMD_STATS", "آمار").lower()
+    cmd_ai = _cmd("CMD_AI", "هوش مصنوعی").lower()
+    cmd_coins = _cmd("CMD_COINS", "کوین‌ها").lower()
+    cmd_settings = _cmd("CMD_SETTINGS", "تنظیمات").lower()
+    cmd_positions = _cmd("CMD_POSITIONS", "پوزیشن").lower()
+
+    try:
+        if normalized in {"help", "راهنما", "دستورات", "commands"}:
+            return _format_help_panel()
+
+        if normalized in {cmd_trade, "trade", "panel", "پنل"}:
+            return _format_settings_panel(runtime)
+
+        if normalized in {cmd_trade_on, "trade on", "ترید روشن"}:
+            runtime.store.set_real_trade_enabled(True)
+            return "✅ ترید واقعی فعال شد.\n" + _format_settings_panel(runtime)
+
+        if normalized in {cmd_trade_off, "trade off", "ترید غیرفعال", "ترید غیر فعال"}:
+            runtime.store.set_real_trade_enabled(False)
+            return "✅ ترید واقعی خاموش شد.\n" + _format_settings_panel(runtime)
+
+        for prefix, setter, label, cast in (
+            (cmd_trade_dollar, runtime.store.set_trade_dollar, "مارجین هر معامله", float),
+            (cmd_trade_leverage, runtime.store.set_leverage, "لوریج", int),
+            (cmd_trade_capital, runtime.store.set_trade_capital, "سرمایه ترید", float),
+            (cmd_max_positions, runtime.store.set_max_slots, "حداکثر پوزیشن", int),
+            (cmd_min_net_profit, runtime.store.set_min_net_profit, "حداقل سود خالص", float),
+        ):
+            prefix_norm = prefix.lower()
+            if normalized == prefix_norm or normalized.startswith(prefix_norm + " "):
+                value_text = _parse_command_number(raw, prefix)
+                if not value_text:
+                    return f"❌ مقدار وارد نشده. مثال: {prefix} 5"
+                value = cast(float(value_text) if cast is int else value_text)
+                setter(value)
+                suffix = "x" if cast is int and prefix == cmd_trade_leverage else ""
+                return f"✅ {label} تنظیم شد: {value}{suffix}\n" + _format_settings_panel(runtime)
+
+        if normalized in {cmd_stats, "stats", "آمار ربات"}:
+            return _format_stats_panel(runtime)
+
+        if normalized in {cmd_positions, "positions", "پوزیشن‌ها", "پوزیشن ها"}:
+            return _format_positions_panel(runtime)
+
+        if normalized in {cmd_coins, "coins", "کوین ها", "واچ لیست", "واچ‌لیست"}:
+            return _format_coins_panel()
+
+        if normalized in {cmd_settings, "settings", "setting", "تنظیمات ربات", "وضعیت"}:
+            return _format_settings_panel(runtime)
+
+        if normalized in {cmd_ai, "ai"}:
+            return f"هوش مصنوعی/اتو سیگنال: {_format_bool(getattr(runtime.store.snapshot().settings, 'auto_signal_enabled', DEFAULT_AUTO_SIGNAL_ENABLED))}"
+        if normalized in {cmd_ai + " فعال", cmd_ai + " روشن", "ai on"}:
+            runtime.store.set_auto_signal_enabled(True)
+            return "✅ هوش مصنوعی/اتو سیگنال روشن شد."
+        if normalized in {cmd_ai + " خاموش", cmd_ai + " غیرفعال", cmd_ai + " غیر فعال", "ai off"}:
+            runtime.store.set_auto_signal_enabled(False)
+            return "✅ هوش مصنوعی/اتو سیگنال خاموش شد."
+
+    except Exception as exc:
+        return f"❌ خطا در اجرای دستور:\n{exc}"
+
+    return ""
+
 
 
 async def _telegram_message_handler(update: Update, context: Any) -> None:
@@ -1154,21 +1307,20 @@ async def _telegram_message_handler(update: Update, context: Any) -> None:
     normalized = text.replace("/", "").strip().lower()
 
     try:
-        router_result = await _call_command_router(update, context, runtime)
-        response_text = _payload_to_text(router_result).strip()
-        if response_text:
-            await update.message.reply_text(response_text[:3900])
-            return
-
-        if normalized in {"start", "وضعیت", "status"}:
-            await update.message.reply_text(_runtime_status_text(runtime))
+        if normalized in {"start", "status", "وضعیت"}:
+            await update.message.reply_text(_format_settings_panel(runtime)[:3900])
             return
 
         if normalized in {"ping", "تست"}:
             await update.message.reply_text("✅ ربات جواب می‌دهد")
             return
 
-        await update.message.reply_text("دستور دریافت شد، اما command_router پاسخی برنگرداند. دستور «وضعیت» را بفرست.")
+        command_response = _handle_config_command_text(text, runtime).strip()
+        if command_response:
+            await update.message.reply_text(command_response[:3900])
+            return
+
+        await update.message.reply_text("دستور نامشخص است. برای دیدن لیست دستورها «راهنما» را بفرست.")
     except Exception as exc:
         runtime.last_error = f"telegram_handler_error:{exc}"
         await update.message.reply_text("❌ خطا در پردازش دستور:\n" + str(exc))
@@ -1198,9 +1350,16 @@ def build_telegram_application(runtime: BotRuntime) -> Application:
     application.bot_data["notifier"] = notifier
     runtime.notifier = notifier
 
+    # Explicit slash commands plus plain Persian text commands.
     application.add_handler(CommandHandler("start", _telegram_message_handler))
     application.add_handler(CommandHandler("status", _telegram_message_handler))
     application.add_handler(CommandHandler("ping", _telegram_message_handler))
+    application.add_handler(CommandHandler("trade", _telegram_message_handler))
+    application.add_handler(CommandHandler("help", _telegram_message_handler))
+    application.add_handler(CommandHandler("stats", _telegram_message_handler))
+    application.add_handler(CommandHandler("positions", _telegram_message_handler))
+    application.add_handler(CommandHandler("coins", _telegram_message_handler))
+    application.add_handler(CommandHandler("settings", _telegram_message_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _telegram_message_handler))
     application.add_error_handler(_telegram_error_handler)
     return application
