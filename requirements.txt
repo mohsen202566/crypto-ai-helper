@@ -1,15 +1,2 @@
-# 27 - requirements.txt
-# Movement Hunter crypto futures bot dependencies
-#
-# Runtime:
-# - Telegram bot
-# - HTTP API access
-# - numeric/data utilities
-# - timezone/date helpers
-
-python-telegram-bot==21.10
+python-telegram-bot==21.6
 requests==2.32.3
-pandas==2.2.3
-numpy==2.2.1
-python-dotenv==1.0.1
-aiohttp==3.11.11
