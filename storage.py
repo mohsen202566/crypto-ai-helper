@@ -203,6 +203,15 @@ class Storage:
             row = conn.execute("SELECT COUNT(*) AS n FROM signals WHERE status='OPEN' AND signal_type='real'").fetchone()
             return int(row["n"])
 
+    def active_symbol_exists(self, toobit_symbol: str) -> bool:
+        """True when any OPEN signal, normal or real, already exists for this symbol."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM signals WHERE status='OPEN' AND toobit_symbol=?",
+                (toobit_symbol,),
+            ).fetchone()
+            return int(row["n"]) > 0
+
     def active_real_symbol_exists(self, toobit_symbol: str) -> bool:
         with self._connect() as conn:
             row = conn.execute(
