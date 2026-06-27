@@ -209,6 +209,34 @@ MIN_AGREEMENT_SCORE = 70.0
 MIN_DIRECTION_EDGE = 8.0
 
 
+
+
+# =========================
+# Strategy scoring gates - balanced 15m/30m auto signal
+# =========================
+# Direction is made by EMA / RSI / MACD / market structure only.
+# ATR, volume and breakout confirm strength; they must not create direction alone.
+SCORE_EMA = 24
+SCORE_RSI = 18
+SCORE_MACD = 18
+SCORE_MARKET_STRUCTURE = 22
+
+# A trade normally needs three aligned directional votes, while allowing one weak/neutral area.
+MIN_DIRECTION_SCORE = 60
+DIRECTION_MAX_OPPOSITE_SCORE = 18
+
+# Strength is not allowed to be too loose: ATR or breakout alone can confirm, volume alone cannot.
+SCORE_ATR_EXPANSION = 12
+SCORE_VOLUME = 8
+SCORE_BREAKOUT = 12
+MIN_STRENGTH_SCORE = 12
+
+# Safety defaults used by bot.py if a strategy result has entry/ATR but no explicit TP/SL.
+STRATEGY_TP_ATR_MULT = 1.25
+STRATEGY_SL_ATR_MULT = 0.85
+STRATEGY_FALLBACK_ATR_PCT = 0.006
+
+
 # =========================
 # Telegram command definitions
 # =========================
@@ -319,6 +347,15 @@ def validate_locked_config() -> None:
         raise AssertionError("گیت‌های ورود 15m/30m تغییر کرده‌اند.")
     if MARGIN_MODE != "isolated":
         raise AssertionError("Margin mode باید همیشه isolated باشد.")
+    # Strategy scoring gates must stay balanced: not too strict, not too loose.
+    if SCORE_EMA + SCORE_RSI + SCORE_MACD + SCORE_MARKET_STRUCTURE < MIN_DIRECTION_SCORE:
+        raise AssertionError("وزن‌های جهت‌دهی استراتژی با حداقل امتیاز جهت هماهنگ نیستند.")
+    if not 50 <= MIN_DIRECTION_SCORE <= 65:
+        raise AssertionError("MIN_DIRECTION_SCORE باید برای مدل 15m/30m متعادل بماند.")
+    if not 10 <= DIRECTION_MAX_OPPOSITE_SCORE <= 25:
+        raise AssertionError("DIRECTION_MAX_OPPOSITE_SCORE باید جلوی سیگنال‌های متضاد را بگیرد.")
+    if not 8 <= MIN_STRENGTH_SCORE <= 18:
+        raise AssertionError("MIN_STRENGTH_SCORE باید نه خیلی سخت و نه خیلی شل باشد.")
     validate_trade_dollar(DEFAULT_TRADE_DOLLAR)
     validate_leverage(DEFAULT_LEVERAGE)
     validate_trade_capital(DEFAULT_TRADE_CAPITAL)
