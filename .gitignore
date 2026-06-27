@@ -1,12 +1,21 @@
+# Environment
 .env
+venv/
+
+# Python
 __pycache__/
 *.pyc
+
+# Logs
 *.log
-data/
-active_signals.json
-signal_stats.json
-paper_trade_state.json
-paper_trades.json
-market_sentiment_cache.json
-users.json
-bot.log
+
+# Runtime data
+state_store.json
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
