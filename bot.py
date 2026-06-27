@@ -1054,62 +1054,124 @@ def _runtime_status_text(runtime: BotRuntime) -> str:
     return "\n".join(lines)
 
 
+
+def _sync_toobit_status(runtime: BotRuntime) -> dict[str, Any]:
+    """Read live Toobit status, store it in StateStore, and return panel data.
+
+    This never fakes Toobit wallet balance from trade_capital_usdt.  If the
+    exchange cannot be read, the panel receives the real error and any last
+    cached value remains clearly marked as cached.
+    """
+    snapshot = runtime.store.snapshot()
+    data: dict[str, Any] = {
+        "toobit_margin_usdt": getattr(snapshot, "toobit_margin_usdt", None),
+        "toobit_open_total": int(getattr(snapshot, "toobit_open_positions", 0) or 0),
+        "open_positions": int(getattr(snapshot, "used_slots", 0) or 0),
+        "toobit_last_sync_at": getattr(snapshot, "toobit_last_sync_at", None),
+        "toobit_status_error": str(getattr(snapshot, "toobit_status_error", "") or ""),
+        "toobit_connected": False,
+    }
+
+    def _store_status(*, margin: Any, positions: Any, error: str) -> None:
+        try:
+            runtime.store.sync_toobit_status(
+                margin_usdt=margin,
+                open_positions=int(positions or 0),
+                error=error,
+            )
+            return
+        except TypeError:
+            # Backward compatibility with older StateStore.sync_toobit_status()
+            try:
+                runtime.store.sync_toobit_status(
+                    margin_usdt=margin,
+                    open_positions=int(positions or 0),
+                )
+                if error and hasattr(runtime.store, "set_toobit_status_error"):
+                    runtime.store.set_toobit_status_error(error)
+            except Exception as exc:
+                data["state_sync_error"] = str(exc)
+        except Exception as exc:
+            data["state_sync_error"] = str(exc)
+
+    if tobit_client is None:
+        error = "toobit_client.py بارگذاری نشده است"
+        data["toobit_status_error"] = error
+        _store_status(
+            margin=data.get("toobit_margin_usdt"),
+            positions=data.get("toobit_open_total"),
+            error=error,
+        )
+        return data
+
+    try:
+        client = tobit_client.get_client()
+    except Exception as exc:
+        error = str(exc)
+        data["toobit_status_error"] = error
+        _store_status(
+            margin=data.get("toobit_margin_usdt"),
+            positions=data.get("toobit_open_total"),
+            error=error,
+        )
+        return data
+
+    errors: list[str] = []
+    live_margin = data.get("toobit_margin_usdt")
+    live_positions = data.get("toobit_open_total")
+
+    try:
+        margin = client.get_wallet_margin_usdt()
+        live_margin = float(margin)
+        data["toobit_margin_usdt"] = live_margin
+    except Exception as exc:
+        errors.append(f"wallet: {exc}")
+
+    try:
+        positions = client.get_open_positions()
+        live_positions = len(positions)
+        data["toobit_open_total"] = live_positions
+        data["open_positions"] = live_positions
+    except Exception as exc:
+        errors.append(f"positions: {exc}")
+
+    error_text = " | ".join(errors)
+    data["toobit_status_error"] = error_text
+    data["toobit_connected"] = not errors
+    _store_status(margin=live_margin, positions=live_positions, error=error_text)
+
+    refreshed = runtime.store.snapshot()
+    data["toobit_last_sync_at"] = getattr(refreshed, "toobit_last_sync_at", data.get("toobit_last_sync_at"))
+    data["open_positions"] = int(getattr(refreshed, "used_slots", data.get("open_positions", 0)) or 0)
+    return data
+
+
+def _format_toobit_margin(value: Any) -> str:
+    margin = _safe_float(value, -1.0)
+    if margin < 0:
+        return "قابل خواندن نیست"
+    return f"{margin:.4g} USDT"
+
+
+def _format_sync_age(timestamp_value: Any) -> str:
+    ts = _safe_float(timestamp_value, 0.0)
+    if ts <= 0:
+        return "ندارد"
+    age = max(0, int(time.time() - ts))
+    if age < 60:
+        return f"{age} ثانیه قبل"
+    return f"{age // 60} دقیقه قبل"
+
+
 def _build_status_provider(runtime: BotRuntime) -> Callable[[], Mapping[str, Any]]:
     """Build live status for Telegram command panels.
 
     The provider reads live Toobit wallet/open-position data when available and
-    falls back safely to StateStore.
+    stores the exact success/error state in StateStore.
     """
 
     def _provider() -> Mapping[str, Any]:
-        snapshot = runtime.store.snapshot()
-        settings = snapshot.settings
-        data: dict[str, Any] = {
-            "margin_usdt": getattr(snapshot, "toobit_margin_usdt", None),
-            "open_positions": getattr(snapshot, "used_slots", 0),
-        }
-
-        client = None
-        if tobit_client is not None:
-            try:
-                client = tobit_client.get_client()
-            except Exception as exc:
-                data["toobit_status_error"] = str(exc)
-
-        if client is not None:
-            live_margin = None
-            live_positions = None
-            try:
-                margin = client.get_wallet_margin_usdt()
-                if margin is not None:
-                    live_margin = float(margin)
-                    data["toobit_margin_usdt"] = live_margin
-            except Exception as exc:
-                data["toobit_margin_error"] = str(exc)
-
-            try:
-                positions = client.get_open_positions()
-                live_positions = len(positions)
-                data["toobit_open_total"] = live_positions
-                data["open_positions"] = live_positions
-            except Exception as exc:
-                data["toobit_positions_error"] = str(exc)
-
-            if live_margin is not None or live_positions is not None:
-                try:
-                    runtime.store.sync_toobit_status(
-                        margin_usdt=live_margin if live_margin is not None else getattr(snapshot, "toobit_margin_usdt", None),
-                        open_positions=int(live_positions if live_positions is not None else getattr(snapshot, "toobit_open_positions", 0) or 0),
-                    )
-                except Exception as exc:
-                    data["state_sync_error"] = str(exc)
-
-        if data.get("toobit_margin_usdt") is None and data.get("margin_usdt") is None:
-            # Last-resort display fallback: avoid "نامشخص" when live Toobit is
-            # unavailable, while keeping the real configured wallet read separate.
-            data["margin_usdt"] = float(getattr(settings, "trade_capital_usdt", 0.0) or 0.0)
-
-        return data
+        return _sync_toobit_status(runtime)
 
     return _provider
 
@@ -1141,21 +1203,34 @@ def _format_bool(value: Any) -> str:
     return "روشن ✅" if bool(value) else "خاموش ❌"
 
 
+
 def _format_settings_panel(runtime: BotRuntime) -> str:
+    snapshot_before = runtime.store.snapshot()
+    settings = snapshot_before.settings
+    toobit_data = _sync_toobit_status(runtime)
     snapshot = runtime.store.snapshot()
-    settings = snapshot.settings
-    return "\n".join([
+    toobit_error = str(toobit_data.get("toobit_status_error") or getattr(snapshot, "toobit_status_error", "") or "")
+    connected = bool(toobit_data.get("toobit_connected")) and not toobit_error
+    status_text = "وصل ✅" if connected else "قطع/خطا ❌"
+    lines = [
         _cmd("TITLE_TRADE_PANEL", "⚙️ وضعیت ربات"),
+        f"اتصال توبیت: {status_text}",
+        f"موجودی واقعی توبیت: {_format_toobit_margin(toobit_data.get('toobit_margin_usdt'))}",
+        f"پوزیشن باز توبیت: {int(toobit_data.get('toobit_open_total') or 0)}",
+        f"آخرین سینک توبیت: {_format_sync_age(toobit_data.get('toobit_last_sync_at'))}",
         f"Auto Signal: {_format_bool(getattr(settings, 'auto_signal_enabled', DEFAULT_AUTO_SIGNAL_ENABLED))}",
         f"Real Trade: {_format_bool(getattr(settings, 'real_trade_enabled', DEFAULT_REAL_TRADE_ENABLED))}",
-        f"سرمایه ترید: {float(getattr(settings, 'trade_capital_usdt', 0.0) or 0.0):.4g} USDT",
+        f"سرمایه ترید تنظیمی: {float(getattr(settings, 'trade_capital_usdt', 0.0) or 0.0):.4g} USDT",
         f"مارجین هر معامله: {float(getattr(settings, 'trade_dollar_usdt', 0.0) or 0.0):.4g} USDT",
         f"لوریج: {int(getattr(settings, 'leverage', 1) or 1)}x",
         f"حداکثر پوزیشن: {int(getattr(settings, 'max_slots', 0) or 0)}",
         f"اسلات استفاده‌شده: {int(getattr(snapshot, 'used_slots', 0) or 0)}",
         f"اسلات آزاد: {int(getattr(snapshot, 'free_slots', 0) or 0)}",
         f"حداقل سود خالص: {float(getattr(settings, 'min_net_profit_usdt', 0.0) or 0.0):.4g} USDT",
-    ])
+    ]
+    if toobit_error:
+        lines.append("خطای توبیت: " + toobit_error[:800])
+    return "\n".join(lines)
 
 
 def _format_stats_panel(runtime: BotRuntime) -> str:
