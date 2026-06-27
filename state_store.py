@@ -28,6 +28,11 @@ from config import (
     DEFAULT_REAL_TRADE_ENABLED,
     DEFAULT_TRADE_CAPITAL,
     DEFAULT_TRADE_DOLLAR,
+    ENTRY_TIMEFRAME,
+    MAX_HOLD_MINUTES,
+    TARGET_HOLD_MINUTES,
+    TIMEFRAME,
+    TREND_FILTER_TIMEFRAME,
     validate_leverage,
     validate_max_positions,
     validate_min_net_profit,
@@ -73,6 +78,12 @@ class SignalRecord:
     exit_price: float | None = None
     pnl_usdt: float = 0.0
     close_reason: str = ""
+    main_timeframe: str = TIMEFRAME
+    entry_timeframe: str = ENTRY_TIMEFRAME
+    trend_timeframe: str = TREND_FILTER_TIMEFRAME
+    target_hold_min_minutes: int = TARGET_HOLD_MINUTES[0]
+    target_hold_max_minutes: int = TARGET_HOLD_MINUTES[1]
+    max_hold_minutes: int = MAX_HOLD_MINUTES
 
 
 @dataclass
@@ -217,6 +228,12 @@ class StateStore:
         entry: float,
         tp: float,
         sl: float,
+        main_timeframe: str = TIMEFRAME,
+        entry_timeframe: str = ENTRY_TIMEFRAME,
+        trend_timeframe: str = TREND_FILTER_TIMEFRAME,
+        target_hold_min_minutes: int = TARGET_HOLD_MINUTES[0],
+        target_hold_max_minutes: int = TARGET_HOLD_MINUTES[1],
+        max_hold_minutes: int = MAX_HOLD_MINUTES,
     ) -> SignalRecord:
         key = symbol.upper()
         get_coin(key)
@@ -232,6 +249,12 @@ class StateStore:
             raise RuntimeError("برای این کوین هنوز سیگنال فعال وجود دارد.")
         if entry <= 0 or tp <= 0 or sl <= 0:
             raise ValueError("Entry/TP/SL باید مثبت باشند.")
+        if target_hold_min_minutes <= 0 or target_hold_max_minutes <= 0 or max_hold_minutes <= 0:
+            raise ValueError("زمان‌های نگهداری پوزیشن باید مثبت باشند.")
+        if target_hold_min_minutes > target_hold_max_minutes:
+            raise ValueError("حداقل زمان هدف نمی‌تواند از حداکثر زمان هدف بیشتر باشد.")
+        if max_hold_minutes < target_hold_max_minutes:
+            raise ValueError("خروج اجباری باید بعد از بازه هدف نگهداری باشد.")
 
         mode: SignalMode = "TOOBIT" if requested_mode == "TOOBIT" and self.state.settings.real_trade_enabled and self.state.free_slots > 0 else "SIGNAL"
         status: SignalStatus = "PENDING_OPEN" if mode == "TOOBIT" else "MONITORING"
@@ -245,6 +268,12 @@ class StateStore:
             sl=float(sl),
             status=status,
             opened_at=time() if mode == "SIGNAL" else None,
+            main_timeframe=str(main_timeframe),
+            entry_timeframe=str(entry_timeframe),
+            trend_timeframe=str(trend_timeframe),
+            target_hold_min_minutes=int(target_hold_min_minutes),
+            target_hold_max_minutes=int(target_hold_max_minutes),
+            max_hold_minutes=int(max_hold_minutes),
         )
         self.state.active_signals[signal_id] = record
         if mode == "TOOBIT":
@@ -277,7 +306,15 @@ class StateStore:
         self.save()
         return record
 
-    def mark_result(self, signal_id: str, *, result: ResultKind, exit_price: float, pnl_usdt: float) -> SignalRecord:
+    def mark_result(
+        self,
+        signal_id: str,
+        *,
+        result: ResultKind,
+        exit_price: float,
+        pnl_usdt: float,
+        close_reason: str | None = None,
+    ) -> SignalRecord:
         record = self._active(signal_id)
         if result not in ("TP", "SL"):
             raise ValueError("نتیجه باید TP یا SL باشد.")
@@ -288,7 +325,7 @@ class StateStore:
         record.result = result
         record.exit_price = float(exit_price)
         record.pnl_usdt = float(pnl_usdt)
-        record.close_reason = str(result)
+        record.close_reason = str(close_reason or result)
         record.closed_at = time()
         self.state.active_signals.pop(signal_id, None)
         self.state.closed_signals[signal_id] = record
