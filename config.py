@@ -222,11 +222,11 @@ SCORE_MACD = 18
 SCORE_MARKET_STRUCTURE = 22
 
 # A trade normally needs three aligned directional votes, while allowing one weak/neutral area.
-MIN_DIRECTION_SCORE = 60
+MIN_DIRECTION_SCORE = 56
 DIRECTION_MAX_OPPOSITE_SCORE = 18
 
 # Strength is not allowed to be too loose: ATR or breakout alone can confirm, volume alone cannot.
-SCORE_ATR_EXPANSION = 12
+SCORE_ATR_EXPANSION = 8
 SCORE_VOLUME = 8
 SCORE_BREAKOUT = 12
 MIN_STRENGTH_SCORE = 12
