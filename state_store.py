@@ -115,8 +115,12 @@ class BotState:
     active_signals: dict[str, SignalRecord] = field(default_factory=dict)
     closed_signals: dict[str, SignalRecord] = field(default_factory=dict)
     stats: StatsState = field(default_factory=StatsState)
+    # Last synced Toobit account status.  This is only a cache used by bot.py
+    # panels/slot logic; StateStore never calls Toobit by itself.
     toobit_margin_usdt: float | None = None
     toobit_open_positions: int = 0
+    toobit_last_sync_at: float | None = None
+    toobit_status_error: str = ""
 
     @property
     def reserved_real_slots(self) -> int:
@@ -198,13 +202,43 @@ class StateStore:
         self.state.settings.min_net_profit_usdt = validate_min_net_profit(value)
         self.save()
 
-    def sync_toobit_status(self, *, margin_usdt: float | None, open_positions: int) -> None:
-        if margin_usdt is not None and margin_usdt < 0:
+    def sync_toobit_status(self, *, margin_usdt: float | None, open_positions: int, error: str | None = None) -> None:
+        """Cache the latest Toobit account status read by bot.py/toobit_client.py.
+
+        This method intentionally does not call any API.  It only stores the
+        result so command/status panels can show the real Toobit wallet value
+        when the exchange read succeeds and the actual error when it fails.
+        """
+        margin = _float_or_none(margin_usdt)
+        if margin is not None and margin < 0:
             raise ValueError("مارجین توبیت نمی‌تواند منفی باشد.")
-        if open_positions < 0:
-            raise ValueError("تعداد پوزیشن باز نمی‌تواند منفی باشد.")
-        self.state.toobit_margin_usdt = margin_usdt
-        self.state.toobit_open_positions = int(open_positions)
+        open_count = _int_nonnegative(open_positions, field_name="تعداد پوزیشن باز")
+        self.state.toobit_margin_usdt = margin
+        self.state.toobit_open_positions = open_count
+        self.state.toobit_last_sync_at = time()
+        self.state.toobit_status_error = str(error or "")
+        self.save()
+
+    def update_toobit_margin(self, margin_usdt: float | None) -> None:
+        """Backward-compatible helper for older bot.py builds."""
+        self.sync_toobit_status(
+            margin_usdt=margin_usdt,
+            open_positions=int(getattr(self.state, "toobit_open_positions", 0) or 0),
+            error="",
+        )
+
+    def update_toobit_open_positions(self, open_positions: int) -> None:
+        """Backward-compatible helper for older bot.py builds."""
+        self.sync_toobit_status(
+            margin_usdt=getattr(self.state, "toobit_margin_usdt", None),
+            open_positions=open_positions,
+            error="",
+        )
+
+    def set_toobit_status_error(self, error: str) -> None:
+        """Store a Toobit sync error without faking the wallet balance."""
+        self.state.toobit_status_error = str(error or "")
+        self.state.toobit_last_sync_at = time()
         self.save()
 
     def has_active_symbol(self, symbol: str) -> bool:
@@ -336,6 +370,10 @@ class StateStore:
             else:
                 self.state.stats.real_sl += 1
             self.state.stats.real_pnl_usdt += float(pnl_usdt)
+            # Local close means one locally tracked real position is no longer active.
+            # Keep this as a conservative cache update; the next Toobit sync remains
+            # the source of truth and can correct the count.
+            self.state.toobit_open_positions = max(0, int(self.state.toobit_open_positions) - 1)
         else:
             if result == "TP":
                 self.state.stats.signal_only_tp += 1
@@ -352,8 +390,18 @@ class StateStore:
     def _load(self) -> BotState:
         if not self.path.exists():
             return BotState()
-        payload = json.loads(self.path.read_text(encoding="utf-8"))
-        return _state_from_dict(payload)
+        try:
+            raw = self.path.read_text(encoding="utf-8").strip()
+            if not raw:
+                return BotState()
+            payload = json.loads(raw)
+            if not isinstance(payload, dict):
+                return BotState()
+            return _state_from_dict(payload)
+        except (json.JSONDecodeError, OSError, TypeError, ValueError):
+            # Do not crash the bot because of an empty/corrupt state file.
+            # Start with a clean runtime state; the next save writes a valid file.
+            return BotState()
 
     def _recalculate_monitoring_counts(self) -> None:
         real = 0
@@ -377,22 +425,59 @@ def _state_to_dict(state: BotState) -> dict[str, object]:
         "stats": asdict(state.stats),
         "toobit_margin_usdt": state.toobit_margin_usdt,
         "toobit_open_positions": state.toobit_open_positions,
+        "toobit_last_sync_at": state.toobit_last_sync_at,
+        "toobit_status_error": state.toobit_status_error,
     }
 
 
 def _state_from_dict(payload: dict[str, object]) -> BotState:
-    settings = BotSettings(**dict(payload.get("settings", {})))
-    active = {key: SignalRecord(**value) for key, value in dict(payload.get("active_signals", {})).items()}
-    closed = {key: SignalRecord(**value) for key, value in dict(payload.get("closed_signals", {})).items()}
-    stats = StatsState(**dict(payload.get("stats", {})))
+    payload = dict(payload or {})
+    settings = BotSettings(**_filter_dataclass_fields(BotSettings, dict(payload.get("settings", {}))))
+    active = {
+        str(key): SignalRecord(**_filter_dataclass_fields(SignalRecord, dict(value)))
+        for key, value in dict(payload.get("active_signals", {})).items()
+        if isinstance(value, dict)
+    }
+    closed = {
+        str(key): SignalRecord(**_filter_dataclass_fields(SignalRecord, dict(value)))
+        for key, value in dict(payload.get("closed_signals", {})).items()
+        if isinstance(value, dict)
+    }
+    stats = StatsState(**_filter_dataclass_fields(StatsState, dict(payload.get("stats", {}))))
     return BotState(
         settings=settings,
         active_signals=active,
         closed_signals=closed,
         stats=stats,
-        toobit_margin_usdt=payload.get("toobit_margin_usdt"),
-        toobit_open_positions=int(payload.get("toobit_open_positions", 0)),
+        toobit_margin_usdt=_float_or_none(payload.get("toobit_margin_usdt")),
+        toobit_open_positions=_int_nonnegative(payload.get("toobit_open_positions", 0), field_name="تعداد پوزیشن باز"),
+        toobit_last_sync_at=_float_or_none(payload.get("toobit_last_sync_at")),
+        toobit_status_error=str(payload.get("toobit_status_error") or ""),
     )
+
+
+def _filter_dataclass_fields(cls: type, payload: dict[str, object]) -> dict[str, object]:
+    allowed = set(getattr(cls, "__dataclass_fields__", {}).keys())
+    return {key: value for key, value in dict(payload or {}).items() if key in allowed}
+
+
+def _float_or_none(value: object) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _int_nonnegative(value: object, *, field_name: str) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = 0
+    if number < 0:
+        raise ValueError(f"{field_name} نمی‌تواند منفی باشد.")
+    return number
 
 
 __all__ = [
