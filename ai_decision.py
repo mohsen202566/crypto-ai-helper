@@ -18,7 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from config import MIN_AGREEMENT_SCORE, MIN_CONFIDENCE, MIN_DIRECTION_PROBABILITY
+from config import MIN_AGREEMENT_SCORE, MIN_CONFIDENCE, MIN_DIRECTION_EDGE, MIN_DIRECTION_PROBABILITY
 from market_context import MarketContext
 from probability_engine import ProbabilityResult
 
@@ -79,7 +79,7 @@ def _direction_ok(
         direction_probability >= MIN_DIRECTION_PROBABILITY
         and confidence >= MIN_CONFIDENCE
         and agreement >= MIN_AGREEMENT_SCORE
-        and direction_probability > opposite_probability
+        and (direction_probability - opposite_probability) >= MIN_DIRECTION_EDGE
     )
 
 
@@ -100,7 +100,8 @@ def _reason(label: str, probability: ProbabilityResult) -> str:
         f"ورود {label}: Preferred={probability.preferred_direction}، "
         f"Long={probability.long_probability:.2f}%، Short={probability.short_probability:.2f}%، "
         f"NoTrade={probability.no_trade_probability:.2f}%، "
-        f"Confidence={probability.confidence:.2f}%، Agreement={probability.agreement_score:.2f}%"
+        f"Confidence={probability.confidence:.2f}%، Agreement={probability.agreement_score:.2f}%، "
+        f"Edge={abs(probability.long_probability - probability.short_probability):.2f}%"
     )
 
 
