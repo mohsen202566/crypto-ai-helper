@@ -39,6 +39,44 @@ MARGIN_ISOLATED = "isolated"
 _CLIENT: "ToobitClient | None" = None
 
 
+def _env_first(*names: str, default: str = "") -> str:
+    """Return the first non-empty environment value.
+
+    The project historically used both TOOBIT_* and TOBIT_* names.
+    Prefer the correctly spelled TOOBIT_* names, but keep TOBIT_* as a
+    backward-compatible alias so old .env files still work.
+    """
+    for name in names:
+        value = os.getenv(name)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return default
+
+
+def _env_int(names: tuple[str, ...], default: int) -> int:
+    value = _env_first(*names, default=str(default))
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _env_float(names: tuple[str, ...], default: float) -> float:
+    value = _env_first(*names, default=str(default))
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _env_decimal(names: tuple[str, ...], default: str) -> Decimal:
+    value = _env_first(*names, default=default)
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return Decimal(str(default))
+
+
 @dataclass(frozen=True)
 class ToobitConfig:
     api_key: str
@@ -51,21 +89,23 @@ class ToobitConfig:
 
     @classmethod
     def from_env(cls) -> "ToobitConfig":
-        api_key = os.getenv("TOBIT_API_KEY", "").strip()
-        secret_key = os.getenv("TOBIT_SECRET_KEY", "").strip()
-        base_url = os.getenv("TOBIT_BASE_URL", "https://api.toobit.com").strip().rstrip("/")
+        # Prefer TOOBIT_* because that is the exchange/project spelling.
+        # Keep TOBIT_* as a backward-compatible alias for older deployments.
+        api_key = _env_first("TOOBIT_API_KEY", "TOBIT_API_KEY")
+        secret_key = _env_first("TOOBIT_SECRET_KEY", "TOBIT_SECRET_KEY")
+        base_url = _env_first("TOOBIT_BASE_URL", "TOBIT_BASE_URL", default="https://api.toobit.com").rstrip("/")
         if not api_key:
-            raise RuntimeError("TOBIT_API_KEY تنظیم نشده است.")
+            raise RuntimeError("TOOBIT_API_KEY یا TOBIT_API_KEY تنظیم نشده است.")
         if not secret_key:
-            raise RuntimeError("TOBIT_SECRET_KEY تنظیم نشده است.")
+            raise RuntimeError("TOOBIT_SECRET_KEY یا TOBIT_SECRET_KEY تنظیم نشده است.")
         return cls(
             api_key=api_key,
             secret_key=secret_key,
             base_url=base_url,
-            recv_window=int(os.getenv("TOBIT_RECV_WINDOW", "5000")),
-            timeout_seconds=int(os.getenv("TOBIT_TIMEOUT_SECONDS", "12")),
-            verify_after_error_seconds=int(os.getenv("TOBIT_VERIFY_AFTER_ERROR_SECONDS", "70")),
-            margin_tolerance_pct=float(os.getenv("TOBIT_MARGIN_TOLERANCE_PCT", "1.0")),
+            recv_window=_env_int(("TOOBIT_RECV_WINDOW", "TOBIT_RECV_WINDOW"), 5000),
+            timeout_seconds=_env_int(("TOOBIT_TIMEOUT_SECONDS", "TOBIT_TIMEOUT_SECONDS"), 12),
+            verify_after_error_seconds=_env_int(("TOOBIT_VERIFY_AFTER_ERROR_SECONDS", "TOBIT_VERIFY_AFTER_ERROR_SECONDS"), 70),
+            margin_tolerance_pct=_env_float(("TOOBIT_MARGIN_TOLERANCE_PCT", "TOBIT_MARGIN_TOLERANCE_PCT"), 1.0),
         )
 
 
@@ -134,19 +174,19 @@ class ToobitClient:
         self.config = config or ToobitConfig.from_env()
         self.session = session or requests.Session()
 
-        self.path_balance = os.getenv("TOBIT_PATH_BALANCE", "/api/v1/futures/balance")
-        self.path_positions = os.getenv("TOBIT_PATH_POSITIONS", "/api/v1/futures/positions")
-        self.path_open_orders = os.getenv("TOBIT_PATH_OPEN_ORDERS", "/api/v1/futures/openOrders")
-        self.path_margin_mode = os.getenv("TOBIT_PATH_MARGIN_MODE", "/api/v1/futures/marginType")
-        self.path_leverage = os.getenv("TOBIT_PATH_LEVERAGE", "/api/v1/futures/leverage")
-        self.path_position_settings = os.getenv("TOBIT_PATH_POSITION_SETTINGS", "/api/v1/futures/positionRisk")
-        self.path_order = os.getenv("TOBIT_PATH_ORDER", "/api/v1/futures/order")
-        self.path_mark_price = os.getenv("TOBIT_PATH_MARK_PRICE", "/api/v1/futures/markPrice")
-        self.path_exchange_info = os.getenv("TOBIT_PATH_EXCHANGE_INFO", "/api/v1/futures/exchangeInfo")
+        self.path_balance = _env_first("TOOBIT_PATH_BALANCE", "TOBIT_PATH_BALANCE", default="/api/v1/futures/balance")
+        self.path_positions = _env_first("TOOBIT_PATH_POSITIONS", "TOBIT_PATH_POSITIONS", default="/api/v1/futures/positions")
+        self.path_open_orders = _env_first("TOOBIT_PATH_OPEN_ORDERS", "TOBIT_PATH_OPEN_ORDERS", default="/api/v1/futures/openOrders")
+        self.path_margin_mode = _env_first("TOOBIT_PATH_MARGIN_MODE", "TOBIT_PATH_MARGIN_MODE", default="/api/v1/futures/marginType")
+        self.path_leverage = _env_first("TOOBIT_PATH_LEVERAGE", "TOBIT_PATH_LEVERAGE", default="/api/v1/futures/leverage")
+        self.path_position_settings = _env_first("TOOBIT_PATH_POSITION_SETTINGS", "TOBIT_PATH_POSITION_SETTINGS", default="/api/v1/futures/positionRisk")
+        self.path_order = _env_first("TOOBIT_PATH_ORDER", "TOBIT_PATH_ORDER", default="/api/v1/futures/order")
+        self.path_mark_price = _env_first("TOOBIT_PATH_MARK_PRICE", "TOBIT_PATH_MARK_PRICE", default="/api/v1/futures/markPrice")
+        self.path_exchange_info = _env_first("TOOBIT_PATH_EXCHANGE_INFO", "TOBIT_PATH_EXCHANGE_INFO", default="/api/v1/futures/exchangeInfo")
 
-        self.param_tp = os.getenv("TOBIT_PARAM_TP", "takeProfit")
-        self.param_sl = os.getenv("TOBIT_PARAM_SL", "stopLoss")
-        self.param_quantity = os.getenv("TOBIT_PARAM_QUANTITY", "quantity")
+        self.param_tp = _env_first("TOOBIT_PARAM_TP", "TOBIT_PARAM_TP", default="takeProfit")
+        self.param_sl = _env_first("TOOBIT_PARAM_SL", "TOBIT_PARAM_SL", default="stopLoss")
+        self.param_quantity = _env_first("TOOBIT_PARAM_QUANTITY", "TOBIT_PARAM_QUANTITY", default="quantity")
 
     def get_wallet_margin_usdt(self) -> float:
         payload = self._request("GET", self.path_balance, signed=True)
@@ -154,7 +194,18 @@ class ToobitClient:
             asset = str(item.get("asset") or item.get("coin") or item.get("currency") or "").upper()
             if asset and asset != "USDT":
                 continue
-            value = _first_decimal(item, "availableBalance", "available", "balance", "walletBalance", "marginBalance")
+            value = _first_decimal(
+                item,
+                "availableBalance",
+                "availableMargin",
+                "available",
+                "free",
+                "balance",
+                "walletBalance",
+                "marginBalance",
+                "equity",
+                "accountEquity",
+            )
             if value is not None and value >= 0:
                 return float(value)
         raise RuntimeError("موجودی/مارجین USDT از پاسخ توبیت قابل خواندن نیست.")
@@ -353,10 +404,10 @@ class ToobitClient:
 
     def get_symbol_rules(self, symbol: str) -> SymbolRules:
         symbol = symbol.upper()
-        fallback_qty = Decimal(os.getenv("TOBIT_DEFAULT_QUANTITY_STEP", "0.0001"))
-        fallback_tick = Decimal(os.getenv("TOBIT_DEFAULT_PRICE_TICK", "0.0001"))
-        fallback_min_qty = Decimal(os.getenv("TOBIT_DEFAULT_MIN_QTY", "0"))
-        fallback_min_notional = Decimal(os.getenv("TOBIT_DEFAULT_MIN_NOTIONAL", "0"))
+        fallback_qty = _env_decimal(("TOOBIT_DEFAULT_QUANTITY_STEP", "TOBIT_DEFAULT_QUANTITY_STEP"), "0.0001")
+        fallback_tick = _env_decimal(("TOOBIT_DEFAULT_PRICE_TICK", "TOBIT_DEFAULT_PRICE_TICK"), "0.0001")
+        fallback_min_qty = _env_decimal(("TOOBIT_DEFAULT_MIN_QTY", "TOBIT_DEFAULT_MIN_QTY"), "0")
+        fallback_min_notional = _env_decimal(("TOOBIT_DEFAULT_MIN_NOTIONAL", "TOBIT_DEFAULT_MIN_NOTIONAL"), "0")
 
         try:
             payload = self._request("GET", self.path_exchange_info, params={"symbol": symbol}, signed=False)
