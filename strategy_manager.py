@@ -1,9 +1,9 @@
 """Strategy manager for Crypto AI Helper bot.
 
-Level 4 / 1H Smart Scalp decision coordinator.
+Level 4 / 15m/30m Fast Smart Scalp decision coordinator.
 
 Locked responsibility:
-- Owns only the strategy decision flow for the active Level 4 profile.
+- Owns only the strategy decision flow for the active Level 4 15m/30m profile.
 - Connects market_context, coin_analyzer, probability_engine, ai_decision, and tp_sl_engine.
 - Returns one simple decision object for bot.py / real_trade_manager.py.
 - No OKX HTTP calls, no Toobit calls, no Telegram sending, no order execution, no slot accounting.
@@ -11,7 +11,7 @@ Locked responsibility:
 Design lock:
 - Only Level 4 is active for new signals.
 - One TP and one SL only.
-- Quality entry over fast/late chase entry.
+- Quality 30m signal + 15m entry confirmation over late chase entry.
 - Prefer NO_TRADE over weak, conflicted, late, or fee-invalid setups.
 """
 
@@ -36,15 +36,22 @@ from config import (
 )
 from market_context import Candle, MarketContext, build_market_context
 from probability_engine import ProbabilityResult, calculate_probabilities
-from tp_sl_engine import TPSLPlan, build_level4_tp_sl_plan
+from tp_sl_engine import TPSLPlan, build_fast_tp_sl_plan
 
 Direction = Literal["LONG", "SHORT", "NONE"]
 Action = Literal["ENTER_LONG", "ENTER_SHORT", "NO_TRADE"]
 ExecutionMode = Literal["REAL", "SIGNAL", "NO_TRADE"]
 
 ACTIVE_STRATEGY_LEVEL = 4
-STRATEGY_NAME = "Level 4 / 1H Smart Scalp"
-STRATEGY_TIMEFRAME = TIMEFRAME
+STRATEGY_NAME = "Level 4 / 15m-30m Fast Smart Scalp"
+STRATEGY_TIMEFRAME = "30m"
+ENTRY_TIMEFRAME = "15m"
+TREND_FILTER_TIMEFRAME = "1h"
+MIN_MAIN_CANDLES_30M = 40
+MIN_ENTRY_CANDLES_15M = 40
+MIN_REAL_CONFIDENCE = 75.0
+MIN_REAL_AGREEMENT = 70.0
+MIN_REAL_DIRECTION_EDGE = 8.0
 
 _real_trading_enabled_override: bool | None = None
 _active_strategy_level: int = ACTIVE_STRATEGY_LEVEL
@@ -93,10 +100,10 @@ def decide(symbol: str, market: Mapping[str, Any] | None = None, **kwargs: Any) 
 
     Expected market keys when available:
     - price: latest entry/reference price.
-    - candles: 1H candles for the symbol, as Candle objects, dicts, or OKX arrays.
-    - btc_candles: 1H BTC candles for market context.
+    - candles / candles_30m: 30m candles for the symbol, as Candle objects, dicts, or OKX arrays.
+    - entry_candles / candles_15m: 15m candles for entry confirmation and fast SL refinement.
+    - btc_candles: BTC candles for market context/trend filter.
     - alt_market_candles: optional broad alt-market proxy candles.
-    - fear_greed_value: optional integer 0..100.
     - real_trade_enabled/trade_margin_usdt/leverage/min_net_profit_usdt: optional runtime settings.
 
     If candle data is missing, this function fails closed with NO_TRADE.  The
@@ -112,20 +119,31 @@ def decide(symbol: str, market: Mapping[str, Any] | None = None, **kwargs: Any) 
         return _no_trade(key, f"کوین خارج از واچ‌لیست قفل‌شده است: {exc}")
 
     entry = _safe_price(market_map.get("price") or market_map.get("entry"))
-    candles = _coerce_candles(market_map.get("candles") or market_map.get("symbol_candles"))
+    candles = _coerce_candles(
+        market_map.get("candles_30m")
+        or market_map.get("candles")
+        or market_map.get("symbol_candles")
+    )
+    entry_candles = _coerce_candles(
+        market_map.get("candles_15m")
+        or market_map.get("entry_candles")
+        or market_map.get("entry_confirm_candles")
+    )
     if entry <= 0 and candles:
         entry = candles[-1].close
     if entry <= 0:
         return _no_trade(key, "قیمت ورود معتبر نیست")
-    if len(candles) < 40:
-        return _no_trade(key, "برای Level 4 حداقل ۴۰ کندل 1H لازم است", entry=entry)
+    if len(candles) < MIN_MAIN_CANDLES_30M:
+        return _no_trade(key, "برای مدل 30m حداقل ۴۰ کندل ۳۰ دقیقه‌ای لازم است", entry=entry)
+    if len(entry_candles) < MIN_ENTRY_CANDLES_15M:
+        return _no_trade(key, "برای تأیید ورود 15m حداقل ۴۰ کندل ۱۵ دقیقه‌ای لازم است", entry=entry)
 
     btc_candles = _coerce_candles(market_map.get("btc_candles") or market_map.get("market_candles"))
     alt_candles = _coerce_candles(market_map.get("alt_market_candles"))
     context = _context_from_market(market_map, btc_candles, alt_candles)
 
     try:
-        analysis = analyze_coin(key, candles)
+        analysis = analyze_coin(key, candles, entry_candles=entry_candles)
         probability = calculate_probabilities(analysis, context)
         ai = make_ai_decision(probability, context)
     except Exception as exc:
@@ -143,6 +161,19 @@ def decide(symbol: str, market: Mapping[str, Any] | None = None, **kwargs: Any) 
             ai=ai,
         )
 
+    final_block = _final_entry_block_reason(probability, ai.confidence, context)
+    if final_block:
+        return _no_trade(
+            key,
+            final_block,
+            entry=entry,
+            confidence=ai.confidence,
+            context=context,
+            analysis=analysis,
+            probability=probability,
+            ai=ai,
+        )
+
     direction: Literal["LONG", "SHORT"] = ai.direction  # type: ignore[assignment]
     trade_margin = _safe_float(market_map.get("trade_margin_usdt") or market_map.get("trade_dollar_usdt"), DEFAULT_TRADE_DOLLAR)
     leverage = int(_safe_float(market_map.get("leverage"), DEFAULT_LEVERAGE))
@@ -151,11 +182,12 @@ def decide(symbol: str, market: Mapping[str, Any] | None = None, **kwargs: Any) 
     try:
         # SL/TP construction belongs to tp_sl_engine.  strategy_manager only
         # coordinates the already-approved direction, market analysis, and runtime mode.
-        plan = build_level4_tp_sl_plan(
+        plan = build_fast_tp_sl_plan(
             symbol=key,
             direction=direction,
             entry=entry,
-            candles=candles,
+            candles_30m=candles,
+            candles_15m=entry_candles,
             move_strength=analysis.move_strength,
             trade_margin_usdt=trade_margin,
             leverage=leverage,
@@ -206,6 +238,9 @@ def decide(symbol: str, market: Mapping[str, Any] | None = None, **kwargs: Any) 
             "net_profit_usdt": plan.net_profit_usdt,
             "estimated_fee_usdt": plan.estimated_fee_usdt,
             "target_hold_minutes": TARGET_HOLD_MINUTES,
+            "main_timeframe": STRATEGY_TIMEFRAME,
+            "entry_timeframe": ENTRY_TIMEFRAME,
+            "trend_filter_timeframe": TREND_FILTER_TIMEFRAME,
         },
     )
 
@@ -238,6 +273,8 @@ def get_strategy_status() -> dict[str, Any]:
         "active_level": _active_strategy_level,
         "name": STRATEGY_NAME,
         "timeframe": STRATEGY_TIMEFRAME,
+        "entry_timeframe": ENTRY_TIMEFRAME,
+        "trend_filter_timeframe": TREND_FILTER_TIMEFRAME,
         "target_hold_minutes": TARGET_HOLD_MINUTES,
         "only_level_4_active": _active_strategy_level == 4,
     }
@@ -250,6 +287,8 @@ def get_trade_runtime_config(state: Mapping[str, Any] | None = None) -> dict[str
         "strategy_level": _active_strategy_level,
         "strategy_name": STRATEGY_NAME,
         "timeframe": STRATEGY_TIMEFRAME,
+        "entry_timeframe": ENTRY_TIMEFRAME,
+        "trend_filter_timeframe": TREND_FILTER_TIMEFRAME,
         "target_hold_minutes": TARGET_HOLD_MINUTES,
         "real_trading_enabled": real_enabled,
         "trade_margin_usdt": _safe_float(_get(settings, "trade_dollar_usdt", DEFAULT_TRADE_DOLLAR), DEFAULT_TRADE_DOLLAR),
@@ -290,7 +329,6 @@ def _context_from_market(market: Mapping[str, Any], btc_candles: list[Candle], a
         return build_market_context(
             btc_candles,
             alt_market_candles=alt_candles or None,
-            fear_greed_value=_optional_int(market.get("fear_greed_value")),
         )
     return MarketContext(
         btc_direction="neutral",
@@ -302,6 +340,26 @@ def _context_from_market(market: Mapping[str, Any], btc_candles: list[Candle], a
         short_bias=0.0,
         reason="BTC context candles missing; cautious mode",
     )
+
+
+def _final_entry_block_reason(probability: ProbabilityResult, confidence: float, context: MarketContext) -> str:
+    """Final fast-mode gate before TP/SL and real/signal execution.
+
+    probability_engine already prefers NO_TRADE, but the strategy layer keeps the
+    locked 15m/30m entry rules explicit and fail-closed.
+    """
+    edge = abs(probability.long_probability - probability.short_probability)
+    if context.trade_permission == "blocked":
+        return "ورود ممنوع: کانتکست بازار blocked است"
+    if confidence < MIN_REAL_CONFIDENCE:
+        return f"ورود ممنوع: Confidence کمتر از حد قفل‌شده است ({confidence:.2f} < {MIN_REAL_CONFIDENCE:.2f})"
+    if probability.agreement_score < MIN_REAL_AGREEMENT:
+        return f"ورود ممنوع: Agreement کمتر از حد قفل‌شده است ({probability.agreement_score:.2f} < {MIN_REAL_AGREEMENT:.2f})"
+    if edge < MIN_REAL_DIRECTION_EDGE:
+        return f"ورود ممنوع: اختلاف LONG/SHORT کافی نیست ({edge:.2f} < {MIN_REAL_DIRECTION_EDGE:.2f})"
+    if probability.preferred_direction not in ("LONG", "SHORT"):
+        return "ورود ممنوع: جهت نهایی معتبر نیست"
+    return ""
 
 
 def _entry_reason(ai: AIDecision, probability: ProbabilityResult, plan: TPSLPlan, mode: ExecutionMode) -> str:
@@ -434,6 +492,8 @@ __all__ = [
     "ACTIVE_STRATEGY_LEVEL",
     "STRATEGY_NAME",
     "STRATEGY_TIMEFRAME",
+    "ENTRY_TIMEFRAME",
+    "TREND_FILTER_TIMEFRAME",
     "StrategyDecision",
     "StrategyRuntimeConfig",
     "decide",
