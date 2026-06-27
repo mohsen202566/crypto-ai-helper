@@ -71,14 +71,16 @@ except Exception:  # pragma: no cover
     telegram_ui = None  # type: ignore
 
 try:
-    import strategy.py
-except Exception:  # pragma: no cover
-    strategy.py = None  # type: ignore
+    import strategy
+    STRATEGY_IMPORT_ERROR = ""
+except Exception as exc:  # pragma: no cover
+    strategy = None  # type: ignore
+    STRATEGY_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
 
 try:
-    import strategy
+    import strategy_manager
 except Exception:  # pragma: no cover
-    strategy = None  # type: ignore
+    strategy_manager = None  # type: ignore
 
 try:
     import real_trade_manager
@@ -390,7 +392,7 @@ class OKXMarketDataProvider:
     """Small OKX public ticker adapter.
 
     It intentionally returns only latest prices. Strategy/indicator work remains in
-    strategy.py (or strategy.py if present) and downstream files.
+    strategy.py (or strategy_manager.py if present) and downstream files.
     """
 
     def __init__(self, base_url: str | None = None, timeout: float = DEFAULT_HTTP_TIMEOUT_SECONDS) -> None:
@@ -624,7 +626,7 @@ class BotRuntime:
             market["candles_30m"] = candles_30m
             market["candles_15m"] = candles_15m
             market["entry_candles"] = candles_15m
-            market["candles"] = candles_30m  # compatibility alias for strategy.py
+            market["candles"] = candles_30m  # compatibility alias for strategy_manager
         return market
 
     def _handle_symbol(self, symbol: str, price: float, prices: Mapping[str, float], shared_market: Mapping[str, Any] | None = None) -> str:
@@ -709,12 +711,42 @@ class StrategyDecisionAdapter:
 
 
 def _default_decision_provider(symbol: str, market: Mapping[str, Any]) -> Any:
-    # Prefer a real strategy when the project has one, but this bot must
-    # also work with the current project layout where strategy.py is the only
-    # strategy file.
+    """Return a normalized decision object for bot.py.
+
+    The current project uses strategy.py as the strategy layer.  A legacy
+    strategy_manager is only used as a fallback, so a stale manager file cannot
+    shadow the real strategy.py output.
+    """
     if strategy is not None:
+        analyze = getattr(strategy, "analyze_strategy", None)
+        if callable(analyze):
+            candles_main = _candles_for_strategy(market.get("candles_30m") or market.get("candles") or [])
+            candles_entry = _candles_for_strategy(market.get("candles_15m") or market.get("entry_candles") or [])
+            try:
+                result = analyze(symbol, candles_main, candles_entry)
+            except TypeError:
+                result = analyze(symbol=symbol, candles_5m=candles_main, candles_15m=candles_entry)
+            return _adapt_strategy_result(symbol, market, result)
+
+    if STRATEGY_IMPORT_ERROR:
+        return StrategyDecisionAdapter(
+            symbol=symbol,
+            action="NO_TRADE",
+            direction="NO_TRADE",
+            entry=_safe_price(market.get("price")),
+            tp=0.0,
+            sl=0.0,
+            tp1=0.0,
+            confidence=0.0,
+            reason=f"strategy_import_failed: {STRATEGY_IMPORT_ERROR}",
+            mode="SIGNAL",
+            raw_strategy_result=None,
+        )
+
+    # Legacy fallback only.  This is intentionally after strategy.py.
+    if strategy_manager is not None:
         for name in ("decide", "analyze_symbol", "build_decision", "evaluate_symbol", "get_decision"):
-            fn = getattr(strategy, name, None)
+            fn = getattr(strategy_manager, name, None)
             if callable(fn):
                 try:
                     return fn(symbol=symbol, market=market)
@@ -724,37 +756,41 @@ def _default_decision_provider(symbol: str, market: Mapping[str, Any]) -> Any:
                     except TypeError:
                         return fn(symbol)
 
-    if strategy is None:
-        return None
+    return StrategyDecisionAdapter(
+        symbol=symbol,
+        action="NO_TRADE",
+        direction="NO_TRADE",
+        entry=_safe_price(market.get("price")),
+        tp=0.0,
+        sl=0.0,
+        tp1=0.0,
+        confidence=0.0,
+        reason="strategy_missing",
+        mode="SIGNAL",
+        raw_strategy_result=None,
+    )
 
-    analyze = getattr(strategy, "analyze_strategy", None)
-    if not callable(analyze):
-        return None
 
-    candles_main = _candles_for_strategy(market.get("candles_30m") or market.get("candles") or [])
-    candles_entry = _candles_for_strategy(market.get("candles_15m") or market.get("entry_candles") or [])
-    try:
-        result = analyze(symbol, candles_main, candles_entry)
-    except TypeError:
-        result = analyze(symbol=symbol, candles_5m=candles_main, candles_15m=candles_entry)
-
+def _adapt_strategy_result(symbol: str, market: Mapping[str, Any], result: Any) -> StrategyDecisionAdapter:
     direction = str(getattr(result, "direction", "") or "").upper()
-    if direction in {"NO_TRADE", "HOLD", "REJECT", "NONE", ""}:
+    entry = _safe_price(getattr(result, "entry_price", 0.0) or market.get("price"))
+    reason = str(getattr(result, "reason", "") or "strategy_no_reason")
+
+    if result is None or direction in {"NO_TRADE", "HOLD", "REJECT", "NONE", ""}:
         return StrategyDecisionAdapter(
             symbol=symbol,
             action="NO_TRADE",
             direction="NO_TRADE",
-            entry=_safe_price(getattr(result, "entry_price", 0.0) or market.get("price")),
+            entry=entry,
             tp=0.0,
             sl=0.0,
             tp1=0.0,
             confidence=0.0,
-            reason=str(getattr(result, "reason", "") or "strategy_no_trade"),
+            reason=reason if result is not None else "strategy_returned_none",
             mode="SIGNAL",
             raw_strategy_result=result,
         )
 
-    entry = _safe_price(getattr(result, "entry_price", 0.0) or market.get("price"))
     atr = _safe_price(getattr(result, "atr", 0.0))
     tp, sl = _strategy_tp_sl_fallback(direction, entry=entry, atr=atr)
     confidence = max(
@@ -771,11 +807,10 @@ def _default_decision_provider(symbol: str, market: Mapping[str, Any]) -> Any:
         sl=sl,
         tp1=tp,
         confidence=round(confidence, 2),
-        reason=str(getattr(result, "reason", "") or "strategy_signal"),
+        reason=reason,
         mode="TOOBIT" if bool(market.get("real_trade_enabled")) else "SIGNAL",
         raw_strategy_result=result,
     )
-
 
 def _candles_for_strategy(raw_candles: Any) -> list[dict[str, float]]:
     """Convert OKX raw candles or dict candles to chronological dict candles."""
@@ -821,16 +856,18 @@ def _candles_for_strategy(raw_candles: Any) -> list[dict[str, float]]:
 def _strategy_tp_sl_fallback(direction: str, *, entry: float, atr: float) -> tuple[float, float]:
     if entry <= 0:
         return 0.0, 0.0
-    tp_mult = max(0.1, _safe_float(os.getenv("STRATEGY_TP_ATR_MULT"), 1.2))
-    sl_mult = max(0.1, _safe_float(os.getenv("STRATEGY_SL_ATR_MULT"), 0.8))
-    atr_value = atr if atr > 0 else entry * max(0.001, _safe_float(os.getenv("STRATEGY_FALLBACK_ATR_PCT"), 0.006))
+    cfg_tp = getattr(bot_config, "STRATEGY_TP_ATR_MULT", 1.25) if bot_config is not None else 1.25
+    cfg_sl = getattr(bot_config, "STRATEGY_SL_ATR_MULT", 0.85) if bot_config is not None else 0.85
+    cfg_atr_pct = getattr(bot_config, "STRATEGY_FALLBACK_ATR_PCT", 0.006) if bot_config is not None else 0.006
+    tp_mult = max(0.1, _safe_float(os.getenv("STRATEGY_TP_ATR_MULT"), _safe_float(cfg_tp, 1.25)))
+    sl_mult = max(0.1, _safe_float(os.getenv("STRATEGY_SL_ATR_MULT"), _safe_float(cfg_sl, 0.85)))
+    atr_value = atr if atr > 0 else entry * max(0.001, _safe_float(os.getenv("STRATEGY_FALLBACK_ATR_PCT"), _safe_float(cfg_atr_pct, 0.006)))
     direction = str(direction or "").upper()
     if direction == "LONG":
         return round(entry + atr_value * tp_mult, 10), round(max(entry - atr_value * sl_mult, entry * 0.001), 10)
     if direction == "SHORT":
         return round(max(entry - atr_value * tp_mult, entry * 0.001), 10), round(entry + atr_value * sl_mult, 10)
     return 0.0, 0.0
-
 
 def _default_exchange_checker(record: Any) -> Mapping[str, Any]:
     if real_trade_manager is not None:
