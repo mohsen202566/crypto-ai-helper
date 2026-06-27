@@ -1,7 +1,9 @@
 #!/bin/bash
-cd /root/crypto-ai-helper
-source venv/bin/activate
+
+cd /root/crypto-ai-helper || exit 1
+
 set -a
 source .env
 set +a
-exec python3 -u bot.py
+
+exec /root/crypto-ai-helper/venv/bin/python3 -u bot.py
