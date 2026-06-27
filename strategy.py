@@ -16,18 +16,26 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from config import (
-    DIRECTION_MAX_OPPOSITE_SCORE,
-    MIN_DIRECTION_SCORE,
-    MIN_STRENGTH_SCORE,
-    SCORE_BREAKOUT,
-    SCORE_EMA,
-    SCORE_MARKET_STRUCTURE,
-    SCORE_MACD,
-    SCORE_RSI,
-    SCORE_ATR_EXPANSION,
-    SCORE_VOLUME,
-)
+import config as strategy_config
+
+
+def _cfg(name: str, default: float) -> float:
+    try:
+        return float(getattr(strategy_config, name, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+DIRECTION_MAX_OPPOSITE_SCORE = _cfg("DIRECTION_MAX_OPPOSITE_SCORE", 18)
+MIN_DIRECTION_SCORE = _cfg("MIN_DIRECTION_SCORE", 56)
+MIN_STRENGTH_SCORE = _cfg("MIN_STRENGTH_SCORE", 12)
+SCORE_BREAKOUT = _cfg("SCORE_BREAKOUT", 12)
+SCORE_EMA = _cfg("SCORE_EMA", 24)
+SCORE_MARKET_STRUCTURE = _cfg("SCORE_MARKET_STRUCTURE", 22)
+SCORE_MACD = _cfg("SCORE_MACD", 18)
+SCORE_RSI = _cfg("SCORE_RSI", 18)
+SCORE_ATR_EXPANSION = _cfg("SCORE_ATR_EXPANSION", 12)
+SCORE_VOLUME = _cfg("SCORE_VOLUME", 8)
 
 Direction = Literal["LONG", "SHORT", "NO_TRADE"]
 Bias = Literal["LONG", "SHORT", "NEUTRAL"]
@@ -52,15 +60,15 @@ class StrategyResult:
 def analyze_strategy(symbol: str, candles_5m: list[dict[str, Any]], candles_15m: list[dict[str, Any]] | None = None) -> StrategyResult:
     """Analyze one symbol with a simple 5m/15m technical model.
 
-    Main timing is 5m. 15m is optional support for smoother structure, but this
-    strategy remains lightweight and score-based.
+    Main timing is the project main timeframe, normally 30m. 15m is optional
+    entry support for smoother structure. The strategy remains lightweight and score-based.
     """
     symbol = symbol.upper()
     candles = _clean_candles(candles_5m)
     higher = _clean_candles(candles_15m or [])
 
     if len(candles) < 60:
-        return _no_trade(symbol, 0.0, 0.0, 0.0, "کندل 5m کافی نیست")
+        return _no_trade(symbol, 0.0, 0.0, 0.0, "کندل اصلی کافی نیست")
 
     close = _closes(candles)
     high = _highs(candles)
@@ -88,12 +96,17 @@ def analyze_strategy(symbol: str, candles_5m: list[dict[str, Any]], candles_15m:
 
     long_score, short_score = _add_vote(long_score, short_score, structure_bias, SCORE_MARKET_STRUCTURE)
     reasons.append(f"Structure={structure_bias}")
+    reasons.append(f"Score(L/S)={long_score:.0f}/{short_score:.0f}")
 
     direction: Direction = "NO_TRADE"
     if long_score >= MIN_DIRECTION_SCORE and short_score <= DIRECTION_MAX_OPPOSITE_SCORE:
         direction = "LONG"
     elif short_score >= MIN_DIRECTION_SCORE and long_score <= DIRECTION_MAX_OPPOSITE_SCORE:
         direction = "SHORT"
+    else:
+        reasons.append(
+            f"DirectionGate fail min={MIN_DIRECTION_SCORE:.0f} opposite_max={DIRECTION_MAX_OPPOSITE_SCORE:.0f}"
+        )
 
     atr_value = _atr(high, low, close, period=14)
     strength_score = 0.0
@@ -113,6 +126,7 @@ def analyze_strategy(symbol: str, candles_5m: list[dict[str, Any]], candles_15m:
         reasons.append(f"VolumeMA20={volume_ok}")
         reasons.append(f"Breakout={breakout_ok}")
 
+        reasons.append(f"StrengthScore={strength_score:.0f}/{MIN_STRENGTH_SCORE:.0f}")
         if strength_score < MIN_STRENGTH_SCORE:
             direction = "NO_TRADE"
             reasons.append("StrengthScore کافی نیست")
@@ -213,20 +227,28 @@ def _structure_bias(candles: list[dict[str, Any]]) -> Bias:
         return "NEUTRAL"
     highs = _highs(candles)
     lows = _lows(candles)
+    close = _closes(candles)
 
     swing_highs = _swing_points(highs, mode="high")[-3:]
     swing_lows = _swing_points(lows, mode="low")[-3:]
-    if len(swing_highs) < 2 or len(swing_lows) < 2:
-        return "NEUTRAL"
+    if len(swing_highs) >= 2 and len(swing_lows) >= 2:
+        hh = swing_highs[-1] > swing_highs[-2]
+        hl = swing_lows[-1] > swing_lows[-2]
+        lh = swing_highs[-1] < swing_highs[-2]
+        ll = swing_lows[-1] < swing_lows[-2]
 
-    hh = swing_highs[-1] > swing_highs[-2]
-    hl = swing_lows[-1] > swing_lows[-2]
-    lh = swing_highs[-1] < swing_highs[-2]
-    ll = swing_lows[-1] < swing_lows[-2]
+        if hh and hl:
+            return "LONG"
+        if lh and ll:
+            return "SHORT"
 
-    if hh and hl:
+    # Fallback for clean impulse moves where swing-points are not formed yet.
+    # This avoids making the bot too strict during early 30-60 minute moves.
+    recent_base = close[-10] if close[-10] else close[-1]
+    recent_change_pct = (close[-1] - recent_base) / recent_base * 100.0
+    if recent_change_pct > 0.35 and close[-1] >= max(close[-6:-1]) and lows[-1] > min(lows[-10:-1]):
         return "LONG"
-    if lh and ll:
+    if recent_change_pct < -0.35 and close[-1] <= min(close[-6:-1]) and highs[-1] < max(highs[-10:-1]):
         return "SHORT"
     return "NEUTRAL"
 
