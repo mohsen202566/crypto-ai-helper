@@ -17,6 +17,8 @@ class SignalMonitor:
     async def check_once(self, send_result) -> None:
         signals = self.storage.open_signals()
         for signal in signals:
+            if signal.signal_type == "real" and signal.real_status != "opened":
+                continue
             try:
                 price = await asyncio.to_thread(self.okx.get_last_price, signal.okx_symbol)
             except Exception:
@@ -24,7 +26,8 @@ class SignalMonitor:
             status = self._status_from_price(signal, price)
             if status is None:
                 continue
-            approx_pnl = self._approx_pnl(signal, price)
+            exit_price = signal.tp if status == "TP" else signal.sl
+            approx_pnl = self._approx_pnl(signal, exit_price)
             real_pnl = await self._real_pnl(signal) if signal.signal_type == "real" else None
             result_message_id = await send_result(signal, status, approx_pnl, real_pnl)
             self.storage.finish_signal(
@@ -51,6 +54,8 @@ class SignalMonitor:
     def _approx_pnl(self, signal: StoredSignal, exit_price: float) -> float:
         margin = signal.margin_usdt
         leverage = signal.leverage
+        if signal.entry <= 0:
+            return 0.0
         if signal.direction == "LONG":
             pct = (exit_price - signal.entry) / signal.entry
         else:
@@ -59,8 +64,8 @@ class SignalMonitor:
 
     async def _real_pnl(self, signal: StoredSignal) -> float | None:
         created = datetime.fromisoformat(signal.created_at)
-        start_ms = int((created - timedelta(minutes=5)).timestamp() * 1000)
-        end_ms = int((datetime.now(timezone.utc) + timedelta(minutes=5)).timestamp() * 1000)
+        start_ms = int((created - timedelta(minutes=10)).timestamp() * 1000)
+        end_ms = int((datetime.now(timezone.utc) + timedelta(minutes=10)).timestamp() * 1000)
         try:
             return await asyncio.to_thread(
                 self.toobit.find_realized_pnl,
