@@ -35,11 +35,22 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping, Protocol
 
 try:
-    from config import DEFAULT_AUTO_SIGNAL_ENABLED, DEFAULT_REAL_TRADE_ENABLED, WATCHLIST, get_coin
+    from config import (
+        DEFAULT_AUTO_SIGNAL_ENABLED,
+        DEFAULT_REAL_TRADE_ENABLED,
+        WATCHLIST,
+        TIMEFRAME,
+        ENTRY_TIMEFRAME,
+        TREND_FILTER_TIMEFRAME,
+        get_coin,
+    )
 except Exception:  # pragma: no cover - keeps isolated compile checks possible.
     DEFAULT_AUTO_SIGNAL_ENABLED = True
     DEFAULT_REAL_TRADE_ENABLED = False
     WATCHLIST = ("DOGEUSDT", "XRPUSDT", "SOLUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "INJUSDT")
+    TIMEFRAME = "30m"
+    ENTRY_TIMEFRAME = "15m"
+    TREND_FILTER_TIMEFRAME = "1h"
 
     def get_coin(symbol: str) -> Any:  # type: ignore
         return symbol
@@ -95,7 +106,7 @@ except Exception:  # pragma: no cover - py_compile must work even before require
     filters = None  # type: ignore
 
 
-BOT_VERSION = "level4_main_loop_v2_telegram_okx"
+BOT_VERSION = "level4_fast_15m30m_loop_v1"
 DEFAULT_SCAN_INTERVAL_SECONDS = 5.0
 DEFAULT_HTTP_TIMEOUT_SECONDS = 10.0
 LOGGER = logging.getLogger("crypto_bot")
@@ -169,17 +180,18 @@ class OKXMarketDataProvider:
             return 0.0
         return _safe_price(data[0].get("last"))
 
-    def get_candles(self, symbol: str, *, bar: str = "1H", limit: int = 100) -> list[list[str]]:
-        """Return OKX candles for strategy_manager.
+    def get_candles(self, symbol: str, *, bar: str = TIMEFRAME, limit: int = 100) -> list[list[str]]:
+        """Return OKX candles for the 15m/30m strategy profile.
 
-        strategy_manager Level 4 refuses to trade without at least 40 candles.
-        The runtime therefore must provide candles, not just a last price.
+        The strategy layer fails closed without enough 30m main candles and
+        15m entry-confirmation candles.  bot.py only fetches and passes data;
+        it does not calculate indicators or make TP/SL decisions.
         """
         clean_symbol = str(symbol).upper().strip()
         if not clean_symbol:
             return []
         for inst_id in _okx_inst_id_candidates(clean_symbol):
-            query = urllib.parse.urlencode({"instId": inst_id, "bar": bar, "limit": int(limit)})
+            query = urllib.parse.urlencode({"instId": inst_id, "bar": _okx_bar(bar), "limit": int(limit)})
             url = f"{self.base_url}/api/v5/market/candles?{query}"
             req = urllib.request.Request(url, headers={"User-Agent": f"CryptoAIHelper/{BOT_VERSION}"})
             try:
@@ -200,7 +212,7 @@ class EmptyMarketDataProvider:
     def get_prices(self, symbols: Iterable[str]) -> Mapping[str, float]:
         return {}
 
-    def get_candles(self, symbol: str, *, bar: str = "1H", limit: int = 100) -> list[list[str]]:
+    def get_candles(self, symbol: str, *, bar: str = TIMEFRAME, limit: int = 100) -> list[list[str]]:
         return []
 
 
@@ -329,7 +341,7 @@ class BotRuntime:
         if not callable(candles_getter):
             return {}
         try:
-            btc_candles = candles_getter("BTCUSDT", bar="1H", limit=100)
+            btc_candles = candles_getter("BTCUSDT", bar=TREND_FILTER_TIMEFRAME, limit=80)
         except Exception as exc:
             LOGGER.warning("btc_candles_error error=%s", exc)
             btc_candles = []
@@ -358,10 +370,20 @@ class BotRuntime:
         candles_getter = getattr(self.market_data, "get_candles", None)
         if callable(candles_getter):
             try:
-                market["candles"] = candles_getter(symbol, bar="1H", limit=100)
+                candles_30m = candles_getter(symbol, bar=TIMEFRAME, limit=100)
             except Exception as exc:
-                LOGGER.warning("symbol_candles_error symbol=%s error=%s", symbol, exc)
-                market["candles"] = []
+                LOGGER.warning("symbol_main_candles_error symbol=%s bar=%s error=%s", symbol, TIMEFRAME, exc)
+                candles_30m = []
+            try:
+                candles_15m = candles_getter(symbol, bar=ENTRY_TIMEFRAME, limit=100)
+            except Exception as exc:
+                LOGGER.warning("symbol_entry_candles_error symbol=%s bar=%s error=%s", symbol, ENTRY_TIMEFRAME, exc)
+                candles_15m = []
+
+            market["candles_30m"] = candles_30m
+            market["candles_15m"] = candles_15m
+            market["entry_candles"] = candles_15m
+            market["candles"] = candles_30m  # compatibility alias for strategy_manager
         return market
 
     def _handle_symbol(self, symbol: str, price: float, prices: Mapping[str, float], shared_market: Mapping[str, Any] | None = None) -> str:
@@ -650,6 +672,19 @@ def _install_stop_handlers(stop: Callable[[], None]) -> None:
         signal.signal(signal.SIGINT, _handler)
     except Exception:
         pass
+
+
+def _okx_bar(bar: str) -> str:
+    """Normalize internal timeframe names to OKX bar values."""
+    value = str(bar or "").strip()
+    mapping = {
+        "15M": "15m",
+        "30M": "30m",
+        "1H": "1H",
+        "1h": "1H",
+        "60M": "1H",
+    }
+    return mapping.get(value, mapping.get(value.upper(), value or "30m"))
 
 
 def _okx_inst_id_candidates(symbol: str) -> list[str]:
