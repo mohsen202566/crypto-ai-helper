@@ -5,36 +5,59 @@ import logging
 
 from telegram.ext import Application, MessageHandler, filters
 
+from ai_controller import AIController, AnalysisInput
 from bot_ui import BotUI
-from config import SCAN_INTERVAL_SECONDS, MONITOR_INTERVAL_SECONDS, SYMBOLS, TELEGRAM_BOT_TOKEN, ensure_runtime_config
-from indicators import calculate_indicators
+from config import (
+    MARKET_CONTEXT_SYMBOLS,
+    MONITOR_INTERVAL_SECONDS,
+    SCAN_INTERVAL_SECONDS,
+    TELEGRAM_BOT_TOKEN,
+    TIMEFRAME_1H,
+    TIMEFRAMES,
+    ensure_runtime_config,
+)
 from monitor import SignalMonitor
 from okx_data import OkxDataClient
-from scorer import TechnicalScorer
 from storage import Storage
+from symbols import SYMBOLS
 from toobit_client import get_client
 from trade_manager import TradeManager
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-LOGGER = logging.getLogger("scalp5")
+LOGGER = logging.getLogger("mtf_ai_bot")
 
 
-async def scanner_loop(okx: OkxDataClient, scorer: TechnicalScorer, trade_manager: TradeManager, ui: BotUI) -> None:
+async def scanner_loop(okx: OkxDataClient, controller: AIController, trade_manager: TradeManager, ui: BotUI) -> None:
+    market_cache: dict[str, list] = {}
     while True:
-        for symbol in SYMBOLS:
-            try:
-                candles = await asyncio.to_thread(okx.get_candles, symbol.okx_inst_id)
-                indicator = calculate_indicators(candles)
-                entry = candles[-1].close
-                decision = scorer.score(indicator, entry)
-                if not decision.accepted:
-                    continue
-                created = await trade_manager.create_signal(symbol, decision)
-                if created is None:
-                    continue
-                await ui.send_signal(symbol_name=symbol.name, decision=decision, created=created)
-            except Exception as exc:
-                LOGGER.warning("scan error for %s: %s", symbol.name, exc)
+        try:
+            market_cache = {}
+            for inst_id in MARKET_CONTEXT_SYMBOLS:
+                try:
+                    market_cache[inst_id] = await asyncio.to_thread(okx.get_candles, inst_id, TIMEFRAME_1H)
+                except Exception as exc:
+                    LOGGER.warning("market context error for %s: %s", inst_id, exc)
+            for symbol in SYMBOLS:
+                try:
+                    candles_by_tf = await asyncio.to_thread(okx.get_multi_timeframe, symbol.okx_inst_id, TIMEFRAMES)
+                    decision = controller.analyze(
+                        AnalysisInput(
+                            symbol_name=symbol.name,
+                            candles_by_tf=candles_by_tf,
+                            btc_1h=market_cache.get(MARKET_CONTEXT_SYMBOLS[0]),
+                            eth_1h=market_cache.get(MARKET_CONTEXT_SYMBOLS[1]),
+                        )
+                    )
+                    if not decision.accepted:
+                        continue
+                    created = await trade_manager.create_signal(symbol, decision)
+                    if created is None:
+                        continue
+                    await ui.send_signal(symbol_name=symbol.name, decision=decision, created=created)
+                except Exception as exc:
+                    LOGGER.warning("scan error for %s: %s", symbol.name, exc)
+        except Exception as exc:
+            LOGGER.warning("scanner loop error: %s", exc)
         await asyncio.sleep(SCAN_INTERVAL_SECONDS)
 
 
@@ -51,7 +74,7 @@ def main() -> None:
     ensure_runtime_config()
     storage = Storage()
     okx = OkxDataClient()
-    scorer = TechnicalScorer()
+    controller = AIController()
     toobit = get_client()
     trade_manager = TradeManager(storage, toobit)
     ui = BotUI(storage, trade_manager)
@@ -59,7 +82,7 @@ def main() -> None:
 
     async def post_init(app: Application) -> None:
         ui.bind_app(app)
-        asyncio.create_task(scanner_loop(okx, scorer, trade_manager, ui))
+        asyncio.create_task(scanner_loop(okx, controller, trade_manager, ui))
         asyncio.create_task(monitor_loop(monitor, ui))
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
