@@ -22,6 +22,12 @@ from time import time
 from typing import Any, Callable, Iterable, Literal, Mapping
 
 try:
+    from config import MAX_HOLD_MINUTES, TARGET_HOLD_MINUTES
+except Exception:  # pragma: no cover - isolated compile fallback.
+    TARGET_HOLD_MINUTES = (30, 60)
+    MAX_HOLD_MINUTES = 75
+
+try:
     from state_store import ResultKind, SignalMode, SignalRecord, StateStore
 except Exception:  # pragma: no cover - allows isolated compile during file checks.
     ResultKind = Literal["TP", "SL"]  # type: ignore
@@ -123,10 +129,23 @@ class PositionMonitor:
         if price is None or price <= 0:
             return _no_result(record, "price_missing")
         hit = detect_tp_sl(record.direction, price=price, tp=record.tp, sl=record.sl)
-        if hit is None:
-            return _no_result(record, "tp_sl_not_hit")
-        pnl = estimate_pnl_usdt(record, price)
-        return self._record_result(record, result=hit, exit_price=price, pnl_usdt=pnl, reason="signal_tp_sl_hit")
+        if hit is not None:
+            pnl = estimate_pnl_usdt(record, price)
+            return self._record_result(record, result=hit, exit_price=price, pnl_usdt=pnl, reason="signal_tp_sl_hit")
+
+        time_exit = detect_smart_time_exit(record, price=price)
+        if time_exit is not None:
+            pnl = estimate_pnl_usdt(record, price)
+            return self._record_result(
+                record,
+                result=time_exit,
+                exit_price=price,
+                pnl_usdt=pnl,
+                reason="signal_smart_time_exit",
+                raw={"max_hold_minutes": MAX_HOLD_MINUTES, "target_hold_minutes": TARGET_HOLD_MINUTES},
+            )
+
+        return _no_result(record, "tp_sl_not_hit")
 
     def _check_real(self, record: SignalRecord, price: float | None) -> MonitorResult:
         if self.exchange_checker is None:
@@ -235,6 +254,21 @@ def detect_tp_sl(direction: Direction, *, price: float, tp: float, sl: float) ->
             return "SL"
         return None
     raise ValueError("direction باید LONG یا SHORT باشد.")
+
+
+def detect_smart_time_exit(record: SignalRecord, *, price: float) -> ResultKind | None:
+    """Close stale SIGNAL_ONLY records after MAX_HOLD_MINUTES.
+
+    The monitor cannot create a third result kind because StateStore is locked to
+    TP/SL stats. A timed exit is therefore classified as TP when the current move
+    is non-negative and SL when it is negative. Real Toobit exits are not touched
+    here; this helper only affects SIGNAL mode through _check_signal_only().
+    """
+    if price <= 0:
+        return None
+    if _duration_minutes(record) < int(MAX_HOLD_MINUTES):
+        return None
+    return "TP" if move_pct(record.direction, record.entry, price) >= 0 else "SL"
 
 
 def infer_result_kind(record: SignalRecord, exit_price: float) -> ResultKind:
@@ -374,6 +408,7 @@ __all__ = [
     "ResultPanelPayload",
     "build_result_panel_payload",
     "detect_tp_sl",
+    "detect_smart_time_exit",
     "estimate_pnl_usdt",
     "infer_result_kind",
     "move_pct",
