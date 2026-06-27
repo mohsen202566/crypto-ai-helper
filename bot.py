@@ -7,7 +7,7 @@ Locked responsibility:
 - Registers SIGNAL_ONLY when real trading is off, slots are full, or the strategy/TP-SL
   result says the trade should be monitored only.
 - Sends REAL requests only through real_trade_manager.py.
-- Runs position_monitor.py every cycle so TP/SL results are detected and recorded fast.
+- Runs the internal PositionMonitor every cycle so TP/SL results are detected and recorded fast.
 - Builds Telegram/UI payloads through telegram_ui.py only.
 - Connects Telegram messages to command_router.py.
 
@@ -60,13 +60,10 @@ try:
 except Exception:  # pragma: no cover
     StateStore = Any  # type: ignore
 
-try:
-    from position_monitor import PositionMonitor, build_result_panel_payload
-except Exception:  # pragma: no cover
-    PositionMonitor = Any  # type: ignore
-
-    def build_result_panel_payload(result: Any, fa_name: str = "") -> Any:  # type: ignore
-        return result
+# NOTE:
+# There is no required position_monitor.py dependency in this cleaned build.
+# Monitoring is handled below by PositionMonitor using StateStore records and
+# Toobit/price data already provided by the other project files.
 
 try:
     import telegram_ui
@@ -84,7 +81,7 @@ except Exception:  # pragma: no cover
     real_trade_manager = None  # type: ignore
 
 try:
-    import tobit_client
+    import toobit_client as tobit_client
 except Exception:  # pragma: no cover - status panel must still work without Toobit deps.
     tobit_client = None  # type: ignore
 
@@ -143,6 +140,250 @@ class CycleReport:
     real_requested: int = 0
     monitor_results: int = 0
     errors: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class MonitorResult:
+    signal_id: str
+    symbol: str
+    direction: str
+    mode: str
+    result: str
+    entry: float
+    exit_price: float
+    tp: float
+    sl: float
+    pnl_usdt: float
+    close_reason: str
+
+
+class PositionMonitor:
+    """Monitor active StateStore records without a separate position_monitor.py file.
+
+    SIGNAL records are closed by latest OKX price hitting local TP/SL.
+    TOOBIT records are synced from exchange callbacks/toobit_client state and only
+    marked closed when a TP/SL hit can be identified safely from the current price.
+    """
+
+    def __init__(
+        self,
+        store: StateStore,
+        *,
+        exchange_checker: Callable[[Any], Mapping[str, Any] | bool | None] | None = None,
+        closed_pnl_reader: Callable[[Any], Mapping[str, Any] | float | int | None] | None = None,
+        result_callback: Callable[[Any], None] | None = None,
+    ) -> None:
+        self.store = store
+        self.exchange_checker = exchange_checker
+        self.closed_pnl_reader = closed_pnl_reader
+        self.result_callback = result_callback
+        self.last_error = ""
+
+    def check_once(self, prices: Mapping[str, Any] | None = None) -> list[MonitorResult]:
+        prices = prices or {}
+        snapshot = self.store.snapshot()
+        active = dict(getattr(snapshot, "active_signals", {}) or {})
+        results: list[MonitorResult] = []
+        for signal_id, record in active.items():
+            try:
+                status = str(getattr(record, "status", "") or "").upper()
+                if status not in {"PENDING_OPEN", "MONITORING"}:
+                    continue
+                mode = str(getattr(record, "mode", "") or "").upper()
+                if mode == "TOOBIT":
+                    result = self._check_toobit(signal_id, record, prices)
+                else:
+                    result = self._check_signal(signal_id, record, prices)
+                if result is not None:
+                    results.append(result)
+                    self._emit(result)
+            except Exception as exc:
+                self.last_error = f"{signal_id}:{exc}"
+                LOGGER.exception("position_monitor_record_error signal_id=%s", signal_id)
+        return results
+
+    def _check_signal(self, signal_id: str, record: Any, prices: Mapping[str, Any]) -> MonitorResult | None:
+        hit = self._local_price_hit(record, prices)
+        if hit is None:
+            return None
+        result, exit_price = hit
+        pnl = self._estimate_signal_pnl(record, exit_price=exit_price, result=result)
+        closed = self.store.mark_result(
+            signal_id,
+            result=result,  # type: ignore[arg-type]
+            exit_price=exit_price,
+            pnl_usdt=pnl,
+            close_reason=f"SIGNAL_{result}_HIT",
+        )
+        return self._build_result(closed, result=result, exit_price=exit_price, pnl_usdt=pnl, reason=f"SIGNAL_{result}_HIT")
+
+    def _check_toobit(self, signal_id: str, record: Any, prices: Mapping[str, Any]) -> MonitorResult | None:
+        status = str(getattr(record, "status", "") or "").upper()
+        exists_payload = self._safe_exchange_check(record)
+        exists = self._payload_bool(exists_payload, "exists")
+
+        if status == "PENDING_OPEN":
+            if exists is True:
+                self.store.confirm_real_open(signal_id)
+            elif exists is False:
+                # Keep this defensive: only cancel pending records when exchange clearly says no position.
+                self.store.cancel_unconfirmed_real(signal_id, "پوزیشن در توبیت تایید نشد")
+            return None
+
+        if status != "MONITORING":
+            return None
+
+        # First use an explicit closed-PNL reader if real_trade_manager provides one.
+        pnl_payload = self._safe_closed_pnl(record)
+        confirmed = self._payload_bool(pnl_payload, "confirmed")
+        if confirmed is True:
+            result = self._payload_result(pnl_payload) or self._infer_result_from_price(record, prices) or "TP"
+            exit_price = self._payload_float(pnl_payload, "exit_price", "price", default=self._fallback_exit_price(record, prices, result))
+            pnl = self._payload_float(pnl_payload, "pnl_usdt", "pnl", default=0.0)
+            reason = str(self._payload_get(pnl_payload, "reason", "close_reason") or f"TOOBIT_{result}_CONFIRMED")
+            closed = self.store.mark_result(signal_id, result=result, exit_price=exit_price, pnl_usdt=pnl, close_reason=reason)  # type: ignore[arg-type]
+            return self._build_result(closed, result=result, exit_price=exit_price, pnl_usdt=pnl, reason=reason)
+
+        # If Toobit position is gone and the current price clearly crossed local TP/SL,
+        # close the local record so the panel/stat state does not stay stuck.
+        if exists is False:
+            hit = self._local_price_hit(record, prices)
+            if hit is None:
+                return None
+            result, exit_price = hit
+            closed = self.store.mark_result(
+                signal_id,
+                result=result,  # type: ignore[arg-type]
+                exit_price=exit_price,
+                pnl_usdt=0.0,
+                close_reason=f"TOOBIT_{result}_INFERRED_FROM_PRICE",
+            )
+            return self._build_result(closed, result=result, exit_price=exit_price, pnl_usdt=0.0, reason=f"TOOBIT_{result}_INFERRED_FROM_PRICE")
+        return None
+
+    def _local_price_hit(self, record: Any, prices: Mapping[str, Any]) -> tuple[str, float] | None:
+        symbol = str(getattr(record, "symbol", "") or "").upper().strip()
+        price = _safe_price(prices.get(symbol) or prices.get(symbol.lower()))
+        if price <= 0:
+            return None
+        direction = str(getattr(record, "direction", "") or "").upper()
+        tp = _safe_price(getattr(record, "tp", 0.0))
+        sl = _safe_price(getattr(record, "sl", 0.0))
+        if tp <= 0 or sl <= 0:
+            return None
+        if direction == "LONG":
+            if price >= tp:
+                return "TP", price
+            if price <= sl:
+                return "SL", price
+        elif direction == "SHORT":
+            if price <= tp:
+                return "TP", price
+            if price >= sl:
+                return "SL", price
+        return None
+
+    def _infer_result_from_price(self, record: Any, prices: Mapping[str, Any]) -> str | None:
+        hit = self._local_price_hit(record, prices)
+        return None if hit is None else hit[0]
+
+    def _fallback_exit_price(self, record: Any, prices: Mapping[str, Any], result: str) -> float:
+        hit = self._local_price_hit(record, prices)
+        if hit is not None:
+            return hit[1]
+        return _safe_price(getattr(record, "tp" if result == "TP" else "sl", 0.0)) or _safe_price(getattr(record, "entry", 0.0))
+
+    def _estimate_signal_pnl(self, record: Any, *, exit_price: float, result: str) -> float:
+        entry = _safe_price(getattr(record, "entry", 0.0))
+        if entry <= 0:
+            return 0.0
+        move_pct = abs(float(exit_price) - entry) / entry
+        return round(move_pct if result == "TP" else -move_pct, 6)
+
+    def _safe_exchange_check(self, record: Any) -> Mapping[str, Any] | bool | None:
+        if callable(self.exchange_checker):
+            try:
+                return self.exchange_checker(record)
+            except Exception as exc:
+                self.last_error = f"exchange_checker:{exc}"
+        return _toobit_position_exists(record)
+
+    def _safe_closed_pnl(self, record: Any) -> Mapping[str, Any] | float | int | None:
+        if not callable(self.closed_pnl_reader):
+            return None
+        try:
+            return self.closed_pnl_reader(record)
+        except Exception as exc:
+            self.last_error = f"closed_pnl_reader:{exc}"
+            return None
+
+    def _build_result(self, record: Any, *, result: str, exit_price: float, pnl_usdt: float, reason: str) -> MonitorResult:
+        return MonitorResult(
+            signal_id=str(getattr(record, "signal_id", "")),
+            symbol=str(getattr(record, "symbol", "") or "").upper(),
+            direction=str(getattr(record, "direction", "") or "").upper(),
+            mode=str(getattr(record, "mode", "") or ""),
+            result=result,
+            entry=_safe_price(getattr(record, "entry", 0.0)),
+            exit_price=float(exit_price),
+            tp=_safe_price(getattr(record, "tp", 0.0)),
+            sl=_safe_price(getattr(record, "sl", 0.0)),
+            pnl_usdt=float(pnl_usdt),
+            close_reason=reason,
+        )
+
+    def _emit(self, result: MonitorResult) -> None:
+        if callable(self.result_callback):
+            self.result_callback(result)
+
+    @staticmethod
+    def _payload_bool(payload: Any, key: str) -> bool | None:
+        if isinstance(payload, bool):
+            return payload
+        if isinstance(payload, Mapping) and key in payload:
+            value = payload.get(key)
+            if isinstance(value, bool):
+                return value
+            if value is None:
+                return None
+            text = str(value).lower().strip()
+            if text in {"1", "true", "yes", "open", "exists"}:
+                return True
+            if text in {"0", "false", "no", "closed", "missing"}:
+                return False
+        return None
+
+    @staticmethod
+    def _payload_get(payload: Any, *keys: str) -> Any:
+        if isinstance(payload, Mapping):
+            for key in keys:
+                if key in payload and payload.get(key) is not None:
+                    return payload.get(key)
+        return None
+
+    def _payload_float(self, payload: Any, *keys: str, default: float = 0.0) -> float:
+        value = self._payload_get(payload, *keys)
+        return _safe_float(value, default)
+
+    def _payload_result(self, payload: Any) -> str | None:
+        value = str(self._payload_get(payload, "result", "kind", "side") or "").upper()
+        return value if value in {"TP", "SL"} else None
+
+
+def build_result_panel_payload(result: Any, fa_name: str = "") -> dict[str, Any]:
+    title = "🎯 TP خورد" if str(getattr(result, "result", "")).upper() == "TP" else "🛑 SL خورد"
+    symbol = str(getattr(result, "symbol", "") or "")
+    direction = str(getattr(result, "direction", "") or "")
+    pnl = _safe_float(getattr(result, "pnl_usdt", 0.0), 0.0)
+    text = (
+        f"{title}\n"
+        f"کوین: {fa_name or symbol} ({symbol})\n"
+        f"جهت: {direction}\n"
+        f"خروج: {_safe_float(getattr(result, 'exit_price', 0.0), 0.0):.8g}\n"
+        f"PNL: {pnl:.4f} USDT\n"
+        f"دلیل: {getattr(result, 'close_reason', '')}"
+    )
+    return {"type": "position_result", "text": text, "result": result}
 
 
 class OKXMarketDataProvider:
@@ -469,12 +710,25 @@ def _default_decision_provider(symbol: str, market: Mapping[str, Any]) -> Any:
 
 
 def _default_exchange_checker(record: Any) -> Mapping[str, Any]:
-    if real_trade_manager is None:
-        return {"exists": False, "error": "real_trade_manager_missing"}
-    fn = getattr(real_trade_manager, "exchange_position_checker", None)
-    if not callable(fn):
-        return {"exists": False, "error": "exchange_position_checker_missing"}
-    return fn(record)
+    if real_trade_manager is not None:
+        fn = getattr(real_trade_manager, "exchange_position_checker", None)
+        if callable(fn):
+            return fn(record)
+    return _toobit_position_exists(record)
+
+
+def _toobit_position_exists(record: Any) -> Mapping[str, Any]:
+    symbol = str(getattr(record, "symbol", "") or "").upper().strip()
+    if not symbol:
+        return {"exists": None, "error": "symbol_missing"}
+    if tobit_client is None:
+        return {"exists": None, "error": "toobit_client_missing"}
+    try:
+        client = tobit_client.get_client()
+        positions = client.get_open_positions(symbol)
+        return {"exists": bool(positions), "open_positions": len(positions)}
+    except Exception as exc:
+        return {"exists": None, "error": str(exc)}
 
 
 def _default_closed_pnl_reader(record: Any) -> Mapping[str, Any]:
@@ -833,8 +1087,12 @@ def _build_status_provider(runtime: BotRuntime) -> Callable[[], Mapping[str, Any
                 margin = client.get_wallet_margin_usdt()
                 if margin is not None:
                     data["toobit_margin_usdt"] = float(margin)
+                    # StateStore exposes sync_toobit_status(), not update_toobit_margin().
                     try:
-                        runtime.store.update_toobit_margin(float(margin))
+                        runtime.store.sync_toobit_status(
+                            margin_usdt=float(margin),
+                            open_positions=int(data.get("toobit_open_total") or getattr(snapshot, "toobit_open_positions", 0) or 0),
+                        )
                     except Exception:
                         pass
             except Exception as exc:
