@@ -16,8 +16,16 @@ from typing import Dict, Literal, Tuple
 # =========================
 BOT_NAME = "CryptoAIHelperBot"
 QUOTE_ASSET = "USDT"
-TIMEFRAME = "1H"
-TARGET_HOLD_MINUTES: Tuple[int, int] = (60, 90)
+
+# 15m/30m fast model lock
+TIMEFRAME = "30m"
+ENTRY_TIMEFRAME = "15m"
+TREND_FILTER_TIMEFRAME = "1h"
+TARGET_HOLD_MINUTES: Tuple[int, int] = (30, 60)
+MAX_HOLD_MINUTES = 75
+MIN_MAIN_CANDLES_30M = 40
+MIN_ENTRY_CANDLES_15M = 40
+MIN_TREND_CANDLES_1H = 20
 
 
 # =========================
@@ -31,7 +39,7 @@ TOOBIT_BASE_URL = "https://api.toobit.com"
 
 
 # =========================
-# Locked watchlist
+# Locked watchlist - 15 liquid/volatile coins
 # =========================
 @dataclass(frozen=True)
 class CoinConfig:
@@ -42,13 +50,21 @@ class CoinConfig:
 
 
 WATCHLIST: Dict[str, CoinConfig] = {
+    "BTCUSDT": CoinConfig("بیت‌کوین", "BTCUSDT", "BTC-USDT-SWAP", "BTCUSDT"),
+    "ETHUSDT": CoinConfig("اتریوم", "ETHUSDT", "ETH-USDT-SWAP", "ETHUSDT"),
     "SOLUSDT": CoinConfig("سولانا", "SOLUSDT", "SOL-USDT-SWAP", "SOLUSDT"),
+    "DOGEUSDT": CoinConfig("دوج‌کوین", "DOGEUSDT", "DOGE-USDT-SWAP", "DOGEUSDT"),
+    "XRPUSDT": CoinConfig("ریپل", "XRPUSDT", "XRP-USDT-SWAP", "XRPUSDT"),
+    "BNBUSDT": CoinConfig("بی‌ان‌بی", "BNBUSDT", "BNB-USDT-SWAP", "BNBUSDT"),
+    "SUIUSDT": CoinConfig("سویی", "SUIUSDT", "SUI-USDT-SWAP", "SUIUSDT"),
     "AVAXUSDT": CoinConfig("آوالانچ", "AVAXUSDT", "AVAX-USDT-SWAP", "AVAXUSDT"),
     "LINKUSDT": CoinConfig("چین‌لینک", "LINKUSDT", "LINK-USDT-SWAP", "LINKUSDT"),
     "INJUSDT": CoinConfig("اینجکتیو", "INJUSDT", "INJ-USDT-SWAP", "INJUSDT"),
-    "DOGEUSDT": CoinConfig("دوج‌کوین", "DOGEUSDT", "DOGE-USDT-SWAP", "DOGEUSDT"),
-    "SUIUSDT": CoinConfig("سویی", "SUIUSDT", "SUI-USDT-SWAP", "SUIUSDT"),
     "APTUSDT": CoinConfig("آپتوس", "APTUSDT", "APT-USDT-SWAP", "APTUSDT"),
+    "ARBUSDT": CoinConfig("آربیتروم", "ARBUSDT", "ARB-USDT-SWAP", "ARBUSDT"),
+    "OPUSDT": CoinConfig("آپتیمیزم", "OPUSDT", "OP-USDT-SWAP", "OPUSDT"),
+    "SEIUSDT": CoinConfig("سی", "SEIUSDT", "SEI-USDT-SWAP", "SEIUSDT"),
+    "FETUSDT": CoinConfig("فچ‌ای‌آی", "FETUSDT", "FET-USDT-SWAP", "FETUSDT"),
 }
 
 
@@ -77,7 +93,6 @@ MAX_POSITIONS_MAX = 100
 MIN_NET_PROFIT_MIN = 0.01
 MIN_NET_PROFIT_MAX = 10000.0
 
-
 # Defaults can be changed by Telegram commands and persisted by the state layer.
 DEFAULT_AUTO_SIGNAL_ENABLED = True
 DEFAULT_REAL_TRADE_ENABLED = False
@@ -91,15 +106,24 @@ MARGIN_MODE: Literal["isolated"] = "isolated"
 
 
 # =========================
-# TP / SL rules
+# TP / SL rules - 15m/30m lock
 # =========================
 TP_COUNT = 1
 SL_COUNT = 1
-ALLOWED_RISK_REWARD = (1.5, 2.0)
+ALLOWED_RISK_REWARD = (1.2, 1.5, 2.0)
 
-# If a trade cannot satisfy one of these values logically, it must not open real Toobit trade.
-MIN_RISK_REWARD = 1.5
+# Dynamic RR priority:
+# weak -> 1.2, normal -> 1.5, strong -> 2.0
+MIN_RISK_REWARD = 1.2
 MAX_RISK_REWARD = 2.0
+WEAK_RISK_REWARD = 1.2
+NORMAL_RISK_REWARD = 1.5
+STRONG_RISK_REWARD = 2.0
+
+# SL guardrails for fast 30-60 minute trades.
+MIN_SL_DISTANCE_PCT = 0.20
+MAX_SL_DISTANCE_PCT = 1.80
+SL_BUFFER_PCT = 0.10
 
 
 # =========================
@@ -113,9 +137,9 @@ DEFAULT_ROUND_TRIP_FEE_RATE = DEFAULT_OPEN_FEE_RATE + DEFAULT_CLOSE_FEE_RATE
 
 
 # =========================
-# Coin move profiles - approximate starting profiles
-# Percent movement expected over 1-2 hours.
-# These are conservative placeholders and should later be calibrated from OKX historical candles.
+# Coin move profiles
+# Percent movement expected over 30-60 minutes.
+# Conservative placeholders; should later be calibrated from OKX historical candles.
 # =========================
 @dataclass(frozen=True)
 class MoveProfile:
@@ -128,27 +152,44 @@ class MoveProfile:
 
 
 COIN_MOVE_PROFILE: Dict[str, MoveProfile] = {
-    "SOLUSDT": MoveProfile(0.5, 0.8, 1.2, 2.0, 3.0, 5.0),
-    "AVAXUSDT": MoveProfile(0.6, 0.9, 1.5, 2.3, 3.5, 5.5),
-    "LINKUSDT": MoveProfile(0.4, 0.7, 1.0, 1.8, 2.5, 4.0),
-    "INJUSDT": MoveProfile(0.8, 1.2, 2.0, 3.2, 4.5, 7.0),
-    "DOGEUSDT": MoveProfile(0.5, 0.9, 1.3, 2.2, 3.5, 6.0),
-    "SUIUSDT": MoveProfile(0.7, 1.1, 1.8, 3.0, 4.5, 7.0),
-    "APTUSDT": MoveProfile(0.6, 0.9, 1.5, 2.5, 3.5, 5.5),
+    "BTCUSDT": MoveProfile(0.25, 0.45, 0.60, 1.00, 1.30, 2.20),
+    "ETHUSDT": MoveProfile(0.30, 0.55, 0.75, 1.25, 1.60, 2.70),
+    "SOLUSDT": MoveProfile(0.40, 0.70, 1.00, 1.70, 2.20, 3.80),
+    "DOGEUSDT": MoveProfile(0.35, 0.65, 0.90, 1.60, 2.10, 3.70),
+    "XRPUSDT": MoveProfile(0.30, 0.55, 0.80, 1.35, 1.80, 3.00),
+    "BNBUSDT": MoveProfile(0.25, 0.45, 0.65, 1.05, 1.40, 2.30),
+    "SUIUSDT": MoveProfile(0.45, 0.80, 1.15, 1.95, 2.50, 4.30),
+    "AVAXUSDT": MoveProfile(0.40, 0.75, 1.05, 1.80, 2.40, 4.00),
+    "LINKUSDT": MoveProfile(0.35, 0.60, 0.90, 1.50, 1.90, 3.20),
+    "INJUSDT": MoveProfile(0.55, 0.95, 1.35, 2.25, 3.00, 5.00),
+    "APTUSDT": MoveProfile(0.40, 0.75, 1.05, 1.80, 2.35, 3.90),
+    "ARBUSDT": MoveProfile(0.40, 0.75, 1.05, 1.80, 2.35, 3.90),
+    "OPUSDT": MoveProfile(0.40, 0.75, 1.05, 1.80, 2.35, 3.90),
+    "SEIUSDT": MoveProfile(0.50, 0.90, 1.25, 2.10, 2.80, 4.80),
+    "FETUSDT": MoveProfile(0.45, 0.85, 1.15, 1.95, 2.60, 4.40),
 }
 
 
 # =========================
 # Coin analyzer locked weights
+# Direction must come from structure/slope/momentum/breakout.
+# Volume and ATR are confirmation only, not direction makers.
+# Consolidation and liquidity_sweep are blocker/penalty sections, weight=0.
 # =========================
 ANALYZER_WEIGHTS = {
-    "structure": 30,
-    "momentum": 25,
-    "volume": 15,
-    "acceleration": 10,
-    "volatility_atr": 10,
-    "candle_price_action": 5,
+    "structure": 10,
+    "market_structure": 18,
+    "ema_slope": 16,
+    "rsi_slope": 14,
+    "momentum": 8,
+    "acceleration": 8,
+    "breakout_confirmation": 10,
+    "candle_price_action": 6,
     "liquidity": 5,
+    "volume": 3,
+    "volatility_atr": 2,
+    "consolidation": 0,
+    "liquidity_sweep": 0,
 }
 
 ACCELERATION_COMPONENTS = (
@@ -160,12 +201,12 @@ ACCELERATION_COMPONENTS = (
 
 # =========================
 # AI / probability decision gates
-# Balanced defaults: not too strict, not too loose.
 # ai_decision.py must not validate TP/SL directly.
 # =========================
-MIN_DIRECTION_PROBABILITY = 70.0
-MIN_CONFIDENCE = 60.0
-MIN_AGREEMENT_SCORE = 60.0
+MIN_DIRECTION_PROBABILITY = 62.0
+MIN_CONFIDENCE = 75.0
+MIN_AGREEMENT_SCORE = 70.0
+MIN_DIRECTION_EDGE = 8.0
 
 
 # =========================
@@ -258,14 +299,24 @@ def get_coin(symbol: str) -> CoinConfig:
 # Self-check
 # =========================
 def validate_locked_config() -> None:
-    if len(WATCHLIST) != 7:
-        raise AssertionError("واچ‌لیست باید دقیقاً ۷ کوین داشته باشد.")
+    if TIMEFRAME != "30m":
+        raise AssertionError("تایم‌فریم اصلی باید 30m باشد.")
+    if ENTRY_TIMEFRAME != "15m":
+        raise AssertionError("تایم‌فریم ورود باید 15m باشد.")
+    if TREND_FILTER_TIMEFRAME != "1h":
+        raise AssertionError("فیلتر روند باید 1h باشد.")
+    if TARGET_HOLD_MINUTES != (30, 60) or MAX_HOLD_MINUTES != 75:
+        raise AssertionError("زمان نگهداری باید 30-60 دقیقه و خروج اجباری 75 دقیقه باشد.")
+    if len(WATCHLIST) != 15:
+        raise AssertionError("واچ‌لیست باید دقیقاً ۱۵ کوین داشته باشد.")
     if set(WATCHLIST.keys()) != set(COIN_MOVE_PROFILE.keys()):
         raise AssertionError("COIN_MOVE_PROFILE باید دقیقاً با WATCHLIST هماهنگ باشد.")
     if sum(ANALYZER_WEIGHTS.values()) != 100:
         raise AssertionError("وزن‌های تحلیل باید جمعاً ۱۰۰ باشند.")
-    if ALLOWED_RISK_REWARD != (1.5, 2.0):
-        raise AssertionError("Risk/Reward فقط باید 1.5 و 2.0 باشد.")
+    if ALLOWED_RISK_REWARD != (1.2, 1.5, 2.0):
+        raise AssertionError("Risk/Reward فقط باید 1.2، 1.5 و 2.0 باشد.")
+    if MIN_CONFIDENCE != 75.0 or MIN_AGREEMENT_SCORE != 70.0 or MIN_DIRECTION_EDGE != 8.0:
+        raise AssertionError("گیت‌های ورود 15m/30m تغییر کرده‌اند.")
     if MARGIN_MODE != "isolated":
         raise AssertionError("Margin mode باید همیشه isolated باشد.")
     validate_trade_dollar(DEFAULT_TRADE_DOLLAR)
