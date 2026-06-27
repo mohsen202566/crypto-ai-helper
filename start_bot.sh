@@ -6,4 +6,4 @@ set -a
 source .env
 set +a
 
-exec /root/crypto-ai-helper/venv/bin/python3 -u bot.py
+exec /root/crypto-ai-helper/venv/bin/python /root/crypto-ai-helper/main.py
