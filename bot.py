@@ -71,9 +71,9 @@ except Exception:  # pragma: no cover
     telegram_ui = None  # type: ignore
 
 try:
-    import strategy_manager
+    import strategy.py
 except Exception:  # pragma: no cover
-    strategy_manager = None  # type: ignore
+    strategy.py = None  # type: ignore
 
 try:
     import strategy
@@ -390,7 +390,7 @@ class OKXMarketDataProvider:
     """Small OKX public ticker adapter.
 
     It intentionally returns only latest prices. Strategy/indicator work remains in
-    strategy.py (or strategy_manager.py if present) and downstream files.
+    strategy.py (or strategy.py if present) and downstream files.
     """
 
     def __init__(self, base_url: str | None = None, timeout: float = DEFAULT_HTTP_TIMEOUT_SECONDS) -> None:
@@ -624,7 +624,7 @@ class BotRuntime:
             market["candles_30m"] = candles_30m
             market["candles_15m"] = candles_15m
             market["entry_candles"] = candles_15m
-            market["candles"] = candles_30m  # compatibility alias for strategy_manager
+            market["candles"] = candles_30m  # compatibility alias for strategy.py
         return market
 
     def _handle_symbol(self, symbol: str, price: float, prices: Mapping[str, float], shared_market: Mapping[str, Any] | None = None) -> str:
@@ -709,12 +709,12 @@ class StrategyDecisionAdapter:
 
 
 def _default_decision_provider(symbol: str, market: Mapping[str, Any]) -> Any:
-    # Prefer a real strategy_manager when the project has one, but this bot must
+    # Prefer a real strategy when the project has one, but this bot must
     # also work with the current project layout where strategy.py is the only
     # strategy file.
-    if strategy_manager is not None:
+    if strategy is not None:
         for name in ("decide", "analyze_symbol", "build_decision", "evaluate_symbol", "get_decision"):
-            fn = getattr(strategy_manager, name, None)
+            fn = getattr(strategy, name, None)
             if callable(fn):
                 try:
                     return fn(symbol=symbol, market=market)
