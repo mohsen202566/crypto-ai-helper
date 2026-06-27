@@ -1,6 +1,7 @@
 # Environment
 .env
 venv/
+.venv/
 
 # Python
 __pycache__/
@@ -11,6 +12,9 @@ __pycache__/
 
 # Runtime data
 state_store.json
+*.db
+*.sqlite
+*.sqlite3
 
 # IDE
 .vscode/
@@ -19,7 +23,3 @@ state_store.json
 # OS
 .DS_Store
 Thumbs.db
-
-*.db
-*.sqlite
-*.sqlite3
