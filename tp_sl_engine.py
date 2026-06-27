@@ -3,7 +3,7 @@ TP/SL engine for Crypto AI Helper bot.
 
 Locked responsibility:
 - One TP1 and one SL only.
-- Risk/Reward only 1:1.5 or 1:2.
+- Risk/Reward only 1:1.2, 1:1.5 or 1:2.
 - Checks expected movement, margin/leverage, fees and minimum net profit.
 - Does not place orders, call APIs, send Telegram messages, or make AI decisions.
 
@@ -77,7 +77,7 @@ def build_tp_sl_plan(
 
     risk_pct = abs(entry - suggested_sl) / entry * 100.0
     expected_move_pct = _expected_move_pct(key, move_strength)
-    rr = _select_risk_reward(risk_pct, expected_move_pct)
+    rr = _select_risk_reward(risk_pct, expected_move_pct, move_strength)
 
     if rr is None:
         return _signal_only_plan(
@@ -163,23 +163,32 @@ def _validate_inputs(
     if open_fee_rate < 0 or close_fee_rate < 0:
         raise ValueError("نرخ کارمزد نمی‌تواند منفی باشد.")
     if not _allowed_rr_values_are_locked():
-        raise ValueError("R:R مجاز فقط باید 1.5 یا 2.0 باشد.")
+        raise ValueError("R:R مجاز فقط باید 1.2، 1.5 یا 2.0 باشد.")
 
 
 def _allowed_rr_values_are_locked() -> bool:
     allowed = {float(rr) for rr in ALLOWED_RISK_REWARD}
-    return bool(allowed) and allowed.issubset({1.5, 2.0})
+    return bool(allowed) and allowed.issubset({1.2, 1.5, 2.0})
 
 
-def _select_risk_reward(risk_pct: float, expected_move_pct: float) -> float | None:
+def _select_risk_reward(risk_pct: float, expected_move_pct: float, strength: MoveStrength) -> float | None:
     valid: list[float] = []
     for rr in sorted(float(item) for item in ALLOWED_RISK_REWARD):
-        if rr in (1.5, 2.0) and risk_pct * rr <= expected_move_pct:
+        if rr in (1.2, 1.5, 2.0) and risk_pct * rr <= expected_move_pct:
             valid.append(rr)
-    if 2.0 in valid:
-        return 2.0
-    if 1.5 in valid:
-        return 1.5
+
+    # 15m/30m lock:
+    # - weak moves should not wait for a far TP; prefer 1.2, allow 1.5 only when room exists.
+    # - normal moves target 1.5.
+    # - strong moves target 2.0 when the expected move can cover it.
+    preference: dict[MoveStrength, tuple[float, ...]] = {
+        "weak": (1.2, 1.5),
+        "normal": (1.5, 1.2),
+        "strong": (2.0, 1.5, 1.2),
+    }
+    for rr in preference[strength]:
+        if rr in valid:
+            return rr
     return None
 
 
@@ -238,13 +247,132 @@ def _signal_only_plan(
     )
 
 
-__all__ = ["TPSLPlan", "build_tp_sl_plan"]
+__all__ = ["TPSLPlan", "build_tp_sl_plan", "build_fast_tp_sl_plan", "suggest_fast_structural_sl"]
 
 # =========================
 # Level 4 structural TP/SL helper
 # =========================
 # This helper keeps SL construction inside the TP/SL/risk layer instead of
 # strategy_manager.py.  strategy_manager only coordinates decision flow.
+
+
+def build_fast_tp_sl_plan(
+    symbol: str,
+    direction: Direction,
+    entry: float,
+    candles_30m: object,
+    candles_15m: object,
+    move_strength: MoveStrength,
+    trade_margin_usdt: float = DEFAULT_TRADE_DOLLAR,
+    leverage: int = DEFAULT_LEVERAGE,
+    min_net_profit_usdt: float = DEFAULT_MIN_NET_PROFIT_USDT,
+    open_fee_rate: float = DEFAULT_OPEN_FEE_RATE,
+    close_fee_rate: float = DEFAULT_CLOSE_FEE_RATE,
+) -> TPSLPlan:
+    """Build the locked 15m/30m TP/SL plan.
+
+    Rules:
+    - one TP and one SL only;
+    - 30m candles define the main structural SL;
+    - 15m candles may refine the SL closer to entry when the swing is valid;
+    - weak/normal/strong moves map to dynamic RR through build_tp_sl_plan();
+    - no order/exchange side effects.
+    """
+    suggested_sl = suggest_fast_structural_sl(
+        direction=direction,
+        entry=entry,
+        candles_30m=candles_30m,
+        candles_15m=candles_15m,
+        move_strength=move_strength,
+    )
+    if suggested_sl <= 0:
+        raise ValueError("SL منطقی برای مدل 15m/30m از ساختار کندل‌ها ساخته نشد.")
+    return build_tp_sl_plan(
+        symbol=symbol,
+        direction=direction,
+        entry=entry,
+        suggested_sl=suggested_sl,
+        move_strength=move_strength,
+        trade_margin_usdt=trade_margin_usdt,
+        leverage=leverage,
+        min_net_profit_usdt=min_net_profit_usdt,
+        open_fee_rate=open_fee_rate,
+        close_fee_rate=close_fee_rate,
+    )
+
+
+def suggest_fast_structural_sl(
+    direction: Direction,
+    entry: float,
+    candles_30m: object,
+    candles_15m: object,
+    move_strength: MoveStrength = "normal",
+) -> float:
+    """Return a 15m/30m structural SL for 30-60 minute trades.
+
+    30m gives the main swing. 15m may tighten the SL only when it stays on the
+    correct side of entry and passes simple risk-distance limits.
+    """
+    recent_30m = _coerce_level4_candles(candles_30m)[-12:]
+    recent_15m = _coerce_level4_candles(candles_15m)[-16:]
+    if len(recent_30m) < 6 or entry <= 0 or move_strength not in ("weak", "normal", "strong"):
+        return 0.0
+
+    buffer_30m = entry * 0.0012
+    buffer_15m = entry * 0.0008
+    candidates: list[float] = []
+
+    if direction == "LONG":
+        swing_30m = min(c[2] for c in recent_30m[-8:])
+        sl_30m = swing_30m - buffer_30m
+        if 0 < sl_30m < entry:
+            candidates.append(sl_30m)
+
+        if len(recent_15m) >= 6:
+            swing_15m = min(c[2] for c in recent_15m[-8:])
+            sl_15m = swing_15m - buffer_15m
+            if 0 < sl_15m < entry:
+                candidates.append(sl_15m)
+
+        valid = _valid_sl_candidates(entry, candidates, move_strength)
+        return round(max(valid), 8) if valid else 0.0
+
+    if direction == "SHORT":
+        swing_30m = max(c[1] for c in recent_30m[-8:])
+        sl_30m = swing_30m + buffer_30m
+        if sl_30m > entry:
+            candidates.append(sl_30m)
+
+        if len(recent_15m) >= 6:
+            swing_15m = max(c[1] for c in recent_15m[-8:])
+            sl_15m = swing_15m + buffer_15m
+            if sl_15m > entry:
+                candidates.append(sl_15m)
+
+        valid = _valid_sl_candidates(entry, candidates, move_strength)
+        return round(min(valid), 8) if valid else 0.0
+
+    return 0.0
+
+
+def _valid_sl_candidates(entry: float, candidates: list[float], strength: MoveStrength) -> list[float]:
+    min_risk_pct, max_risk_pct = _risk_distance_limits(strength)
+    valid: list[float] = []
+    for sl in candidates:
+        risk_pct = abs(entry - sl) / entry * 100.0
+        if min_risk_pct <= risk_pct <= max_risk_pct:
+            valid.append(sl)
+    return valid
+
+
+def _risk_distance_limits(strength: MoveStrength) -> tuple[float, float]:
+    # Fast 15m/30m trades need tighter SL than the old 1H model.
+    if strength == "weak":
+        return 0.12, 0.80
+    if strength == "strong":
+        return 0.18, 1.60
+    return 0.15, 1.20
+
 
 def build_level4_tp_sl_plan(
     symbol: str,
@@ -262,7 +390,7 @@ def build_level4_tp_sl_plan(
 
     Rules:
     - one TP and one SL only;
-    - SL is structural from recent 1H candles;
+    - SL is structural from recent 30m candles, refined by 15m swing when provided;
     - TP is derived only from locked R:R by build_tp_sl_plan();
     - no order/exchange side effects.
     """
@@ -284,7 +412,7 @@ def build_level4_tp_sl_plan(
 
 
 def suggest_level4_structural_sl(direction: Direction, entry: float, candles: object) -> float:
-    """Return a conservative structural SL from recent 1H candles.
+    """Return a conservative structural SL from recent candles.
 
     Kept in tp_sl_engine because it is risk/TP-SL construction, not strategy
     decision logic.  Accepts Candle objects, dicts, or OKX-like arrays.
@@ -337,4 +465,4 @@ def _coerce_level4_candles(value: object) -> list[tuple[int, float, float, float
     return out
 
 
-__all__ = ["TPSLPlan", "build_tp_sl_plan", "build_level4_tp_sl_plan", "suggest_level4_structural_sl"]
+__all__ = ["TPSLPlan", "build_tp_sl_plan", "build_fast_tp_sl_plan", "suggest_fast_structural_sl", "build_level4_tp_sl_plan", "suggest_level4_structural_sl"]
