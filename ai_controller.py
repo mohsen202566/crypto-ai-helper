@@ -121,6 +121,57 @@ class AIController:
         if session.state == "BAD_REAL_ONLY_NORMAL":
             notes = notes + ("ساعت بد است؛ فقط عادی مجاز است.",)
 
+        micro_break = any("شکست میکرو" in note for note in candle.reasons)
+        watch_confirmed_entry = (
+            data.watch_mode
+            and ignition.state == "PRE_WATCH"
+            and total >= SIGNAL_THRESHOLD
+            and pre.score >= 16
+            and candle.score >= 10
+            and micro_break
+            and stage.stage_pct <= 65
+            and risk.ok
+            and cost.ok
+            and dir1h.confidence >= 65
+        )
+
+        if watch_confirmed_entry:
+            notes = notes + ("واچ چند شرط اصلی را پاس کرد و شکست میکرو 5m تایید شد؛ به سیگنال شکار تبدیل شد.",)
+            return SignalDecision(
+                action="SIGNAL",
+                accepted=True,
+                direction=direction,
+                entry=entry,
+                tp=risk.tp,
+                sl=risk.sl,
+                score=total,
+                threshold=SIGNAL_THRESHOLD,
+                breakdown=breakdown,
+                reason="سیگنال شکار معتبر از واچ؛ جهت، پیش‌قدرت، شکست میکرو و سود/ریسک تایید شد.",
+                ready_alert=False,
+                hunter=True,
+                signal_label="شکار",
+                direction_state_1h=dir1h.state,
+                direction_confidence_1h=dir1h.confidence,
+                bias_4h=bias4h.state,
+                setup_15m=pre.state,
+                entry_5m="IGNITION_READY",
+                candle_pattern="IGNITION_START",
+                entry_stage_pct=stage.stage_pct,
+                ai_confidence=memory.confidence,
+                ai_experience=memory.experience,
+                ai_adjustment=memory.adjustment,
+                net_edge=cost.net_edge,
+                estimated_profit_usdt=cost.estimated_profit_usdt,
+                estimated_profit_pct=cost.estimated_profit_pct,
+                risk_reward=risk.risk_reward,
+                estimated_cost_pct=cost.estimated_cost_pct,
+                market_bias=market.bias,
+                session_state=session.state,
+                order_block_state=ob.state,
+                notes=notes,
+            )
+
         watch_candidate = self._watch_candidate(data.watch_mode, pre.score, watch_score, candle.label, ignition.state)
         if watch_candidate and ignition.state != "IGNITION_READY":
             ready_alert = (
@@ -128,6 +179,7 @@ class AIController:
                 and ignition.state == "PRE_WATCH"
                 and watch_score >= READY_ALERT_THRESHOLD
                 and stage.stage_pct <= READY_ALERT_MAX_STAGE_PCT
+                and micro_break
                 and risk.ok
                 and cost.ok
             )
