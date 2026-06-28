@@ -29,4 +29,4 @@ class EntryStageEngine:
             return EntryStageResult(stage_pct, True, 1, tuple(reasons + ["ورود هنوز قابل قبول ولی حساس است."]))
         if stage_pct <= 40:
             return EntryStageResult(stage_pct, False, -5, tuple(reasons + ["حرکت جلو رفته؛ real ممنوع می‌شود."]))
-        return EntryStageResult(stage_pct, False, -10, tuple(reasons + ["ورود وسط/آخر حرکت است."]))
+        return EntryStageResult(stage_pct, False, -10, tuple(reasons + ["حرکت از ناحیه شروع فاصله گرفته است."]))

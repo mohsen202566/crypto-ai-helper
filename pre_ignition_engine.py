@@ -55,7 +55,7 @@ class PreIgnitionEngine:
                 points += 2
         if s15.volume_ratio > 3.2 or s5.volume_ratio > 3.5:
             points -= 4
-            reasons.append("حجم خیلی انفجاری است؛ احتمال دیر شدن/کلایمکس.")
+            reasons.append("حجم خیلی انفجاری است؛ احتمال کلایمکس یا نوسان غیرعادی.")
         score = max(0, min(WEIGHTS.pre_ignition, points))
         state: DirectionState = direction if score >= 12 else "NEUTRAL"
         confidence = int(min(100, score / max(1, WEIGHTS.pre_ignition) * 100))

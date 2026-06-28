@@ -6,8 +6,8 @@ from typing import Literal
 Direction = Literal["LONG", "SHORT"]
 DirectionState = Literal["LONG", "SHORT", "NEUTRAL", "DANGEROUS"]
 DecisionAction = Literal["REJECT", "WATCH", "SIGNAL"]
-EntryState = Literal["IGNITION_READY", "PRE_WATCH", "LATE", "CHASE", "NO_ENTRY"]
-PatternLabel = Literal["IGNITION_START", "PRE_IGNITION_WATCH", "MID_MOVE", "LATE_CHASE", "PULLBACK", "EXHAUSTION", "NOISE"]
+EntryState = Literal["IGNITION_READY", "PRE_WATCH", "NO_ENTRY"]
+PatternLabel = Literal["IGNITION_START", "PRE_IGNITION_WATCH", "MID_MOVE", "PULLBACK", "EXHAUSTION", "NOISE"]
 SessionState = Literal["GOOD", "NORMAL", "BAD_REAL_ONLY_NORMAL"]
 OrderBlockState = Literal["WITH_SIGNAL", "AGAINST_SIGNAL", "NEUTRAL"]
 

@@ -17,10 +17,15 @@ class IgnitionEntryResult:
 class IgnitionEntryEngine:
     def analyze(self, candle: CandleHunterResult, stage: EntryStageResult) -> IgnitionEntryResult:
         reasons = list(candle.reasons) + list(stage.reasons)
-        if candle.label in {"LATE_CHASE", "MID_MOVE", "EXHAUSTION", "PULLBACK"} or not stage.ok_for_real:
-            return IgnitionEntryResult("LATE", max(0, candle.score + stage.score_bonus), tuple(reasons))
-        if candle.label == "IGNITION_START":
+
+        if candle.label == "IGNITION_START" and stage.ok_for_real:
             return IgnitionEntryResult("IGNITION_READY", min(20, candle.score + stage.score_bonus), tuple(reasons))
+
         if candle.label == "PRE_IGNITION_WATCH":
-            return IgnitionEntryResult("PRE_WATCH", min(14, candle.score + max(0, stage.score_bonus)), tuple(reasons))
-        return IgnitionEntryResult("NO_ENTRY", max(0, candle.score), tuple(reasons))
+            return IgnitionEntryResult("PRE_WATCH", min(16, candle.score + max(0, stage.score_bonus)), tuple(reasons))
+
+        if not stage.ok_for_real and candle.score >= 7:
+            reasons.append("مرحله حرکت برای real مناسب نیست، اما برای واچ/یادگیری حذف کامل نمی‌شود.")
+            return IgnitionEntryResult("PRE_WATCH", min(12, candle.score), tuple(reasons))
+
+        return IgnitionEntryResult("NO_ENTRY", max(0, candle.score + min(0, stage.score_bonus)), tuple(reasons))
