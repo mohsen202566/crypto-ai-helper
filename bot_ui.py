@@ -51,11 +51,12 @@ class BotUI:
         allowed = {str(TELEGRAM_CHAT_ID), str(OWNER_ID)}
         return str(chat_id) in allowed
 
-    async def send_ready_alert(self, *, symbol_name: str, direction: str) -> int | None:
+    async def send_ready_alert(self, *, symbol_name: str, direction: str, score: int | None = None) -> int | None:
         if self.app is None:
             return None
         direction_fa = "لانگ" if direction == "LONG" else "شورت"
-        text = f"🟡 آماده ورود\n{symbol_name} {direction_fa}"
+        score_line = f"\nScore: {score}" if score is not None else ""
+        text = f"🟠 نزدیک ورود\n{symbol_name} {direction_fa}{score_line}\nهنوز سیگنال ورود نیست؛ منتظر کندل تایید نهایی."
         msg = await self.app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
         return int(msg.message_id)
 

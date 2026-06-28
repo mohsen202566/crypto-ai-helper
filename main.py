@@ -50,9 +50,6 @@ async def scanner_loop(okx: OkxDataClient, controller: AIController, trade_manag
                     health.record_okx_success(symbol.name)
                     if decision.action == "WATCH":
                         watch_engine.register_watch(symbol, decision)
-                        if decision.direction and watch_engine.should_send_ready(symbol.name, decision.direction, decision):
-                            await ui.send_ready_alert(symbol_name=symbol.name, direction=decision.direction)
-                            watch_engine.mark_ready_sent(symbol.name, decision.direction)
                     elif decision.accepted:
                         signal_items.append((symbol, decision))
                     else:
@@ -85,12 +82,14 @@ async def watch_loop(okx: OkxDataClient, controller: AIController, trade_manager
                     if decision.action == "WATCH":
                         watch_engine.register_watch(symbol, decision)
                         if decision.direction and watch_engine.should_send_ready(symbol.name, decision.direction, decision):
-                            await ui.send_ready_alert(symbol_name=symbol.name, direction=decision.direction)
+                            await ui.send_ready_alert(symbol_name=symbol.name, direction=decision.direction, score=decision.score)
                             watch_engine.mark_ready_sent(symbol.name, decision.direction)
                     elif decision.accepted:
                         signal_items.append((symbol, decision))
                     else:
-                        watch_engine.remove_watch(symbol.name, str(watch["direction"]))
+                        # Keep the watch until natural expiry. A single weak 15s scan should not
+                        # delete the watch, reset alert cooldown, and recreate Telegram spam.
+                        continue
                 except Exception as exc:
                     health.record_okx_error(symbol.name, str(exc))
                     LOGGER.warning("watch scan error for %s: %s", symbol.name, exc)

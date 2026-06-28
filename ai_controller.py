@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from adaptive_tp_sl_engine import AdaptiveTpSlEngine
 from candle_hunter_engine import CandleHunterEngine
-from config import SIGNAL_THRESHOLD, TIMEFRAME_15M, TIMEFRAME_1H, TIMEFRAME_4H, TIMEFRAME_5M, WATCH_THRESHOLD, WEIGHTS
+from config import READY_ALERT_MAX_STAGE_PCT, READY_ALERT_THRESHOLD, SIGNAL_THRESHOLD, TIMEFRAME_15M, TIMEFRAME_1H, TIMEFRAME_4H, TIMEFRAME_5M, WATCH_THRESHOLD, WEIGHTS
 from cost_engine import CostEngine
 from direction_engine import DirectionEngine
 from entry_stage_engine import EntryStageEngine
@@ -123,7 +123,14 @@ class AIController:
 
         watch_candidate = self._watch_candidate(data.watch_mode, pre.score, watch_score, candle.label, ignition.state)
         if watch_candidate and ignition.state != "IGNITION_READY":
-            ready_alert = ignition.state == "PRE_WATCH" and watch_score >= WATCH_THRESHOLD
+            ready_alert = (
+                data.watch_mode
+                and ignition.state == "PRE_WATCH"
+                and watch_score >= READY_ALERT_THRESHOLD
+                and stage.stage_pct <= READY_ALERT_MAX_STAGE_PCT
+                and risk.ok
+                and cost.ok
+            )
             return SignalDecision(
                 action="WATCH",
                 accepted=False,
@@ -134,7 +141,7 @@ class AIController:
                 score=watch_score,
                 threshold=SIGNAL_THRESHOLD,
                 breakdown=breakdown,
-                reason="شکارگاه زودتر وارد واچ شد؛ منتظر کندل شروع حرکت.",
+                reason="زیر نظر برای شکار؛ هنوز ورود نهایی نیست.",
                 ready_alert=ready_alert,
                 hunter=True,
                 signal_label="شکار",

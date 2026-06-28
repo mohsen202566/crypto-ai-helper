@@ -163,6 +163,16 @@ class Storage:
             )
             conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS watch_alerts (
+                    symbol_name TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    last_alert_at TEXT NOT NULL,
+                    PRIMARY KEY(symbol_name, direction)
+                )
+                """
+            )
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS symbol_health (
                     symbol_name TEXT PRIMARY KEY,
                     okx_error_count INTEGER DEFAULT 0,
@@ -389,15 +399,24 @@ class Storage:
 
     def can_send_ready_alert(self, symbol_name: str, direction: str, cooldown_seconds: int) -> bool:
         with self._connect() as conn:
-            row = conn.execute("SELECT last_ready_alert_at FROM watchlist WHERE symbol_name=? AND direction=?", (symbol_name, direction)).fetchone()
-            if not row or not row["last_ready_alert_at"]:
+            row = conn.execute("SELECT last_alert_at FROM watch_alerts WHERE symbol_name=? AND direction=?", (symbol_name, direction)).fetchone()
+            if not row or not row["last_alert_at"]:
                 return True
-            last = datetime.fromisoformat(str(row["last_ready_alert_at"]))
+            last = datetime.fromisoformat(str(row["last_alert_at"]))
             return datetime.now(timezone.utc) - last >= timedelta(seconds=cooldown_seconds)
 
     def mark_ready_alert_sent(self, symbol_name: str, direction: str) -> None:
+        now = datetime.now(timezone.utc).isoformat()
         with self._connect() as conn:
-            conn.execute("UPDATE watchlist SET last_ready_alert_at=? WHERE symbol_name=? AND direction=?", (datetime.now(timezone.utc).isoformat(), symbol_name, direction))
+            conn.execute(
+                """
+                INSERT INTO watch_alerts(symbol_name, direction, last_alert_at)
+                VALUES(?, ?, ?)
+                ON CONFLICT(symbol_name, direction) DO UPDATE SET last_alert_at=excluded.last_alert_at
+                """,
+                (symbol_name, direction, now),
+            )
+            conn.execute("UPDATE watchlist SET last_ready_alert_at=? WHERE symbol_name=? AND direction=?", (now, symbol_name, direction))
 
     def remove_watch(self, symbol_name: str, direction: str | None = None) -> None:
         with self._connect() as conn:
