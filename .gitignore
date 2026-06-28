@@ -1,20 +1,42 @@
 # Environment
 .env
+.env.*
+!.env.example
+
+# Virtual environments
 venv/
 .venv/
+env/
 
 # Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.Python
 
 # Logs
 *.log
+logs/
 
 # Runtime data
+data/
 state_store.json
 *.db
+*.db-wal
+*.db-shm
 *.sqlite
+*.sqlite-wal
+*.sqlite-shm
 *.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
+# Backups / archives
+*.zip
+*.tar
+*.tar.gz
+*.bak
 
 # IDE
 .vscode/
