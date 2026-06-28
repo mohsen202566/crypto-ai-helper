@@ -22,7 +22,6 @@ SYMBOLS: tuple[MarketSymbol, ...] = (
     MarketSymbol("DOT", "DOT-USDT-SWAP", "DOT-SWAP-USDT"),
     MarketSymbol("TRX", "TRX-USDT-SWAP", "TRX-SWAP-USDT"),
     MarketSymbol("SUI", "SUI-USDT-SWAP", "SUI-SWAP-USDT"),
-    MarketSymbol("TON", "TON-USDT-SWAP", "TON-SWAP-USDT"),
     MarketSymbol("NEAR", "NEAR-USDT-SWAP", "NEAR-SWAP-USDT"),
     MarketSymbol("APT", "APT-USDT-SWAP", "APT-SWAP-USDT"),
     MarketSymbol("INJ", "INJ-USDT-SWAP", "INJ-SWAP-USDT"),

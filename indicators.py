@@ -36,6 +36,8 @@ class IndicatorSnapshot:
     recent_low: float
     candle_range: float
     body_pct: float
+    upper_wick_pct: float
+    lower_wick_pct: float
     consecutive_up: int
     consecutive_down: int
 
@@ -50,6 +52,19 @@ class IndicatorSnapshot:
         if self.prev_ema200 <= 0:
             return 0.0
         return (self.ema200 - self.prev_ema200) / self.prev_ema200
+
+    @property
+    def macd_hist_slope(self) -> float:
+        return self.macd_hist - self.prev_macd_hist
+
+    @property
+    def macd_hist_norm(self) -> float:
+        base = max(self.atr, self.close * 0.0001)
+        return self.macd_hist / base
+
+    @property
+    def atr_pct(self) -> float:
+        return self.atr / self.close if self.close > 0 else 0.0
 
 
 def calculate_indicators(candles: list[Candle]) -> IndicatorSnapshot:
@@ -72,8 +87,6 @@ def calculate_indicators(candles: list[Candle]) -> IndicatorSnapshot:
 
     last = _last_complete_index(ema20, ema50, rsi, macd_line, macd_signal, macd_hist, adx, plus_di, minus_di, atr, vwap)
     prev = _previous_complete_index(last, ema20, ema50, rsi, macd_hist, adx, atr)
-
-    # If EMA200 is not ready, use EMA50 as a conservative fallback so smaller datasets still work.
     ema200_now = ema200[last] if ema200[last] is not None else ema50[last]
     ema200_prev = ema200[prev] if ema200[prev] is not None else ema50[prev]
     if ema200_now is None or ema200_prev is None:
@@ -84,42 +97,25 @@ def calculate_indicators(candles: list[Candle]) -> IndicatorSnapshot:
     recent_low = min(c.low for c in window)
     candle_range = max(0.0, highs[last] - lows[last])
     body = abs(closes[last] - opens[last])
+    top_body = max(closes[last], opens[last])
+    bottom_body = min(closes[last], opens[last])
+    upper_wick = max(0.0, highs[last] - top_body)
+    lower_wick = max(0.0, bottom_body - lows[last])
     body_pct = body / candle_range if candle_range > 0 else 0.0
+    upper_wick_pct = upper_wick / candle_range if candle_range > 0 else 0.0
+    lower_wick_pct = lower_wick / candle_range if candle_range > 0 else 0.0
     vol_window = [v for v in volumes[max(0, last - 20): last] if v > 0]
     avg_vol = sum(vol_window) / len(vol_window) if vol_window else 0.0
     volume_ratio = (volumes[last] / avg_vol) if avg_vol > 0 and volumes[last] > 0 else 1.0
 
     return IndicatorSnapshot(
-        close=float(closes[last]),
-        prev_close=float(closes[prev]),
-        high=float(highs[last]),
-        low=float(lows[last]),
-        open=float(opens[last]),
-        volume=float(volumes[last]),
-        volume_ratio=float(volume_ratio),
-        ema20=float(ema20[last]),
-        ema50=float(ema50[last]),
-        ema200=float(ema200_now),
-        prev_ema20=float(ema20[prev]),
-        prev_ema50=float(ema50[prev]),
-        prev_ema200=float(ema200_prev),
-        rsi=float(rsi[last]),
-        prev_rsi=float(rsi[prev]),
-        macd=float(macd_line[last]),
-        macd_signal=float(macd_signal[last]),
-        macd_hist=float(macd_hist[last]),
-        prev_macd_hist=float(macd_hist[prev]),
-        adx=float(adx[last]),
-        plus_di=float(plus_di[last]),
-        minus_di=float(minus_di[last]),
-        atr=float(atr[last]),
-        prev_atr=float(atr[prev]),
-        vwap=float(vwap[last]),
-        recent_high=float(recent_high),
-        recent_low=float(recent_low),
-        candle_range=float(candle_range),
-        body_pct=float(body_pct),
-        consecutive_up=_consecutive(candles[: last + 1], up=True),
+        close=float(closes[last]), prev_close=float(closes[prev]), high=float(highs[last]), low=float(lows[last]), open=float(opens[last]),
+        volume=float(volumes[last]), volume_ratio=float(volume_ratio), ema20=float(ema20[last]), ema50=float(ema50[last]), ema200=float(ema200_now),
+        prev_ema20=float(ema20[prev]), prev_ema50=float(ema50[prev]), prev_ema200=float(ema200_prev), rsi=float(rsi[last]), prev_rsi=float(rsi[prev]),
+        macd=float(macd_line[last]), macd_signal=float(macd_signal[last]), macd_hist=float(macd_hist[last]), prev_macd_hist=float(macd_hist[prev]),
+        adx=float(adx[last]), plus_di=float(plus_di[last]), minus_di=float(minus_di[last]), atr=float(atr[last]), prev_atr=float(atr[prev]),
+        vwap=float(vwap[last]), recent_high=float(recent_high), recent_low=float(recent_low), candle_range=float(candle_range), body_pct=float(body_pct),
+        upper_wick_pct=float(upper_wick_pct), lower_wick_pct=float(lower_wick_pct), consecutive_up=_consecutive(candles[: last + 1], up=True),
         consecutive_down=_consecutive(candles[: last + 1], up=False),
     )
 
@@ -162,8 +158,7 @@ def _ema_from_optional(values: list[float | None], period: int) -> list[float | 
     compact_ema = _ema(compact, period)
     for compact_index, ema_value in enumerate(compact_ema):
         if ema_value is not None:
-            original_index = valid_pairs[compact_index][0]
-            result[original_index] = ema_value
+            result[valid_pairs[compact_index][0]] = ema_value
     return result
 
 
@@ -214,12 +209,11 @@ def _atr(highs: list[float], lows: list[float], closes: list[float], period: int
     result: list[float | None] = [None] * len(closes)
     if len(closes) <= period:
         return result
-    trs: list[float] = [0.0] * len(closes)
+    trs = [0.0] * len(closes)
     for i in range(1, len(closes)):
         trs[i] = max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1]))
-    first = sum(trs[1: period + 1]) / period
-    result[period] = first
-    previous = first
+    previous = sum(trs[1: period + 1]) / period
+    result[period] = previous
     for i in range(period + 1, len(closes)):
         previous = ((previous * (period - 1)) + trs[i]) / period
         result[i] = previous
@@ -242,59 +236,53 @@ def _adx_dmi(highs: list[float], lows: list[float], closes: list[float], period:
         plus_dm[i] = up_move if up_move > down_move and up_move > 0 else 0.0
         minus_dm[i] = down_move if down_move > up_move and down_move > 0 else 0.0
         tr[i] = max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1]))
-
-    tr_smooth = sum(tr[1: period + 1])
+    atr_smooth = sum(tr[1: period + 1])
     plus_smooth = sum(plus_dm[1: period + 1])
     minus_smooth = sum(minus_dm[1: period + 1])
-    dx: list[float | None] = [None] * length
+    dx_values: list[float | None] = [None] * length
     for i in range(period, length):
         if i > period:
-            tr_smooth = tr_smooth - (tr_smooth / period) + tr[i]
+            atr_smooth = atr_smooth - (atr_smooth / period) + tr[i]
             plus_smooth = plus_smooth - (plus_smooth / period) + plus_dm[i]
             minus_smooth = minus_smooth - (minus_smooth / period) + minus_dm[i]
-        if tr_smooth <= 0:
+        if atr_smooth <= 0:
             continue
-        plus_di = 100.0 * plus_smooth / tr_smooth
-        minus_di = 100.0 * minus_smooth / tr_smooth
-        plus_di_out[i] = plus_di
-        minus_di_out[i] = minus_di
-        denom = plus_di + minus_di
-        if denom > 0:
-            dx[i] = 100.0 * abs(plus_di - minus_di) / denom
-
-    first_adx_index = period * 2
-    first_dx_values = [float(x) for x in dx[period:first_adx_index] if x is not None]
-    if len(first_dx_values) < period:
+        plus = 100.0 * plus_smooth / atr_smooth
+        minus = 100.0 * minus_smooth / atr_smooth
+        plus_di_out[i] = plus
+        minus_di_out[i] = minus
+        denom = plus + minus
+        dx_values[i] = 100.0 * abs(plus - minus) / denom if denom > 0 else 0.0
+    first_dx = [x for x in dx_values[period: period * 2] if x is not None]
+    if len(first_dx) < period:
         return adx, plus_di_out, minus_di_out
-    value = sum(first_dx_values[-period:]) / period
-    adx[first_adx_index - 1] = value
-    for i in range(first_adx_index, length):
-        if dx[i] is None:
-            continue
-        value = ((value * (period - 1)) + float(dx[i])) / period
-        adx[i] = value
+    prev_adx = sum(first_dx) / len(first_dx)
+    adx[period * 2 - 1] = prev_adx
+    for i in range(period * 2, length):
+        if dx_values[i] is not None:
+            prev_adx = ((prev_adx * (period - 1)) + float(dx_values[i])) / period
+            adx[i] = prev_adx
     return adx, plus_di_out, minus_di_out
 
 
 def _rolling_vwap(candles: list[Candle], period: int) -> list[float | None]:
     result: list[float | None] = [None] * len(candles)
     for i in range(len(candles)):
-        start = max(0, i - period + 1)
-        window = candles[start: i + 1]
-        denom = sum(max(c.volume, 0.0) for c in window)
-        if denom <= 0:
-            result[i] = sum((c.high + c.low + c.close) / 3.0 for c in window) / len(window)
-        else:
-            result[i] = sum(((c.high + c.low + c.close) / 3.0) * max(c.volume, 0.0) for c in window) / denom
+        if i + 1 < period:
+            continue
+        window = candles[i - period + 1: i + 1]
+        pv = sum(((c.high + c.low + c.close) / 3.0) * max(c.volume, 0.0) for c in window)
+        vol = sum(max(c.volume, 0.0) for c in window)
+        result[i] = pv / vol if vol > 0 else sum(c.close for c in window) / len(window)
     return result
 
 
 def _consecutive(candles: list[Candle], *, up: bool) -> int:
     count = 0
-    for candle in reversed(candles[-8:]):
-        is_up = candle.close > candle.open
-        is_down = candle.close < candle.open
-        if (up and is_up) or ((not up) and is_down):
+    for candle in reversed(candles):
+        bullish = candle.close > candle.open
+        bearish = candle.close < candle.open
+        if (up and bullish) or ((not up) and bearish):
             count += 1
         else:
             break

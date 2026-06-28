@@ -26,39 +26,22 @@ class OkxDataClient:
         self.session = requests.Session()
 
     def get_candles(self, inst_id: str, timeframe: str, limit: int = OKX_CANDLE_LIMIT) -> list[Candle]:
-        payload = self._get(
-            "/api/v5/market/candles",
-            {"instId": inst_id, "bar": timeframe, "limit": str(limit)},
-        )
+        payload = self._get("/api/v5/market/candles", {"instId": inst_id, "bar": timeframe, "limit": str(limit)})
         raw_rows = payload.get("data")
         if not isinstance(raw_rows, list):
             raise RuntimeError(f"کندل‌های OKX برای {inst_id} تایم {timeframe} قابل خواندن نیست.")
-
         candles: list[Candle] = []
         for row in raw_rows:
             if not isinstance(row, list) or len(row) < 5:
                 continue
-            confirmed = True
-            if len(row) >= 9:
-                confirmed = str(row[8]) == "1"
+            confirmed = str(row[8]) == "1" if len(row) >= 9 else True
             volume = 0.0
             if len(row) >= 6:
                 try:
                     volume = float(row[5])
                 except (TypeError, ValueError):
                     volume = 0.0
-            candles.append(
-                Candle(
-                    ts=int(row[0]),
-                    open=float(row[1]),
-                    high=float(row[2]),
-                    low=float(row[3]),
-                    close=float(row[4]),
-                    volume=volume,
-                    confirmed=confirmed,
-                )
-            )
-
+            candles.append(Candle(ts=int(row[0]), open=float(row[1]), high=float(row[2]), low=float(row[3]), close=float(row[4]), volume=volume, confirmed=confirmed))
         candles.sort(key=lambda item: item.ts)
         confirmed_only = [c for c in candles if c.confirmed]
         if len(confirmed_only) >= min(80, max(20, limit // 3)):

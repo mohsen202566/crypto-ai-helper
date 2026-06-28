@@ -1,57 +1,58 @@
-# Multi Timeframe AI Futures Bot v1
+# AI Helper Hunter Bot v2
 
-نسخه جدید ربات بر اساس طراحی نهایی:
+ربات شکارچی شروع حرکت + AI واقعی + اجرای هماهنگ با Toobit.
 
-- 15 ارز
-- حداقل سیگنال: 75
-- 1H جهت اصلی، 40 امتیاز
-- 4H جهت بزرگ‌تر، 7 امتیاز
-- 15m تأیید setup، 18 امتیاز
-- 5m فقط تایمینگ ورود، 4 امتیاز
-- Late Entry Guard، 10 امتیاز
-- TP/SL + Net Edge، 15 امتیاز
-- Market Quality، 6 امتیاز
-- یک TP و یک SL
-- آمار لانگ/شورت جدا
-- آمار عادی/واقعی جدا
-- اسلات real_pending/opening با تأیید 70 ثانیه‌ای Toobit
+## قفل‌های اصلی
 
-## دستورات تلگرام
+- 14 ارز ترید: SOL, XRP, DOGE, ADA, LTC, BCH, LINK, AVAX, DOT, TRX, SUI, NEAR, APT, INJ
+- BTC/ETH فقط برای Market Context
+- اسکن کامل هر 60 ثانیه
+- اسکن Watchlist هر 15 ثانیه
+- حداقل امتیاز سیگنال: 75
+- Watch بدون اسپم؛ فقط پیام کوتاه «آماده ورود»
+- AI Confidence و AI Experience در پیام سیگنال
+- حداقل سود دلاری و درصدی قابل تنظیم
+- اسلات‌های real/reserved/opening/opened هماهنگ با چک 70 ثانیه‌ای Toobit
+- خطای یک نماد فقط همان نماد را skip یا موقتاً غیرفعال می‌کند
+
+## دستورات
 
 ```text
 پنل
 وضعیت
+ترید
 آمار
 آمار 7
+هوش مصنوعی
+Ai
+هوش
+مصنوعی
 ترید فعال
 ترید خاموش
 ترید دلار 20
 ترید لوریج 10
 حداکثر پوزیشن 3
+حداقل سود 1
+درصد سود 0.10
+حذف آمار
+حذف آمار تایید
+ریست یادگیری
+ریست یادگیری تایید
 راهنما
 ```
 
-## نصب روی VPS
-
-قبل از جایگزینی، بکاپ بگیر:
+## نصب
 
 ```bash
-cd /root/crypto-ai-helper
+cd /root
 cp -r /root/crypto-ai-helper /root/crypto-ai-helper-backup-$(date +%F-%H%M)
-```
-
-بعد فایل‌ها را جایگزین کن و تست بگیر:
-
-```bash
+# فایل‌های این نسخه را داخل /root/crypto-ai-helper جایگزین کن
 cd /root/crypto-ai-helper
 /root/crypto-ai-helper/venv/bin/python -m py_compile *.py
 systemctl restart crypto-bot.service
 journalctl -u crypto-bot -n 100 --no-pager
 ```
 
-## نکته‌های حساس
+## نکته امنیتی
 
-- API key و secret را داخل تلگرام یا لاگ عمومی نفرست.
-- `toobit_client.py` سفارش واقعی را در thread جدا اجرا می‌کند؛ خودش بعد از سفارش 70 ثانیه صبر می‌کند و پوزیشن را تأیید می‌کند.
-- در زمان 70 ثانیه، اسلات در دیتابیس با `real_status=opening` رزرو می‌ماند تا سفارش تکراری ایجاد نشود.
-- Toobit منبع حقیقت پول و پوزیشن واقعی است؛ دیتابیس منبع حقیقت تنظیمات ربات و آمار است.
+`.env` را عمومی نکن. توکن تلگرام و کلیدهای Toobit نباید داخل لاگ یا پیام دیده شوند.

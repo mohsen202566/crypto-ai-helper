@@ -15,8 +15,7 @@ class SignalMonitor:
         self.toobit = toobit
 
     async def check_once(self, send_result) -> None:
-        signals = self.storage.open_signals()
-        for signal in signals:
+        for signal in self.storage.open_signals():
             if signal.signal_type == "real" and signal.real_status != "opened":
                 continue
             try:
@@ -30,13 +29,9 @@ class SignalMonitor:
             approx_pnl = self._approx_pnl(signal, exit_price)
             real_pnl = await self._real_pnl(signal) if signal.signal_type == "real" else None
             result_message_id = await send_result(signal, status, approx_pnl, real_pnl)
-            self.storage.finish_signal(
-                signal.id,
-                status=status,
-                approx_pnl=approx_pnl,
-                real_pnl=real_pnl,
-                result_message_id=result_message_id,
-            )
+            mfe_pct = abs(signal.tp - signal.entry) / signal.entry if signal.entry > 0 and status == "TP" else 0.0
+            mae_pct = abs(signal.entry - signal.sl) / signal.entry if signal.entry > 0 and status == "SL" else 0.0
+            self.storage.finish_signal(signal.id, status=status, approx_pnl=approx_pnl, real_pnl=real_pnl, result_message_id=result_message_id, mfe_pct=mfe_pct, mae_pct=mae_pct)
 
     def _status_from_price(self, signal: StoredSignal, price: float) -> str | None:
         if signal.direction == "LONG":
@@ -52,27 +47,16 @@ class SignalMonitor:
         return None
 
     def _approx_pnl(self, signal: StoredSignal, exit_price: float) -> float:
-        margin = signal.margin_usdt
-        leverage = signal.leverage
         if signal.entry <= 0:
             return 0.0
-        if signal.direction == "LONG":
-            pct = (exit_price - signal.entry) / signal.entry
-        else:
-            pct = (signal.entry - exit_price) / signal.entry
-        return margin * leverage * pct
+        pct = (exit_price - signal.entry) / signal.entry if signal.direction == "LONG" else (signal.entry - exit_price) / signal.entry
+        return signal.margin_usdt * signal.leverage * pct
 
     async def _real_pnl(self, signal: StoredSignal) -> float | None:
         created = datetime.fromisoformat(signal.created_at)
         start_ms = int((created - timedelta(minutes=10)).timestamp() * 1000)
         end_ms = int((datetime.now(timezone.utc) + timedelta(minutes=10)).timestamp() * 1000)
         try:
-            return await asyncio.to_thread(
-                self.toobit.find_realized_pnl,
-                symbol=signal.toobit_symbol,
-                side=signal.direction,
-                start_ms=start_ms,
-                end_ms=end_ms,
-            )
+            return await asyncio.to_thread(self.toobit.find_realized_pnl, symbol=signal.toobit_symbol, side=signal.direction, start_ms=start_ms, end_ms=end_ms)
         except Exception:
             return None

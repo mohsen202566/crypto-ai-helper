@@ -30,9 +30,4 @@ class LevelsEngine:
             support = swing_low
         if resistance <= entry:
             resistance = swing_high
-        return LevelsResult(
-            support=float(support),
-            resistance=float(resistance),
-            swing_low=float(swing_low),
-            swing_high=float(swing_high),
-        )
+        return LevelsResult(float(support), float(resistance), float(swing_low), float(swing_high))
