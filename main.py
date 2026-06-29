@@ -4,7 +4,9 @@
 """
 from __future__ import annotations
 
+import os
 import signal
+import sys
 import threading
 import time
 from typing import Any
@@ -19,7 +21,50 @@ from strategy import ClassicScalpingStrategy
 from telegram_bot import TelegramBotService
 from toobit_client import ToobitClient
 from trade_manager import TradeManager
-from utils import logger, now_utc_iso, safe_sleep
+from utils import logger, safe_sleep
+
+
+class SingleInstanceLock:
+    """جلوگیری از اجرای همزمان چند ربات روی یک VPS.
+
+    اجرای همزمان چند main.py باعث 409 تلگرام، ارسال چند سیگنال از یک ارز، و خراب‌شدن مانیتور نتیجه می‌شود.
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self.file = None
+
+    def acquire(self) -> bool:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.file = open(self.path, "w", encoding="utf-8")
+        try:
+            import fcntl
+
+            fcntl.flock(self.file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.file.seek(0)
+            self.file.truncate()
+            self.file.write(str(os.getpid()))
+            self.file.flush()
+            return True
+        except BlockingIOError:
+            return False
+        except Exception as exc:
+            logger.warning("قفل تک‌اجرایی فعال نشد، ادامه با احتیاط: %s", exc)
+            return True
+
+    def release(self) -> None:
+        if not self.file:
+            return
+        try:
+            import fcntl
+
+            fcntl.flock(self.file.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            self.file.close()
+        except Exception:
+            pass
 
 
 class FiveMinuteScalperBot:
@@ -109,6 +154,21 @@ class FiveMinuteScalperBot:
         self.storage.set_symbol_error(symbol, str(exc), time.time())
         logger.warning("خطای نماد %s؛ فقط همین نماد رد شد: %s", symbol, exc)
 
+    def _send_result_messages(self, normal_results=None, real_results=None) -> None:
+        for signal_data, result, price, pnl in normal_results or []:
+            msg_id = signal_data.get("telegram_message_id")
+            self.telegram.send_message(normal_result_message(signal_data, result, price, pnl), reply_to_message_id=msg_id)
+
+        for signal_data, result, price, pnl in real_results or []:
+            msg_id = signal_data.get("telegram_message_id")
+            self.telegram.send_message(real_result_message(signal_data, result, price, pnl), reply_to_message_id=msg_id)
+
+    def _check_symbol_normal_result_now(self, internal: str, latest_price: float) -> None:
+        """قبل از تحلیل سیگنال جدید، نتیجه سیگنال باز همان نماد را با قیمت زنده چک کن."""
+        results = self.trade_manager.check_normal_results({internal: float(latest_price)})
+        if results:
+            self._send_result_messages(normal_results=results)
+
     def _process_symbol(self, internal: str, mapped: dict[str, Any]) -> float | None:
         if self._symbol_in_cooldown(internal):
             return None
@@ -118,6 +178,13 @@ class FiveMinuteScalperBot:
             candles = self.okx.get_candles(okx_symbol)
             indicators = calculate_indicators(candles)
             latest_price = float(indicators["close"])
+
+            # اول نتیجه سیگنال باز همین نماد بررسی شود؛ بعد اگر هنوز باز بود، اصلاً سیگنال جدید نساز.
+            self._check_symbol_normal_result_now(internal, latest_price)
+            if self.storage.has_active_symbol(internal):
+                logger.info("رد شد: برای این نماد %s هنوز سیگنال باز وجود دارد", internal)
+                return latest_price
+
             signal_data = self.strategy.evaluate(internal, okx_symbol, toobit_symbol, indicators)
             if not signal_data:
                 return latest_price
@@ -135,7 +202,11 @@ class FiveMinuteScalperBot:
             # اگر ترید روشن، Toobit وصل، و اسلات پوزیشن خالی باشد => رئال Toobit
             # در غیر این صورت => عادی / داخلی
             signal_data = self.trade_manager.decide_execution_mode(signal_data)
-            signal_data = self.trade_manager.register_signal(signal_data)
+            signal_data, register_reason = self.trade_manager.register_signal(signal_data)
+            if signal_data is None:
+                logger.info("سیگنال %s قبل از ارسال رد شد: %s", internal, register_reason)
+                return latest_price
+
             msg_id = self.telegram.send_message(signal_message(signal_data))
             if msg_id:
                 self.storage.update_signal(signal_data["signal_id"], telegram_message_id=msg_id)
@@ -155,13 +226,9 @@ class FiveMinuteScalperBot:
             return None
 
     def _check_results(self, latest_prices: dict[str, float]) -> None:
-        for signal_data, result, price, pnl in self.trade_manager.check_normal_results(latest_prices):
-            msg_id = signal_data.get("telegram_message_id")
-            self.telegram.send_message(normal_result_message(signal_data, result, price, pnl), reply_to_message_id=msg_id)
-
-        for signal_data, result, price, pnl in self.trade_manager.check_real_results():
-            msg_id = signal_data.get("telegram_message_id")
-            self.telegram.send_message(real_result_message(signal_data, result, price, pnl), reply_to_message_id=msg_id)
+        normal_results = self.trade_manager.check_normal_results(latest_prices)
+        real_results = self.trade_manager.check_real_results()
+        self._send_result_messages(normal_results=normal_results, real_results=real_results)
 
     def analysis_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -188,8 +255,17 @@ class FiveMinuteScalperBot:
 
 
 def main() -> None:
-    bot = FiveMinuteScalperBot()
-    bot.start()
+    lock = SingleInstanceLock(config.LOCK_FILE)
+    if not lock.acquire():
+        message = "یک نسخه دیگر از ربات در حال اجراست؛ برای جلوگیری از سیگنال تکراری و خطای 409، این نسخه اجرا نشد."
+        print(message, file=sys.stderr)
+        logger.error(message)
+        return
+    try:
+        bot = FiveMinuteScalperBot()
+        bot.start()
+    finally:
+        lock.release()
 
 
 if __name__ == "__main__":

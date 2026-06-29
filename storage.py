@@ -108,7 +108,6 @@ class JSONStorage:
         with self._lock:
             current = self.state["stats"].get(key, 0)
             self.state["stats"][key] = current + amount
-            # شمارنده‌های باز منفی نشوند
             if key in ("normal_open", "real_open") and self.state["stats"][key] < 0:
                 self.state["stats"][key] = 0
             self.save()
@@ -120,15 +119,59 @@ class JSONStorage:
                 self.state["signals"] = {}
             self.save()
 
+    # -----------------------------
+    # چرخه عمر سیگنال
+    # -----------------------------
+    @staticmethod
+    def _is_closed_by_result(signal: dict[str, Any]) -> bool:
+        mode = str(signal.get("execution_mode") or "NORMAL").upper()
+        if mode == "REAL":
+            return bool(signal.get("real_result"))
+        return bool(signal.get("normal_result"))
+
+    @classmethod
+    def _is_open_signal(cls, signal: dict[str, Any]) -> bool:
+        # نسخه‌های قدیمی status ندارند؛ برای سازگاری، نتیجه TP/SL ملاک بسته‌شدن است.
+        if cls._is_closed_by_result(signal):
+            return False
+        status = str(signal.get("status") or "OPEN").upper()
+        return status != "CLOSED"
+
     def save_signal(self, signal: dict[str, Any]) -> None:
         with self._lock:
-            self.state["signals"][signal["signal_id"]] = copy.deepcopy(signal)
+            signal = copy.deepcopy(signal)
+            signal.setdefault("status", "OPEN")
+            signal.setdefault("closed_utc", None)
+            self.state["signals"][signal["signal_id"]] = signal
             self.save()
+
+    def try_save_signal(self, signal: dict[str, Any]) -> tuple[bool, str]:
+        """ذخیره اتمیک: از هر ارز فقط یک سیگنال باز مجاز است."""
+        with self._lock:
+            symbol = signal.get("symbol")
+            for old in self.state["signals"].values():
+                if old.get("symbol") == symbol and self._is_open_signal(old):
+                    return False, "برای این نماد هنوز سیگنال باز وجود دارد"
+            signal = copy.deepcopy(signal)
+            signal.setdefault("status", "OPEN")
+            signal.setdefault("closed_utc", None)
+            self.state["signals"][signal["signal_id"]] = signal
+            self.save()
+            return True, ""
 
     def update_signal(self, signal_id: str, **updates: Any) -> None:
         with self._lock:
             if signal_id in self.state["signals"]:
-                self.state["signals"][signal_id].update(updates)
+                sig = self.state["signals"][signal_id]
+                # اگر نتیجه ثبت شد، سیگنال حتماً بسته شود تا نماد آزاد شود.
+                if updates.get("normal_result") or updates.get("real_result"):
+                    updates.setdefault("status", "CLOSED")
+                    updates.setdefault("closed_utc", now_utc_iso())
+                sig.update(updates)
+                # محافظت برای stateهای قدیمی: اگر نتیجه از قبل وجود دارد، status اصلاح شود.
+                if self._is_closed_by_result(sig):
+                    sig["status"] = "CLOSED"
+                    sig.setdefault("closed_utc", now_utc_iso())
                 self.save()
 
     def get_signal(self, signal_id: str) -> dict[str, Any] | None:
@@ -146,37 +189,26 @@ class JSONStorage:
             out = []
             for s in self.state["signals"].values():
                 mode = str(s.get("execution_mode") or "NORMAL").upper()
-                if mode == "NORMAL" and not s.get("normal_result"):
+                if mode == "NORMAL" and self._is_open_signal(s) and not s.get("normal_result"):
                     out.append(copy.deepcopy(s))
             return out
 
     def active_real_signals(self) -> list[dict[str, Any]]:
-        """سیگنال‌های رئال که هنوز نتیجه واقعی ندارند، حتی اگر تایید سفارش در انتظار باشد."""
+        """سیگنال‌های رئال که هنوز نتیجه واقعی ندارند."""
         with self._lock:
             out = []
             for s in self.state["signals"].values():
                 mode = str(s.get("execution_mode") or "NORMAL").upper()
-                if mode == "REAL" and not s.get("real_result"):
+                if mode == "REAL" and self._is_open_signal(s) and not s.get("real_result"):
                     out.append(copy.deepcopy(s))
             return out
 
     def has_active_symbol(self, internal_symbol: str) -> bool:
-        """از هر ارز فقط یک سیگنال تا بسته‌شدن کامل مجاز است.
-
-        عادی با normal_result بسته می‌شود؛ رئال با real_result بسته می‌شود.
-        اگر رئال بعداً به عادی downgrade شود، normal_result ملاک بسته‌شدن است.
-        """
+        """از هر ارز فقط یک سیگنال باز؛ لانگ/شورت فرقی ندارد."""
         with self._lock:
             for s in self.state["signals"].values():
-                if s.get("symbol") != internal_symbol:
-                    continue
-                mode = str(s.get("execution_mode") or "NORMAL").upper()
-                if mode == "REAL":
-                    if not s.get("real_result"):
-                        return True
-                else:
-                    if not s.get("normal_result"):
-                        return True
+                if s.get("symbol") == internal_symbol and self._is_open_signal(s):
+                    return True
             return False
 
     def count_open_real(self) -> int:
@@ -185,7 +217,7 @@ class JSONStorage:
             return sum(
                 1
                 for s in self.state["signals"].values()
-                if str(s.get("execution_mode") or "").upper() == "REAL" and not s.get("real_result")
+                if str(s.get("execution_mode") or "").upper() == "REAL" and self._is_open_signal(s)
             )
 
     def set_validated_symbols(self, mapping: dict[str, Any]) -> None:

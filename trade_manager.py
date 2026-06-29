@@ -74,6 +74,8 @@ class TradeManager:
     def attach_signal_defaults(self, signal: dict[str, Any]) -> dict[str, Any]:
         signal["created_utc"] = now_utc_iso()
         signal["created_ms"] = int(time.time() * 1000)
+        signal.setdefault("status", "OPEN")
+        signal.setdefault("closed_utc", None)
         signal.setdefault("normal_result", None)
         signal.setdefault("real_result", None)
         signal.setdefault("real_order", None)
@@ -81,11 +83,14 @@ class TradeManager:
         signal.setdefault("telegram_message_id", None)
         return signal
 
-    def register_signal(self, signal: dict[str, Any]) -> dict[str, Any]:
+    def register_signal(self, signal: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
+        """ثبت اتمیک سیگنال. اگر نماد هنوز باز باشد، اصلاً ذخیره و ارسال نمی‌شود."""
         signal = self.attach_signal_defaults(signal)
-        self.storage.save_signal(signal)
+        ok, reason = self.storage.try_save_signal(signal)
+        if not ok:
+            return None, reason
         self.stats.record_signal(signal.get("execution_mode", "NORMAL"))
-        return signal
+        return signal, ""
 
     def _downgrade_real_to_normal(self, signal: dict[str, Any], reason: str) -> None:
         self.storage.update_signal(
@@ -95,6 +100,7 @@ class TradeManager:
             execution_reason=f"اجرای رئال انجام نشد؛ از اینجا به بعد نتیجه به‌صورت عادی پیگیری می‌شود. علت: {reason}",
             real_error=reason,
             real_order=None,
+            status="OPEN",
         )
         self.stats.convert_real_signal_to_normal()
 
@@ -144,6 +150,7 @@ class TradeManager:
                 real_error=None,
                 real_open_utc=now_utc_iso(),
                 real_position_confirmed=True,
+                status="OPEN",
             )
             self.stats.record_real_open()
             return True, response.get("reason", "سفارش واقعی در Toobit ارسال و تایید شد"), response
@@ -178,18 +185,22 @@ class TradeManager:
             if price is None:
                 continue
             result = hit_tp_sl(signal["side"], float(price), float(signal["tp"]), float(signal["sl"]))
-            if result:
-                pnl = self._signal_pnl(signal, float(price))
-                self.storage.update_signal(
-                    signal["signal_id"],
-                    normal_result=result,
-                    normal_exit_price=price,
-                    normal_exit_utc=now_utc_iso(),
-                    normal_pnl=pnl,
-                )
-                self.stats.record_normal_result(result, pnl=pnl)
-                updated = self.storage.get_signal(signal["signal_id"]) or signal
-                results.append((updated, result, float(price), pnl))
+            if not result:
+                continue
+
+            # سیگنال عادی با TP/SL ثابت بسته می‌شود؛ خروج دقیقاً همان TP یا SL باشد، نه قیمت دیرتر/اسلیپیج.
+            exit_price = float(signal["tp"] if result == "TP" else signal["sl"])
+            pnl = self._signal_pnl(signal, exit_price)
+            self.storage.update_signal(
+                signal["signal_id"],
+                normal_result=result,
+                normal_exit_price=exit_price,
+                normal_exit_utc=now_utc_iso(),
+                normal_pnl=pnl,
+            )
+            self.stats.record_normal_result(result, pnl=pnl)
+            updated = self.storage.get_signal(signal["signal_id"]) or signal
+            results.append((updated, result, exit_price, pnl))
         return results
 
     def _real_result_from_history(self, signal: dict[str, Any]) -> tuple[str, float, float] | None:
@@ -210,13 +221,13 @@ class TradeManager:
         return result, float(close_price), pnl
 
     def check_real_results(self) -> list[tuple[dict[str, Any], str, float, float]]:
-        """نتیجه رئال فقط از وضعیت واقعی Toobit ثبت می‌شود.
+        """نتیجه رئال فقط از وضعیت واقعی Toobit و historyPositions ثبت می‌شود.
 
-        اگر پوزیشن هنوز باز است، نتیجه ثبت نمی‌شود. وقتی پوزیشن بسته شد، PnL از historyPositions خوانده می‌شود.
+        اگر پوزیشن هنوز باز است، نتیجه ثبت نمی‌شود.
+        اگر پوزیشن بسته شد ولی history هنوز آماده نبود، باز هم نتیجه ثبت نمی‌کنیم تا PnL واقعی بیاید.
         """
         results: list[tuple[dict[str, Any], str, float, float]] = []
         for signal in self.storage.active_real_signals():
-            # اگر سفارش هنوز تایید نشده/ندارد، چیزی ثبت نمی‌کنیم.
             if not signal.get("real_order"):
                 continue
             try:
@@ -227,25 +238,18 @@ class TradeManager:
             if position is not None:
                 continue
 
-            # پوزیشن بسته شده؛ حالا PnL دقیق را از تاریخچه توبیت بخوان.
+            # پوزیشن دیگر باز نیست؛ فقط وقتی historyPositions سود/ضرر واقعی را داد، نتیجه ثبت می‌شود.
             try:
                 history_result = self._real_result_from_history(signal)
             except Exception as exc:
                 logger.warning("خواندن history برای نتیجه واقعی %s ناموفق بود: %s", signal.get("symbol"), exc)
                 history_result = None
 
-            if history_result:
-                result, exit_price, pnl = history_result
-            else:
-                # fallback نادر: اگر history جواب نداد، از آخرین مارک/TP/SL فقط برای ثبت نتیجه استفاده می‌کنیم.
-                try:
-                    price = self.toobit.get_mark_price(signal["toobit_symbol"])
-                except Exception:
-                    price = float(signal.get("tp") or signal.get("entry") or 0)
-                result = hit_tp_sl(signal["side"], float(price), float(signal["tp"]), float(signal["sl"])) or ("TP" if self._signal_pnl(signal, price) >= 0 else "SL")
-                exit_price = float(price)
-                pnl = self._signal_pnl(signal, exit_price)
+            if not history_result:
+                logger.info("پوزیشن واقعی %s بسته شده ولی history/PnL هنوز آماده نیست؛ نتیجه ثبت نشد.", signal.get("symbol"))
+                continue
 
+            result, exit_price, pnl = history_result
             self.storage.update_signal(
                 signal["signal_id"],
                 real_result=result,

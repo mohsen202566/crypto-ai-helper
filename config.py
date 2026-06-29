@@ -184,6 +184,7 @@ MAX_POSITIONS_MAX = 100
 # -----------------------------
 STATE_FILE = DATA_DIR / "state.json"
 LOG_FILE = DATA_DIR / "bot.log"
+LOCK_FILE = DATA_DIR / "bot.lock"
 
 # -----------------------------
 # تنظیمات تأیید اجرای واقعی Toobit
