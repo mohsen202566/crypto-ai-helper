@@ -10,7 +10,7 @@ env/
 
 # Python
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
 *.pyd
 .Python
@@ -19,7 +19,7 @@ __pycache__/
 *.log
 logs/
 
-# Runtime data
+# Runtime data / AI memory / databases
 data/
 state_store.json
 *.db
