@@ -34,6 +34,10 @@ _ENV_KEYS = [
     "SYMBOL_ERROR_COOLDOWN_SECONDS",
     "RECV_WINDOW",
     "REQUEST_TIMEOUT",
+    "REAL_ORDER_MISSING_TO_NORMAL_SECONDS",
+    "REAL_HISTORY_FALLBACK_SECONDS",
+    "TOOBIT_PATH_ORDER_HISTORY",
+    "TOOBIT_PATH_ORDER_HISTORY_ALT",
 ]
 
 
@@ -192,3 +196,13 @@ LOCK_FILE = DATA_DIR / "bot.lock"
 TOOBIT_VERIFY_AFTER_ERROR_SECONDS = _get_int("TOOBIT_VERIFY_AFTER_ERROR_SECONDS", 70)
 TOOBIT_CLOSE_VERIFY_SECONDS = _get_float("TOOBIT_CLOSE_VERIFY_SECONDS", 2.0)
 TOOBIT_PLACE_REAL_TP = _get_bool("TOOBIT_PLACE_REAL_TP", True)
+
+# مانیتورینگ نتیجه رئال
+# اگر پیام رئال ثبت شد ولی real_order داخل state نیامد، بعد از این زمان به عادی تبدیل می‌شود تا گیر نکند.
+REAL_ORDER_MISSING_TO_NORMAL_SECONDS = _get_int("REAL_ORDER_MISSING_TO_NORMAL_SECONDS", 25)
+# اگر Toobit پوزیشن را بسته نشان داد ولی history/order history هنوز PnL نداد، بعد از این زمان fallback ثبت می‌شود.
+REAL_HISTORY_FALLBACK_SECONDS = _get_int("REAL_HISTORY_FALLBACK_SECONDS", 180)
+
+# مسیرهای قابل override برای تاریخچه توبیت
+TOOBIT_PATH_ORDER_HISTORY = _get_env("TOOBIT_PATH_ORDER_HISTORY", "/api/v1/futures/historyOrders")
+TOOBIT_PATH_ORDER_HISTORY_ALT = _get_env("TOOBIT_PATH_ORDER_HISTORY_ALT", "/api/v1/futures/order/history")
