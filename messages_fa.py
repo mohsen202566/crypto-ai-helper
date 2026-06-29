@@ -51,90 +51,58 @@ def signal_message(signal: dict[str, Any]) -> str:
     return text
 
 
-def normal_result_message(signal: dict[str, Any], result: str, price: float, pnl: float = 0.0) -> str:
+def _movement_percent(signal: dict[str, Any], price: float) -> float:
+    entry = float(signal.get("entry") or 0)
+    if entry <= 0:
+        return 0.0
+    if str(signal.get("side", "")).upper() == "BUY":
+        return (float(price) - entry) / entry * 100.0
+    return (entry - float(price)) / entry * 100.0
+
+
+def _signed(value: float, digits: int = 2) -> str:
+    sign = "+" if value >= 0 else ""
+    return f"{sign}{format_num(value, digits)}"
+
+
+def _result_message(signal: dict[str, Any], result: str, price: float, pnl: float, mode_fa: str, source_fa: str) -> str:
     side_fa = side_label(signal["side"])
-    pnl_text = f"{format_num(pnl, 4)} USDT"
+    move = _movement_percent(signal, price)
     if result == "TP":
-        return f"""✅ TP عادی / داخلی فعال شد — {signal['symbol']}
+        return f"""✅ TP خورد — {signal['symbol']}
 
-جهت سیگنال: {side_fa}
+نوع: {mode_fa}
+جهت: {side_fa}
 ورود: {format_num(signal['entry'])}
-قیمت برخورد: {format_num(price)}
-نتیجه درصدی: +{config.FIXED_TP_PERCENT:.2f}%
-سود/ضرر این نتیجه: +{pnl_text}
+خروج: {format_num(price)}
+حرکت: {_signed(move, 2)}%
+سود: {_signed(pnl, 4)} USDT
 
-دلیل خروج:
-قیمت طبق دیتای OKX به حد سود ثابت سیگنال رسید.
+دلیل:
+قیمت به حد سود ثابت رسید.
+منبع نتیجه: {source_fa}"""
 
-جزئیات:
-• حرکت در جهت سیگنال ادامه پیدا کرد
-• تارگت ثابت {config.FIXED_TP_PERCENT:.2f}% لمس شد
-• این نتیجه عادی/داخلی است و رئال Toobit نیست
+    return f"""❌ استاپ خورد — {signal['symbol']}
 
-منبع بررسی: OKX
-شناسه سیگنال: {signal['signal_id']}"""
-    return f"""❌ SL عادی / داخلی فعال شد — {signal['symbol']}
-
-جهت سیگنال: {side_fa}
+نوع: {mode_fa}
+جهت: {side_fa}
 ورود: {format_num(signal['entry'])}
-قیمت برخورد: {format_num(price)}
-نتیجه درصدی: -{config.FIXED_SL_PERCENT:.2f}%
-سود/ضرر این نتیجه: {pnl_text}
+خروج: {format_num(price)}
+حرکت: {_signed(move, 2)}%
+ضرر: {_signed(pnl, 4)} USDT
 
 دلیل استاپ:
-قیمت طبق دیتای OKX به محدوده حد ضرر ثابت سیگنال رسید.
+قیمت به حد ضرر ثابت رسید.
+مومنتوم برگشت و حرکت ادامه نداد.
+منبع نتیجه: {source_fa}"""
 
-جزئیات:
-• قیمت از ناحیه ورود برگشت
-• مومنتوم ادامه پیدا نکرد
-• سطح SL ثابت سیگنال لمس شد
-• این نتیجه عادی/داخلی است و رئال Toobit نیست
 
-منبع بررسی: OKX
-شناسه سیگنال: {signal['signal_id']}"""
+def normal_result_message(signal: dict[str, Any], result: str, price: float, pnl: float = 0.0) -> str:
+    return _result_message(signal, result, price, pnl, "عادی / داخلی", "OKX")
 
 
 def real_result_message(signal: dict[str, Any], result: str, price: float, pnl: float = 0.0) -> str:
-    side_fa = side_label(signal["side"])
-    pnl_text = f"{format_num(pnl, 4)} USDT"
-    if result == "TP":
-        return f"""✅ TP رئال Toobit فعال شد — {signal['symbol']}
-
-جهت سیگنال: {side_fa}
-ورود واقعی/ثبت‌شده: {format_num(signal['entry'])}
-قیمت خروج/برخورد: {format_num(price)}
-نتیجه درصدی: +{config.FIXED_TP_PERCENT:.2f}%
-سود/ضرر این نتیجه: +{pnl_text}
-
-دلیل خروج:
-پوزیشن واقعی/پیگیری‌شده در Toobit به محدوده حد سود ثابت رسید.
-
-جزئیات:
-• حرکت طبق جهت سیگنال ادامه پیدا کرد
-• قیمت به تارگت {config.FIXED_TP_PERCENT:.2f}% رسید
-• این نتیجه مخصوص معامله رئال Toobit است
-
-منبع نتیجه: Toobit
-شناسه سیگنال: {signal['signal_id']}"""
-    return f"""❌ SL رئال Toobit فعال شد — {signal['symbol']}
-
-جهت سیگنال: {side_fa}
-ورود واقعی/ثبت‌شده: {format_num(signal['entry'])}
-قیمت خروج/برخورد: {format_num(price)}
-نتیجه درصدی: -{config.FIXED_SL_PERCENT:.2f}%
-سود/ضرر این نتیجه: {pnl_text}
-
-دلیل استاپ:
-پوزیشن واقعی/پیگیری‌شده در Toobit به محدوده حد ضرر ثابت رسید.
-
-جزئیات:
-• قیمت مارک/آخرین قیمت توبیت به محدوده ضرر رسید
-• معامله طبق مدیریت ریسک ثابت بسته یا قابل ثبت به عنوان SL شد
-• علت خروج، برخورد به SL ثابت سیگنال است
-• این نتیجه مخصوص معامله رئال Toobit است
-
-منبع نتیجه: Toobit
-شناسه سیگنال: {signal['signal_id']}"""
+    return _result_message(signal, result, price, pnl, "رئال Toobit", "Toobit")
 
 
 def stats_message(stats: dict[str, Any]) -> str:

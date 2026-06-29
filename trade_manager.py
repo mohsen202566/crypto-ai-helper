@@ -23,7 +23,7 @@ class TradeManager:
 
     def check_toobit_connection(self) -> tuple[bool, str, dict[str, Any] | None]:
         if not self.toobit.has_credentials:
-            return False, "کلید API توبیت تنظیم نشده است", None
+            return False, "کلید API توبیت تنظیم نشده است یا فایل .env درست خوانده نشده است", None
         try:
             balance = self.toobit.get_usdt_balance_summary()
             return True, "اتصال Toobit برقرار است", balance
@@ -84,24 +84,35 @@ class TradeManager:
         self.stats.record_signal(signal.get("execution_mode", "NORMAL"))
         return signal
 
+    def _downgrade_real_to_normal(self, signal: dict[str, Any], reason: str) -> None:
+        self.storage.update_signal(
+            signal["signal_id"],
+            execution_mode="NORMAL",
+            execution_mode_fa="عادی / داخلی",
+            execution_reason=f"اجرای رئال انجام نشد؛ از اینجا به بعد نتیجه به‌صورت عادی پیگیری می‌شود. علت: {reason}",
+            real_error=reason,
+        )
+        self.stats.convert_real_signal_to_normal()
+
     def try_execute_real(self, signal: dict[str, Any], symbol_info: dict[str, Any] | None = None) -> tuple[bool, str, Any]:
         if str(signal.get("execution_mode") or "").upper() != "REAL":
             return False, signal.get("execution_reason", "سیگنال عادی است"), None
 
         settings = self.storage.get_settings()
         if not settings.get("trade_enabled"):
-            self.storage.update_signal(signal["signal_id"], real_error="ترید واقعی خاموش است")
-            return False, "ترید واقعی خاموش است", None
+            message = "ترید واقعی خاموش است"
+            self._downgrade_real_to_normal(signal, message)
+            return False, message, None
 
         if self.storage.count_open_real() >= int(settings.get("max_positions", 1)):
             message = "حداکثر تعداد پوزیشن باز پر شده است"
-            self.storage.update_signal(signal["signal_id"], execution_mode="NORMAL", execution_mode_fa="عادی / داخلی", real_error=message)
+            self._downgrade_real_to_normal(signal, message)
             return False, message, None
 
         ok, reason, _balance = self.check_toobit_connection()
         if not ok:
             self.stats.record_real_failed()
-            self.storage.update_signal(signal["signal_id"], real_error=reason)
+            self._downgrade_real_to_normal(signal, reason)
             return False, reason, None
 
         try:
@@ -128,13 +139,24 @@ class TradeManager:
             message = f"اجرای واقعی ناموفق بود: {exc}"
             logger.exception(message)
             self.stats.record_real_failed()
-            self.storage.update_signal(signal["signal_id"], real_error=message)
+            self._downgrade_real_to_normal(signal, message)
             return False, message, None
 
-    def _signal_pnl(self, signal: dict[str, Any], result: str) -> float:
+    @staticmethod
+    def _movement_percent(signal: dict[str, Any], exit_price: float) -> float:
+        entry = safe_float(signal.get("entry"), 0.0)
+        if entry <= 0:
+            return 0.0
+        if str(signal.get("side", "")).upper() == "BUY":
+            return (float(exit_price) - entry) / entry * 100.0
+        return (entry - float(exit_price)) / entry * 100.0
+
+    def _signal_pnl(self, signal: dict[str, Any], exit_price: float) -> float:
         trade_amount = float(signal.get("trade_amount_usdt") or self.storage.get_settings().get("trade_amount_usdt", config.DEFAULT_TRADE_AMOUNT_USDT))
-        raw_percent = config.FIXED_TP_PERCENT if result == "TP" else -config.FIXED_SL_PERCENT
-        return trade_amount * raw_percent / 100.0
+        leverage = int(signal.get("leverage") or self.storage.get_settings().get("leverage", config.DEFAULT_LEVERAGE))
+        movement = self._movement_percent(signal, exit_price)
+        notional = trade_amount * leverage
+        return notional * movement / 100.0
 
     def check_normal_results(self, symbol_prices: dict[str, float]) -> list[tuple[dict[str, Any], str, float, float]]:
         results: list[tuple[dict[str, Any], str, float, float]] = []
@@ -144,7 +166,7 @@ class TradeManager:
                 continue
             result = hit_tp_sl(signal["side"], float(price), float(signal["tp"]), float(signal["sl"]))
             if result:
-                pnl = self._signal_pnl(signal, result)
+                pnl = self._signal_pnl(signal, float(price))
                 self.storage.update_signal(
                     signal["signal_id"],
                     normal_result=result,
@@ -168,7 +190,7 @@ class TradeManager:
             result = hit_tp_sl(signal["side"], price, float(signal["tp"]), float(signal["sl"]))
             if not result:
                 continue
-            pnl = self._signal_pnl(signal, result)
+            pnl = self._signal_pnl(signal, float(price))
             self.storage.update_signal(
                 signal["signal_id"],
                 real_result=result,

@@ -19,6 +19,12 @@ class StatsManager:
             self.storage.inc_stat("normal_signals_total", 1)
             self.storage.inc_stat("normal_open", 1)
 
+    def convert_real_signal_to_normal(self) -> None:
+        """وقتی سیگنال اول رئال انتخاب شده ولی اجرای واقعی شکست می‌خورد، آمارش عادی شود."""
+        self.storage.inc_stat("real_signals_total", -1)
+        self.storage.inc_stat("normal_signals_total", 1)
+        self.storage.inc_stat("normal_open", 1)
+
     def record_real_open(self) -> None:
         self.storage.inc_stat("real_open", 1)
 

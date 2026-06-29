@@ -137,11 +137,12 @@ class TelegramBotService:
         parts = cmd.split()
         number = self._last_number(parts)
 
-        if cmd in ("start", "help", "راهنما", "کمک", "دستورات", "commands", "ترید"):
-            return help_message()
-
-        if cmd in ("پنل", "پنل ترید", "وضعیت", "وضعیت ترید", "panel", "status"):
+        # «ترید» باید پنل ترید بدهد، نه راهنما.
+        if cmd in ("ترید", "پنل", "پنل ترید", "وضعیت", "وضعیت ترید", "panel", "status"):
             return self._panel()
+
+        if cmd in ("start", "help", "راهنما", "کمک", "دستورات", "commands"):
+            return help_message()
 
         if cmd in ("آمار", "امار", "stats", "stat"):
             return stats_message(self.stats_manager.summary())
