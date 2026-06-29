@@ -184,3 +184,10 @@ MAX_POSITIONS_MAX = 100
 # -----------------------------
 STATE_FILE = DATA_DIR / "state.json"
 LOG_FILE = DATA_DIR / "bot.log"
+
+# -----------------------------
+# تنظیمات تأیید اجرای واقعی Toobit
+# -----------------------------
+TOOBIT_VERIFY_AFTER_ERROR_SECONDS = _get_int("TOOBIT_VERIFY_AFTER_ERROR_SECONDS", 70)
+TOOBIT_CLOSE_VERIFY_SECONDS = _get_float("TOOBIT_CLOSE_VERIFY_SECONDS", 2.0)
+TOOBIT_PLACE_REAL_TP = _get_bool("TOOBIT_PLACE_REAL_TP", True)
