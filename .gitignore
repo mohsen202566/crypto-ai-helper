@@ -1,4 +1,4 @@
-# Environment / secrets
+# Environment
 .env
 .env.*
 !.env.example
@@ -8,24 +8,18 @@ venv/
 .venv/
 env/
 
-# Python cache/build
+# Python
 __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
 .Python
-build/
-dist/
-*.egg-info/
 
-# Logs
+# Logs and runtime data
 *.log
 logs/
-
-# Runtime data / stats / local state
-bot_state.json
-state_store.json
 data/
+state_store.json
 *.db
 *.db-wal
 *.db-shm
@@ -42,10 +36,8 @@ data/
 *.tar.gz
 *.bak
 
-# IDE
+# IDE / OS
 .vscode/
 .idea/
-
-# OS
 .DS_Store
 Thumbs.db
