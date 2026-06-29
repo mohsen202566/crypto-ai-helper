@@ -1,4 +1,4 @@
-"""تلگرام بات با دستورات فارسی عادی، با اسلش و بدون اسلش."""
+"""تلگرام بات ساده با دستورات فارسی عادی، بدون الزام اسلش."""
 from __future__ import annotations
 
 import re
@@ -9,14 +9,7 @@ from typing import Any
 import requests
 
 from . import config
-from .messages_fa import (
-    balance_message,
-    help_message,
-    panel_message,
-    positions_message,
-    stats_message,
-    toobit_status_message,
-)
+from .messages_fa import balance_message, help_message, panel_message, positions_message, stats_message
 from .storage import JSONStorage
 from .trade_manager import TradeManager
 from .utils import logger, safe_float, safe_int, validate_range
@@ -99,99 +92,102 @@ class TelegramBotService:
     @staticmethod
     def _normalize(text: str) -> str:
         text = str(text or "").strip()
+        text = text.replace("/", " ").replace("_", " ").replace("‌", " ")
         text = text.replace("ي", "ی").replace("ك", "ک")
-        text = text.replace("‌", " ")
-        text = text.replace("/", " ").replace("_", " ").replace("-", " ")
-        text = re.sub(r"\s+", " ", text).strip().lower()
-        return text
+        text = re.sub(r"\s+", " ", text)
+        return text.strip().lower()
 
     @staticmethod
-    def _last_number(text: str) -> str | None:
-        m = re.findall(r"\d+(?:\.\d+)?", text)
-        return m[-1] if m else None
+    def _last_number(parts: list[str]) -> str | None:
+        if not parts:
+            return None
+        raw = parts[-1].replace(",", ".")
+        try:
+            float(raw)
+            return raw
+        except Exception:
+            return None
 
     def _panel(self) -> str:
         balance, balance_err = self.trade_manager.get_balance_safe()
         positions, pos_err = self.trade_manager.get_positions_safe()
-        toobit_status = self.trade_manager.get_toobit_status_safe(balance=balance, balance_error=balance_err)
+        today_pnl, today_err = self.trade_manager.get_today_pnl_safe()
+        toobit_ok = balance_err is None
         symbols_count = len(self.storage.get_validated_symbols() or config.WATCHLIST)
+        errors = []
+        if balance_err:
+            errors.append(f"موجودی/اتصال: {balance_err}")
+        if pos_err:
+            errors.append(f"پوزیشن‌ها: {pos_err}")
+        if today_err:
+            errors.append(f"سود امروز: {today_err}")
         return panel_message(
             self.storage.get_settings(),
             self.stats_manager.summary(),
             balance,
             positions,
             symbols_count,
-            toobit_status,
-            errors=[e for e in (balance_err, pos_err) if e],
-        )
-
-    def _enable_real_trading(self) -> str:
-        ok, status = self.trade_manager.check_toobit_connection()
-        if not ok:
-            self.storage.update_setting("trade_enabled", False)
-            return (
-                "❌ ترید واقعی روشن نشد.\n"
-                "اتصال Toobit یا کلید API مشکل دارد.\n\n"
-                f"جزئیات: {status.get('message', 'نامشخص')}\n\n"
-                "تا وقتی Toobit وصل نباشد، سیگنال‌ها فقط عادی/داخلی ثبت می‌شوند."
-            )
-        self.storage.update_setting("trade_enabled", True)
-        return (
-            "✅ ترید واقعی فعال شد.\n"
-            "اتصال Toobit بررسی شد و پاسخ داد.\n"
-            "اگر اسلات پوزیشن خالی باشد، سیگنال‌های بعدی به‌صورت رئال روی Toobit اجرا می‌شوند."
-        )
-
-    def _disable_real_trading(self) -> str:
-        self.storage.update_setting("trade_enabled", False)
-        return (
-            "⛔ ترید واقعی خاموش شد.\n"
-            "ربات همچنان تحلیل می‌کند و سیگنال می‌دهد، اما سیگنال‌ها عادی/داخلی ثبت می‌شوند."
+            toobit_ok=toobit_ok,
+            toobit_error="\n".join(errors) if errors else None,
+            today_pnl=today_pnl,
         )
 
     def handle_command(self, text: str) -> str:
-        raw = str(text or "").strip()
-        cmd = self._normalize(raw)
-        number = self._last_number(cmd)
+        cmd = self._normalize(text)
+        parts = cmd.split()
+        number = self._last_number(parts)
 
-        # راهنما و پنل
-        if cmd in {"start", "help", "راهنما", "کمک", "دستورات", "لیست دستورات"}:
+        if cmd in ("start", "help", "راهنما", "کمک", "دستورات", "commands", "ترید"):
             return help_message()
-        if cmd in {"پنل", "پنل ترید", "وضعیت", "وضعیت ربات", "status", "panel", "ترید"}:
+
+        if cmd in ("پنل", "پنل ترید", "وضعیت", "وضعیت ترید", "panel", "status"):
             return self._panel()
 
-        # آمار
-        if cmd in {"آمار", "امار", "stats", "stat"}:
+        if cmd in ("آمار", "امار", "stats", "stat"):
             return stats_message(self.stats_manager.summary())
-        if cmd in {"حذف آمار", "حذف امار", "پاک کردن آمار", "پاک کردن امار", "ریست آمار", "ریست امار", "reset stats"}:
+
+        if cmd in ("حذف آمار", "حذف امار", "پاک کردن آمار", "پاک کردن امار", "ریست آمار", "ریست امار", "reset stats"):
             self.stats_manager.reset()
-            return "⚠️ آمار ربات حذف شد.\nآمار سیگنال‌ها، TP/SL عادی، TP/SL رئال و سود/ضرر کل از صفر شروع می‌شود."
+            return "⚠️ آمار ربات حذف شد.\nآمار سیگنال‌ها، TP/SL عادی، TP/SL واقعی، سود/ضرر و سیگنال‌های باز از صفر شروع می‌شود."
 
-        # روشن/خاموش کردن ترید واقعی و Toobit
-        enable_phrases = {
-            "ترید فعال", "ترید روشن", "فعال کردن ترید", "روشن کردن ترید",
-            "ترید رئال فعال", "ترید واقعی فعال", "معامله فعال", "معامله واقعی فعال",
-            "توبیت روشن", "توبیت فعال", "فعال کردن توبیت", "روشن کردن توبیت",
-            "trade on", "real on", "toobit on",
-        }
-        disable_phrases = {
-            "ترید خاموش", "ترید غیر فعال", "ترید غیرفعال", "خاموش کردن ترید", "غیر فعال کردن ترید", "غیرفعال کردن ترید",
-            "ترید رئال خاموش", "ترید واقعی خاموش", "معامله خاموش", "معامله واقعی خاموش",
-            "توبیت خاموش", "توبیت غیر فعال", "توبیت غیرفعال", "خاموش کردن توبیت",
-            "trade off", "real off", "toobit off",
-        }
-        if cmd in enable_phrases:
-            return self._enable_real_trading()
-        if cmd in disable_phrases:
-            return self._disable_real_trading()
+        if cmd in ("موجودی", "بالانس", "مارجین", "balance", "margin"):
+            balance, err = self.trade_manager.get_balance_safe()
+            if err:
+                return f"❌ اتصال یا دریافت موجودی Toobit ناموفق بود:\n{err}"
+            return balance_message(balance or {})
 
-        # وضعیت Toobit
-        if cmd in {"چک توبیت", "تست توبیت", "وضعیت توبیت", "اتصال توبیت", "toobit", "toobit status"}:
-            ok, status = self.trade_manager.check_toobit_connection()
-            return toobit_status_message(status, ok)
+        if cmd in ("پوزیشن", "پوزیشن ها", "پوزیشن‌ها", "positions"):
+            positions, err = self.trade_manager.get_positions_safe()
+            if err:
+                return f"❌ دریافت پوزیشن‌های Toobit ناموفق بود:\n{err}"
+            return positions_message(positions)
 
-        # تنظیمات عددی ترید
-        if cmd.startswith(("دلار ترید", "مقدار ترید", "مارجین ترید", "حجم ترید", "trade amount")):
+        if cmd in ("چک توبیت", "تست توبیت", "بررسی توبیت", "اتصال توبیت", "toobit check"):
+            ok, msg, balance = self.trade_manager.check_toobit_connection()
+            positions, pos_err = self.trade_manager.get_positions_safe()
+            if not ok:
+                self.storage.update_setting("trade_enabled", False)
+                return f"❌ اتصال Toobit برقرار نیست. ترید واقعی خاموش شد.\n\nخطا:\n{msg}"
+            out = "✅ اتصال Toobit برقرار است.\n\n" + balance_message(balance or {})
+            if pos_err:
+                out += f"\n⚠️ دریافت پوزیشن‌ها ناموفق بود:\n{pos_err}"
+            else:
+                out += f"\n📌 تعداد پوزیشن‌های باز: {len(positions)}"
+            return out
+
+        if cmd in ("ترید فعال", "ترید روشن", "فعال کردن ترید", "روشن کردن ترید", "توبیت روشن", "معامله فعال", "trade on"):
+            ok, msg, _balance = self.trade_manager.check_toobit_connection()
+            if not ok:
+                self.storage.update_setting("trade_enabled", False)
+                return f"❌ ترید واقعی فعال نشد.\nاول باید اتصال Toobit درست باشد.\n\nخطا:\n{msg}"
+            self.storage.update_setting("trade_enabled", True)
+            return "✅ ترید واقعی فعال شد.\nاز این به بعد اگر سیگنال معتبر باشد و اسلات پوزیشن خالی باشد، معامله واقعی روی Toobit باز می‌شود."
+
+        if cmd in ("ترید خاموش", "ترید غیر فعال", "ترید غیرفعال", "خاموش کردن ترید", "غیر فعال کردن ترید", "توبیت خاموش", "معامله خاموش", "trade off"):
+            self.storage.update_setting("trade_enabled", False)
+            return "⛔ ترید واقعی خاموش شد.\nربات همچنان تحلیل می‌کند و اگر سیگنال صادر شود، آن را فقط عادی/داخلی پیگیری می‌کند."
+
+        if cmd.startswith(("دلار ترید", "مقدار ترید", "مارجین ترید", "trade amount")):
             if number is None:
                 return "❌ مقدار دلار ترید را وارد کن.\nمثال: دلار ترید 10"
             value = safe_float(number, -1)
@@ -199,7 +195,7 @@ class TelegramBotService:
             if not ok:
                 return msg
             self.storage.update_setting("trade_amount_usdt", value)
-            return f"✅ مقدار هر ترید تنظیم شد.\nمقدار جدید: {value:g} USDT\nمحدوده مجاز: 1 تا 10000 USDT"
+            return f"✅ مقدار ترید تنظیم شد.\nمقدار جدید هر معامله: {value:g} USDT"
 
         if cmd.startswith(("لوریج ترید", "لوریج", "leverage")):
             if number is None:
@@ -209,9 +205,9 @@ class TelegramBotService:
             if not ok:
                 return msg
             self.storage.update_setting("leverage", value)
-            return f"✅ لوریج ترید تنظیم شد.\nلوریج جدید: {value}x\nمحدوده مجاز: 1x تا 100x"
+            return f"✅ لوریج ترید تنظیم شد.\nلوریج جدید: {value}x"
 
-        if cmd.startswith(("حداکثر پوزیشن", "حد اکثر پوزیشن", "حداکثر پوزیشن همزمان", "max positions")):
+        if cmd.startswith(("حداکثر پوزیشن", "حد اکثر پوزیشن", "max positions")):
             if number is None:
                 return "❌ تعداد حداکثر پوزیشن را وارد کن.\nمثال: حداکثر پوزیشن 3"
             value = safe_int(number, -1)
@@ -219,25 +215,25 @@ class TelegramBotService:
             if not ok:
                 return msg
             self.storage.update_setting("max_positions", value)
-            return f"✅ حداکثر پوزیشن تنظیم شد.\nحداکثر پوزیشن رئال همزمان: {value}\nمحدوده مجاز: 1 تا 100"
+            return f"✅ حداکثر پوزیشن تنظیم شد.\nحداکثر پوزیشن رئال همزمان: {value}"
 
-        # موجودی، مارجین، پوزیشن، سود امروز
-        if cmd in {"موجودی", "بالانس", "مارجین", "موجودی توبیت", "مارجین توبیت", "balance"}:
-            balance, err = self.trade_manager.get_balance_safe()
-            if err:
-                return f"⚠️ دریافت موجودی/مارجین Toobit ناموفق بود:\n{err}"
-            return balance_message(balance or {})
+        if cmd in ("سود امروز", "ضرر امروز", "سود ضرر", "سود و ضرر", "pnl today", "today pnl"):
+            stats = self.stats_manager.summary()
+            balance, _err = self.trade_manager.get_balance_safe()
+            today_pnl, today_err = self.trade_manager.get_today_pnl_safe()
+            balance = balance or {}
+            today_txt = f"{today_pnl:.4f} USDT" if today_pnl is not None else f"نامشخص ({today_err})"
+            return f"""💰 سود و ضرر ربات
 
-        if cmd in {"پوزیشن", "پوزیشن ها", "پوزیشن‌ها", "پوزیشن توبیت", "positions"}:
-            positions, err = self.trade_manager.get_positions_safe()
-            if err:
-                return f"⚠️ دریافت پوزیشن‌ها ناموفق بود:\n{err}"
-            return positions_message(positions)
+سود/ضرر عادی ثبت‌شده: {stats.get('normal_pnl', 0):.4f} USDT
+سود/ضرر رئال ثبت‌شده: {stats.get('real_pnl', 0):.4f} USDT
+جمع سود/ضرر ثبت‌شده: {stats.get('total_pnl', 0):.4f} USDT
+سود/ضرر شناور Toobit: {balance.get('unrealized_pnl', 0):.4f} USDT
+سود/ضرر امروز Toobit: {today_txt}
 
-        if cmd in {"سود امروز", "ضرر امروز", "سود ضرر امروز", "سود و ضرر امروز", "pnl today", "today pnl"}:
-            pnl, err = self.trade_manager.get_today_pnl_safe()
-            if err:
-                return f"⚠️ دریافت سود/ضرر امروز Toobit ناموفق بود:\n{err}"
-            return f"📅 سود/ضرر امروز Toobit\n\nسود/ضرر امروز: {pnl:.4f} USDT"
+TP واقعی: {int(stats.get('real_tp', 0))}
+SL واقعی: {int(stats.get('real_sl', 0))}
+اجرای ناموفق: {int(stats.get('real_failed', 0))}
+"""
 
         return "دستور نامشخص است. برای دیدن دستورات بنویس: راهنما"

@@ -1,4 +1,4 @@
-"""مدیریت آمار عادی و رئال Toobit."""
+"""مدیریت آمار عادی و واقعی."""
 from __future__ import annotations
 
 from typing import Any
@@ -10,13 +10,14 @@ class StatsManager:
     def __init__(self, storage: JSONStorage):
         self.storage = storage
 
-    def record_signal(self, signal_mode: str = "NORMAL") -> None:
+    def record_signal(self, mode: str = "NORMAL") -> None:
+        mode = str(mode or "NORMAL").upper()
         self.storage.inc_stat("signals_total", 1)
-        if str(signal_mode).upper() == "REAL":
-            self.storage.inc_stat("signals_real", 1)
+        if mode == "REAL":
+            self.storage.inc_stat("real_signals_total", 1)
         else:
-            self.storage.inc_stat("signals_normal", 1)
-        self.storage.inc_stat("normal_open", 1)
+            self.storage.inc_stat("normal_signals_total", 1)
+            self.storage.inc_stat("normal_open", 1)
 
     def record_real_open(self) -> None:
         self.storage.inc_stat("real_open", 1)
@@ -45,14 +46,9 @@ class StatsManager:
 
     def summary(self) -> dict[str, Any]:
         stats = self.storage.get_stats()
-        # سازگاری با state قدیمی
-        stats.setdefault("signals_normal", 0)
-        stats.setdefault("signals_real", 0)
-        stats.setdefault("normal_pnl", 0.0)
-        stats.setdefault("real_pnl", 0.0)
         normal_done = stats.get("normal_tp", 0) + stats.get("normal_sl", 0)
         real_done = stats.get("real_tp", 0) + stats.get("real_sl", 0)
         stats["normal_winrate"] = (stats.get("normal_tp", 0) / normal_done * 100) if normal_done else 0.0
         stats["real_winrate"] = (stats.get("real_tp", 0) / real_done * 100) if real_done else 0.0
-        stats["total_pnl"] = float(stats.get("normal_pnl", 0.0)) + float(stats.get("real_pnl", 0.0))
+        stats["total_pnl"] = float(stats.get("normal_pnl", 0.0) or 0.0) + float(stats.get("real_pnl", 0.0) or 0.0)
         return stats

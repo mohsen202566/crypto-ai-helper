@@ -22,8 +22,8 @@ def _default_state() -> dict[str, Any]:
         },
         "stats": {
             "signals_total": 0,
-            "signals_normal": 0,
-            "signals_real": 0,
+            "normal_signals_total": 0,
+            "real_signals_total": 0,
             "normal_tp": 0,
             "normal_sl": 0,
             "normal_open": 0,
@@ -60,13 +60,15 @@ class JSONStorage:
             default = _default_state()
             for key, val in default.items():
                 if key not in data:
-                    data[key] = val
+                    data[key] = copy.deepcopy(val)
             for key, val in default["settings"].items():
                 data["settings"].setdefault(key, val)
             for key, val in default["stats"].items():
                 data["stats"].setdefault(key, val)
             data.setdefault("signals", {})
-            data.setdefault("runtime", default["runtime"])
+            data.setdefault("runtime", copy.deepcopy(default["runtime"]))
+            data["runtime"].setdefault("last_symbol_errors", {})
+            data["runtime"].setdefault("validated_symbols", {})
             return data
         except Exception:
             backup = self.path.with_suffix(".broken.json")
@@ -104,7 +106,11 @@ class JSONStorage:
 
     def inc_stat(self, key: str, amount: float = 1) -> None:
         with self._lock:
-            self.state["stats"][key] = self.state["stats"].get(key, 0) + amount
+            current = self.state["stats"].get(key, 0)
+            self.state["stats"][key] = current + amount
+            # شمارنده‌های باز منفی نشوند
+            if key in ("normal_open", "real_open") and self.state["stats"][key] < 0:
+                self.state["stats"][key] = 0
             self.save()
 
     def reset_stats(self, clear_signals: bool = True) -> None:
@@ -135,23 +141,44 @@ class JSONStorage:
             return copy.deepcopy(self.state["signals"])
 
     def active_signals(self) -> list[dict[str, Any]]:
+        """فقط سیگنال‌های عادی/داخلی که هنوز TP/SL عادی نگرفته‌اند."""
         with self._lock:
-            return [copy.deepcopy(s) for s in self.state["signals"].values() if not s.get("normal_result")]
+            out = []
+            for s in self.state["signals"].values():
+                mode = str(s.get("execution_mode") or "NORMAL").upper()
+                if mode == "NORMAL" and not s.get("normal_result"):
+                    out.append(copy.deepcopy(s))
+            return out
 
     def active_real_signals(self) -> list[dict[str, Any]]:
+        """فقط سیگنال‌های رئال که سفارش واقعی دارند و هنوز نتیجه رئال نگرفته‌اند."""
         with self._lock:
-            return [copy.deepcopy(s) for s in self.state["signals"].values() if s.get("real_order") and not s.get("real_result")]
+            out = []
+            for s in self.state["signals"].values():
+                mode = str(s.get("execution_mode") or "NORMAL").upper()
+                if mode == "REAL" and s.get("real_order") and not s.get("real_result"):
+                    out.append(copy.deepcopy(s))
+            return out
 
     def has_active_symbol(self, internal_symbol: str) -> bool:
         with self._lock:
             for s in self.state["signals"].values():
-                if s.get("symbol") == internal_symbol and not s.get("normal_result"):
+                if s.get("symbol") != internal_symbol:
+                    continue
+                mode = str(s.get("execution_mode") or "NORMAL").upper()
+                if mode == "NORMAL" and not s.get("normal_result"):
+                    return True
+                if mode == "REAL" and s.get("real_order") and not s.get("real_result"):
                     return True
             return False
 
     def count_open_real(self) -> int:
         with self._lock:
-            return sum(1 for s in self.state["signals"].values() if s.get("real_order") and not s.get("real_result"))
+            return sum(
+                1
+                for s in self.state["signals"].values()
+                if str(s.get("execution_mode") or "").upper() == "REAL" and s.get("real_order") and not s.get("real_result")
+            )
 
     def set_validated_symbols(self, mapping: dict[str, Any]) -> None:
         with self._lock:

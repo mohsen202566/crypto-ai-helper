@@ -128,41 +128,38 @@ class ToobitClient:
 
     def get_usdt_balance_summary(self) -> dict[str, float]:
         balances = self.get_balance()
-        usdt = next((b for b in balances if str(b.get("coin") or b.get("asset") or b.get("currency") or "").upper() == "USDT"), {})
-
-        def first_float(*keys: str) -> float:
-            for key in keys:
-                if key in usdt and usdt.get(key) not in (None, ""):
-                    return safe_float(usdt.get(key))
-            return 0.0
-
+        usdt = next((b for b in balances if str(b.get("coin") or b.get("asset") or "").upper() == "USDT"), {})
         return {
-            "balance": first_float("balance", "walletBalance", "totalWalletBalance", "equity", "total"),
-            "available": first_float("availableBalance", "available", "free", "maxWithdrawAmount"),
-            "position_margin": first_float("positionMargin", "positionInitialMargin", "maintMargin"),
-            "order_margin": first_float("orderMargin", "openOrderInitialMargin"),
-            "unrealized_pnl": first_float("crossUnRealizedPnl", "unrealizedPnl", "unRealizedPnl"),
-            "coupon": first_float("coupon"),
+            "balance": safe_float(usdt.get("balance") or usdt.get("walletBalance") or usdt.get("totalWalletBalance")),
+            "available": safe_float(usdt.get("availableBalance") or usdt.get("available") or usdt.get("free")),
+            "position_margin": safe_float(usdt.get("positionMargin") or usdt.get("positionInitialMargin")),
+            "order_margin": safe_float(usdt.get("orderMargin") or usdt.get("openOrderInitialMargin")),
+            "unrealized_pnl": safe_float(usdt.get("crossUnRealizedPnl") or usdt.get("unrealizedPnl") or usdt.get("unrealizedProfit")),
+            "coupon": safe_float(usdt.get("coupon")),
         }
 
     def get_today_pnl(self) -> float:
+        """دریافت سود/ضرر امروز از Toobit اگر endpoint حساب پشتیبانی کند."""
         payload = self._request("GET", "/api/v1/futures/todayPnl", signed=True)
         data = payload.get("data") if isinstance(payload, dict) else payload
         if isinstance(data, dict):
-            for key in ("todayPnl", "pnl", "profit", "realizedPnl", "totalPnl", "income"):
+            for key in ("todayPnl", "pnl", "realizedPnl", "totalPnl", "profit"):
                 if key in data:
                     return safe_float(data.get(key))
         if isinstance(data, list):
             total = 0.0
+            found = False
             for item in data:
                 if isinstance(item, dict):
-                    for key in ("todayPnl", "pnl", "profit", "realizedPnl", "income"):
+                    for key in ("todayPnl", "pnl", "realizedPnl", "totalPnl", "profit"):
                         if key in item:
                             total += safe_float(item.get(key))
+                            found = True
                             break
-            return total
+            if found:
+                return total
         if isinstance(payload, dict):
-            for key in ("todayPnl", "pnl", "profit", "realizedPnl", "totalPnl", "income"):
+            for key in ("todayPnl", "pnl", "realizedPnl", "totalPnl", "profit"):
                 if key in payload:
                     return safe_float(payload.get(key))
         return 0.0
