@@ -1,75 +1,135 @@
-# AI Helper Hunter Bot v2
+# Crypto AI Helper 1H Soft AI
 
-ربات شکارچی شروع حرکت + AI واقعی + اجرای هماهنگ با Toobit.
+ربات Crypto Futures یک‌ساعته با تحلیل OKX و اجرای واقعی فقط روی Toobit.
 
-## قفل‌های اصلی
+این نسخه از منطق Soft AI نسخه ۵ دقیقه‌ای ساخته شده، اما برای اسکالپ ۱ ساعته هماهنگ شده است:
 
-- 14 ارز ترید: SOL, XRP, DOGE, ADA, LTC, BCH, LINK, AVAX, DOT, TRX, SUI, NEAR, APT, INJ
-- BTC/ETH فقط برای Market Context
-- اسکن کامل هر 60 ثانیه
-- اسکن Watchlist هر 15 ثانیه؛ واچ‌لیست اولویت شکار است
-- حداقل امتیاز سیگنال: 75
-- Watch زود و نرم فعال می‌شود؛ پیام «نزدیک ورود» فقط وقتی واقعاً نزدیک تریگر است و با کول‌داون ۱۰ دقیقه‌ای می‌آید
-- AI Confidence و AI Experience در پیام سیگنال
-- حداقل سود دلاری و درصدی قابل تنظیم
-- اسلات‌های real/reserved/opening/opened هماهنگ با چک 70 ثانیه‌ای Toobit
-- خطای یک نماد فقط همان نماد را skip یا موقتاً غیرفعال می‌کند
+- تایم اصلی تصمیم: `1H`
+- کانتکست روند: `4H`
+- ورود دقیق‌تر: `30m` و تایید کوتاه‌تر `15m`
+- مانیتور TP/SL: هر ۱۰ ثانیه
+- Full Scan: هر ۵ دقیقه
+- Watch Scan: هر ۳۰ ثانیه
+- دیتای تحلیل: OKX
+- اجرای واقعی: Toobit Futures
 
-## دستورات
+## قانون اصلی AI
 
-```text
-پنل
-وضعیت
-ترید
-آمار
-آمار 7
-هوش مصنوعی
-Ai
-هوش
-مصنوعی
-ترید فعال
-ترید خاموش
-ترید دلار 20
-ترید لوریج 10
-حداکثر پوزیشن 3
-حداقل سود 1
-درصد سود 0.10
-حذف آمار
-حذف آمار تایید
-ریست یادگیری
-ریست یادگیری تایید
-راهنما
-```
+بجز کنترل‌های پنل ترید، همه چیز زیر تصمیم نرم و یادگیرنده AI است.
 
-## نصب
+کنترل‌های کاربر:
+
+- ترید روشن/خاموش
+- دلار/مارجین هر معامله
+- لوریج
+- حداکثر پوزیشن/اسلات
+
+تصمیم‌های AI:
+
+- Watch / Normal / Real
+- Threshold سیگنال
+- Threshold واقعی
+- Entry Precision
+- Entry Quality
+- TP/SL
+- Early Exit
+- Pattern وزن‌دهی
+- Noise / Market Mode
+- Real Block یا Normal شدن
+- سخت/نرم شدن برای هر ارز، جهت، الگو، بازه امتیاز، و حالت بازار
+
+هیچ reject تحلیلی خشک وجود ندارد. ضعف تحلیلی فقط تبدیل می‌شود به Watch، Normal، Internal Learning یا Real Block. فقط Safety اجرای واقعی hard است: API، اسلات، duplicate، sync قیمت OKX/Toobit، net profit واقعی، و تایید سفارش Toobit.
+
+## اندیکاتورهای 1H
+
+این نسخه اندیکاتورها را برای ۱ ساعت هماهنگ کرده است:
+
+- EMA 20 / 50 / 200
+- RSI 14
+- MACD 12/26/9
+- ADX 14 + DI+/DI-
+- ATR 14
+- Bollinger Bands 20/2
+- Relative Volume
+- Rolling VWAP 24 کندلی
+- حمایت/مقاومت و Order Block روی ساختار 1H
+
+## ارزهای فعال ۱۲تایی
+
+- SOL
+- XRP
+- DOGE
+- AVAX
+- LINK
+- ADA
+- SUI
+- LTC
+- NEAR
+- APT
+- ARB
+- OP
+
+BTC و ETH برای context بازار استفاده می‌شوند، نه سیگنال اصلی.
+
+## Threshold شروع
+
+این‌ها فقط مقدار شروع‌اند، نه قانون دائمی:
+
+- `BASE_SIGNAL_THRESHOLD=68`
+- `BASE_REAL_THRESHOLD=76`
+
+بعد از یادگیری، AI برای هر symbol + direction + pattern + entry_quality + market_mode + score bucket خودش تنظیم می‌کند.
+
+## دستورات تلگرام
+
+- `پنل`
+- `آمار`
+- `آمار 7`
+- `هوش`
+- `یادگیری`
+- `پیشنهاد`
+- `ارزها`
+- `شکار`
+- `زنده`
+- `ردها`
+- `سیگنال‌ها`
+- `ترید روشن`
+- `ترید خاموش`
+- `ترید دلار 20`
+- `ترید لوریج 10`
+- `حداکثر پوزیشن 3`
+- `حذف آمار`
+- `ریست یادگیری`
+- `راهنما`
+
+## نصب روی VPS
 
 ```bash
-cd /root
-cp -r /root/crypto-ai-helper /root/crypto-ai-helper-backup-$(date +%F-%H%M)
-# فایل‌های این نسخه را داخل /root/crypto-ai-helper جایگزین کن
-cd /root/crypto-ai-helper
-/root/crypto-ai-helper/venv/bin/python -m py_compile *.py
-systemctl restart crypto-bot.service
-journalctl -u crypto-bot -n 100 --no-pager
+cd /root/crypto-ai-helper-1h
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+nano .env
+python3 -m py_compile *.py
+python3 main.py
 ```
 
-## نکته امنیتی
+برای systemd از سرویس فعلی پروژه می‌توانی فقط مسیر پوشه و نام سرویس را تغییر بدهی.
 
-`.env` را عمومی نکن. توکن تلگرام و کلیدهای Toobit نباید داخل لاگ یا پیام دیده شوند.
+## چک زنده DB
 
+```bash
+sqlite3 -header -column data/crypto_ai_helper_1h.sqlite3 \
+"select id,created_at,symbol_name,direction,score,threshold,real_threshold,signal_type,real_status,status,entry_quality,message_id from signals order by id desc limit 20;"
+```
 
-## اصلاح شکار
+```bash
+sqlite3 -header -column data/crypto_ai_helper_1h.sqlite3 \
+"select symbol_name,direction,score,ai_confidence,updated_at,expires_at from watchlist order by score desc;"
+```
 
-فیلتر جداگانه ورود دیر حذف شده است. تشخیص مناسب بودن نقطه ورود فقط با تکنیکال، کندل، Entry Stage و Watchlist انجام می‌شود. Watch قبل از شرط‌های سخت سود/ریسک فعال می‌شود تا فرصت شکار از دست نرود.
+## پیشنهاد دلار/لوریج
 
-
-## اصلاح ضد اسپم Watch
-
-- Scanner فقط Watch را ثبت می‌کند و پیام تلگرام نمی‌فرستد.
-- پیام «نزدیک ورود» فقط از Watch Loop و فقط وقتی score >= 72، Entry Stage <= 28%، TP/SL و حداقل سود پاس شده باشد ارسال می‌شود.
-- Cooldown پیام‌ها از جدول watchlist جدا شده و در watch_alerts ذخیره می‌شود، پس حذف/ساخت دوباره Watch باعث اسپم نمی‌شود.
-- Watch با یک اسکن ضعیف حذف نمی‌شود؛ تا زمان انقضا زیر نظر می‌ماند و فقط با سیگنال نهایی یا اتمام زمان پاک می‌شود.
-
-## محاسبه سود
-
-سود تخمینی با Notional = margin × leverage حساب می‌شود. از حرکت خام تا TP، کارمزد رفت‌وبرگشت، اسپرد و اسلیپیج کم می‌شود و سپس هم حداقل سود دلاری و هم حداقل درصد سود بررسی می‌شود.
+AI می‌تواند بر اساس نتایج ۱ ساعته، سود خالص Real، MAE/MFE و TP/SL پیشنهاد بدهد که دلار هر پوزیشن یا لوریج بهتر است کمتر/بیشتر شود.
+این فقط پیشنهاد است؛ ربات هیچ‌وقت مارجین، لوریج، اسلات یا Trading ON/OFF را خودش تغییر نمی‌دهد. اعمال تغییر فقط با دستور پنل انجام می‌شود.

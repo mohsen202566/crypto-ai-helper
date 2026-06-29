@@ -123,6 +123,16 @@ class OpenOrderResult:
 
 
 @dataclass(frozen=True)
+class ClosePositionResult:
+    symbol: str
+    direction: Direction
+    closed: bool
+    order_id: str | None
+    reason: str
+    raw: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
 class HistoryPositionInfo:
     symbol: str
     side: Direction | None
@@ -147,6 +157,7 @@ class ToobitClient:
         self.path_exchange_info = _env_first("TOOBIT_PATH_EXCHANGE_INFO", "TOBIT_PATH_EXCHANGE_INFO", default="/api/v1/futures/exchangeInfo")
         self.path_history_positions = _env_first("TOOBIT_PATH_HISTORY_POSITIONS", "TOBIT_PATH_HISTORY_POSITIONS", default="/api/v1/futures/historyPositions")
         self.path_today_pnl = _env_first("TOOBIT_PATH_TODAY_PNL", "TOBIT_PATH_TODAY_PNL", default="/api/v1/futures/todayPnl")
+        self.path_close_order = _env_first("TOOBIT_PATH_CLOSE_ORDER", "TOBIT_PATH_CLOSE_ORDER", default=self.path_order)
         self.param_tp = _env_first("TOOBIT_PARAM_TP", "TOBIT_PARAM_TP", default="takeProfit")
         self.param_sl = _env_first("TOOBIT_PARAM_SL", "TOBIT_PARAM_SL", default="stopLoss")
 
@@ -268,7 +279,7 @@ class ToobitClient:
             "type": "LIMIT",
             "priceType": "MARKET",
             "valueQuantity": _decimal_to_api(notional),
-            "newClientOrderId": f"scalp5_{int(time.time() * 1000)}",
+            "newClientOrderId": f"ai1h_{int(time.time() * 1000)}",
             self.param_tp: _decimal_to_api(tp_decimal),
             self.param_sl: _decimal_to_api(sl_decimal),
             "tpTriggerBy": "CONTRACT_PRICE",
@@ -317,6 +328,34 @@ class ToobitClient:
             reason=f"سفارش ارسال شد و بعد از تایید {self.config.verify_after_error_seconds} ثانیه‌ای وضعیت پوزیشن بررسی شد.",
             raw=raw if isinstance(raw, dict) else {"response": raw},
         )
+
+    def close_position_market(self, *, symbol: str, direction: Direction) -> ClosePositionResult:
+        symbol = symbol.upper()
+        _validate_direction(direction)
+        positions = [p for p in self.get_open_positions(symbol) if p.side == direction and p.quantity > 0]
+        if not positions:
+            return ClosePositionResult(symbol=symbol, direction=direction, closed=True, order_id=None, reason="پوزیشن بازی برای بستن پیدا نشد.")
+        quantity = Decimal(str(positions[0].quantity))
+        side = "SELL_CLOSE" if direction == "LONG" else "BUY_CLOSE"
+        params = {
+            "symbol": symbol,
+            "side": side,
+            "type": "LIMIT",
+            "priceType": "MARKET",
+            "quantity": _decimal_to_api(quantity),
+            "newClientOrderId": f"ai1h_close_{int(time.time() * 1000)}",
+        }
+        try:
+            raw = self._request("POST", self.path_close_order, params=params, signed=True)
+            if self.config.verify_after_error_seconds > 0:
+                time.sleep(float(self.config.verify_after_error_seconds))
+            still_open = self._verify_position(symbol, direction) is not None
+            return ClosePositionResult(symbol=symbol, direction=direction, closed=not still_open, order_id=_extract_order_id(raw), reason="درخواست بستن ارسال شد و وضعیت پوزیشن تایید شد.", raw=raw if isinstance(raw, dict) else {"response": raw})
+        except Exception as exc:
+            if self.config.verify_after_error_seconds > 0:
+                time.sleep(float(self.config.verify_after_error_seconds))
+            still_open = self._verify_position(symbol, direction) is not None
+            return ClosePositionResult(symbol=symbol, direction=direction, closed=not still_open, order_id=None, reason=f"خطا در بستن؛ بعد از تایید وضعیت بررسی شد: {exc}")
 
     def get_mark_price(self, symbol: str) -> float:
         payload = self._request("GET", self.path_mark_price, params={"symbol": symbol.upper()}, signed=False)
@@ -607,6 +646,7 @@ def _int_or_none(value: Any) -> int | None:
 
 __all__ = [
     "Direction",
+    "ClosePositionResult",
     "HistoryPositionInfo",
     "OpenOrderInfo",
     "OpenOrderResult",
