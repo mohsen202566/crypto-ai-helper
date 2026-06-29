@@ -203,6 +203,22 @@ class JSONStorage:
                     out.append(copy.deepcopy(s))
             return out
 
+
+    def active_symbols(self) -> list[str]:
+        """همه نمادهایی که سیگنال باز دارند؛ برای مانیتور مستقل نتیجه."""
+        with self._lock:
+            symbols = []
+            for sig in self.state["signals"].values():
+                symbol = sig.get("symbol")
+                if symbol and self._is_open_signal(sig) and symbol not in symbols:
+                    symbols.append(symbol)
+            return symbols
+
+    def active_all_signals(self) -> list[dict[str, Any]]:
+        """همه سیگنال‌های باز، چه عادی چه رئال."""
+        with self._lock:
+            return [copy.deepcopy(s) for s in self.state["signals"].values() if self._is_open_signal(s)]
+
     def has_active_symbol(self, internal_symbol: str) -> bool:
         """از هر ارز فقط یک سیگنال باز؛ لانگ/شورت فرقی ندارد."""
         with self._lock:

@@ -132,6 +132,25 @@ class TelegramBotService:
             today_pnl=today_pnl,
         )
 
+    def _monitor_message(self) -> str:
+        signals = self.storage.active_all_signals()
+        if not signals:
+            return "✅ هیچ سیگنال باز/گیرکرده‌ای وجود ندارد."
+        lines = ["📡 وضعیت مانیتورینگ سیگنال‌های باز", ""]
+        for sig in signals:
+            mode = str(sig.get("execution_mode_fa") or sig.get("execution_mode") or "عادی")
+            side = "لانگ" if str(sig.get("side")).upper() == "BUY" else "شورت"
+            lines.append(f"• {sig.get('symbol')} | {side} | {mode}")
+            lines.append(f"  ورود: {sig.get('entry')} | TP: {sig.get('tp')} | SL: {sig.get('sl')}")
+            if sig.get("real_order"):
+                lines.append("  رئال: سفارش/پوزیشن اولیه ثبت شده")
+            if sig.get("real_monitor_note"):
+                lines.append(f"  مانیتور: {sig.get('real_monitor_note')}")
+            if sig.get("history_missing_since_ms"):
+                lines.append("  هشدار: پوزیشن بسته دیده شده ولی history هنوز PnL نداده")
+            lines.append("")
+        return "\n".join(lines).strip()
+
     def handle_command(self, text: str) -> str:
         cmd = self._normalize(text)
         parts = cmd.split()
@@ -146,6 +165,9 @@ class TelegramBotService:
 
         if cmd in ("آمار", "امار", "stats", "stat"):
             return stats_message(self.stats_manager.summary())
+
+        if cmd in ("مانیتور", "وضعیت مانیتور", "سیگنال باز", "سیگنال های باز", "سیگنال‌های باز", "open signals", "monitor"):
+            return self._monitor_message()
 
         if cmd in ("حذف آمار", "حذف امار", "پاک کردن آمار", "پاک کردن امار", "ریست آمار", "ریست امار", "reset stats"):
             self.stats_manager.reset()

@@ -163,11 +163,28 @@ class FiveMinuteScalperBot:
             msg_id = signal_data.get("telegram_message_id")
             self.telegram.send_message(real_result_message(signal_data, result, price, pnl), reply_to_message_id=msg_id)
 
-    def _check_symbol_normal_result_now(self, internal: str, latest_price: float) -> None:
-        """قبل از تحلیل سیگنال جدید، نتیجه سیگنال باز همان نماد را با قیمت زنده چک کن."""
-        results = self.trade_manager.check_normal_results({internal: float(latest_price)})
-        if results:
-            self._send_result_messages(normal_results=results)
+    def _collect_active_prices(self) -> dict[str, float]:
+        """مانیتور مستقل نتیجه: برای همه سیگنال‌های باز قیمت تازه OKX بگیر، حتی اگر تحلیل آن نماد رد شود."""
+        prices: dict[str, float] = {}
+        for internal in self.storage.active_symbols():
+            mapped = self.valid_symbols.get(internal)
+            if not mapped:
+                continue
+            try:
+                candles = self.okx.get_candles(mapped["okx_symbol"])
+                indicators = calculate_indicators(candles)
+                prices[internal] = float(indicators["close"])
+            except Exception as exc:
+                logger.warning("مانیتور نتیجه: گرفتن قیمت فعال %s از OKX ناموفق بود: %s", internal, exc)
+        return prices
+
+    def _check_symbol_result_now(self, internal: str, latest_price: float) -> None:
+        """قبل از تحلیل سیگنال جدید، نتیجه سیگنال باز همان نماد را همان لحظه چک کن."""
+        prices = {internal: float(latest_price)}
+        normal_results = self.trade_manager.check_normal_results(prices)
+        real_results = self.trade_manager.check_real_results(prices)
+        if normal_results or real_results:
+            self._send_result_messages(normal_results=normal_results, real_results=real_results)
 
     def _process_symbol(self, internal: str, mapped: dict[str, Any]) -> float | None:
         if self._symbol_in_cooldown(internal):
@@ -180,7 +197,7 @@ class FiveMinuteScalperBot:
             latest_price = float(indicators["close"])
 
             # اول نتیجه سیگنال باز همین نماد بررسی شود؛ بعد اگر هنوز باز بود، اصلاً سیگنال جدید نساز.
-            self._check_symbol_normal_result_now(internal, latest_price)
+            self._check_symbol_result_now(internal, latest_price)
             if self.storage.has_active_symbol(internal):
                 logger.info("رد شد: برای این نماد %s هنوز سیگنال باز وجود دارد", internal)
                 return latest_price
@@ -225,9 +242,12 @@ class FiveMinuteScalperBot:
             self._mark_symbol_error(internal, exc)
             return None
 
-    def _check_results(self, latest_prices: dict[str, float]) -> None:
-        normal_results = self.trade_manager.check_normal_results(latest_prices)
-        real_results = self.trade_manager.check_real_results()
+    def _check_results(self, latest_prices: dict[str, float] | None = None) -> None:
+        # نتیجه‌ها نباید وابسته به صدور سیگنال جدید باشند. هر دور برای سیگنال‌های باز قیمت تازه می‌گیریم.
+        prices = self._collect_active_prices()
+        prices.update(latest_prices or {})
+        normal_results = self.trade_manager.check_normal_results(prices)
+        real_results = self.trade_manager.check_real_results(prices)
         self._send_result_messages(normal_results=normal_results, real_results=real_results)
 
     def analysis_loop(self) -> None:
@@ -236,6 +256,11 @@ class FiveMinuteScalperBot:
                 self.validate_symbols()
                 safe_sleep(15)
                 continue
+
+            try:
+                self._check_results({})
+            except Exception as exc:
+                logger.warning("مانیتور ابتدای حلقه ناموفق بود، ربات ادامه می‌دهد: %s", exc)
 
             latest_prices: dict[str, float] = {}
             for internal, mapped in list(self.valid_symbols.items()):

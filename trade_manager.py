@@ -1,4 +1,10 @@
-"""مدیریت اجرای معامله، اسلات رئال، مانیتور نتیجه و کنترل ریسک اجرایی."""
+"""مدیریت اجرای معامله، اسلات رئال، مانیتور نتیجه و کنترل ریسک اجرایی.
+
+v11: مانیتور نتیجه سخت‌گیرانه‌تر شد:
+- سیگنال رئالِ بدون real_order گیر نمی‌کند و بعد از مهلت کوتاه به عادی تبدیل می‌شود.
+- مانیتور رئال هر دور وضعیت پوزیشن واقعی، تاریخچه پوزیشن و تاریخچه سفارش را چک می‌کند.
+- اگر پوزیشن بسته شده باشد ولی history دیر بدهد، بعد از تایم‌اوت fallback ثبت می‌شود تا نماد قفل نماند.
+"""
 from __future__ import annotations
 
 import time
@@ -81,6 +87,8 @@ class TradeManager:
         signal.setdefault("real_order", None)
         signal.setdefault("real_error", None)
         signal.setdefault("telegram_message_id", None)
+        signal.setdefault("real_monitor_note", None)
+        signal.setdefault("history_missing_since_ms", None)
         return signal
 
     def register_signal(self, signal: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
@@ -100,6 +108,7 @@ class TradeManager:
             execution_reason=f"اجرای رئال انجام نشد؛ از اینجا به بعد نتیجه به‌صورت عادی پیگیری می‌شود. علت: {reason}",
             real_error=reason,
             real_order=None,
+            real_monitor_note=reason,
             status="OPEN",
         )
         self.stats.convert_real_signal_to_normal()
@@ -150,6 +159,7 @@ class TradeManager:
                 real_error=None,
                 real_open_utc=now_utc_iso(),
                 real_position_confirmed=True,
+                real_monitor_note="پوزیشن واقعی توسط Toobit تایید شد",
                 status="OPEN",
             )
             self.stats.record_real_open()
@@ -171,7 +181,7 @@ class TradeManager:
         return (entry - float(exit_price)) / entry * 100.0
 
     def _signal_pnl(self, signal: dict[str, Any], exit_price: float) -> float:
-        # سود/ضرر عادی هم با دلار و لوریج تنظیم‌شده در پنل حساب می‌شود.
+        # سود/ضرر عادی و fallback رئال با دلار و لوریج تنظیم‌شده در پنل حساب می‌شود.
         trade_amount = float(signal.get("trade_amount_usdt") or self.storage.get_settings().get("trade_amount_usdt", config.DEFAULT_TRADE_AMOUNT_USDT))
         leverage = int(signal.get("leverage") or self.storage.get_settings().get("leverage", config.DEFAULT_LEVERAGE))
         movement = self._movement_percent(signal, exit_price)
@@ -183,8 +193,13 @@ class TradeManager:
         for signal in self.storage.active_signals():
             price = symbol_prices.get(signal["symbol"])
             if price is None:
+                logger.info("مانیتور عادی: برای %s قیمت زنده ندارم؛ نتیجه چک نشد", signal.get("symbol"))
                 continue
             result = hit_tp_sl(signal["side"], float(price), float(signal["tp"]), float(signal["sl"]))
+            logger.info(
+                "مانیتور عادی %s: price=%s entry=%s tp=%s sl=%s result=%s",
+                signal.get("symbol"), price, signal.get("entry"), signal.get("tp"), signal.get("sl"), result or "OPEN",
+            )
             if not result:
                 continue
 
@@ -197,6 +212,7 @@ class TradeManager:
                 normal_exit_price=exit_price,
                 normal_exit_utc=now_utc_iso(),
                 normal_pnl=pnl,
+                result_source="OKX_LIVE_PRICE",
             )
             self.stats.record_normal_result(result, pnl=pnl)
             updated = self.storage.get_signal(signal["signal_id"]) or signal
@@ -220,42 +236,113 @@ class TradeManager:
             close_price = float(signal["tp"] if result == "TP" else signal["sl"])
         return result, float(close_price), pnl
 
-    def check_real_results(self) -> list[tuple[dict[str, Any], str, float, float]]:
-        """نتیجه رئال فقط از وضعیت واقعی Toobit و historyPositions ثبت می‌شود.
+    def _fallback_real_result(self, signal: dict[str, Any], symbol_prices: dict[str, float]) -> tuple[str, float, float] | None:
+        """آخرین محافظ ضد گیرکردن: اگر Toobit پوزیشن را بسته نشان دهد ولی history جواب ندهد."""
+        price = symbol_prices.get(signal.get("symbol"))
+        if price is None:
+            return None
+        direct = hit_tp_sl(signal["side"], float(price), float(signal["tp"]), float(signal["sl"]))
+        if direct:
+            exit_price = float(signal["tp"] if direct == "TP" else signal["sl"])
+            return direct, exit_price, self._signal_pnl(signal, exit_price)
+        # اگر پوزیشن در Toobit دیگر وجود ندارد ولی قیمت فعلی بین TP/SL است، فقط جهت حرکت را ملاک بگذار.
+        movement = self._movement_percent(signal, float(price))
+        result = "TP" if movement >= 0 else "SL"
+        return result, float(price), self._signal_pnl(signal, float(price))
 
-        اگر پوزیشن هنوز باز است، نتیجه ثبت نمی‌شود.
-        اگر پوزیشن بسته شد ولی history هنوز آماده نبود، باز هم نتیجه ثبت نمی‌کنیم تا PnL واقعی بیاید.
+    def check_real_results(self, symbol_prices: dict[str, float] | None = None) -> list[tuple[dict[str, Any], str, float, float]]:
+        """مانیتور دقیق رئال.
+
+        مسیر اصلی: Toobit positions -> اگر پوزیشن بسته بود -> Toobit history/order history -> ثبت PnL واقعی.
+        مسیر ضد گیر: اگر history دیر کرد و پوزیشن دیگر باز نبود، بعد از timeout نتیجه fallback ثبت می‌شود تا نماد قفل نماند.
         """
+        symbol_prices = symbol_prices or {}
         results: list[tuple[dict[str, Any], str, float, float]] = []
+        now_ms = int(time.time() * 1000)
+
         for signal in self.storage.active_real_signals():
+            symbol = signal.get("symbol")
+            toobit_symbol = signal.get("toobit_symbol")
+
+            # اگر به هر دلیل ربات بعد از ارسال پیام و قبل از ثبت order خاموش شده باشد، این سیگنال نباید برای همیشه قفل شود.
             if not signal.get("real_order"):
-                continue
-            try:
-                position = self.toobit.get_open_position(signal["toobit_symbol"], signal["side"])
-            except Exception as exc:
-                logger.warning("بررسی پوزیشن واقعی %s ناموفق بود: %s", signal.get("symbol"), exc)
-                continue
-            if position is not None:
+                age = (now_ms - int(signal.get("created_ms") or now_ms)) / 1000.0
+                if age >= float(getattr(config, "REAL_ORDER_MISSING_TO_NORMAL_SECONDS", 25)):
+                    reason = "سیگنال رئال real_order ندارد؛ احتمالاً ربات قبل/حین اجرای سفارش قطع شده. به عادی تبدیل شد تا مانیتور شود."
+                    logger.warning("مانیتور رئال %s: %s", symbol, reason)
+                    self._downgrade_real_to_normal(signal, reason)
+                else:
+                    logger.info("مانیتور رئال %s: هنوز real_order ندارد؛ age=%.1fs", symbol, age)
                 continue
 
-            # پوزیشن دیگر باز نیست؛ فقط وقتی historyPositions سود/ضرر واقعی را داد، نتیجه ثبت می‌شود.
+            try:
+                position = self.toobit.get_open_position(toobit_symbol, signal["side"])
+            except Exception as exc:
+                logger.warning("مانیتور رئال %s: خواندن پوزیشن Toobit ناموفق بود: %s", symbol, exc)
+                continue
+
+            if position is not None:
+                price = symbol_prices.get(symbol)
+                touch = hit_tp_sl(signal["side"], float(price), float(signal["tp"]), float(signal["sl"])) if price is not None else None
+                note = "پوزیشن واقعی هنوز باز است"
+                if touch:
+                    note = f"قیمت OKX به {touch} رسیده ولی Toobit هنوز پوزیشن را باز نشان می‌دهد؛ منتظر اجرای TP/SL صرافی"
+                self.storage.update_signal(
+                    signal["signal_id"],
+                    real_last_monitor_utc=now_utc_iso(),
+                    real_position_seen=True,
+                    real_monitor_note=note,
+                    history_missing_since_ms=None,
+                )
+                logger.info(
+                    "مانیتور رئال %s: position=OPEN price=%s tp=%s sl=%s note=%s",
+                    symbol, price, signal.get("tp"), signal.get("sl"), note,
+                )
+                continue
+
+            # اینجا پوزیشن دیگر در Toobit باز نیست. پس باید نتیجه ثبت شود.
             try:
                 history_result = self._real_result_from_history(signal)
             except Exception as exc:
-                logger.warning("خواندن history برای نتیجه واقعی %s ناموفق بود: %s", signal.get("symbol"), exc)
+                logger.warning("مانیتور رئال %s: خواندن history/order history ناموفق بود: %s", symbol, exc)
                 history_result = None
 
-            if not history_result:
-                logger.info("پوزیشن واقعی %s بسته شده ولی history/PnL هنوز آماده نیست؛ نتیجه ثبت نشد.", signal.get("symbol"))
-                continue
+            if history_result:
+                result, exit_price, pnl = history_result
+                source = "TOOBIT_HISTORY"
+            else:
+                missing_since = int(signal.get("history_missing_since_ms") or now_ms)
+                wait_seconds = (now_ms - missing_since) / 1000.0
+                self.storage.update_signal(
+                    signal["signal_id"],
+                    history_missing_since_ms=missing_since,
+                    real_last_monitor_utc=now_utc_iso(),
+                    real_monitor_note=f"پوزیشن در Toobit باز نیست ولی history هنوز PnL نداده؛ wait={wait_seconds:.0f}s",
+                )
+                logger.warning(
+                    "مانیتور رئال %s: position=CLOSED اما history/PnL نیامده؛ wait=%.0fs",
+                    symbol, wait_seconds,
+                )
+                if wait_seconds < float(getattr(config, "REAL_HISTORY_FALLBACK_SECONDS", 180)):
+                    continue
+                fallback = self._fallback_real_result(signal, symbol_prices)
+                if not fallback:
+                    continue
+                result, exit_price, pnl = fallback
+                source = "FALLBACK_AFTER_TOOBIT_HISTORY_TIMEOUT"
+                logger.error(
+                    "مانیتور رئال %s: history بعد از timeout نیامد؛ نتیجه fallback ثبت شد. result=%s pnl=%s",
+                    symbol, result, pnl,
+                )
 
-            result, exit_price, pnl = history_result
             self.storage.update_signal(
                 signal["signal_id"],
                 real_result=result,
                 real_exit_price=exit_price,
                 real_exit_utc=now_utc_iso(),
                 real_pnl=pnl,
+                real_result_source=source,
+                real_monitor_note=f"نتیجه از {source} ثبت شد",
             )
             self.stats.record_real_result(result, pnl=pnl)
             updated = self.storage.get_signal(signal["signal_id"]) or signal

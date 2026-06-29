@@ -48,6 +48,8 @@ class ToobitClient:
         self.path_mark_price = getattr(config, "TOOBIT_PATH_MARK_PRICE", "/api/v1/futures/markPrice")
         self.path_exchange_info = getattr(config, "TOOBIT_PATH_EXCHANGE_INFO", "/api/v1/futures/exchangeInfo")
         self.path_history_positions = getattr(config, "TOOBIT_PATH_HISTORY_POSITIONS", "/api/v1/futures/historyPositions")
+        self.path_order_history = getattr(config, "TOOBIT_PATH_ORDER_HISTORY", "/api/v1/futures/historyOrders")
+        self.path_order_history_alt = getattr(config, "TOOBIT_PATH_ORDER_HISTORY_ALT", "/api/v1/futures/order/history")
         self.path_today_pnl = getattr(config, "TOOBIT_PATH_TODAY_PNL", "/api/v1/futures/todayPnl")
         self.path_close_order = getattr(config, "TOOBIT_PATH_CLOSE_ORDER", self.path_order)
         self.param_tp = getattr(config, "TOOBIT_PARAM_TP", "takeProfit")
@@ -507,22 +509,88 @@ class ToobitClient:
             out.append(item)
         return out
 
+    def get_order_history(self, symbol: str | None = None, start_ms: int | None = None, end_ms: int | None = None, limit: int = 50) -> list[dict[str, Any]]:
+        """خواندن تاریخچه سفارش‌ها با دو endpoint قابل تنظیم.
+
+        بعضی نسخه‌های Toobit اسم endpoint تاریخچه را متفاوت برمی‌گردانند. برای همین اول مسیر اصلی و بعد مسیر جایگزین تست می‌شود.
+        """
+        params: dict[str, Any] = {"limit": max(1, min(int(limit), 1000))}
+        if symbol:
+            params["symbol"] = symbol.upper()
+        if start_ms is not None:
+            params["startTime"] = int(start_ms)
+        if end_ms is not None:
+            params["endTime"] = int(end_ms)
+
+        last_error: Exception | None = None
+        rows: list[dict[str, Any]] = []
+        for path in (self.path_order_history, self.path_order_history_alt):
+            if not path:
+                continue
+            try:
+                payload = self._request("GET", path, params=params, signed=True)
+                for item in self._extract_dicts(payload):
+                    if symbol and self._symbol_from_item(item) not in ("", symbol.upper()):
+                        continue
+                    rows.append(item)
+                if rows:
+                    return rows
+            except Exception as exc:
+                last_error = exc
+                logger.warning("خواندن order history توبیت از %s ناموفق بود: %s", path, exc)
+        if last_error and not rows:
+            # خطا را بالا نمی‌بریم تا مانیتور بتواند historyPositions یا fallback را هم امتحان کند.
+            return []
+        return rows
+
     def find_realized_result(self, symbol: str, side: str, start_ms: int, end_ms: int | None = None) -> dict[str, Any] | None:
         direction = side_to_toobit_position(side)
         end_ms = end_ms or int(time.time() * 1000)
-        rows = self.get_history_positions(symbol=symbol, start_ms=max(0, int(start_ms) - 60_000), end_ms=end_ms + 60_000, limit=50)
+        start_window = max(0, int(start_ms) - 120_000)
+        end_window = int(end_ms) + 120_000
+
+        rows: list[dict[str, Any]] = []
+        try:
+            rows.extend(self.get_history_positions(symbol=symbol, start_ms=start_window, end_ms=end_window, limit=100))
+        except Exception as exc:
+            logger.warning("خواندن historyPositions توبیت برای %s ناموفق بود: %s", symbol, exc)
+        try:
+            rows.extend(self.get_order_history(symbol=symbol, start_ms=start_window, end_ms=end_window, limit=100))
+        except Exception as exc:
+            logger.warning("خواندن orderHistory توبیت برای %s ناموفق بود: %s", symbol, exc)
+
         candidates: list[dict[str, Any]] = []
         for item in rows:
             raw_side = str(item.get("side") or item.get("positionSide") or item.get("direction") or "").upper()
-            if raw_side and raw_side not in {direction, "LONG" if side == "BUY" else "SHORT"}:
-                # اگر صرافی side را نداد یا متفاوت بود، سخت‌گیری نمی‌کنیم؛ ولی اگر واضح مخالف بود رد شود.
-                if raw_side in {"LONG", "SHORT"}:
+            if raw_side and raw_side not in {direction, "LONG" if side == "BUY" else "SHORT", "SELL_CLOSE" if side == "BUY" else "BUY_CLOSE"}:
+                if raw_side in {"LONG", "SHORT", "BUY_OPEN", "SELL_OPEN", "BUY_CLOSE", "SELL_CLOSE"}:
                     continue
-            pnl = self._first_decimal(item, "realizedPnL", "realizedPnl", "realizedPnlWithoutFee", "pnl", "profit")
+
+            status = str(item.get("status") or item.get("orderStatus") or item.get("state") or "").upper()
+            if status and status in {"NEW", "PARTIALLY_FILLED", "OPEN", "ORDER_NEW"}:
+                continue
+
+            pnl = self._first_decimal(
+                item,
+                "realizedPnL", "realizedPnl", "realizedPnlWithoutFee", "closedPnl",
+                "profit", "pnl", "cumRealizedPnl", "realProfit", "income",
+            )
+            close_price = self._first_decimal(
+                item,
+                "closePrice", "avgClosePrice", "exitPrice", "closeAvgPrice",
+                "avgPrice", "price", "triggerPrice", "stopPrice", "executedPrice",
+            )
+            close_time = safe_int(
+                item.get("closeTime") or item.get("updatedTime") or item.get("updateTime") or
+                item.get("time") or item.get("transactTime") or item.get("createdTime"),
+                0,
+            )
+
+            # بعضی order history ها فقط سفارش TP/SL را می‌دهند و PnL ندارند. اینها برای تشخیص TP/SL مفیدند،
+            # اما برای PnL واقعی فقط وقتی pnl موجود است استفاده می‌شود.
             if pnl is None:
                 continue
-            close_time = safe_int(item.get("closeTime") or item.get("updatedTime") or item.get("time"), 0)
-            close_price = self._first_decimal(item, "closePrice", "avgClosePrice", "exitPrice", "closeAvgPrice", "markPrice", "price")
+
             candidates.append({
                 "pnl": float(pnl),
                 "close_time_ms": close_time,
