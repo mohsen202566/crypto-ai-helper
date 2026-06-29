@@ -1,4 +1,4 @@
-# Environment
+# Environment / secrets
 .env
 .env.*
 !.env.example
@@ -8,20 +8,24 @@ venv/
 .venv/
 env/
 
-# Python
+# Python cache/build
 __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
 .Python
+build/
+dist/
+*.egg-info/
 
 # Logs
 *.log
 logs/
 
-# Runtime data / AI memory / databases
-data/
+# Runtime data / stats / local state
+bot_state.json
 state_store.json
+data/
 *.db
 *.db-wal
 *.db-shm
