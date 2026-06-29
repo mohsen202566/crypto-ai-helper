@@ -1,6 +1,7 @@
-"""مدیریت اجرای معامله و کنترل ریسک اجرایی."""
+"""مدیریت اجرای معامله، اسلات رئال، مانیتور نتیجه و کنترل ریسک اجرایی."""
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import config
@@ -17,6 +18,7 @@ class TradeManager:
         self.toobit = toobit
 
     def can_accept_signal(self, signal: dict[str, Any]) -> tuple[bool, str]:
+        # قانون قطعی: از هر ارز فقط یک سیگنال تا بسته‌شدن همان سیگنال.
         if self.storage.has_active_symbol(signal["symbol"]):
             return False, "برای این نماد هنوز سیگنال باز وجود دارد"
         return True, ""
@@ -71,6 +73,7 @@ class TradeManager:
 
     def attach_signal_defaults(self, signal: dict[str, Any]) -> dict[str, Any]:
         signal["created_utc"] = now_utc_iso()
+        signal["created_ms"] = int(time.time() * 1000)
         signal.setdefault("normal_result", None)
         signal.setdefault("real_result", None)
         signal.setdefault("real_order", None)
@@ -91,6 +94,7 @@ class TradeManager:
             execution_mode_fa="عادی / داخلی",
             execution_reason=f"اجرای رئال انجام نشد؛ از اینجا به بعد نتیجه به‌صورت عادی پیگیری می‌شود. علت: {reason}",
             real_error=reason,
+            real_order=None,
         )
         self.stats.convert_real_signal_to_normal()
 
@@ -104,7 +108,8 @@ class TradeManager:
             self._downgrade_real_to_normal(signal, message)
             return False, message, None
 
-        if self.storage.count_open_real() >= int(settings.get("max_positions", 1)):
+        if self.storage.count_open_real() > int(settings.get("max_positions", 1)):
+            # علامت > چون همین سیگنال قبل از ارسال سفارش اسلات را رزرو کرده است.
             message = "حداکثر تعداد پوزیشن باز پر شده است"
             self._downgrade_real_to_normal(signal, message)
             return False, message, None
@@ -116,11 +121,6 @@ class TradeManager:
             return False, reason, None
 
         try:
-            try:
-                self.toobit.set_margin_type(signal["toobit_symbol"], str(settings.get("margin_type", config.DEFAULT_MARGIN_TYPE)))
-            except Exception as exc:
-                logger.warning("تنظیم مارجین تایپ ناموفق بود، ادامه می‌دهیم: %s", exc)
-            self.toobit.set_leverage(signal["toobit_symbol"], int(settings.get("leverage", config.DEFAULT_LEVERAGE)))
             response = self.toobit.place_market_order(
                 symbol=signal["toobit_symbol"],
                 side=signal["side"],
@@ -132,9 +132,21 @@ class TradeManager:
                 client_order_id=signal["signal_id"].replace("-", "")[:32],
                 symbol_info=symbol_info or {},
             )
-            self.storage.update_signal(signal["signal_id"], real_order=response, real_error=None)
+            if not isinstance(response, dict) or not response.get("opened"):
+                message = (response or {}).get("reason") if isinstance(response, dict) else "پوزیشن بعد از تأیید باز نشد"
+                self.stats.record_real_failed()
+                self._downgrade_real_to_normal(signal, str(message))
+                return False, str(message), response
+
+            self.storage.update_signal(
+                signal["signal_id"],
+                real_order=response,
+                real_error=None,
+                real_open_utc=now_utc_iso(),
+                real_position_confirmed=True,
+            )
             self.stats.record_real_open()
-            return True, "سفارش واقعی در Toobit ارسال شد", response
+            return True, response.get("reason", "سفارش واقعی در Toobit ارسال و تایید شد"), response
         except Exception as exc:
             message = f"اجرای واقعی ناموفق بود: {exc}"
             logger.exception(message)
@@ -152,6 +164,7 @@ class TradeManager:
         return (entry - float(exit_price)) / entry * 100.0
 
     def _signal_pnl(self, signal: dict[str, Any], exit_price: float) -> float:
+        # سود/ضرر عادی هم با دلار و لوریج تنظیم‌شده در پنل حساب می‌شود.
         trade_amount = float(signal.get("trade_amount_usdt") or self.storage.get_settings().get("trade_amount_usdt", config.DEFAULT_TRADE_AMOUNT_USDT))
         leverage = int(signal.get("leverage") or self.storage.get_settings().get("leverage", config.DEFAULT_LEVERAGE))
         movement = self._movement_percent(signal, exit_price)
@@ -179,28 +192,70 @@ class TradeManager:
                 results.append((updated, result, float(price), pnl))
         return results
 
+    def _real_result_from_history(self, signal: dict[str, Any]) -> tuple[str, float, float] | None:
+        start_ms = int(signal.get("created_ms") or 0)
+        history = self.toobit.find_realized_result(
+            symbol=signal["toobit_symbol"],
+            side=signal["side"],
+            start_ms=start_ms,
+            end_ms=int(time.time() * 1000),
+        )
+        if not history:
+            return None
+        pnl = float(history.get("pnl") or 0.0)
+        result = "TP" if pnl >= 0 else "SL"
+        close_price = history.get("close_price")
+        if close_price is None or float(close_price) <= 0:
+            close_price = float(signal["tp"] if result == "TP" else signal["sl"])
+        return result, float(close_price), pnl
+
     def check_real_results(self) -> list[tuple[dict[str, Any], str, float, float]]:
+        """نتیجه رئال فقط از وضعیت واقعی Toobit ثبت می‌شود.
+
+        اگر پوزیشن هنوز باز است، نتیجه ثبت نمی‌شود. وقتی پوزیشن بسته شد، PnL از historyPositions خوانده می‌شود.
+        """
         results: list[tuple[dict[str, Any], str, float, float]] = []
         for signal in self.storage.active_real_signals():
+            # اگر سفارش هنوز تایید نشده/ندارد، چیزی ثبت نمی‌کنیم.
+            if not signal.get("real_order"):
+                continue
             try:
-                price = self.toobit.get_mark_price(signal["toobit_symbol"])
+                position = self.toobit.get_open_position(signal["toobit_symbol"], signal["side"])
             except Exception as exc:
-                logger.warning("بررسی نتیجه واقعی %s ناموفق بود: %s", signal.get("symbol"), exc)
+                logger.warning("بررسی پوزیشن واقعی %s ناموفق بود: %s", signal.get("symbol"), exc)
                 continue
-            result = hit_tp_sl(signal["side"], price, float(signal["tp"]), float(signal["sl"]))
-            if not result:
+            if position is not None:
                 continue
-            pnl = self._signal_pnl(signal, float(price))
+
+            # پوزیشن بسته شده؛ حالا PnL دقیق را از تاریخچه توبیت بخوان.
+            try:
+                history_result = self._real_result_from_history(signal)
+            except Exception as exc:
+                logger.warning("خواندن history برای نتیجه واقعی %s ناموفق بود: %s", signal.get("symbol"), exc)
+                history_result = None
+
+            if history_result:
+                result, exit_price, pnl = history_result
+            else:
+                # fallback نادر: اگر history جواب نداد، از آخرین مارک/TP/SL فقط برای ثبت نتیجه استفاده می‌کنیم.
+                try:
+                    price = self.toobit.get_mark_price(signal["toobit_symbol"])
+                except Exception:
+                    price = float(signal.get("tp") or signal.get("entry") or 0)
+                result = hit_tp_sl(signal["side"], float(price), float(signal["tp"]), float(signal["sl"])) or ("TP" if self._signal_pnl(signal, price) >= 0 else "SL")
+                exit_price = float(price)
+                pnl = self._signal_pnl(signal, exit_price)
+
             self.storage.update_signal(
                 signal["signal_id"],
                 real_result=result,
-                real_exit_price=price,
+                real_exit_price=exit_price,
                 real_exit_utc=now_utc_iso(),
                 real_pnl=pnl,
             )
             self.stats.record_real_result(result, pnl=pnl)
             updated = self.storage.get_signal(signal["signal_id"]) or signal
-            results.append((updated, result, price, pnl))
+            results.append((updated, result, exit_price, pnl))
         return results
 
     def get_balance_safe(self) -> tuple[dict[str, float] | None, str | None]:
@@ -216,7 +271,7 @@ class TradeManager:
             return [], "کلید API توبیت تنظیم نشده است"
         try:
             positions = self.toobit.get_positions()
-            positions = [p for p in positions if safe_float(p.get("position") or p.get("positionAmt") or p.get("size")) != 0]
+            positions = [p for p in positions if safe_float(p.get("position") or p.get("positionAmt") or p.get("positionAmount") or p.get("size") or p.get("quantity") or p.get("qty")) != 0]
             return positions, None
         except Exception as exc:
             return [], str(exc)

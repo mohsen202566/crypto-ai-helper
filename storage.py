@@ -141,7 +141,7 @@ class JSONStorage:
             return copy.deepcopy(self.state["signals"])
 
     def active_signals(self) -> list[dict[str, Any]]:
-        """فقط سیگنال‌های عادی/داخلی که هنوز TP/SL عادی نگرفته‌اند."""
+        """سیگنال‌های عادی/داخلی که هنوز نتیجه نگرفته‌اند."""
         with self._lock:
             out = []
             for s in self.state["signals"].values():
@@ -151,33 +151,41 @@ class JSONStorage:
             return out
 
     def active_real_signals(self) -> list[dict[str, Any]]:
-        """فقط سیگنال‌های رئال که سفارش واقعی دارند و هنوز نتیجه رئال نگرفته‌اند."""
+        """سیگنال‌های رئال که هنوز نتیجه واقعی ندارند، حتی اگر تایید سفارش در انتظار باشد."""
         with self._lock:
             out = []
             for s in self.state["signals"].values():
                 mode = str(s.get("execution_mode") or "NORMAL").upper()
-                if mode == "REAL" and s.get("real_order") and not s.get("real_result"):
+                if mode == "REAL" and not s.get("real_result"):
                     out.append(copy.deepcopy(s))
             return out
 
     def has_active_symbol(self, internal_symbol: str) -> bool:
+        """از هر ارز فقط یک سیگنال تا بسته‌شدن کامل مجاز است.
+
+        عادی با normal_result بسته می‌شود؛ رئال با real_result بسته می‌شود.
+        اگر رئال بعداً به عادی downgrade شود، normal_result ملاک بسته‌شدن است.
+        """
         with self._lock:
             for s in self.state["signals"].values():
                 if s.get("symbol") != internal_symbol:
                     continue
                 mode = str(s.get("execution_mode") or "NORMAL").upper()
-                if mode == "NORMAL" and not s.get("normal_result"):
-                    return True
-                if mode == "REAL" and s.get("real_order") and not s.get("real_result"):
-                    return True
+                if mode == "REAL":
+                    if not s.get("real_result"):
+                        return True
+                else:
+                    if not s.get("normal_result"):
+                        return True
             return False
 
     def count_open_real(self) -> int:
+        """اسلات‌های رئال رزروشده/باز؛ تا ثبت real_result آزاد نمی‌شود."""
         with self._lock:
             return sum(
                 1
                 for s in self.state["signals"].values()
-                if str(s.get("execution_mode") or "").upper() == "REAL" and s.get("real_order") and not s.get("real_result")
+                if str(s.get("execution_mode") or "").upper() == "REAL" and not s.get("real_result")
             )
 
     def set_validated_symbols(self, mapping: dict[str, Any]) -> None:
