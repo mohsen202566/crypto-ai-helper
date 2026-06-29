@@ -9,8 +9,8 @@ from urllib.parse import urlencode
 
 import requests
 
-from . import config
-from .utils import (
+import config
+from utils import (
     decimal_round_down,
     extract_filter,
     logger,

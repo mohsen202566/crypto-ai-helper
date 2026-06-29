@@ -7,8 +7,8 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from . import config
-from .utils import now_utc_iso
+import config
+from utils import now_utc_iso
 
 
 def _default_state() -> dict[str, Any]:

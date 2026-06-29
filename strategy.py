@@ -3,8 +3,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from . import config
-from .utils import build_signal_id, is_entry_window, price_by_percent, side_to_persian
+import config
+from utils import build_signal_id, is_entry_window, price_by_percent, side_to_persian
 
 
 class ClassicScalpingStrategy:

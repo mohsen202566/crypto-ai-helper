@@ -3,8 +3,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from . import config
-from .utils import format_num
+import config
+from utils import format_num
 
 
 def side_label(side: str) -> str:

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .storage import JSONStorage
+from storage import JSONStorage
 
 
 class StatsManager:

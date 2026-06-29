@@ -6,8 +6,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from . import config
-from .utils import candle_age_seconds, safe_float
+import config
+from utils import candle_age_seconds, safe_float
 
 
 def _rsi(close: pd.Series, period: int) -> pd.Series:

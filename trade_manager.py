@@ -3,11 +3,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from . import config
-from .stats_manager import StatsManager
-from .storage import JSONStorage
-from .toobit_client import ToobitClient
-from .utils import hit_tp_sl, logger, now_utc_iso, safe_float
+import config
+from stats_manager import StatsManager
+from storage import JSONStorage
+from toobit_client import ToobitClient
+from utils import hit_tp_sl, logger, now_utc_iso, safe_float
 
 
 class TradeManager:

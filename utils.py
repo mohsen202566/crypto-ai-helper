@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
 from typing import Any, Optional
 
-from . import config
+import config
 
 
 def setup_logger(name: str = "scalper") -> logging.Logger:

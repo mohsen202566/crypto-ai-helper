@@ -5,8 +5,8 @@ from typing import Any
 
 import requests
 
-from . import config
-from .utils import logger, okx_symbol_candidates, safe_float
+import config
+from utils import logger, okx_symbol_candidates, safe_float
 
 
 class OKXError(RuntimeError):

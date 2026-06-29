@@ -8,11 +8,11 @@ from typing import Any
 
 import requests
 
-from . import config
-from .messages_fa import balance_message, help_message, panel_message, positions_message, stats_message
-from .storage import JSONStorage
-from .trade_manager import TradeManager
-from .utils import logger, safe_float, safe_int, validate_range
+import config
+from messages_fa import balance_message, help_message, panel_message, positions_message, stats_message
+from storage import JSONStorage
+from trade_manager import TradeManager
+from utils import logger, safe_float, safe_int, validate_range
 
 
 class TelegramBotService:
