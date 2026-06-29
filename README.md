@@ -1,135 +1,90 @@
-# Crypto AI Helper 1H Soft AI
+# Crypto AI Helper 1H — Wave Exit Fix
 
-ربات Crypto Futures یک‌ساعته با تحلیل OKX و اجرای واقعی فقط روی Toobit.
+این بسته برای نسخه ۱ ساعته است و عمداً حساسیت خروج آن مثل ۵ دقیقه‌ای نیست.
 
-این نسخه از منطق Soft AI نسخه ۵ دقیقه‌ای ساخته شده، اما برای اسکالپ ۱ ساعته هماهنگ شده است:
+## قفل‌های پیاده‌شده
 
-- تایم اصلی تصمیم: `1H`
-- کانتکست روند: `4H`
-- ورود دقیق‌تر: `30m` و تایید کوتاه‌تر `15m`
-- مانیتور TP/SL: هر ۱۰ ثانیه
-- Full Scan: هر ۵ دقیقه
-- Watch Scan: هر ۳۰ ثانیه
-- دیتای تحلیل: OKX
-- اجرای واقعی: Toobit Futures
+- AI Exit قبل از ۱۰ دقیقه فعال بودن پوزیشن اجرا نمی‌شود.
+- TP به صورت پیش‌فرض Target Zone ذهنی است، نه خروج اجباری.
+- خروج با یک ضعف انجام نمی‌شود؛ حداقل ۳ ضعف معتبر لازم است.
+- برگشت کوچک با بافر نویز تطبیقی بر اساس ATR همان ارز/جهت فیلتر می‌شود.
+- Giveback باید از نویز طبیعی بیشتر شود.
+- بعد از AI_EXIT، قفل خشک ۲ ساعته وجود ندارد؛ فقط همان موج قبلی بلاک می‌شود.
+- اگر پولبک/ریست واقعی یا شکست تازه ساخته شود، همان ارز/جهت دوباره می‌تواند سیگنال بدهد.
 
-## قانون اصلی AI
+## فایل‌های تغییر کرده
 
-بجز کنترل‌های پنل ترید، همه چیز زیر تصمیم نرم و یادگیرنده AI است.
+- config.py
+- exit_engine.py
+- monitor.py
+- storage.py
+- trade_manager.py
+- toobit_client.py
+- tp_sl_result_engine.py
+- bot_ui.py
 
-کنترل‌های کاربر:
+## تنظیمات پیشنهادی .env
 
-- ترید روشن/خاموش
-- دلار/مارجین هر معامله
-- لوریج
-- حداکثر پوزیشن/اسلات
+```env
+AI_EXIT_ENABLED=true
+AI_EXIT_TP_IS_TARGET_ZONE=true
+AI_EXIT_MIN_ACTIVE_SECONDS=600
+AI_EXIT_TARGET_ZONE_RATIO=0.95
+AI_EXIT_WEAKNESS_CONFIRMATIONS=3
+AI_EXIT_NOISE_ATR_MULTIPLIER=0.35
+AI_EXIT_MIN_GIVEBACK_PCT=0.0012
+AI_EXIT_GIVEBACK_RATIO=0.55
+AI_EXIT_RISKY_GIVEBACK_RATIO=0.48
+AI_EXIT_MIN_PROFIT_PCT=0.0035
+AI_EXIT_BREAKEVEN_BUFFER_PCT=0.0004
+AI_EXIT_DAMAGE_CONTROL_ADVERSE_RATIO=0.60
+AI_EXIT_REVERSAL_TICKS=8
+AI_EXIT_RECENT_TICKS=48
 
-تصمیم‌های AI:
+AI_REENTRY_COOLDOWN_SECONDS=900
+AI_REENTRY_REQUIRE_NEW_SETUP=true
+AI_REENTRY_MIN_RESET_ATR=0.35
 
-- Watch / Normal / Real
-- Threshold سیگنال
-- Threshold واقعی
-- Entry Precision
-- Entry Quality
-- TP/SL
-- Early Exit
-- Pattern وزن‌دهی
-- Noise / Market Mode
-- Real Block یا Normal شدن
-- سخت/نرم شدن برای هر ارز، جهت، الگو، بازه امتیاز، و حالت بازار
+TOOBIT_PLACE_REAL_TP=false
+```
 
-هیچ reject تحلیلی خشک وجود ندارد. ضعف تحلیلی فقط تبدیل می‌شود به Watch، Normal، Internal Learning یا Real Block. فقط Safety اجرای واقعی hard است: API، اسلات، duplicate، sync قیمت OKX/Toobit، net profit واقعی، و تایید سفارش Toobit.
+اگر خواستی TP واقعی هم روی Toobit ثبت شود:
 
-## اندیکاتورهای 1H
+```env
+TOOBIT_PLACE_REAL_TP=true
+AI_EXIT_TP_IS_TARGET_ZONE=false
+```
 
-این نسخه اندیکاتورها را برای ۱ ساعت هماهنگ کرده است:
-
-- EMA 20 / 50 / 200
-- RSI 14
-- MACD 12/26/9
-- ADX 14 + DI+/DI-
-- ATR 14
-- Bollinger Bands 20/2
-- Relative Volume
-- Rolling VWAP 24 کندلی
-- حمایت/مقاومت و Order Block روی ساختار 1H
-
-## ارزهای فعال ۱۲تایی
-
-- SOL
-- XRP
-- DOGE
-- AVAX
-- LINK
-- ADA
-- SUI
-- LTC
-- NEAR
-- APT
-- ARB
-- OP
-
-BTC و ETH برای context بازار استفاده می‌شوند، نه سیگنال اصلی.
-
-## Threshold شروع
-
-این‌ها فقط مقدار شروع‌اند، نه قانون دائمی:
-
-- `BASE_SIGNAL_THRESHOLD=68`
-- `BASE_REAL_THRESHOLD=76`
-
-بعد از یادگیری، AI برای هر symbol + direction + pattern + entry_quality + market_mode + score bucket خودش تنظیم می‌کند.
-
-## دستورات تلگرام
-
-- `پنل`
-- `آمار`
-- `آمار 7`
-- `هوش`
-- `یادگیری`
-- `پیشنهاد`
-- `ارزها`
-- `شکار`
-- `زنده`
-- `ردها`
-- `سیگنال‌ها`
-- `ترید روشن`
-- `ترید خاموش`
-- `ترید دلار 20`
-- `ترید لوریج 10`
-- `حداکثر پوزیشن 3`
-- `حذف آمار`
-- `ریست یادگیری`
-- `راهنما`
-
-## نصب روی VPS
+## اجرای VPS
 
 ```bash
-cd /root/crypto-ai-helper-1h
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-nano .env
+cd /root/crypto-ai-helper
 python3 -m py_compile *.py
-python3 main.py
+sudo systemctl restart crypto-bot.service
+sudo systemctl status crypto-bot.service --no-pager -l
+journalctl -u crypto-bot.service -f
 ```
 
-برای systemd از سرویس فعلی پروژه می‌توانی فقط مسیر پوشه و نام سرویس را تغییر بدهی.
-
-## چک زنده DB
+## چک دیتابیس بعد از اجرا
 
 ```bash
 sqlite3 -header -column data/crypto_ai_helper_1h.sqlite3 \
-"select id,created_at,symbol_name,direction,score,threshold,real_threshold,signal_type,real_status,status,entry_quality,message_id from signals order by id desc limit 20;"
+"select id,created_at,symbol_name,direction,status,score,entry,tp,sl,exit_price,ai_exit_status,ai_exit_score,giveback_pct,approx_pnl,result_source
+ from signals
+ order by id desc
+ limit 20;"
 ```
 
 ```bash
 sqlite3 -header -column data/crypto_ai_helper_1h.sqlite3 \
-"select symbol_name,direction,score,ai_confidence,updated_at,expires_at from watchlist order by score desc;"
+"select symbol_name,direction,code,count(*) as n,max(created_at) as last_seen
+ from rejection_log
+ where code='SAME_WAVE_COOLDOWN'
+ group by symbol_name,direction,code;"
 ```
 
-## پیشنهاد دلار/لوریج
+## تست انجام‌شده
 
-AI می‌تواند بر اساس نتایج ۱ ساعته، سود خالص Real، MAE/MFE و TP/SL پیشنهاد بدهد که دلار هر پوزیشن یا لوریج بهتر است کمتر/بیشتر شود.
-این فقط پیشنهاد است؛ ربات هیچ‌وقت مارجین، لوریج، اسلات یا Trading ON/OFF را خودش تغییر نمی‌دهد. اعمال تغییر فقط با دستور پنل انجام می‌شود.
+- py_compile روی فایل‌های تغییرکرده بدون خطا انجام شد.
+- migration دیتابیس تست شد و ستون‌های AI Exit ساخته شدند.
+- Direction / ai_controller دست زده نشده تا خطای قفل‌شدن سیگنال مثل نسخه ۵ دقیقه‌ای تکرار نشود.

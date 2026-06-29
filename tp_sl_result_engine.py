@@ -13,7 +13,7 @@ class TpSlResult:
 class TpSlResultEngine:
     def classify(self, *, status: str, signal_type: str, real_status: str, real_pnl_available: bool) -> TpSlResult:
         if status == "EXIT":
-            source = "toobit_real" if signal_type == "real" and real_status == "opened" else "normal"
+            source = "ai_exit_toobit_real" if signal_type == "real" and real_status == "opened" else "ai_exit_normal"
             return TpSlResult(status=status, result_source=source, description="خروج هوشمند AI")
         if signal_type == "real" and real_status == "opened" and real_pnl_available:
             return TpSlResult(status=status, result_source="toobit_real", description="TP/SL واقعی توبیت")

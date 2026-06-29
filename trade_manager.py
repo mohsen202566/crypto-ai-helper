@@ -4,7 +4,7 @@ import asyncio
 import time
 from dataclasses import dataclass
 
-from config import TOOBIT_PANEL_CACHE_SECONDS
+from config import TOOBIT_PANEL_CACHE_SECONDS, TOOBIT_PLACE_REAL_TP
 from learning_engine import LearningEngine
 from scorer import SignalDecision
 from storage import Storage
@@ -61,6 +61,10 @@ class TradeManager:
         for symbol, decision in accepted:
             if self.storage.active_symbol_exists(symbol.toobit_symbol):
                 continue
+            same_wave_reason = self.storage.same_wave_reentry_block(symbol_name=symbol.name, direction=decision.direction, entry=decision.entry, score=decision.score)
+            if same_wave_reason:
+                self.storage.record_rejection(symbol.name, decision.direction, "SAME_WAVE_COOLDOWN", same_wave_reason, decision.score)
+                continue
             want_real = real_slots > 0 and decision.real_allowed and decision.session_state != "BAD_REAL_ONLY_NORMAL" and self.symbol_health.toobit_real_enabled(symbol.name)
             result = await self._create_one(symbol, decision, want_real=want_real)
             if result:
@@ -106,7 +110,7 @@ class TradeManager:
     async def _open_real_position(self, signal_id: int, symbol: MarketSymbol, decision: SignalDecision) -> None:
         self.storage.mark_real_opening(signal_id)
         try:
-            result = await asyncio.to_thread(self.toobit.open_position_with_tp_sl, symbol=symbol.toobit_symbol, direction=decision.direction, margin_usdt=self.storage.margin_usdt(), leverage=self.storage.leverage(), tp_price=decision.tp, sl_price=decision.sl, price=decision.entry)
+            result = await asyncio.to_thread(self.toobit.open_position_with_tp_sl, symbol=symbol.toobit_symbol, direction=decision.direction, margin_usdt=self.storage.margin_usdt(), leverage=self.storage.leverage(), tp_price=decision.tp, sl_price=decision.sl, price=decision.entry, place_tp=TOOBIT_PLACE_REAL_TP)
             self.storage.mark_real_open_result(signal_id, opened=result.opened, order_id=result.order_id, reason=result.reason, actual_margin_usdt=result.actual_margin_usdt, quantity=result.quantity)
             if result.opened:
                 self.symbol_health.record_toobit_success(symbol.name)

@@ -121,6 +121,30 @@ MIN_SCALP_SL_PCT = _env_float("MIN_1H_SL_PCT", "MIN_SCALP_SL_PCT", default=0.003
 MIN_SCALP_TP_PCT = _env_float("MIN_1H_TP_PCT", "MIN_SCALP_TP_PCT", default=0.0050)
 MAX_SCALP_SL_PCT = _env_float("MAX_1H_SL_PCT", "MAX_SCALP_SL_PCT", default=0.0550)
 
+# 1H AI Exit / Hold Wave. SL is hard protection; TP is a mental target zone by default.
+AI_EXIT_ENABLED = _env_bool("AI_EXIT_ENABLED", default=True)
+AI_EXIT_TP_IS_TARGET_ZONE = _env_bool("AI_EXIT_TP_IS_TARGET_ZONE", default=True)
+AI_EXIT_MIN_ACTIVE_SECONDS = _env_int("AI_EXIT_MIN_ACTIVE_SECONDS", default=600)
+AI_EXIT_TARGET_ZONE_RATIO = _env_float("AI_EXIT_TARGET_ZONE_RATIO", default=0.95)
+AI_EXIT_MIN_PROFIT_PCT = _env_float("AI_EXIT_MIN_PROFIT_PCT", default=0.0035)
+AI_EXIT_MIN_GIVEBACK_PCT = _env_float("AI_EXIT_MIN_GIVEBACK_PCT", default=0.0012)
+AI_EXIT_NOISE_ATR_MULTIPLIER = _env_float("AI_EXIT_NOISE_ATR_MULTIPLIER", default=0.35)
+AI_EXIT_GIVEBACK_RATIO = _env_float("AI_EXIT_GIVEBACK_RATIO", default=0.55)
+AI_EXIT_RISKY_GIVEBACK_RATIO = _env_float("AI_EXIT_RISKY_GIVEBACK_RATIO", default=0.48)
+AI_EXIT_BREAKEVEN_BUFFER_PCT = _env_float("AI_EXIT_BREAKEVEN_BUFFER_PCT", default=0.0004)
+AI_EXIT_DAMAGE_CONTROL_ADVERSE_RATIO = _env_float("AI_EXIT_DAMAGE_CONTROL_ADVERSE_RATIO", default=0.60)
+AI_EXIT_WEAKNESS_CONFIRMATIONS = _env_int("AI_EXIT_WEAKNESS_CONFIRMATIONS", default=3)
+AI_EXIT_REVERSAL_TICKS = _env_int("AI_EXIT_REVERSAL_TICKS", default=8)
+AI_EXIT_RECENT_TICKS = _env_int("AI_EXIT_RECENT_TICKS", default=48)
+
+# Re-entry is wave-reset based, not a fixed two-hour lock.
+AI_REENTRY_COOLDOWN_SECONDS = _env_int("AI_REENTRY_COOLDOWN_SECONDS", default=900)
+AI_REENTRY_REQUIRE_NEW_SETUP = _env_bool("AI_REENTRY_REQUIRE_NEW_SETUP", default=True)
+AI_REENTRY_MIN_RESET_ATR = _env_float("AI_REENTRY_MIN_RESET_ATR", default=0.35)
+
+# Real Toobit protection: SL stays on exchange. TP is optional because AI manages profit exit.
+TOOBIT_PLACE_REAL_TP = _env_bool("TOOBIT_PLACE_REAL_TP", default=False)
+
 LEARNING_DAYS = _env_int("LEARNING_DAYS", default=21)
 AI_MIN_SAMPLES_SOFT = 5
 AI_MIN_SAMPLES_MEDIUM = 10

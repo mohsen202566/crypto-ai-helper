@@ -10,7 +10,7 @@ from config import (
     DB_PATH, DEFAULT_LEVERAGE, DEFAULT_MARGIN_USDT, DEFAULT_MAX_POSITIONS, DEFAULT_MIN_PROFIT_PCT,
     DEFAULT_MIN_PROFIT_USDT, DEFAULT_TRADE_ENABLED, LEARNING_DAYS, LEVERAGE_MAX, LEVERAGE_MIN,
     MARGIN_MAX_USDT, MARGIN_MIN_USDT, MAX_POSITIONS_MAX, MAX_POSITIONS_MIN,
-    MIN_REAL_NET_PROFIT_USDT,
+    MIN_REAL_NET_PROFIT_USDT, AI_REENTRY_COOLDOWN_SECONDS, AI_REENTRY_MIN_RESET_ATR, AI_REENTRY_REQUIRE_NEW_SETUP,
 )
 from scorer import SignalDecision
 
@@ -47,8 +47,18 @@ class StoredSignal:
     risk_reward: float
     reason: str | None
     result_source: str | None = None
+    exit_price: float | None = None
+    ai_exit_reason: str | None = None
+    ai_exit_status: str | None = None
+    ai_exit_score: int = 0
+    target_zone_reached: bool = False
+    giveback_pct: float = 0.0
     entry_quality: str | None = None
     indicator_profile: str | None = None
+    market_mode: str | None = None
+    atr_pct_15m: float = 0.0
+    best_price: float | None = None
+    worst_price: float | None = None
     mfe_pct: float = 0.0
     mae_pct: float = 0.0
 
@@ -105,6 +115,12 @@ class Storage:
                     approx_pnl REAL,
                     real_pnl REAL,
                     result_source TEXT,
+                    exit_price REAL,
+                    ai_exit_reason TEXT,
+                    ai_exit_status TEXT,
+                    ai_exit_score INTEGER DEFAULT 0,
+                    target_zone_reached INTEGER DEFAULT 0,
+                    giveback_pct REAL DEFAULT 0,
                     margin_usdt REAL,
                     leverage INTEGER,
                     result_at TEXT,
@@ -202,6 +218,7 @@ class Storage:
             conn.execute("CREATE TABLE IF NOT EXISTS ai_shadow_tests (id INTEGER PRIMARY KEY AUTOINCREMENT, signal_id INTEGER NOT NULL, plan_name TEXT NOT NULL, tp REAL NOT NULL, sl REAL NOT NULL, result TEXT DEFAULT 'pending', created_at TEXT NOT NULL, updated_at TEXT)")
             conn.execute("CREATE TABLE IF NOT EXISTS ai_judgements (id INTEGER PRIMARY KEY AUTOINCREMENT, signal_id INTEGER NOT NULL, entry_quality TEXT, tp_quality TEXT, sl_quality TEXT, failure_reason TEXT, score_delta INTEGER, reasons TEXT, created_at TEXT NOT NULL)")
             conn.execute("CREATE TABLE IF NOT EXISTS ai_second_snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, signal_id INTEGER NOT NULL, created_at TEXT NOT NULL, price REAL NOT NULL, mfe_pct REAL DEFAULT 0, mae_pct REAL DEFAULT 0)")
+            conn.execute("CREATE TABLE IF NOT EXISTS ai_exit_events (id INTEGER PRIMARY KEY AUTOINCREMENT, signal_id INTEGER NOT NULL, created_at TEXT NOT NULL, status TEXT, price REAL, profit_pct REAL DEFAULT 0, mfe_pct REAL DEFAULT 0, mae_pct REAL DEFAULT 0, giveback_pct REAL DEFAULT 0, exit_score INTEGER DEFAULT 0, reason TEXT)")
             conn.execute("CREATE TABLE IF NOT EXISTS ai_suggestions (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, level TEXT, message TEXT, status TEXT DEFAULT 'open', suggestion_key TEXT, updated_at TEXT)")
             conn.execute("CREATE TABLE IF NOT EXISTS toobit_orders (id INTEGER PRIMARY KEY AUTOINCREMENT, signal_id INTEGER, symbol TEXT, action TEXT, order_id TEXT, status TEXT, reason TEXT, created_at TEXT)")
             self._migrate_columns(conn)
@@ -218,6 +235,8 @@ class Storage:
             "real_allowed": "INTEGER DEFAULT 0", "real_block_reason": "TEXT", "real_threshold": "INTEGER DEFAULT 76", "threshold_source": "TEXT DEFAULT 'BOOT'", "score_entry_precision": "INTEGER DEFAULT 0", "score_tp_sl": "INTEGER DEFAULT 0",
             "score_market_mode": "INTEGER DEFAULT 0", "score_net_sync": "INTEGER DEFAULT 0", "entry_precision_pct": "REAL DEFAULT 0", "pattern_id": "TEXT",
             "estimated_net_profit_usdt": "REAL DEFAULT 0", "market_mode": "TEXT", "best_price": "REAL", "worst_price": "REAL",
+            "exit_price": "REAL", "ai_exit_reason": "TEXT", "ai_exit_status": "TEXT", "ai_exit_score": "INTEGER DEFAULT 0",
+            "target_zone_reached": "INTEGER DEFAULT 0", "giveback_pct": "REAL DEFAULT 0",
         }
         for name, spec in columns.items():
             if name not in existing:
@@ -369,10 +388,42 @@ class Storage:
             conn.execute("INSERT INTO ai_second_snapshots(signal_id, created_at, price, mfe_pct, mae_pct) VALUES(?, ?, ?, ?, ?)", (signal_id, datetime.now(timezone.utc).isoformat(), price, mfe, mae))
             return mfe, mae
 
-    def finish_signal(self, signal_id: int, *, status: str, approx_pnl: float, real_pnl: float | None, result_message_id: int | None, mfe_pct: float, mae_pct: float, result_source: str | None = None) -> bool:
+    def recent_second_snapshots(self, signal_id: int, limit: int = 48) -> list[dict[str, Any]]:
+        limit = max(2, min(int(limit), 240))
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT created_at, price, mfe_pct, mae_pct FROM ai_second_snapshots WHERE signal_id=? ORDER BY id DESC LIMIT ?",
+                (signal_id, limit),
+            ).fetchall()
+        return [dict(row) for row in reversed(rows)]
+
+    def record_ai_exit_event(self, signal_id: int, *, status: str, price: float, reason: str | None, profit_pct: float, mfe_pct: float, mae_pct: float, giveback_pct: float, exit_score: int) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO ai_exit_events(signal_id, created_at, status, price, profit_pct, mfe_pct, mae_pct, giveback_pct, exit_score, reason) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (signal_id, datetime.now(timezone.utc).isoformat(), status, price, profit_pct, mfe_pct, mae_pct, giveback_pct, int(exit_score or 0), reason),
+            )
+
+    def finish_signal(self, signal_id: int, *, status: str, approx_pnl: float, real_pnl: float | None, result_message_id: int | None, mfe_pct: float, mae_pct: float, result_source: str | None = None, exit_price: float | None = None, ai_exit_reason: str | None = None, ai_exit_status: str | None = None, ai_exit_score: int = 0, target_zone_reached: bool = False, giveback_pct: float = 0.0) -> bool:
         now = datetime.now(timezone.utc).isoformat()
         with self._connect() as conn:
-            cur = conn.execute("UPDATE signals SET status=?, approx_pnl=?, real_pnl=?, result_message_id=?, result_at=?, mfe_pct=?, mae_pct=?, result_source=?, result_5m=?, result_10m=?, result_15m=? WHERE id=? AND status='OPEN'", (status, approx_pnl, real_pnl, result_message_id, now, mfe_pct, mae_pct, result_source, status, status, status, signal_id))
+            cur = conn.execute(
+                """
+                UPDATE signals
+                SET status=?, approx_pnl=?, real_pnl=?, result_message_id=?, result_at=?, mfe_pct=?, mae_pct=?,
+                    result_source=?, exit_price=?, ai_exit_reason=?, ai_exit_status=?, ai_exit_score=?,
+                    target_zone_reached=?, giveback_pct=?,
+                    real_status=CASE WHEN signal_type='real' THEN 'closed' ELSE real_status END,
+                    result_5m=?, result_10m=?, result_15m=?
+                WHERE id=? AND status='OPEN'
+                """,
+                (
+                    status, approx_pnl, real_pnl, result_message_id, now, mfe_pct, mae_pct,
+                    result_source, exit_price, ai_exit_reason, ai_exit_status, int(ai_exit_score or 0),
+                    1 if target_zone_reached else 0, float(giveback_pct or 0.0),
+                    status, status, status, signal_id,
+                ),
+            )
             return cur.rowcount > 0
 
     def open_signals(self) -> list[StoredSignal]:
@@ -389,6 +440,69 @@ class Storage:
         with self._connect() as conn:
             row = conn.execute("SELECT COUNT(*) AS n FROM signals WHERE status='OPEN' AND toobit_symbol=?", (toobit_symbol,)).fetchone()
             return int(row["n"]) > 0
+
+    def same_wave_reentry_block(self, *, symbol_name: str, direction: str, entry: float, score: int = 0) -> str | None:
+        """Block only immediate re-entry into the same unfinished wave.
+
+        This is not a fixed 2-hour ban. It prevents spam after AI_EXIT while
+        allowing a fresh breakout or a real pullback/reset to create a new setup.
+        """
+        if not AI_REENTRY_REQUIRE_NEW_SETUP:
+            return None
+        if entry <= 0 or not symbol_name or direction not in {"LONG", "SHORT"}:
+            return None
+
+        lookback = max(int(AI_REENTRY_COOLDOWN_SECONDS * 4), int(AI_REENTRY_COOLDOWN_SECONDS), 1)
+        start = datetime.now(timezone.utc) - timedelta(seconds=lookback)
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, created_at, result_at, symbol_name, direction, entry, exit_price, best_price, worst_price,
+                       tp, sl, score, ai_exit_status, ai_exit_reason, atr_pct_15m
+                FROM signals
+                WHERE symbol_name=?
+                  AND direction=?
+                  AND status='EXIT'
+                  AND result_at>=?
+                ORDER BY result_at DESC, id DESC
+                LIMIT 1
+                """,
+                (symbol_name, direction, start.isoformat()),
+            ).fetchone()
+        if not row:
+            return None
+
+        result_at = str(row["result_at"] or row["created_at"])
+        try:
+            closed_at = datetime.fromisoformat(result_at)
+        except ValueError:
+            return None
+        if closed_at.tzinfo is None:
+            closed_at = closed_at.replace(tzinfo=timezone.utc)
+        age = max(0.0, (datetime.now(timezone.utc) - closed_at).total_seconds())
+
+        last_exit = float(row["exit_price"] or row["entry"] or entry)
+        last_score = int(row["score"] or 0)
+        atr_pct = max(float(row["atr_pct_15m"] or 0.0), abs(float(row["tp"] or entry) - float(row["entry"] or entry)) / max(entry, 1e-9) * 0.35, 0.001)
+        reset_distance = max(entry * atr_pct * AI_REENTRY_MIN_RESET_ATR, entry * 0.001)
+        strong_score_reset = int(score or 0) >= last_score + 6
+
+        if direction == "LONG":
+            last_best = float(row["best_price"] or row["entry"] or entry)
+            breakout_reset = entry >= last_best + reset_distance
+            pullback_reset = entry <= last_exit - reset_distance
+        else:
+            last_best = float(row["best_price"] or row["entry"] or entry)
+            breakout_reset = entry <= last_best - reset_distance
+            pullback_reset = entry >= last_exit + reset_distance
+
+        wave_reset = breakout_reset or pullback_reset or strong_score_reset
+        if wave_reset:
+            return None
+
+        if age <= AI_REENTRY_COOLDOWN_SECONDS:
+            return f"SAME_WAVE_COOLDOWN: آخرین AI_EXIT همین ارز/جهت تازه بسته شده و هنوز موج جدید تأیید نشده است. age={age:.0f}s reset_distance={reset_distance:.6f}"
+        return f"SAME_WAVE_NOT_RESET: بعد از AI_EXIT هنوز قیمت از موج قبلی جدا نشده؛ ورود دوباره همان موج بلاک شد. reset_distance={reset_distance:.6f}"
 
     def active_real_count(self) -> int:
         with self._connect() as conn:
@@ -922,4 +1036,32 @@ class Storage:
         return {"total": len(subset), "tp": tp_count, "sl": sl_count, "open": sum(1 for row in subset if row["status"] == "OPEN"), "exit": sum(1 for row in subset if row["status"] == "EXIT"), "failed": sum(1 for row in subset if row["status"] == "FAILED"), "win_rate": (tp_count / len(closed) * 100.0) if closed else 0.0, "pnl": sum(float(row[pnl_key] or 0.0) for row in subset), "avg_score": sum(float(row["score"] or 0) for row in subset) / len(subset) if subset else 0.0}
 
     def _row_to_signal(self, row: sqlite3.Row) -> StoredSignal:
-        return StoredSignal(id=int(row["id"]), created_at=str(row["created_at"]), okx_symbol=str(row["okx_symbol"]), toobit_symbol=str(row["toobit_symbol"]), symbol_name=str(row["symbol_name"] or ""), direction=str(row["direction"]), entry=float(row["entry"]), tp=float(row["tp"]), sl=float(row["sl"]), score=int(row["score"]), ai_confidence=int(row["ai_confidence"] or 0), ai_experience=int(row["ai_experience"] or 0), signal_type=str(row["signal_type"]), hunter_type=str(row["hunter_type"] or "ordinary"), status=str(row["status"]), real_status=str(row["real_status"]), message_id=int(row["message_id"]) if row["message_id"] is not None else None, result_message_id=int(row["result_message_id"]) if row["result_message_id"] is not None else None, order_id=str(row["order_id"]) if row["order_id"] is not None else None, approx_pnl=float(row["approx_pnl"]) if row["approx_pnl"] is not None else None, real_pnl=float(row["real_pnl"]) if row["real_pnl"] is not None else None, margin_usdt=float(row["margin_usdt"] or 0.0), leverage=int(row["leverage"] or 1), net_edge=float(row["net_edge"] or 0.0), estimated_profit_usdt=float(row["estimated_profit_usdt"] or 0.0), estimated_net_profit_usdt=float(row["estimated_net_profit_usdt"] or 0.0), estimated_profit_pct=float(row["estimated_profit_pct"] or 0.0), risk_reward=float(row["risk_reward"] or 0.0), reason=str(row["reason"]) if row["reason"] is not None else None, result_source=str(row["result_source"]) if row["result_source"] is not None else None, entry_quality=str(row["entry_quality"]) if row["entry_quality"] is not None else None, indicator_profile=str(row["indicator_profile"]) if row["indicator_profile"] is not None else None, mfe_pct=float(row["mfe_pct"] or 0.0), mae_pct=float(row["mae_pct"] or 0.0))
+        return StoredSignal(
+            id=int(row["id"]), created_at=str(row["created_at"]), okx_symbol=str(row["okx_symbol"]),
+            toobit_symbol=str(row["toobit_symbol"]), symbol_name=str(row["symbol_name"] or ""),
+            direction=str(row["direction"]), entry=float(row["entry"]), tp=float(row["tp"]), sl=float(row["sl"]),
+            score=int(row["score"]), ai_confidence=int(row["ai_confidence"] or 0), ai_experience=int(row["ai_experience"] or 0),
+            signal_type=str(row["signal_type"]), hunter_type=str(row["hunter_type"] or "ordinary"), status=str(row["status"]),
+            real_status=str(row["real_status"]), message_id=int(row["message_id"]) if row["message_id"] is not None else None,
+            result_message_id=int(row["result_message_id"]) if row["result_message_id"] is not None else None,
+            order_id=str(row["order_id"]) if row["order_id"] is not None else None,
+            approx_pnl=float(row["approx_pnl"]) if row["approx_pnl"] is not None else None,
+            real_pnl=float(row["real_pnl"]) if row["real_pnl"] is not None else None,
+            margin_usdt=float(row["margin_usdt"] or 0.0), leverage=int(row["leverage"] or 1),
+            net_edge=float(row["net_edge"] or 0.0), estimated_profit_usdt=float(row["estimated_profit_usdt"] or 0.0),
+            estimated_net_profit_usdt=float(row["estimated_net_profit_usdt"] or 0.0), estimated_profit_pct=float(row["estimated_profit_pct"] or 0.0),
+            risk_reward=float(row["risk_reward"] or 0.0), reason=str(row["reason"]) if row["reason"] is not None else None,
+            result_source=str(row["result_source"]) if row["result_source"] is not None else None,
+            exit_price=float(row["exit_price"]) if row["exit_price"] is not None else None,
+            ai_exit_reason=str(row["ai_exit_reason"]) if row["ai_exit_reason"] is not None else None,
+            ai_exit_status=str(row["ai_exit_status"]) if row["ai_exit_status"] is not None else None,
+            ai_exit_score=int(row["ai_exit_score"] or 0), target_zone_reached=bool(row["target_zone_reached"] or 0),
+            giveback_pct=float(row["giveback_pct"] or 0.0),
+            entry_quality=str(row["entry_quality"]) if row["entry_quality"] is not None else None,
+            indicator_profile=str(row["indicator_profile"]) if row["indicator_profile"] is not None else None,
+            market_mode=str(row["market_mode"]) if row["market_mode"] is not None else None,
+            atr_pct_15m=float(row["atr_pct_15m"] or 0.0),
+            best_price=float(row["best_price"]) if row["best_price"] is not None else None,
+            worst_price=float(row["worst_price"]) if row["worst_price"] is not None else None,
+            mfe_pct=float(row["mfe_pct"] or 0.0), mae_pct=float(row["mae_pct"] or 0.0),
+        )

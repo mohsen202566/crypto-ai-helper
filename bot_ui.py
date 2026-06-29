@@ -95,7 +95,7 @@ class BotUI:
         direction_fa = "لانگ" if signal.direction == "LONG" else "شورت"
         result_fa = "تیپی خورد" if status == "TP" else "استاپ خورد" if status == "SL" else "خروج هوشمند AI"
         icon = "🟢" if status == "TP" else "🔴" if status == "SL" else "🟡"
-        source_fa = {"toobit_real": "واقعی توبیت", "normal_on_real": "عادی روی سیگنال واقعی", "normal": "عادی ربات", "ghost_or_failed": "Ghost/Failed"}.get(result_source or signal.result_source or "", "عادی ربات")
+        source_fa = {"toobit_real": "واقعی توبیت", "normal_on_real": "عادی روی سیگنال واقعی", "normal": "عادی ربات", "ai_exit_toobit_real": "AI Exit واقعی توبیت", "ai_exit_normal": "AI Exit عادی", "ghost_or_failed": "Ghost/Failed"}.get(result_source or signal.result_source or "", "عادی ربات")
         text = f"{icon} نتیجه {direction_fa}: {result_fa}\nارز: {signal.symbol_name or signal.toobit_symbol}\nنوع نتیجه: {source_fa}\nنوع سیگنال: {signal.hunter_type} / {signal.signal_type}\nکیفیت AI: {signal.entry_quality or '-'}\nسود/ضرر تقریبی: {fmt_money(approx_pnl)}"
         if signal.signal_type == "real":
             text += f"\nسود/ضرر واقعی Toobit: {fmt_money(real_pnl)}"

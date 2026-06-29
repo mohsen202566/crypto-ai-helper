@@ -256,6 +256,7 @@ class ToobitClient:
         tp_price: float,
         sl_price: float,
         price: float | None = None,
+        place_tp: bool = True,
     ) -> OpenOrderResult:
         symbol = symbol.upper()
         _validate_direction(direction)
@@ -268,7 +269,10 @@ class ToobitClient:
         rules = self.get_symbol_rules(symbol)
         tp_decimal = _round_price_to_tick(Decimal(str(tp_price)), rules.price_tick, direction, is_tp=True)
         sl_decimal = _round_price_to_tick(Decimal(str(sl_price)), rules.price_tick, direction, is_tp=False)
-        self._validate_prices(direction, tp_price=tp_decimal, sl_price=sl_decimal, reference_price=entry_price)
+        if place_tp:
+            self._validate_prices(direction, tp_price=tp_decimal, sl_price=sl_decimal, reference_price=entry_price)
+        else:
+            self._validate_sl_price(direction, sl_price=sl_decimal, reference_price=entry_price)
         notional = Decimal(str(margin_usdt)) * Decimal(str(leverage))
         actual_margin = notional / Decimal(str(leverage))
         self._validate_actual_margin(requested_margin=Decimal(str(margin_usdt)), actual_margin=actual_margin)
@@ -280,13 +284,16 @@ class ToobitClient:
             "priceType": "MARKET",
             "valueQuantity": _decimal_to_api(notional),
             "newClientOrderId": f"ai1h_{int(time.time() * 1000)}",
-            self.param_tp: _decimal_to_api(tp_decimal),
             self.param_sl: _decimal_to_api(sl_decimal),
-            "tpTriggerBy": "CONTRACT_PRICE",
             "slTriggerBy": "CONTRACT_PRICE",
-            "tpOrderType": "MARKET",
             "slOrderType": "MARKET",
         }
+        if place_tp:
+            params.update({
+                self.param_tp: _decimal_to_api(tp_decimal),
+                "tpTriggerBy": "CONTRACT_PRICE",
+                "tpOrderType": "MARKET",
+            })
         try:
             raw = self._request("POST", self.path_order, params=params, signed=True)
         except Exception as exc:
@@ -515,6 +522,14 @@ class ToobitClient:
             raise ValueError("برای LONG باید TP بالاتر از ورود و SL پایین‌تر از ورود باشد.")
         if direction == "SHORT" and not (tp_price < reference_price < sl_price):
             raise ValueError("برای SHORT باید TP پایین‌تر از ورود و SL بالاتر از ورود باشد.")
+
+    def _validate_sl_price(self, direction: Direction, *, sl_price: Decimal, reference_price: Decimal) -> None:
+        if sl_price <= 0 or reference_price <= 0:
+            raise ValueError("قیمت ورود و SL باید مثبت باشند.")
+        if direction == "LONG" and not (reference_price > sl_price):
+            raise ValueError("برای LONG باید SL پایین‌تر از ورود باشد.")
+        if direction == "SHORT" and not (reference_price < sl_price):
+            raise ValueError("برای SHORT باید SL بالاتر از ورود باشد.")
 
     def _validate_actual_margin(self, *, requested_margin: Decimal, actual_margin: Decimal) -> None:
         if requested_margin <= 0 or actual_margin <= 0:
