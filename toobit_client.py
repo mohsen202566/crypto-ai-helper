@@ -128,15 +128,44 @@ class ToobitClient:
 
     def get_usdt_balance_summary(self) -> dict[str, float]:
         balances = self.get_balance()
-        usdt = next((b for b in balances if str(b.get("coin", "")).upper() == "USDT"), {})
+        usdt = next((b for b in balances if str(b.get("coin") or b.get("asset") or b.get("currency") or "").upper() == "USDT"), {})
+
+        def first_float(*keys: str) -> float:
+            for key in keys:
+                if key in usdt and usdt.get(key) not in (None, ""):
+                    return safe_float(usdt.get(key))
+            return 0.0
+
         return {
-            "balance": safe_float(usdt.get("balance")),
-            "available": safe_float(usdt.get("availableBalance")),
-            "position_margin": safe_float(usdt.get("positionMargin")),
-            "order_margin": safe_float(usdt.get("orderMargin")),
-            "unrealized_pnl": safe_float(usdt.get("crossUnRealizedPnl")),
-            "coupon": safe_float(usdt.get("coupon")),
+            "balance": first_float("balance", "walletBalance", "totalWalletBalance", "equity", "total"),
+            "available": first_float("availableBalance", "available", "free", "maxWithdrawAmount"),
+            "position_margin": first_float("positionMargin", "positionInitialMargin", "maintMargin"),
+            "order_margin": first_float("orderMargin", "openOrderInitialMargin"),
+            "unrealized_pnl": first_float("crossUnRealizedPnl", "unrealizedPnl", "unRealizedPnl"),
+            "coupon": first_float("coupon"),
         }
+
+    def get_today_pnl(self) -> float:
+        payload = self._request("GET", "/api/v1/futures/todayPnl", signed=True)
+        data = payload.get("data") if isinstance(payload, dict) else payload
+        if isinstance(data, dict):
+            for key in ("todayPnl", "pnl", "profit", "realizedPnl", "totalPnl", "income"):
+                if key in data:
+                    return safe_float(data.get(key))
+        if isinstance(data, list):
+            total = 0.0
+            for item in data:
+                if isinstance(item, dict):
+                    for key in ("todayPnl", "pnl", "profit", "realizedPnl", "income"):
+                        if key in item:
+                            total += safe_float(item.get(key))
+                            break
+            return total
+        if isinstance(payload, dict):
+            for key in ("todayPnl", "pnl", "profit", "realizedPnl", "totalPnl", "income"):
+                if key in payload:
+                    return safe_float(payload.get(key))
+        return 0.0
 
     def get_positions(self, symbol: str | None = None, side: str | None = None) -> list[dict[str, Any]]:
         params: dict[str, Any] = {}

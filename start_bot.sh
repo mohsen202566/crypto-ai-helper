@@ -1,28 +1,16 @@
-#!/usr/bin/env bash
-set -Eeuo pipefail
+#!/bin/bash
+cd "$(dirname "$0")" || exit 1
 
-# اجرای ربات اسکالپ کلاسیک ۵ دقیقه‌ای
-# این اسکریپت از هر مسیری اجرا شود، خودش وارد پوشه پروژه می‌شود.
-
-PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$PROJECT_DIR"
-
-if [ ! -f ".env" ]; then
-  echo "❌ فایل .env پیدا نشد. اول فایل .env.example را به .env کپی و تنظیم کن."
-  exit 1
+if [ -f .env ]; then
+  set -a
+  source .env
+  set +a
 fi
 
-set -a
-# shellcheck disable=SC1091
-source .env
-set +a
-
-if [ -x "$PROJECT_DIR/venv/bin/python" ]; then
-  PYTHON_BIN="$PROJECT_DIR/venv/bin/python"
-elif [ -x "$PROJECT_DIR/.venv/bin/python" ]; then
-  PYTHON_BIN="$PROJECT_DIR/.venv/bin/python"
+if [ -x "venv/bin/python" ]; then
+  exec venv/bin/python main.py
+elif [ -x "/root/venv/bin/python" ]; then
+  exec /root/venv/bin/python main.py
 else
-  PYTHON_BIN="python3"
+  exec python3 main.py
 fi
-
-exec "$PYTHON_BIN" "$PROJECT_DIR/main.py"

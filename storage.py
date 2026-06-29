@@ -22,9 +22,12 @@ def _default_state() -> dict[str, Any]:
         },
         "stats": {
             "signals_total": 0,
+            "signals_normal": 0,
+            "signals_real": 0,
             "normal_tp": 0,
             "normal_sl": 0,
             "normal_open": 0,
+            "normal_pnl": 0.0,
             "real_tp": 0,
             "real_sl": 0,
             "real_open": 0,
