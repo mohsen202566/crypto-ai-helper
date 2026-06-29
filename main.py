@@ -1,25 +1,61 @@
 """اجرای اصلی ربات اسکالپ کلاسیک ۵ دقیقه‌ای.
 
-تحلیل از OKX گرفته می‌شود و اجرای واقعی، در صورت روشن بودن ترید، روی Toobit انجام می‌شود.
+این فایل مخصوص ساختار ریشه‌ای است؛ یعنی همه فایل‌های .py کنار همین main.py هستند
+و پوشه bot لازم نیست. برای اینکه فایل‌های قدیمی که داخلشان import نسبی مثل
+`from . import config` دارند هم بدون خطا کار کنند، همین فایل یک پکیج مجازی به نام
+`bot` روی همین پوشه می‌سازد و بعد ماژول‌ها را از همان پکیج اجرا می‌کند.
 """
 from __future__ import annotations
 
+import importlib
 import signal
+import sys
 import threading
 import time
+import types
+from pathlib import Path
 from typing import Any
 
-import config
-from indicators import calculate_indicators
-from messages_fa import normal_result_message, real_result_message, signal_message
-from okx_client import OKXClient
-from stats_manager import StatsManager
-from storage import JSONStorage
-from strategy import ClassicScalpingStrategy
-from telegram_bot import TelegramBotService
-from toobit_client import ToobitClient
-from trade_manager import TradeManager
-from utils import logger, now_utc_iso, safe_sleep
+
+# ---------------------------------------------------------------------------
+# سازگاری با پروژه ریشه‌ای
+# ---------------------------------------------------------------------------
+# پروژه شما همیشه فایل‌ها را در ریشه ریپو می‌گذارد، نه داخل پوشه bot.
+# اما بعضی فایل‌ها هنوز import نسبی دارند مثل: from . import config
+# این بخش باعث می‌شود همان فایل‌های ریشه‌ای مثل یک پکیج به نام bot دیده شوند.
+BASE_DIR = Path(__file__).resolve().parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
+if "bot" not in sys.modules:
+    bot_pkg = types.ModuleType("bot")
+    bot_pkg.__file__ = str(BASE_DIR / "__init__.py")
+    bot_pkg.__path__ = [str(BASE_DIR)]
+    bot_pkg.__package__ = "bot"
+    sys.modules["bot"] = bot_pkg
+
+
+def _load_module(name: str):
+    """ماژول را از ریشه پروژه، به شکل bot.<name> بارگذاری می‌کند."""
+    return importlib.import_module(f"bot.{name}")
+
+
+config = _load_module("config")
+calculate_indicators = _load_module("indicators").calculate_indicators
+_messages = _load_module("messages_fa")
+normal_result_message = _messages.normal_result_message
+real_result_message = _messages.real_result_message
+signal_message = _messages.signal_message
+OKXClient = _load_module("okx_client").OKXClient
+StatsManager = _load_module("stats_manager").StatsManager
+JSONStorage = _load_module("storage").JSONStorage
+ClassicScalpingStrategy = _load_module("strategy").ClassicScalpingStrategy
+TelegramBotService = _load_module("telegram_bot").TelegramBotService
+ToobitClient = _load_module("toobit_client").ToobitClient
+TradeManager = _load_module("trade_manager").TradeManager
+_utils = _load_module("utils")
+logger = _utils.logger
+safe_sleep = _utils.safe_sleep
 
 
 class FiveMinuteScalperBot:
@@ -84,7 +120,10 @@ class FiveMinuteScalperBot:
         logger.info("ربات اسکالپ کلاسیک ۵ دقیقه‌ای شروع شد")
         self.validate_symbols()
         self.telegram.start()
-        self.telegram.send_message("✅ ربات اسکالپ کلاسیک ۵ دقیقه‌ای روشن شد.\nتحلیل از OKX و اجرای واقعی از Toobit انجام می‌شود.")
+        self.telegram.send_message(
+            "✅ ربات اسکالپ کلاسیک ۵ دقیقه‌ای روشن شد.\n"
+            "تحلیل از OKX و اجرای واقعی از Toobit انجام می‌شود."
+        )
         self._install_signal_handlers()
         self.analysis_loop()
 
@@ -112,8 +151,10 @@ class FiveMinuteScalperBot:
     def _process_symbol(self, internal: str, mapped: dict[str, Any]) -> float | None:
         if self._symbol_in_cooldown(internal):
             return None
+
         okx_symbol = mapped["okx_symbol"]
         toobit_symbol = mapped["toobit_symbol"]
+
         try:
             candles = self.okx.get_candles(okx_symbol)
             indicators = calculate_indicators(candles)
@@ -131,22 +172,26 @@ class FiveMinuteScalperBot:
                 logger.info("سیگنال %s رد شد: %s", internal, reason)
                 return latest_price
 
-            # تعیین ریشه‌ای نوع سیگنال قبل از ارسال:
-            # اگر ترید روشن، Toobit وصل، و اسلات پوزیشن خالی باشد => رئال Toobit
-            # در غیر این صورت => عادی / داخلی
-            signal_data = self.trade_manager.decide_execution_mode(signal_data)
             signal_data = self.trade_manager.register_signal(signal_data)
             msg_id = self.telegram.send_message(signal_message(signal_data))
             if msg_id:
                 self.storage.update_signal(signal_data["signal_id"], telegram_message_id=msg_id)
                 signal_data["telegram_message_id"] = msg_id
 
-            if signal_data.get("execution_mode") == "REAL":
-                executed, exec_message, _response = self.trade_manager.try_execute_real(signal_data, mapped.get("toobit_info", {}))
-                if not executed:
-                    self.telegram.send_message(f"⚠️ اجرای واقعی سیگنال انجام نشد:\n{exec_message}", reply_to_message_id=msg_id)
-                else:
-                    self.telegram.send_message("✅ سفارش رئال Toobit ارسال شد و TP/SL ثابت همراه سفارش ثبت شد.", reply_to_message_id=msg_id)
+            executed, exec_message, _response = self.trade_manager.try_execute_real(
+                signal_data,
+                mapped.get("toobit_info", {}),
+            )
+            if not executed and self.storage.get_settings().get("trade_enabled"):
+                self.telegram.send_message(
+                    f"⚠️ اجرای واقعی سیگنال انجام نشد:\n{exec_message}",
+                    reply_to_message_id=msg_id,
+                )
+            elif executed:
+                self.telegram.send_message(
+                    "✅ سفارش واقعی روی Toobit ارسال شد و TP/SL ثابت همراه سفارش ثبت شد.",
+                    reply_to_message_id=msg_id,
+                )
 
             self.last_signal_ts[internal] = now_ts
             return latest_price
@@ -155,13 +200,19 @@ class FiveMinuteScalperBot:
             return None
 
     def _check_results(self, latest_prices: dict[str, float]) -> None:
-        for signal_data, result, price, pnl in self.trade_manager.check_normal_results(latest_prices):
+        for signal_data, result, price in self.trade_manager.check_normal_results(latest_prices):
             msg_id = signal_data.get("telegram_message_id")
-            self.telegram.send_message(normal_result_message(signal_data, result, price, pnl), reply_to_message_id=msg_id)
+            self.telegram.send_message(
+                normal_result_message(signal_data, result, price),
+                reply_to_message_id=msg_id,
+            )
 
         for signal_data, result, price, pnl in self.trade_manager.check_real_results():
             msg_id = signal_data.get("telegram_message_id")
-            self.telegram.send_message(real_result_message(signal_data, result, price, pnl), reply_to_message_id=msg_id)
+            self.telegram.send_message(
+                real_result_message(signal_data, result, price, pnl),
+                reply_to_message_id=msg_id,
+            )
 
     def analysis_loop(self) -> None:
         while not self.stop_event.is_set():
