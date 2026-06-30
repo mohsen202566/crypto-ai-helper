@@ -18,6 +18,7 @@ def signal_message(signal: dict[str, Any]) -> str:
     reasons = "\n".join(f"✅ {r}" for r in signal.get("reasons", [])) or "✅ شرایط اصلی برقرار است"
     warnings = "\n".join(f"⚠️ {w}" for w in signal.get("warnings", []))
     ind = signal.get("indicators", {})
+    score_text = signal.get("score_label") or f"{signal.get('score', 0)} از 100"
     text = f"""{icon} سیگنال {side_fa} — {signal['symbol']}
 
 نوع اجرا: {mode_fa}
@@ -29,8 +30,9 @@ def signal_message(signal: dict[str, Any]) -> str:
 
 دلار ترید: {format_num(signal.get('trade_amount_usdt'), 2)} USDT
 لوریج: {signal.get('leverage', '-')}x
+جهت بازار: {signal.get('market_state', '-')}
 
-امتیاز: {signal['score']} از 100
+منطق ورود: {score_text}
 نوع سیگنال: {signal['signal_type']} اسکالپ ۵ دقیقه‌ای
 منبع تحلیل: OKX  ({signal['okx_symbol']})
 محل اجرای احتمالی: Toobit  ({signal['toobit_symbol']})

@@ -80,6 +80,7 @@ def calculate_indicators(candles: list[dict[str, Any]]) -> dict[str, Any]:
 
     df["ema_fast"] = df["close"].ewm(span=config.EMA_FAST, adjust=False).mean()
     df["ema_slow"] = df["close"].ewm(span=config.EMA_SLOW, adjust=False).mean()
+    df["ema_trend"] = df["close"].ewm(span=config.EMA_TREND, adjust=False).mean()
 
     typical_price = (df["high"] + df["low"] + df["close"]) / 3
     cumulative_volume = df["volume"].replace(0, np.nan).cumsum()
@@ -121,6 +122,7 @@ def calculate_indicators(candles: list[dict[str, Any]]) -> dict[str, Any]:
         "volume_multiplier": volume_multiplier,
         "ema_fast": safe_float(latest["ema_fast"]),
         "ema_slow": safe_float(latest["ema_slow"]),
+        "ema_trend": safe_float(latest["ema_trend"]),
         "ema_fast_prev": safe_float(previous["ema_fast"]),
         "ema_slow_prev": safe_float(previous["ema_slow"]),
         "vwap": safe_float(latest["vwap"]),

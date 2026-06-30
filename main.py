@@ -67,6 +67,122 @@ class SingleInstanceLock:
             pass
 
 
+class MarketTrendFilter:
+    """فیلتر جهت کلی بازار بر اساس 1H و 4H + تایید BTC و ETH.
+
+    خروجی فقط یکی از این سه حالت است:
+    BUY   = بازار صعودی؛ فقط لانگ مجاز
+    SELL  = بازار نزولی؛ فقط شورت مجاز
+    RANGE = بازار رنج؛ هیچ سیگنال جدیدی صادر نشود
+    """
+
+    def __init__(self, okx: OKXClient) -> None:
+        self.okx = okx
+        self.last_update_ts = 0.0
+        self.cache: dict[str, Any] = {
+            "direction": "RANGE",
+            "summary": "بازار هنوز جهت تاییدشده ندارد؛ حالت رنج",
+            "details": {},
+        }
+
+    @staticmethod
+    def _classify(ind: dict[str, Any]) -> str:
+        close = float(ind.get("close") or 0)
+        ema_fast = float(ind.get("ema_fast") or 0)
+        ema_slow = float(ind.get("ema_slow") or 0)
+        ema_trend = float(ind.get("ema_trend") or ema_slow or 0)
+        rsi = float(ind.get("rsi") or 50)
+        adx = float(ind.get("adx") or 0)
+
+        if close > ema_trend and ema_fast > ema_slow and rsi >= config.TREND_RSI_BUY_MIN and adx >= config.TREND_ADX_MIN:
+            return "BUY"
+        if close < ema_trend and ema_fast < ema_slow and rsi <= config.TREND_RSI_SELL_MAX and adx >= config.TREND_ADX_MIN:
+            return "SELL"
+        return "RANGE"
+
+    @staticmethod
+    def _majority_direction(counts: dict[str, int], total: int) -> str:
+        if total < config.MARKET_TREND_MIN_SYMBOLS:
+            return "RANGE"
+        buy = counts.get("BUY", 0)
+        sell = counts.get("SELL", 0)
+        if buy / max(1, total) >= config.MARKET_TREND_MIN_AGREEMENT and buy > sell:
+            return "BUY"
+        if sell / max(1, total) >= config.MARKET_TREND_MIN_AGREEMENT and sell > buy:
+            return "SELL"
+        return "RANGE"
+
+    def _okx_symbol_for(self, internal: str, valid_symbols: dict[str, dict[str, Any]]) -> str:
+        mapped = valid_symbols.get(internal) or {}
+        return str(mapped.get("okx_symbol") or config.SYMBOL_MAP[internal]["okx"])
+
+    def _calculate(self, valid_symbols: dict[str, dict[str, Any]]) -> dict[str, Any]:
+        details: dict[str, Any] = {"timeframes": {}, "anchors": {}}
+        timeframe_directions: dict[str, str] = {}
+
+        for bar in config.MARKET_TREND_TIMEFRAMES:
+            counts = {"BUY": 0, "SELL": 0, "RANGE": 0}
+            analyzed = 0
+            for internal in config.WATCHLIST:
+                try:
+                    okx_symbol = self._okx_symbol_for(internal, valid_symbols)
+                    candles = self.okx.get_candles(okx_symbol, bar=bar, limit=config.MARKET_TREND_CANDLE_LIMIT)
+                    ind = calculate_indicators(candles)
+                    direction = self._classify(ind)
+                    counts[direction] = counts.get(direction, 0) + 1
+                    analyzed += 1
+                    if internal in config.MARKET_TREND_ANCHORS:
+                        details["anchors"].setdefault(internal, {})[bar] = direction
+                except Exception as exc:
+                    logger.warning("فیلتر بازار %s %s ناموفق بود: %s", internal, bar, exc)
+
+            tf_direction = self._majority_direction(counts, analyzed)
+            timeframe_directions[bar] = tf_direction
+            details["timeframes"][bar] = {"direction": tf_direction, "counts": counts, "analyzed": analyzed}
+
+        directions = set(timeframe_directions.values())
+        if len(directions) != 1:
+            return {
+                "direction": "RANGE",
+                "summary": "بازار رنج است؛ جهت 1H و 4H باهم موافق نیستند",
+                "details": details,
+            }
+
+        market_direction = next(iter(directions)) if directions else "RANGE"
+        if market_direction not in ("BUY", "SELL"):
+            return {
+                "direction": "RANGE",
+                "summary": "بازار رنج است؛ اکثریت 1H و 4H جهت سالم ندادند",
+                "details": details,
+            }
+
+        for anchor in config.MARKET_TREND_ANCHORS:
+            anchor_tfs = details["anchors"].get(anchor, {})
+            if any(anchor_tfs.get(bar) != market_direction for bar in config.MARKET_TREND_TIMEFRAMES):
+                return {
+                    "direction": "RANGE",
+                    "summary": f"بازار رنج است؛ {anchor.replace('USDT', '')} با جهت کلی بازار در 1H/4H هم‌جهت نیست",
+                    "details": details,
+                }
+
+        fa = "صعودی" if market_direction == "BUY" else "نزولی / شورت"
+        side_fa = "لانگ" if market_direction == "BUY" else "شورت"
+        return {
+            "direction": market_direction,
+            "summary": f"جهت کلی بازار {fa} است؛ 1H و 4H هم‌جهت‌اند و BTC/ETH تایید کردند؛ فقط {side_fa} مجاز است",
+            "details": details,
+        }
+
+    def get(self, valid_symbols: dict[str, dict[str, Any]], *, force: bool = False) -> dict[str, Any]:
+        now_ts = time.time()
+        if not force and now_ts - self.last_update_ts < config.MARKET_TREND_REFRESH_SECONDS:
+            return self.cache
+        self.cache = self._calculate(valid_symbols)
+        self.last_update_ts = now_ts
+        logger.info("فیلتر بازار به‌روزرسانی شد: %s | %s", self.cache.get("direction"), self.cache.get("summary"))
+        return self.cache
+
+
 class FiveMinuteScalperBot:
     def __init__(self):
         self.storage = JSONStorage()
@@ -74,6 +190,7 @@ class FiveMinuteScalperBot:
         self.toobit = ToobitClient()
         self.stats = StatsManager(self.storage)
         self.strategy = ClassicScalpingStrategy()
+        self.market_filter = MarketTrendFilter(self.okx)
         self.trade_manager = TradeManager(self.storage, self.stats, self.toobit)
         self.telegram = TelegramBotService(self.storage, self.trade_manager, self.stats)
         self.stop_event = threading.Event()
@@ -186,7 +303,7 @@ class FiveMinuteScalperBot:
         if normal_results or real_results:
             self._send_result_messages(normal_results=normal_results, real_results=real_results)
 
-    def _process_symbol(self, internal: str, mapped: dict[str, Any]) -> float | None:
+    def _process_symbol(self, internal: str, mapped: dict[str, Any], market_info: dict[str, Any]) -> float | None:
         if self._symbol_in_cooldown(internal):
             return None
         okx_symbol = mapped["okx_symbol"]
@@ -202,7 +319,7 @@ class FiveMinuteScalperBot:
                 logger.info("رد شد: برای این نماد %s هنوز سیگنال باز وجود دارد", internal)
                 return latest_price
 
-            signal_data = self.strategy.evaluate(internal, okx_symbol, toobit_symbol, indicators)
+            signal_data = self.strategy.evaluate(internal, okx_symbol, toobit_symbol, indicators, market_info)
             if not signal_data:
                 return latest_price
 
@@ -262,11 +379,17 @@ class FiveMinuteScalperBot:
             except Exception as exc:
                 logger.warning("مانیتور ابتدای حلقه ناموفق بود، ربات ادامه می‌دهد: %s", exc)
 
+            market_info = self.market_filter.get(self.valid_symbols)
+            if str(market_info.get("direction") or "RANGE").upper() == "RANGE":
+                logger.info("بازار در حالت رنج است؛ سیگنال جدید صادر نمی‌شود: %s", market_info.get("summary"))
+                safe_sleep(config.POLL_INTERVAL_SECONDS)
+                continue
+
             latest_prices: dict[str, float] = {}
             for internal, mapped in list(self.valid_symbols.items()):
                 if self.stop_event.is_set():
                     break
-                price = self._process_symbol(internal, mapped)
+                price = self._process_symbol(internal, mapped, market_info)
                 if price is not None:
                     latest_prices[internal] = price
                 safe_sleep(0.15)

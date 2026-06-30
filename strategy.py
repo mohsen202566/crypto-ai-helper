@@ -1,4 +1,10 @@
-"""منطق کلاسیک ورود سریع بدون AI."""
+"""منطق کلاسیک بازه‌ای بدون امتیاز.
+
+قانون اصلی:
+- بازار فقط سه حالت دارد: BUY، SELL، RANGE.
+- در RANGE هیچ سیگنالی صادر نمی‌شود.
+- امتیازدهی حذف شده؛ سیگنال فقط وقتی صادر می‌شود که همه بازه‌های سالم ورود برقرار باشند.
+"""
 from __future__ import annotations
 
 from typing import Any
@@ -12,152 +18,116 @@ class ClassicScalpingStrategy:
         atr_percent = float(ind.get("atr_percent", 0))
         return config.ATR_MIN_PERCENT <= atr_percent <= config.ATR_MAX_PERCENT
 
-    def _volume_score(self, multiplier: float) -> int:
-        if multiplier >= 1.60:
-            return 25
-        if multiplier >= 1.30:
-            return 22
-        if multiplier >= 1.10:
-            return 17
-        if multiplier >= 1.00:
-            return 8
-        return 0
+    @staticmethod
+    def _vwap_distance_percent(ind: dict[str, Any]) -> float:
+        close = float(ind.get("close") or 0)
+        vwap = float(ind.get("vwap") or 0)
+        if close <= 0 or vwap <= 0:
+            return 999.0
+        return abs(close - vwap) / close * 100.0
 
-    def _score_buy(self, ind: dict[str, Any]) -> tuple[int, list[str], list[str]]:
-        score = 0
-        reasons: list[str] = []
-        warnings: list[str] = []
-        close = ind["close"]
+    @staticmethod
+    def _bb_position(ind: dict[str, Any]) -> float:
+        """موقعیت قیمت داخل بولینگر: 0 نزدیک باند پایین، 1 نزدیک باند بالا."""
+        close = float(ind.get("close") or 0)
+        upper = float(ind.get("bb_upper") or 0)
+        lower = float(ind.get("bb_lower") or 0)
+        width = upper - lower
+        if close <= 0 or width <= 0:
+            return 0.5
+        return (close - lower) / width
 
-        if close > ind["vwap"]:
-            score += 20
-            reasons.append("قیمت بالای VWAP است")
-        else:
-            warnings.append("قیمت هنوز بالای VWAP تثبیت نشده")
-
-        if ind["rsi"] > 50:
-            rsi_score = 20 if ind["rsi"] >= 53 and ind["rsi"] >= ind["rsi_prev"] else 14
-            score += rsi_score
-            reasons.append("RSI مومنتوم صعودی دارد")
-        else:
-            warnings.append("RSI برای خرید ضعیف است")
-
-        v_score = self._volume_score(ind["volume_multiplier"])
-        score += v_score
-        if v_score >= 17:
-            reasons.append("حجم زنده کندل قوی‌تر از میانگین است")
-        else:
-            warnings.append("حجم زنده هنوز کافی نیست")
-
-        ema_positive = ind["ema_fast"] >= ind["ema_slow"] or (ind["ema_fast"] - ind["ema_slow"] > ind["ema_fast_prev"] - ind["ema_slow_prev"])
-        if ema_positive:
-            score += 15
-            reasons.append("EMA 9 و EMA 21 هم‌جهت خرید هستند")
-        else:
-            warnings.append("EMA هنوز کاملاً هم‌جهت نیست")
-
-        if close >= ind["bb_mid"]:
-            score += 10
-            reasons.append("فشار قیمت در نیمه بالایی بولینگر است")
-        else:
-            warnings.append("فشار بولینگر برای خرید متوسط است")
-
-        if ind["adx"] >= 18:
-            score += 5
-            reasons.append("ADX قدرت روند قابل قبول دارد")
-        else:
-            warnings.append("ADX متوسط یا ضعیف است")
-
-        if self._atr_valid(ind):
-            score += 5
-            reasons.append("ATR با TP/SL ثابت هماهنگ است")
-        else:
-            warnings.append("ATR با TP/SL ثابت هماهنگ نیست")
-        return score, reasons, warnings
-
-    def _score_sell(self, ind: dict[str, Any]) -> tuple[int, list[str], list[str]]:
-        score = 0
-        reasons: list[str] = []
-        warnings: list[str] = []
-        close = ind["close"]
-
-        if close < ind["vwap"]:
-            score += 20
-            reasons.append("قیمت زیر VWAP است")
-        else:
-            warnings.append("قیمت هنوز زیر VWAP تثبیت نشده")
-
-        if ind["rsi"] < 50:
-            rsi_score = 20 if ind["rsi"] <= 47 and ind["rsi"] <= ind["rsi_prev"] else 14
-            score += rsi_score
-            reasons.append("RSI مومنتوم نزولی دارد")
-        else:
-            warnings.append("RSI برای فروش ضعیف است")
-
-        v_score = self._volume_score(ind["volume_multiplier"])
-        score += v_score
-        if v_score >= 17:
-            reasons.append("حجم زنده کندل قوی‌تر از میانگین است")
-        else:
-            warnings.append("حجم زنده هنوز کافی نیست")
-
-        ema_negative = ind["ema_fast"] <= ind["ema_slow"] or (ind["ema_fast"] - ind["ema_slow"] < ind["ema_fast_prev"] - ind["ema_slow_prev"])
-        if ema_negative:
-            score += 15
-            reasons.append("EMA 9 و EMA 21 هم‌جهت فروش هستند")
-        else:
-            warnings.append("EMA هنوز کاملاً هم‌جهت نیست")
-
-        if close <= ind["bb_mid"]:
-            score += 10
-            reasons.append("فشار قیمت در نیمه پایینی بولینگر است")
-        else:
-            warnings.append("فشار بولینگر برای فروش متوسط است")
-
-        if ind["adx"] >= 18:
-            score += 5
-            reasons.append("ADX قدرت روند قابل قبول دارد")
-        else:
-            warnings.append("ADX متوسط یا ضعیف است")
-
-        if self._atr_valid(ind):
-            score += 5
-            reasons.append("ATR با TP/SL ثابت هماهنگ است")
-        else:
-            warnings.append("ATR با TP/SL ثابت هماهنگ نیست")
-        return score, reasons, warnings
-
-    def evaluate(self, symbol: str, okx_symbol: str, toobit_symbol: str, ind: dict[str, Any]) -> dict[str, Any] | None:
+    def _base_blockers(self, ind: dict[str, Any]) -> list[str]:
+        blockers: list[str] = []
         if not is_entry_window(ind["open_time"]):
-            return None
+            blockers.append("کندل زنده خارج از پنجره مجاز ورود است")
         if not self._atr_valid(ind):
+            blockers.append("ATR خارج از بازه سالم است")
+        return blockers
+
+    def _long_zone(self, ind: dict[str, Any]) -> tuple[bool, list[str], list[str]]:
+        reasons: list[str] = []
+        blockers: list[str] = self._base_blockers(ind)
+        close = float(ind.get("close") or 0)
+        vwap_distance = self._vwap_distance_percent(ind)
+        bb_pos = self._bb_position(ind)
+        volume_multiplier = float(ind.get("volume_multiplier") or 0)
+        rsi = float(ind.get("rsi") or 50)
+        adx = float(ind.get("adx") or 0)
+
+        checks = [
+            (close > float(ind.get("vwap") or 0), "قیمت بالای VWAP است", "قیمت بالای VWAP نیست"),
+            (float(ind.get("ema_fast") or 0) > float(ind.get("ema_slow") or 0), "EMA 9 بالای EMA 21 است", "EMA 9 بالای EMA 21 نیست"),
+            (config.ZONE_LONG_RSI_MIN <= rsi <= config.ZONE_LONG_RSI_MAX, f"RSI داخل بازه سالم لانگ است ({config.ZONE_LONG_RSI_MIN:g}-{config.ZONE_LONG_RSI_MAX:g})", "RSI خارج از بازه سالم لانگ است"),
+            (config.ZONE_ADX_MIN <= adx <= config.ZONE_ADX_MAX, f"ADX داخل بازه روند سالم است ({config.ZONE_ADX_MIN:g}-{config.ZONE_ADX_MAX:g})", "ADX خیلی ضعیف یا خیلی داغ است"),
+            (config.ZONE_VWAP_DISTANCE_MIN_PERCENT <= vwap_distance <= config.ZONE_VWAP_DISTANCE_MAX_PERCENT, "فاصله قیمت از VWAP داخل بازه ورود سالم است", "فاصله قیمت از VWAP یا خیلی کم است یا حرکت دیر شده"),
+            (config.ZONE_VOLUME_MULTIPLIER_MIN <= volume_multiplier <= config.ZONE_VOLUME_MULTIPLIER_MAX, "حجم زنده داخل بازه تایید سالم است", "حجم زنده خارج از بازه سالم است"),
+            (bb_pos < config.ZONE_BB_LONG_MAX_POSITION, "قیمت به باند بالایی بولینگر نچسبیده است", "قیمت نزدیک باند بالایی است؛ احتمال خستگی حرکت"),
+        ]
+        for ok, reason, block in checks:
+            if ok:
+                reasons.append(reason)
+            else:
+                blockers.append(block)
+        return not blockers, reasons, blockers
+
+    def _short_zone(self, ind: dict[str, Any]) -> tuple[bool, list[str], list[str]]:
+        reasons: list[str] = []
+        blockers: list[str] = self._base_blockers(ind)
+        close = float(ind.get("close") or 0)
+        vwap_distance = self._vwap_distance_percent(ind)
+        bb_pos = self._bb_position(ind)
+        volume_multiplier = float(ind.get("volume_multiplier") or 0)
+        rsi = float(ind.get("rsi") or 50)
+        adx = float(ind.get("adx") or 0)
+
+        checks = [
+            (close < float(ind.get("vwap") or 0), "قیمت زیر VWAP است", "قیمت زیر VWAP نیست"),
+            (float(ind.get("ema_fast") or 0) < float(ind.get("ema_slow") or 0), "EMA 9 پایین EMA 21 است", "EMA 9 پایین EMA 21 نیست"),
+            (config.ZONE_SHORT_RSI_MIN <= rsi <= config.ZONE_SHORT_RSI_MAX, f"RSI داخل بازه سالم شورت است ({config.ZONE_SHORT_RSI_MIN:g}-{config.ZONE_SHORT_RSI_MAX:g})", "RSI خارج از بازه سالم شورت است"),
+            (config.ZONE_ADX_MIN <= adx <= config.ZONE_ADX_MAX, f"ADX داخل بازه روند سالم است ({config.ZONE_ADX_MIN:g}-{config.ZONE_ADX_MAX:g})", "ADX خیلی ضعیف یا خیلی داغ است"),
+            (config.ZONE_VWAP_DISTANCE_MIN_PERCENT <= vwap_distance <= config.ZONE_VWAP_DISTANCE_MAX_PERCENT, "فاصله قیمت از VWAP داخل بازه ورود سالم است", "فاصله قیمت از VWAP یا خیلی کم است یا حرکت دیر شده"),
+            (config.ZONE_VOLUME_MULTIPLIER_MIN <= volume_multiplier <= config.ZONE_VOLUME_MULTIPLIER_MAX, "حجم زنده داخل بازه تایید سالم است", "حجم زنده خارج از بازه سالم است"),
+            (bb_pos > config.ZONE_BB_SHORT_MIN_POSITION, "قیمت به باند پایینی بولینگر نچسبیده است", "قیمت نزدیک باند پایینی است؛ احتمال خستگی حرکت"),
+        ]
+        for ok, reason, block in checks:
+            if ok:
+                reasons.append(reason)
+            else:
+                blockers.append(block)
+        return not blockers, reasons, blockers
+
+    def evaluate(
+        self,
+        symbol: str,
+        okx_symbol: str,
+        toobit_symbol: str,
+        ind: dict[str, Any],
+        market: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        market = market or {"direction": "RANGE", "summary": "بازار رنج است"}
+        direction = str(market.get("direction") or "RANGE").upper()
+        if direction not in ("BUY", "SELL"):
             return None
 
-        buy_mandatory = ind["close"] > ind["vwap"] and ind["rsi"] > 50 and ind["volume_multiplier"] >= config.MIN_PROJECTED_VOLUME_MULTIPLIER
-        sell_mandatory = ind["close"] < ind["vwap"] and ind["rsi"] < 50 and ind["volume_multiplier"] >= config.MIN_PROJECTED_VOLUME_MULTIPLIER
+        if direction == "BUY":
+            allowed, reasons, blockers = self._long_zone(ind)
+            side = "BUY"
+            zone_label = "LONG_ENTRY_ZONE"
+        else:
+            allowed, reasons, blockers = self._short_zone(ind)
+            side = "SELL"
+            zone_label = "SHORT_ENTRY_ZONE"
 
-        candidates: list[dict[str, Any]] = []
-        if buy_mandatory:
-            score, reasons, warnings = self._score_buy(ind)
-            candidates.append({"side": "BUY", "score": score, "reasons": reasons, "warnings": warnings})
-        if sell_mandatory:
-            score, reasons, warnings = self._score_sell(ind)
-            candidates.append({"side": "SELL", "score": score, "reasons": reasons, "warnings": warnings})
-
-        if not candidates:
+        if not allowed:
             return None
 
-        best = max(candidates, key=lambda x: x["score"])
-        fast_allowed = best["score"] >= config.ALLOW_FAST_ENTRY_SCORE and ind["volume_multiplier"] >= config.FAST_VOLUME_MULTIPLIER
-        normal_allowed = best["score"] >= config.MIN_SIGNAL_SCORE
-        if not normal_allowed and not fast_allowed:
-            return None
-
-        side = best["side"]
-        entry = ind["close"]
+        entry = float(ind["close"])
         tp = price_by_percent(entry, config.FIXED_TP_PERCENT, side, "TP")
         sl = price_by_percent(entry, config.FIXED_SL_PERCENT, side, "SL")
-        signal_type = "ورود سریع" if fast_allowed and not normal_allowed else "ورود عادی"
+
+        market_summary = str(market.get("summary") or "جهت کلی بازار تایید شد")
+        reasons = [market_summary] + reasons
 
         return {
             "signal_id": build_signal_id(symbol, side),
@@ -169,11 +139,16 @@ class ClassicScalpingStrategy:
             "entry": entry,
             "tp": tp,
             "sl": sl,
-            "score": int(best["score"]),
-            "signal_type": signal_type,
-            "reasons": best["reasons"][:6],
-            "warnings": best["warnings"][:4],
+            "score": 0,
+            "score_label": "ندارد؛ ورود بازه‌ای",
+            "signal_type": "ورود بازه‌ای",
+            "market_direction": direction,
+            "market_state": "صعودی" if direction == "BUY" else "نزولی / شورت",
+            "entry_zone": zone_label,
+            "reasons": reasons[:8],
+            "warnings": blockers[:4],
             "indicators": ind,
+            "market_filter": market,
             "created_at": ind.get("open_time"),
             "created_utc": None,
             "normal_result": None,
