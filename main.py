@@ -15,6 +15,7 @@ import config
 from indicators import calculate_indicators
 from messages_fa import normal_result_message, real_result_message, signal_message
 from okx_client import OKXClient
+from rolling_pattern_optimizer import RollingPatternOptimizer
 from stats_manager import StatsManager
 from storage import JSONStorage
 from strategy import ClassicScalpingStrategy
@@ -211,6 +212,7 @@ class FiveMinuteScalperBot:
         self.toobit = ToobitClient()
         self.stats = StatsManager(self.storage)
         self.strategy = ClassicScalpingStrategy()
+        self.rolling_optimizer = RollingPatternOptimizer()
         self.market_filter = MarketTrendFilter(self.okx, self.storage)
         self.trade_manager = TradeManager(self.storage, self.stats, self.toobit)
         self.telegram = TelegramBotService(self.storage, self.trade_manager, self.stats)
@@ -218,6 +220,7 @@ class FiveMinuteScalperBot:
         self.valid_symbols: dict[str, dict[str, Any]] = {}
         self.last_signal_ts: dict[str, float] = {}
         self.last_error_ts: dict[str, float] = {}
+        self.last_optimizer_check_ts = 0.0
 
     def validate_symbols(self) -> dict[str, dict[str, Any]]:
         logger.info("شروع اعتبارسنجی نمادها بین OKX و Toobit")
@@ -268,8 +271,22 @@ class FiveMinuteScalperBot:
         self.validate_symbols()
         self.telegram.start()
         self.telegram.send_message("✅ ربات اسکالپ کلاسیک ۵ دقیقه‌ای روشن شد.\nتحلیل از OKX و اجرای واقعی از Toobit انجام می‌شود.")
+        self._maybe_start_daily_optimizer(force=False)
         self._install_signal_handlers()
         self.analysis_loop()
+
+    def _maybe_start_daily_optimizer(self, *, force: bool = False) -> None:
+        """بهینه‌ساز بازه‌ها فقط روزی یک بار و در بک‌گراند اجرا می‌شود؛ حلقه ترید منتظر آن نمی‌ماند."""
+        now_ts = time.time()
+        if not force and now_ts - self.last_optimizer_check_ts < 5 * 60:
+            return
+        self.last_optimizer_check_ts = now_ts
+        try:
+            started = self.rolling_optimizer.start_if_needed(self.valid_symbols, force=force)
+            if started:
+                logger.info("بهینه‌ساز روزانه بازه‌ها در بک‌گراند شروع شد")
+        except Exception as exc:
+            logger.warning("شروع بهینه‌ساز روزانه بازه‌ها ناموفق بود: %s", exc)
 
     def _install_signal_handlers(self) -> None:
         def handler(_sig: int, _frame: Any) -> None:
@@ -394,6 +411,8 @@ class FiveMinuteScalperBot:
                 self.validate_symbols()
                 safe_sleep(15)
                 continue
+
+            self._maybe_start_daily_optimizer(force=False)
 
             try:
                 self._check_results({})

@@ -11,6 +11,7 @@ import requests
 import config
 from messages_fa import balance_message, help_message, panel_message, positions_message, stats_message
 from storage import JSONStorage
+from symbol_profiles import SymbolProfileManager
 from trade_manager import TradeManager
 from utils import logger, safe_float, safe_int, validate_range
 
@@ -20,6 +21,7 @@ class TelegramBotService:
         self.storage = storage
         self.trade_manager = trade_manager
         self.stats_manager = stats_manager
+        self.profile_manager = SymbolProfileManager()
         self.token = config.TELEGRAM_BOT_TOKEN
         self.chat_id = config.TELEGRAM_CHAT_ID
         self.enabled = bool(self.token and self.chat_id)
@@ -184,6 +186,12 @@ class TelegramBotService:
         lines.append("اگر حالت بازار رنج باشد، ربات عمداً سیگنال جدید نمی‌دهد.")
         return "\n".join([x for x in lines if x is not None]).strip()
 
+    def _profile_message(self, cmd: str) -> str:
+        parts = cmd.split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            return "❌ نماد را وارد کن. مثال: بازه SOL یا بازه XRP"
+        return self.profile_manager.format_profile_message(parts[1].strip())
+
     def handle_command(self, text: str) -> str:
         cmd = self._normalize(text)
         parts = cmd.split()
@@ -204,6 +212,9 @@ class TelegramBotService:
 
         if cmd in ("بازار", "جهت بازار", "وضعیت بازار", "دلیل سکوت", "چرا سیگنال نمیده", "چرا سیگنال نمی‌دهد", "market"):
             return self._market_message()
+
+        if cmd.startswith(("بازه ", "profile ")) or cmd == "بازه":
+            return self._profile_message(cmd)
 
         if cmd in ("حذف آمار", "حذف امار", "پاک کردن آمار", "پاک کردن امار", "ریست آمار", "ریست امار", "reset stats"):
             self.stats_manager.reset()
