@@ -151,6 +151,39 @@ class TelegramBotService:
             lines.append("")
         return "\n".join(lines).strip()
 
+
+    def _market_message(self) -> str:
+        market = self.storage.get_market_state()
+        if not market:
+            return "⚠️ هنوز وضعیت بازار ذخیره نشده است. چند دقیقه صبر کن یا ربات را ری‌استارت کن."
+
+        direction = str(market.get("direction") or "RANGE").upper()
+        fa = "صعودی / فقط لانگ" if direction == "BUY" else "نزولی / فقط شورت" if direction == "SELL" else "رنج / بدون سیگنال"
+        lines = ["📊 وضعیت فیلتر بازار", "", f"حالت فعلی: {fa}", str(market.get("summary") or "").strip(), ""]
+
+        details = market.get("details") or {}
+        tfs = details.get("timeframes") or {}
+        if tfs:
+            lines.append("تایم‌فریم‌های بازار:")
+            for tf, info in tfs.items():
+                counts = info.get("counts") or {}
+                lines.append(
+                    f"• {tf}: {info.get('direction')} | BUY={counts.get('BUY', 0)} SELL={counts.get('SELL', 0)} RANGE={counts.get('RANGE', 0)}"
+                )
+            lines.append("")
+
+        anchors = details.get("anchors") or {}
+        if anchors:
+            lines.append("تایید BTC/ETH:")
+            for sym, item in anchors.items():
+                label = sym.replace("USDT", "")
+                parts = [f"{tf}={val}" for tf, val in item.items()]
+                lines.append(f"• {label}: " + " | ".join(parts))
+
+        lines.append("")
+        lines.append("اگر حالت بازار رنج باشد، ربات عمداً سیگنال جدید نمی‌دهد.")
+        return "\n".join([x for x in lines if x is not None]).strip()
+
     def handle_command(self, text: str) -> str:
         cmd = self._normalize(text)
         parts = cmd.split()
@@ -168,6 +201,9 @@ class TelegramBotService:
 
         if cmd in ("مانیتور", "وضعیت مانیتور", "سیگنال باز", "سیگنال های باز", "سیگنال‌های باز", "open signals", "monitor"):
             return self._monitor_message()
+
+        if cmd in ("بازار", "جهت بازار", "وضعیت بازار", "دلیل سکوت", "چرا سیگنال نمیده", "چرا سیگنال نمی‌دهد", "market"):
+            return self._market_message()
 
         if cmd in ("حذف آمار", "حذف امار", "پاک کردن آمار", "پاک کردن امار", "ریست آمار", "ریست امار", "reset stats"):
             self.stats_manager.reset()

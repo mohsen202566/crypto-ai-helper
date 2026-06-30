@@ -76,8 +76,9 @@ class MarketTrendFilter:
     RANGE = بازار رنج؛ هیچ سیگنال جدیدی صادر نشود
     """
 
-    def __init__(self, okx: OKXClient) -> None:
+    def __init__(self, okx: OKXClient, storage: JSONStorage | None = None) -> None:
         self.okx = okx
+        self.storage = storage
         self.last_update_ts = 0.0
         self.cache: dict[str, Any] = {
             "direction": "RANGE",
@@ -87,28 +88,42 @@ class MarketTrendFilter:
 
     @staticmethod
     def _classify(ind: dict[str, Any]) -> str:
-        close = float(ind.get("close") or 0)
-        ema_fast = float(ind.get("ema_fast") or 0)
-        ema_slow = float(ind.get("ema_slow") or 0)
-        ema_trend = float(ind.get("ema_trend") or ema_slow or 0)
-        rsi = float(ind.get("rsi") or 50)
-        adx = float(ind.get("adx") or 0)
+        """تشخیص جهت برای 1H/4H.
 
-        if close > ema_trend and ema_fast > ema_slow and rsi >= config.TREND_RSI_BUY_MIN and adx >= config.TREND_ADX_MIN:
+        این قسمت عمداً نرم‌تر از بازه ورود 5M است.
+        جهت بازار نباید آن‌قدر سخت باشد که ربات همیشه RANGE بماند.
+        شرط اصلی جهت: موقعیت قیمت نسبت به EMA50 + RSI.
+        """
+        close = float(ind.get("close") or 0)
+        ema_trend = float(ind.get("ema_trend") or ind.get("ema_slow") or 0)
+        rsi = float(ind.get("rsi") or 50)
+
+        if close <= 0 or ema_trend <= 0:
+            return "RANGE"
+        if close > ema_trend and rsi >= config.TREND_RSI_BUY_MIN:
             return "BUY"
-        if close < ema_trend and ema_fast < ema_slow and rsi <= config.TREND_RSI_SELL_MAX and adx >= config.TREND_ADX_MIN:
+        if close < ema_trend and rsi <= config.TREND_RSI_SELL_MAX:
             return "SELL"
         return "RANGE"
 
     @staticmethod
     def _majority_direction(counts: dict[str, int], total: int) -> str:
+        """جهت اکثریت بازار.
+
+        RANGEهای تک‌ارزها نباید باعث خفه شدن کامل ربات شوند؛
+        اگر بین ارزهای جهت‌دار، خرید/فروش برتری واضح داشت، جهت بازار همان است.
+        """
         if total < config.MARKET_TREND_MIN_SYMBOLS:
             return "RANGE"
         buy = counts.get("BUY", 0)
         sell = counts.get("SELL", 0)
-        if buy / max(1, total) >= config.MARKET_TREND_MIN_AGREEMENT and buy > sell:
+        decisive = buy + sell
+        if decisive <= 0:
+            return "RANGE"
+        min_ratio = config.MARKET_TREND_MIN_AGREEMENT
+        if buy > sell and buy / max(1, decisive) >= min_ratio:
             return "BUY"
-        if sell / max(1, total) >= config.MARKET_TREND_MIN_AGREEMENT and sell > buy:
+        if sell > buy and sell / max(1, decisive) >= min_ratio:
             return "SELL"
         return "RANGE"
 
@@ -178,7 +193,13 @@ class MarketTrendFilter:
         if not force and now_ts - self.last_update_ts < config.MARKET_TREND_REFRESH_SECONDS:
             return self.cache
         self.cache = self._calculate(valid_symbols)
+        self.cache["updated_ts"] = now_ts
         self.last_update_ts = now_ts
+        if self.storage is not None:
+            try:
+                self.storage.set_market_state(self.cache)
+            except Exception as exc:
+                logger.warning("ذخیره وضعیت بازار ناموفق بود: %s", exc)
         logger.info("فیلتر بازار به‌روزرسانی شد: %s | %s", self.cache.get("direction"), self.cache.get("summary"))
         return self.cache
 
@@ -190,7 +211,7 @@ class FiveMinuteScalperBot:
         self.toobit = ToobitClient()
         self.stats = StatsManager(self.storage)
         self.strategy = ClassicScalpingStrategy()
-        self.market_filter = MarketTrendFilter(self.okx)
+        self.market_filter = MarketTrendFilter(self.okx, self.storage)
         self.trade_manager = TradeManager(self.storage, self.stats, self.toobit)
         self.telegram = TelegramBotService(self.storage, self.trade_manager, self.stats)
         self.stop_event = threading.Event()

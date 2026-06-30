@@ -39,6 +39,7 @@ def _default_state() -> dict[str, Any]:
         "runtime": {
             "last_symbol_errors": {},
             "validated_symbols": {},
+            "market_state": {},
         },
     }
 
@@ -69,6 +70,7 @@ class JSONStorage:
             data.setdefault("runtime", copy.deepcopy(default["runtime"]))
             data["runtime"].setdefault("last_symbol_errors", {})
             data["runtime"].setdefault("validated_symbols", {})
+            data["runtime"].setdefault("market_state", {})
             return data
         except Exception:
             backup = self.path.with_suffix(".broken.json")
@@ -244,6 +246,17 @@ class JSONStorage:
     def get_validated_symbols(self) -> dict[str, Any]:
         with self._lock:
             return copy.deepcopy(self.state["runtime"].get("validated_symbols", {}))
+
+
+    def set_market_state(self, market: dict[str, Any]) -> None:
+        """ذخیره آخرین وضعیت جهت بازار برای دستور تلگرام «بازار/دلیل سکوت»."""
+        with self._lock:
+            self.state["runtime"]["market_state"] = copy.deepcopy(market or {})
+            self.save()
+
+    def get_market_state(self) -> dict[str, Any]:
+        with self._lock:
+            return copy.deepcopy(self.state["runtime"].get("market_state", {}))
 
     def set_symbol_error(self, symbol: str, message: str, ts: float) -> None:
         with self._lock:
