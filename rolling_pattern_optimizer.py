@@ -459,7 +459,8 @@ class RollingPatternOptimizer:
         target_start = int(time.time() * 1000) - config.ROLLING_OPTIMIZER_DAYS * 24 * 60 * 60 * 1000
         symbols_out: dict[str, Any] = {}
 
-        for internal in config.WATCHLIST:
+        active_symbols = list(valid_symbols.keys()) if valid_symbols else list(config.WATCHLIST)
+        for internal in active_symbols:
             okx_symbol = self._okx_symbol_for(internal, valid_symbols)
             try:
                 logger.info("بهینه‌سازی بازه %s شروع شد", internal)
@@ -490,7 +491,7 @@ class RollingPatternOptimizer:
                 }
 
         return {
-            "version": "v14",
+            "version": "v15",
             "generated_utc": generated.isoformat(),
             "generated_date_utc": generated.date().isoformat(),
             "timeframe": config.TIMEFRAME,
@@ -505,6 +506,12 @@ class RollingPatternOptimizer:
 
 if __name__ == "__main__":
     opt = RollingPatternOptimizer()
-    result = opt.generate_profiles({})
+    try:
+        from storage import JSONStorage
+
+        valid = JSONStorage().get_validated_symbols() or {}
+    except Exception:
+        valid = {}
+    result = opt.generate_profiles(valid)
     opt._atomic_write(result)
     print(f"OK: {opt.output_path}")

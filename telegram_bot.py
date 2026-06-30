@@ -154,6 +154,17 @@ class TelegramBotService:
         return "\n".join(lines).strip()
 
 
+
+    def _symbols_message(self) -> str:
+        valid = self.storage.get_validated_symbols() or {}
+        active = list(valid.keys())
+        lines = ["📌 ارزهای فعال و معتبر ربات", "", f"کاندیدا: {len(config.WATCHLIST)}", f"فعال نهایی: {len(active)}", ""]
+        if active:
+            lines.append("، ".join(active))
+        else:
+            lines.append("هنوز نماد معتبری ذخیره نشده است یا اعتبارسنجی کامل نشده.")
+        return "\n".join(lines).strip()
+
     def _market_message(self) -> str:
         market = self.storage.get_market_state()
         if not market:
@@ -209,6 +220,9 @@ class TelegramBotService:
 
         if cmd in ("مانیتور", "وضعیت مانیتور", "سیگنال باز", "سیگنال های باز", "سیگنال‌های باز", "open signals", "monitor"):
             return self._monitor_message()
+
+        if cmd in ("ارزها", "نمادها", "لیست ارزها", "symbols"):
+            return self._symbols_message()
 
         if cmd in ("بازار", "جهت بازار", "وضعیت بازار", "دلیل سکوت", "چرا سیگنال نمیده", "چرا سیگنال نمی‌دهد", "market"):
             return self._market_message()

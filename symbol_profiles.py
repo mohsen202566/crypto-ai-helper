@@ -2,7 +2,7 @@
 
 این فایل فقط یک لایه سبک روی بازه‌های ورود است:
 - اگر data/symbol_profiles.json بازه معتبر امروز داشته باشد، همان را می‌دهد.
-- اگر فایل نباشد، خراب باشد، یا نمونه کافی نباشد، بازه عمومی config برگردانده می‌شود.
+- اگر فایل نباشد، خراب باشد، یا نمونه کافی نباشد، برای نمایش بازه عمومی نشان داده می‌شود؛ اما اگر REQUIRE_CUSTOM_PROFILE_FOR_SIGNAL روشن باشد، سیگنال عمومی صادر نمی‌شود.
 """
 from __future__ import annotations
 
@@ -215,7 +215,7 @@ class SymbolProfileManager:
 
         for side_key, title, icon in (("LONG", "لانگ", "🟢"), ("SHORT", "شورت", "🔴")):
             profile = self.get_profile(symbol, side_key)
-            status = "اختصاصی فعال ✅" if not profile.get("using_default") else "عمومی / پیش‌فرض ⚠️"
+            status = "اختصاصی فعال ✅" if not profile.get("using_default") else ("عمومی / فقط نمایش؛ سیگنال غیرفعال ⚠️" if getattr(config, "REQUIRE_CUSTOM_PROFILE_FOR_SIGNAL", False) else "عمومی / پیش‌فرض ⚠️")
             samples = int(profile.get("samples") or 0)
             lines.append(f"{icon} {title} {symbol}")
             lines.append(f"وضعیت: {status}")
@@ -238,5 +238,5 @@ class SymbolProfileManager:
                 lines.append("• شرط ثابت VWAP: قیمت زیر VWAP")
             lines.append("")
 
-        lines.append("این همان بازه‌ای است که امروز strategy برای این ارز استفاده می‌کند.")
+        lines.append("این همان بازه‌ای است که امروز strategy می‌بیند. اگر وضعیت عمومی و ورود عمومی غیرفعال باشد، ربات از آن جهت سیگنال صادر نمی‌کند.")
         return "\n".join(lines).strip()

@@ -31,9 +31,10 @@ def signal_message(signal: dict[str, Any]) -> str:
 دلار ترید: {format_num(signal.get('trade_amount_usdt'), 2)} USDT
 لوریج: {signal.get('leverage', '-')}x
 جهت بازار: {signal.get('market_state', '-')}
+مدت هدف سیگنال: حداکثر {signal.get('max_hold_minutes', 180)} دقیقه
 
 منطق ورود: {score_text}
-نوع سیگنال: {signal['signal_type']} اسکالپ ۵ دقیقه‌ای
+نوع سیگنال: {signal['signal_type']}
 منبع تحلیل: OKX  ({signal['okx_symbol']})
 محل اجرای احتمالی: Toobit  ({signal['toobit_symbol']})
 
@@ -108,7 +109,7 @@ def real_result_message(signal: dict[str, Any], result: str, price: float, pnl: 
 
 
 def stats_message(stats: dict[str, Any]) -> str:
-    return f"""📊 آمار ربات اسکالپ ۵ دقیقه‌ای
+    return f"""📊 آمار ربات ورود ۵ دقیقه‌ای با تایید چندتایم‌فریمی
 
 تعداد کل سیگنال‌ها: {int(stats.get('signals_total', 0))}
 سیگنال‌های عادی / داخلی: {int(stats.get('normal_signals_total', 0))}
@@ -149,13 +150,14 @@ def panel_message(
     trade_status = "فعال ✅" if settings.get("trade_enabled") else "خاموش ⛔"
     conn = "وصل ✅" if toobit_ok else "قطع/خطا ❌"
     today_txt = f"{format_num(today_pnl, 4)} USDT" if today_pnl is not None else "نامشخص"
-    text = f"""🤖 پنل ترید ربات اسکالپ کلاسیک ۵ دقیقه‌ای
+    text = f"""🤖 پنل ترید ربات ورود ۵ دقیقه‌ای با تایید چندتایم‌فریمی
 
 وضعیت ترید واقعی: {trade_status}
 وضعیت اتصال Toobit: {conn}
 منبع تحلیل: OKX
 محل اجرا: Toobit
-تایم‌فریم: ۵ دقیقه
+تایم‌فریم ورود: ۵ دقیقه
+تایید روند: 1D + 4H + 1H
 نمادهای فعال/معتبر: {symbols_count}
 
 تنظیمات ترید:
@@ -198,6 +200,7 @@ def help_message() -> str:
 سود امروز — نمایش سود/ضرر امروز و آمار سود/ضرر
 بازار — نمایش جهت بازار و دلیل سکوت
 بازه SOL — نمایش بازه امروز لانگ و شورت همان ارز
+ارزها — نمایش ارزهای فعال معتبر OKX/Toobit
 مانیتور — نمایش سیگنال‌های باز و وضعیت مانیتور
 
 دلار ترید 10 — تنظیم مقدار هر ترید از ۱ تا ۱۰۰۰۰

@@ -63,6 +63,8 @@ class ClassicScalpingStrategy:
         profile = self.profiles.get_profile(symbol, "LONG")
         reasons: list[str] = []
         blockers: list[str] = self._base_blockers(ind)
+        if getattr(config, "REQUIRE_CUSTOM_PROFILE_FOR_SIGNAL", False) and profile.get("using_default"):
+            blockers.append(f"بازه اختصاصی معتبر برای لانگ {symbol} وجود ندارد؛ ورود عمومی غیرفعال است")
         close = float(ind.get("close") or 0)
         vwap_distance = self._vwap_distance_percent(ind)
         bb_pos = self._bb_position(ind)
@@ -94,6 +96,8 @@ class ClassicScalpingStrategy:
         profile = self.profiles.get_profile(symbol, "SHORT")
         reasons: list[str] = []
         blockers: list[str] = self._base_blockers(ind)
+        if getattr(config, "REQUIRE_CUSTOM_PROFILE_FOR_SIGNAL", False) and profile.get("using_default"):
+            blockers.append(f"بازه اختصاصی معتبر برای شورت {symbol} وجود ندارد؛ ورود عمومی غیرفعال است")
         close = float(ind.get("close") or 0)
         vwap_distance = self._vwap_distance_percent(ind)
         bb_pos = self._bb_position(ind)
@@ -167,7 +171,7 @@ class ClassicScalpingStrategy:
             "sl": sl,
             "score": 0,
             "score_label": score_label,
-            "signal_type": "ورود بازه‌ای",
+            "signal_type": "ورود ۵ دقیقه‌ای با تایید 1D/4H/1H",
             "market_direction": direction,
             "market_state": "صعودی" if direction == "BUY" else "نزولی / شورت",
             "entry_zone": zone_label,
@@ -179,6 +183,7 @@ class ClassicScalpingStrategy:
             "indicators": ind,
             "market_filter": market,
             "created_at": ind.get("open_time"),
+            "max_hold_minutes": getattr(config, "SIGNAL_MAX_HOLD_MINUTES", 180),
             "created_utc": None,
             "normal_result": None,
             "real_result": None,

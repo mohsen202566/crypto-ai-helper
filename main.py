@@ -16,6 +16,7 @@ from indicators import calculate_indicators
 from messages_fa import normal_result_message, real_result_message, signal_message
 from okx_client import OKXClient
 from rolling_pattern_optimizer import RollingPatternOptimizer
+from support_resistance_filter import SupportResistanceFilter
 from stats_manager import StatsManager
 from storage import JSONStorage
 from strategy import ClassicScalpingStrategy
@@ -69,7 +70,7 @@ class SingleInstanceLock:
 
 
 class MarketTrendFilter:
-    """فیلتر جهت کلی بازار بر اساس 1H و 4H + تایید BTC و ETH.
+    """فیلتر جهت کلی بازار بر اساس 1D و 4H و 1H + تایید BTC و ETH.
 
     خروجی فقط یکی از این سه حالت است:
     BUY   = بازار صعودی؛ فقط لانگ مجاز
@@ -139,7 +140,8 @@ class MarketTrendFilter:
         for bar in config.MARKET_TREND_TIMEFRAMES:
             counts = {"BUY": 0, "SELL": 0, "RANGE": 0}
             analyzed = 0
-            for internal in config.WATCHLIST:
+            active = list(valid_symbols.keys()) or list(config.WATCHLIST)
+            for internal in active:
                 try:
                     okx_symbol = self._okx_symbol_for(internal, valid_symbols)
                     candles = self.okx.get_candles(okx_symbol, bar=bar, limit=config.MARKET_TREND_CANDLE_LIMIT)
@@ -160,7 +162,7 @@ class MarketTrendFilter:
         if len(directions) != 1:
             return {
                 "direction": "RANGE",
-                "summary": "بازار رنج است؛ جهت 1H و 4H باهم موافق نیستند",
+                "summary": "بازار رنج است؛ جهت 1D و 4H و 1H باهم موافق نیستند",
                 "details": details,
             }
 
@@ -168,7 +170,7 @@ class MarketTrendFilter:
         if market_direction not in ("BUY", "SELL"):
             return {
                 "direction": "RANGE",
-                "summary": "بازار رنج است؛ اکثریت 1H و 4H جهت سالم ندادند",
+                "summary": "بازار رنج است؛ اکثریت 1D و 4H و 1H جهت سالم ندادند",
                 "details": details,
             }
 
@@ -177,7 +179,7 @@ class MarketTrendFilter:
             if any(anchor_tfs.get(bar) != market_direction for bar in config.MARKET_TREND_TIMEFRAMES):
                 return {
                     "direction": "RANGE",
-                    "summary": f"بازار رنج است؛ {anchor.replace('USDT', '')} با جهت کلی بازار در 1H/4H هم‌جهت نیست",
+                    "summary": f"بازار رنج است؛ {anchor.replace('USDT', '')} با جهت کلی بازار در 1D/4H/1H هم‌جهت نیست",
                     "details": details,
                 }
 
@@ -185,7 +187,7 @@ class MarketTrendFilter:
         side_fa = "لانگ" if market_direction == "BUY" else "شورت"
         return {
             "direction": market_direction,
-            "summary": f"جهت کلی بازار {fa} است؛ 1H و 4H هم‌جهت‌اند و BTC/ETH تایید کردند؛ فقط {side_fa} مجاز است",
+            "summary": f"جهت کلی بازار {fa} است؛ 1D و 4H و 1H هم‌جهت‌اند و BTC/ETH تایید کردند؛ فقط {side_fa} مجاز است",
             "details": details,
         }
 
@@ -214,6 +216,7 @@ class FiveMinuteScalperBot:
         self.strategy = ClassicScalpingStrategy()
         self.rolling_optimizer = RollingPatternOptimizer()
         self.market_filter = MarketTrendFilter(self.okx, self.storage)
+        self.sr_filter = SupportResistanceFilter()
         self.trade_manager = TradeManager(self.storage, self.stats, self.toobit)
         self.telegram = TelegramBotService(self.storage, self.trade_manager, self.stats)
         self.stop_event = threading.Event()
@@ -251,6 +254,9 @@ class FiveMinuteScalperBot:
                 if toobit_symbols is not None:
                     toobit_symbol, symbol_info = self.toobit.validate_symbol(internal, toobit_symbols)
 
+                # تست عملی OKX: اگر کندل/قیمت همین نماد خطا بدهد، فقط همان ارز حذف می‌شود.
+                self.okx.get_candles(okx_symbol, bar=config.TIMEFRAME, limit=60)
+
                 valid[internal] = {
                     "okx_symbol": okx_symbol,
                     "toobit_symbol": toobit_symbol,
@@ -267,7 +273,7 @@ class FiveMinuteScalperBot:
         return valid
 
     def start(self) -> None:
-        logger.info("ربات اسکالپ کلاسیک ۵ دقیقه‌ای شروع شد")
+        logger.info("ربات ورود ۵ دقیقه‌ای با تایید چندتایم‌فریمی شروع شد")
         self.validate_symbols()
         self.telegram.start()
         self.telegram.send_message("✅ ربات اسکالپ کلاسیک ۵ دقیقه‌ای روشن شد.\nتحلیل از OKX و اجرای واقعی از Toobit انجام می‌شود.")
@@ -341,6 +347,61 @@ class FiveMinuteScalperBot:
         if normal_results or real_results:
             self._send_result_messages(normal_results=normal_results, real_results=real_results)
 
+    def _symbol_mtf_confirmation(self, internal: str, mapped: dict[str, Any], direction: str) -> tuple[bool, str]:
+        """خود همان ارز هم باید در 1D/4H/1H هم‌جهت باشد؛ خطای یک تایم‌فریم فقط همان ارز را رد می‌کند."""
+        required = tuple(getattr(config, "MARKET_TREND_TIMEFRAMES", ("1D", "4H", "1H")))
+        seen: dict[str, str] = {}
+        for bar in required:
+            try:
+                candles = self.okx.get_candles(mapped["okx_symbol"], bar=bar, limit=config.MARKET_TREND_CANDLE_LIMIT)
+                ind = calculate_indicators(candles)
+                seen[bar] = MarketTrendFilter._classify(ind)
+            except Exception as exc:
+                return False, f"تایید {bar} برای {internal} ناموفق بود: {exc}"
+        bad = {tf: val for tf, val in seen.items() if val != direction}
+        if bad:
+            parts = " | ".join(f"{tf}={val}" for tf, val in seen.items())
+            return False, f"خود ارز در تایم‌های بالا هم‌جهت نیست: {parts}"
+        fa = "صعودی" if direction == "BUY" else "نزولی / شورت"
+        return True, f"خود {internal} در 1D/4H/1H هم‌جهت {fa} است"
+
+    def _entry_confirmation(self, internal: str, mapped: dict[str, Any], direction: str) -> tuple[bool, str]:
+        """15m فقط آماده‌بودن ورود را تایید می‌کند؛ تصمیم اصلی و بازه ورود همچنان 5m است."""
+        bar = getattr(config, "ENTRY_CONFIRM_TIMEFRAME", "15m")
+        try:
+            candles = self.okx.get_candles(mapped["okx_symbol"], bar=bar, limit=getattr(config, "ENTRY_CONFIRM_CANDLE_LIMIT", 120))
+            ind = calculate_indicators(candles)
+            close = float(ind.get("close") or 0)
+            vwap = float(ind.get("vwap") or 0)
+            ema_fast = float(ind.get("ema_fast") or 0)
+            ema_slow = float(ind.get("ema_slow") or 0)
+            classified = MarketTrendFilter._classify(ind)
+            if direction == "BUY":
+                ok = classified == "BUY" and close > vwap and ema_fast > ema_slow
+                return ok, (f"{bar} آماده ورود لانگ است" if ok else f"{bar} ورود لانگ را تایید نکرد")
+            ok = classified == "SELL" and close < vwap and ema_fast < ema_slow
+            return ok, (f"{bar} آماده ورود شورت است" if ok else f"{bar} ورود شورت را تایید نکرد")
+        except Exception as exc:
+            return False, f"تایید {bar} برای {internal} ناموفق بود: {exc}"
+
+    def _support_resistance_confirmation(self, internal: str, mapped: dict[str, Any], signal_data: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
+        if not getattr(config, "SR_FILTER_ENABLED", True):
+            return True, "فیلتر حمایت/مقاومت خاموش است", {}
+        try:
+            candles_1h = self.okx.get_candles(mapped["okx_symbol"], bar="1H", limit=getattr(config, "SR_CANDLE_LIMIT_1H", 180))
+            candles_4h = self.okx.get_candles(mapped["okx_symbol"], bar="4H", limit=getattr(config, "SR_CANDLE_LIMIT_4H", 120))
+            return self.sr_filter.check_path(
+                symbol=internal,
+                side=str(signal_data.get("side") or ""),
+                entry=float(signal_data.get("entry") or 0),
+                tp=float(signal_data.get("tp") or 0),
+                candles_1h=candles_1h,
+                candles_4h=candles_4h,
+            )
+        except Exception as exc:
+            logger.warning("فیلتر حمایت/مقاومت %s خطا داد؛ فقط همین سیگنال رد شد: %s", internal, exc)
+            return False, f"فیلتر حمایت/مقاومت ناموفق بود: {exc}", {}
+
     def _process_symbol(self, internal: str, mapped: dict[str, Any], market_info: dict[str, Any]) -> float | None:
         if self._symbol_in_cooldown(internal):
             return None
@@ -360,6 +421,26 @@ class FiveMinuteScalperBot:
             signal_data = self.strategy.evaluate(internal, okx_symbol, toobit_symbol, indicators, market_info)
             if not signal_data:
                 return latest_price
+
+            direction = str(market_info.get("direction") or "RANGE").upper()
+            ok_mtf, msg_mtf = self._symbol_mtf_confirmation(internal, mapped, direction)
+            if not ok_mtf:
+                logger.info("سیگنال %s رد شد: %s", internal, msg_mtf)
+                return latest_price
+
+            ok_entry, msg_entry = self._entry_confirmation(internal, mapped, direction)
+            if not ok_entry:
+                logger.info("سیگنال %s رد شد: %s", internal, msg_entry)
+                return latest_price
+
+            ok_sr, msg_sr, sr_meta = self._support_resistance_confirmation(internal, mapped, signal_data)
+            if not ok_sr:
+                logger.info("سیگنال %s رد شد: %s", internal, msg_sr)
+                return latest_price
+
+            signal_data.setdefault("reasons", [])
+            signal_data["reasons"] = (signal_data.get("reasons") or []) + [msg_mtf, msg_entry, msg_sr]
+            signal_data["support_resistance"] = sr_meta
 
             now_ts = time.time()
             if now_ts - self.last_signal_ts.get(internal, 0) < config.SIGNAL_COOLDOWN_SECONDS:
