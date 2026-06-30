@@ -178,7 +178,7 @@ VOLUME_MA_PERIOD = 20
 # -----------------------------
 # ورود و خروج
 # -----------------------------
-FIXED_TP_PERCENT = 0.70
+FIXED_TP_PERCENT = 0.58
 FIXED_SL_PERCENT = 0.45
 MIN_SIGNAL_SCORE = 80
 ALLOW_FAST_ENTRY_SCORE = 75
