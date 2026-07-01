@@ -224,6 +224,7 @@ class FiveMinuteScalperBot:
         self.last_signal_ts: dict[str, float] = {}
         self.last_error_ts: dict[str, float] = {}
         self.last_optimizer_check_ts = 0.0
+        self.active_indicators: dict[str, dict[str, Any]] = {}
 
     def validate_symbols(self) -> dict[str, dict[str, Any]]:
         logger.info("شروع اعتبارسنجی نمادها بین OKX و Toobit")
@@ -334,6 +335,7 @@ class FiveMinuteScalperBot:
             try:
                 candles = self.okx.get_candles(mapped["okx_symbol"])
                 indicators = calculate_indicators(candles)
+                self.active_indicators[internal] = indicators
                 prices[internal] = float(indicators["close"])
             except Exception as exc:
                 logger.warning("مانیتور نتیجه: گرفتن قیمت فعال %s از OKX ناموفق بود: %s", internal, exc)
@@ -342,8 +344,8 @@ class FiveMinuteScalperBot:
     def _check_symbol_result_now(self, internal: str, latest_price: float) -> None:
         """قبل از تحلیل سیگنال جدید، نتیجه سیگنال باز همان نماد را همان لحظه چک کن."""
         prices = {internal: float(latest_price)}
-        normal_results = self.trade_manager.check_normal_results(prices)
-        real_results = self.trade_manager.check_real_results(prices)
+        normal_results = self.trade_manager.check_normal_results(prices, self.active_indicators)
+        real_results = self.trade_manager.check_real_results(prices, self.active_indicators)
         if normal_results or real_results:
             self._send_result_messages(normal_results=normal_results, real_results=real_results)
 
@@ -411,6 +413,7 @@ class FiveMinuteScalperBot:
             candles = self.okx.get_candles(okx_symbol)
             indicators = calculate_indicators(candles)
             latest_price = float(indicators["close"])
+            self.active_indicators[internal] = indicators
 
             # اول نتیجه سیگنال باز همین نماد بررسی شود؛ بعد اگر هنوز باز بود، اصلاً سیگنال جدید نساز.
             self._check_symbol_result_now(internal, latest_price)
@@ -482,8 +485,8 @@ class FiveMinuteScalperBot:
         # نتیجه‌ها نباید وابسته به صدور سیگنال جدید باشند. هر دور برای سیگنال‌های باز قیمت تازه می‌گیریم.
         prices = self._collect_active_prices()
         prices.update(latest_prices or {})
-        normal_results = self.trade_manager.check_normal_results(prices)
-        real_results = self.trade_manager.check_real_results(prices)
+        normal_results = self.trade_manager.check_normal_results(prices, self.active_indicators)
+        real_results = self.trade_manager.check_real_results(prices, self.active_indicators)
         self._send_result_messages(normal_results=normal_results, real_results=real_results)
 
     def analysis_loop(self) -> None:

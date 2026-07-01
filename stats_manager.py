@@ -32,19 +32,27 @@ class StatsManager:
         self.storage.inc_stat("real_failed", 1)
 
     def record_normal_result(self, result: str, pnl: float = 0.0) -> None:
+        result = str(result or "").upper()
         self.storage.inc_stat("normal_open", -1)
         if result == "TP":
             self.storage.inc_stat("normal_tp", 1)
         elif result == "SL":
             self.storage.inc_stat("normal_sl", 1)
+        elif result.startswith("SMART"):
+            self.storage.inc_stat("normal_smart_exit", 1)
+            self.storage.inc_stat("normal_smart_profit" if pnl >= 0 else "normal_smart_loss", 1)
         self.storage.inc_stat("normal_pnl", pnl)
 
     def record_real_result(self, result: str, pnl: float = 0.0) -> None:
+        result = str(result or "").upper()
         self.storage.inc_stat("real_open", -1)
         if result == "TP":
             self.storage.inc_stat("real_tp", 1)
         elif result == "SL":
             self.storage.inc_stat("real_sl", 1)
+        elif result.startswith("SMART"):
+            self.storage.inc_stat("real_smart_exit", 1)
+            self.storage.inc_stat("real_smart_profit" if pnl >= 0 else "real_smart_loss", 1)
         self.storage.inc_stat("real_pnl", pnl)
 
     def reset(self) -> None:
@@ -52,9 +60,11 @@ class StatsManager:
 
     def summary(self) -> dict[str, Any]:
         stats = self.storage.get_stats()
-        normal_done = stats.get("normal_tp", 0) + stats.get("normal_sl", 0)
-        real_done = stats.get("real_tp", 0) + stats.get("real_sl", 0)
-        stats["normal_winrate"] = (stats.get("normal_tp", 0) / normal_done * 100) if normal_done else 0.0
-        stats["real_winrate"] = (stats.get("real_tp", 0) / real_done * 100) if real_done else 0.0
+        normal_done = stats.get("normal_tp", 0) + stats.get("normal_sl", 0) + stats.get("normal_smart_exit", 0)
+        real_done = stats.get("real_tp", 0) + stats.get("real_sl", 0) + stats.get("real_smart_exit", 0)
+        normal_wins = stats.get("normal_tp", 0) + stats.get("normal_smart_profit", 0)
+        real_wins = stats.get("real_tp", 0) + stats.get("real_smart_profit", 0)
+        stats["normal_winrate"] = (normal_wins / normal_done * 100) if normal_done else 0.0
+        stats["real_winrate"] = (real_wins / real_done * 100) if real_done else 0.0
         stats["total_pnl"] = float(stats.get("normal_pnl", 0.0) or 0.0) + float(stats.get("real_pnl", 0.0) or 0.0)
         return stats

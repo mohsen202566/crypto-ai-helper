@@ -70,8 +70,10 @@ def _signed(value: float, digits: int = 2) -> str:
 
 def _result_message(signal: dict[str, Any], result: str, price: float, pnl: float, mode_fa: str, source_fa: str) -> str:
     side_fa = side_label(signal["side"])
+    result_key = str(result or "").upper()
     move = _movement_percent(signal, price)
-    if result == "TP":
+
+    if result_key == "TP":
         return f"""✅ TP خورد — {signal['symbol']}
 
 نوع: {mode_fa}
@@ -83,6 +85,25 @@ def _result_message(signal: dict[str, Any], result: str, price: float, pnl: floa
 
 دلیل:
 قیمت به حد سود ثابت رسید.
+منبع نتیجه: {source_fa}"""
+
+    if result_key.startswith("SMART"):
+        reason = signal.get("real_exit_reason") if "رئال" in mode_fa else signal.get("normal_exit_reason")
+        if not reason:
+            reason = "مومنتوم برگشت و خروج هوشمند برای حفظ سود یا جلوگیری از ضرر کامل فعال شد."
+        title = "🟡 خروج هوشمند در سود" if pnl >= 0 else "🟡 خروج هوشمند دفاعی"
+        pnl_label = "سود" if pnl >= 0 else "نتیجه"
+        return f"""{title} — {signal['symbol']}
+
+نوع: {mode_fa}
+جهت: {side_fa}
+ورود: {format_num(signal['entry'])}
+خروج: {format_num(price)}
+حرکت: {_signed(move, 2)}%
+{pnl_label}: {_signed(pnl, 4)} USDT
+
+دلیل خروج:
+{reason}
 منبع نتیجه: {source_fa}"""
 
     return f"""❌ استاپ خورد — {signal['symbol']}
@@ -118,6 +139,7 @@ def stats_message(stats: dict[str, Any]) -> str:
 آمار عادی / داخلی:
 ✅ TP عادی: {int(stats.get('normal_tp', 0))}
 ❌ SL عادی: {int(stats.get('normal_sl', 0))}
+🟡 خروج هوشمند عادی: {int(stats.get('normal_smart_exit', 0))}
 ⏳ باز/نامشخص عادی: {int(stats.get('normal_open', 0))}
 💰 سود/ضرر عادی: {format_num(stats.get('normal_pnl', 0), 4)} USDT
 درصد موفقیت عادی: {format_num(stats.get('normal_winrate', 0), 2)}%
@@ -125,6 +147,7 @@ def stats_message(stats: dict[str, Any]) -> str:
 آمار واقعی Toobit:
 ✅ TP واقعی: {int(stats.get('real_tp', 0))}
 ❌ SL واقعی: {int(stats.get('real_sl', 0))}
+🟡 خروج هوشمند واقعی: {int(stats.get('real_smart_exit', 0))}
 ⏳ پوزیشن/معامله باز واقعی: {int(stats.get('real_open', 0))}
 ⚠️ اجرای ناموفق: {int(stats.get('real_failed', 0))}
 💰 سود/ضرر واقعی: {format_num(stats.get('real_pnl', 0), 4)} USDT

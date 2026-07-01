@@ -80,7 +80,14 @@ _ENV_KEYS = [
     "ROLLING_OPTIMIZER_LONG_RSI_FLOOR",
     "ROLLING_OPTIMIZER_SHORT_RSI_CEIL",
     "ROLLING_OPTIMIZER_LONG_BB_MAX",
-    "ROLLING_OPTIMIZER_SHORT_BB_MIN",]
+    "ROLLING_OPTIMIZER_SHORT_BB_MIN",
+    "SMART_EXIT_ENABLED",
+    "SMART_EXIT_MIN_PROFIT_PERCENT",
+    "SMART_EXIT_DEFENSE_AFTER_SECONDS",
+    "SMART_EXIT_DEFENSE_MAX_LOSS_PERCENT",
+    "SMART_EXIT_DEFENSE_MAX_PROFIT_PERCENT",
+    "SMART_EXIT_CONFIRMATIONS",
+]
 
 
 def _raw_env_text() -> str:
@@ -242,7 +249,7 @@ VOLUME_MA_PERIOD = 20
 # ورود و خروج
 # -----------------------------
 FIXED_TP_PERCENT = 2.00
-FIXED_SL_PERCENT = 0.95
+FIXED_SL_PERCENT = 1.50
 MIN_SIGNAL_SCORE = 80
 ALLOW_FAST_ENTRY_SCORE = 75
 FAST_VOLUME_MULTIPLIER = 1.50
@@ -311,6 +318,20 @@ ROLLING_OPTIMIZER_LONG_RSI_FLOOR = _get_float("ROLLING_OPTIMIZER_LONG_RSI_FLOOR"
 ROLLING_OPTIMIZER_SHORT_RSI_CEIL = _get_float("ROLLING_OPTIMIZER_SHORT_RSI_CEIL", 58.0)
 ROLLING_OPTIMIZER_LONG_BB_MAX = _get_float("ROLLING_OPTIMIZER_LONG_BB_MAX", 1.05)
 ROLLING_OPTIMIZER_SHORT_BB_MIN = _get_float("ROLLING_OPTIMIZER_SHORT_BB_MIN", -0.05)
+
+
+# -----------------------------
+# خروج هوشمند
+# -----------------------------
+SMART_EXIT_ENABLED = _get_bool("SMART_EXIT_ENABLED", True)
+# وقتی معامله حداقل این مقدار وارد سود شود و مومنتوم برگردد، خروج در سود مجاز است.
+SMART_EXIT_MIN_PROFIT_PERCENT = _get_float("SMART_EXIT_MIN_PROFIT_PERCENT", 0.70)
+# اگر بعد از چند دقیقه ورود جواب نداد و نشانه‌های برگشت فعال شد، خروج سر به سر/ضرر کم مجاز است.
+SMART_EXIT_DEFENSE_AFTER_SECONDS = _get_int("SMART_EXIT_DEFENSE_AFTER_SECONDS", 180)
+SMART_EXIT_DEFENSE_MAX_LOSS_PERCENT = _get_float("SMART_EXIT_DEFENSE_MAX_LOSS_PERCENT", 0.35)
+SMART_EXIT_DEFENSE_MAX_PROFIT_PERCENT = _get_float("SMART_EXIT_DEFENSE_MAX_PROFIT_PERCENT", 0.25)
+# برای جلوگیری از خروج با نویز، چند تایید همزمان لازم است.
+SMART_EXIT_CONFIRMATIONS = _get_int("SMART_EXIT_CONFIRMATIONS", 3)
 
 # -----------------------------
 # تنظیمات قابل تغییر از تلگرام
