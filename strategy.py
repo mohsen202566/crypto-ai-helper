@@ -1,10 +1,9 @@
-"""منطق کلاسیک بازه‌ای بدون امتیاز.
+"""منطق v16: اسکالپ ۵ دقیقه‌ای فقط شورت.
 
 قانون اصلی:
-- بازار فقط سه حالت دارد: BUY، SELL، RANGE.
-- در RANGE هیچ سیگنالی صادر نمی‌شود.
-- امتیازدهی حذف شده؛ سیگنال فقط وقتی صادر می‌شود که همه بازه‌های سالم ورود برقرار باشند.
-- v14 فقط بازه‌های اندیکاتورها را می‌تواند برای هر ارز/جهت اختصاصی کند؛ جهت بازار و قوانین اصلی دست‌نخورده‌اند.
+- لانگ کامل غیرفعال است.
+- فقط وقتی بازار SELL باشد و بازه 5m شورت تایید شود، سیگنال فروش ساخته می‌شود.
+- پنل، Toobit، مانیتور و نتیجه‌ها در فایل‌های دیگر دست‌نخورده می‌مانند.
 """
 from __future__ import annotations
 
@@ -135,17 +134,27 @@ class ClassicScalpingStrategy:
     ) -> dict[str, Any] | None:
         market = market or {"direction": "RANGE", "summary": "بازار رنج است"}
         direction = str(market.get("direction") or "RANGE").upper()
-        if direction not in ("BUY", "SELL"):
-            return None
-
-        if direction == "BUY":
-            allowed, reasons, blockers, profile = self._long_zone(symbol, ind)
-            side = "BUY"
-            zone_label = "LONG_ENTRY_ZONE"
-        else:
+        if getattr(config, "SHORT_ONLY_MODE", True):
+            if direction != "SELL" or not getattr(config, "ALLOW_SHORT_SIGNALS", True):
+                return None
             allowed, reasons, blockers, profile = self._short_zone(symbol, ind)
             side = "SELL"
             zone_label = "SHORT_ENTRY_ZONE"
+        else:
+            if direction not in ("BUY", "SELL"):
+                return None
+            if direction == "BUY":
+                if not getattr(config, "ALLOW_LONG_SIGNALS", False):
+                    return None
+                allowed, reasons, blockers, profile = self._long_zone(symbol, ind)
+                side = "BUY"
+                zone_label = "LONG_ENTRY_ZONE"
+            else:
+                if not getattr(config, "ALLOW_SHORT_SIGNALS", True):
+                    return None
+                allowed, reasons, blockers, profile = self._short_zone(symbol, ind)
+                side = "SELL"
+                zone_label = "SHORT_ENTRY_ZONE"
 
         if not allowed:
             return None
@@ -171,9 +180,9 @@ class ClassicScalpingStrategy:
             "sl": sl,
             "score": 0,
             "score_label": score_label,
-            "signal_type": "ورود ۵ دقیقه‌ای با تایید 1D/4H/1H",
+            "signal_type": "اسکالپ ۵ دقیقه‌ای فقط شورت",
             "market_direction": direction,
-            "market_state": "صعودی" if direction == "BUY" else "نزولی / شورت",
+            "market_state": "نزولی / فقط شورت",
             "entry_zone": zone_label,
             "profile_source": profile_source,
             "profile_samples": int(profile.get("samples") or 0),

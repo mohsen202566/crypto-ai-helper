@@ -1,4 +1,4 @@
-"""اجرای اصلی ربات اسکالپ کلاسیک ۵ دقیقه‌ای.
+"""اجرای اصلی ربات اسکالپ ۵ دقیقه‌ای فقط شورت v16.
 
 تحلیل از OKX گرفته می‌شود و اجرای واقعی، در صورت روشن بودن ترید، روی Toobit انجام می‌شود.
 """
@@ -70,12 +70,10 @@ class SingleInstanceLock:
 
 
 class MarketTrendFilter:
-    """فیلتر جهت کلی بازار بر اساس 1D و 4H و 1H + تایید BTC و ETH.
+    """فیلتر جهت بازار برای v16 Short-only.
 
-    خروجی فقط یکی از این سه حالت است:
-    BUY   = بازار صعودی؛ فقط لانگ مجاز
-    SELL  = بازار نزولی؛ فقط شورت مجاز
-    RANGE = بازار رنج؛ هیچ سیگنال جدیدی صادر نشود
+    ربات فقط وقتی اجازه شکار دارد که بازار در تایم‌های تنظیم‌شده نزولی باشد
+    و BTC/ETH هم همان جهت را تایید کنند. BUY عمداً به RANGE تبدیل می‌شود.
     """
 
     def __init__(self, okx: OKXClient, storage: JSONStorage | None = None) -> None:
@@ -90,11 +88,9 @@ class MarketTrendFilter:
 
     @staticmethod
     def _classify(ind: dict[str, Any]) -> str:
-        """تشخیص جهت برای 1H/4H.
+        """تشخیص جهت نرم برای تایم‌فریم‌های بالاتر از 5m.
 
-        این قسمت عمداً نرم‌تر از بازه ورود 5M است.
-        جهت بازار نباید آن‌قدر سخت باشد که ربات همیشه RANGE بماند.
-        شرط اصلی جهت: موقعیت قیمت نسبت به EMA50 + RSI.
+        برای v16 فقط خروجی SELL اجازه سیگنال دارد؛ BUY برای لانگ استفاده نمی‌شود.
         """
         close = float(ind.get("close") or 0)
         ema_trend = float(ind.get("ema_trend") or ind.get("ema_slow") or 0)
@@ -162,7 +158,7 @@ class MarketTrendFilter:
         if len(directions) != 1:
             return {
                 "direction": "RANGE",
-                "summary": "بازار رنج است؛ جهت 1D و 4H و 1H باهم موافق نیستند",
+                "summary": "بازار رنج است؛ تایم‌فریم‌های فیلتر شورت باهم موافق نیستند",
                 "details": details,
             }
 
@@ -170,7 +166,7 @@ class MarketTrendFilter:
         if market_direction not in ("BUY", "SELL"):
             return {
                 "direction": "RANGE",
-                "summary": "بازار رنج است؛ اکثریت 1D و 4H و 1H جهت سالم ندادند",
+                "summary": "بازار رنج است؛ اکثریت تایم‌فریم‌های فیلتر، شورت سالم ندادند",
                 "details": details,
             }
 
@@ -179,15 +175,20 @@ class MarketTrendFilter:
             if any(anchor_tfs.get(bar) != market_direction for bar in config.MARKET_TREND_TIMEFRAMES):
                 return {
                     "direction": "RANGE",
-                    "summary": f"بازار رنج است؛ {anchor.replace('USDT', '')} با جهت کلی بازار در 1D/4H/1H هم‌جهت نیست",
+                    "summary": f"بازار رنج است؛ {anchor.replace('USDT', '')} با جهت شورت بازار هم‌جهت نیست",
                     "details": details,
                 }
 
-        fa = "صعودی" if market_direction == "BUY" else "نزولی / شورت"
-        side_fa = "لانگ" if market_direction == "BUY" else "شورت"
+        if market_direction != "SELL":
+            return {
+                "direction": "RANGE",
+                "summary": "بازار صعودی/غیرشورت است؛ چون ربات v16 فقط شکارچی شورت است، سیگنال صادر نمی‌شود",
+                "details": details,
+            }
+
         return {
-            "direction": market_direction,
-            "summary": f"جهت کلی بازار {fa} است؛ 1D و 4H و 1H هم‌جهت‌اند و BTC/ETH تایید کردند؛ فقط {side_fa} مجاز است",
+            "direction": "SELL",
+            "summary": "بازار نزولی / شورت است؛ فیلترهای بازار و BTC/ETH تایید کردند؛ فقط شورت مجاز است",
             "details": details,
         }
 
@@ -224,7 +225,6 @@ class FiveMinuteScalperBot:
         self.last_signal_ts: dict[str, float] = {}
         self.last_error_ts: dict[str, float] = {}
         self.last_optimizer_check_ts = 0.0
-        self.active_indicators: dict[str, dict[str, Any]] = {}
 
     def validate_symbols(self) -> dict[str, dict[str, Any]]:
         logger.info("شروع اعتبارسنجی نمادها بین OKX و Toobit")
@@ -274,10 +274,10 @@ class FiveMinuteScalperBot:
         return valid
 
     def start(self) -> None:
-        logger.info("ربات ورود ۵ دقیقه‌ای با تایید چندتایم‌فریمی شروع شد")
+        logger.info("ربات v16 اسکالپ ۵ دقیقه‌ای فقط شورت شروع شد")
         self.validate_symbols()
         self.telegram.start()
-        self.telegram.send_message("✅ ربات اسکالپ کلاسیک ۵ دقیقه‌ای روشن شد.\nتحلیل از OKX و اجرای واقعی از Toobit انجام می‌شود.")
+        self.telegram.send_message("✅ ربات اسکالپ ۵ دقیقه‌ای فقط شورت v16 روشن شد.\nتحلیل از OKX و اجرای واقعی از Toobit انجام می‌شود.\nلانگ غیرفعال است؛ فقط SELL شکار می‌شود.")
         self._maybe_start_daily_optimizer(force=False)
         self._install_signal_handlers()
         self.analysis_loop()
@@ -335,7 +335,6 @@ class FiveMinuteScalperBot:
             try:
                 candles = self.okx.get_candles(mapped["okx_symbol"])
                 indicators = calculate_indicators(candles)
-                self.active_indicators[internal] = indicators
                 prices[internal] = float(indicators["close"])
             except Exception as exc:
                 logger.warning("مانیتور نتیجه: گرفتن قیمت فعال %s از OKX ناموفق بود: %s", internal, exc)
@@ -344,13 +343,13 @@ class FiveMinuteScalperBot:
     def _check_symbol_result_now(self, internal: str, latest_price: float) -> None:
         """قبل از تحلیل سیگنال جدید، نتیجه سیگنال باز همان نماد را همان لحظه چک کن."""
         prices = {internal: float(latest_price)}
-        normal_results = self.trade_manager.check_normal_results(prices, self.active_indicators)
-        real_results = self.trade_manager.check_real_results(prices, self.active_indicators)
+        normal_results = self.trade_manager.check_normal_results(prices)
+        real_results = self.trade_manager.check_real_results(prices)
         if normal_results or real_results:
             self._send_result_messages(normal_results=normal_results, real_results=real_results)
 
     def _symbol_mtf_confirmation(self, internal: str, mapped: dict[str, Any], direction: str) -> tuple[bool, str]:
-        """خود همان ارز هم باید در 1D/4H/1H هم‌جهت باشد؛ خطای یک تایم‌فریم فقط همان ارز را رد می‌کند."""
+        """خود همان ارز هم باید در تایم‌فریم فیلتر، شورت باشد؛ خطای یک تایم‌فریم فقط همان ارز را رد می‌کند."""
         required = tuple(getattr(config, "MARKET_TREND_TIMEFRAMES", ("1D", "4H", "1H")))
         seen: dict[str, str] = {}
         for bar in required:
@@ -364,11 +363,12 @@ class FiveMinuteScalperBot:
         if bad:
             parts = " | ".join(f"{tf}={val}" for tf, val in seen.items())
             return False, f"خود ارز در تایم‌های بالا هم‌جهت نیست: {parts}"
-        fa = "صعودی" if direction == "BUY" else "نزولی / شورت"
-        return True, f"خود {internal} در 1D/4H/1H هم‌جهت {fa} است"
+        fa = "نزولی / شورت" if direction == "SELL" else "غیرشورت"
+        tf_text = "/".join(required)
+        return True, f"خود {internal} در {tf_text} هم‌جهت {fa} است"
 
     def _entry_confirmation(self, internal: str, mapped: dict[str, Any], direction: str) -> tuple[bool, str]:
-        """15m فقط آماده‌بودن ورود را تایید می‌کند؛ تصمیم اصلی و بازه ورود همچنان 5m است."""
+        """15m فقط آماده‌بودن شورت را تایید می‌کند؛ تصمیم اصلی و بازه ورود همچنان 5m است."""
         bar = getattr(config, "ENTRY_CONFIRM_TIMEFRAME", "15m")
         try:
             candles = self.okx.get_candles(mapped["okx_symbol"], bar=bar, limit=getattr(config, "ENTRY_CONFIRM_CANDLE_LIMIT", 120))
@@ -413,7 +413,6 @@ class FiveMinuteScalperBot:
             candles = self.okx.get_candles(okx_symbol)
             indicators = calculate_indicators(candles)
             latest_price = float(indicators["close"])
-            self.active_indicators[internal] = indicators
 
             # اول نتیجه سیگنال باز همین نماد بررسی شود؛ بعد اگر هنوز باز بود، اصلاً سیگنال جدید نساز.
             self._check_symbol_result_now(internal, latest_price)
@@ -421,11 +420,14 @@ class FiveMinuteScalperBot:
                 logger.info("رد شد: برای این نماد %s هنوز سیگنال باز وجود دارد", internal)
                 return latest_price
 
+            direction = str(market_info.get("direction") or "RANGE").upper()
+            if getattr(config, "SHORT_ONLY_MODE", True) and direction != "SELL":
+                return latest_price
+
             signal_data = self.strategy.evaluate(internal, okx_symbol, toobit_symbol, indicators, market_info)
             if not signal_data:
                 return latest_price
 
-            direction = str(market_info.get("direction") or "RANGE").upper()
             ok_mtf, msg_mtf = self._symbol_mtf_confirmation(internal, mapped, direction)
             if not ok_mtf:
                 logger.info("سیگنال %s رد شد: %s", internal, msg_mtf)
@@ -485,8 +487,8 @@ class FiveMinuteScalperBot:
         # نتیجه‌ها نباید وابسته به صدور سیگنال جدید باشند. هر دور برای سیگنال‌های باز قیمت تازه می‌گیریم.
         prices = self._collect_active_prices()
         prices.update(latest_prices or {})
-        normal_results = self.trade_manager.check_normal_results(prices, self.active_indicators)
-        real_results = self.trade_manager.check_real_results(prices, self.active_indicators)
+        normal_results = self.trade_manager.check_normal_results(prices)
+        real_results = self.trade_manager.check_real_results(prices)
         self._send_result_messages(normal_results=normal_results, real_results=real_results)
 
     def analysis_loop(self) -> None:

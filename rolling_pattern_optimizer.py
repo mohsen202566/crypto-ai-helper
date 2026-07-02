@@ -469,17 +469,15 @@ class RollingPatternOptimizer:
                 df = df[df["open_time"] >= target_start].reset_index(drop=True)
                 if len(df) < 500:
                     raise RuntimeError(f"کندل قابل تحلیل کافی نیست: {len(df)}")
-                long_events = self.extract_good_moves(df, "LONG")
                 short_events = self.extract_good_moves(df, "SHORT")
                 symbols_out[internal] = {
                     "okx_symbol": okx_symbol,
-                    "LONG": self._build_side_profile(long_events, "LONG"),
+                    "LONG": {"enabled": False, "using_default": True, "reason": "short_only_v16_long_disabled", "samples": 0, "ranges": {}},
                     "SHORT": self._build_side_profile(short_events, "SHORT"),
                 }
                 logger.info(
-                    "بازه %s ساخته شد | LONG=%s SHORT=%s",
+                    "بازه %s ساخته شد | SHORT=%s | LONG disabled",
                     internal,
-                    len(long_events),
                     len(short_events),
                 )
             except Exception as exc:
@@ -491,7 +489,7 @@ class RollingPatternOptimizer:
                 }
 
         return {
-            "version": "v15",
+            "version": "v16_short_only_5m",
             "generated_utc": generated.isoformat(),
             "generated_date_utc": generated.date().isoformat(),
             "timeframe": config.TIMEFRAME,
@@ -499,7 +497,7 @@ class RollingPatternOptimizer:
             "target_move_percent": config.ROLLING_OPTIMIZER_TARGET_MOVE_PERCENT,
             "adverse_percent": config.ROLLING_OPTIMIZER_ADVERSE_PERCENT,
             "min_good_moves": config.ROLLING_OPTIMIZER_MIN_GOOD_MOVES,
-            "method": "start_of_real_good_moves_clean_quantile_ranges",
+            "method": "short_only_5m_good_dumps_clean_quantile_ranges",
             "symbols": symbols_out,
         }
 

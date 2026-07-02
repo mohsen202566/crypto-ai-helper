@@ -213,7 +213,15 @@ class SymbolProfileManager:
             "",
         ]
 
-        for side_key, title, icon in (("LONG", "لانگ", "🟢"), ("SHORT", "شورت", "🔴")):
+        if getattr(config, "SHORT_ONLY_MODE", False):
+            lines.append("🟢 لانگ")
+            lines.append("وضعیت: غیرفعال در v16؛ ربات فقط شکارچی شورت است")
+            lines.append("")
+            sides_to_show = (("SHORT", "شورت", "🔴"),)
+        else:
+            sides_to_show = (("LONG", "لانگ", "🟢"), ("SHORT", "شورت", "🔴"))
+
+        for side_key, title, icon in sides_to_show:
             profile = self.get_profile(symbol, side_key)
             status = "اختصاصی فعال ✅" if not profile.get("using_default") else ("عمومی / فقط نمایش؛ سیگنال غیرفعال ⚠️" if getattr(config, "REQUIRE_CUSTOM_PROFILE_FOR_SIGNAL", False) else "عمومی / پیش‌فرض ⚠️")
             samples = int(profile.get("samples") or 0)
@@ -230,13 +238,9 @@ class SymbolProfileManager:
             for feature in ["rsi", "adx", "volume_multiplier", "vwap_distance_percent", "atr_percent", "bb_position", "ema_gap_percent"]:
                 label = _FEATURE_LABELS.get(feature, feature)
                 lines.append(f"• {label}: {self.range_text(profile, feature)}")
-            if side_key == "LONG":
-                lines.append("• شرط ثابت EMA: EMA9 بالاتر از EMA21")
-                lines.append("• شرط ثابت VWAP: قیمت بالای VWAP")
-            else:
-                lines.append("• شرط ثابت EMA: EMA9 پایین‌تر از EMA21")
-                lines.append("• شرط ثابت VWAP: قیمت زیر VWAP")
+            lines.append("• شرط ثابت EMA: EMA9 پایین‌تر از EMA21")
+            lines.append("• شرط ثابت VWAP: قیمت زیر VWAP")
             lines.append("")
 
-        lines.append("این همان بازه‌ای است که امروز strategy می‌بیند. اگر وضعیت عمومی و ورود عمومی غیرفعال باشد، ربات از آن جهت سیگنال صادر نمی‌کند.")
+        lines.append("این همان بازه‌ای است که امروز strategy می‌بیند. در v16 فقط شورت سیگنال می‌دهد و ورود عمومی غیرفعال است.")
         return "\n".join(lines).strip()

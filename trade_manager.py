@@ -188,77 +188,7 @@ class TradeManager:
         notional = trade_amount * leverage
         return notional * movement / 100.0
 
-    def _smart_exit_confirmation_score(self, signal: dict[str, Any], ind: dict[str, Any]) -> tuple[int, list[str]]:
-        """امتیاز برگشت مومنتوم برای خروج هوشمند؛ چند تایید همزمان لازم است تا نویز حذف شود."""
-        if not ind:
-            return 0, []
-        side = str(signal.get("side", "")).upper()
-        close = safe_float(ind.get("close"), 0.0)
-        ema_fast = safe_float(ind.get("ema_fast"), 0.0)
-        ema_slow = safe_float(ind.get("ema_slow"), 0.0)
-        vwap = safe_float(ind.get("vwap"), 0.0)
-        rsi = safe_float(ind.get("rsi"), 50.0)
-        score = 0
-        reasons: list[str] = []
-
-        if side == "BUY":
-            checks = [
-                (close > 0 and ema_fast > 0 and close < ema_fast, "قیمت زیر EMA سریع رفت"),
-                (ema_fast > 0 and ema_slow > 0 and ema_fast <= ema_slow, "EMA سریع قدرت لانگ را از دست داد"),
-                (vwap > 0 and close < vwap, "قیمت VWAP را از دست داد"),
-                (rsi < 50, "RSI زیر ناحیه میانی برگشت"),
-            ]
-        else:
-            checks = [
-                (close > 0 and ema_fast > 0 and close > ema_fast, "قیمت بالای EMA سریع برگشت"),
-                (ema_fast > 0 and ema_slow > 0 and ema_fast >= ema_slow, "EMA سریع قدرت شورت را از دست داد"),
-                (vwap > 0 and close > vwap, "قیمت بالای VWAP برگشت"),
-                (rsi > 50, "RSI بالای ناحیه میانی برگشت"),
-            ]
-        for ok, text in checks:
-            if ok:
-                score += 1
-                reasons.append(text)
-        return score, reasons
-
-    def _smart_exit_decision(
-        self,
-        signal: dict[str, Any],
-        price: float,
-        ind: dict[str, Any] | None = None,
-    ) -> tuple[str, float, float, str] | None:
-        if not getattr(config, "SMART_EXIT_ENABLED", True):
-            return None
-        price = float(price)
-        movement = self._movement_percent(signal, price)
-        score, reasons = self._smart_exit_confirmation_score(signal, ind or {})
-        min_confirmations = int(getattr(config, "SMART_EXIT_CONFIRMATIONS", 3))
-        if score < min_confirmations:
-            return None
-
-        # خروج در سود: فقط وقتی سود حداقلی داریم و چند نشانه برگشت همزمان دیده می‌شود.
-        if movement >= float(getattr(config, "SMART_EXIT_MIN_PROFIT_PERCENT", 0.70)):
-            reason = "؛ ".join(reasons[:4])
-            return "SMART_PROFIT", price, self._signal_pnl(signal, price), f"معامله وارد سود شد اما برگشت مومنتوم تایید شد: {reason}. برای حفظ سود خروج هوشمند انجام شد."
-
-        # خروج دفاعی: اگر بعد از چند دقیقه ورود جواب نداد و هنوز نزدیک ورود/ضرر کم است، قبل از SL کامل خارج شو.
-        created_ms = int(signal.get("created_ms") or int(time.time() * 1000))
-        age_seconds = (int(time.time() * 1000) - created_ms) / 1000.0
-        min_age = float(getattr(config, "SMART_EXIT_DEFENSE_AFTER_SECONDS", 180))
-        max_loss = float(getattr(config, "SMART_EXIT_DEFENSE_MAX_LOSS_PERCENT", 0.35))
-        max_profit = float(getattr(config, "SMART_EXIT_DEFENSE_MAX_PROFIT_PERCENT", 0.25))
-        if age_seconds >= min_age and -max_loss <= movement <= max_profit:
-            reason = "؛ ".join(reasons[:4])
-            return "SMART_DEFENSE", price, self._signal_pnl(signal, price), f"بعد از ورود، حرکت تاییدی شکل نگرفت و برگشت مومنتوم دیده شد: {reason}. برای جلوگیری از خوردن SL کامل خروج دفاعی انجام شد."
-
-        return None
-
-    def check_normal_results(
-        self,
-        symbol_prices: dict[str, float],
-        symbol_indicators: dict[str, dict[str, Any]] | None = None,
-    ) -> list[tuple[dict[str, Any], str, float, float]]:
-        symbol_indicators = symbol_indicators or {}
+    def check_normal_results(self, symbol_prices: dict[str, float]) -> list[tuple[dict[str, Any], str, float, float]]:
         results: list[tuple[dict[str, Any], str, float, float]] = []
         for signal in self.storage.active_signals():
             price = symbol_prices.get(signal["symbol"])
@@ -266,37 +196,24 @@ class TradeManager:
                 logger.info("مانیتور عادی: برای %s قیمت زنده ندارم؛ نتیجه چک نشد", signal.get("symbol"))
                 continue
             result = hit_tp_sl(signal["side"], float(price), float(signal["tp"]), float(signal["sl"]))
-            exit_reason = None
-            if result:
-                # سیگنال عادی با TP/SL ثابت بسته می‌شود؛ خروج دقیقاً همان TP یا SL باشد، نه قیمت دیرتر/اسلیپیج.
-                exit_price = float(signal["tp"] if result == "TP" else signal["sl"])
-                pnl = self._signal_pnl(signal, exit_price)
-                source = "OKX_LIVE_PRICE"
-            else:
-                smart = self._smart_exit_decision(signal, float(price), symbol_indicators.get(signal["symbol"], {}))
-                if not smart:
-                    logger.info(
-                        "مانیتور عادی %s: price=%s entry=%s tp=%s sl=%s result=OPEN",
-                        signal.get("symbol"), price, signal.get("entry"), signal.get("tp"), signal.get("sl"),
-                    )
-                    continue
-                result, exit_price, pnl, exit_reason = smart
-                source = "SMART_EXIT_OKX"
-
             logger.info(
                 "مانیتور عادی %s: price=%s entry=%s tp=%s sl=%s result=%s",
-                signal.get("symbol"), price, signal.get("entry"), signal.get("tp"), signal.get("sl"), result,
+                signal.get("symbol"), price, signal.get("entry"), signal.get("tp"), signal.get("sl"), result or "OPEN",
             )
-            updates = dict(
+            if not result:
+                continue
+
+            # سیگنال عادی با TP/SL ثابت بسته می‌شود؛ خروج دقیقاً همان TP یا SL باشد، نه قیمت دیرتر/اسلیپیج.
+            exit_price = float(signal["tp"] if result == "TP" else signal["sl"])
+            pnl = self._signal_pnl(signal, exit_price)
+            self.storage.update_signal(
+                signal["signal_id"],
                 normal_result=result,
                 normal_exit_price=exit_price,
                 normal_exit_utc=now_utc_iso(),
                 normal_pnl=pnl,
-                result_source=source,
+                result_source="OKX_LIVE_PRICE",
             )
-            if exit_reason:
-                updates["normal_exit_reason"] = exit_reason
-            self.storage.update_signal(signal["signal_id"], **updates)
             self.stats.record_normal_result(result, pnl=pnl)
             updated = self.storage.get_signal(signal["signal_id"]) or signal
             results.append((updated, result, exit_price, pnl))
@@ -333,18 +250,13 @@ class TradeManager:
         result = "TP" if movement >= 0 else "SL"
         return result, float(price), self._signal_pnl(signal, float(price))
 
-    def check_real_results(
-        self,
-        symbol_prices: dict[str, float] | None = None,
-        symbol_indicators: dict[str, dict[str, Any]] | None = None,
-    ) -> list[tuple[dict[str, Any], str, float, float]]:
+    def check_real_results(self, symbol_prices: dict[str, float] | None = None) -> list[tuple[dict[str, Any], str, float, float]]:
         """مانیتور دقیق رئال.
 
         مسیر اصلی: Toobit positions -> اگر پوزیشن بسته بود -> Toobit history/order history -> ثبت PnL واقعی.
         مسیر ضد گیر: اگر history دیر کرد و پوزیشن دیگر باز نبود، بعد از timeout نتیجه fallback ثبت می‌شود تا نماد قفل نماند.
         """
         symbol_prices = symbol_prices or {}
-        symbol_indicators = symbol_indicators or {}
         results: list[tuple[dict[str, Any], str, float, float]] = []
         now_ms = int(time.time() * 1000)
 
@@ -375,69 +287,6 @@ class TradeManager:
                 note = "پوزیشن واقعی هنوز باز است"
                 if touch:
                     note = f"قیمت OKX به {touch} رسیده ولی Toobit هنوز پوزیشن را باز نشان می‌دهد؛ منتظر اجرای TP/SL صرافی"
-
-                smart = None
-                if price is not None:
-                    smart = self._smart_exit_decision(signal, float(price), symbol_indicators.get(symbol, {}))
-
-                if smart:
-                    result, exit_price, pnl, exit_reason = smart
-                    try:
-                        raw_close = self.toobit.flash_close(toobit_symbol, signal["side"])
-                        time.sleep(float(getattr(config, "TOOBIT_CLOSE_VERIFY_SECONDS", 2.0)))
-                        still_open = self.toobit.get_open_position(toobit_symbol, signal["side"]) is not None
-                    except Exception as exc:
-                        logger.warning("خروج هوشمند رئال %s ناموفق بود: %s", symbol, exc)
-                        self.storage.update_signal(
-                            signal["signal_id"],
-                            real_last_monitor_utc=now_utc_iso(),
-                            real_position_seen=True,
-                            real_monitor_note=f"خروج هوشمند فعال شد ولی flashClose خطا داد: {exc}",
-                            history_missing_since_ms=None,
-                        )
-                        continue
-
-                    if still_open:
-                        self.storage.update_signal(
-                            signal["signal_id"],
-                            real_last_monitor_utc=now_utc_iso(),
-                            real_position_seen=True,
-                            real_monitor_note="خروج هوشمند ارسال شد اما Toobit هنوز پوزیشن را باز نشان می‌دهد",
-                            smart_close_raw=raw_close if isinstance(raw_close, dict) else {"response": raw_close},
-                            history_missing_since_ms=None,
-                        )
-                        continue
-
-                    history_result = None
-                    try:
-                        history_result = self._real_result_from_history(signal)
-                    except Exception as exc:
-                        logger.warning("خروج هوشمند رئال %s: خواندن history بعد از flashClose ناموفق بود: %s", symbol, exc)
-                    if history_result:
-                        hist_result, hist_exit_price, hist_pnl = history_result
-                        result = result if result.startswith("SMART") else hist_result
-                        exit_price = hist_exit_price
-                        pnl = hist_pnl
-                        source = "SMART_EXIT_TOOBIT_HISTORY"
-                    else:
-                        source = "SMART_EXIT_FLASH_CLOSE_FALLBACK"
-
-                    self.storage.update_signal(
-                        signal["signal_id"],
-                        real_result=result,
-                        real_exit_price=exit_price,
-                        real_exit_utc=now_utc_iso(),
-                        real_pnl=pnl,
-                        real_result_source=source,
-                        real_exit_reason=exit_reason,
-                        real_monitor_note=f"خروج هوشمند با flashClose انجام شد؛ نتیجه از {source} ثبت شد",
-                        smart_close_raw=raw_close if isinstance(raw_close, dict) else {"response": raw_close},
-                    )
-                    self.stats.record_real_result(result, pnl=pnl)
-                    updated = self.storage.get_signal(signal["signal_id"]) or signal
-                    results.append((updated, result, exit_price, pnl))
-                    continue
-
                 self.storage.update_signal(
                     signal["signal_id"],
                     real_last_monitor_utc=now_utc_iso(),
