@@ -1,21 +1,23 @@
 """کلاینت Toobit Spot-only.
 
-این فایل عمداً فقط برای Spot ساخته شده است:
+این فایل فقط برای Spot ساخته شده است:
+- خواندن موجودی Spot
+- چک نمادهای Spot
 - خرید Spot
 - فروش Limit Spot
-- موجودی Spot
 - سفارش‌های باز Spot
 - تاریخچه سفارش‌های Spot
 
-هیچ منطق شورت، لوریج، مارجین یا استاپ داخل این فایل وجود ندارد.
+هیچ منطق Futures، لوریج، مارجین، شورت یا Stop Loss داخل این فایل وجود ندارد.
 """
 from __future__ import annotations
+
+TOOBIT_CLIENT_SPOT_FIXED_VERSION = "spot-final-v4-2026-07-02"
 
 import hashlib
 import hmac
 import os
 import time
-from decimal import Decimal
 from typing import Any
 from urllib.parse import urlencode
 
@@ -38,31 +40,107 @@ class ToobitError(RuntimeError):
 
 
 class ToobitClient:
+    """ارتباط مستقیم با Toobit Spot.
+
+    نکته مهم:
+    config.py نسخه قبلی مسیرهای اشتباه زیر را داشت:
+    - /api/v1/spot/account
+    - /api/v1/spot/exchangeInfo
+    برای اینکه فقط با تعویض همین فایل مشکل حل شود، این فایل مسیرهای رسمی Spot را خودش اصلاح می‌کند.
+    """
+
+    BAD_EXCHANGE_PATHS = {"/api/v1/spot/exchangeInfo", "/api/v1/spot/exchangeinfo"}
+    BAD_BALANCE_PATHS = {"/api/v1/spot/account"}
+    BAD_HISTORY_PATHS = {"/api/v1/spot/historyOrders", "/api/v1/spot/order/history"}
+
     def __init__(self, base_url: str = config.TOOBIT_BASE_URL, timeout: int = config.REQUEST_TIMEOUT):
-        self.base_url = base_url.rstrip("/")
-        self.timeout = timeout
-        # هماهنگ با .env فعلی سرور شما:
+        self.base_url = str(base_url or "https://api.toobit.com").rstrip("/")
+        self.timeout = int(timeout or 15)
+
+        # هماهنگ با .env فعلی شما:
         # TOOBIT_API_KEY=...
         # TOOBIT_SECRET_KEY=...
-        # اگر در آینده نام استاندارد TOOBIT_API_SECRET هم گذاشته شد، همان هم پشتیبانی می‌شود.
+        # همچنین اگر بعداً TOOBIT_API_SECRET گذاشته شود، پشتیبانی می‌شود.
         self.api_key = (
-            getattr(config, "TOOBIT_API_KEY", "")
-            or os.getenv("TOOBIT_API_KEY", "")
+            os.getenv("TOOBIT_API_KEY", "")
+            or getattr(config, "TOOBIT_API_KEY", "")
+            or ""
         ).strip()
         self.api_secret = (
-            getattr(config, "TOOBIT_API_SECRET", "")
-            or getattr(config, "TOOBIT_SECRET_KEY", "")
-            or os.getenv("TOOBIT_API_SECRET", "")
+            os.getenv("TOOBIT_API_SECRET", "")
             or os.getenv("TOOBIT_SECRET_KEY", "")
+            or getattr(config, "TOOBIT_API_SECRET", "")
+            or getattr(config, "TOOBIT_SECRET_KEY", "")
+            or ""
         ).strip()
+
         self.session = requests.Session()
 
-        self.path_exchange_info = config.TOOBIT_SPOT_PATH_EXCHANGE_INFO
-        self.path_balance = config.TOOBIT_SPOT_PATH_BALANCE
-        self.path_order = config.TOOBIT_SPOT_PATH_ORDER
-        self.path_open_orders = config.TOOBIT_SPOT_PATH_OPEN_ORDERS
-        self.path_order_history = config.TOOBIT_SPOT_PATH_ORDER_HISTORY
-        self.path_order_history_alt = config.TOOBIT_SPOT_PATH_ORDER_HISTORY_ALT
+        # مسیرهای رسمی Toobit Spot طبق API Docs:
+        # Account: GET /api/v1/account
+        # ExchangeInfo: GET /api/v1/exchangeInfo
+        # Order: /api/v1/spot/order
+        # Open orders: /api/v1/spot/openOrders
+        # All orders: GET /api/v1/spot/tradeOrders
+        # Price ticker: GET /quote/v1/ticker/price
+        self.path_exchange_info = self._clean_path(
+            env_name="TOOBIT_SPOT_PATH_EXCHANGE_INFO",
+            config_name="TOOBIT_SPOT_PATH_EXCHANGE_INFO",
+            default="/api/v1/exchangeInfo",
+            bad_paths=self.BAD_EXCHANGE_PATHS,
+        )
+        self.path_balance = self._clean_path(
+            env_name="TOOBIT_SPOT_PATH_BALANCE",
+            config_name="TOOBIT_SPOT_PATH_BALANCE",
+            default="/api/v1/account",
+            bad_paths=self.BAD_BALANCE_PATHS,
+        )
+        self.path_order = self._clean_path(
+            env_name="TOOBIT_SPOT_PATH_ORDER",
+            config_name="TOOBIT_SPOT_PATH_ORDER",
+            default="/api/v1/spot/order",
+        )
+        self.path_open_orders = self._clean_path(
+            env_name="TOOBIT_SPOT_PATH_OPEN_ORDERS",
+            config_name="TOOBIT_SPOT_PATH_OPEN_ORDERS",
+            default="/api/v1/spot/openOrders",
+        )
+        self.path_order_history = self._clean_path(
+            env_name="TOOBIT_SPOT_PATH_ORDER_HISTORY",
+            config_name="TOOBIT_SPOT_PATH_ORDER_HISTORY",
+            default="/api/v1/spot/tradeOrders",
+            bad_paths=self.BAD_HISTORY_PATHS,
+        )
+        self.path_order_history_alt = self._clean_path(
+            env_name="TOOBIT_SPOT_PATH_ORDER_HISTORY_ALT",
+            config_name="TOOBIT_SPOT_PATH_ORDER_HISTORY_ALT",
+            default="/api/v1/spot/tradeOrders",
+            bad_paths=self.BAD_HISTORY_PATHS,
+        )
+        self.path_account_trades = self._clean_path(
+            env_name="TOOBIT_SPOT_PATH_ACCOUNT_TRADES",
+            config_name="TOOBIT_SPOT_PATH_ACCOUNT_TRADES",
+            default="/api/v1/account/trades",
+        )
+        self.path_price_ticker = self._clean_path(
+            env_name="TOOBIT_SPOT_PATH_PRICE_TICKER",
+            config_name="TOOBIT_SPOT_PATH_PRICE_TICKER",
+            default="/quote/v1/ticker/price",
+        )
+
+    @staticmethod
+    def _clean_path(env_name: str, config_name: str, default: str, bad_paths: set[str] | None = None) -> str:
+        """مسیر را از env/config می‌خواند ولی مسیرهای اشتباه نسخه قبلی را اصلاح می‌کند."""
+        bad_paths = bad_paths or set()
+        raw = (
+            os.getenv(env_name, "")
+            or getattr(config, config_name, "")
+            or default
+        )
+        path = str(raw).strip() or default
+        if path in bad_paths:
+            return default
+        return path
 
     @property
     def has_credentials(self) -> bool:
@@ -75,11 +153,12 @@ class ToobitClient:
     def _request(self, method: str, path: str, params: dict[str, Any] | None = None, signed: bool = False) -> Any:
         params = dict(params or {})
         headers: dict[str, str] = {}
+
         if signed:
             if not self.has_credentials:
                 raise ToobitError("کلید API توبیت تنظیم نشده است؛ TOOBIT_API_KEY و TOOBIT_SECRET_KEY را در .env چک کن")
             params.setdefault("timestamp", int(time.time() * 1000))
-            params.setdefault("recvWindow", config.RECV_WINDOW)
+            params.setdefault("recvWindow", getattr(config, "RECV_WINDOW", 5000))
             params["signature"] = self._sign(params)
             headers["X-BB-APIKEY"] = self.api_key
 
@@ -94,6 +173,7 @@ class ToobitClient:
                 response = self.session.delete(url, data=params, headers=headers, timeout=self.timeout)
             else:
                 raise ToobitError(f"متد پشتیبانی نمی‌شود: {method}")
+
             if response.status_code >= 400:
                 raise ToobitError(f"HTTP {response.status_code}: {response.text[:500]}")
             payload = response.json()
@@ -105,7 +185,9 @@ class ToobitClient:
         if isinstance(payload, dict):
             code = payload.get("code") or payload.get("retCode") or payload.get("status")
             if code not in (None, 0, 200, "0", "200", "OK", "ok", "success", "SUCCESS", True):
-                raise ToobitError(f"پاسخ ناموفق Toobit: {payload.get('msg') or payload.get('message') or payload.get('error') or payload}")
+                raise ToobitError(
+                    f"پاسخ ناموفق Toobit: {payload.get('msg') or payload.get('message') or payload.get('error') or payload}"
+                )
         return payload
 
     # -----------------------------
@@ -117,6 +199,7 @@ class ToobitClient:
             return [item for item in payload if isinstance(item, dict)]
         if not isinstance(payload, dict):
             return []
+
         result: list[dict[str, Any]] = []
         for key in ("data", "result", "balances", "assets", "rows", "list", "orders"):
             value = payload.get(key)
@@ -125,6 +208,7 @@ class ToobitClient:
                 result.extend(ToobitClient._extract_dicts(value))
             elif isinstance(value, list):
                 result.extend(item for item in value if isinstance(item, dict))
+
         if not result:
             result.append(payload)
         return result
@@ -170,8 +254,12 @@ class ToobitClient:
         )
         if price > 0:
             return price
+
         qty = ToobitClient._filled_qty(item)
-        quote = safe_float(item.get("cummulativeQuoteQty") or item.get("cumQuote") or item.get("dealAmount") or item.get("quoteQty"))
+        quote = safe_float(
+            item.get("cumulativeQuoteQty") or item.get("cummulativeQuoteQty") or
+            item.get("cumQuote") or item.get("dealAmount") or item.get("quoteQty")
+        )
         if qty > 0 and quote > 0:
             return quote / qty
         return 0.0
@@ -184,6 +272,13 @@ class ToobitClient:
         )
         if fee > 0:
             return fee
+
+        fee_obj = item.get("fee")
+        if isinstance(fee_obj, dict):
+            nested_fee = safe_float(fee_obj.get("fee") or fee_obj.get("feeAmount"))
+            if nested_fee > 0:
+                return nested_fee
+
         return float(fallback_value_usdt) * float(fallback_fee_pct) / 100.0
 
     # -----------------------------
@@ -196,6 +291,7 @@ class ToobitClient:
     def get_spot_symbols(self) -> dict[str, dict[str, Any]]:
         payload = self.get_spot_exchange_info()
         raw_symbols: list[Any] = []
+
         if isinstance(payload.get("symbols"), list):
             raw_symbols = payload["symbols"]
         elif isinstance(payload.get("data"), dict) and isinstance(payload["data"].get("symbols"), list):
@@ -209,16 +305,26 @@ class ToobitClient:
         for item in raw_symbols:
             if not isinstance(item, dict):
                 continue
+            # فقط Spot؛ قراردادهای Futures داخل contracts نباید وارد شوند.
+            quote = str(item.get("quoteAsset") or item.get("quoteAssetName") or "").upper()
+            if quote and quote != "USDT":
+                continue
             for name in (item.get("symbol"), item.get("symbolId"), item.get("symbolName"), item.get("s")):
                 if name:
                     result[str(name).upper()] = item
         return result
 
-    def validate_spot_symbol(self, symbol: str, exchange_symbols: dict[str, dict[str, Any]] | None = None) -> tuple[str, dict[str, Any]]:
+    def validate_spot_symbol(
+        self,
+        symbol: str,
+        exchange_symbols: dict[str, dict[str, Any]] | None = None,
+    ) -> tuple[str, dict[str, Any]]:
         symbols = exchange_symbols or self.get_spot_symbols()
-        candidates = [symbol.upper(), symbol.replace("/", "").replace("-", "").upper()]
-        if "USDT" not in candidates[-1]:
-            candidates.append(f"{candidates[-1]}USDT")
+        cleaned = symbol.replace("/", "").replace("-", "").upper()
+        candidates = [symbol.upper(), cleaned]
+        if not cleaned.endswith("USDT"):
+            candidates.append(f"{cleaned}USDT")
+
         for candidate in candidates:
             if candidate in symbols:
                 return candidate, symbols[candidate]
@@ -228,11 +334,33 @@ class ToobitClient:
         info = symbol_info or {}
         lot = extract_filter(info, "LOT_SIZE")
         price_filter = extract_filter(info, "PRICE_FILTER")
-        step = str(lot.get("stepSize") or lot.get("quantityStep") or lot.get("qtyStep") or info.get("quantityStep") or "0.000001")
-        tick = str(price_filter.get("tickSize") or info.get("tickSize") or info.get("priceTick") or "0.000001")
+        min_notional_filter = extract_filter(info, "MIN_NOTIONAL")
+
+        step = str(
+            lot.get("stepSize") or lot.get("quantityStep") or lot.get("qtyStep") or
+            info.get("quantityStep") or "0.000001"
+        )
+        tick = str(
+            price_filter.get("tickSize") or info.get("tickSize") or info.get("priceTick") or "0.000001"
+        )
         min_qty = safe_float(lot.get("minQty") or info.get("minQty") or info.get("minQuantity"), 0.0)
-        min_notional = safe_float(info.get("minNotional") or info.get("minOrderValue") or info.get("minQuoteAmount"), 0.0)
+        min_notional = safe_float(
+            min_notional_filter.get("minNotional") or info.get("minNotional") or
+            info.get("minOrderValue") or info.get("minQuoteAmount"),
+            0.0,
+        )
         return step, tick, min_qty, min_notional
+
+    def get_spot_last_price(self, symbol: str) -> float:
+        payload = self._request("GET", self.path_price_ticker, params={"symbol": symbol.upper()}, signed=False)
+        for item in self._extract_dicts(payload):
+            item_symbol = self._symbol_from_item(item)
+            if item_symbol and item_symbol != symbol.upper():
+                continue
+            price = safe_float(item.get("p") or item.get("price") or item.get("lastPrice") or item.get("c"))
+            if price > 0:
+                return price
+        raise ToobitError(f"قیمت Spot توبیت برای {symbol} دریافت نشد")
 
     # -----------------------------
     # موجودی Spot
@@ -264,6 +392,7 @@ class ToobitClient:
         if symbol:
             params["symbol"] = symbol.upper()
         payload = self._request("GET", self.path_open_orders, params=params, signed=True)
+
         out: list[dict[str, Any]] = []
         for item in self._extract_dicts(payload):
             status = self._order_status(item)
@@ -274,7 +403,12 @@ class ToobitClient:
             out.append(item)
         return out
 
-    def get_spot_order(self, symbol: str, order_id: str | None = None, client_order_id: str | None = None) -> dict[str, Any] | None:
+    def get_spot_order(
+        self,
+        symbol: str,
+        order_id: str | None = None,
+        client_order_id: str | None = None,
+    ) -> dict[str, Any] | None:
         params: dict[str, Any] = {"symbol": symbol.upper()}
         if order_id:
             params["orderId"] = order_id
@@ -285,10 +419,16 @@ class ToobitClient:
             for item in self._extract_dicts(payload):
                 return item
         except Exception as exc:
-            logger.warning("خواندن سفارش Spot ناموفق بود %s %s: %s", symbol, order_id, exc)
+            logger.warning("خواندن سفارش Spot ناموفق بود %s %s: %s", symbol, order_id or client_order_id, exc)
         return None
 
-    def get_spot_order_history(self, symbol: str | None = None, start_ms: int | None = None, end_ms: int | None = None, limit: int = 100) -> list[dict[str, Any]]:
+    def get_spot_order_history(
+        self,
+        symbol: str | None = None,
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
         params: dict[str, Any] = {"limit": max(1, min(int(limit), 1000))}
         if symbol:
             params["symbol"] = symbol.upper()
@@ -298,10 +438,11 @@ class ToobitClient:
             params["endTime"] = int(end_ms)
 
         rows: list[dict[str, Any]] = []
-        last_error: Exception | None = None
-        for path in (self.path_order_history, self.path_order_history_alt):
-            if not path:
+        tried: set[str] = set()
+        for path in (self.path_order_history, self.path_order_history_alt, "/api/v1/spot/tradeOrders"):
+            if not path or path in tried:
                 continue
+            tried.add(path)
             try:
                 payload = self._request("GET", path, params=params, signed=True)
                 for item in self._extract_dicts(payload):
@@ -311,25 +452,75 @@ class ToobitClient:
                 if rows:
                     return rows
             except Exception as exc:
-                last_error = exc
                 logger.warning("خواندن order history اسپات توبیت از %s ناموفق بود: %s", path, exc)
-        if last_error and not rows:
-            return []
         return rows
 
+    def get_spot_account_trades(
+        self,
+        symbol: str,
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {"symbol": symbol.upper(), "limit": max(1, min(int(limit), 1000))}
+        if start_ms is not None:
+            params["startTime"] = int(start_ms)
+        if end_ms is not None:
+            params["endTime"] = int(end_ms)
+        payload = self._request("GET", self.path_account_trades, params=params, signed=True)
+        return [item for item in self._extract_dicts(payload) if self._symbol_from_item(item) in ("", symbol.upper())]
+
     def place_spot_market_buy(self, symbol: str, quote_amount_usdt: float, client_order_id: str) -> dict[str, Any]:
+        """خرید مارکت Spot با مبلغ دلاری.
+
+        Toobit در مستندات Spot برای MARKET پارامتر quantity را الزامی کرده است، نه quoteOrderQty.
+        پس مقدار USDT به مقدار کوین تبدیل و با stepSize گرد می‌شود.
+        """
+        symbol = symbol.upper()
+        spot_symbol, symbol_info = self.validate_spot_symbol(symbol)
+        last_price = self.get_spot_last_price(spot_symbol)
+        step, _, min_qty, min_notional = self.get_symbol_rules(spot_symbol, symbol_info)
+
+        base_qty = float(quote_amount_usdt) / last_price if last_price > 0 else 0.0
+        if min_qty > 0 and base_qty < min_qty:
+            base_qty = min_qty
+        quantity = decimal_round_down(base_qty, step=step, digits=8)
+
+        notional_estimate = safe_float(quantity) * last_price
+        if min_notional > 0 and notional_estimate < min_notional:
+            raise ToobitError(
+                f"مبلغ سفارش {quote_amount_usdt} USDT برای {spot_symbol} کمتر از حداقل معامله Toobit است: {min_notional} USDT"
+            )
+
         params = {
-            "symbol": symbol.upper(),
+            "symbol": spot_symbol,
             "side": "BUY",
             "type": "MARKET",
-            "quoteOrderQty": decimal_to_api(quote_amount_usdt),
+            "quantity": quantity,
             "newClientOrderId": client_order_id,
         }
         raw = self._request("POST", self.path_order, params=params, signed=True)
-        return {"order_id": self._extract_order_id(raw), "raw": raw if isinstance(raw, dict) else {"response": raw}}
+        return {
+            "order_id": self._extract_order_id(raw),
+            "symbol": spot_symbol,
+            "requested_usdt": float(quote_amount_usdt),
+            "estimated_price": last_price,
+            "estimated_quantity": safe_float(quantity),
+            "raw": raw if isinstance(raw, dict) else {"response": raw},
+        }
 
-    def place_spot_limit_sell(self, symbol: str, quantity: float, price: float, client_order_id: str, symbol_info: dict[str, Any] | None = None) -> dict[str, Any]:
-        step, tick, min_qty, _ = self.get_symbol_rules(symbol, symbol_info)
+    def place_spot_limit_sell(
+        self,
+        symbol: str,
+        quantity: float,
+        price: float,
+        client_order_id: str,
+        symbol_info: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        symbol = symbol.upper()
+        if symbol_info is None:
+            symbol, symbol_info = self.validate_spot_symbol(symbol)
+        step, tick, _, _ = self.get_symbol_rules(symbol, symbol_info)
         qty_str = decimal_round_down(quantity, step=step, digits=8)
         price_float = round_price_to_tick(price, tick, direction="up")
         params = {
@@ -354,12 +545,20 @@ class ToobitClient:
         if order_id:
             params["orderId"] = order_id
         if client_order_id:
-            params["origClientOrderId"] = client_order_id
+            params["clientOrderId"] = client_order_id
         return self._request("DELETE", self.path_order, params=params, signed=True)
 
-    def wait_spot_order_fill(self, symbol: str, order_id: str | None, timeout_seconds: int, poll_seconds: int = 5) -> dict[str, Any] | None:
+    def wait_spot_order_fill(
+        self,
+        symbol: str,
+        order_id: str | None,
+        timeout_seconds: int,
+        poll_seconds: int = 5,
+    ) -> dict[str, Any] | None:
         end_time = time.time() + max(1, int(timeout_seconds))
         last_item: dict[str, Any] | None = None
+        start_ms = int((time.time() - 3600) * 1000)
+
         while time.time() <= end_time:
             if order_id:
                 item = self.get_spot_order(symbol, order_id=order_id)
@@ -367,9 +566,11 @@ class ToobitClient:
                     last_item = item
                     if self._is_filled(item) or self._filled_qty(item) > 0:
                         return item
-            rows = self.get_spot_order_history(symbol=symbol, start_ms=int((time.time() - 3600) * 1000), limit=50)
+
+            rows = self.get_spot_order_history(symbol=symbol, start_ms=start_ms, limit=50)
             for item in rows:
-                if order_id and str(item.get("orderId") or item.get("id") or "") != str(order_id):
+                item_order_id = str(item.get("orderId") or item.get("id") or "")
+                if order_id and item_order_id != str(order_id):
                     continue
                 last_item = item
                 if self._is_filled(item) or self._filled_qty(item) > 0:
@@ -377,7 +578,14 @@ class ToobitClient:
             time.sleep(max(1, int(poll_seconds)))
         return last_item
 
-    def find_filled_order(self, symbol: str, order_id: str | None, side: str, start_ms: int | None = None, end_ms: int | None = None) -> dict[str, Any] | None:
+    def find_filled_order(
+        self,
+        symbol: str,
+        order_id: str | None,
+        side: str,
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+    ) -> dict[str, Any] | None:
         rows = self.get_spot_order_history(symbol=symbol, start_ms=start_ms, end_ms=end_ms, limit=200)
         side_u = side.upper()
         for item in rows:
@@ -393,7 +601,9 @@ class ToobitClient:
     def parse_order_fill(self, item: dict[str, Any], fallback_fee_pct: float = 0.0) -> dict[str, float]:
         qty = self._filled_qty(item)
         avg = self._avg_price(item)
-        value = qty * avg if qty > 0 and avg > 0 else safe_float(item.get("dealAmount") or item.get("cummulativeQuoteQty"))
+        value = qty * avg if qty > 0 and avg > 0 else safe_float(
+            item.get("dealAmount") or item.get("cumulativeQuoteQty") or item.get("cummulativeQuoteQty")
+        )
         fee = self._fee_usdt(item, fallback_value_usdt=value, fallback_fee_pct=fallback_fee_pct)
         ts = safe_int(item.get("updateTime") or item.get("transactTime") or item.get("time") or item.get("createdTime"), 0)
         return {"qty": qty, "avg_price": avg, "value_usdt": value, "fee_usdt": fee, "time_ms": ts}
