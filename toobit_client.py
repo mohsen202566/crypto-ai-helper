@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import os
 import time
 from decimal import Decimal
 from typing import Any
@@ -40,8 +41,20 @@ class ToobitClient:
     def __init__(self, base_url: str = config.TOOBIT_BASE_URL, timeout: int = config.REQUEST_TIMEOUT):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
-        self.api_key = config.TOOBIT_API_KEY
-        self.api_secret = config.TOOBIT_API_SECRET
+        # هماهنگ با .env فعلی سرور شما:
+        # TOOBIT_API_KEY=...
+        # TOOBIT_SECRET_KEY=...
+        # اگر در آینده نام استاندارد TOOBIT_API_SECRET هم گذاشته شد، همان هم پشتیبانی می‌شود.
+        self.api_key = (
+            getattr(config, "TOOBIT_API_KEY", "")
+            or os.getenv("TOOBIT_API_KEY", "")
+        ).strip()
+        self.api_secret = (
+            getattr(config, "TOOBIT_API_SECRET", "")
+            or getattr(config, "TOOBIT_SECRET_KEY", "")
+            or os.getenv("TOOBIT_API_SECRET", "")
+            or os.getenv("TOOBIT_SECRET_KEY", "")
+        ).strip()
         self.session = requests.Session()
 
         self.path_exchange_info = config.TOOBIT_SPOT_PATH_EXCHANGE_INFO
@@ -64,7 +77,7 @@ class ToobitClient:
         headers: dict[str, str] = {}
         if signed:
             if not self.has_credentials:
-                raise ToobitError("کلید API توبیت تنظیم نشده است")
+                raise ToobitError("کلید API توبیت تنظیم نشده است؛ TOOBIT_API_KEY و TOOBIT_SECRET_KEY را در .env چک کن")
             params.setdefault("timestamp", int(time.time() * 1000))
             params.setdefault("recvWindow", config.RECV_WINDOW)
             params["signature"] = self._sign(params)
