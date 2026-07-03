@@ -1,158 +1,140 @@
-"""اندیکاتورها و ابزارهای تحلیل کندل."""
 from __future__ import annotations
 
-from typing import Any
+from dataclasses import dataclass
 
-import numpy as np
-import pandas as pd
-
-
-def candles_to_df(candles: list[list[Any]]) -> pd.DataFrame:
-    """کندل‌های OKX را به DataFrame مرتب‌شده از قدیم به جدید تبدیل می‌کند."""
-    rows = []
-    for c in candles:
-        if len(c) < 6:
-            continue
-        rows.append({
-            "ts": int(float(c[0])),
-            "open": float(c[1]),
-            "high": float(c[2]),
-            "low": float(c[3]),
-            "close": float(c[4]),
-            "volume": float(c[5]),
-        })
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-    return df.sort_values("ts").reset_index(drop=True)
+from okx_data import Candle
 
 
-def ema(series: pd.Series, length: int) -> pd.Series:
-    return series.ewm(span=length, adjust=False).mean()
+@dataclass(frozen=True)
+class IndicatorSnapshot:
+    close: float
+    ema20: float
+    ema50: float
+    ema200: float
+    vwap: float
+    rsi14: float
+    adx14: float
+    di_plus: float
+    di_minus: float
+    atr14: float
+    atr_pct: float
+    volume_ratio: float
+    swing_high: float
+    swing_low: float
+    dist_vwap_pct: float
+    dist_ema20_pct: float
+    dist_ema50_pct: float
+    dist_ema200_pct: float
 
 
-def rsi(series: pd.Series, length: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1 / length, min_periods=length, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / length, min_periods=length, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
-
-
-def macd(series: pd.Series) -> tuple[pd.Series, pd.Series, pd.Series]:
-    fast = ema(series, 12)
-    slow = ema(series, 26)
-    line = fast - slow
-    signal = ema(line, 9)
-    hist = line - signal
-    return line, signal, hist
-
-
-def atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
-    high = df["high"]
-    low = df["low"]
-    close = df["close"]
-    prev_close = close.shift(1)
-    tr = pd.concat([
-        high - low,
-        (high - prev_close).abs(),
-        (low - prev_close).abs(),
-    ], axis=1).max(axis=1)
-    return tr.ewm(alpha=1 / length, min_periods=length, adjust=False).mean()
-
-
-def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-    out = df.copy()
-    out["ema20"] = ema(out["close"], 20)
-    out["ema50"] = ema(out["close"], 50)
-    out["ema100"] = ema(out["close"], 100)
-    out["rsi14"] = rsi(out["close"], 14)
-    line, signal, hist = macd(out["close"])
-    out["macd"] = line
-    out["macd_signal"] = signal
-    out["macd_hist"] = hist
-    out["vol_avg20"] = out["volume"].rolling(20).mean()
-    out["atr14"] = atr(out, 14)
+def ema(values: list[float], period: int) -> float:
+    if not values:
+        return 0.0
+    k = 2 / (period + 1)
+    out = values[0]
+    for value in values[1:]:
+        out = value * k + out * (1 - k)
     return out
 
 
-def last(df: pd.DataFrame) -> pd.Series:
-    return df.iloc[-1]
+def rsi(values: list[float], period: int = 14) -> float:
+    if len(values) <= period:
+        return 50.0
+    gains: list[float] = []
+    losses: list[float] = []
+    for i in range(1, len(values)):
+        change = values[i] - values[i - 1]
+        gains.append(max(change, 0.0))
+        losses.append(max(-change, 0.0))
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+    if avg_loss == 0:
+        return 100.0 if avg_gain > 0 else 50.0
+    rs = avg_gain / avg_loss
+    return 100 - 100 / (1 + rs)
 
 
-def pct_from_high(df: pd.DataFrame, lookback: int = 24) -> float:
-    if df.empty:
+def atr(candles: list[Candle], period: int = 14) -> float:
+    if len(candles) <= period:
         return 0.0
-    part = df.tail(lookback)
-    high = float(part["high"].max())
-    close = float(part.iloc[-1]["close"])
-    if high <= 0:
-        return 0.0
-    return (high - close) / high * 100.0
+    trs: list[float] = []
+    for i in range(1, len(candles)):
+        c = candles[i]
+        prev = candles[i - 1]
+        trs.append(max(c.high - c.low, abs(c.high - prev.close), abs(c.low - prev.close)))
+    return sum(trs[-period:]) / period if trs else 0.0
 
 
-def pct_to_recent_high(df: pd.DataFrame, lookback: int = 60) -> float:
-    if df.empty:
-        return 0.0
-    part = df.tail(lookback)
-    high = float(part["high"].max())
-    close = float(part.iloc[-1]["close"])
-    if close <= 0:
-        return 0.0
-    return (high - close) / close * 100.0
+def adx_di(candles: list[Candle], period: int = 14) -> tuple[float, float, float]:
+    if len(candles) <= period + 2:
+        return 0.0, 0.0, 0.0
+    trs: list[float] = []
+    pdm: list[float] = []
+    ndm: list[float] = []
+    for i in range(1, len(candles)):
+        cur = candles[i]
+        prev = candles[i - 1]
+        up = cur.high - prev.high
+        down = prev.low - cur.low
+        pdm.append(up if up > down and up > 0 else 0.0)
+        ndm.append(down if down > up and down > 0 else 0.0)
+        trs.append(max(cur.high - cur.low, abs(cur.high - prev.close), abs(cur.low - prev.close)))
+    tr = sum(trs[-period:])
+    if tr <= 0:
+        return 0.0, 0.0, 0.0
+    di_plus = 100 * sum(pdm[-period:]) / tr
+    di_minus = 100 * sum(ndm[-period:]) / tr
+    dx_values: list[float] = []
+    start = max(period, len(trs) - period)
+    for end in range(start, len(trs) + 1):
+        tr_window = sum(trs[max(0, end - period):end])
+        if tr_window <= 0:
+            continue
+        p = 100 * sum(pdm[max(0, end - period):end]) / tr_window
+        n = 100 * sum(ndm[max(0, end - period):end]) / tr_window
+        den = p + n
+        dx_values.append(100 * abs(p - n) / den if den else 0.0)
+    adx = sum(dx_values[-period:]) / min(period, len(dx_values)) if dx_values else 0.0
+    return adx, di_plus, di_minus
 
 
-def last_n_change_pct(df: pd.DataFrame, n: int) -> float:
-    if len(df) <= n:
-        return 0.0
-    old = float(df.iloc[-n - 1]["close"])
-    new = float(df.iloc[-1]["close"])
-    if old <= 0:
-        return 0.0
-    return (new - old) / old * 100.0
-
-
-def bullish_candle(row: pd.Series) -> bool:
-    return float(row["close"]) > float(row["open"])
-
-
-def strong_bullish_candle(row: pd.Series) -> bool:
-    rng = float(row["high"] - row["low"])
-    if rng <= 0:
-        return False
-    body = float(row["close"] - row["open"])
-    return body > 0 and body / rng >= 0.55
-
-
-def volume_ratio(row: pd.Series) -> float:
-    avg = float(row.get("vol_avg20") or 0)
-    if avg <= 0:
-        return 1.0
-    return float(row.get("volume") or 0) / avg
-
-
-def above_emas(row: pd.Series) -> bool:
-    close = float(row["close"])
-    return close > float(row.get("ema20") or 0) and close > float(row.get("ema50") or 0)
-
-
-def ema_bullish(row: pd.Series) -> bool:
-    return float(row.get("ema20") or 0) > float(row.get("ema50") or 0)
-
-
-def near_ema_support(row: pd.Series, max_distance_pct: float = 1.8) -> bool:
-    close = float(row["close"])
-    if close <= 0:
-        return False
-    ema20 = float(row.get("ema20") or 0)
-    ema50 = float(row.get("ema50") or 0)
-    distances = []
-    if ema20 > 0:
-        distances.append(abs(close - ema20) / close * 100.0)
-    if ema50 > 0:
-        distances.append(abs(close - ema50) / close * 100.0)
-    return bool(distances) and min(distances) <= max_distance_pct
+def build_snapshot(candles: list[Candle]) -> IndicatorSnapshot:
+    if len(candles) < 205:
+        raise RuntimeError(f"کندل کافی برای اندیکاتور نیست: {len(candles)}")
+    closes = [c.close for c in candles]
+    close = closes[-1]
+    ema20 = ema(closes[-80:], 20)
+    ema50 = ema(closes[-120:], 50)
+    ema200 = ema(closes[-205:], 200)
+    recent = candles[-80:]
+    vol_sum = sum(c.volume for c in recent)
+    vwap = sum(((c.high + c.low + c.close) / 3) * c.volume for c in recent) / vol_sum if vol_sum > 0 else close
+    rsi14 = rsi(closes[-80:], 14)
+    atr14 = atr(candles[-80:], 14)
+    adx14, di_plus, di_minus = adx_di(candles[-80:], 14)
+    vols = [c.volume for c in candles[-25:]]
+    avg_vol = sum(vols[:-1]) / max(len(vols) - 1, 1)
+    volume_ratio = candles[-1].volume / avg_vol if avg_vol > 0 else 1.0
+    swings = candles[-30:]
+    swing_high = max(c.high for c in swings)
+    swing_low = min(c.low for c in swings)
+    return IndicatorSnapshot(
+        close=close,
+        ema20=ema20,
+        ema50=ema50,
+        ema200=ema200,
+        vwap=vwap,
+        rsi14=rsi14,
+        adx14=adx14,
+        di_plus=di_plus,
+        di_minus=di_minus,
+        atr14=atr14,
+        atr_pct=atr14 / close if close > 0 else 0.0,
+        volume_ratio=volume_ratio,
+        swing_high=swing_high,
+        swing_low=swing_low,
+        dist_vwap_pct=(close - vwap) / close if close else 0.0,
+        dist_ema20_pct=(close - ema20) / close if close else 0.0,
+        dist_ema50_pct=(close - ema50) / close if close else 0.0,
+        dist_ema200_pct=(close - ema200) / close if close else 0.0,
+    )

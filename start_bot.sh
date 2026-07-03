@@ -1,17 +1,29 @@
 #!/bin/bash
-set -e
-cd "$(dirname "$0")" || exit 1
+set -euo pipefail
 
-if [ -f .env ]; then
+PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$PROJECT_DIR" || exit 1
+
+if [ -f ".env" ]; then
   set -a
-  source .env
+  # shellcheck disable=SC1091
+  source ".env"
   set +a
 fi
 
-if [ -x "venv/bin/python" ]; then
-  exec "venv/bin/python" main.py
-elif [ -x "/root/venv/bin/python" ]; then
-  exec "/root/venv/bin/python" main.py
+export PYTHONUNBUFFERED=1
+
+if [ -x "$PROJECT_DIR/.venv/bin/python" ]; then
+  PYTHON="$PROJECT_DIR/.venv/bin/python"
+elif [ -x "$PROJECT_DIR/venv/bin/python" ]; then
+  PYTHON="$PROJECT_DIR/venv/bin/python"
 else
-  exec python3 main.py
+  PYTHON="$(command -v python3 || true)"
 fi
+
+if [ -z "${PYTHON:-}" ] || [ ! -x "$PYTHON" ]; then
+  echo "ERROR: python executable not found. Create venv or install python3." >&2
+  exit 1
+fi
+
+exec "$PYTHON" "$PROJECT_DIR/main.py"

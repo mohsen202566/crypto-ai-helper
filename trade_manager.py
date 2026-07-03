@@ -1,163 +1,118 @@
-"""مدیر اصلی سیگنال‌ها و معاملات.
-
-قانون طلایی:
-- real  => فقط Toobit
-- normal => فقط OKX
-"""
 from __future__ import annotations
 
 import asyncio
-from typing import Awaitable, Callable
+import time
+from dataclasses import dataclass
 
 import config
-from messages_fa import (
-    format_buy_confirm,
-    format_normal_result,
-    format_real_open_failed_to_normal,
-    format_real_result,
-    format_signal,
-)
-from models import Signal
-from okx_client import OkxClient
-from order_manager import OrderManager
-from storage import JsonStorage
-from utils import estimate_round_trip_fee, logger, net_profit_estimate, pct_change
+from ai_brain import SignalDecision
+from learning_engine import LearningEngine
+from storage import Storage
+from symbols import MarketSymbol
+from toobit_client import ToobitClient
+from utils import logger
 
-SendMessage = Callable[[str], Awaitable[int | None]]
-SendReply = Callable[[int | None, str], Awaitable[int | None]]
+
+@dataclass(frozen=True)
+class CreatedSignal:
+    signal_id: int
+    signal_type: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class PanelData:
+    auto_signals_enabled: bool
+    trade_enabled: bool
+    trade_usdt: float
+    max_positions: int
+    filled_slots: int
+    empty_slots: int
+    today_pnl: float
+    total_pnl: float
+    today_stats: dict
+    all_stats: dict
+    wallet_usdt: float | None
+    open_orders: int | None
+    exchange_error: str | None
+    ai_confidence: float
 
 
 class TradeManager:
-    def __init__(self, storage: JsonStorage, okx: OkxClient, order_manager: OrderManager):
+    def __init__(self, storage: Storage, toobit: ToobitClient) -> None:
         self.storage = storage
-        self.okx = okx
-        self.order_manager = order_manager
-        self._normal_lock = asyncio.Lock()
-        self._real_lock = asyncio.Lock()
+        self.toobit = toobit
+        self.learning = LearningEngine(storage)
+        self._panel_cache_time = 0.0
+        self._panel_cache: tuple[float | None, int | None, str | None] | None = None
 
-    def refresh_settings(self) -> None:
-        self.order_manager.update_settings(self.storage.settings)
+    async def create_signal(self, symbol: MarketSymbol, decision: SignalDecision) -> tuple[SignalDecision, CreatedSignal] | None:
+        if not decision.accepted:
+            self.storage.record_no_signal(symbol.name, decision.reason, decision.features_key)
+            return None
+        if self.storage.active_symbol_exists(symbol.toobit_symbol):
+            self.storage.record_no_signal(symbol.name, "برای این ارز سیگنال فعال وجود دارد.", decision.features_key)
+            return None
+        signal_type = "normal"
+        reason = "ترید خاموش یا اسلات پر است؛ سیگنال عادی برای یادگیری ثبت شد."
+        if self.storage.trade_enabled() and self.storage.active_real_count() < self.storage.max_positions() and decision.real_allowed:
+            signal_type = "real"
+            reason = "ترید واقعی اسپات مجاز شد؛ خرید Market و فروش Limit هدف انجام می‌شود."
+        signal_id = self.storage.add_signal(decision, signal_type=signal_type)
+        created = CreatedSignal(signal_id=signal_id, signal_type=signal_type, reason=reason)
+        if signal_type == "real":
+            asyncio.create_task(self._open_real_spot(signal_id, symbol, decision))
+        return decision, created
 
-    async def handle_new_signal(self, signal: Signal, send_message: SendMessage, send_reply: SendReply) -> None:
-        self.refresh_settings()
-        if self.storage.has_active_symbol(signal.base_symbol):
-            logger.info("سیگنال %s رد شد چون از این ارز سیگنال باز داریم", signal.base_symbol)
-            return
-
-        settings = self.storage.settings
-        can_real = settings.trading_enabled and self.storage.free_real_slots() > 0
-        if can_real:
-            signal.execution_mode = config.MODE_REAL
-            signal.status = config.STATUS_PENDING_BUY
-        else:
-            signal.execution_mode = config.MODE_NORMAL
-            signal.status = config.STATUS_NORMAL_OPEN
-
-        msg_id = await send_message(format_signal(signal, settings))
-        signal.telegram_message_id = msg_id
-        self.storage.add_signal(signal)
-
-        if signal.execution_mode == config.MODE_NORMAL:
-            return
-
-        # اجرای واقعی Toobit؛ اگر نشد، تبدیل به عادی OKX می‌شود.
-        result = await self.order_manager.open_real_spot_position(signal)
-        fresh = self.storage.get_signal(signal.id)
-        if not fresh:
-            return
-
-        if not result.opened:
-            fresh.execution_mode = config.MODE_NORMAL
-            fresh.status = config.STATUS_NORMAL_OPEN
-            fresh.raw.update({"real_open_failed": result.raw, "real_open_failed_reason": result.reason})
-            self.storage.update_signal(fresh)
-            await send_reply(fresh.telegram_message_id, format_real_open_failed_to_normal(fresh, result.reason))
-            return
-
-        fresh.status = config.STATUS_REAL_OPEN
-        fresh.buy_order_id = result.buy_order_id
-        fresh.sell_order_id = result.sell_order_id
-        fresh.avg_buy_price = result.avg_buy_price
-        fresh.entry_price = result.avg_buy_price or fresh.entry_price
-        fresh.target_price = result.target_price or fresh.target_price
-        fresh.filled_qty = result.filled_qty
-        fresh.buy_fee_usdt = result.buy_fee_usdt
-        fresh.raw.update({"real_open": result.raw})
-        self.storage.update_signal(fresh)
-        await send_reply(fresh.telegram_message_id, format_buy_confirm(fresh))
-
-    async def monitor_normal_signals(self, send_reply: SendReply) -> None:
-        async with self._normal_lock:
-            signals = self.storage.normal_open_signals()
-            if not signals:
+    async def _open_real_spot(self, signal_id: int, symbol: MarketSymbol, decision: SignalDecision) -> None:
+        trade_usdt = self.storage.trade_usdt()
+        buy_client_id = f"spot_buy_{signal_id}_{int(time.time())}"
+        sell_client_id = f"spot_sell_{signal_id}_{int(time.time())}"
+        try:
+            buy = await asyncio.to_thread(self.toobit.place_spot_market_buy, symbol.toobit_symbol, trade_usdt, buy_client_id)
+            buy_order_id = buy.get("order_id")
+            self.storage.mark_buy_order(signal_id, buy_order_id, "market buy submitted")
+            fill = await asyncio.to_thread(self.toobit.wait_spot_order_fill, symbol.toobit_symbol, buy_order_id, config.BUY_FILL_VERIFY_SECONDS, 5)
+            if not fill:
+                self.storage.fail_signal(signal_id, "خرید در زمان تعیین‌شده پر نشد.")
                 return
-            settings = self.storage.settings
-            for sig in signals:
-                try:
-                    price = await asyncio.to_thread(self.okx.get_ticker_price, sig.base_symbol)
-                    if price <= 0:
-                        continue
-                    move = pct_change(sig.entry_price, price)
-                    if move + 1e-9 < sig.target_percent:
-                        continue
-
-                    gross = sig.amount_usdt * move / 100.0
-                    fee = estimate_round_trip_fee(
-                        sig.amount_usdt,
-                        move,
-                        settings.taker_fee_pct,
-                        settings.maker_fee_pct,
-                    )
-                    net = gross - fee
-                    closed = self.storage.close_signal(
-                        sig.id,
-                        close_price=price,
-                        move_percent=move,
-                        gross_profit_usdt=gross,
-                        fee_usdt=fee,
-                        net_profit_usdt=net,
-                        close_reason="قیمت OKX به درصد حرکت هدف رسید",
-                        raw={"okx_close_price": price},
-                    )
-                    if closed:
-                        await send_reply(closed.telegram_message_id, format_normal_result(closed))
-                except Exception as exc:
-                    logger.warning("مانیتور سیگنال عادی %s ناموفق بود: %s", sig.base_symbol, exc)
-
-    async def monitor_real_orders(self, send_reply: SendReply) -> None:
-        async with self._real_lock:
-            signals = self.storage.real_open_signals()
-            if not signals:
+            parsed = self.toobit.parse_order_fill(fill, fallback_fee_pct=config.SPOT_TAKER_FEE_RATE * 100)
+            qty = float(parsed.get("qty") or buy.get("estimated_quantity") or 0.0)
+            entry = float(parsed.get("avg_price") or buy.get("estimated_price") or decision.entry)
+            fee = float(parsed.get("fee_usdt") or 0.0)
+            if qty <= 0 or entry <= 0:
+                self.storage.fail_signal(signal_id, "جزئیات خرید پرشده قابل خواندن نیست.")
                 return
-            for sig in signals:
-                try:
-                    result = await self.order_manager.check_real_close(sig)
-                    if not result.closed:
-                        continue
-                    closed = self.storage.close_signal(
-                        sig.id,
-                        close_price=result.close_price or 0.0,
-                        move_percent=result.move_percent,
-                        gross_profit_usdt=result.gross_profit_usdt,
-                        fee_usdt=result.fee_usdt,
-                        net_profit_usdt=result.net_profit_usdt,
-                        close_reason=result.reason,
-                        raw={"real_close": result.raw},
-                    )
-                    if closed:
-                        closed.sell_fee_usdt = result.sell_fee_usdt
-                        self.storage.update_signal(closed)
-                        await send_reply(closed.telegram_message_id, format_real_result(closed))
-                except Exception as exc:
-                    logger.warning("چک پوزیشن واقعی %s ناموفق بود: %s", sig.base_symbol, exc)
+            self.storage.mark_buy_filled(signal_id, quantity=qty, entry_price=entry, fee_usdt=fee)
+            sell = await asyncio.to_thread(self.toobit.place_spot_limit_sell, symbol.toobit_symbol, qty, decision.target, sell_client_id)
+            self.storage.mark_sell_order(signal_id, sell.get("order_id"), float(sell.get("price") or decision.target))
+        except Exception as exc:
+            logger.exception("real spot open failed %s", symbol.name)
+            self.storage.fail_signal(signal_id, f"خطا در اجرای اسپات Toobit: {exc}")
 
-    async def normal_monitor_loop(self, send_reply: SendReply) -> None:
-        while True:
-            await self.monitor_normal_signals(send_reply)
-            await asyncio.sleep(config.NORMAL_MONITOR_INTERVAL_SECONDS)
+    async def panel_data(self) -> PanelData:
+        wallet, orders, error = await self._cached_exchange_data()
+        today = self.storage.today_stats()
+        all_stats = self.storage.all_stats()
+        ai = self.storage.ai_summary()
+        max_pos = self.storage.max_positions()
+        filled = self.storage.active_real_count()
+        return PanelData(auto_signals_enabled=self.storage.auto_signals_enabled(), trade_enabled=self.storage.trade_enabled(), trade_usdt=self.storage.trade_usdt(), max_positions=max_pos, filled_slots=filled, empty_slots=max(0, max_pos - filled), today_pnl=float(today.get("pnl", 0.0)), total_pnl=float(all_stats.get("pnl", 0.0)), today_stats=today, all_stats=all_stats, wallet_usdt=wallet, open_orders=orders, exchange_error=error, ai_confidence=float(ai.get("confidence") or 0.0))
 
-    async def real_history_loop(self, send_reply: SendReply) -> None:
-        while True:
-            minutes = max(config.MIN_HISTORY_CHECK_MINUTES, int(self.storage.settings.history_check_minutes))
-            await self.monitor_real_orders(send_reply)
-            await asyncio.sleep(minutes * 60)
+    async def _cached_exchange_data(self) -> tuple[float | None, int | None, str | None]:
+        now = time.monotonic()
+        if self._panel_cache and now - self._panel_cache_time <= config.PANEL_CACHE_SECONDS:
+            return self._panel_cache
+        wallet = None
+        orders = None
+        error = None
+        try:
+            bal = await asyncio.to_thread(self.toobit.get_spot_usdt_balance)
+            wallet = float(bal.get("free", 0.0))
+            open_orders = await asyncio.to_thread(self.toobit.get_spot_open_orders)
+            orders = len(open_orders)
+        except Exception as exc:
+            error = str(exc)
+        self._panel_cache = (wallet, orders, error)
+        self._panel_cache_time = now
+        return self._panel_cache

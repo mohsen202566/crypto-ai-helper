@@ -1,228 +1,211 @@
-"""ربات تلگرام متنی، بدون دکمه."""
 from __future__ import annotations
 
-import asyncio
-import re
-from typing import Callable
+from telegram import Message, Update
+from telegram.ext import ContextTypes
 
-from telegram import Update
-from telegram.ext import Application, ContextTypes, MessageHandler, filters
-
-import config
-from messages_fa import (
-    format_active_symbols,
-    format_balance,
-    format_command_error,
-    format_positions,
-    format_setting_ok,
-    format_stats,
-    format_status,
-    format_symbol_check,
-    format_trade_panel,
-)
-from okx_client import OkxClient
-from scanner import MarketScanner
-from storage import JsonStorage
-from toobit_client import ToobitClient
-from trade_manager import TradeManager
-from utils import logger, okx_inst_id, toobit_symbol
+from ai_brain import SignalDecision
+from config import BOT_NAME, OWNER_ID, TELEGRAM_CHAT_ID
+from storage import Storage, StoredSignal
+from trade_manager import CreatedSignal, TradeManager
+from utils import duration_text, money, normalize_digits, parse_float, parse_int, pct
 
 
-class TelegramBot:
-    def __init__(self, storage: JsonStorage, okx: OkxClient, toobit: ToobitClient, trade_manager: TradeManager, scanner: MarketScanner):
-        if not config.TELEGRAM_BOT_TOKEN:
-            raise RuntimeError("TELEGRAM_BOT_TOKEN تنظیم نشده است")
+class TelegramBotUI:
+    def __init__(self, storage: Storage, trade_manager: TradeManager) -> None:
         self.storage = storage
-        self.okx = okx
-        self.toobit = toobit
         self.trade_manager = trade_manager
-        self.scanner = scanner
-        self.app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
-        self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_text))
-        self.app.add_handler(MessageHandler(filters.COMMAND, self.on_text))
+        self.app = None
 
-    async def send_message(self, text: str) -> int | None:
-        if not config.TELEGRAM_CHAT_ID:
-            logger.warning("TELEGRAM_CHAT_ID تنظیم نشده است؛ پیام ارسال نشد")
-            return None
-        msg = await self.app.bot.send_message(chat_id=config.TELEGRAM_CHAT_ID, text=text)
-        return msg.message_id
+    def bind_app(self, app) -> None:
+        self.app = app
 
-    async def send_reply(self, reply_to_message_id: int | None, text: str) -> int | None:
-        if not config.TELEGRAM_CHAT_ID:
-            return None
-        msg = await self.app.bot.send_message(
-            chat_id=config.TELEGRAM_CHAT_ID,
-            text=text,
-            reply_to_message_id=reply_to_message_id,
-            allow_sending_without_reply=True,
-        )
-        return msg.message_id
-
-    async def on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         message = update.effective_message
-        if not message or not message.text:
+        if message is None or message.text is None:
             return
-        text = self._normalize(message.text)
+        if OWNER_ID and update.effective_user and int(update.effective_user.id) != OWNER_ID:
+            return
+        text = normalize_digits(message.text.strip())
+        low = text.lower()
         try:
-            answer = await self.handle_command(text)
+            if low in {"/start", "start", "پنل", "panel", "status", "ترید"}:
+                await message.reply_text(await self.panel_text())
+            elif low in {"آمار", "stats"}:
+                await message.reply_text(self.stats_text())
+            elif low in {"هوش", "هوش مصنوعی", "ai"}:
+                await message.reply_text(self.ai_text())
+            elif low in {"اسکن", "scan"}:
+                await message.reply_text(self.scan_text())
+            elif low in {"ردها", "دلایل رد", "rejects"}:
+                await message.reply_text(self.rejections_text())
+            elif low in {"ترید روشن", "trade on"}:
+                self.storage.set_trade_enabled(True)
+                await message.reply_text("ترید واقعی اسپات روشن شد.")
+            elif low in {"ترید خاموش", "trade off"}:
+                self.storage.set_trade_enabled(False)
+                await message.reply_text("ترید واقعی اسپات خاموش شد؛ سیگنال‌های عادی برای یادگیری ادامه دارند.")
+            elif low in {"اتو سیگنال روشن", "اتوسیگنال روشن", "سیگنال روشن", "auto signal on"}:
+                self.storage.set_auto_signals_enabled(True)
+                await message.reply_text("اتوسیگنال روشن شد.")
+            elif low in {"اتو سیگنال خاموش", "اتوسیگنال خاموش", "سیگنال خاموش", "auto signal off"}:
+                self.storage.set_auto_signals_enabled(False)
+                await message.reply_text("اتوسیگنال خاموش شد؛ پوزیشن‌های باز همچنان مانیتور می‌شوند.")
+            elif low.startswith("ترید دلار") or low.startswith("trade dollar"):
+                value = parse_float(text)
+                self.storage.set_trade_usdt(value)
+                await message.reply_text(f"دلار هر پوزیشن اسپات تنظیم شد: {value:.2f} USDT")
+            elif low.startswith("حداکثر پوزیشن") or low.startswith("max"):
+                value = parse_int(text)
+                self.storage.set_max_positions(value)
+                await message.reply_text(f"حداکثر پوزیشن همزمان تنظیم شد: {value}")
+            elif low == "حذف آمار تایید":
+                self.storage.reset_stats()
+                await message.reply_text("آمار و یادگیری پاک شد.")
+            elif low == "حذف آمار":
+                await message.reply_text("برای تایید بنویس: حذف آمار تایید")
+            else:
+                await message.reply_text(self.help_text())
         except Exception as exc:
-            logger.exception("خطا در پردازش دستور: %s", exc)
-            answer = format_command_error(f"خطا در اجرای دستور: {exc}")
-        await message.reply_text(answer)
+            await message.reply_text(f"خطا: {exc}")
 
-    @staticmethod
-    def _normalize(text: str) -> str:
-        return " ".join(text.replace("\u200c", " ").strip().split())
-
-    @staticmethod
-    def _number(text: str) -> float | None:
-        m = re.search(r"(-?\d+(?:\.\d+)?)", text)
-        if not m:
+    async def send_signal(self, *, decision: SignalDecision, created: CreatedSignal) -> int | None:
+        if self.app is None:
             return None
-        return float(m.group(1))
+        icon = "🟢"
+        text = (
+            f"{icon} سیگنال خرید SPOT\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"ارز: {decision.symbol_name}\n"
+            f"نوع: {created.signal_type.upper()}\n"
+            f"ورود: {decision.entry:.8f}\n"
+            f"هدف فروش: {decision.target:.8f} ({pct(decision.target_distance_pct)})\n"
+            f"سود تقریبی بعد کارمزد: {money(decision.estimated_net_profit_usdt)}\n"
+            f"زمان احتمالی باز بودن: {duration_text(decision.expected_hold_minutes * 60)}\n"
+            f"اعتماد AI: {decision.confidence}% | نمونه بازه: {decision.samples}\n"
+            f"بازار: {decision.market_state} | {decision.alignment}\n"
+            f"اندیکاتورها: {decision.indicator_profile}\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"دلیل AI: {decision.reason[:1200]}"
+        )
+        msg: Message = await self.app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
+        self.storage.update_message_id(created.signal_id, msg.message_id)
+        return msg.message_id
 
-    async def handle_command(self, text: str) -> str:
-        lower = text.lower()
+    async def send_result(self, signal: StoredSignal, status: str, exit_price: float, approx_pnl: float, real_pnl: float | None, result_source: str) -> int | None:
+        if self.app is None:
+            return None
+        icon = "✅" if status == "TARGET" else "❌"
+        pnl_text = money(real_pnl if real_pnl is not None else approx_pnl)
+        text = (
+            f"{icon} نتیجه سیگنال SPOT\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"ارز: {signal.symbol_name}\n"
+            f"نوع: {signal.signal_type.upper()} / {result_source}\n"
+            f"ورود: {signal.entry_price:.8f}\n"
+            f"خروج/فروش: {exit_price:.8f}\n"
+            f"هدف: {signal.target_price:.8f}\n"
+            f"سود واقعی/نهایی: {pnl_text}\n"
+            f"MFE: {pct(signal.mfe_pct)} | MAE: {pct(signal.mae_pct)}\n"
+            f"وضعیت: {'هدف رسید' if status == 'TARGET' else 'ناموفق'}\n"
+            f"یادگیری: نتیجه وارد حافظه AI شد."
+        )
+        msg = await self.app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, reply_to_message_id=signal.message_id)
+        return msg.message_id
 
-        if lower in {"/trade_on", "ترید فعال", "روشن کردن ترید"}:
-            self.storage.update_settings(trading_enabled=True)
-            return format_setting_ok("ترید واقعی Spot روشن شد.")
+    async def send_warning(self, signal: StoredSignal, current_price: float, reason: str) -> int | None:
+        if self.app is None:
+            return None
+        distance = (signal.target_price - current_price) / current_price if current_price > 0 else 0.0
+        text = (
+            f"⚠️ هشدار سیگنال فعال SPOT\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"ارز: {signal.symbol_name}\n"
+            f"نوع: {signal.signal_type.upper()}\n"
+            f"ورود: {signal.entry_price:.8f}\n"
+            f"قیمت فعلی: {current_price:.8f}\n"
+            f"هدف فروش: {signal.target_price:.8f}\n"
+            f"فاصله تا هدف: {pct(distance)}\n"
+            f"سود احتمالی: {money(signal.estimated_net_profit_usdt)}\n"
+            f"دلیل هشدار: {reason}\n"
+            f"اقدام: فروش اجباری انجام نمی‌شود؛ هشدار برای اطلاع و یادگیری ثبت شد."
+        )
+        msg = await self.app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, reply_to_message_id=signal.message_id)
+        return msg.message_id
 
-        if lower in {"/trade_off", "ترید خاموش", "خاموش کردن ترید"}:
-            self.storage.update_settings(trading_enabled=False)
-            return format_setting_ok("ترید واقعی Spot خاموش شد. سیگنال‌ها همچنان عادی با OKX دنبال می‌شوند.")
+    async def panel_text(self) -> str:
+        data = await self.trade_manager.panel_data()
+        auto_status = "روشن 🟢" if data.auto_signals_enabled else "خاموش 🔴"
+        real_status = "روشن 🟢" if data.trade_enabled else "خاموش ⛔"
+        return (
+            f"⚙️ پنل ترید {BOT_NAME}\n"
+            f"وضعیت اتوسیگنال: {auto_status}\n"
+            f"وضعیت ترید واقعی اسپات: {real_status}\n"
+            f"دلار هر پوزیشن: {data.trade_usdt:.2f} USDT\n"
+            f"حداکثر پوزیشن: {data.max_positions}\n"
+            f"اسلات: {data.filled_slots}/{data.max_positions} | خالی {data.empty_slots}\n"
+            f"موجودی USDT توبیت: {money(data.wallet_usdt)}\n"
+            f"سفارش‌های باز توبیت: {data.open_orders if data.open_orders is not None else '-'}\n"
+            f"سود امروز: {money(data.today_pnl)}\n"
+            f"سود کلی: {money(data.total_pnl)}\n"
+            f"اعتماد AI: {data.ai_confidence:.1f}%\n"
+            f"TP امروز: {data.today_stats.get('target', 0)} | WinRate {data.today_stats.get('win_rate', 0):.1f}%\n\n"
+            f"دستورات: ترید روشن/خاموش | اتو سیگنال روشن/خاموش | ترید دلار 10 | حداکثر پوزیشن 5 | آمار | هوش | اسکن | ردها"
+        )
 
-        if lower in {"ترید", "پنل ترید"}:
-            balance = None
-            if self.toobit.has_credentials:
-                try:
-                    balance = await asyncio.to_thread(self.toobit.get_spot_usdt_balance)
-                except Exception as exc:
-                    logger.warning("خواندن موجودی ناموفق بود: %s", exc)
-            return format_trade_panel(
-                self.storage.settings,
-                self.storage.stats,
-                balance,
-                len(self.storage.real_open_signals()),
-                len(self.storage.normal_open_signals()),
-                self.scanner.active_symbols(),
-            )
+    def stats_text(self) -> str:
+        stats = self.storage.all_stats()
+        return (
+            f"📊 آمار کل\n"
+            f"کل سیگنال‌ها: {stats['total']}\n"
+            f"باز: {stats['open']} | بسته: {stats['closed']} | ناموفق: {stats['failed']}\n"
+            f"Real: {stats['real']} | Normal: {stats['normal']}\n"
+            f"هدف‌های رسیده: {stats['target']}\n"
+            f"WinRate: {stats['win_rate']:.1f}%\n"
+            f"سود/ضرر کل: {money(stats['pnl'])}"
+        )
 
-        if lower.startswith("ترید دلار") or lower.startswith("تنظیم ترید دلار"):
-            value = self._number(lower)
-            if value is None or not (config.MIN_TRADE_AMOUNT_USDT <= value <= config.MAX_TRADE_AMOUNT_USDT):
-                return format_command_error(f"ترید دلار باید بین {config.MIN_TRADE_AMOUNT_USDT:g} تا {config.MAX_TRADE_AMOUNT_USDT:g} باشد.")
-            self.storage.update_settings(trade_amount_usdt=float(value))
-            return format_setting_ok(f"پول هر معامله روی {value:g} USDT تنظیم شد.")
+    def ai_text(self) -> str:
+        data = self.storage.ai_summary()
+        best = data.get("best") or {}
+        worst = data.get("worst") or {}
+        suggestions = data.get("suggestions", [])
+        requests = data.get("requests", [])
+        warnings = data.get("warnings", [])
+        sug = "\n".join(f"- {x['message']}" for x in suggestions) or "فعلاً پیشنهادی نیست."
+        req = "\n".join(f"- {x['reason']}" for x in requests) or "فعلاً درخواست اندیکاتور نیست."
+        warn = "\n".join(f"- {x['reason']}" for x in warnings) or "هشدار فعالی نیست."
+        return (
+            f"🧠 پنل هوش AI\n"
+            f"اعتماد کلی AI: {data.get('confidence', 0):.1f}%\n"
+            f"نمونه‌های یادگیری: {data.get('total_samples', 0)}\n"
+            f"بهترین ارز: {best.get('symbol_name', '-')} | WR {best.get('win_rate', 0):.1f}% | Net {best.get('net_profit', 0):.4f}\n"
+            f"بدترین ارز: {worst.get('symbol_name', '-')} | WR {worst.get('win_rate', 0):.1f}% | Net {worst.get('net_profit', 0):.4f}\n"
+            f"پیشنهاد دلار/ریسک:\n{sug}\n"
+            f"هشدارهای فعال:\n{warn}\n"
+            f"درخواست اندیکاتور:\n{req}"
+        )
 
-        if lower.startswith("حداکثر پوزیشن") or lower.startswith("تنظیم حداکثر پوزیشن"):
-            value = self._number(lower)
-            if value is None or not (config.MIN_MAX_POSITIONS <= int(value) <= config.MAX_MAX_POSITIONS):
-                return format_command_error(f"حداکثر پوزیشن باید بین {config.MIN_MAX_POSITIONS} تا {config.MAX_MAX_POSITIONS} باشد.")
-            self.storage.update_settings(max_real_positions=int(value))
-            return format_setting_ok(f"حداکثر پوزیشن واقعی روی {int(value)} تنظیم شد.")
+    def scan_text(self) -> str:
+        info = self.storage.scan_info()
+        return (
+            f"📡 وضعیت اسکن\n"
+            f"آخرین اسکن: {info.get('time', '-')}\n"
+            f"اتوسیگنال: {'روشن' if self.storage.auto_signals_enabled() else 'خاموش'}\n"
+            f"بررسی‌شده: {info.get('checked', 0)}\n"
+            f"سیگنال ساخته‌شده: {info.get('created', 0)}\n"
+            f"رد شده: {info.get('rejected', 0)}\n"
+            f"خطا: {info.get('errors', 0)}"
+        )
 
-        if lower.startswith("درصد حرکت") or lower.startswith("تنظیم درصد حرکت"):
-            value = self._number(lower)
-            if value is None or not (config.MIN_TARGET_PERCENT <= value <= config.MAX_TARGET_PERCENT):
-                return format_command_error(f"درصد حرکت باید بین {config.MIN_TARGET_PERCENT:g} تا {config.MAX_TARGET_PERCENT:g} باشد.")
-            self.storage.update_settings(target_percent=float(value))
-            return format_setting_ok(f"درصد حرکت هدف روی {value:g}٪ تنظیم شد.")
+    def rejections_text(self) -> str:
+        rows = self.storage.recent_rejections(12)
+        if not rows:
+            return "ردی ثبت نشده است."
+        lines = ["📋 آخرین دلایل رد"]
+        for row in rows:
+            lines.append(f"{row['symbol_name']}: {row['reason'][:160]}")
+        return "\n".join(lines)
 
-        if lower.startswith("تعداد ارز فعال") or lower.startswith("تنظیم تعداد ارز فعال"):
-            value = self._number(lower)
-            if value is None or not (config.MIN_ACTIVE_SYMBOL_COUNT <= int(value) <= config.MAX_ACTIVE_SYMBOL_COUNT):
-                return format_command_error(f"تعداد ارز فعال باید بین {config.MIN_ACTIVE_SYMBOL_COUNT} تا {config.MAX_ACTIVE_SYMBOL_COUNT} باشد.")
-            self.storage.update_settings(active_symbol_count=int(value))
-            return format_setting_ok(f"تعداد ارز فعال روی {int(value)} تنظیم شد.")
-
-        if lower.startswith("چک هیستوری") or lower.startswith("تنظیم چک هیستوری"):
-            value = self._number(lower)
-            if value is None or not (config.MIN_HISTORY_CHECK_MINUTES <= int(value) <= config.MAX_HISTORY_CHECK_MINUTES):
-                return format_command_error(f"چک هیستوری باید بین {config.MIN_HISTORY_CHECK_MINUTES} تا {config.MAX_HISTORY_CHECK_MINUTES} دقیقه باشد.")
-            self.storage.update_settings(history_check_minutes=int(value))
-            return format_setting_ok(f"چک Order History واقعی هر {int(value)} دقیقه انجام می‌شود.")
-
-        if lower.startswith("کارمزد میکر"):
-            value = self._number(lower)
-            if value is None or not (config.MIN_FEE_PCT <= value <= config.MAX_FEE_PCT):
-                return format_command_error(f"کارمزد میکر باید بین {config.MIN_FEE_PCT:g} تا {config.MAX_FEE_PCT:g} درصد باشد.")
-            self.storage.update_settings(maker_fee_pct=float(value))
-            return format_setting_ok(f"کارمزد Maker روی {value:g}٪ تنظیم شد.")
-
-        if lower.startswith("کارمزد تیکر"):
-            value = self._number(lower)
-            if value is None or not (config.MIN_FEE_PCT <= value <= config.MAX_FEE_PCT):
-                return format_command_error(f"کارمزد تیکر باید بین {config.MIN_FEE_PCT:g} تا {config.MAX_FEE_PCT:g} درصد باشد.")
-            self.storage.update_settings(taker_fee_pct=float(value))
-            return format_setting_ok(f"کارمزد Taker روی {value:g}٪ تنظیم شد.")
-
-        if lower in {"آمار", "/stats"}:
-            return format_stats(self.storage.stats)
-
-        if lower == "موجودی":
-            if not self.toobit.has_credentials:
-                return format_command_error("کلید API توبیت تنظیم نشده است.")
-            balance = await asyncio.to_thread(self.toobit.get_spot_usdt_balance)
-            return format_balance(balance)
-
-        if lower == "وضعیت":
-            okx_ok = True
-            toobit_ok = self.toobit.has_credentials
-            return format_status(self.storage.settings, okx_ok, toobit_ok, len(self.storage.real_open_signals()), len(self.storage.normal_open_signals()))
-
-
-        if lower in {"چک نمادها", "بررسی نمادها", "چک ارزها"}:
-            rows = []
-            for base in self.scanner.active_symbols():
-                row = {"base": base, "okx_symbol": okx_inst_id(base), "toobit_symbol": toobit_symbol(base)}
-                okx_ok, okx_msg = await asyncio.to_thread(self.okx.validate_symbol, base)
-                row["okx_ok"] = okx_ok
-                if okx_ok:
-                    row["okx_symbol"] = okx_msg
-                else:
-                    row["okx_error"] = okx_msg
-                try:
-                    tb_symbol, _ = await asyncio.to_thread(self.toobit.validate_spot_symbol, toobit_symbol(base))
-                    row["toobit_ok"] = True
-                    row["toobit_symbol"] = tb_symbol
-                except Exception as exc:
-                    row["toobit_ok"] = False
-                    row["toobit_error"] = str(exc)
-                rows.append(row)
-            return format_symbol_check(rows)
-
-        if lower == "ارزهای فعال":
-            busy = {s.base_symbol for s in self.storage.open_signals()}
-            return format_active_symbols(self.scanner.active_symbols(), busy)
-
-        if lower in {"پوزیشن ها", "پوزیشن های باز"}:
-            return format_positions("📌 پوزیشن‌ها و سیگنال‌های باز", self.storage.open_signals())
-
-        if lower == "پوزیشن های بسته":
-            return format_positions("✅ پوزیشن‌ها و سیگنال‌های بسته‌شده", self.storage.closed_signals())
-
-        if lower == "سیگنال های عادی":
-            return format_positions("📘 سیگنال‌های عادی OKX", self.storage.normal_open_signals())
-
-        if lower == "پوزیشن های واقعی":
-            return format_positions("📗 پوزیشن‌های واقعی Toobit", self.storage.real_open_signals())
-
-        if lower == "ریست آمار":
-            self.storage.reset_stats()
-            return format_setting_ok("آمار صفر شد، ولی سیگنال‌ها و تنظیمات باقی ماندند.")
-
-        if lower == "حذف آمار":
-            self.storage.delete_history()
-            return format_setting_ok("آمار و تاریخچه سیگنال‌ها حذف شد.")
-
-        return format_command_error("دستور شناخته نشد. برای دیدن پنل بنویس: ترید")
-
-    async def run(self) -> None:
-        await self.app.initialize()
-        await self.app.start()
-        if self.app.updater:
-            await self.app.updater.start_polling(drop_pending_updates=True)
-        logger.info("ربات تلگرام Spot Hunter شروع شد")
-        await asyncio.Event().wait()
+    @staticmethod
+    def help_text() -> str:
+        return "دستورات: ترید، آمار، هوش، اسکن، ردها، اتو سیگنال روشن/خاموش، ترید روشن/خاموش، ترید دلار 10، حداکثر پوزیشن 5، حذف آمار"
