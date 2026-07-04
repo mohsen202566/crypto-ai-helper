@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from config import DEFAULT_LEVERAGE, DEFAULT_MARGIN_USDT, DEFAULT_MAX_POSITIONS, DEFAULT_TRADE_ENABLED, LEVERAGE_MAX, LEVERAGE_MIN, MARGIN_MAX_USDT, MARGIN_MIN_USDT, MAX_POSITIONS_MAX, MAX_POSITIONS_MIN, DB_PATH
-from utils import direction_profit_pct, json_safe, now_utc
+from utils import direction_profit_pct, json_safe, now_utc, round_trip_fee_usdt
 from guard_utils import half_hour_bucket, session_info, signal_time, weekday_key
 
 
@@ -118,6 +118,18 @@ class Storage:
             conn.execute("CREATE TABLE IF NOT EXISTS guard_alerts(alert_key TEXT PRIMARY KEY, guard_type TEXT, title TEXT, created_at TEXT NOT NULL)")
             conn.execute("CREATE TABLE IF NOT EXISTS guard_events(id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, guard_type TEXT, severity TEXT, reason TEXT, action TEXT, payload TEXT)")
             conn.execute("CREATE TABLE IF NOT EXISTS time_risk_profiles(profile_key TEXT PRIMARY KEY, scope TEXT, symbol_name TEXT, direction TEXT, session_name TEXT, hour_bucket TEXT, weekday TEXT, samples INTEGER DEFAULT 0, tp INTEGER DEFAULT 0, sl INTEGER DEFAULT 0, max_consecutive_sl INTEGER DEFAULT 0, risk_score INTEGER DEFAULT 0, main_cause TEXT, action TEXT DEFAULT 'ALLOW', last_updated TEXT)")
+            conn.execute("CREATE TABLE IF NOT EXISTS adaptive_fix_profiles(profile_key TEXT PRIMARY KEY, scope TEXT, symbol_name TEXT, direction TEXT, market_state TEXT, alignment TEXT, session_name TEXT, hour_bucket TEXT, weekday TEXT, samples INTEGER DEFAULT 0, tp INTEGER DEFAULT 0, sl INTEGER DEFAULT 0, total_net_profit REAL DEFAULT 0, avg_mfe_pct REAL DEFAULT 0, avg_mae_pct REAL DEFAULT 0, avg_tp_distance_pct REAL DEFAULT 0, avg_sl_distance_pct REAL DEFAULT 0, risk_score INTEGER DEFAULT 0, last_cause TEXT, recommended_action TEXT DEFAULT 'ALLOW', recommended_tp_pct REAL DEFAULT 0, recommended_sl_pct REAL DEFAULT 0, last_updated TEXT)")
+            # V3 forensic learning: complete stop cases and treatment testing. Existing DBs are migrated with ALTER below.
+            conn.execute("CREATE TABLE IF NOT EXISTS signal_forensic_snapshots(id INTEGER PRIMARY KEY AUTOINCREMENT, signal_id INTEGER UNIQUE, created_at TEXT NOT NULL, symbol_name TEXT, direction TEXT, session_name TEXT, hour_bucket TEXT, weekday TEXT, is_session_open INTEGER DEFAULT 0, near_news INTEGER DEFAULT 0, entry REAL, tp REAL, sl REAL, risk_reward REAL, fee_usdt REAL DEFAULT 0, expected_net_profit REAL DEFAULT 0, market_state TEXT, alignment TEXT, indicator_profile TEXT, features_key TEXT, payload TEXT)")
+            conn.execute("CREATE TABLE IF NOT EXISTS loss_cases(id INTEGER PRIMARY KEY AUTOINCREMENT, signal_id INTEGER UNIQUE, created_at TEXT NOT NULL, symbol_name TEXT, direction TEXT, primary_cause TEXT, secondary_causes TEXT, cause_scores TEXT, fix_policy TEXT, action TEXT, treatment_level INTEGER DEFAULT 0, message TEXT, indicator_suggestion TEXT)")
+            conn.execute("CREATE TABLE IF NOT EXISTS treatment_tests(id INTEGER PRIMARY KEY AUTOINCREMENT, profile_key TEXT, signal_id INTEGER, created_at TEXT NOT NULL, result TEXT, net_profit REAL DEFAULT 0, treatment_level INTEGER DEFAULT 0, fix_policy TEXT, cause TEXT)")
+            self._ensure_column(conn, 'adaptive_fix_profiles', 'treatment_level', 'INTEGER DEFAULT 0')
+            self._ensure_column(conn, 'adaptive_fix_profiles', 'tests', 'INTEGER DEFAULT 0')
+            self._ensure_column(conn, 'adaptive_fix_profiles', 'successes', 'INTEGER DEFAULT 0')
+            self._ensure_column(conn, 'adaptive_fix_profiles', 'failures', 'INTEGER DEFAULT 0')
+            self._ensure_column(conn, 'adaptive_fix_profiles', 'consecutive_failures', 'INTEGER DEFAULT 0')
+            self._ensure_column(conn, 'adaptive_fix_profiles', 'fix_policy', 'TEXT')
+            self._ensure_column(conn, 'adaptive_fix_profiles', 'last_message', 'TEXT')
             self._set_default(conn, "guard_cooldown_until", "")
             self._set_default(conn, "guard_cooldown_reason", "")
             self._set_default(conn, "trade_enabled", "1" if DEFAULT_TRADE_ENABLED else "0")
@@ -128,6 +140,12 @@ class Storage:
 
     def _set_default(self, conn: sqlite3.Connection, key: str, value: str) -> None:
         conn.execute("INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)", (key, value))
+
+    def _ensure_column(self, conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+        cols = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if column not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
 
     def _get_setting(self, key: str, default: str) -> str:
         with self._connect() as conn:
@@ -181,7 +199,22 @@ class Storage:
                 INSERT INTO signals(created_at, okx_symbol, toobit_symbol, symbol_name, direction, entry, tp, sl, signal_type, real_status, real_allowed, margin_usdt, leverage, features_key, confidence, samples, win_rate, predicted_move_pct, tp_distance_pct, sl_distance_pct, risk_reward, estimated_net_profit_usdt, estimated_cost_pct, market_state, alignment, indicator_profile, reason, best_price, worst_price)
                 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (now, okx_symbol, toobit_symbol, symbol_name, decision.direction, decision.entry, decision.tp, decision.sl, signal_type, real_status, 1 if decision.real_allowed else 0, self.margin_usdt(), self.leverage(), decision.features_key, decision.confidence, decision.samples, decision.win_rate, decision.predicted_move_pct, decision.tp_distance_pct, decision.sl_distance_pct, decision.risk_reward, decision.estimated_net_profit_usdt, decision.estimated_cost_pct, decision.market_state, decision.alignment, decision.indicator_profile, decision.reason, decision.entry, decision.entry))
-            return int(cur.lastrowid)
+            signal_id = int(cur.lastrowid)
+            info = session_info()
+            fee = round_trip_fee_usdt(self.margin_usdt(), self.leverage())
+            payload = {
+                "confidence": decision.confidence, "samples": decision.samples, "win_rate": decision.win_rate,
+                "predicted_move_pct": decision.predicted_move_pct, "tp_distance_pct": decision.tp_distance_pct,
+                "sl_distance_pct": decision.sl_distance_pct, "estimated_cost_pct": decision.estimated_cost_pct,
+                "rsi": getattr(decision, "rsi", 0.0), "adx": getattr(decision, "adx", 0.0),
+                "atr_pct": getattr(decision, "atr_pct", 0.0), "volume_ratio": getattr(decision, "volume_ratio", 0.0),
+                "reason": decision.reason[:1000],
+            }
+            conn.execute("""
+                INSERT OR REPLACE INTO signal_forensic_snapshots(signal_id, created_at, symbol_name, direction, session_name, hour_bucket, weekday, is_session_open, near_news, entry, tp, sl, risk_reward, fee_usdt, expected_net_profit, market_state, alignment, indicator_profile, features_key, payload)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (signal_id, now, symbol_name, decision.direction, info.name, info.hour_bucket, info.weekday, 1 if info.is_open_watch else 0, 1 if ("NEWS" in decision.reason.upper() or "خبر" in decision.reason) else 0, decision.entry, decision.tp, decision.sl, decision.risk_reward, fee, decision.estimated_net_profit_usdt, decision.market_state, decision.alignment, decision.indicator_profile, decision.features_key, json.dumps(json_safe(payload), ensure_ascii=False)))
+            return signal_id
 
     def update_message_id(self, signal_id: int, message_id: int | None) -> None:
         if message_id is None:
@@ -428,6 +461,259 @@ class Storage:
             rows = conn.execute("SELECT * FROM time_risk_profiles WHERE action!='ALLOW' ORDER BY risk_score DESC, sl DESC, samples DESC LIMIT ?", (int(max(1, min(limit, 20))),)).fetchall()
         return [dict(row) for row in rows]
 
+
+    # -----------------------------
+    # Adaptive fix learning: every closed signal changes these profiles
+    # -----------------------------
+    def record_adaptive_fix(self, *, signal: dict[str, Any], result: str, cause: str, report: Any | None = None) -> None:
+        result = str(result or "").upper()
+        if result not in {"TP", "SL"}:
+            return
+        keys = self._adaptive_keys_from_signal(signal)
+        symbol = str(signal.get("symbol_name") or "-")
+        direction = str(signal.get("direction") or "-")
+        market_state = str(signal.get("market_state") or "-")
+        alignment = str(signal.get("alignment") or "-")
+        dt = signal_time(signal)
+        info = session_info(dt)
+        weekday = info.weekday
+        net_profit = float(signal.get("real_pnl") if signal.get("real_pnl") is not None else signal.get("approx_pnl") or 0.0)
+        mfe = float(signal.get("mfe_pct") or 0.0)
+        mae = float(signal.get("mae_pct") or 0.0)
+        tp_distance = float(signal.get("tp_distance_pct") or 0.0)
+        sl_distance = float(signal.get("sl_distance_pct") or 0.0)
+        report_action = str(getattr(report, "action", "") or "")
+        report_policy = str(getattr(report, "fix_policy", "") or "")
+        report_level = int(getattr(report, "treatment_level", 0) or 0)
+        report_message = str(getattr(report, "message", "") or "")
+        with self._connect() as conn:
+            for scope, key in keys:
+                row = conn.execute("SELECT * FROM adaptive_fix_profiles WHERE profile_key=?", (key,)).fetchone()
+                if row:
+                    samples = int(row["samples"] or 0) + 1
+                    tp = int(row["tp"] or 0) + (1 if result == "TP" else 0)
+                    sl = int(row["sl"] or 0) + (1 if result == "SL" else 0)
+                    total_net = float(row["total_net_profit"] or 0.0) + net_profit
+                    avg_mfe = ((float(row["avg_mfe_pct"] or 0.0) * (samples - 1)) + mfe) / samples
+                    avg_mae = ((float(row["avg_mae_pct"] or 0.0) * (samples - 1)) + mae) / samples
+                    avg_tp = ((float(row["avg_tp_distance_pct"] or 0.0) * (samples - 1)) + tp_distance) / samples
+                    avg_sl = ((float(row["avg_sl_distance_pct"] or 0.0) * (samples - 1)) + sl_distance) / samples
+                    risk = int(row["risk_score"] or 0)
+                    tests = int(row["tests"] or 0) + 1
+                    successes = int(row["successes"] or 0) + (1 if result == "TP" else 0)
+                    failures = int(row["failures"] or 0) + (1 if result == "SL" else 0)
+                    consecutive = (int(row["consecutive_failures"] or 0) + 1) if result == "SL" else 0
+                    level = int(row["treatment_level"] or 0)
+                else:
+                    samples = 1
+                    tp = 1 if result == "TP" else 0
+                    sl = 1 if result == "SL" else 0
+                    total_net = net_profit
+                    avg_mfe = mfe
+                    avg_mae = mae
+                    avg_tp = tp_distance
+                    avg_sl = sl_distance
+                    risk = 0
+                    tests = 1
+                    successes = 1 if result == "TP" else 0
+                    failures = 1 if result == "SL" else 0
+                    consecutive = 1 if result == "SL" else 0
+                    level = 0
+
+                # Every single result matters. First SL creates a real but light treatment.
+                if result == "SL":
+                    add = 18
+                    if cause in {"WRONG_DIRECTION_OR_CONTEXT", "FAKE_BREAKOUT_OR_CLIMAX", "NEWS_RISK", "SESSION_OPEN_NOISE", "MARKET_NOISE_OR_RANGE", "HTF_ALIGNMENT_WEAKNESS", "BTC_ETH_CONFLICT"}:
+                        add += 8
+                    if cause in {"ECONOMIC_EDGE_TOO_SMALL", "FEE_TOO_HEAVY_FOR_TARGET"}:
+                        add += 10
+                    if scope == "FEATURE":
+                        add += 4
+                    risk += add
+                    level = max(level, report_level or 1)
+                    if consecutive >= 2:
+                        level += 1
+                    if consecutive >= 3 or (failures >= 4 and total_net < 0):
+                        level = max(level, 4)
+                else:
+                    risk -= 12
+                    if net_profit > 0:
+                        risk -= 4
+                    if level > 0:
+                        level -= 1
+                if total_net < 0:
+                    risk += 3
+                risk = max(0, min(100, risk))
+                level = max(0, min(5, level))
+
+                sl_rate = sl / max(samples, 1)
+                action = "ALLOW"
+                if result == "SL" and samples == 1 and scope in {"FEATURE", "SYMBOL_DIRECTION", "SYMBOL_STATE"}:
+                    action = "CAUTION"
+                if report_action in {"NEWS_PAUSE", "SESSION_PAUSE"}:
+                    # The actual hard pause remains in news/session guard. For future similar cases,
+                    # adaptive layer only downgrades to Watch/Normal.
+                    action = "WATCH_ONLY" if level >= 4 else "REAL_BLOCK"
+                elif report_action == "WATCH_ONLY":
+                    action = "WATCH_ONLY"
+                elif report_action == "REAL_BLOCK":
+                    action = "REAL_BLOCK"
+                elif report_action == "CAUTION":
+                    action = "CAUTION"
+
+                if level >= 5:
+                    action = "WATCH_ONLY"
+                elif level >= 4 and total_net < 0:
+                    action = "WATCH_ONLY"
+                elif level >= 3 and action == "ALLOW":
+                    action = "REAL_BLOCK"
+                elif level >= 1 and action == "ALLOW":
+                    action = "CAUTION"
+                if samples >= 3 and sl_rate >= 0.60 and total_net < 0:
+                    action = "REAL_BLOCK" if action != "WATCH_ONLY" else action
+                if risk >= 70 and total_net < 0:
+                    action = "WATCH_ONLY"
+                elif risk >= 45 and action == "ALLOW":
+                    action = "REAL_BLOCK"
+                elif risk >= 22 and action == "ALLOW":
+                    action = "CAUTION"
+
+                # Learned price cure candidates. Applied later only if RR/net-profit after fees stays valid.
+                rec_tp = avg_tp
+                if avg_mfe > 0 and (cause == "TP_TOO_FAR_OR_REVERSAL" or avg_mfe < avg_tp * 0.92):
+                    rec_tp = max(avg_mfe * 0.72, avg_tp * 0.58)
+                rec_sl = avg_sl
+                if avg_mae > avg_sl * 0.85 or cause in {"STOP_TOO_TIGHT", "SL_HIT_AFTER_NOISE_OR_BAD_RANGE"}:
+                    # First single SL can propose a SMALL test widening; repeated failures widen more.
+                    factor = 1.10 if samples <= 1 else (1.18 if level <= 2 else 1.28)
+                    rec_sl = max(avg_sl, avg_mae * factor)
+
+                conn.execute("""
+                    INSERT INTO adaptive_fix_profiles(profile_key, scope, symbol_name, direction, market_state, alignment, session_name, hour_bucket, weekday, samples, tp, sl, total_net_profit, avg_mfe_pct, avg_mae_pct, avg_tp_distance_pct, avg_sl_distance_pct, risk_score, last_cause, recommended_action, recommended_tp_pct, recommended_sl_pct, last_updated, treatment_level, tests, successes, failures, consecutive_failures, fix_policy, last_message)
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(profile_key) DO UPDATE SET
+                        samples=excluded.samples, tp=excluded.tp, sl=excluded.sl, total_net_profit=excluded.total_net_profit,
+                        avg_mfe_pct=excluded.avg_mfe_pct, avg_mae_pct=excluded.avg_mae_pct,
+                        avg_tp_distance_pct=excluded.avg_tp_distance_pct, avg_sl_distance_pct=excluded.avg_sl_distance_pct,
+                        risk_score=excluded.risk_score, last_cause=excluded.last_cause,
+                        recommended_action=excluded.recommended_action, recommended_tp_pct=excluded.recommended_tp_pct,
+                        recommended_sl_pct=excluded.recommended_sl_pct, last_updated=excluded.last_updated,
+                        treatment_level=excluded.treatment_level, tests=excluded.tests, successes=excluded.successes,
+                        failures=excluded.failures, consecutive_failures=excluded.consecutive_failures,
+                        fix_policy=excluded.fix_policy, last_message=excluded.last_message
+                """, (key, scope, symbol, direction, market_state, alignment, info.name, info.hour_bucket, weekday, samples, tp, sl, total_net, avg_mfe, avg_mae, avg_tp, avg_sl, risk, cause, action, rec_tp, rec_sl, now_utc().isoformat(), level, tests, successes, failures, consecutive, report_policy, report_message[:1000]))
+                conn.execute("INSERT INTO treatment_tests(profile_key, signal_id, created_at, result, net_profit, treatment_level, fix_policy, cause) VALUES(?, ?, ?, ?, ?, ?, ?, ?)", (key, int(signal.get("id") or 0), now_utc().isoformat(), result, net_profit, level, report_policy, cause))
+
+    def record_loss_case(self, *, signal: dict[str, Any], report: Any) -> None:
+        if str(signal.get("status") or "").upper() != "SL":
+            return
+        with self._connect() as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO loss_cases(signal_id, created_at, symbol_name, direction, primary_cause, secondary_causes, cause_scores, fix_policy, action, treatment_level, message, indicator_suggestion)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                int(signal.get("id") or 0), now_utc().isoformat(), str(signal.get("symbol_name") or "-"), str(signal.get("direction") or "-"),
+                str(getattr(report, "primary_cause", "UNKNOWN_SL_REASON")), json.dumps(list(getattr(report, "secondary_causes", ())), ensure_ascii=False),
+                json.dumps(getattr(report, "cause_scores", {}), ensure_ascii=False), str(getattr(report, "fix_policy", "")), str(getattr(report, "action", "")),
+                int(getattr(report, "treatment_level", 0) or 0), str(getattr(report, "message", ""))[:1200], str(getattr(report, "indicator_suggestion", "") or "")[:600],
+            ))
+        suggestion = getattr(report, "indicator_suggestion", None)
+        if suggestion:
+            self.record_indicator_request_once("STOP_FORENSIC", str(suggestion))
+
+    def record_indicator_request_once(self, indicator: str, reason: str) -> None:
+        reason = (reason or "")[:1000]
+        if not reason:
+            return
+        with self._connect() as conn:
+            recent = conn.execute("SELECT reason FROM indicator_requests ORDER BY id DESC LIMIT 5").fetchall()
+            if any(str(r["reason"]) == reason for r in recent):
+                return
+            conn.execute("INSERT INTO indicator_requests(created_at, indicator, reason) VALUES(?, ?, ?)", (now_utc().isoformat(), indicator[:80], reason))
+
+    def latest_loss_cases(self, limit: int = 5) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM loss_cases ORDER BY id DESC LIMIT ?", (int(max(1, min(limit, 20))),)).fetchall()
+        return [dict(row) for row in rows]
+
+    def _adaptive_keys_from_signal(self, signal: dict[str, Any]) -> list[tuple[str, str]]:
+        symbol = str(signal.get("symbol_name") or "-")
+        direction = str(signal.get("direction") or "-")
+        features_key = str(signal.get("features_key") or "")
+        market_state = str(signal.get("market_state") or "UNKNOWN")
+        alignment = str(signal.get("alignment") or "UNKNOWN")
+        info = session_info(signal_time(signal))
+        keys: list[tuple[str, str]] = []
+        if features_key:
+            keys.append(("FEATURE", "FEATURE|" + features_key))
+            parts = features_key.split("|")
+            if len(parts) >= 12:
+                indicator_signature = "|".join([direction, parts[3], parts[4], *parts[5:]])
+                keys.append(("INDICATOR", "INDICATOR|" + indicator_signature))
+        keys.append(("SYMBOL_DIRECTION", "SYMBOL_DIRECTION|" + "|".join([symbol, direction])))
+        keys.append(("SYMBOL_STATE", "SYMBOL_STATE|" + "|".join([symbol, direction, market_state, alignment])))
+        keys.append(("TIME", "TIME|" + "|".join([info.name, info.hour_bucket, info.weekday])))
+        keys.append(("TIME_GLOBAL", "TIME_GLOBAL|" + "|".join([info.name, info.hour_bucket, "ANYDAY"])))
+        return list(dict.fromkeys(keys))
+
+    def get_adaptive_fix_profiles(self, keys: list[str]) -> list[dict[str, Any]]:
+        keys = [str(k) for k in keys if str(k)]
+        if not keys:
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(f"SELECT * FROM adaptive_fix_profiles WHERE profile_key IN ({','.join('?' for _ in keys)})", keys).fetchall()
+        return [dict(row) for row in rows]
+
+    def top_adaptive_fix_profiles(self, limit: int = 5) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM adaptive_fix_profiles WHERE recommended_action!='ALLOW' ORDER BY risk_score DESC, sl DESC, samples DESC LIMIT ?", (int(max(1, min(limit, 20))),)).fetchall()
+        return [dict(row) for row in rows]
+
+    def rebuild_adaptive_fix_profiles_from_history(self, limit: int = 5000) -> int:
+        # Backfill the new stronger learning from existing closed signals so old 2000+ samples matter immediately.
+        with self._connect() as conn:
+            count_row = conn.execute("SELECT COUNT(*) AS n FROM adaptive_fix_profiles").fetchone()
+            if int(count_row["n"] or 0) > 0:
+                return 0
+            rows = conn.execute("SELECT * FROM signals WHERE status IN ('TP','SL') ORDER BY COALESCE(result_at, created_at) ASC, id ASC LIMIT ?", (int(limit),)).fetchall()
+        from stop_forensic_engine import StopForensicEngine
+        forensic = StopForensicEngine(self)
+        done = 0
+        for row in rows:
+            signal = dict(row)
+            status = str(signal.get("status") or "")
+            report = forensic.analyze(signal)
+            cause = report.primary_cause if status == "SL" else "TP_OK"
+            if status == "SL":
+                self.record_loss_case(signal=signal, report=report)
+            self.record_adaptive_fix(signal=signal, result=status, cause=cause, report=report)
+            done += 1
+        if done:
+            self._set_setting("adaptive_fix_rebuild_done", now_utc().isoformat())
+        return done
+
+    @staticmethod
+    def _legacy_failure_reason(signal: dict[str, Any]) -> str:
+        mae = float(signal.get("mae_pct") or 0)
+        sl_dist = float(signal.get("sl_distance_pct") or 0)
+        mfe = float(signal.get("mfe_pct") or 0)
+        tp_dist = float(signal.get("tp_distance_pct") or 0)
+        market_state = str(signal.get("market_state") or "")
+        reason = str(signal.get("reason") or "")
+        if "خبر" in reason or "NEWS" in reason.upper():
+            return "NEWS_RISK"
+        if "BTC" in reason or "ETH" in reason:
+            return "BTC_ETH_CONFLICT"
+        if sl_dist > 0 and mae >= sl_dist * 0.95 and mfe < tp_dist * 0.25:
+            return "DIRECTION_OR_ENTRY_WRONG"
+        if mfe >= tp_dist * 0.60:
+            return "TP_TOO_FAR_OR_REVERSAL"
+        if market_state in {"CLIMAX", "FAKE_BREAKOUT_RISK"}:
+            return "CLIMAX_OR_FAKE_BREAKOUT"
+        if sl_dist > 0 and mae <= sl_dist * 1.05:
+            return "SL_HIT_AFTER_NOISE_OR_BAD_RANGE"
+        return "UNKNOWN_SL_REASON"
+
     def get_range_profile(self, features_key: str) -> dict[str, Any] | None:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM range_profiles WHERE features_key=?", (features_key,)).fetchone()
@@ -492,7 +778,7 @@ class Storage:
 
     def reset_stats(self) -> None:
         with self._connect() as conn:
-            for table in ("signals", "signal_snapshots", "range_profiles", "range_observations", "shadow_tests", "historical_replay_runs", "missed_opportunities", "symbol_direction_profiles", "session_profiles", "capital_suggestions", "indicator_requests", "toobit_orders", "no_signal_log", "guard_events", "guard_alerts", "time_risk_profiles"):
+            for table in ("signals", "signal_snapshots", "range_profiles", "range_observations", "shadow_tests", "historical_replay_runs", "missed_opportunities", "symbol_direction_profiles", "session_profiles", "capital_suggestions", "indicator_requests", "toobit_orders", "no_signal_log", "guard_events", "guard_alerts", "time_risk_profiles", "adaptive_fix_profiles", "signal_forensic_snapshots", "loss_cases", "treatment_tests"):
                 conn.execute(f"DELETE FROM {table}")
             conn.execute("INSERT INTO settings(key, value) VALUES('guard_cooldown_until', '') ON CONFLICT(key) DO UPDATE SET value='' ")
             conn.execute("INSERT INTO settings(key, value) VALUES('guard_cooldown_reason', '') ON CONFLICT(key) DO UPDATE SET value='' ")
@@ -503,8 +789,22 @@ class Storage:
         sl = sum(1 for r in closed if str(r["status"]) == "SL")
         real = sum(1 for r in rows if str(r["signal_type"]) == "real")
         normal = sum(1 for r in rows if str(r["signal_type"]) == "normal")
-        pnl = sum(float(r["real_pnl"] if r["real_pnl"] is not None else r["approx_pnl"] or 0.0) for r in rows)
-        return {"total": len(rows), "open": sum(1 for r in rows if str(r["status"]) == "OPEN"), "closed": len(closed), "real": real, "normal": normal, "tp": tp, "sl": sl, "win_rate": tp / len(closed) * 100.0 if closed else 0.0, "pnl": pnl}
+        watch = sum(1 for r in rows if str(r["signal_type"]) == "watch")
+
+        def row_net(row: sqlite3.Row) -> float:
+            return float(row["real_pnl"] if row["real_pnl"] is not None else row["approx_pnl"] or 0.0)
+
+        pnl = sum(row_net(r) for r in closed)
+        real_pnl = sum(row_net(r) for r in closed if str(r["signal_type"]) == "real")
+        normal_pnl = sum(row_net(r) for r in closed if str(r["signal_type"]) == "normal")
+        watch_pnl = sum(row_net(r) for r in closed if str(r["signal_type"]) == "watch")
+        fees = sum(round_trip_fee_usdt(float(r["margin_usdt"] or 0.0), int(r["leverage"] or 1)) for r in closed)
+        return {
+            "total": len(rows), "open": sum(1 for r in rows if str(r["status"]) == "OPEN"), "closed": len(closed),
+            "real": real, "normal": normal, "watch": watch, "tp": tp, "sl": sl,
+            "win_rate": tp / len(closed) * 100.0 if closed else 0.0,
+            "pnl": pnl, "real_pnl": real_pnl, "normal_pnl": normal_pnl, "watch_pnl": watch_pnl, "fees": fees,
+        }
 
     def _row_to_signal(self, row: sqlite3.Row) -> StoredSignal:
         return StoredSignal(

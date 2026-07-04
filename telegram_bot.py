@@ -7,7 +7,7 @@ from ai_brain import SignalDecision
 from config import BOT_NAME, OWNER_ID, TELEGRAM_CHAT_ID
 from storage import Storage, StoredSignal
 from trade_manager import CreatedSignal, TradeManager
-from utils import money, normalize_digits, parse_float, parse_int, pct
+from utils import money, normalize_digits, parse_float, parse_int, pct, round_trip_fee_usdt, pnl_breakdown_for_exit, net_pnl_for_exit
 
 
 class TelegramBotUI:
@@ -80,6 +80,10 @@ class TelegramBotUI:
 
         direction_icon = self._direction_icon(decision.direction)
         signal_type = created.signal_type.upper()
+        margin = self.storage.margin_usdt()
+        leverage = self.storage.leverage()
+        fee = round_trip_fee_usdt(margin, leverage)
+        sl_net = net_pnl_for_exit(margin, leverage, decision.direction or "LONG", decision.entry, decision.sl) if decision.direction else 0.0
         text = (
             f"{direction_icon} سیگنال {signal_type}\n"
             f"━━━━━━━━━━━━━━\n"
@@ -89,7 +93,9 @@ class TelegramBotUI:
             f"🎯 TP: {decision.tp:.8f} ({pct(decision.tp_distance_pct)})\n"
             f"🛑 SL: {decision.sl:.8f} ({pct(decision.sl_distance_pct)})\n"
             f"RR: {decision.risk_reward:.2f}\n"
-            f"سود خالص تخمینی: {money(decision.estimated_net_profit_usdt)}\n\n"
+            f"کارمزد رفت‌وبرگشت تقریبی: {money(-fee)}\n"
+            f"سود خالص احتمالی TP: {money(decision.estimated_net_profit_usdt)}\n"
+            f"ضرر خالص احتمالی SL: {money(sl_net)}\n\n"
             f"اعتماد AI: {decision.confidence}% | نمونه بازه: {decision.samples}\n"
             f"وضعیت بازار: {decision.market_state}\n"
             f"تایم‌های بالا: {decision.alignment}\n"
@@ -107,6 +113,7 @@ class TelegramBotUI:
         status_icon = self._result_icon(status)
         direction_icon = self._direction_icon(signal.direction)
         status_label = status.upper()
+        bd = pnl_breakdown_for_exit(signal.margin_usdt, signal.leverage, signal.direction, signal.entry, exit_price)
         text = (
             f"{status_icon} نتیجه سیگنال: {status_label}\n"
             f"━━━━━━━━━━━━━━\n"
@@ -117,7 +124,9 @@ class TelegramBotUI:
             f"خروج: {exit_price:.8f}\n"
             f"TP: {signal.tp:.8f}\n"
             f"SL: {signal.sl:.8f}\n\n"
-            f"سود/ضرر تقریبی: {money(approx_pnl)}\n"
+            f"سود/ضرر خام تقریبی: {money(bd['gross'])}\n"
+            f"کارمزد تقریبی: {money(-bd['fee'])}\n"
+            f"سود/ضرر خالص تقریبی: {money(approx_pnl)}\n"
             f"سود/ضرر واقعی Toobit: {money(real_pnl)}\n"
             f"MFE: {pct(signal.mfe_pct)} | MAE: {pct(signal.mae_pct)}\n\n"
             f"دلیل استاپ/نتیجه در حافظه AI ثبت شد."
@@ -139,7 +148,9 @@ class TelegramBotUI:
             f"اسلات واقعی: {data.filled_slots}/{data.max_positions} | خالی {data.empty_slots} | درحال بازشدن {data.pending_slots}\n"
             f"موجودی Toobit: {money(data.wallet_margin_usdt)}\n"
             f"پوزیشن/سفارش صرافی: {data.exchange_open_positions}/{data.exchange_open_orders}\n"
-            f"PNL امروز ربات: {money(float(data.today_stats.get('pnl', 0)))}\n"
+            f"PNL خالص امروز ربات: {money(float(data.today_stats.get('pnl', 0)))}\n"
+            f"Normal خالص امروز: {money(float(data.today_stats.get('normal_pnl', 0)))} | Real خالص امروز: {money(float(data.today_stats.get('real_pnl', 0)))} | Watch خالص: {money(float(data.today_stats.get('watch_pnl', 0)))}\n"
+            f"کارمزد تقریبی امروز: {money(-float(data.today_stats.get('fees', 0)))}\n"
             f"TP/SL امروز: {data.today_stats.get('tp', 0)}/{data.today_stats.get('sl', 0)} | WinRate {data.today_stats.get('win_rate', 0):.1f}%\n\n"
             f"نکته: اگر اتوسیگنال خاموش باشد سیگنال جدید صادر نمی‌شود؛ اما سیگنال‌های باز همچنان مانیتور و نتیجه‌شان ثبت می‌شود.\n\n"
             f"دستورات مهم:\n"
@@ -155,10 +166,12 @@ class TelegramBotUI:
             f"📊 آمار کل\n"
             f"کل سیگنال‌ها: {stats['total']}\n"
             f"باز: {stats['open']} | بسته: {stats['closed']}\n"
-            f"Real: {stats['real']} | Normal: {stats['normal']}\n"
+            f"Real: {stats['real']} | Normal: {stats['normal']} | Watch: {stats.get('watch', 0)}\n"
             f"TP: {stats['tp']} | SL: {stats['sl']}\n"
             f"WinRate: {stats['win_rate']:.1f}%\n"
-            f"سود/ضرر کل: {money(stats['pnl'])}"
+            f"سود/ضرر خالص کل: {money(stats['pnl'])}\n"
+            f"Normal خالص: {money(stats.get('normal_pnl', 0))} | Real خالص: {money(stats.get('real_pnl', 0))} | Watch خالص: {money(stats.get('watch_pnl', 0))}\n"
+            f"کارمزد تقریبی کل: {money(-float(stats.get('fees', 0)))}"
         )
 
     def ai_text(self) -> str:
@@ -174,6 +187,16 @@ class TelegramBotUI:
             f"- {x.get('session_name','-')} {x.get('hour_bucket','-')} {x.get('weekday','-')} | {x.get('action','-')} | SL {x.get('sl',0)}/{x.get('samples',0)} | {x.get('main_cause','-')}"
             for x in risk_profiles
         ) or "فعلاً ساعت/سشن پرریسک یادگرفته‌شده نیست."
+        adaptive_profiles = self.storage.top_adaptive_fix_profiles(4)
+        adaptive_text = "\n".join(
+            f"- {x.get('scope','-')} {x.get('symbol_name','-')} {x.get('direction','-')} | {x.get('recommended_action','-')} | سطح {x.get('treatment_level',0)} | تست {x.get('tests',0)} موفق {x.get('successes',0)} شکست {x.get('failures',0)} | TP {x.get('tp',0)}/SL {x.get('sl',0)} | {x.get('last_cause','-')}"
+            for x in adaptive_profiles
+        ) or "فعلاً درمان یادگرفته‌شده فعال نیست."
+        loss_cases = self.storage.latest_loss_cases(3)
+        loss_text = "\n".join(
+            f"- {x.get('symbol_name','-')} {x.get('direction','-')} | {x.get('primary_cause','-')} | {x.get('fix_policy','-')}"
+            for x in loss_cases
+        ) or "فعلاً پرونده استاپ جدیدی نیست."
         cooldown = self.storage.guard_cooldown()
         cooldown_text = cooldown.get("reason") or "غیرفعال"
         return (
@@ -184,6 +207,8 @@ class TelegramBotUI:
             f"بدترین: {worst.get('symbol_name', '-')} {worst.get('direction', '-')} | WR {worst.get('win_rate', 0):.1f}% | Net {worst.get('net_profit', 0):.4f}\n"
             f"وضعیت ترمز ضرر: {cooldown_text[:300]}\n"
             f"ساعت/سشن‌های پرریسک یادگرفته‌شده:\n{risk_text}\n"
+            f"درمان‌های یادگیری فعال:\n{adaptive_text}\n"
+            f"آخرین پرونده‌های بازپرس استاپ:\n{loss_text}\n"
             f"پیشنهاد دلار/لوریج:\n{sug}\n"
             f"درخواست اندیکاتور:\n{req}"
         )

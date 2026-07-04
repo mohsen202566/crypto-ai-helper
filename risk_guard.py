@@ -38,7 +38,7 @@ class StopLossGuard:
         reason = cooldown.get("reason") or ""
         if until and now < until:
             payload = {"until": until.isoformat(), "reason": reason}
-            return GuardVerdict("BLOCK", "STOP_GUARD", f"ترمز ضرر فعال است تا {until.strftime('%H:%M UTC')}: {reason}", 0, payload)
+            return GuardVerdict("REAL_BLOCK", "STOP_GUARD", f"ترمز درمان استاپ فعال است تا {until.strftime('%H:%M UTC')}: {reason}؛ سیگنال حذف نمی‌شود، فقط Real بسته/Normal یا Watch می‌شود.", STOP_GUARD_CAUTION_MIN_CONFIDENCE, payload)
         profile = self.storage.get_time_risk_profile(symbol_name=symbol_name, direction=getattr(decision, "direction", None))
         if profile and int(profile.get("samples") or 0) >= STOP_GUARD_LEARNED_RISK_MIN_SAMPLES:
             action = str(profile.get("action") or "ALLOW")
@@ -47,7 +47,7 @@ class StopLossGuard:
             calm = decision_market_is_calm(decision)
             payload = {"profile": profile, "calm": calm}
             if action == "BLOCK" and not calm:
-                return GuardVerdict("BLOCK", "STOP_GUARD", f"حافظه AI این ساعت/سشن را پرریسک می‌داند ({cause}, risk={risk_score}) و بازار آرام نیست.", 0, payload)
+                return GuardVerdict("REAL_BLOCK", "STOP_GUARD", f"حافظه AI این ساعت/سشن را پرریسک می‌داند ({cause}, risk={risk_score}) و بازار آرام نیست؛ سیگنال حذف نمی‌شود ولی Real بسته است.", STOP_GUARD_CAUTION_MIN_CONFIDENCE, payload)
             if action == "BLOCK":
                 return GuardVerdict("REAL_BLOCK", "STOP_GUARD", f"حافظه AI این ساعت/سشن را بد می‌شناسد ({cause}); Real بسته می‌شود.", STOP_GUARD_CAUTION_MIN_CONFIDENCE, payload)
             if action == "REAL_BLOCK":
