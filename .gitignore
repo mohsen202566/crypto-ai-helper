@@ -1,41 +1,70 @@
-# Secrets
-.env
-.env.*
-!.env.example
-
+# =========================
 # Python
+# =========================
 __pycache__/
 *.py[cod]
-*$py.class
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
+*.pyo
+*.pyd
+*.so
 
-# Virtual environments
-.venv/
+# =========================
+# Virtual Environment
+# =========================
 venv/
+.venv/
 env/
 ENV/
 
-# Runtime data / databases
+# =========================
+# Secrets
+# =========================
+.env
+.env.local
+.env.production
+*.key
+*.pem
+
+# =========================
+# Database / Learning Data
+# یادگیری واقعی روی سرور ساخته شود، داخل گیت نرود
+# =========================
 data/
 *.db
 *.sqlite
 *.sqlite3
 
-# Logs and temporary files
+# =========================
+# Logs
+# =========================
 logs/
 *.log
-*.tmp
-*.bak
-*.old
 
-# Local IDE / OS files
-.vscode/
-.idea/
+# =========================
+# Runtime / Cache
+# =========================
+.cache/
+tmp/
+temp/
+*.pid
+
+# =========================
+# News / Local Fundamental Events
+# فایل واقعی اخبار روی سرور ساخته شود
+# فقط fundamental_events.example.json داخل گیت بماند
+# =========================
+fundamental_events.json
+
+# =========================
+# OS / Editor
+# =========================
 .DS_Store
 Thumbs.db
+.vscode/
+.idea/
 
-# Build/output archives
+# =========================
+# Archives
+# =========================
 *.zip
-*.tar.gz
+*.tar
+*.gz
