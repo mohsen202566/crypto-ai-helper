@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from storage import Storage
-from utils import direction_profit_pct, pnl_breakdown_for_move
+from utils import direction_profit_pct
+from risk_guard import StopLossGuard
 
 
 class LearningEngine:
@@ -21,10 +22,11 @@ class LearningEngine:
         margin = float(signal.get("margin_usdt") or 0)
         leverage = int(signal.get("leverage") or 1)
         profit_pct = direction_profit_pct(direction, entry, exit_price)
-        pnl = pnl_breakdown_for_move(margin, leverage, profit_pct)
-        net_profit = float(signal.get("net_pnl") if signal.get("net_pnl") is not None else pnl["net_pnl"])
-        result_reason = self._failure_reason(signal) if status == "SL" else "TP_OK"
+        approx_net = margin * leverage * profit_pct
+        real_pnl = signal.get("real_pnl")
+        net_profit = float(real_pnl) if real_pnl is not None else approx_net
         features_key = str(signal.get("features_key") or "")
+        learning_reason = self._failure_reason(signal) if status == "SL" else "TP_OK"
         self.storage.record_observation(
             source=str(signal.get("signal_type") or "normal"),
             signal_id=signal_id,
@@ -37,10 +39,9 @@ class LearningEngine:
             mae_pct=float(signal.get("mae_pct") or 0),
             tp_distance_pct=float(signal.get("tp_distance_pct") or 0),
             sl_distance_pct=float(signal.get("sl_distance_pct") or 0),
-            reason=result_reason,
+            reason=learning_reason,
         )
-        self.storage.update_signal_stop_reason(signal_id, result_reason)
-        self.storage.record_stop_reason_profile({**signal, "status": status, "net_pnl": net_profit}, result_reason)
+        StopLossGuard(self.storage).learn_from_closed_signal(signal_id, learning_reason)
         self.storage.update_shadow_results(signal_id, direction, float(signal.get("best_price") or entry), float(signal.get("worst_price") or entry))
         self._maybe_capital_suggestion()
         self._maybe_indicator_request()

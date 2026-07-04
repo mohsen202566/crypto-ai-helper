@@ -68,6 +68,12 @@ class TelegramBotUI:
         except Exception as exc:
             await message.reply_text(f"خطا: {exc}")
 
+    async def send_guard_alert(self, text: str) -> int | None:
+        if self.app is None:
+            return None
+        msg: Message = await self.app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
+        return msg.message_id
+
     async def send_signal(self, *, symbol_name: str, decision: SignalDecision, created: CreatedSignal) -> int | None:
         if self.app is None:
             return None
@@ -94,14 +100,13 @@ class TelegramBotUI:
         self.storage.update_message_id(created.signal_id, msg.message_id)
         return msg.message_id
 
-    async def send_result(self, signal: StoredSignal, status: str, exit_price: float, gross_pnl: float, fee_usdt: float, net_pnl: float, real_pnl: float | None, result_source: str) -> int | None:
+    async def send_result(self, signal: StoredSignal, status: str, exit_price: float, approx_pnl: float, real_pnl: float | None, result_source: str) -> int | None:
         if self.app is None:
             return None
 
         status_icon = self._result_icon(status)
         direction_icon = self._direction_icon(signal.direction)
         status_label = status.upper()
-        real_line = f"PNL خام Toobit: {money(real_pnl)}\n" if real_pnl is not None else ""
         text = (
             f"{status_icon} نتیجه سیگنال: {status_label}\n"
             f"━━━━━━━━━━━━━━\n"
@@ -112,21 +117,13 @@ class TelegramBotUI:
             f"خروج: {exit_price:.8f}\n"
             f"TP: {signal.tp:.8f}\n"
             f"SL: {signal.sl:.8f}\n\n"
-            f"سود کل: {money(gross_pnl)}\n"
-            f"کارمزد فیوچرز: {money(-abs(fee_usdt))}\n"
-            f"سود/ضرر خالص: {money(net_pnl)}\n"
-            f"{real_line}"
+            f"سود/ضرر تقریبی: {money(approx_pnl)}\n"
+            f"سود/ضرر واقعی Toobit: {money(real_pnl)}\n"
             f"MFE: {pct(signal.mfe_pct)} | MAE: {pct(signal.mae_pct)}\n\n"
             f"دلیل استاپ/نتیجه در حافظه AI ثبت شد."
         )
         msg = await self.app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, reply_to_message_id=signal.message_id)
         return msg.message_id
-
-    async def send_guard_alert(self, text: str) -> bool:
-        if self.app is None:
-            return False
-        await self.app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text[:3900])
-        return True
 
     async def panel_text(self) -> str:
         data = await self.trade_manager.panel_data()
@@ -142,8 +139,7 @@ class TelegramBotUI:
             f"اسلات واقعی: {data.filled_slots}/{data.max_positions} | خالی {data.empty_slots} | درحال بازشدن {data.pending_slots}\n"
             f"موجودی Toobit: {money(data.wallet_margin_usdt)}\n"
             f"پوزیشن/سفارش صرافی: {data.exchange_open_positions}/{data.exchange_open_orders}\n"
-            f"سود/ضرر خالص Normal امروز: {money(float(data.today_stats.get('normal_net_pnl', 0)))}\n"
-            f"سود/ضرر خالص Real امروز: {money(float(data.today_stats.get('real_net_pnl', 0)))}\n"
+            f"PNL امروز ربات: {money(float(data.today_stats.get('pnl', 0)))}\n"
             f"TP/SL امروز: {data.today_stats.get('tp', 0)}/{data.today_stats.get('sl', 0)} | WinRate {data.today_stats.get('win_rate', 0):.1f}%\n\n"
             f"نکته: اگر اتوسیگنال خاموش باشد سیگنال جدید صادر نمی‌شود؛ اما سیگنال‌های باز همچنان مانیتور و نتیجه‌شان ثبت می‌شود.\n\n"
             f"دستورات مهم:\n"
@@ -155,18 +151,14 @@ class TelegramBotUI:
 
     def stats_text(self) -> str:
         stats = self.storage.all_stats()
-        normal = stats.get("normal_stats", {})
-        real = stats.get("real_stats", {})
         return (
             f"📊 آمار کل\n"
             f"کل سیگنال‌ها: {stats['total']}\n"
             f"باز: {stats['open']} | بسته: {stats['closed']}\n"
             f"Real: {stats['real']} | Normal: {stats['normal']}\n"
             f"TP: {stats['tp']} | SL: {stats['sl']}\n"
-            f"WinRate: {stats['win_rate']:.1f}%\n\n"
-            f"Normal: TP/SL {normal.get('tp', 0)}/{normal.get('sl', 0)} | خالص {money(float(normal.get('net_pnl', 0)))}\n"
-            f"Real: TP/SL {real.get('tp', 0)}/{real.get('sl', 0)} | خالص {money(float(real.get('net_pnl', 0)))}\n"
-            f"سود/ضرر خالص کل: {money(stats['pnl'])}"
+            f"WinRate: {stats['win_rate']:.1f}%\n"
+            f"سود/ضرر کل: {money(stats['pnl'])}"
         )
 
     def ai_text(self) -> str:
@@ -177,12 +169,21 @@ class TelegramBotUI:
         requests = data.get("requests", [])
         sug = "\n".join(f"- {x['message']}" for x in suggestions) or "فعلاً پیشنهادی نیست."
         req = "\n".join(f"- {x['reason']}" for x in requests) or "فعلاً درخواست اندیکاتور نیست."
+        risk_profiles = self.storage.top_time_risk_profiles(3)
+        risk_text = "\n".join(
+            f"- {x.get('session_name','-')} {x.get('hour_bucket','-')} {x.get('weekday','-')} | {x.get('action','-')} | SL {x.get('sl',0)}/{x.get('samples',0)} | {x.get('main_cause','-')}"
+            for x in risk_profiles
+        ) or "فعلاً ساعت/سشن پرریسک یادگرفته‌شده نیست."
+        cooldown = self.storage.guard_cooldown()
+        cooldown_text = cooldown.get("reason") or "غیرفعال"
         return (
             f"🧠 پنل AI\n"
             f"نمونه‌های یادگیری: {data.get('total_samples', 0)}\n"
             f"اعتماد کلی AI: {data.get('confidence', 0):.1f}%\n"
             f"بهترین: {best.get('symbol_name', '-')} {best.get('direction', '-')} | WR {best.get('win_rate', 0):.1f}% | Net {best.get('net_profit', 0):.4f}\n"
             f"بدترین: {worst.get('symbol_name', '-')} {worst.get('direction', '-')} | WR {worst.get('win_rate', 0):.1f}% | Net {worst.get('net_profit', 0):.4f}\n"
+            f"وضعیت ترمز ضرر: {cooldown_text[:300]}\n"
+            f"ساعت/سشن‌های پرریسک یادگرفته‌شده:\n{risk_text}\n"
             f"پیشنهاد دلار/لوریج:\n{sug}\n"
             f"درخواست اندیکاتور:\n{req}"
         )

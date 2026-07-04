@@ -2,18 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import replace
 
 from telegram.ext import Application, MessageHandler, filters
 
-from ai_brain import AIBrain, AnalysisInput, SignalDecision
-from config import CONTEXT_SYMBOLS, MONITOR_SECONDS, RUN_REPLAY_ON_START, SCANNER_SECONDS, SESSION_CAUTION_MIN_CONFIDENCE, TELEGRAM_BOT_TOKEN, TIMEFRAME_1H, TIMEFRAMES, ensure_runtime_config
-from fundamental_guard import FundamentalGuard
+from ai_brain import AIBrain, AnalysisInput
+from config import CONTEXT_SYMBOLS, MONITOR_SECONDS, RUN_REPLAY_ON_START, SCANNER_SECONDS, TELEGRAM_BOT_TOKEN, TIMEFRAME_1H, TIMEFRAMES, ensure_runtime_config
 from historical_replay import HistoricalReplayEngine
 from monitor import SignalMonitor
 from okx_data import OkxDataClient
-from risk_guard import RiskGuard
-from session_guard import GuardDecision, SessionGuard
+from safety_layer import SafetyLayer
 from storage import Storage
 from symbols import ACTIVE_SYMBOLS, MarketSymbol
 from telegram_bot import TelegramBotUI
@@ -40,61 +37,20 @@ async def analyze_symbol(okx: OkxDataClient, brain: AIBrain, symbol: MarketSymbo
     return brain.analyze(AnalysisInput(symbol_name=symbol.name, candles_by_tf=candles_by_tf, btc_1h=context_cache.get(CONTEXT_SYMBOLS[0]), eth_1h=context_cache.get(CONTEXT_SYMBOLS[1]), live_price=live_price))
 
 
-def apply_guards(decision: SignalDecision, guards: list[GuardDecision]) -> SignalDecision:
-    active = [g for g in guards if g.level != "OK"]
-    if not active:
-        return decision
-    reason_suffix = " | ".join(g.reason for g in active if g.reason)
-    if any(g.hard_block or not g.normal_allowed for g in active):
-        return replace(
-            decision,
-            action="NO_SIGNAL",
-            accepted=False,
-            real_allowed=False,
-            signal_type_hint="none",
-            reason=f"{decision.reason} | {reason_suffix}"[:1800],
-        )
-    penalty = sum(max(0, g.confidence_penalty) for g in active)
-    confidence = max(0, int(decision.confidence) - penalty)
-    real_allowed = bool(decision.real_allowed and all(g.real_allowed for g in active))
-    if any(g.caution for g in active) and confidence < SESSION_CAUTION_MIN_CONFIDENCE:
-        return replace(
-            decision,
-            action="NO_SIGNAL",
-            accepted=False,
-            real_allowed=False,
-            signal_type_hint="none",
-            confidence=confidence,
-            reason=f"{decision.reason} | GUARD_REJECT_LOW_CONFIDENCE: اعتماد بعد از گارد {confidence}% شد. | {reason_suffix}"[:1800],
-        )
-    return replace(
-        decision,
-        real_allowed=real_allowed,
-        signal_type_hint="real" if real_allowed else "normal",
-        confidence=confidence,
-        reason=f"{decision.reason} | {reason_suffix}"[:1800],
-    )
-
-
-async def scanner_loop(okx: OkxDataClient, brain: AIBrain, trade_manager: TradeManager, ui: TelegramBotUI, storage: Storage, session_guard: SessionGuard, risk_guard: RiskGuard, fundamental_guard: FundamentalGuard) -> None:
+async def scanner_loop(okx: OkxDataClient, brain: AIBrain, trade_manager: TradeManager, ui: TelegramBotUI, storage: Storage, safety: SafetyLayer) -> None:
     while True:
         try:
-            fundamental_guard.refresh_if_due()
-            await fundamental_guard.send_due_alerts(ui)
             if not storage.auto_signals_enabled():
                 await asyncio.sleep(SCANNER_SECONDS)
                 continue
-
-            fundamental_decision = fundamental_guard.evaluate()
-            session_decision = session_guard.evaluate()
-            global_risk_decision = risk_guard.evaluate()
-            global_guards = [fundamental_decision, session_decision, global_risk_decision]
-            if any(g.hard_block for g in global_guards):
-                reason = " | ".join(g.reason for g in global_guards if g.level != "OK")
-                storage.record_no_signal("ALL", None, f"GLOBAL_GUARD_BLOCK: {reason}", "")
+            for alert_text in safety.pending_alert_messages():
+                await ui.send_guard_alert(alert_text)
+            pre_guard = safety.pre_scan_verdict()
+            if pre_guard.blocks_signal:
+                storage.record_guard_event("SAFETY_LAYER", "pre_scan_block", pre_guard.reason, "BLOCK", pre_guard.payload)
+                LOGGER.info("pre-scan blocked by safety guard: %s", pre_guard.reason)
                 await asyncio.sleep(SCANNER_SECONDS)
                 continue
-
             context_cache = await load_context(okx)
             items = []
             for symbol in ACTIVE_SYMBOLS:
@@ -102,15 +58,14 @@ async def scanner_loop(okx: OkxDataClient, brain: AIBrain, trade_manager: TradeM
                     if storage.active_symbol_exists(symbol.toobit_symbol):
                         continue
                     decision = await analyze_symbol(okx, brain, symbol, context_cache)
-                    direction = decision.direction if decision.direction else None
-                    specific_risk = GuardDecision.ok("risk")
-                    if direction and global_risk_decision.level == "OK":
-                        specific_risk = risk_guard.evaluate(symbol.name, direction)
-                    guarded = apply_guards(decision, [fundamental_decision, session_decision, global_risk_decision, specific_risk])
-                    if guarded.accepted:
-                        items.append((symbol, guarded))
+                    if decision.accepted:
+                        guarded_decision, guard_verdict = safety.apply(symbol, decision)
+                        if guarded_decision is None:
+                            storage.record_no_signal(symbol.name, decision.direction, f"{guard_verdict.source}: {guard_verdict.reason}", decision.features_key)
+                        else:
+                            items.append((symbol, guarded_decision))
                     else:
-                        storage.record_no_signal(symbol.name, guarded.direction, guarded.reason, guarded.features_key)
+                        storage.record_no_signal(symbol.name, decision.direction, decision.reason, decision.features_key)
                 except Exception as exc:
                     LOGGER.warning("scan error %s: %s", symbol.name, exc)
                     storage.record_no_signal(symbol.name, None, f"خطای اسکن: {exc}", "")
@@ -153,14 +108,12 @@ def main() -> None:
     trade_manager = TradeManager(storage, toobit)
     ui = TelegramBotUI(storage, trade_manager)
     monitor = SignalMonitor(storage, okx, toobit)
-    session_guard = SessionGuard()
-    risk_guard = RiskGuard(storage)
-    fundamental_guard = FundamentalGuard(storage)
+    safety = SafetyLayer(storage)
 
     async def post_init(app: Application) -> None:
         ui.bind_app(app)
         asyncio.create_task(replay_on_start(storage, okx))
-        asyncio.create_task(scanner_loop(okx, brain, trade_manager, ui, storage, session_guard, risk_guard, fundamental_guard))
+        asyncio.create_task(scanner_loop(okx, brain, trade_manager, ui, storage, safety))
         asyncio.create_task(monitor_loop(monitor, ui))
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()

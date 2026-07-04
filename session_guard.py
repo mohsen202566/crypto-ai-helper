@@ -1,106 +1,52 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, time as dt_time, timezone
-from zoneinfo import ZoneInfo
-
 from config import (
-    BOT_TIMEZONE,
     SESSION_GUARD_ENABLED,
-    SESSION_CAUTION_MIN_CONFIDENCE,
-    SESSION_WINDOWS,
+    SESSION_OPEN_CAUTION_MIN_CONFIDENCE,
+    SESSION_OPEN_HARD_BLOCK_MINUTES,
+    SESSION_OPEN_REAL_BLOCK_MIN_CONFIDENCE,
 )
-from utils import now_utc, session_bucket
+from guard_types import GuardVerdict
+from guard_utils import decision_market_is_calm, session_info
 
 
-@dataclass(frozen=True)
-class GuardDecision:
-    name: str
-    level: str
-    normal_allowed: bool
-    real_allowed: bool
-    confidence_penalty: int
-    reason: str
-    hard_block: bool = False
-    caution: bool = False
+class SessionOpenGuard:
+    """External guard for Asia/Europe/America session openings.
 
-    @staticmethod
-    def ok(name: str = "guard") -> "GuardDecision":
-        return GuardDecision(name, "OK", True, True, 0, "")
-
-
-@dataclass(frozen=True)
-class SessionWindow:
-    start: dt_time
-    end: dt_time
-    level: str
-    label: str
-    reason: str
-
-
-class SessionGuard:
-    """Time/session risk layer.
-
-    The guard is intentionally conservative around repeated bad transition windows.
-    It does not replace AIBrain; it only blocks Real, adds confidence penalties,
-    or hard-blocks new signals during very risky windows.
+    It does not alter the AI's internal logic. It only decides whether the created signal should be
+    blocked, downgraded to Normal, or allowed after the session-open noise calms down.
     """
 
-    def __init__(self) -> None:
-        self.tz = ZoneInfo(BOT_TIMEZONE)
-        self.windows = self._parse_windows(SESSION_WINDOWS)
+    def __init__(self, storage) -> None:
+        self.storage = storage
 
-    def evaluate(self, now: datetime | None = None) -> GuardDecision:
+    def evaluate(self, symbol_name: str, decision) -> GuardVerdict:
         if not SESSION_GUARD_ENABLED:
-            return GuardDecision.ok("session")
-        local = (now or now_utc()).astimezone(self.tz)
-        current = local.time().replace(second=0, microsecond=0)
-        bucket = session_bucket(local)
-        for window in self.windows:
-            if self._contains(window.start, window.end, current):
-                level = window.level.upper()
-                if level == "BLOCK":
-                    return GuardDecision(
-                        "session", level, False, False, 100,
-                        f"SESSION_BLOCK {bucket} {window.label}: {window.reason}",
-                        hard_block=True,
-                        caution=True,
-                    )
-                if level == "REAL_BLOCK":
-                    return GuardDecision(
-                        "session", level, True, False, max(10, SESSION_CAUTION_MIN_CONFIDENCE // 2),
-                        f"SESSION_REAL_BLOCK {bucket} {window.label}: {window.reason}",
-                        caution=True,
-                    )
-                if level == "CAUTION":
-                    return GuardDecision(
-                        "session", level, True, False, 15,
-                        f"SESSION_CAUTION {bucket} {window.label}: {window.reason}",
-                        caution=True,
-                    )
-        return GuardDecision.ok("session")
+            return GuardVerdict()
+        info = session_info()
+        if not info.is_open_watch:
+            return GuardVerdict()
+        calm = decision_market_is_calm(decision)
+        learned = self.storage.get_time_risk_profile(symbol_name=symbol_name, direction=getattr(decision, "direction", None))
+        learned_risk = int((learned or {}).get("risk_score") or 0)
+        learned_action = str((learned or {}).get("action") or "ALLOW")
+        label = f"{info.label} ({info.minutes_from_open} دقیقه از شروع)"
+        payload = {"session": info.name, "minutes_from_open": info.minutes_from_open, "calm": calm, "learned_risk": learned_risk}
 
-    @staticmethod
-    def _contains(start: dt_time, end: dt_time, current: dt_time) -> bool:
-        if start <= end:
-            return start <= current <= end
-        return current >= start or current <= end
+        if learned_action == "BLOCK" and not calm:
+            return GuardVerdict("BLOCK", "SESSION_GUARD", f"{label} + حافظه ساعت بد؛ بازار هنوز آرام نیست.", 0, payload)
+        if learned_action == "REAL_BLOCK":
+            return GuardVerdict("REAL_BLOCK", "SESSION_GUARD", f"{label} در حافظه قبلی پرریسک بوده؛ Real بسته می‌شود.", SESSION_OPEN_REAL_BLOCK_MIN_CONFIDENCE, payload)
+        if learned_action == "CAUTION":
+            return GuardVerdict("CAUTION", "SESSION_GUARD", f"{label} در حافظه قبلی ضعیف بوده؛ فقط سیگنال قوی مجاز است.", SESSION_OPEN_CAUTION_MIN_CONFIDENCE, payload)
 
-    @staticmethod
-    def _parse_time(value: str) -> dt_time:
-        hh, mm = value.strip().split(":", 1)
-        return dt_time(hour=int(hh), minute=int(mm))
-
-    def _parse_windows(self, raw: str) -> tuple[SessionWindow, ...]:
-        windows: list[SessionWindow] = []
-        for item in (raw or "").split(";"):
-            item = item.strip()
-            if not item:
-                continue
-            try:
-                time_range, level, label, reason = (part.strip() for part in item.split("|", 3))
-                start_s, end_s = (part.strip() for part in time_range.split("-", 1))
-                windows.append(SessionWindow(self._parse_time(start_s), self._parse_time(end_s), level.upper(), label, reason))
-            except Exception:
-                continue
-        return tuple(windows)
+        # Fixed session-open protection. Europe/America openings are usually sharper than Asia.
+        if info.minutes_from_open <= SESSION_OPEN_HARD_BLOCK_MINUTES and info.name in {"EUROPE", "AMERICA"} and not calm:
+            return GuardVerdict("BLOCK", "SESSION_GUARD", f"{label}؛ کندل/حجم/ATR هنوز عادی نشده.", 0, payload)
+        if not calm and info.name in {"EUROPE", "AMERICA"}:
+            return GuardVerdict("REAL_BLOCK", "SESSION_GUARD", f"{label}؛ شروع سشن هنوز نوسانی است، Real بسته می‌شود.", SESSION_OPEN_REAL_BLOCK_MIN_CONFIDENCE, payload)
+        if not calm:
+            return GuardVerdict("CAUTION", "SESSION_GUARD", f"{label}؛ بازار هنوز کاملاً آرام نیست.", SESSION_OPEN_CAUTION_MIN_CONFIDENCE, payload)
+        if info.minutes_from_open <= SESSION_OPEN_HARD_BLOCK_MINUTES:
+            return GuardVerdict("CAUTION", "SESSION_GUARD", f"{label}؛ بازار آرام است ولی شروع سشن است، احتیاط سبک.", SESSION_OPEN_CAUTION_MIN_CONFIDENCE, payload)
+        return GuardVerdict()

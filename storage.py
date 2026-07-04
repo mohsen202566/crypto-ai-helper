@@ -8,7 +8,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from config import DEFAULT_LEVERAGE, DEFAULT_MARGIN_USDT, DEFAULT_MAX_POSITIONS, DEFAULT_TRADE_ENABLED, LEVERAGE_MAX, LEVERAGE_MIN, MARGIN_MAX_USDT, MARGIN_MIN_USDT, MAX_POSITIONS_MAX, MAX_POSITIONS_MIN, DB_PATH
-from utils import direction_profit_pct, json_safe, now_utc, session_bucket
+from utils import direction_profit_pct, json_safe, now_utc
+from guard_utils import half_hour_bucket, session_info, signal_time, weekday_key
 
 
 @dataclass(frozen=True)
@@ -33,13 +34,10 @@ class StoredSignal:
     features_key: str
     approx_pnl: float | None
     real_pnl: float | None
-    gross_pnl: float | None = None
-    fee_usdt: float | None = None
-    net_pnl: float | None = None
-    best_price: float = 0.0
-    worst_price: float = 0.0
-    mfe_pct: float = 0.0
-    mae_pct: float = 0.0
+    best_price: float
+    worst_price: float
+    mfe_pct: float
+    mae_pct: float
 
 
 class Storage:
@@ -96,10 +94,6 @@ class Storage:
                     reason TEXT,
                     approx_pnl REAL,
                     real_pnl REAL,
-                    gross_pnl REAL,
-                    fee_usdt REAL,
-                    net_pnl REAL,
-                    stop_reason TEXT,
                     result_source TEXT,
                     result_at TEXT,
                     exit_price REAL,
@@ -121,28 +115,16 @@ class Storage:
             conn.execute("CREATE TABLE IF NOT EXISTS indicator_requests(id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, indicator TEXT, reason TEXT, status TEXT DEFAULT 'open')")
             conn.execute("CREATE TABLE IF NOT EXISTS toobit_orders(id INTEGER PRIMARY KEY AUTOINCREMENT, signal_id INTEGER, symbol TEXT, action TEXT, order_id TEXT, status TEXT, reason TEXT, created_at TEXT)")
             conn.execute("CREATE TABLE IF NOT EXISTS no_signal_log(id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, symbol_name TEXT, direction TEXT, reason TEXT, features_key TEXT)")
-            conn.execute("CREATE TABLE IF NOT EXISTS guard_state(name TEXT PRIMARY KEY, level TEXT, cooldown_until TEXT, reason TEXT, updated_at TEXT)")
-            conn.execute("CREATE TABLE IF NOT EXISTS fundamental_events(event_id TEXT PRIMARY KEY, title TEXT NOT NULL, source TEXT, event_time TEXT NOT NULL, severity TEXT, category TEXT, url TEXT, last_seen TEXT)")
-            conn.execute("CREATE TABLE IF NOT EXISTS fundamental_alerts(event_id TEXT NOT NULL, alert_type TEXT NOT NULL, sent_at TEXT NOT NULL, PRIMARY KEY(event_id, alert_type))")
-            conn.execute("CREATE TABLE IF NOT EXISTS stop_reason_profiles(symbol_name TEXT NOT NULL, direction TEXT NOT NULL, session_bucket TEXT NOT NULL, market_state TEXT NOT NULL, alignment TEXT NOT NULL, common_reason TEXT NOT NULL, samples INTEGER DEFAULT 0, tp_count INTEGER DEFAULT 0, sl_count INTEGER DEFAULT 0, win_rate REAL DEFAULT 0, net_profit REAL DEFAULT 0, last_reason TEXT, last_seen TEXT, PRIMARY KEY(symbol_name, direction, session_bucket, market_state, alignment, common_reason))")
-            self._migrate_schema(conn)
+            conn.execute("CREATE TABLE IF NOT EXISTS guard_alerts(alert_key TEXT PRIMARY KEY, guard_type TEXT, title TEXT, created_at TEXT NOT NULL)")
+            conn.execute("CREATE TABLE IF NOT EXISTS guard_events(id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, guard_type TEXT, severity TEXT, reason TEXT, action TEXT, payload TEXT)")
+            conn.execute("CREATE TABLE IF NOT EXISTS time_risk_profiles(profile_key TEXT PRIMARY KEY, scope TEXT, symbol_name TEXT, direction TEXT, session_name TEXT, hour_bucket TEXT, weekday TEXT, samples INTEGER DEFAULT 0, tp INTEGER DEFAULT 0, sl INTEGER DEFAULT 0, max_consecutive_sl INTEGER DEFAULT 0, risk_score INTEGER DEFAULT 0, main_cause TEXT, action TEXT DEFAULT 'ALLOW', last_updated TEXT)")
+            self._set_default(conn, "guard_cooldown_until", "")
+            self._set_default(conn, "guard_cooldown_reason", "")
             self._set_default(conn, "trade_enabled", "1" if DEFAULT_TRADE_ENABLED else "0")
             self._set_default(conn, "margin_usdt", str(DEFAULT_MARGIN_USDT))
             self._set_default(conn, "leverage", str(DEFAULT_LEVERAGE))
             self._set_default(conn, "max_positions", str(DEFAULT_MAX_POSITIONS))
             self._set_default(conn, "auto_signals_enabled", "1")
-
-    def _migrate_schema(self, conn: sqlite3.Connection) -> None:
-        existing = {row["name"] for row in conn.execute("PRAGMA table_info(signals)").fetchall()}
-        additions = {
-            "gross_pnl": "REAL",
-            "fee_usdt": "REAL",
-            "net_pnl": "REAL",
-            "stop_reason": "TEXT",
-        }
-        for column, decl in additions.items():
-            if column not in existing:
-                conn.execute(f"ALTER TABLE signals ADD COLUMN {column} {decl}")
 
     def _set_default(self, conn: sqlite3.Connection, key: str, value: str) -> None:
         conn.execute("INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)", (key, value))
@@ -267,15 +249,9 @@ class Storage:
             conn.execute("INSERT INTO signal_snapshots(signal_id, created_at, price, mfe_pct, mae_pct) VALUES(?, ?, ?, ?, ?)", (signal.id, now_utc().isoformat(), price, mfe, mae))
         return mfe, mae
 
-    def finish_signal(self, signal_id: int, *, status: str, exit_price: float, approx_pnl: float, real_pnl: float | None, result_message_id: int | None, result_source: str, mfe_pct: float, mae_pct: float, gross_pnl: float | None = None, fee_usdt: float | None = None, net_pnl: float | None = None, stop_reason: str | None = None) -> bool:
-        if gross_pnl is None:
-            gross_pnl = approx_pnl
-        if fee_usdt is None:
-            fee_usdt = 0.0
-        if net_pnl is None:
-            net_pnl = approx_pnl
+    def finish_signal(self, signal_id: int, *, status: str, exit_price: float, approx_pnl: float, real_pnl: float | None, result_message_id: int | None, result_source: str, mfe_pct: float, mae_pct: float) -> bool:
         with self._connect() as conn:
-            cur = conn.execute("UPDATE signals SET status=?, exit_price=?, approx_pnl=?, real_pnl=?, gross_pnl=?, fee_usdt=?, net_pnl=?, stop_reason=?, result_message_id=?, result_source=?, result_at=?, mfe_pct=?, mae_pct=? WHERE id=? AND status='OPEN'", (status, exit_price, net_pnl, real_pnl, gross_pnl, fee_usdt, net_pnl, stop_reason, result_message_id, result_source, now_utc().isoformat(), mfe_pct, mae_pct, signal_id))
+            cur = conn.execute("UPDATE signals SET status=?, exit_price=?, approx_pnl=?, real_pnl=?, result_message_id=?, result_source=?, result_at=?, mfe_pct=?, mae_pct=? WHERE id=? AND status='OPEN'", (status, exit_price, approx_pnl, real_pnl, result_message_id, result_source, now_utc().isoformat(), mfe_pct, mae_pct, signal_id))
             return cur.rowcount > 0
 
     def register_shadows(self, signal_id: int, shadows: tuple[tuple[str, float, float], ...]) -> None:
@@ -314,90 +290,6 @@ class Storage:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def get_guard_state(self, name: str) -> dict[str, Any]:
-        with self._connect() as conn:
-            row = conn.execute("SELECT * FROM guard_state WHERE name=?", (name,)).fetchone()
-            return dict(row) if row else {}
-
-    def set_guard_state(self, name: str, level: str, cooldown_until: str | None, reason: str) -> None:
-        with self._connect() as conn:
-            conn.execute("INSERT INTO guard_state(name, level, cooldown_until, reason, updated_at) VALUES(?, ?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET level=excluded.level, cooldown_until=excluded.cooldown_until, reason=excluded.reason, updated_at=excluded.updated_at", (name, level, cooldown_until, reason[:1000], now_utc().isoformat()))
-
-    def clear_guard_state(self, name: str) -> None:
-        with self._connect() as conn:
-            conn.execute("DELETE FROM guard_state WHERE name=?", (name,))
-
-    def recent_closed_signals(self, *, minutes: int = 60, limit: int = 30) -> list[dict[str, Any]]:
-        since = (now_utc() - timedelta(minutes=minutes)).isoformat()
-        with self._connect() as conn:
-            rows = conn.execute("SELECT * FROM signals WHERE status IN ('TP','SL') AND result_at>=? ORDER BY result_at DESC, id DESC LIMIT ?", (since, int(max(1, min(limit, 200))))).fetchall()
-        return [dict(row) for row in rows]
-
-    def upsert_fundamental_event(self, event) -> None:
-        with self._connect() as conn:
-            conn.execute("INSERT INTO fundamental_events(event_id, title, source, event_time, severity, category, url, last_seen) VALUES(?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(event_id) DO UPDATE SET title=excluded.title, source=excluded.source, event_time=excluded.event_time, severity=excluded.severity, category=excluded.category, url=excluded.url, last_seen=excluded.last_seen", (event.event_id, event.title, event.source, event.event_time.isoformat(), event.severity, event.category, event.url, now_utc().isoformat()))
-
-    def active_fundamental_events(self, *, now_iso: str, before_minutes: int, after_minutes: int) -> list[dict[str, Any]]:
-        now_dt = datetime.fromisoformat(now_iso)
-        start = (now_dt - timedelta(minutes=after_minutes)).isoformat()
-        end = (now_dt + timedelta(minutes=before_minutes)).isoformat()
-        with self._connect() as conn:
-            rows = conn.execute("SELECT * FROM fundamental_events WHERE category IN ('MARKET_WIDE_HIGH','MARKET_WIDE_MEDIUM') AND event_time BETWEEN ? AND ? ORDER BY event_time ASC", (start, end)).fetchall()
-        return [dict(row) for row in rows]
-
-    def due_fundamental_alerts(self, *, now_iso: str, before_minutes: int) -> list[dict[str, Any]]:
-        now_dt = datetime.fromisoformat(now_iso)
-        start = now_dt.isoformat()
-        end = (now_dt + timedelta(minutes=before_minutes)).isoformat()
-        with self._connect() as conn:
-            rows = conn.execute("SELECT e.* FROM fundamental_events e LEFT JOIN fundamental_alerts a ON a.event_id=e.event_id AND a.alert_type='pre_5m' WHERE e.category IN ('MARKET_WIDE_HIGH','MARKET_WIDE_MEDIUM') AND e.event_time BETWEEN ? AND ? AND a.event_id IS NULL ORDER BY e.event_time ASC", (start, end)).fetchall()
-        return [dict(row) for row in rows]
-
-    def mark_fundamental_alert_sent(self, event_id: str, alert_type: str) -> None:
-        with self._connect() as conn:
-            conn.execute("INSERT OR IGNORE INTO fundamental_alerts(event_id, alert_type, sent_at) VALUES(?, ?, ?)", (event_id, alert_type, now_utc().isoformat()))
-
-    def update_signal_stop_reason(self, signal_id: int, reason: str) -> None:
-        with self._connect() as conn:
-            conn.execute("UPDATE signals SET stop_reason=? WHERE id=?", (reason[:500], signal_id))
-
-    def record_stop_reason_profile(self, signal: dict[str, Any], result_reason: str) -> None:
-        created = str(signal.get("created_at") or now_utc().isoformat())
-        try:
-            created_dt = datetime.fromisoformat(created)
-        except Exception:
-            created_dt = now_utc()
-        bucket = session_bucket(created_dt)
-        symbol = str(signal.get("symbol_name") or "")
-        direction = str(signal.get("direction") or "ALL")
-        market_state = str(signal.get("market_state") or "UNKNOWN")
-        alignment = str(signal.get("alignment") or "UNKNOWN")
-        status = str(signal.get("status") or "")
-        net = float(signal.get("net_pnl") if signal.get("net_pnl") is not None else signal.get("approx_pnl") or 0.0)
-        reason = str(result_reason or "UNKNOWN")
-        keys = [
-            (symbol, direction, bucket, market_state, alignment, reason),
-            ("ALL", direction, bucket, market_state, alignment, reason),
-            ("ALL", "ALL", bucket, "ALL", "ALL", reason),
-        ]
-        with self._connect() as conn:
-            for key in keys:
-                row = conn.execute("SELECT * FROM stop_reason_profiles WHERE symbol_name=? AND direction=? AND session_bucket=? AND market_state=? AND alignment=? AND common_reason=?", key).fetchone()
-                old_samples = int(row["samples"] or 0) if row else 0
-                old_tp = int(row["tp_count"] or 0) if row else 0
-                old_sl = int(row["sl_count"] or 0) if row else 0
-                old_net = float(row["net_profit"] or 0) if row else 0.0
-                samples = old_samples + 1
-                tp_count = old_tp + (1 if status == "TP" else 0)
-                sl_count = old_sl + (1 if status == "SL" else 0)
-                win_rate = tp_count / max(samples, 1) * 100.0
-                conn.execute("INSERT INTO stop_reason_profiles(symbol_name, direction, session_bucket, market_state, alignment, common_reason, samples, tp_count, sl_count, win_rate, net_profit, last_reason, last_seen) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(symbol_name, direction, session_bucket, market_state, alignment, common_reason) DO UPDATE SET samples=excluded.samples, tp_count=excluded.tp_count, sl_count=excluded.sl_count, win_rate=excluded.win_rate, net_profit=excluded.net_profit, last_reason=excluded.last_reason, last_seen=excluded.last_seen", (*key, samples, tp_count, sl_count, win_rate, old_net + net, reason, now_utc().isoformat()))
-
-    def get_stop_reason_profile(self, *, symbol_name: str, direction: str, session_bucket: str) -> dict[str, Any] | None:
-        with self._connect() as conn:
-            row = conn.execute("SELECT *, (sl_count * 1.0 / CASE WHEN samples=0 THEN 1 ELSE samples END) AS sl_rate FROM stop_reason_profiles WHERE symbol_name=? AND direction=? AND session_bucket=? ORDER BY sl_rate DESC, samples DESC LIMIT 1", (symbol_name, direction, session_bucket)).fetchone()
-            return dict(row) if row else None
-
     def scan_summary(self, minutes: int = 60) -> dict[str, Any]:
         since = (now_utc() - timedelta(minutes=minutes)).isoformat()
         with self._connect() as conn:
@@ -419,6 +311,122 @@ class Storage:
             "open": int(active["n"] or 0),
             "symbols_with_rejects": int(symbols["n"] or 0),
         }
+
+
+    def guard_alert_sent(self, alert_key: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute("SELECT 1 FROM guard_alerts WHERE alert_key=?", (alert_key,)).fetchone()
+            return row is not None
+
+    def mark_guard_alert_sent(self, alert_key: str, guard_type: str, title: str) -> None:
+        with self._connect() as conn:
+            conn.execute("INSERT OR IGNORE INTO guard_alerts(alert_key, guard_type, title, created_at) VALUES(?, ?, ?, ?)", (alert_key, guard_type, title[:300], now_utc().isoformat()))
+
+    def record_guard_event(self, guard_type: str, severity: str, reason: str, action: str, payload: dict[str, Any] | None = None) -> None:
+        with self._connect() as conn:
+            conn.execute("INSERT INTO guard_events(created_at, guard_type, severity, reason, action, payload) VALUES(?, ?, ?, ?, ?, ?)", (now_utc().isoformat(), guard_type, severity, reason[:1000], action, json.dumps(json_safe(payload or {}), ensure_ascii=False)))
+
+    def set_guard_cooldown(self, until_iso: str, reason: str) -> None:
+        self._set_setting("guard_cooldown_until", until_iso or "")
+        self._set_setting("guard_cooldown_reason", reason[:1000] if reason else "")
+
+    def guard_cooldown(self) -> dict[str, str]:
+        return {
+            "until": self._get_setting("guard_cooldown_until", ""),
+            "reason": self._get_setting("guard_cooldown_reason", ""),
+        }
+
+    def recent_closed_signals(self, limit: int = 20, minutes: int | None = None) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM signals WHERE status IN ('TP','SL')"
+        params: list[Any] = []
+        if minutes is not None:
+            since = (now_utc() - timedelta(minutes=int(minutes))).isoformat()
+            sql += " AND COALESCE(result_at, created_at) >= ?"
+            params.append(since)
+        sql += " ORDER BY COALESCE(result_at, created_at) DESC, id DESC LIMIT ?"
+        params.append(int(max(1, min(limit, 200))))
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_time_risk_profile(self, *, signal: dict[str, Any], result: str, cause: str) -> None:
+        dt = signal_time(signal)
+        info = session_info(dt)
+        symbol = str(signal.get("symbol_name") or "GLOBAL")
+        direction = str(signal.get("direction") or "ANY")
+        result = str(result).upper()
+        scopes = [
+            ("GLOBAL", "ALL", "ANY"),
+            ("GLOBAL_WEEKDAY", "ALL", "ANY"),
+            ("SYMBOL", symbol, "ANY"),
+            ("SYMBOL_DIRECTION", symbol, direction),
+        ]
+        weekdays = {"GLOBAL": "ANYDAY", "SYMBOL": "ANYDAY", "GLOBAL_WEEKDAY": info.weekday, "SYMBOL_DIRECTION": info.weekday}
+        with self._connect() as conn:
+            for scope, prof_symbol, prof_direction in scopes:
+                weekday = weekdays.get(scope, "ANYDAY")
+                key = "|".join([scope, prof_symbol, prof_direction, info.name, info.hour_bucket, weekday])
+                row = conn.execute("SELECT * FROM time_risk_profiles WHERE profile_key=?", (key,)).fetchone()
+                if row:
+                    samples = int(row["samples"] or 0) + 1
+                    tp = int(row["tp"] or 0) + (1 if result == "TP" else 0)
+                    sl = int(row["sl"] or 0) + (1 if result == "SL" else 0)
+                    risk = int(row["risk_score"] or 0)
+                    if result == "SL":
+                        risk += 10 if scope.startswith("GLOBAL") else 12
+                    else:
+                        risk -= 5
+                    risk = max(0, min(100, risk))
+                    max_consecutive = int(row["max_consecutive_sl"] or 0)
+                else:
+                    samples = 1
+                    tp = 1 if result == "TP" else 0
+                    sl = 1 if result == "SL" else 0
+                    risk = 10 if result == "SL" else 0
+                    max_consecutive = 1 if result == "SL" else 0
+                sl_rate = (sl / max(samples, 1)) * 100.0
+                action = "ALLOW"
+                if samples >= 4 and sl >= 3 and sl_rate >= 70:
+                    action = "BLOCK"
+                elif samples >= 3 and sl >= 2 and sl_rate >= 60:
+                    action = "REAL_BLOCK"
+                elif samples >= 2 and sl >= 2:
+                    action = "CAUTION"
+                if risk >= 70:
+                    action = "BLOCK"
+                elif risk >= 45 and action == "ALLOW":
+                    action = "REAL_BLOCK"
+                elif risk >= 25 and action == "ALLOW":
+                    action = "CAUTION"
+                conn.execute("""
+                    INSERT INTO time_risk_profiles(profile_key, scope, symbol_name, direction, session_name, hour_bucket, weekday, samples, tp, sl, max_consecutive_sl, risk_score, main_cause, action, last_updated)
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(profile_key) DO UPDATE SET
+                        samples=excluded.samples, tp=excluded.tp, sl=excluded.sl, max_consecutive_sl=MAX(time_risk_profiles.max_consecutive_sl, excluded.max_consecutive_sl),
+                        risk_score=excluded.risk_score, main_cause=excluded.main_cause, action=excluded.action, last_updated=excluded.last_updated
+                """, (key, scope, prof_symbol, prof_direction, info.name, info.hour_bucket, weekday, samples, tp, sl, max_consecutive, risk, cause, action, now_utc().isoformat()))
+
+    def get_time_risk_profile(self, *, symbol_name: str, direction: str | None = None, at: datetime | None = None) -> dict[str, Any] | None:
+        info = session_info(at)
+        symbol = str(symbol_name or "ALL")
+        direction_value = str(direction or "ANY")
+        keys = [
+            "|".join(["SYMBOL_DIRECTION", symbol, direction_value, info.name, info.hour_bucket, info.weekday]),
+            "|".join(["SYMBOL", symbol, "ANY", info.name, info.hour_bucket, "ANYDAY"]),
+            "|".join(["GLOBAL_WEEKDAY", "ALL", "ANY", info.name, info.hour_bucket, info.weekday]),
+            "|".join(["GLOBAL", "ALL", "ANY", info.name, info.hour_bucket, "ANYDAY"]),
+        ]
+        with self._connect() as conn:
+            rows = conn.execute(f"SELECT * FROM time_risk_profiles WHERE profile_key IN ({','.join('?' for _ in keys)})", keys).fetchall()
+        if not rows:
+            return None
+        rows_dict = [dict(r) for r in rows]
+        return max(rows_dict, key=lambda r: int(r.get("risk_score") or 0))
+
+    def top_time_risk_profiles(self, limit: int = 5) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM time_risk_profiles WHERE action!='ALLOW' ORDER BY risk_score DESC, sl DESC, samples DESC LIMIT ?", (int(max(1, min(limit, 20))),)).fetchall()
+        return [dict(row) for row in rows]
 
     def get_range_profile(self, features_key: str) -> dict[str, Any] | None:
         with self._connect() as conn:
@@ -484,44 +492,21 @@ class Storage:
 
     def reset_stats(self) -> None:
         with self._connect() as conn:
-            for table in ("signals", "signal_snapshots", "range_profiles", "range_observations", "shadow_tests", "historical_replay_runs", "missed_opportunities", "symbol_direction_profiles", "session_profiles", "capital_suggestions", "indicator_requests", "toobit_orders", "no_signal_log", "guard_state", "stop_reason_profiles"):
+            for table in ("signals", "signal_snapshots", "range_profiles", "range_observations", "shadow_tests", "historical_replay_runs", "missed_opportunities", "symbol_direction_profiles", "session_profiles", "capital_suggestions", "indicator_requests", "toobit_orders", "no_signal_log", "guard_events", "guard_alerts", "time_risk_profiles"):
                 conn.execute(f"DELETE FROM {table}")
+            conn.execute("INSERT INTO settings(key, value) VALUES('guard_cooldown_until', '') ON CONFLICT(key) DO UPDATE SET value='' ")
+            conn.execute("INSERT INTO settings(key, value) VALUES('guard_cooldown_reason', '') ON CONFLICT(key) DO UPDATE SET value='' ")
 
     def _stats_from_rows(self, rows: list[sqlite3.Row]) -> dict[str, Any]:
-        def row_net(row: sqlite3.Row) -> float:
-            try:
-                if row["net_pnl"] is not None:
-                    return float(row["net_pnl"] or 0.0)
-            except Exception:
-                pass
-            return float(row["real_pnl"] if row["real_pnl"] is not None else row["approx_pnl"] or 0.0)
-
-        def subset_stats(subset: list[sqlite3.Row]) -> dict[str, Any]:
-            closed = [r for r in subset if str(r["status"]) in {"TP", "SL"}]
-            tp = sum(1 for r in closed if str(r["status"]) == "TP")
-            sl = sum(1 for r in closed if str(r["status"]) == "SL")
-            net = sum(row_net(r) for r in subset)
-            gross = sum(float(r["gross_pnl"] or 0.0) if "gross_pnl" in r.keys() else 0.0 for r in subset)
-            fee = sum(float(r["fee_usdt"] or 0.0) if "fee_usdt" in r.keys() else 0.0 for r in subset)
-            return {"total": len(subset), "open": sum(1 for r in subset if str(r["status"]) == "OPEN"), "closed": len(closed), "tp": tp, "sl": sl, "win_rate": tp / len(closed) * 100.0 if closed else 0.0, "net_pnl": net, "gross_pnl": gross, "fee_usdt": fee}
-
-        normal_rows = [r for r in rows if str(r["signal_type"]) == "normal"]
-        real_rows = [r for r in rows if str(r["signal_type"]) == "real"]
-        all_stats = subset_stats(rows)
-        normal_stats = subset_stats(normal_rows)
-        real_stats = subset_stats(real_rows)
-        all_stats.update({
-            "real": len(real_rows),
-            "normal": len(normal_rows),
-            "pnl": all_stats["net_pnl"],
-            "normal_net_pnl": normal_stats["net_pnl"],
-            "real_net_pnl": real_stats["net_pnl"],
-            "normal_stats": normal_stats,
-            "real_stats": real_stats,
-        })
-        return all_stats
+        closed = [r for r in rows if str(r["status"]) in {"TP", "SL"}]
+        tp = sum(1 for r in closed if str(r["status"]) == "TP")
+        sl = sum(1 for r in closed if str(r["status"]) == "SL")
+        real = sum(1 for r in rows if str(r["signal_type"]) == "real")
+        normal = sum(1 for r in rows if str(r["signal_type"]) == "normal")
+        pnl = sum(float(r["real_pnl"] if r["real_pnl"] is not None else r["approx_pnl"] or 0.0) for r in rows)
+        return {"total": len(rows), "open": sum(1 for r in rows if str(r["status"]) == "OPEN"), "closed": len(closed), "real": real, "normal": normal, "tp": tp, "sl": sl, "win_rate": tp / len(closed) * 100.0 if closed else 0.0, "pnl": pnl}
 
     def _row_to_signal(self, row: sqlite3.Row) -> StoredSignal:
         return StoredSignal(
-            id=int(row["id"]), created_at=str(row["created_at"]), okx_symbol=str(row["okx_symbol"]), toobit_symbol=str(row["toobit_symbol"]), symbol_name=str(row["symbol_name"]), direction=str(row["direction"]), entry=float(row["entry"]), tp=float(row["tp"]), sl=float(row["sl"]), status=str(row["status"]), signal_type=str(row["signal_type"]), real_status=str(row["real_status"]), message_id=row["message_id"], result_message_id=row["result_message_id"], order_id=row["order_id"], margin_usdt=float(row["margin_usdt"]), leverage=int(row["leverage"]), features_key=str(row["features_key"] or ""), approx_pnl=row["approx_pnl"], real_pnl=row["real_pnl"], gross_pnl=row["gross_pnl"] if "gross_pnl" in row.keys() else None, fee_usdt=row["fee_usdt"] if "fee_usdt" in row.keys() else None, net_pnl=row["net_pnl"] if "net_pnl" in row.keys() else None, best_price=float(row["best_price"] or row["entry"]), worst_price=float(row["worst_price"] or row["entry"]), mfe_pct=float(row["mfe_pct"] or 0), mae_pct=float(row["mae_pct"] or 0)
+            id=int(row["id"]), created_at=str(row["created_at"]), okx_symbol=str(row["okx_symbol"]), toobit_symbol=str(row["toobit_symbol"]), symbol_name=str(row["symbol_name"]), direction=str(row["direction"]), entry=float(row["entry"]), tp=float(row["tp"]), sl=float(row["sl"]), status=str(row["status"]), signal_type=str(row["signal_type"]), real_status=str(row["real_status"]), message_id=row["message_id"], result_message_id=row["result_message_id"], order_id=row["order_id"], margin_usdt=float(row["margin_usdt"]), leverage=int(row["leverage"]), features_key=str(row["features_key"] or ""), approx_pnl=row["approx_pnl"], real_pnl=row["real_pnl"], best_price=float(row["best_price"] or row["entry"]), worst_price=float(row["worst_price"] or row["entry"]), mfe_pct=float(row["mfe_pct"] or 0), mae_pct=float(row["mae_pct"] or 0)
         )
