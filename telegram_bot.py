@@ -11,6 +11,7 @@ from config import load_settings, set_leverage, set_max_positions, set_trade_amo
 from signal_manager import Signal
 from stats_manager import StatsManager
 from slot_manager import SlotManager
+from toobit_client import get_client
 
 PERSIAN_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")
 
@@ -61,6 +62,14 @@ def result_message(signal: Signal, is_tp: bool) -> str:
     )
 
 
+def toobit_margin_status() -> tuple[str, str]:
+    try:
+        margin = get_client().get_wallet_margin_usdt()
+        return "وصل", f"{margin:.4f} دلار"
+    except Exception:
+        return "قطع", "نامشخص"
+
+
 def trade_panel_message(stats_manager: StatsManager, slot_manager: SlotManager) -> str:
     settings = load_settings()
     slot_manager.clear_expired()
@@ -70,9 +79,12 @@ def trade_panel_message(stats_manager: StatsManager, slot_manager: SlotManager) 
     free_slots = max(settings.max_positions - used_slots, 0)
     today_pnl = stats_manager.today_net_pnl()
     trade_status = "فعال" if settings.trade_enabled else "غیرفعال"
+    toobit_status, toobit_margin = toobit_margin_status()
     return (
         "📊 پنل ترید\n\n"
         f"ترید: {trade_status}\n"
+        f"توبیت: {toobit_status}\n"
+        f"مارجین توبیت: {toobit_margin}\n"
         f"اسلات‌های پر: {used_slots}\n"
         f"اسلات‌های خالی: {free_slots}\n"
         f"لوریج: {settings.leverage}\n"
