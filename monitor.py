@@ -7,7 +7,7 @@ from learning_engine import LearningEngine
 from okx_data import OkxDataClient
 from storage import Storage, StoredSignal
 from toobit_client import ToobitClient
-from utils import net_pnl_for_exit
+from utils import direction_profit_pct
 
 
 class SignalMonitor:
@@ -75,7 +75,8 @@ class SignalMonitor:
 
     @staticmethod
     def _approx_pnl(signal: StoredSignal, exit_price: float) -> float:
-        return net_pnl_for_exit(signal.direction, signal.entry, exit_price, signal.margin_usdt, signal.leverage)
+        pct = direction_profit_pct(signal.direction, signal.entry, exit_price)
+        return signal.margin_usdt * signal.leverage * pct
 
     async def _real_pnl(self, signal: StoredSignal) -> float | None:
         try:

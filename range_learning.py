@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from config import BOOT_NORMAL_SAMPLE_LIMIT, INITIAL_SOFT_MODE, REAL_MIN_SAMPLES, TIMEFRAME_ENTRY
+from config import BOOT_NORMAL_SAMPLE_LIMIT, INITIAL_SOFT_MODE, REAL_MIN_SAMPLES
 from indicators import IndicatorSnapshot
 from market_context import MarketContextResult
 from market_state import MarketStateResult
@@ -14,7 +14,6 @@ Direction = Literal["LONG", "SHORT"]
 
 @dataclass(frozen=True)
 class RangeFeatures:
-    timeframe: str
     symbol_name: str
     direction: Direction
     session: str
@@ -31,7 +30,7 @@ class RangeFeatures:
 
     @property
     def key(self) -> str:
-        return "|".join((self.timeframe, self.symbol_name, self.direction, self.session, self.market_state, self.alignment, self.rsi_bin, self.adx_bin, self.atr_bin, self.volume_bin, self.vwap_bin, self.ema_gap_bin, self.di_bin))
+        return "|".join((self.symbol_name, self.direction, self.session, self.market_state, self.alignment, self.rsi_bin, self.adx_bin, self.atr_bin, self.volume_bin, self.vwap_bin, self.ema_gap_bin, self.di_bin))
 
 
 @dataclass(frozen=True)
@@ -61,7 +60,6 @@ class RangeLearningEngine:
             "di_edge": di_edge,
         }
         return RangeFeatures(
-            timeframe=TIMEFRAME_ENTRY,
             symbol_name=symbol_name,
             direction=direction,
             session=session_bucket(),

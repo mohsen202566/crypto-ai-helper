@@ -377,34 +377,10 @@ class Storage:
         closed = [r for r in rows if str(r["status"]) in {"TP", "SL"}]
         tp = sum(1 for r in closed if str(r["status"]) == "TP")
         sl = sum(1 for r in closed if str(r["status"]) == "SL")
-        real_rows = [r for r in rows if str(r["signal_type"]) == "real"]
-        normal_rows = [r for r in rows if str(r["signal_type"]) == "normal"]
-        real_closed = [r for r in real_rows if str(r["status"]) in {"TP", "SL"}]
-        normal_closed = [r for r in normal_rows if str(r["status"]) in {"TP", "SL"}]
-
-        def row_net(row: sqlite3.Row) -> float:
-            return float(row["real_pnl"] if row["real_pnl"] is not None else row["approx_pnl"] or 0.0)
-
-        real_pnl = sum(row_net(r) for r in real_rows)
-        normal_pnl = sum(row_net(r) for r in normal_rows)
-        pnl = real_pnl + normal_pnl
-        return {
-            "total": len(rows),
-            "open": sum(1 for r in rows if str(r["status"]) == "OPEN"),
-            "closed": len(closed),
-            "real": len(real_rows),
-            "normal": len(normal_rows),
-            "tp": tp,
-            "sl": sl,
-            "win_rate": tp / len(closed) * 100.0 if closed else 0.0,
-            "pnl": pnl,
-            "real_pnl": real_pnl,
-            "normal_pnl": normal_pnl,
-            "real_tp": sum(1 for r in real_closed if str(r["status"]) == "TP"),
-            "real_sl": sum(1 for r in real_closed if str(r["status"]) == "SL"),
-            "normal_tp": sum(1 for r in normal_closed if str(r["status"]) == "TP"),
-            "normal_sl": sum(1 for r in normal_closed if str(r["status"]) == "SL"),
-        }
+        real = sum(1 for r in rows if str(r["signal_type"]) == "real")
+        normal = sum(1 for r in rows if str(r["signal_type"]) == "normal")
+        pnl = sum(float(r["real_pnl"] if r["real_pnl"] is not None else r["approx_pnl"] or 0.0) for r in rows)
+        return {"total": len(rows), "open": sum(1 for r in rows if str(r["status"]) == "OPEN"), "closed": len(closed), "real": real, "normal": normal, "tp": tp, "sl": sl, "win_rate": tp / len(closed) * 100.0 if closed else 0.0, "pnl": pnl}
 
     def _row_to_signal(self, row: sqlite3.Row) -> StoredSignal:
         return StoredSignal(

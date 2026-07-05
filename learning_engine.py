@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from storage import Storage
-from utils import net_pnl_for_exit
+from utils import direction_profit_pct
 
 
 class LearningEngine:
@@ -20,7 +20,8 @@ class LearningEngine:
         direction = str(signal.get("direction"))
         margin = float(signal.get("margin_usdt") or 0)
         leverage = int(signal.get("leverage") or 1)
-        approx_net = net_pnl_for_exit(direction, entry, exit_price, margin, leverage)
+        profit_pct = direction_profit_pct(direction, entry, exit_price)
+        approx_net = margin * leverage * profit_pct
         real_pnl = signal.get("real_pnl")
         net_profit = float(real_pnl) if real_pnl is not None else approx_net
         features_key = str(signal.get("features_key") or "")

@@ -7,7 +7,7 @@ from ai_brain import SignalDecision
 from config import BOT_NAME, OWNER_ID, TELEGRAM_CHAT_ID
 from storage import Storage, StoredSignal
 from trade_manager import CreatedSignal, TradeManager
-from utils import gross_pnl_for_exit, money, normalize_digits, parse_float, parse_int, pct, round_trip_fee_usdt, total_round_trip_cost_rate
+from utils import money, normalize_digits, parse_float, parse_int, pct
 
 
 class TelegramBotUI:
@@ -101,8 +101,6 @@ class TelegramBotUI:
         status_icon = self._result_icon(status)
         direction_icon = self._direction_icon(signal.direction)
         status_label = status.upper()
-        gross_pnl = gross_pnl_for_exit(signal.direction, signal.entry, exit_price, signal.margin_usdt, signal.leverage)
-        fee_cost = round_trip_fee_usdt(signal.margin_usdt, signal.leverage)
         text = (
             f"{status_icon} نتیجه سیگنال: {status_label}\n"
             f"━━━━━━━━━━━━━━\n"
@@ -113,12 +111,10 @@ class TelegramBotUI:
             f"خروج: {exit_price:.8f}\n"
             f"TP: {signal.tp:.8f}\n"
             f"SL: {signal.sl:.8f}\n\n"
-            f"سود/ضرر خام: {money(gross_pnl)}\n"
-            f"کارمزد/بافر رفت‌وبرگشت: -{fee_cost:.4f} USDT\n"
-            f"سود/ضرر خالص تقریبی: {money(approx_pnl)}\n"
+            f"سود/ضرر تقریبی: {money(approx_pnl)}\n"
             f"سود/ضرر واقعی Toobit: {money(real_pnl)}\n"
             f"MFE: {pct(signal.mfe_pct)} | MAE: {pct(signal.mae_pct)}\n\n"
-            f"دلیل استاپ/نتیجه در حافظه AI با سود خالص ثبت شد."
+            f"دلیل استاپ/نتیجه در حافظه AI ثبت شد."
         )
         msg = await self.app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, reply_to_message_id=signal.message_id)
         return msg.message_id
@@ -137,11 +133,8 @@ class TelegramBotUI:
             f"اسلات واقعی: {data.filled_slots}/{data.max_positions} | خالی {data.empty_slots} | درحال بازشدن {data.pending_slots}\n"
             f"موجودی Toobit: {money(data.wallet_margin_usdt)}\n"
             f"پوزیشن/سفارش صرافی: {data.exchange_open_positions}/{data.exchange_open_orders}\n"
-            f"PNL امروز کل خالص: {money(float(data.today_stats.get('pnl', 0)))}\n"
-            f"Real امروز: {data.today_stats.get('real_tp', 0)}/{data.today_stats.get('real_sl', 0)} | Net {money(float(data.today_stats.get('real_pnl', 0)))}\n"
-            f"Normal امروز: {data.today_stats.get('normal_tp', 0)}/{data.today_stats.get('normal_sl', 0)} | Net {money(float(data.today_stats.get('normal_pnl', 0)))}\n"
-            f"TP/SL امروز کل: {data.today_stats.get('tp', 0)}/{data.today_stats.get('sl', 0)} | WinRate {data.today_stats.get('win_rate', 0):.1f}%\n"
-            f"Fee Mode: Taker x2 + buffer = {total_round_trip_cost_rate()*100:.3f}%\n\n"
+            f"PNL امروز ربات: {money(float(data.today_stats.get('pnl', 0)))}\n"
+            f"TP/SL امروز: {data.today_stats.get('tp', 0)}/{data.today_stats.get('sl', 0)} | WinRate {data.today_stats.get('win_rate', 0):.1f}%\n\n"
             f"نکته: اگر اتوسیگنال خاموش باشد سیگنال جدید صادر نمی‌شود؛ اما سیگنال‌های باز همچنان مانیتور و نتیجه‌شان ثبت می‌شود.\n\n"
             f"دستورات مهم:\n"
             f"ترید | اتو سیگنال روشن | اتو سیگنال خاموش\n"
@@ -159,8 +152,7 @@ class TelegramBotUI:
             f"Real: {stats['real']} | Normal: {stats['normal']}\n"
             f"TP: {stats['tp']} | SL: {stats['sl']}\n"
             f"WinRate: {stats['win_rate']:.1f}%\n"
-            f"Real Net: {money(stats.get('real_pnl', 0.0))} | Normal Net: {money(stats.get('normal_pnl', 0.0))}\n"
-            f"سود/ضرر کل خالص: {money(stats['pnl'])}"
+            f"سود/ضرر کل: {money(stats['pnl'])}"
         )
 
     def ai_text(self) -> str:

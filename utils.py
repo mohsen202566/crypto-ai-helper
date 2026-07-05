@@ -54,26 +54,11 @@ def total_round_trip_cost_rate() -> float:
     return (TAKER_FEE_RATE * 2.0) + SLIPPAGE_BUFFER_RATE
 
 
-def round_trip_fee_usdt(margin_usdt: float, leverage: int) -> float:
-    notional = max(margin_usdt * leverage, 0.0)
-    return notional * total_round_trip_cost_rate()
-
-
 def net_profit_for_move(margin_usdt: float, leverage: int, move_pct: float) -> float:
     notional = margin_usdt * leverage
     gross = notional * move_pct
     costs = notional * total_round_trip_cost_rate()
     return gross - costs
-
-
-def net_pnl_for_exit(direction: str, entry: float, exit_price: float, margin_usdt: float, leverage: int) -> float:
-    move_pct = direction_profit_pct(direction, entry, exit_price)
-    return net_profit_for_move(margin_usdt, leverage, move_pct)
-
-
-def gross_pnl_for_exit(direction: str, entry: float, exit_price: float, margin_usdt: float, leverage: int) -> float:
-    move_pct = direction_profit_pct(direction, entry, exit_price)
-    return margin_usdt * leverage * move_pct
 
 
 def required_move_for_min_profit(margin_usdt: float, leverage: int, min_profit: float = MIN_NET_PROFIT_USDT) -> float:

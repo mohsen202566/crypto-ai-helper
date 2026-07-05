@@ -6,7 +6,7 @@ import logging
 from telegram.ext import Application, MessageHandler, filters
 
 from ai_brain import AIBrain, AnalysisInput
-from config import CONTEXT_SYMBOLS, MONITOR_SECONDS, RUN_REPLAY_ON_START, SCANNER_SECONDS, TELEGRAM_BOT_TOKEN, TIMEFRAMES, ensure_runtime_config
+from config import CONTEXT_SYMBOLS, MONITOR_SECONDS, RUN_REPLAY_ON_START, SCANNER_SECONDS, TELEGRAM_BOT_TOKEN, TIMEFRAME_1H, TIMEFRAMES, ensure_runtime_config
 from historical_replay import HistoricalReplayEngine
 from monitor import SignalMonitor
 from okx_data import OkxDataClient
@@ -16,32 +16,24 @@ from telegram_bot import TelegramBotUI
 from toobit_client import get_client
 from trade_manager import TradeManager
 
-LOGGER = logging.getLogger("ai_range_1h_bot")
+LOGGER = logging.getLogger("ai_range_5m_bot")
 
 
-async def load_context(okx: OkxDataClient) -> dict[str, dict[str, list]]:
-    cache: dict[str, dict[str, list]] = {}
+async def load_context(okx: OkxDataClient) -> dict[str, list]:
+    cache: dict[str, list] = {}
     for inst_id in CONTEXT_SYMBOLS:
         try:
-            cache[inst_id] = await asyncio.to_thread(okx.get_multi_timeframe, inst_id, TIMEFRAMES)
+            cache[inst_id] = await asyncio.to_thread(okx.get_candles, inst_id, TIMEFRAME_1H)
         except Exception as exc:
             LOGGER.warning("context error %s: %s", inst_id, exc)
     return cache
 
 
-async def analyze_symbol(okx: OkxDataClient, brain: AIBrain, symbol: MarketSymbol, context_cache: dict[str, dict[str, list]]):
+async def analyze_symbol(okx: OkxDataClient, brain: AIBrain, symbol: MarketSymbol, context_cache: dict[str, list]):
     candles_task = asyncio.to_thread(okx.get_multi_timeframe, symbol.okx_inst_id, TIMEFRAMES)
     price_task = asyncio.to_thread(okx.get_last_price, symbol.okx_inst_id)
     candles_by_tf, live_price = await asyncio.gather(candles_task, price_task)
-    return brain.analyze(
-        AnalysisInput(
-            symbol_name=symbol.name,
-            candles_by_tf=candles_by_tf,
-            btc_candles_by_tf=context_cache.get(CONTEXT_SYMBOLS[0]),
-            eth_candles_by_tf=context_cache.get(CONTEXT_SYMBOLS[1]),
-            live_price=live_price,
-        )
-    )
+    return brain.analyze(AnalysisInput(symbol_name=symbol.name, candles_by_tf=candles_by_tf, btc_1h=context_cache.get(CONTEXT_SYMBOLS[0]), eth_1h=context_cache.get(CONTEXT_SYMBOLS[1]), live_price=live_price))
 
 
 async def scanner_loop(okx: OkxDataClient, brain: AIBrain, trade_manager: TradeManager, ui: TelegramBotUI, storage: Storage) -> None:

@@ -5,7 +5,7 @@ from typing import Any
 
 import requests
 
-from config import MIN_ENTRY_CANDLES, MIN_HTF_CANDLES, OKX_BASE_URL, OKX_CANDLE_LIMIT, OKX_TIMEOUT_SECONDS, TIMEFRAMES, TIMEFRAME_ENTRY
+from config import MIN_ENTRY_CANDLES, MIN_HTF_CANDLES, OKX_BASE_URL, OKX_CANDLE_LIMIT, OKX_TIMEOUT_SECONDS, TIMEFRAMES
 
 
 @dataclass(frozen=True)
@@ -28,7 +28,7 @@ class OkxDataClient:
     def get_candles(self, inst_id: str, timeframe: str, limit: int = OKX_CANDLE_LIMIT) -> list[Candle]:
         payload = self._get("/api/v5/market/candles", {"instId": inst_id, "bar": timeframe, "limit": str(limit)})
         candles = self._parse_candles(payload, inst_id, timeframe)
-        minimum = MIN_ENTRY_CANDLES if timeframe == TIMEFRAME_ENTRY else MIN_HTF_CANDLES
+        minimum = MIN_ENTRY_CANDLES if timeframe == "5m" else MIN_HTF_CANDLES
         if len(candles) < minimum:
             raise RuntimeError(f"کندل کافی برای {inst_id} تایم {timeframe} نیست: {len(candles)} / حداقل {minimum}")
         return candles
