@@ -10,6 +10,7 @@ from telegram.ext import Application, ContextTypes, MessageHandler, filters
 from config import load_settings, set_leverage, set_max_positions, set_trade_amount, set_trade_enabled
 from signal_manager import Signal
 from stats_manager import StatsManager
+from slot_manager import SlotManager
 
 PERSIAN_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")
 
@@ -60,6 +61,26 @@ def result_message(signal: Signal, is_tp: bool) -> str:
     )
 
 
+def trade_panel_message(stats_manager: StatsManager, slot_manager: SlotManager) -> str:
+    settings = load_settings()
+    slot_manager.clear_expired()
+    real_open = stats_manager.store.open_real_count()
+    reserved = len(slot_manager.reserved_slots())
+    used_slots = min(settings.max_positions, real_open + reserved)
+    free_slots = max(settings.max_positions - used_slots, 0)
+    today_pnl = stats_manager.today_net_pnl()
+    trade_status = "فعال" if settings.trade_enabled else "غیرفعال"
+    return (
+        "📊 پنل ترید\n\n"
+        f"ترید: {trade_status}\n"
+        f"اسلات‌های پر: {used_slots}\n"
+        f"اسلات‌های خالی: {free_slots}\n"
+        f"لوریج: {settings.leverage}\n"
+        f"دلار هر ترید: {settings.trade_amount_usdt:.2f}\n"
+        f"سود یا ضرر امروز: {today_pnl:.4f} دلار"
+    )
+
+
 def format_duration(start: float, end: float) -> str:
     seconds = max(0, int(end - start))
     hours = seconds // 3600
@@ -70,9 +91,10 @@ def format_duration(start: float, end: float) -> str:
 
 
 class PersianTelegramBot:
-    def __init__(self, token: str, stats_manager: StatsManager) -> None:
+    def __init__(self, token: str, stats_manager: StatsManager, slot_manager: SlotManager) -> None:
         self.app = Application.builder().token(token).build()
         self.stats_manager = stats_manager
+        self.slot_manager = slot_manager
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text))
 
     async def handle_text(self, update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -80,6 +102,10 @@ class PersianTelegramBot:
         if message is None or message.text is None:
             return
         text = message.text.strip()
+
+        if text == "ترید":
+            await message.reply_text(trade_panel_message(self.stats_manager, self.slot_manager))
+            return
 
         if text == "ترید روشن":
             set_trade_enabled(True)

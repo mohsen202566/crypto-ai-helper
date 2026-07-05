@@ -39,7 +39,7 @@ class BotRuntime:
         self.slots = SlotManager(self.store)
         self.executor = TradeExecutor(self.slots)
         self.stats = StatsManager(self.store)
-        self.telegram = PersianTelegramBot(token, self.stats)
+        self.telegram = PersianTelegramBot(token, self.stats, self.slots)
 
     async def run(self) -> None:
         await self.telegram.app.initialize()

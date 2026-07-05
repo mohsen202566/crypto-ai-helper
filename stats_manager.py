@@ -10,6 +10,11 @@ class StatsManager:
     def __init__(self, store: SignalStore) -> None:
         self.store = store
 
+    def today_net_pnl(self) -> float:
+        signals = self.store.all()
+        today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        return sum((s.net_pnl or 0.0) for s in signals if s.status != "باز" and (s.closed_at or 0) >= today_start)
+
     def render_stats(self) -> str:
         signals = self.store.all()
         open_items = [s for s in signals if s.status == "باز"]
@@ -20,7 +25,7 @@ class StatsManager:
         normal = [s for s in signals if s.signal_type == "نرمال"]
         total_net = sum(s.net_pnl or 0.0 for s in closed)
         today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
-        today_net = sum(s.net_pnl or 0.0 for s in closed if (s.closed_at or 0) >= today_start)
+        today_net = self.today_net_pnl()
         win_rate = (len(tp) / len(closed) * 100) if closed else 0.0
 
         return (
