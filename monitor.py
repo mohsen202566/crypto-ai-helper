@@ -7,7 +7,7 @@ from learning_engine import LearningEngine
 from okx_data import OkxDataClient
 from storage import Storage, StoredSignal
 from toobit_client import ToobitClient
-from utils import direction_profit_pct
+from pnl_utils import net_profit_for_exit
 
 
 class SignalMonitor:
@@ -49,12 +49,31 @@ class SignalMonitor:
             return False
         if has_position:
             return False
-        real_pnl = await self._real_pnl(signal)
+        raw_real_pnl = await self._real_pnl(signal)
+        exit_price_for_estimate = signal.tp if raw_real_pnl is not None and raw_real_pnl >= 0 else signal.sl
+        estimated = net_profit_for_exit(
+            signal.direction,
+            signal.entry,
+            exit_price_for_estimate,
+            signal.margin_usdt,
+            signal.leverage,
+        )
+        real_pnl = raw_real_pnl - estimated.cost_usdt if raw_real_pnl is not None else None
         status = "TP" if real_pnl is not None and real_pnl >= 0 else "SL"
         exit_price = signal.tp if status == "TP" else signal.sl
         approx_pnl = self._approx_pnl(signal, exit_price)
         message_id = await send_result(signal, status, exit_price, approx_pnl, real_pnl, "toobit_real")
-        closed = self.storage.finish_signal(signal.id, status=status, exit_price=exit_price, approx_pnl=approx_pnl, real_pnl=real_pnl, result_message_id=message_id, result_source="toobit_real", mfe_pct=signal.mfe_pct, mae_pct=signal.mae_pct)
+        closed = self.storage.finish_signal(
+            signal.id,
+            status=status,
+            exit_price=exit_price,
+            approx_pnl=approx_pnl,
+            real_pnl=real_pnl,
+            result_message_id=message_id,
+            result_source="toobit_real",
+            mfe_pct=signal.mfe_pct,
+            mae_pct=signal.mae_pct,
+        )
         if closed:
             self.learning.learn_from_closed_signal(signal.id)
         return closed
@@ -75,8 +94,7 @@ class SignalMonitor:
 
     @staticmethod
     def _approx_pnl(signal: StoredSignal, exit_price: float) -> float:
-        pct = direction_profit_pct(signal.direction, signal.entry, exit_price)
-        return signal.margin_usdt * signal.leverage * pct
+        return net_profit_for_exit(signal.direction, signal.entry, exit_price, signal.margin_usdt, signal.leverage).net_usdt
 
     async def _real_pnl(self, signal: StoredSignal) -> float | None:
         try:

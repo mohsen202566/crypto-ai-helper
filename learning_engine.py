@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from storage import Storage
-from utils import direction_profit_pct
+from pnl_utils import learning_bucket_key, net_profit_for_exit
 
 
 class LearningEngine:
@@ -20,28 +20,31 @@ class LearningEngine:
         direction = str(signal.get("direction"))
         margin = float(signal.get("margin_usdt") or 0)
         leverage = int(signal.get("leverage") or 1)
-        profit_pct = direction_profit_pct(direction, entry, exit_price)
-        approx_net = margin * leverage * profit_pct
+        estimated = net_profit_for_exit(direction, entry, exit_price, margin, leverage)
         real_pnl = signal.get("real_pnl")
-        net_profit = float(real_pnl) if real_pnl is not None else approx_net
-        features_key = str(signal.get("features_key") or "")
+        net_profit = float(real_pnl) if real_pnl is not None else estimated.net_usdt
+        net_result = "TP" if net_profit > 0 else "SL"
+        features_key = learning_bucket_key(
+            str(signal.get("symbol_name") or ""),
+            direction,
+            str(signal.get("features_key") or ""),
+        )
         self.storage.record_observation(
             source=str(signal.get("signal_type") or "normal"),
             signal_id=signal_id,
             features_key=features_key,
             symbol_name=str(signal.get("symbol_name")),
             direction=direction,
-            result=status,
+            result=net_result,
             net_profit=net_profit,
             mfe_pct=float(signal.get("mfe_pct") or 0),
             mae_pct=float(signal.get("mae_pct") or 0),
             tp_distance_pct=float(signal.get("tp_distance_pct") or 0),
             sl_distance_pct=float(signal.get("sl_distance_pct") or 0),
-            reason=self._failure_reason(signal) if status == "SL" else "TP_OK",
+            reason=self._failure_reason(signal) if net_result == "SL" else "TP_OK",
         )
         self.storage.update_shadow_results(signal_id, direction, float(signal.get("best_price") or entry), float(signal.get("worst_price") or entry))
-        self._maybe_capital_suggestion()
-        self._maybe_indicator_request()
+        # Keep learning simple: only improve range buckets per symbol + direction.
 
     @staticmethod
     def _failure_reason(signal: dict) -> str:

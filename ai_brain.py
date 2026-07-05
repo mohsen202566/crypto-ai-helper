@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, is_dataclass, replace
 from typing import Literal
 
-from config import TIMEFRAME_1D, TIMEFRAME_1H, TIMEFRAME_4H, TIMEFRAME_ENTRY
+from config import MIN_NET_PROFIT_USDT, TIMEFRAME_1D, TIMEFRAME_1H, TIMEFRAME_4H, TIMEFRAME_ENTRY
 from indicators import IndicatorSnapshot, calculate_htf_snapshot, calculate_indicators
 from market_context import MarketContextEngine, MarketContextResult
 from market_state import MarketStateEngine, MarketStateResult
 from okx_data import Candle
+from pnl_utils import learning_bucket_key, net_profit_for_move
 from range_learning import RangeFeatures, RangeLearningEngine, RangeVerdict
 from tp_sl_engine import TpSlEngine, TpSlPlan
 
@@ -86,6 +87,7 @@ class AIBrain:
         context = self.context_engine.analyze(direction, snapshots.get(TIMEFRAME_1D), snapshots.get(TIMEFRAME_4H), snapshots.get(TIMEFRAME_1H), btc_snapshot, eth_snapshot)
         state = self.state_engine.analyze(s5, direction)
         features = self.range_engine.build_features(symbol_name, direction, s5, context, state)
+        features = self._scoped_features(features, symbol_name, direction)
         verdict = self.range_engine.evaluate(self.storage, features, s5, context)
         if not verdict.normal_allowed:
             return self._reject(direction, entry, features, verdict, state, context, "بازه/کانتکست برای سیگنال نرم هم مجاز نیست.")
@@ -96,18 +98,42 @@ class AIBrain:
             return self._reject(direction, entry, features, verdict, state, context, plan.reason)
         indicator_profile = self._indicator_profile(s5)
         real_allowed = bool(verdict.real_allowed and context.real_ok)
+        expected_net = net_profit_for_move(margin, leverage, plan.predicted_move_pct)
+        if expected_net.net_usdt < MIN_NET_PROFIT_USDT:
+            return self._reject(
+                direction,
+                entry,
+                features,
+                verdict,
+                state,
+                context,
+                f"سود خالص بعد از کارمزد کافی نیست: {expected_net.net_usdt:.4f} USDT",
+            )
         reason = " | ".join(tuple(context.reasons) + tuple(state.reasons) + tuple(verdict.reasons) + (plan.reason,))
         return SignalDecision(
             action="SIGNAL", accepted=True, direction=direction, entry=entry, tp=plan.tp, sl=plan.sl,
             signal_type_hint="real" if real_allowed else "normal", real_allowed=real_allowed, reason=reason,
             features_key=features.key, confidence=verdict.confidence, samples=verdict.samples, win_rate=verdict.win_rate,
             predicted_move_pct=plan.predicted_move_pct, tp_distance_pct=plan.tp_distance_pct, sl_distance_pct=plan.sl_distance_pct,
-            risk_reward=plan.risk_reward, estimated_net_profit_usdt=plan.estimated_net_profit_usdt, estimated_cost_pct=plan.estimated_cost_pct,
+            risk_reward=plan.risk_reward, estimated_net_profit_usdt=expected_net.net_usdt, estimated_cost_pct=expected_net.cost_pct,
             market_state=state.state, alignment=context.alignment, indicator_profile=indicator_profile,
             notes=tuple(context.reasons) + tuple(state.reasons) + tuple(verdict.reasons),
             shadow_plans=tuple((p.name, p.tp, p.sl) for p in plan.shadow_plans),
             rsi=s5.rsi, adx=s5.adx, atr_pct=s5.atr_pct, volume_ratio=s5.volume_ratio,
         )
+
+    @staticmethod
+    def _scoped_features(features: RangeFeatures, symbol_name: str, direction: Direction) -> RangeFeatures:
+        scoped_key = learning_bucket_key(symbol_name, direction, features.key)
+        if scoped_key == features.key:
+            return features
+        if is_dataclass(features):
+            return replace(features, key=scoped_key)
+        try:
+            features.key = scoped_key
+        except Exception:
+            pass
+        return features
 
     def _reject(self, direction: Direction, entry: float, features: RangeFeatures, verdict: RangeVerdict, state: MarketStateResult, context: MarketContextResult, reason: str) -> SignalDecision:
         return SignalDecision(
