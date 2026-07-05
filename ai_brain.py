@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, is_dataclass, replace
 from typing import Literal
 
-from config import MIN_NET_PROFIT_USDT, TIMEFRAME_1D, TIMEFRAME_1H, TIMEFRAME_4H, TIMEFRAME_ENTRY
+from config import MIN_NET_PROFIT_USDT, TIMEFRAME_1H, TIMEFRAME_4H, TIMEFRAME_ENTRY
 from indicators import IndicatorSnapshot, calculate_htf_snapshot, calculate_indicators
 from market_context import MarketContextEngine, MarketContextResult
 from market_state import MarketStateEngine, MarketStateResult
@@ -84,7 +84,7 @@ class AIBrain:
     def _analyze_direction(self, symbol_name: str, direction: Direction, entry: float, s5: IndicatorSnapshot, snapshots: dict[str, IndicatorSnapshot], btc_1h: list[Candle] | None, eth_1h: list[Candle] | None) -> SignalDecision:
         btc_snapshot = self._safe_snapshot(btc_1h)
         eth_snapshot = self._safe_snapshot(eth_1h)
-        context = self.context_engine.analyze(direction, snapshots.get(TIMEFRAME_1D), snapshots.get(TIMEFRAME_4H), snapshots.get(TIMEFRAME_1H), btc_snapshot, eth_snapshot)
+        context = self.context_engine.analyze(direction, None, snapshots.get(TIMEFRAME_4H), snapshots.get(TIMEFRAME_1H), btc_snapshot, eth_snapshot)
         state = self.state_engine.analyze(s5, direction)
         features = self.range_engine.build_features(symbol_name, direction, s5, context, state)
         features = self._scoped_features(features, symbol_name, direction)
@@ -143,7 +143,7 @@ class AIBrain:
         )
 
     def _snapshots(self, data: AnalysisInput) -> dict[str, IndicatorSnapshot]:
-        required = (TIMEFRAME_ENTRY, TIMEFRAME_1H, TIMEFRAME_4H, TIMEFRAME_1D)
+        required = (TIMEFRAME_ENTRY, TIMEFRAME_1H, TIMEFRAME_4H)
         out: dict[str, IndicatorSnapshot] = {}
         for tf in required:
             candles = data.candles_by_tf.get(tf)
@@ -163,4 +163,4 @@ class AIBrain:
 
     @staticmethod
     def _indicator_profile(s: IndicatorSnapshot) -> str:
-        return f"RSI {s.rsi:.1f} | ADX {s.adx:.1f} | DI+ {s.plus_di:.1f} / DI- {s.minus_di:.1f} | ATR {s.atr_pct*100:.3f}% | Vol {s.volume_ratio:.2f} | VWAP {s.price_vs_vwap_pct*100:.3f}% | EMA20/50 {s.ema20_50_gap_pct*100:.3f}%"
+        return f"RSI {s.rsi:.1f} | ADX {s.adx:.1f} | DI+ {s.plus_di:.1f} / DI- {s.minus_di:.1f} | ATR {s.atr_pct*100:.3f}% | VWAP {s.price_vs_vwap_pct*100:.3f}% | EMA20 {s.price_vs_ema20_pct*100:.3f}% | EMA50 {s.price_vs_ema50_pct*100:.3f}% | EMA200 {s.price_vs_ema200_pct*100:.3f}% | EMA20/50 {s.ema20_50_gap_pct*100:.3f}%"
