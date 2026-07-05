@@ -79,7 +79,8 @@ class TelegramBotUI:
             return None
 
         direction_icon = self._direction_icon(decision.direction)
-        signal_type = created.signal_type.upper()
+        hint = str(getattr(decision, "signal_type_hint", created.signal_type) or created.signal_type)
+        signal_type = "NORMAL_CONTROLLED" if hint == "normal_controlled" else created.signal_type.upper()
         margin = self.storage.margin_usdt()
         leverage = self.storage.leverage()
         fee = round_trip_fee_usdt(margin, leverage)
@@ -97,6 +98,7 @@ class TelegramBotUI:
             f"سود خالص احتمالی TP: {money(decision.estimated_net_profit_usdt)}\n"
             f"ضرر خالص احتمالی SL: {money(sl_net)}\n\n"
             f"اعتماد AI: {decision.confidence}% | نمونه بازه: {decision.samples}\n"
+            f"تصمیم: {getattr(decision, 'decision_label', signal_type) or signal_type}\n"
             f"وضعیت بازار: {decision.market_state}\n"
             f"تایم‌های بالا: {decision.alignment}\n"
             f"اندیکاتورها:\n{decision.indicator_profile}\n\n"
@@ -149,7 +151,7 @@ class TelegramBotUI:
             f"موجودی Toobit: {money(data.wallet_margin_usdt)}\n"
             f"پوزیشن/سفارش صرافی: {data.exchange_open_positions}/{data.exchange_open_orders}\n"
             f"PNL خالص قابل معامله امروز (Real+Normal): {money(float(data.today_stats.get('tradable_pnl', 0)))}\n"
-            f"PNL آموزشی Watch امروز: {money(float(data.today_stats.get('watch_pnl', 0)))} | کل آزمایشی: {money(float(data.today_stats.get('pnl', 0)))}\n"
+            f"PNL قدیمی Watch: {money(float(data.today_stats.get('legacy_watch_pnl', 0)))} | فقط آرشیو قدیمی؛ Watch جدید نداریم\n"
             f"Normal خالص امروز: {money(float(data.today_stats.get('normal_pnl', 0)))} | Real خالص امروز: {money(float(data.today_stats.get('real_pnl', 0)))}\n"
             f"کارمزد تقریبی امروز: {money(-float(data.today_stats.get('fees', 0)))}\n"
             f"TP/SL امروز: {data.today_stats.get('tp', 0)}/{data.today_stats.get('sl', 0)} | WinRate {data.today_stats.get('win_rate', 0):.1f}%\n\n"
@@ -167,12 +169,12 @@ class TelegramBotUI:
             f"📊 آمار کل\n"
             f"کل سیگنال‌ها: {stats['total']}\n"
             f"باز: {stats['open']} | بسته: {stats['closed']}\n"
-            f"Real: {stats['real']} | Normal: {stats['normal']} | Watch: {stats.get('watch', 0)}\n"
+            f"Real: {stats['real']} | Normal: {stats['normal']} | Rejectها در لاگ No Signal ثبت می‌شوند\n"
             f"TP: {stats['tp']} | SL: {stats['sl']}\n"
             f"WinRate: {stats['win_rate']:.1f}%\n"
             f"سود/ضرر خالص قابل معامله (Real+Normal): {money(stats.get('tradable_pnl', 0))}\n"
             f"Normal خالص: {money(stats.get('normal_pnl', 0))} | Real خالص: {money(stats.get('real_pnl', 0))}\n"
-            f"Watch آموزشی خالص: {money(stats.get('watch_pnl', 0))} | کل آزمایشی: {money(stats['pnl'])}\n"
+            f"Legacy Watch قدیمی: {stats.get('legacy_watch', 0)} | PnL قدیمی جدا: {money(stats.get('legacy_watch_pnl', 0))}\n"
             f"کارمزد تقریبی کل: {money(-float(stats.get('fees', 0)))}"
         )
 

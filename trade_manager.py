@@ -69,6 +69,8 @@ class TradeManager:
     async def _create_one(self, symbol: MarketSymbol, decision: SignalDecision, want_real: bool) -> CreatedSignal | None:
         if not decision.direction:
             return None
+        if getattr(decision, "signal_type_hint", "") == "reject":
+            return None
         signal_type, real_status, reason = await self._select_signal_type(symbol, decision, want_real)
         signal_id = self.storage.add_signal(okx_symbol=symbol.okx_inst_id, toobit_symbol=symbol.toobit_symbol, symbol_name=symbol.name, decision=decision, signal_type=signal_type, real_status=real_status)
         if signal_type == "real":
@@ -76,8 +78,6 @@ class TradeManager:
         return CreatedSignal(signal_id, signal_type, real_status, reason)
 
     async def _select_signal_type(self, symbol: MarketSymbol, decision: SignalDecision, want_real: bool) -> tuple[str, str, str]:
-        if getattr(decision, "signal_type_hint", "") == "watch":
-            return "watch", "none", "AI این موقعیت را فقط برای Watch مناسب می‌داند؛ نتیجه ثبت می‌شود ولی Real باز نمی‌شود."
         if not self.storage.trade_enabled():
             return "normal", "none", "ترید واقعی خاموش است؛ سیگنال Normal ثبت شد."
         if not decision.real_allowed:

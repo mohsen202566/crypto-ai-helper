@@ -113,7 +113,7 @@ class RangeLearningEngine:
         real_allowed = False
         if samples == 0 and INITIAL_SOFT_MODE:
             confidence = 5
-            reasons.append("نمونه دقیق این بازه هنوز صفر است؛ برای یادگیری فقط Normal/Watch نرم مجاز است.")
+            reasons.append("نمونه دقیق این بازه هنوز صفر است؛ برای یادگیری فقط Normal کنترل‌شده مجاز است؛ Watch حذف شده است.")
         elif exact_samples == 0 and fallback is active_profile:
             confidence = min(32, 6 + samples // 2)
             reasons.append(f"نمونه دقیق بازه صفر است؛ از حافظه ارز/جهت با {samples} نمونه برای احتیاط استفاده شد.")
@@ -121,7 +121,7 @@ class RangeLearningEngine:
             real_allowed = False
             if net_profit < 0 or win_rate < 42:
                 normal_allowed = normal_allowed and INITIAL_SOFT_MODE
-                reasons.append("حافظه ارز/جهت هنوز ضعیف است؛ Real ممنوع و Normal فقط برای یادگیری/احتیاط است.")
+                reasons.append("حافظه ارز/جهت هنوز ضعیف است؛ Real ممنوع و فقط Normal کنترل‌شده برای یادگیری/احتیاط مجاز است.")
         elif samples < BOOT_NORMAL_SAMPLE_LIMIT:
             confidence = min(35, 8 + samples)
             reasons.append("نمونه دقیق این بازه هنوز کم است؛ Normal برای یادگیری مجاز است.")

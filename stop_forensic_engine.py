@@ -245,21 +245,21 @@ class StopForensicEngine:
 
     @staticmethod
     def _fix_for_cause(primary: str, secondary: tuple[str, ...], signal: dict[str, Any], scores: dict[str, int]) -> tuple[str, str, int]:
-        # action meanings: ALLOW, CAUTION, REAL_BLOCK, WATCH_ONLY, SESSION_PAUSE, NEWS_PAUSE.
+        # action meanings: ALLOW, CAUTION, REAL_BLOCK, REJECT, SESSION_PAUSE, NEWS_PAUSE. WATCH is removed.
         if primary == "NEWS_RISK":
-            return "PAUSE_NEWS_15M_THEN_NORMAL_OR_WATCH_UNTIL_CALM", "NEWS_PAUSE", 4
+            return "PAUSE_NEWS_15M_THEN_NORMAL_CONTROLLED_OR_REJECT_UNTIL_CALM", "NEWS_PAUSE", 4
         if primary == "SESSION_OPEN_NOISE":
-            return "PAUSE_SESSION_10M_THEN_NORMAL_OR_WATCH_UNTIL_CALM", "SESSION_PAUSE", 3
+            return "PAUSE_SESSION_10M_THEN_NORMAL_CONTROLLED_OR_REJECT_UNTIL_CALM", "SESSION_PAUSE", 3
         if primary == "ECONOMIC_EDGE_TOO_SMALL" or primary == "FEE_TOO_HEAVY_FOR_TARGET":
-            return "REQUIRE_NET_PROFIT_AFTER_FEE_OR_KEEP_AS_WATCH", "WATCH_ONLY", 3
+            return "REQUIRE_NET_PROFIT_AFTER_FEE_OR_REJECT", "REJECT", 3
         if primary == "STOP_TOO_TIGHT":
             return "TEST_STRUCTURAL_WIDER_SL_ONLY_IF_RR_AND_NET_STAY_VALID", "CAUTION", 2
         if primary == "TP_TOO_FAR_OR_REVERSAL":
             return "TEST_MORE_REALISTIC_TP_FROM_PREVIOUS_MFE", "CAUTION", 2
         if primary == "STOP_TOO_WIDE_OR_RR_DAMAGE":
-            return "KEEP_TP_SL_ONLY_IF_RR_AND_NET_ARE_VALID_ELSE_WATCH", "WATCH_ONLY", 3
+            return "KEEP_TP_SL_ONLY_IF_RR_AND_NET_ARE_VALID_ELSE_REJECT", "REJECT", 3
         if primary in {"MARKET_NOISE_OR_RANGE", "FAKE_BREAKOUT_OR_CLIMAX", "VOLATILITY_OVERHEAT"}:
-            return "NORMAL_OR_WATCH_AND_REQUIRE_CALMER_MARKET_CONTEXT", "REAL_BLOCK", 3
+            return "NORMAL_CONTROLLED_OR_REJECT_AND_REQUIRE_CALMER_MARKET_CONTEXT", "REAL_BLOCK", 3
         if primary in {"HTF_ALIGNMENT_WEAKNESS", "BTC_ETH_CONFLICT", "WRONG_DIRECTION_OR_CONTEXT", "INDICATOR_CONTEXT_BAD"}:
             return "DOWNGRADE_REAL_AND_TEST_STRONGER_CONFIRMATION_FOR_SAME_CONTEXT", "REAL_BLOCK", 3
         return "FORENSIC_CAUTION_AND_TEST_NEXT_SIMILAR_SIGNALS", "CAUTION", 1

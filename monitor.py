@@ -37,8 +37,9 @@ class SignalMonitor:
                 continue
             exit_price = signal.tp if status == "TP" else signal.sl
             approx_pnl = self._approx_pnl(signal, exit_price)
-            message_id = await send_result(signal, status, exit_price, approx_pnl, None, "normal" if signal.signal_type == "normal" else ("watch" if signal.signal_type == "watch" else "normal_on_real"))
-            closed = self.storage.finish_signal(signal.id, status=status, exit_price=exit_price, approx_pnl=approx_pnl, real_pnl=None, result_message_id=message_id, result_source="normal" if signal.signal_type == "normal" else ("watch" if signal.signal_type == "watch" else "normal_on_real"), mfe_pct=mfe_pct, mae_pct=mae_pct)
+            result_source = "normal_on_real" if signal.signal_type == "real" else "normal"
+            message_id = await send_result(signal, status, exit_price, approx_pnl, None, result_source)
+            closed = self.storage.finish_signal(signal.id, status=status, exit_price=exit_price, approx_pnl=approx_pnl, real_pnl=None, result_message_id=message_id, result_source=result_source, mfe_pct=mfe_pct, mae_pct=mae_pct)
             if closed:
                 self.learning.learn_from_closed_signal(signal.id)
 

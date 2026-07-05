@@ -51,25 +51,27 @@ class AdaptiveFixEngine:
             reason_note = self._reason_text(strongest, notes)
             adjusted = replace(adjusted, reason=(adjusted.reason or "") + "\n\n🧠 درمان یادگیری: " + reason_note)
 
-        if action == "WATCH_ONLY":
-            adjusted = replace(adjusted, real_allowed=False, signal_type_hint="watch")
+        if action in {"WATCH_ONLY", "REJECT", "BLOCK"}:
+            adjusted = replace(adjusted, real_allowed=False, signal_type_hint="reject", decision_label="REJECT", control_mode="reject")
             return adjusted, GuardVerdict(
-                "REAL_BLOCK",
+                "BLOCK",
                 "ADAPTIVE_FIX",
-                f"درمان‌های قبلی برای الگوی مشابه هنوز جواب نداده‌اند ({cause}, level={strongest.get('treatment_level',0)}, risk={risk}). سیگنال حذف نشد؛ فقط Watch و ثبت نتیجه.",
+                f"الگوی مشابه از نظر Net PnL و درمان‌های قبلی قابل معامله نیست ({cause}, level={strongest.get('treatment_level',0)}, risk={risk}). Watch حذف شده؛ این موقعیت Reject می‌شود.",
                 0,
                 {"profile": strongest, "notes": notes},
             )
-        if action in {"CAUTION", "REAL_BLOCK"}:
-            adjusted = replace(adjusted, real_allowed=False, signal_type_hint="normal")
+        if action in {"CAUTION", "REAL_BLOCK", "NORMAL_CONTROLLED"}:
+            adjusted = replace(adjusted, real_allowed=False, signal_type_hint="normal_controlled", decision_label="NORMAL_CONTROLLED", control_mode="normal_controlled")
             level = "REAL_BLOCK" if action == "REAL_BLOCK" or risk >= 45 else "CAUTION"
             return adjusted, GuardVerdict(
                 level,
                 "ADAPTIVE_FIX",
-                f"الگوی مشابه قبلاً ریسک داده ({cause}, risk={risk}). سیگنال حذف نشد؛ فقط محتاط/Normal شد.",
+                f"الگوی مشابه قبلاً ریسک داده ({cause}, risk={risk}). Watch حذف شده؛ فقط Normal کنترل‌شده مجاز است.",
                 0,
                 {"profile": strongest, "notes": notes},
             )
+        if notes:
+            adjusted = replace(adjusted, signal_type_hint="normal_controlled" if not getattr(adjusted, "real_allowed", False) else getattr(adjusted, "signal_type_hint", "normal"), control_mode="normal_controlled" if not getattr(adjusted, "real_allowed", False) else getattr(adjusted, "control_mode", "real"))
         return adjusted, GuardVerdict("ALLOW", "ADAPTIVE_FIX", "", 0, {"profile": strongest, "notes": notes})
 
     @staticmethod
@@ -157,7 +159,7 @@ class AdaptiveFixEngine:
         if rejected_sl_fix and not sl_changed:
             notes.append("SL کوچک تشخیص داده شد، اما بازترکردن آن RR یا سود خالص را خراب می‌کرد؛ پس فقط Real محتاط/بسته شد.")
         if rejected_tp_fix and not tp_changed:
-            notes.append("TP دور تشخیص داده شد، اما اصلاح TP بعد از کارمزد ارزش کافی نمی‌داد؛ پس فقط Watch/Normal محتاط شد.")
+            notes.append("TP دور تشخیص داده شد، اما اصلاح TP بعد از کارمزد ارزش کافی نمی‌داد؛ پس Real بسته و فقط Normal کنترل‌شده یا Reject مجاز است.")
 
         if not notes:
             return decision, []

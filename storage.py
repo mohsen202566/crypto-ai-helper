@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from config import DEFAULT_LEVERAGE, DEFAULT_MARGIN_USDT, DEFAULT_MAX_POSITIONS, DEFAULT_TRADE_ENABLED, LEVERAGE_MAX, LEVERAGE_MIN, MARGIN_MAX_USDT, MARGIN_MIN_USDT, MAX_POSITIONS_MAX, MAX_POSITIONS_MIN, DB_PATH
-from utils import direction_profit_pct, json_safe, now_utc, round_trip_fee_usdt
+from utils import direction_profit_pct, json_safe, now_utc, round_trip_fee_usdt, net_pnl_for_exit
 from guard_utils import half_hour_bucket, session_info, signal_time, weekday_key
 
 
@@ -130,6 +130,11 @@ class Storage:
             self._ensure_column(conn, 'adaptive_fix_profiles', 'consecutive_failures', 'INTEGER DEFAULT 0')
             self._ensure_column(conn, 'adaptive_fix_profiles', 'fix_policy', 'TEXT')
             self._ensure_column(conn, 'adaptive_fix_profiles', 'last_message', 'TEXT')
+            self._ensure_column(conn, 'shadow_tests', 'exit_price', 'REAL DEFAULT 0')
+            self._ensure_column(conn, 'shadow_tests', 'net_profit', 'REAL DEFAULT 0')
+            self._ensure_column(conn, 'shadow_tests', 'mfe_pct', 'REAL DEFAULT 0')
+            self._ensure_column(conn, 'shadow_tests', 'mae_pct', 'REAL DEFAULT 0')
+            conn.execute("UPDATE adaptive_fix_profiles SET recommended_action='REJECT' WHERE recommended_action='WATCH_ONLY'")
             self._set_default(conn, "guard_cooldown_until", "")
             self._set_default(conn, "guard_cooldown_reason", "")
             self._set_default(conn, "trade_enabled", "1" if DEFAULT_TRADE_ENABLED else "0")
@@ -294,22 +299,38 @@ class Storage:
 
     def update_shadow_results(self, signal_id: int, direction: str, best_price: float, worst_price: float) -> None:
         with self._connect() as conn:
+            signal = conn.execute("SELECT * FROM signals WHERE id=?", (signal_id,)).fetchone()
             rows = conn.execute("SELECT * FROM shadow_tests WHERE signal_id=? AND result='pending'", (signal_id,)).fetchall()
             for row in rows:
                 tp = float(row["tp"])
                 sl = float(row["sl"])
                 result = "open"
+                exit_price = 0.0
                 if direction == "LONG":
                     if best_price >= tp:
                         result = "TP"
+                        exit_price = tp
                     elif worst_price <= sl:
                         result = "SL"
+                        exit_price = sl
+                    mfe = max(0.0, (best_price - float(signal["entry"])) / float(signal["entry"])) if signal else 0.0
+                    mae = max(0.0, (float(signal["entry"]) - worst_price) / float(signal["entry"])) if signal else 0.0
                 else:
                     if best_price <= tp:
                         result = "TP"
+                        exit_price = tp
                     elif worst_price >= sl:
                         result = "SL"
-                conn.execute("UPDATE shadow_tests SET result=?, updated_at=? WHERE id=?", (result, now_utc().isoformat(), row["id"]))
+                        exit_price = sl
+                    mfe = max(0.0, (float(signal["entry"]) - best_price) / float(signal["entry"])) if signal else 0.0
+                    mae = max(0.0, (worst_price - float(signal["entry"])) / float(signal["entry"])) if signal else 0.0
+                net_profit = 0.0
+                if signal and exit_price > 0:
+                    net_profit = net_pnl_for_exit(float(signal["margin_usdt"] or 0.0), int(signal["leverage"] or 1), direction, float(signal["entry"]), exit_price)
+                conn.execute(
+                    "UPDATE shadow_tests SET result=?, exit_price=?, net_profit=?, mfe_pct=?, mae_pct=?, updated_at=? WHERE id=?",
+                    (result, exit_price, net_profit, mfe, mae, now_utc().isoformat(), row["id"]),
+                )
 
     def record_no_signal(self, symbol_name: str, direction: str | None, reason: str, features_key: str = "") -> None:
         with self._connect() as conn:
@@ -552,27 +573,27 @@ class Storage:
                     action = "CAUTION"
                 if report_action in {"NEWS_PAUSE", "SESSION_PAUSE"}:
                     # The actual hard pause remains in news/session guard. For future similar cases,
-                    # adaptive layer only downgrades to Watch/Normal.
-                    action = "WATCH_ONLY" if level >= 4 else "REAL_BLOCK"
-                elif report_action == "WATCH_ONLY":
-                    action = "WATCH_ONLY"
+                    # adaptive layer only downgrades to Normal-Controlled or Reject.
+                    action = "REJECT" if level >= 4 else "REAL_BLOCK"
+                elif report_action in {"WATCH_ONLY", "REJECT", "BLOCK"}:
+                    action = "REJECT"
                 elif report_action == "REAL_BLOCK":
                     action = "REAL_BLOCK"
                 elif report_action == "CAUTION":
                     action = "CAUTION"
 
                 if level >= 5:
-                    action = "WATCH_ONLY"
+                    action = "REJECT"
                 elif level >= 4 and total_net < 0:
-                    action = "WATCH_ONLY"
+                    action = "REJECT"
                 elif level >= 3 and action == "ALLOW":
                     action = "REAL_BLOCK"
                 elif level >= 1 and action == "ALLOW":
                     action = "CAUTION"
                 if samples >= 3 and sl_rate >= 0.60 and total_net < 0:
-                    action = "REAL_BLOCK" if action != "WATCH_ONLY" else action
+                    action = "REAL_BLOCK" if action != "REJECT" else action
                 if risk >= 70 and total_net < 0:
-                    action = "WATCH_ONLY"
+                    action = "REJECT"
                 elif risk >= 45 and action == "ALLOW":
                     action = "REAL_BLOCK"
                 elif risk >= 22 and action == "ALLOW":
@@ -809,22 +830,23 @@ class Storage:
         sl = sum(1 for r in closed if str(r["status"]) == "SL")
         real = sum(1 for r in rows if str(r["signal_type"]) == "real")
         normal = sum(1 for r in rows if str(r["signal_type"]) == "normal")
-        watch = sum(1 for r in rows if str(r["signal_type"]) == "watch")
+        legacy_watch = sum(1 for r in rows if str(r["signal_type"]) == "watch")
 
         def row_net(row: sqlite3.Row) -> float:
             return float(row["real_pnl"] if row["real_pnl"] is not None else row["approx_pnl"] or 0.0)
 
-        pnl = sum(row_net(r) for r in closed)
         real_pnl = sum(row_net(r) for r in closed if str(r["signal_type"]) == "real")
         normal_pnl = sum(row_net(r) for r in closed if str(r["signal_type"]) == "normal")
-        watch_pnl = sum(row_net(r) for r in closed if str(r["signal_type"]) == "watch")
+        legacy_watch_pnl = sum(row_net(r) for r in closed if str(r["signal_type"]) == "watch")
         fees = sum(round_trip_fee_usdt(float(r["margin_usdt"] or 0.0), int(r["leverage"] or 1)) for r in closed)
         tradable_pnl = real_pnl + normal_pnl
+        experimental_pnl = tradable_pnl + legacy_watch_pnl
         return {
             "total": len(rows), "open": sum(1 for r in rows if str(r["status"]) == "OPEN"), "closed": len(closed),
-            "real": real, "normal": normal, "watch": watch, "tp": tp, "sl": sl,
+            "real": real, "normal": normal, "legacy_watch": legacy_watch, "watch": 0, "tp": tp, "sl": sl,
             "win_rate": tp / len(closed) * 100.0 if closed else 0.0,
-            "pnl": pnl, "tradable_pnl": tradable_pnl, "real_pnl": real_pnl, "normal_pnl": normal_pnl, "watch_pnl": watch_pnl, "fees": fees,
+            "pnl": tradable_pnl, "tradable_pnl": tradable_pnl, "real_pnl": real_pnl, "normal_pnl": normal_pnl,
+            "legacy_watch_pnl": legacy_watch_pnl, "watch_pnl": 0.0, "experimental_pnl": experimental_pnl, "fees": fees,
         }
 
     def _row_to_signal(self, row: sqlite3.Row) -> StoredSignal:

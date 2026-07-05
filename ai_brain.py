@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Literal
 
 from config import TIMEFRAME_1D, TIMEFRAME_1H, TIMEFRAME_4H, TIMEFRAME_ENTRY
@@ -54,6 +54,8 @@ class SignalDecision:
     adx: float = 0.0
     atr_pct: float = 0.0
     volume_ratio: float = 0.0
+    decision_label: str = ""
+    control_mode: str = ""
 
 
 class AIBrain:
@@ -95,11 +97,14 @@ class AIBrain:
         if not plan.ok:
             return self._reject(direction, entry, features, verdict, state, context, plan.reason)
         indicator_profile = self._indicator_profile(s5)
-        real_allowed = bool(verdict.real_allowed and context.real_ok)
-        reason = " | ".join(tuple(context.reasons) + tuple(state.reasons) + tuple(verdict.reasons) + (plan.reason,))
+        signal_hint, real_allowed, control_note = self._decision_mode(verdict, context, state, plan)
+        reason_parts = tuple(context.reasons) + tuple(state.reasons) + tuple(verdict.reasons) + (plan.reason,)
+        if control_note:
+            reason_parts = reason_parts + (control_note,)
+        reason = " | ".join(reason_parts)
         return SignalDecision(
             action="SIGNAL", accepted=True, direction=direction, entry=entry, tp=plan.tp, sl=plan.sl,
-            signal_type_hint="real" if real_allowed else "normal", real_allowed=real_allowed, reason=reason,
+            signal_type_hint=signal_hint, real_allowed=real_allowed, reason=reason,
             features_key=features.key, confidence=verdict.confidence, samples=verdict.samples, win_rate=verdict.win_rate,
             predicted_move_pct=plan.predicted_move_pct, tp_distance_pct=plan.tp_distance_pct, sl_distance_pct=plan.sl_distance_pct,
             risk_reward=plan.risk_reward, estimated_net_profit_usdt=plan.estimated_net_profit_usdt, estimated_cost_pct=plan.estimated_cost_pct,
@@ -107,13 +112,34 @@ class AIBrain:
             notes=tuple(context.reasons) + tuple(state.reasons) + tuple(verdict.reasons),
             shadow_plans=tuple((p.name, p.tp, p.sl) for p in plan.shadow_plans),
             rsi=s5.rsi, adx=s5.adx, atr_pct=s5.atr_pct, volume_ratio=s5.volume_ratio,
+            decision_label="REAL" if real_allowed else ("NORMAL_CONTROLLED" if signal_hint == "normal_controlled" else "NORMAL"),
+            control_mode=signal_hint,
         )
+
+    @staticmethod
+    def _decision_mode(verdict: RangeVerdict, context: MarketContextResult, state: MarketStateResult, plan: TpSlPlan) -> tuple[str, bool, str]:
+        """Return signal hint, real permission, and a human-readable control note.
+
+        NORMAL_CONTROLLED replaces the old Watch idea. The signal is still a Normal
+        signal and is included in tradable learning/PnL, but Real is blocked until
+        the same context proves positive net PnL. Bad contexts are rejected earlier.
+        """
+        risky_states = {"RANGE", "NOISE", "BREAKOUT", "FAKE_BREAKOUT", "CLIMAX", "REVERSAL", "HIGH_VOLATILITY", "LOW_VOLUME"}
+        hard_real_block_states = {"NOISE", "FAKE_BREAKOUT", "CLIMAX", "REVERSAL", "HIGH_VOLATILITY", "LOW_VOLUME"}
+        state_name = str(state.state)
+        real_allowed = bool(verdict.real_allowed and context.real_ok and state_name not in hard_real_block_states)
+        if real_allowed:
+            return "real", True, "DecisionLayer: شرایط برای Real candidate معتبر است."
+        if state_name in risky_states:
+            return "normal_controlled", False, "DecisionLayer: این موقعیت Watch نمی‌شود؛ به‌خاطر رفتار بازار فقط Normal کنترل‌شده است و اگر کنترل خروج/Net PnL ضعیف شود Reject خواهد شد."
+        return "normal", False, "DecisionLayer: سیگنال Normal است؛ Real فقط بعد از نمونه کافی و Net PnL مثبت فعال می‌شود."
 
     def _reject(self, direction: Direction, entry: float, features: RangeFeatures, verdict: RangeVerdict, state: MarketStateResult, context: MarketContextResult, reason: str) -> SignalDecision:
         return SignalDecision(
             action="NO_SIGNAL", accepted=False, direction=direction, entry=entry, tp=0.0, sl=0.0, signal_type_hint="none", real_allowed=False,
             reason=reason, features_key=features.key, confidence=verdict.confidence, samples=verdict.samples, win_rate=verdict.win_rate,
             predicted_move_pct=verdict.predicted_move_pct, market_state=state.state, alignment=context.alignment,
+            decision_label="REJECT", control_mode="reject",
         )
 
     def _snapshots(self, data: AnalysisInput) -> dict[str, IndicatorSnapshot]:
