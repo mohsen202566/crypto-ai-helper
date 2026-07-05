@@ -77,12 +77,27 @@ class RangeLearningEngine:
 
     def evaluate(self, storage: Any, features: RangeFeatures, snapshot: IndicatorSnapshot, context: MarketContextResult) -> RangeVerdict:
         profile = storage.get_range_profile(features.key)
-        samples = int(profile.get("samples", 0)) if profile else 0
-        wins = int(profile.get("tp", 0)) if profile else 0
+        exact_samples = int(profile.get("samples", 0)) if profile else 0
+
+        # If the exact high-resolution range is still zero, do not ignore yesterday's
+        # learning. Use symbol+direction memory as a fallback so the bot can separate
+        # good/bad coins and directions while the exact range profile is still forming.
+        # This does not change the feature key; future closed trades still update the exact range.
+        fallback = None
+        if exact_samples == 0 and hasattr(storage, "get_symbol_direction_profile"):
+            fallback = storage.get_symbol_direction_profile(features.symbol_name, features.direction)
+        active_profile = profile if exact_samples > 0 else fallback
+
+        samples = int(active_profile.get("samples", 0)) if active_profile else 0
+        wins = int(active_profile.get("tp", 0)) if active_profile else 0
         win_rate = (wins / samples * 100.0) if samples else 0.0
-        net_profit = float(profile.get("net_profit", 0.0)) if profile else 0.0
-        avg_mfe = float(profile.get("avg_mfe_pct", 0.0)) if profile else 0.0
-        avg_mae = float(profile.get("avg_mae_pct", 0.0)) if profile else 0.0
+        net_profit = float(active_profile.get("net_profit", 0.0)) if active_profile else 0.0
+        avg_mfe = float(active_profile.get("avg_mfe_pct", 0.0)) if active_profile else 0.0
+        avg_mae = float(active_profile.get("avg_mae_pct", 0.0)) if active_profile else 0.0
+        # symbol_direction_profiles do not carry MFE/MAE; keep TP/SL engine conservative there.
+        if fallback is active_profile and exact_samples == 0:
+            avg_mfe = 0.0
+            avg_mae = 0.0
         reasons: list[str] = []
         soft_ok, soft_reasons = self._soft_gate(features.direction, snapshot)
         reasons.extend(soft_reasons)
@@ -98,10 +113,18 @@ class RangeLearningEngine:
         real_allowed = False
         if samples == 0 and INITIAL_SOFT_MODE:
             confidence = 5
-            reasons.append("بازه جدید است؛ برای یادگیری Normal نرم مجاز است.")
+            reasons.append("نمونه دقیق این بازه هنوز صفر است؛ برای یادگیری فقط Normal/Watch نرم مجاز است.")
+        elif exact_samples == 0 and fallback is active_profile:
+            confidence = min(32, 6 + samples // 2)
+            reasons.append(f"نمونه دقیق بازه صفر است؛ از حافظه ارز/جهت با {samples} نمونه برای احتیاط استفاده شد.")
+            # Fallback memory can permit Normal, but never Real by itself.
+            real_allowed = False
+            if net_profit < 0 or win_rate < 42:
+                normal_allowed = normal_allowed and INITIAL_SOFT_MODE
+                reasons.append("حافظه ارز/جهت هنوز ضعیف است؛ Real ممنوع و Normal فقط برای یادگیری/احتیاط است.")
         elif samples < BOOT_NORMAL_SAMPLE_LIMIT:
             confidence = min(35, 8 + samples)
-            reasons.append("نمونه هنوز کم است؛ Normal برای یادگیری مجاز است.")
+            reasons.append("نمونه دقیق این بازه هنوز کم است؛ Normal برای یادگیری مجاز است.")
             if win_rate >= 55 and net_profit > 0 and samples >= REAL_MIN_SAMPLES and context.real_ok:
                 real_allowed = True
         else:

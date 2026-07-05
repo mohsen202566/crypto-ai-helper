@@ -588,6 +588,21 @@ class Storage:
                     factor = 1.10 if samples <= 1 else (1.18 if level <= 2 else 1.28)
                     rec_sl = max(avg_sl, avg_mae * factor)
 
+                stored_cause = cause
+                stored_policy = report_policy
+                stored_message = report_message[:1000]
+                # A single TP must not relabel a still-bad profile as TP_OK. It should lower
+                # risk gradually, but the dominant failure cause stays until the treatment is
+                # truly recovered. This fixes confusing messages such as TP 2/SL 5 + TP_OK.
+                if result == "TP" and row and (sl > tp or failures > successes or total_net < 0):
+                    stored_cause = str(row["last_cause"] or "RECOVERING_BUT_STILL_RISKY")
+                    if stored_cause == "TP_OK":
+                        stored_cause = "RECOVERING_BUT_STILL_RISKY"
+                    stored_policy = str(row["fix_policy"] or stored_policy)
+                    stored_message = str(row["last_message"] or stored_message)[:1000]
+                elif result == "TP" and total_net <= 0:
+                    stored_cause = "TP_WEAK_AFTER_FEES"
+
                 conn.execute("""
                     INSERT INTO adaptive_fix_profiles(profile_key, scope, symbol_name, direction, market_state, alignment, session_name, hour_bucket, weekday, samples, tp, sl, total_net_profit, avg_mfe_pct, avg_mae_pct, avg_tp_distance_pct, avg_sl_distance_pct, risk_score, last_cause, recommended_action, recommended_tp_pct, recommended_sl_pct, last_updated, treatment_level, tests, successes, failures, consecutive_failures, fix_policy, last_message)
                     VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -601,7 +616,7 @@ class Storage:
                         treatment_level=excluded.treatment_level, tests=excluded.tests, successes=excluded.successes,
                         failures=excluded.failures, consecutive_failures=excluded.consecutive_failures,
                         fix_policy=excluded.fix_policy, last_message=excluded.last_message
-                """, (key, scope, symbol, direction, market_state, alignment, info.name, info.hour_bucket, weekday, samples, tp, sl, total_net, avg_mfe, avg_mae, avg_tp, avg_sl, risk, cause, action, rec_tp, rec_sl, now_utc().isoformat(), level, tests, successes, failures, consecutive, report_policy, report_message[:1000]))
+                """, (key, scope, symbol, direction, market_state, alignment, info.name, info.hour_bucket, weekday, samples, tp, sl, total_net, avg_mfe, avg_mae, avg_tp, avg_sl, risk, stored_cause, action, rec_tp, rec_sl, now_utc().isoformat(), level, tests, successes, failures, consecutive, stored_policy, stored_message))
                 conn.execute("INSERT INTO treatment_tests(profile_key, signal_id, created_at, result, net_profit, treatment_level, fix_policy, cause) VALUES(?, ?, ?, ?, ?, ?, ?, ?)", (key, int(signal.get("id") or 0), now_utc().isoformat(), result, net_profit, level, report_policy, cause))
 
     def record_loss_case(self, *, signal: dict[str, Any], report: Any) -> None:
@@ -719,6 +734,11 @@ class Storage:
             row = conn.execute("SELECT * FROM range_profiles WHERE features_key=?", (features_key,)).fetchone()
             return dict(row) if row else None
 
+    def get_symbol_direction_profile(self, symbol_name: str, direction: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM symbol_direction_profiles WHERE symbol_name=? AND direction=?", (symbol_name, direction)).fetchone()
+            return dict(row) if row else None
+
     def record_observation(self, *, source: str, signal_id: int | None, features_key: str, symbol_name: str, direction: str, result: str, net_profit: float, mfe_pct: float, mae_pct: float, tp_distance_pct: float, sl_distance_pct: float, reason: str = "") -> None:
         with self._connect() as conn:
             conn.execute("INSERT INTO range_observations(created_at, source, signal_id, features_key, symbol_name, direction, result, net_profit, mfe_pct, mae_pct, tp_distance_pct, sl_distance_pct, reason) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (now_utc().isoformat(), source, signal_id, features_key, symbol_name, direction, result, net_profit, mfe_pct, mae_pct, tp_distance_pct, sl_distance_pct, reason))
@@ -799,11 +819,12 @@ class Storage:
         normal_pnl = sum(row_net(r) for r in closed if str(r["signal_type"]) == "normal")
         watch_pnl = sum(row_net(r) for r in closed if str(r["signal_type"]) == "watch")
         fees = sum(round_trip_fee_usdt(float(r["margin_usdt"] or 0.0), int(r["leverage"] or 1)) for r in closed)
+        tradable_pnl = real_pnl + normal_pnl
         return {
             "total": len(rows), "open": sum(1 for r in rows if str(r["status"]) == "OPEN"), "closed": len(closed),
             "real": real, "normal": normal, "watch": watch, "tp": tp, "sl": sl,
             "win_rate": tp / len(closed) * 100.0 if closed else 0.0,
-            "pnl": pnl, "real_pnl": real_pnl, "normal_pnl": normal_pnl, "watch_pnl": watch_pnl, "fees": fees,
+            "pnl": pnl, "tradable_pnl": tradable_pnl, "real_pnl": real_pnl, "normal_pnl": normal_pnl, "watch_pnl": watch_pnl, "fees": fees,
         }
 
     def _row_to_signal(self, row: sqlite3.Row) -> StoredSignal:

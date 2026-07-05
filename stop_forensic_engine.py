@@ -68,6 +68,39 @@ class StopForensicEngine:
             indicator_suggestion=suggestion,
         )
 
+    @staticmethod
+    def _read_profile_number(indicator_profile: str, token: str, default: float = 0.0) -> float:
+        upper = (indicator_profile or "").upper()
+        token = token.upper()
+        if token not in upper:
+            return default
+        try:
+            part = upper.split(token, 1)[1].strip()
+            # Keep digits, minus, dot until a non-number-ish separator.
+            raw = []
+            for ch in part:
+                if ch.isdigit() or ch in ".-":
+                    raw.append(ch)
+                elif raw:
+                    break
+            return float("".join(raw)) if raw else default
+        except Exception:
+            return default
+
+    @staticmethod
+    def _read_donch_breakout(indicator_profile: str) -> str:
+        upper = (indicator_profile or "").upper()
+        if "DONCH" not in upper:
+            return "NONE"
+        try:
+            tail = upper.split("DONCH", 1)[1].strip().split()
+            if len(tail) >= 2 and tail[1] in {"UP", "DOWN", "NONE"}:
+                return tail[1]
+        except Exception:
+            pass
+        return "NONE"
+
+
     def _score_loss_causes(self, signal: dict[str, Any]) -> dict[str, int]:
         scores: dict[str, int] = {}
 
@@ -169,6 +202,43 @@ class StopForensicEngine:
             except Exception:
                 pass
 
+        # New stop-forensic-only indicators. These are not used to create entry signals;
+        # they only explain SL causes after the fact and improve future treatment notes.
+        atrp = self._read_profile_number(indicator, "ATRP", 50.0)
+        chop = self._read_profile_number(indicator, "CHOP", 50.0)
+        bbw_pct = self._read_profile_number(indicator, "BBW", 0.0) / 100.0
+        squeeze = self._read_profile_number(indicator, "SQZ", 1.0)
+        donch_pos = self._read_profile_number(indicator, "DONCH", 50.0)
+        donch_breakout = self._read_donch_breakout(indicator)
+
+        if atrp >= 85:
+            add("VOLATILITY_OVERHEAT", 48)
+            if minutes_to_sl <= 20:
+                add("FAKE_BREAKOUT_OR_CLIMAX", 25)
+        elif atrp <= 18 and chop >= 55:
+            add("MARKET_NOISE_OR_RANGE", 38)
+
+        if chop >= 61:
+            add("MARKET_NOISE_OR_RANGE", 55)
+            if squeeze < 1.05:
+                add("SQUEEZE_RANGE_TRAP", 35)
+        elif chop <= 38 and market_state in {"RANGE", "NOISY", "DEAD_MARKET"}:
+            # Trend-like move while market_state says range often means classification conflict.
+            add("INDICATOR_CONTEXT_BAD", 26)
+
+        if squeeze <= 0.75:
+            add("SQUEEZE_COMPRESSION", 32)
+            if donch_breakout in {"UP", "DOWN"} and minutes_to_sl <= 25:
+                add("FAKE_BREAKOUT_OR_CLIMAX", 42)
+        if bbw_pct >= 0.018 and atrp >= 75:
+            add("VOLATILITY_OVERHEAT", 34)
+
+        direction = str(signal.get("direction") or "").upper()
+        if direction == "LONG" and donch_pos >= 92 and mfe < max(tp_dist * 0.35, 0.00001):
+            add("FAKE_BREAKOUT_OR_CLIMAX", 30)
+        if direction == "SHORT" and donch_pos <= 8 and mfe < max(tp_dist * 0.35, 0.00001):
+            add("FAKE_BREAKOUT_OR_CLIMAX", 30)
+
         if not scores:
             add("UNKNOWN_SL_REASON", 30)
         return scores
@@ -198,11 +268,11 @@ class StopForensicEngine:
     def _indicator_suggestion(primary: str, secondary: tuple[str, ...], signal: dict[str, Any], scores: dict[str, int]) -> str | None:
         causes = {primary, *secondary}
         if "MARKET_NOISE_OR_RANGE" in causes and scores.get("MARKET_NOISE_OR_RANGE", 0) >= 70:
-            return "پیشنهاد فقط برای تحلیل استاپ: Choppiness Index یا Bollinger/Keltner Squeeze برای تشخیص بهتر رنج/نویز."
+            return "اندیکاتورهای فقط-تحلیل-استاپ فعال شدند: Choppiness/Squeeze برای تشخیص رنج و نویز این پرونده بررسی شد."
         if "FAKE_BREAKOUT_OR_CLIMAX" in causes:
-            return "پیشنهاد فقط برای تحلیل استاپ: Donchian/Breakout Retest یا Bollinger Width برای تشخیص شکست فیک/کلایمکس."
+            return "اندیکاتورهای فقط-تحلیل-استاپ فعال شدند: Donchian/Bollinger Width برای بررسی شکست فیک یا کلایمکس استفاده شد."
         if "VOLATILITY_OVERHEAT" in causes:
-            return "پیشنهاد فقط برای تحلیل استاپ: ATR Percentile برای تشخیص نوسان غیرعادی قبل از ورود."
+            return "اندیکاتور فقط-تحلیل-استاپ فعال شد: ATR Percentile برای نوسان غیرعادی این پرونده بررسی شد."
         if "INDICATOR_CONTEXT_BAD" in causes:
             return "پیشنهاد فقط برای تحلیل استاپ: بررسی وزن RSI/MACD/ADX در همان شرایط؛ اندیکاتور جدید فقط با تایید شما اضافه شود."
         return None

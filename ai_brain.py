@@ -137,4 +137,12 @@ class AIBrain:
 
     @staticmethod
     def _indicator_profile(s: IndicatorSnapshot) -> str:
-        return f"RSI {s.rsi:.1f} | ADX {s.adx:.1f} | DI+ {s.plus_di:.1f} / DI- {s.minus_di:.1f} | ATR {s.atr_pct*100:.3f}% | Vol {s.volume_ratio:.2f} | VWAP {s.price_vs_vwap_pct*100:.3f}% | EMA20/50 {s.ema20_50_gap_pct*100:.3f}%"
+        # First line = original indicators used by the normal AI.
+        # Second line = stop-forensic-only indicators; they are stored to explain
+        # future SL causes and do not enter RangeLearningEngine feature keys.
+        return (
+            f"RSI {s.rsi:.1f} | ADX {s.adx:.1f} | DI+ {s.plus_di:.1f} / DI- {s.minus_di:.1f} | "
+            f"ATR {s.atr_pct*100:.3f}% | Vol {s.volume_ratio:.2f} | VWAP {s.price_vs_vwap_pct*100:.3f}% | EMA20/50 {s.ema20_50_gap_pct*100:.3f}%"
+            f"\nStopOnly: ATRP {s.atr_percentile:.0f} | CHOP {s.choppiness:.1f} | BBW {s.bb_width_pct*100:.3f}% | "
+            f"SQZ {s.keltner_squeeze_ratio:.2f} | DONCH {s.donchian_position_pct:.0f} {s.donchian_breakout}"
+        )

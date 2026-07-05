@@ -148,8 +148,9 @@ class TelegramBotUI:
             f"اسلات واقعی: {data.filled_slots}/{data.max_positions} | خالی {data.empty_slots} | درحال بازشدن {data.pending_slots}\n"
             f"موجودی Toobit: {money(data.wallet_margin_usdt)}\n"
             f"پوزیشن/سفارش صرافی: {data.exchange_open_positions}/{data.exchange_open_orders}\n"
-            f"PNL خالص امروز ربات: {money(float(data.today_stats.get('pnl', 0)))}\n"
-            f"Normal خالص امروز: {money(float(data.today_stats.get('normal_pnl', 0)))} | Real خالص امروز: {money(float(data.today_stats.get('real_pnl', 0)))} | Watch خالص: {money(float(data.today_stats.get('watch_pnl', 0)))}\n"
+            f"PNL خالص قابل معامله امروز (Real+Normal): {money(float(data.today_stats.get('tradable_pnl', 0)))}\n"
+            f"PNL آموزشی Watch امروز: {money(float(data.today_stats.get('watch_pnl', 0)))} | کل آزمایشی: {money(float(data.today_stats.get('pnl', 0)))}\n"
+            f"Normal خالص امروز: {money(float(data.today_stats.get('normal_pnl', 0)))} | Real خالص امروز: {money(float(data.today_stats.get('real_pnl', 0)))}\n"
             f"کارمزد تقریبی امروز: {money(-float(data.today_stats.get('fees', 0)))}\n"
             f"TP/SL امروز: {data.today_stats.get('tp', 0)}/{data.today_stats.get('sl', 0)} | WinRate {data.today_stats.get('win_rate', 0):.1f}%\n\n"
             f"نکته: اگر اتوسیگنال خاموش باشد سیگنال جدید صادر نمی‌شود؛ اما سیگنال‌های باز همچنان مانیتور و نتیجه‌شان ثبت می‌شود.\n\n"
@@ -169,8 +170,9 @@ class TelegramBotUI:
             f"Real: {stats['real']} | Normal: {stats['normal']} | Watch: {stats.get('watch', 0)}\n"
             f"TP: {stats['tp']} | SL: {stats['sl']}\n"
             f"WinRate: {stats['win_rate']:.1f}%\n"
-            f"سود/ضرر خالص کل: {money(stats['pnl'])}\n"
-            f"Normal خالص: {money(stats.get('normal_pnl', 0))} | Real خالص: {money(stats.get('real_pnl', 0))} | Watch خالص: {money(stats.get('watch_pnl', 0))}\n"
+            f"سود/ضرر خالص قابل معامله (Real+Normal): {money(stats.get('tradable_pnl', 0))}\n"
+            f"Normal خالص: {money(stats.get('normal_pnl', 0))} | Real خالص: {money(stats.get('real_pnl', 0))}\n"
+            f"Watch آموزشی خالص: {money(stats.get('watch_pnl', 0))} | کل آزمایشی: {money(stats['pnl'])}\n"
             f"کارمزد تقریبی کل: {money(-float(stats.get('fees', 0)))}"
         )
 

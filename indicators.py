@@ -36,6 +36,14 @@ class IndicatorSnapshot:
     body_pct: float
     upper_wick_pct: float
     lower_wick_pct: float
+    # Stop-forensic-only indicators. These are stored for SL investigation;
+    # the normal signal decision/feature key does not use them.
+    atr_percentile: float = 50.0
+    choppiness: float = 50.0
+    bb_width_pct: float = 0.0
+    keltner_squeeze_ratio: float = 1.0
+    donchian_position_pct: float = 50.0
+    donchian_breakout: str = "NONE"
 
     @property
     def atr_pct(self) -> float:
@@ -102,12 +110,26 @@ def calculate_indicators(candles: list[Candle]) -> IndicatorSnapshot:
     vol_window = [v for v in volumes[max(0, last - 20): last] if v > 0]
     avg_vol = sum(vol_window) / len(vol_window) if vol_window else 0.0
     volume_ratio = volumes[last] / avg_vol if avg_vol > 0 and volumes[last] > 0 else 1.0
+
+    # Stop-forensic-only helpers. They are calculated from the same candle batch
+    # and are NOT used in RangeLearningEngine.build_features(), so they do not
+    # change the original entry logic. They only help the stop investigator explain
+    # range/noise, fake breakout, squeeze, and abnormal volatility after a result.
+    atr_percentile = _last_percentile([x for x in atr[max(0, last - 119): last + 1] if x is not None and x > 0], atr[last] or 0.0)
+    choppiness = _choppiness(highs, lows, closes, last, 14)
+    bb_width_pct = _bollinger_width_pct(closes, last, 20)
+    keltner_squeeze_ratio = _keltner_squeeze_ratio(closes, atr, last, 20)
+    donchian_position_pct, donchian_breakout = _donchian_position(highs, lows, closes, last, 20)
+
     return IndicatorSnapshot(
         close=float(closes[last]), prev_close=float(closes[prev]), open=float(opens[last]), high=float(highs[last]), low=float(lows[last]), volume=float(volumes[last]), volume_ratio=float(volume_ratio),
         ema20=float(ema20[last]), ema50=float(ema50[last]), ema200=float(ema200[last]), prev_ema20=float(ema20[prev]), prev_ema50=float(ema50[prev]), prev_ema200=float(ema200[prev]),
         rsi=float(rsi[last]), prev_rsi=float(rsi[prev]), adx=float(adx[last]), plus_di=float(plus_di[last]), minus_di=float(minus_di[last]), atr=float(atr[last]), prev_atr=float(atr[prev]), vwap=float(vwap[last]),
         recent_high=float(max(c.high for c in win80)), recent_low=float(min(c.low for c in win80)), swing_high=float(max(c.high for c in win20)), swing_low=float(min(c.low for c in win20)),
         body_pct=body / candle_range if candle_range > 0 else 0.0, upper_wick_pct=upper_wick / candle_range if candle_range > 0 else 0.0, lower_wick_pct=lower_wick / candle_range if candle_range > 0 else 0.0,
+        atr_percentile=float(atr_percentile), choppiness=float(choppiness), bb_width_pct=float(bb_width_pct),
+        keltner_squeeze_ratio=float(keltner_squeeze_ratio), donchian_position_pct=float(donchian_position_pct),
+        donchian_breakout=str(donchian_breakout),
     )
 
 
@@ -139,6 +161,87 @@ def _previous_complete_index(start: int, *series: list[float | None]) -> int:
         if all(values[index] is not None for values in series):
             return index
     raise RuntimeError("مقدار قبلی اندیکاتورها آماده نیست.")
+
+
+
+def _last_percentile(values: list[float], current: float) -> float:
+    vals = sorted(v for v in values if v is not None and v > 0)
+    if not vals or current <= 0:
+        return 50.0
+    below = sum(1 for v in vals if v <= current)
+    return max(0.0, min(100.0, 100.0 * below / len(vals)))
+
+
+def _std(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    mean = sum(values) / len(values)
+    return (sum((v - mean) ** 2 for v in values) / len(values)) ** 0.5
+
+
+def _bollinger_width_pct(closes: list[float], last: int, period: int = 20) -> float:
+    if last + 1 < period:
+        return 0.0
+    win = closes[last - period + 1: last + 1]
+    mid = sum(win) / len(win)
+    if mid <= 0:
+        return 0.0
+    width = 4.0 * _std(win)  # upper-lower with 2 std on each side
+    return width / mid
+
+
+def _keltner_squeeze_ratio(closes: list[float], atr: list[float | None], last: int, period: int = 20) -> float:
+    """Bollinger width / Keltner width. < 1 means squeeze/compression."""
+    bb_width = _bollinger_width_pct(closes, last, period)
+    atr_val = atr[last] if 0 <= last < len(atr) and atr[last] is not None else 0.0
+    mid = sum(closes[max(0, last - period + 1): last + 1]) / max(1, min(period, last + 1))
+    if atr_val <= 0 or mid <= 0:
+        return 1.0
+    keltner_width_pct = (4.0 * atr_val) / mid
+    if keltner_width_pct <= 0:
+        return 1.0
+    return max(0.0, min(5.0, bb_width / keltner_width_pct))
+
+
+def _donchian_position(highs: list[float], lows: list[float], closes: list[float], last: int, period: int = 20) -> tuple[float, str]:
+    if last + 1 < period:
+        return 50.0, "NONE"
+    # Use the previous channel for breakout detection to avoid counting the current candle in its own channel.
+    start_prev = max(0, last - period)
+    prev_highs = highs[start_prev:last]
+    prev_lows = lows[start_prev:last]
+    win_highs = highs[max(0, last - period + 1): last + 1]
+    win_lows = lows[max(0, last - period + 1): last + 1]
+    hi = max(win_highs) if win_highs else highs[last]
+    lo = min(win_lows) if win_lows else lows[last]
+    rng = hi - lo
+    pos = 50.0 if rng <= 0 else 100.0 * (closes[last] - lo) / rng
+    breakout = "NONE"
+    if prev_highs and closes[last] > max(prev_highs):
+        breakout = "UP"
+    elif prev_lows and closes[last] < min(prev_lows):
+        breakout = "DOWN"
+    return max(0.0, min(100.0, pos)), breakout
+
+
+def _choppiness(highs: list[float], lows: list[float], closes: list[float], last: int, period: int = 14) -> float:
+    """Choppiness Index, 0=trend, 100=chop. Used only for stop forensics."""
+    import math
+    if last < period:
+        return 50.0
+    tr_sum = 0.0
+    for i in range(last - period + 1, last + 1):
+        if i <= 0:
+            tr = highs[i] - lows[i]
+        else:
+            tr = max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1]))
+        tr_sum += max(0.0, tr)
+    hi = max(highs[last - period + 1: last + 1])
+    lo = min(lows[last - period + 1: last + 1])
+    denom = hi - lo
+    if tr_sum <= 0 or denom <= 0 or period <= 1:
+        return 50.0
+    return max(0.0, min(100.0, 100.0 * math.log10(tr_sum / denom) / math.log10(period)))
 
 
 def _ema(values: list[float], period: int) -> list[float | None]:

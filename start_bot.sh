@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-PROJECT_DIR="/root/forex-signal-bot"
+PROJECT_DIR="/root/crypto-ai-helper"
 cd "$PROJECT_DIR" || exit 1
 
 # Load environment variables from .env if it exists

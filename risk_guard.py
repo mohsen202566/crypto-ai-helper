@@ -38,7 +38,7 @@ class StopLossGuard:
         reason = cooldown.get("reason") or ""
         if until and now < until:
             payload = {"until": until.isoformat(), "reason": reason}
-            return GuardVerdict("REAL_BLOCK", "STOP_GUARD", f"ترمز درمان استاپ فعال است تا {until.strftime('%H:%M UTC')}: {reason}؛ سیگنال حذف نمی‌شود، فقط Real بسته/Normal یا Watch می‌شود.", STOP_GUARD_CAUTION_MIN_CONFIDENCE, payload)
+            return GuardVerdict("REAL_BLOCK", "STOP_GUARD", f"ترمز درمان استاپ فعال است تا {until.strftime('%H:%M UTC')}: {reason}؛ سیگنال حذف نمی‌شود، معامله واقعی محدود و در صورت ریسک بالا Watch می‌شود.", STOP_GUARD_CAUTION_MIN_CONFIDENCE, payload)
         profile = self.storage.get_time_risk_profile(symbol_name=symbol_name, direction=getattr(decision, "direction", None))
         if profile and int(profile.get("samples") or 0) >= STOP_GUARD_LEARNED_RISK_MIN_SAMPLES:
             action = str(profile.get("action") or "ALLOW")
@@ -144,7 +144,7 @@ class StopLossGuard:
         message = (
             f"{len(cluster)} استاپ پشت‌سرهم تشخیص داده شد. علت غالب: {main_cause}. "
             f"سشن/ساعت: {session_text}. ارزها: {symbol_text}. "
-            "ربات برای جلوگیری از SL زنجیره‌ای موقتاً سیگنال جدید را نگه می‌دارد و این ساعت/الگو را در حافظه ریسک ذخیره می‌کند."
+            "ربات معامله واقعی/نرمال را محدود می‌کند؛ سیگنال حذف نمی‌شود و در صورت ریسک بالا فقط Watch/ثبت نتیجه می‌شود. این ساعت/الگو در حافظه ریسک ذخیره شد."
         )
         return {
             "main_cause": main_cause,
