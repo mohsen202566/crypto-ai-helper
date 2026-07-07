@@ -1,4 +1,4 @@
-"""Root config for the simple 4H OKX -> Toobit futures bot.
+"""Root config for the 1H OKX -> Toobit futures trend-pullback bot.
 
 Everything is intentionally in the project root because the user deploys by pushing
 these files to GitHub and running `git pull` on the VPS.
@@ -52,9 +52,9 @@ def _env_bool(name: str, default: bool) -> bool:
     return value in {"1", "true", "yes", "y", "on", "فعال"}
 
 
-BOT_NAME = _env("BOT_NAME", "Crypto 4H Simple Toobit Bot")
+BOT_NAME = _env("BOT_NAME", "Crypto 1H Trend Pullback Toobit Bot")
 BOT_DATA_DIR = _env("BOT_DATA_DIR", "data")
-BOT_DB_PATH = _env("BOT_DB_PATH", os.path.join(BOT_DATA_DIR, "crypto_4h_simple.sqlite3"))
+BOT_DB_PATH = _env("BOT_DB_PATH", os.path.join(BOT_DATA_DIR, "crypto_1h_trend_pullback.sqlite3"))
 LOG_LEVEL = _env("LOG_LEVEL", "INFO")
 
 # Telegram
@@ -97,7 +97,7 @@ TOOBIT_PARAM_TP = _env("TOOBIT_PARAM_TP", "takeProfit")
 TOOBIT_PARAM_SL = _env("TOOBIT_PARAM_SL", "stopLoss")
 
 # Main runtime laws discussed with the user.
-MAX_WATCH_SYMBOLS = _env_int("MAX_WATCH_SYMBOLS", 30)
+MAX_WATCH_SYMBOLS = _env_int("MAX_WATCH_SYMBOLS", 50)
 FULL_SCAN_SECONDS = _env_int("FULL_SCAN_SECONDS", 70)
 MONITOR_INTERVAL_SECONDS = _env_int("MONITOR_INTERVAL_SECONDS", 10)
 SLOT_RECHECK_SECONDS = _env_int("SLOT_RECHECK_SECONDS", 70)
@@ -112,16 +112,37 @@ DEFAULT_LEVERAGE = _env_int("DEFAULT_LEVERAGE", 10)
 DEFAULT_MAX_POSITIONS = _env_int("DEFAULT_MAX_POSITIONS", 3)
 DEFAULT_MIN_NET_PROFIT_USDT = _env_float("DEFAULT_MIN_NET_PROFIT_USDT", 0.01)
 
-# Simple 4H strategy laws.
-SIGNAL_SCORE_THRESHOLD = _env_float("SIGNAL_SCORE_THRESHOLD", 70.0)
+# 1H trend-pullback strategy laws.
+SIGNAL_SCORE_THRESHOLD = _env_float("SIGNAL_SCORE_THRESHOLD", 80.0)
 STRONG_SCORE_THRESHOLD = _env_float("STRONG_SCORE_THRESHOLD", 85.0)
 RR_NORMAL = _env_float("RR_NORMAL", 1.5)
 RR_STRONG = _env_float("RR_STRONG", 2.0)
 ROUND_TRIP_FEE_USDT = _env_float("ROUND_TRIP_FEE_USDT", 0.05)
-MIN_4H_SL_PCT = _env_float("MIN_4H_SL_PCT", 0.008)   # 0.8%
-MAX_4H_SL_PCT = _env_float("MAX_4H_SL_PCT", 0.050)   # 5%
+
+SWING_LOOKBACK_4H = _env_int("SWING_LOOKBACK_4H", 8)
+SWING_LOOKBACK_1H = _env_int("SWING_LOOKBACK_1H", 12)
+EMA_SLOPE_LOOKBACK = _env_int("EMA_SLOPE_LOOKBACK", 10)
+
+MIN_TREND_ADX = _env_float("MIN_TREND_ADX", 20.0)
+STRONG_TREND_ADX = _env_float("STRONG_TREND_ADX", 25.0)
+EXHAUSTION_ADX = _env_float("EXHAUSTION_ADX", 40.0)
+FLAT_EMA_ATR_MULT = _env_float("FLAT_EMA_ATR_MULT", 0.30)
+
+PULLBACK_LOOKBACK_1H = _env_int("PULLBACK_LOOKBACK_1H", 5)
+PULLBACK_ATR_BUFFER = _env_float("PULLBACK_ATR_BUFFER", 0.20)
+MIN_ENTRY_BODY_RATIO = _env_float("MIN_ENTRY_BODY_RATIO", 0.45)
+
+MAX_DISTANCE_EMA20_ATR = _env_float("MAX_DISTANCE_EMA20_ATR", 1.50)
+MAX_DISTANCE_EMA50_ATR = _env_float("MAX_DISTANCE_EMA50_ATR", 2.50)
+ATR_SL_BUFFER_MULT = _env_float("ATR_SL_BUFFER_MULT", 0.20)
+MIN_1H_RISK_ATR = _env_float("MIN_1H_RISK_ATR", 0.70)
+MAX_1H_RISK_ATR = _env_float("MAX_1H_RISK_ATR", 2.20)
+MAX_1H_SL_PCT = _env_float("MAX_1H_SL_PCT", 0.035)  # 3.5% maximum 1H structure stop.
+
+# Backward compatible names, in case old VPS env/systemd still uses them.
+MIN_4H_SL_PCT = _env_float("MIN_4H_SL_PCT", 0.008)
+MAX_4H_SL_PCT = _env_float("MAX_4H_SL_PCT", 0.050)
 ATR_SL_MULT = _env_float("ATR_SL_MULT", 1.20)
-SWING_LOOKBACK_4H = _env_int("SWING_LOOKBACK_4H", 12)
 
 # Hard rule: no support/resistance filter for now.
 ENABLE_SUPPORT_RESISTANCE_FILTER = False
@@ -130,15 +151,18 @@ ENABLE_DCA = False
 ENABLE_MARTINGALE = False
 ENABLE_TRAILING_STOP = False
 
-# 30 symbols. Keep internal name USDT style. OKX and Toobit mapping happens in utils.py.
+# 50 symbols. Keep internal name USDT style. OKX and Toobit mapping/validation happens at runtime.
+DEFAULT_WATCHLIST = (
+    "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,BNBUSDT,DOGEUSDT,ADAUSDT,AVAXUSDT,LINKUSDT,TRXUSDT,"
+    "DOTUSDT,LTCUSDT,BCHUSDT,TONUSDT,SUIUSDT,APTUSDT,OPUSDT,ARBUSDT,NEARUSDT,INJUSDT,"
+    "ATOMUSDT,FILUSDT,ETCUSDT,AAVEUSDT,UNIUSDT,SEIUSDT,WIFUSDT,ORDIUSDT,PEPEUSDT,JUPUSDT,"
+    "TIAUSDT,WLDUSDT,FETUSDT,IMXUSDT,STXUSDT,ICPUSDT,MKRUSDT,LDOUSDT,ENSUSDT,ARUSDT,"
+    "GRTUSDT,ALGOUSDT,XLMUSDT,EOSUSDT,PEOPLEUSDT,FLOKIUSDT,BONKUSDT,NOTUSDT,ONDOUSDT,PENDLEUSDT"
+)
+
 WATCHLIST = tuple(
     s.strip().upper()
-    for s in _env(
-        "WATCHLIST",
-        "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT,ADAUSDT,AVAXUSDT,LINKUSDT,TRXUSDT,"
-        "TONUSDT,DOTUSDT,NEARUSDT,APTUSDT,ARBUSDT,OPUSDT,SUIUSDT,SEIUSDT,FETUSDT,INJUSDT,"
-        "LTCUSDT,BCHUSDT,ETCUSDT,FILUSDT,ATOMUSDT,AAVEUSDT,UNIUSDT,1000PEPEUSDT,WIFUSDT,ORDIUSDT",
-    ).split(",")
+    for s in _env("WATCHLIST", DEFAULT_WATCHLIST).split(",")
     if s.strip()
 )[:MAX_WATCH_SYMBOLS]
 

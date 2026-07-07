@@ -53,7 +53,7 @@ def render_signal(signal_id: int, plan: Any, mode: str) -> str:
         "",
         f"Entry: {fmt_price(d['entry_price'])}",
         f"TP: {fmt_price(d['tp_price'])}",
-        f"SL 4H: {fmt_price(d['sl_price'])}",
+        f"SL 1H: {fmt_price(d['sl_price'])}",
         "",
         f"سود خام تقریبی: {float(d.get('estimated_profit_usdt') or 0):.2f} USDT",
         f"سود خالص تقریبی: {float(d.get('estimated_net_profit_usdt') or 0):.2f} USDT",

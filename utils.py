@@ -13,7 +13,7 @@ logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL.upper(), logging.INFO),
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-logger = logging.getLogger("crypto_4h_bot")
+logger = logging.getLogger("crypto_1h_bot")
 
 
 def safe_float(value: Any, default: float = 0.0) -> float:
@@ -90,6 +90,12 @@ def toobit_symbol_candidates(internal_symbol: str) -> list[str]:
     if s.endswith("USDT"):
         base = s[:-4]
         candidates.extend([f"{base}USDT", f"{base}-USDT", f"{base}_USDT", f"{base}USDT_PERP"])
+        # Some exchanges list meme contracts with a 1000-prefix while OKX may use the raw base.
+        if base in {"PEPE", "SHIB", "BONK", "FLOKI", "SATS", "RATS"}:
+            candidates.extend([f"1000{base}USDT", f"1000{base}-USDT", f"1000{base}_USDT", f"1000{base}USDT_PERP"])
+        if base.startswith("1000") and len(base) > 4:
+            raw = base[4:]
+            candidates.extend([f"{raw}USDT", f"{raw}-USDT", f"{raw}_USDT", f"{raw}USDT_PERP"])
     # keep order, unique
     out: list[str] = []
     for item in candidates:

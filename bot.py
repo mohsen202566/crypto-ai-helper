@@ -18,7 +18,7 @@ from toobit_client import ToobitClient
 from utils import logger, normalize_symbol, safe_float, safe_int, side_to_order_side
 
 
-class Crypto4HBot:
+class Crypto1HBot:
     def __init__(self) -> None:
         self.storage = Storage()
         self.okx = OkxDataClient()
@@ -36,7 +36,7 @@ class Crypto4HBot:
     # -------------------------
     def run(self) -> None:
         logger.info("%s شروع شد | symbols=%s", config.BOT_NAME, len(config.WATCHLIST))
-        self.telegram.send("✅ ربات 4H ساده روشن شد.\nبرای پنل بنویس: ترید")
+        self.telegram.send("✅ ربات 1H Trend Pullback روشن شد.\nبرای پنل بنویس: ترید")
         threads = [
             threading.Thread(target=self._scan_loop, name="scan-loop", daemon=True),
             threading.Thread(target=self._monitor_loop, name="monitor-loop", daemon=True),
@@ -114,12 +114,14 @@ class Crypto4HBot:
     def _analyze_symbol(self, symbol: str) -> SignalPlan | None:
         settings = self.storage.settings()
         toobit_symbol = self._resolve_toobit_symbol(symbol)
-        candles_1d = self.okx.get_candles(symbol, "1D", config.OKX_CANDLE_LIMIT)
+        if not toobit_symbol:
+            return None
         candles_4h = self.okx.get_candles(symbol, "4H", config.OKX_CANDLE_LIMIT)
+        candles_1h = self.okx.get_candles(symbol, "1H", config.OKX_CANDLE_LIMIT)
         return self.strategy.analyze(
             symbol,
-            candles_1d,
             candles_4h,
+            candles_1h,
             margin_usdt=float(settings["trade_dollar_usdt"]),
             leverage=int(settings["leverage"]),
             toobit_symbol=toobit_symbol,
@@ -154,7 +156,7 @@ class Crypto4HBot:
         try:
             exchange_symbols = self._get_toobit_exchange_symbols()
             toobit_symbol, symbol_info = self.toobit.validate_symbol(plan.symbol, exchange_symbols)
-            client_id = f"c4h_{plan.symbol}_{int(time.time())}"
+            client_id = f"c1h_{plan.symbol}_{int(time.time())}"
             result = self.toobit.place_market_order(
                 symbol=toobit_symbol,
                 side=side_to_order_side(plan.direction),
@@ -188,13 +190,14 @@ class Crypto4HBot:
             self.storage.mark_real_failed(plan.symbol, str(exc))
             return self._emit_normal(plan)
 
-    def _resolve_toobit_symbol(self, symbol: str) -> str:
+    def _resolve_toobit_symbol(self, symbol: str) -> str | None:
         try:
             exchange_symbols = self._get_toobit_exchange_symbols()
             resolved, _info = self.toobit.validate_symbol(symbol, exchange_symbols)
             return resolved
-        except Exception:
-            return symbol
+        except Exception as exc:
+            logger.warning("نماد %s در Toobit معتبر نشد و رد شد: %s", symbol, exc)
+            return None
 
     def _get_toobit_exchange_symbols(self) -> dict[str, dict[str, Any]]:
         now = time.time()
@@ -301,7 +304,7 @@ class Crypto4HBot:
 
 
 def main() -> None:
-    bot = Crypto4HBot()
+    bot = Crypto1HBot()
     bot.run()
 
 
