@@ -9,6 +9,7 @@ from okx_data import Candle
 from utils import clamp, okx_swap_symbol
 
 Direction = Literal["LONG", "SHORT"]
+MarketState = Literal["LONG", "SHORT", "RANGE"]
 
 
 @dataclass(frozen=True)
@@ -61,7 +62,7 @@ class SignalPlan:
 
 @dataclass(frozen=True)
 class DirectionScore:
-    direction: Direction | None
+    direction: MarketState
     score: float
     reasons: tuple[str, ...]
 
@@ -103,8 +104,14 @@ class Simple4HStrategy:
         return self.last_reject.text()
 
     @staticmethod
-    def _dir_label(direction: Direction | None) -> str:
-        return direction if direction is not None else "نامشخص"
+    def _dir_label(direction: MarketState | str | None) -> str:
+        if direction == "LONG":
+            return "صعودی"
+        if direction == "SHORT":
+            return "نزولی"
+        if direction == "RANGE":
+            return "رنج/خنثی"
+        return "نامشخص"
 
     @staticmethod
     def _snapshot_summary(prefix: str, s: Snapshot) -> str:
@@ -135,19 +142,27 @@ class Simple4HStrategy:
 
         d4 = self._direction_4h(s4h)
         d1 = self._direction_1h(s1h)
-        if d4.direction is None or d1.direction is None:
+        if d4.direction == "RANGE" or d1.direction == "RANGE":
+            if d4.direction == "RANGE" and d1.direction == "RANGE":
+                reason = "4H و 1H هر دو رنج/خنثی هستند"
+            elif d4.direction == "RANGE":
+                reason = "4H رنج/خنثی است"
+            else:
+                reason = "1H رنج/خنثی است"
             details = (
                 f"4H={self._dir_label(d4.direction)}, 1H={self._dir_label(d1.direction)} | "
+                f"4H_reason={'; '.join(d4.reasons) or 'بدون توضیح'} | "
+                f"1H_reason={'; '.join(d1.reasons) or 'بدون توضیح'} | "
                 f"{self._snapshot_summary('4H', s4h)} | {self._snapshot_summary('1H', s1h)}"
             )
-            self._set_reject(symbol, "DIRECTION", "جهت 4H یا 1H واضح نیست", details)
+            self._set_reject(symbol, "DIRECTION", reason, details)
             return None
         if d4.direction != d1.direction:
             details = (
                 f"4H={self._dir_label(d4.direction)} ولی 1H={self._dir_label(d1.direction)} | "
-                "شرط ورود: 4H و 1H باید هم‌جهت باشند"
+                "شرط ورود: جهت 4H و 1H باید همسو باشد"
             )
-            self._set_reject(symbol, "DIRECTION", "4H و 1H هم‌جهت نیستند", details)
+            self._set_reject(symbol, "DIRECTION", "4H و 1H خلاف جهت‌اند", details)
             return None
 
         direction: Direction = d1.direction
@@ -222,30 +237,53 @@ class Simple4HStrategy:
         )
 
     def _direction_4h(self, s: Snapshot) -> DirectionScore:
+        """Classify the mother timeframe into LONG / SHORT / RANGE.
+
+        Direction is intentionally separated from strength. EMA slope, ADX and DMI
+        are checked later as filters, so a clean trend is not mislabeled as
+        ``نامشخص`` only because momentum is temporarily weak.
+        """
         reasons: list[str] = []
-        if s.close > s.ema200 and s.ema50 > s.ema200 and s.ema50 >= s.ema50_lookback:
-            reasons.append("4H جهت مادر صعودی: قیمت و EMA50 بالای EMA200")
+        if min(s.ema50, s.ema200) <= s.close <= max(s.ema50, s.ema200):
+            reasons.append("4H قیمت بین EMA50 و EMA200 است؛ محدوده رنج/انتقالی")
+            return DirectionScore("RANGE", 0.0, tuple(reasons))
+        if s.close > s.ema200 and s.ema50 > s.ema200:
+            reasons.append("4H صعودی: قیمت و EMA50 بالای EMA200")
             return DirectionScore("LONG", 25.0, tuple(reasons))
-        if s.close < s.ema200 and s.ema50 < s.ema200 and s.ema50 <= s.ema50_lookback:
-            reasons.append("4H جهت مادر نزولی: قیمت و EMA50 زیر EMA200")
+        if s.close < s.ema200 and s.ema50 < s.ema200:
+            reasons.append("4H نزولی: قیمت و EMA50 زیر EMA200")
             return DirectionScore("SHORT", 25.0, tuple(reasons))
-        return DirectionScore(None, 0.0, tuple(reasons))
+        reasons.append("4H رنج/خنثی: قیمت و EMA50 نسبت به EMA200 همسو نیستند")
+        return DirectionScore("RANGE", 0.0, tuple(reasons))
 
     def _direction_1h(self, s: Snapshot) -> DirectionScore:
+        """Classify the entry timeframe into LONG / SHORT / RANGE.
+
+        DMI and ADX are filters, not the raw direction classifier. This keeps
+        logs three-state and clear: صعودی / نزولی / رنج.
+        """
         reasons: list[str] = []
-        if s.close > s.ema200 and s.ema50 > s.ema200 and s.ema50 > s.ema50_lookback and s.plus_di > s.minus_di:
-            reasons.append("1H جهت صعودی: EMAها و DMI همسو")
+        if min(s.ema50, s.ema200) <= s.close <= max(s.ema50, s.ema200):
+            reasons.append("1H قیمت بین EMA50 و EMA200 است؛ محدوده رنج/انتقالی")
+            return DirectionScore("RANGE", 0.0, tuple(reasons))
+        if s.close > s.ema200 and s.ema50 > s.ema200:
+            reasons.append("1H صعودی: قیمت و EMA50 بالای EMA200")
             return DirectionScore("LONG", 25.0, tuple(reasons))
-        if s.close < s.ema200 and s.ema50 < s.ema200 and s.ema50 < s.ema50_lookback and s.minus_di > s.plus_di:
-            reasons.append("1H جهت نزولی: EMAها و DMI همسو")
+        if s.close < s.ema200 and s.ema50 < s.ema200:
+            reasons.append("1H نزولی: قیمت و EMA50 زیر EMA200")
             return DirectionScore("SHORT", 25.0, tuple(reasons))
-        return DirectionScore(None, 0.0, tuple(reasons))
+        reasons.append("1H رنج/خنثی: قیمت و EMA50 نسبت به EMA200 همسو نیستند")
+        return DirectionScore("RANGE", 0.0, tuple(reasons))
 
     def _hard_reject_reason(self, direction: Direction, s: Snapshot, candles: list[Candle]) -> str | None:
         if s.atr <= 0:
             return f"ATR فعال/معتبر نیست | ATR={s.atr:g}"
         if s.adx < float(config.MIN_TREND_ADX):
             return f"ADX پایین است / بازار روند کافی ندارد | ADX={s.adx:.1f} < {float(config.MIN_TREND_ADX):.1f}"
+        if direction == "LONG" and s.plus_di <= s.minus_di:
+            return f"DMI با جهت صعودی همسو نیست | +DI={s.plus_di:.1f} <= -DI={s.minus_di:.1f}"
+        if direction == "SHORT" and s.minus_di <= s.plus_di:
+            return f"DMI با جهت نزولی همسو نیست | -DI={s.minus_di:.1f} <= +DI={s.plus_di:.1f}"
         ema_slope_atr = abs(s.ema50 - s.ema50_lookback) / s.atr if s.atr > 0 else 0.0
         if ema_slope_atr < float(config.FLAT_EMA_ATR_MULT):
             return f"EMA50 صاف است / احتمال رنج | EMA50_slope={ema_slope_atr:.2f}ATR < {float(config.FLAT_EMA_ATR_MULT):.2f}ATR"
