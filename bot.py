@@ -229,6 +229,52 @@ class Crypto1HBot:
         toobit_symbol = str(item.get("toobit_symbol") or s).upper().strip()
         return toobit_symbol or None
 
+
+    def _log_strategy_reject(self, symbol: str, reject_logged: int = 0) -> int:
+        """Log and store the last logical reject reason produced by the strategy.
+
+        This is intentionally not a technical error. It explains why a coin did not
+        become a signal, for example: 4H/1H mismatch, low ADX, invalid ATR, late
+        entry, no pullback, or low score.
+        """
+        if not bool(getattr(config, "LOG_REJECT_REASONS", True)) and not bool(getattr(config, "STORE_REJECT_REASONS", True)):
+            return reject_logged
+
+        max_per_scan = max(0, int(getattr(config, "REJECT_LOG_MAX_PER_SCAN", 60)))
+        if max_per_scan and reject_logged >= max_per_scan:
+            return reject_logged
+
+        reject = getattr(self.strategy, "last_reject", None)
+        stage = str(getattr(reject, "stage", "") or "FILTER").strip()
+        reason = str(getattr(reject, "reason", "") or "شرایط ورود کامل نشد").strip()
+        details = str(getattr(reject, "details", "") or "").strip()
+        symbol = normalize_symbol(str(getattr(reject, "symbol", "") or symbol))
+
+        if not reason:
+            reason = "شرایط ورود کامل نشد"
+        if not stage:
+            stage = "FILTER"
+
+        if bool(getattr(config, "STORE_REJECT_REASONS", True)):
+            try:
+                self.storage.add_reject_log(symbol, stage, reason, details)
+            except Exception as exc:
+                logger.warning("ثبت رد منطقی برای %s ناموفق بود: %s", symbol, exc)
+
+        if bool(getattr(config, "LOG_REJECT_REASONS", True)):
+            msg = f"ارز {symbol} رد شد | مرحله: {stage} | دلیل: {reason}"
+            if details:
+                msg += f" | {details}"
+            level = str(getattr(config, "REJECT_LOG_LEVEL", "INFO")).upper()
+            if level == "WARNING":
+                logger.warning(msg)
+            elif level == "ERROR":
+                logger.error(msg)
+            else:
+                logger.info(msg)
+
+        return reject_logged + 1
+
     # -------------------------
     # Telegram commands
     # -------------------------
