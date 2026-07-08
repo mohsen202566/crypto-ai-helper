@@ -6,6 +6,11 @@ import threading
 import time
 from typing import Any
 
+try:
+    import symbols_config
+except Exception:  # optional static registry
+    symbols_config = None  # type: ignore
+
 import config
 from monitor import SignalMonitor
 from okx_data import OkxDataClient
@@ -28,8 +33,7 @@ class Crypto1HBot:
         self.monitor = SignalMonitor(self.storage, self.okx, self.toobit)
         self.telegram = TelegramClient()
         self.stop_event = threading.Event()
-        self._toobit_symbols_cache: dict[str, dict[str, Any]] | None = None
-        self._toobit_symbols_cache_at = 0.0
+        self._symbol_registry = self._build_symbol_registry()
 
     # -------------------------
     # Main loops
@@ -113,6 +117,8 @@ class Crypto1HBot:
 
     def _analyze_symbol(self, symbol: str) -> SignalPlan | None:
         settings = self.storage.settings()
+        # قانون اصلی: کل تحلیل و دیتای بازار فقط از OKX است.
+        # در چرخه اسکن حتی یک درخواست هم به Toobit زده نمی‌شود؛ نماد Toobit فقط از فایل محلی خوانده می‌شود.
         toobit_symbol = self._resolve_toobit_symbol(symbol)
         if not toobit_symbol:
             return None
@@ -137,8 +143,8 @@ class Crypto1HBot:
             self.storage.runtime_set("last_real_block_reason", f"MIN_NET_PROFIT {plan.symbol}: {plan.estimated_net_profit_usdt:.4f}")
             self._emit_normal(plan)
             return
-        if not self.safety.can_open_real_now(self.toobit, max_positions=int(settings["max_positions"])):
-            self.storage.runtime_set("last_real_block_reason", "SLOTS_FULL_WAIT_70S_TOOBIT_RECHECK")
+        if not self.safety.can_open_real_now(max_positions=int(settings["max_positions"])):
+            self.storage.runtime_set("last_real_block_reason", "SLOTS_FULL_STORAGE_ONLY")
             self._emit_normal(plan)
             return
         self._open_real_or_fallback(plan, settings)
@@ -154,8 +160,10 @@ class Crypto1HBot:
             self.storage.mark_real_failed(plan.symbol, "Toobit API key/secret is empty")
             return self._emit_normal(plan)
         try:
-            exchange_symbols = self._get_toobit_exchange_symbols()
-            toobit_symbol, symbol_info = self.toobit.validate_symbol(plan.symbol, exchange_symbols)
+            # Toobit فقط برای اجرای Real صدا زده می‌شود. exchangeInfo/چک نماد در اسکن یا قبل از تحلیل نداریم.
+            # اگر نماد فایل محلی در Toobit معتبر نباشد، فقط همین Real ناموفق می‌شود و سیگنال Normal ثبت می‌شود.
+            toobit_symbol = str(getattr(plan, "toobit_symbol", "") or plan.symbol).upper()
+            symbol_info: dict[str, Any] = {}
             client_id = f"c1h_{plan.symbol}_{int(time.time())}"
             result = self.toobit.place_market_order(
                 symbol=toobit_symbol,
@@ -190,22 +198,34 @@ class Crypto1HBot:
             self.storage.mark_real_failed(plan.symbol, str(exc))
             return self._emit_normal(plan)
 
-    def _resolve_toobit_symbol(self, symbol: str) -> str | None:
-        try:
-            exchange_symbols = self._get_toobit_exchange_symbols()
-            resolved, _info = self.toobit.validate_symbol(symbol, exchange_symbols)
-            return resolved
-        except Exception as exc:
-            logger.warning("نماد %s در Toobit معتبر نشد و رد شد: %s", symbol, exc)
-            return None
+    def _build_symbol_registry(self) -> dict[str, dict[str, str]]:
+        registry: dict[str, dict[str, str]] = {}
+        if symbols_config is not None and hasattr(symbols_config, "enabled_symbols"):
+            try:
+                for item in symbols_config.enabled_symbols():
+                    name = normalize_symbol(str(item.get("name") or ""))
+                    if name and not name.endswith("USDT"):
+                        name = f"{name}USDT"
+                    if not name:
+                        continue
+                    registry[name] = {
+                        "okx_symbol": str(item.get("okx_symbol") or "").upper(),
+                        "toobit_symbol": str(item.get("toobit_symbol") or name).upper(),
+                    }
+            except Exception as exc:
+                logger.warning("خواندن symbols_config ناموفق بود و نگاشت ساده استفاده می‌شود: %s", exc)
+        for symbol in config.WATCHLIST:
+            s = normalize_symbol(symbol)
+            if s and s not in registry:
+                registry[s] = {"okx_symbol": "", "toobit_symbol": s}
+        return registry
 
-    def _get_toobit_exchange_symbols(self) -> dict[str, dict[str, Any]]:
-        now = time.time()
-        if self._toobit_symbols_cache is not None and now - self._toobit_symbols_cache_at < 3600:
-            return self._toobit_symbols_cache
-        self._toobit_symbols_cache = self.toobit.get_exchange_symbols()
-        self._toobit_symbols_cache_at = now
-        return self._toobit_symbols_cache
+    def _resolve_toobit_symbol(self, symbol: str) -> str | None:
+        # فقط نگاشت محلی؛ بدون تماس با Toobit در اسکن. این جلوی HTTP 429 و خوابیدن سیگنال را می‌گیرد.
+        s = normalize_symbol(symbol)
+        item = self._symbol_registry.get(s) or {}
+        toobit_symbol = str(item.get("toobit_symbol") or s).upper().strip()
+        return toobit_symbol or None
 
     # -------------------------
     # Telegram commands
@@ -272,15 +292,10 @@ class Crypto1HBot:
 
     def _panel_text(self) -> str:
         settings = self.storage.settings()
-        margin = None
-        try:
-            if self.toobit.has_credentials:
-                margin = self.toobit.get_usdt_balance_summary()
-        except Exception as exc:
-            logger.warning("خواندن مارجین توبیت برای پنل ناموفق بود: %s", exc)
+        # پنل هم به Toobit درخواست نمی‌زند؛ برای جلوگیری از 429 فقط آمار داخلی ربات نمایش داده می‌شود.
         active = self.storage.active_real_count()
         free = self.storage.free_real_slots(int(settings["max_positions"]))
-        return render_trade_panel(settings, active_real=active, free_slots=free, margin_summary=margin)
+        return render_trade_panel(settings, active_real=active, free_slots=free, margin_summary=None)
 
     @staticmethod
     def _help_text() -> str:

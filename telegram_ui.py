@@ -15,7 +15,7 @@ def onoff(value: bool) -> str:
 
 
 def render_trade_panel(settings: dict[str, Any], *, active_real: int, free_slots: int, margin_summary: dict[str, Any] | None = None) -> str:
-    margin = "نامشخص"
+    margin = "غیرفعال برای جلوگیری از فشار API"
     if margin_summary:
         margin = f"{float(margin_summary.get('available') or margin_summary.get('balance') or 0):.2f} USDT"
     return "\n".join([

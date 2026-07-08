@@ -6,7 +6,12 @@ from dataclasses import dataclass
 import requests
 
 import config
-from utils import okx_swap_symbol, safe_float
+from utils import normalize_symbol, okx_swap_symbol, safe_float
+
+try:
+    import symbols_config
+except Exception:
+    symbols_config = None  # type: ignore
 
 
 @dataclass(frozen=True)
@@ -26,9 +31,29 @@ class OkxDataClient:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.session = requests.Session()
+        self._symbol_map = self._build_symbol_map()
+
+    def _build_symbol_map(self) -> dict[str, str]:
+        out: dict[str, str] = {}
+        if symbols_config is not None and hasattr(symbols_config, "enabled_symbols"):
+            try:
+                for item in symbols_config.enabled_symbols():
+                    name = normalize_symbol(str(item.get("name") or ""))
+                    if name and not name.endswith("USDT"):
+                        name = f"{name}USDT"
+                    okx_symbol = str(item.get("okx_symbol") or "").upper().strip()
+                    if name and okx_symbol:
+                        out[name] = okx_symbol
+            except Exception:
+                pass
+        return out
+
+    def _okx_symbol(self, symbol: str) -> str:
+        s = normalize_symbol(symbol)
+        return self._symbol_map.get(s) or okx_swap_symbol(s)
 
     def get_candles(self, symbol: str, bar: str, limit: int = config.OKX_CANDLE_LIMIT) -> list[Candle]:
-        inst_id = okx_swap_symbol(symbol)
+        inst_id = self._okx_symbol(symbol)
         params = {"instId": inst_id, "bar": bar, "limit": str(max(50, min(int(limit), 300)))}
         url = f"{self.base_url}/api/v5/market/candles"
         last_error: Exception | None = None
@@ -64,7 +89,7 @@ class OkxDataClient:
         raise RuntimeError(f"OKX candles failed for {symbol} {bar}: {last_error}")
 
     def get_last_price(self, symbol: str) -> float:
-        inst_id = okx_swap_symbol(symbol)
+        inst_id = self._okx_symbol(symbol)
         url = f"{self.base_url}/api/v5/market/ticker"
         last_error: Exception | None = None
         for _ in range(3):

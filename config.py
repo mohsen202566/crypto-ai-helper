@@ -104,6 +104,9 @@ SLOT_RECHECK_SECONDS = _env_int("SLOT_RECHECK_SECONDS", 70)
 COIN_ERROR_COOLDOWN_SECONDS = _env_int("COIN_ERROR_COOLDOWN_SECONDS", 70)
 TOOBIT_PANEL_CACHE_SECONDS = _env_int("TOOBIT_PANEL_CACHE_SECONDS", 20)
 
+# OKX-only data law: automatic scan/monitor/panel must not call Toobit.
+# Toobit is only used when opening a Real order and by explicit execution helpers.
+
 # Trade panel defaults - user can change them from Telegram.
 DEFAULT_TRADE_ENABLED = _env_bool("DEFAULT_TRADE_ENABLED", False)
 DEFAULT_TRADE_DOLLAR = _env_float("DEFAULT_TRADE_DOLLAR", _env_float("DEFAULT_MARGIN_USDT", 10.0))
