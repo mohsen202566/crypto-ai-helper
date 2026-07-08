@@ -1,46 +1,40 @@
 from __future__ import annotations
 
+import json
 import re
-import signal
 import threading
 import time
 from typing import Any
 
-try:
-    import symbols_config
-except Exception:  # optional static registry
-    symbols_config = None  # type: ignore
-
 import config
 from monitor import SignalMonitor
 from okx_data import OkxDataClient
-from runtime_safety_4h import RuntimeSafety4H
+from runtime_safety import RuntimeSafety
 from storage import Storage, StoredSignal
-from strategy_4h_simple import SignalPlan, Simple4HStrategy
+from strategy_ice_5m import ICE5MStrategy, SignalPlan
 from telegram_client import TelegramClient
-from telegram_ui import render_result, render_signal, render_stats, render_trade_panel
+from telegram_ui import render_brain, render_result, render_signal, render_stats, render_trade_panel
 from toobit_client import ToobitClient
 from utils import logger, normalize_symbol, safe_float, safe_int, side_to_order_side
 
 
-class Crypto1HBot:
+class Crypto5MICEBot:
     def __init__(self) -> None:
         self.storage = Storage()
         self.okx = OkxDataClient()
         self.toobit = ToobitClient()
-        self.strategy = Simple4HStrategy()
-        self.safety = RuntimeSafety4H(self.storage)
+        self.strategy = ICE5MStrategy()
+        self.safety = RuntimeSafety(self.storage)
         self.monitor = SignalMonitor(self.storage, self.okx, self.toobit)
         self.telegram = TelegramClient()
         self.stop_event = threading.Event()
-        self._symbol_registry = self._build_symbol_registry()
+        self._toobit_symbols_cache: dict[str, dict[str, Any]] | None = None
+        self._toobit_symbols_cache_at = 0.0
+        self._panel_balance_cache: tuple[float, dict[str, float]] | None = None
 
-    # -------------------------
-    # Main loops
-    # -------------------------
     def run(self) -> None:
-        logger.info("%s شروع شد | symbols=%s", config.BOT_NAME, len(config.WATCHLIST))
-        self.telegram.send("✅ ربات 1H Trend Pullback روشن شد.\nبرای پنل بنویس: ترید")
+        logger.info("%s started | symbols=%s", config.BOT_NAME, len(config.WATCHLIST))
+        self.telegram.send("✅ ربات ICE-5M روشن شد.\nبرای پنل بنویس: ترید")
         threads = [
             threading.Thread(target=self._scan_loop, name="scan-loop", daemon=True),
             threading.Thread(target=self._monitor_loop, name="monitor-loop", daemon=True),
@@ -53,25 +47,26 @@ class Crypto1HBot:
                 time.sleep(1)
         except KeyboardInterrupt:
             self.stop_event.set()
-        logger.info("ربات متوقف شد")
+        logger.info("bot stopped")
 
     def _scan_loop(self) -> None:
         while not self.stop_event.is_set():
-            start = time.time()
             try:
-                self.scan_once()
+                settings = self.storage.settings()
+                if settings.get("auto_signal_enabled"):
+                    self.scan_once()
+                else:
+                    self.storage.runtime_set("last_scan_status", "auto_signal_off")
             except Exception as exc:
-                logger.exception("چرخه اسکن کرش نکرد؛ خطای کلی ثبت شد: %s", exc)
-            elapsed = time.time() - start
-            sleep_for = max(1.0, float(config.FULL_SCAN_SECONDS) - elapsed)
-            self.stop_event.wait(sleep_for)
+                logger.exception("scan loop failed without crash: %s", exc)
+            self.stop_event.wait(max(1, int(config.FULL_SCAN_SECONDS)))
 
     def _monitor_loop(self) -> None:
         while not self.stop_event.is_set():
             try:
                 self.monitor.check_once(self._send_result)
             except Exception as exc:
-                logger.exception("چرخه مانیتورینگ کرش نکرد؛ خطا ثبت شد: %s", exc)
+                logger.exception("monitor loop failed without crash: %s", exc)
             self.stop_event.wait(max(1, int(config.MONITOR_INTERVAL_SECONDS)))
 
     def _telegram_loop(self) -> None:
@@ -81,18 +76,26 @@ class Crypto1HBot:
                 try:
                     self._handle_update(update)
                 except Exception as exc:
-                    logger.warning("پردازش پیام تلگرام خطا داد: %s", exc)
+                    logger.warning("telegram update failed: %s", exc)
             if not self.telegram.enabled:
                 self.stop_event.wait(5)
 
-    # -------------------------
-    # Scanner
-    # -------------------------
     def scan_once(self) -> None:
         watchlist = self.safety.limited_watchlist()
-        self.storage.runtime_set("last_scan_started_at", int(time.time()))
-        found = 0
-        reject_logged = 0
+        started_at = int(time.time())
+        self.storage.runtime_set("last_scan_started_at", started_at)
+        summary: dict[str, Any] = {
+            "started_at": started_at,
+            "total": len(watchlist),
+            "scanned": 0,
+            "signals": 0,
+            "rejected": 0,
+            "skipped_open": 0,
+            "skipped_cooldown": 0,
+            "errors": 0,
+            "last_rejects": [],
+        }
+        reason_counts: dict[str, int] = {}
         for symbol in watchlist:
             if self.stop_event.is_set():
                 break
@@ -100,53 +103,74 @@ class Crypto1HBot:
             if not symbol:
                 continue
             if not self.safety.can_scan_coin(symbol):
+                summary["skipped_cooldown"] += 1
+                reason = "رد شد: ارز در کول‌داون خطا است"
+                self._record_reject(summary, reason_counts, symbol, reason)
                 continue
             try:
                 if self.storage.has_open_symbol(symbol):
+                    summary["skipped_open"] += 1
                     continue
+                summary["scanned"] += 1
                 plan = self._analyze_symbol(symbol)
                 self.safety.clear_coin_error(symbol)
                 if plan is None:
-                    reject_logged = self._log_strategy_reject(symbol, reject_logged)
+                    reason = self.strategy.last_reject_reason or "رد شد: شرایط ICE کامل نشد"
+                    summary["rejected"] += 1
+                    self._record_reject(summary, reason_counts, symbol, reason)
                     continue
-                found += 1
+                summary["signals"] += 1
                 self._handle_plan(plan)
             except Exception as exc:
+                summary["errors"] += 1
                 self.safety.record_coin_error(symbol, exc)
-                continue
-        self.storage.runtime_set("last_scan_finished_at", int(time.time()))
-        self.storage.runtime_set("last_scan_found", found)
+        finished_at = int(time.time())
+        summary["finished_at"] = finished_at
+        summary["duration_seconds"] = max(0, finished_at - started_at)
+        summary["reason_counts"] = sorted([{"reason": r, "count": c} for r, c in reason_counts.items()], key=lambda x: x["count"], reverse=True)[:10]
+        summary["last_rejects"] = summary["last_rejects"][-15:]
+        self.storage.runtime_set("last_scan_finished_at", finished_at)
+        self.storage.runtime_set("last_scan_summary", json.dumps(summary, ensure_ascii=False))
+        logger.info("scan summary: %s", summary)
+
+    def _record_reject(self, summary: dict[str, Any], reason_counts: dict[str, int], symbol: str, reason: str) -> None:
+        logger.info("scan rejected: %s | %s", symbol, reason)
+        self.storage.add_scan_reject(symbol, reason)
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        summary["last_rejects"].append({"symbol": symbol, "reason": reason})
 
     def _analyze_symbol(self, symbol: str) -> SignalPlan | None:
         settings = self.storage.settings()
-        # قانون اصلی: کل تحلیل و دیتای بازار فقط از OKX است.
-        # در چرخه اسکن حتی یک درخواست هم به Toobit زده نمی‌شود؛ نماد Toobit فقط از فایل محلی خوانده می‌شود.
         toobit_symbol = self._resolve_toobit_symbol(symbol)
-        if not toobit_symbol:
-            return None
-        candles_4h = self.okx.get_candles(symbol, "4H", config.OKX_CANDLE_LIMIT)
-        candles_1h = self.okx.get_candles(symbol, "1H", config.OKX_CANDLE_LIMIT)
+        candles_15m = self.okx.get_candles(symbol, "15m", config.OKX_CANDLE_LIMIT)
+        candles_5m = self.okx.get_candles(symbol, "5m", config.OKX_CANDLE_LIMIT)
+        candles_1m = self.okx.get_candles(symbol, "1m", max(80, min(300, config.OKX_CANDLE_LIMIT)))
+        order_book = self.okx.get_order_book(symbol, config.ORDERBOOK_DEPTH_LEVELS)
+        trades = self.okx.get_trades(symbol, 100)
         return self.strategy.analyze(
             symbol,
-            candles_4h,
-            candles_1h,
+            candles_15m,
+            candles_5m,
+            candles_1m,
+            order_book,
+            trades,
             margin_usdt=float(settings["trade_dollar_usdt"]),
             leverage=int(settings["leverage"]),
+            min_net_profit_usdt=float(settings["min_net_profit_usdt"]),
             toobit_symbol=toobit_symbol,
             round_trip_fee_usdt=float(config.ROUND_TRIP_FEE_USDT),
         )
 
     def _handle_plan(self, plan: SignalPlan) -> None:
         settings = self.storage.settings()
+        if plan.estimated_net_profit_usdt < float(settings["min_net_profit_usdt"]):
+            self.storage.runtime_set("last_signal_block_reason", f"MIN_NET_PROFIT {plan.symbol}: {plan.estimated_net_profit_usdt:.4f}")
+            return
         if not settings["real_trade_enabled"]:
             self._emit_normal(plan)
             return
-        if plan.estimated_net_profit_usdt < float(settings["min_net_profit_usdt"]):
-            self.storage.runtime_set("last_real_block_reason", f"MIN_NET_PROFIT {plan.symbol}: {plan.estimated_net_profit_usdt:.4f}")
-            self._emit_normal(plan)
-            return
-        if not self.safety.can_open_real_now(max_positions=int(settings["max_positions"])):
-            self.storage.runtime_set("last_real_block_reason", "SLOTS_FULL_STORAGE_ONLY")
+        if not self.safety.can_open_real_now(self.toobit, max_positions=int(settings["max_positions"])):
+            self.storage.runtime_set("last_real_block_reason", "SLOTS_FULL_WAIT_70S_TOOBIT_RECHECK")
             self._emit_normal(plan)
             return
         self._open_real_or_fallback(plan, settings)
@@ -162,11 +186,9 @@ class Crypto1HBot:
             self.storage.mark_real_failed(plan.symbol, "Toobit API key/secret is empty")
             return self._emit_normal(plan)
         try:
-            # Toobit فقط برای اجرای Real صدا زده می‌شود. exchangeInfo/چک نماد در اسکن یا قبل از تحلیل نداریم.
-            # اگر نماد فایل محلی در Toobit معتبر نباشد، فقط همین Real ناموفق می‌شود و سیگنال Normal ثبت می‌شود.
-            toobit_symbol = str(getattr(plan, "toobit_symbol", "") or plan.symbol).upper()
-            symbol_info: dict[str, Any] = {}
-            client_id = f"c1h_{plan.symbol}_{int(time.time())}"
+            exchange_symbols = self._get_toobit_exchange_symbols()
+            toobit_symbol, symbol_info = self.toobit.validate_symbol(plan.symbol, exchange_symbols)
+            client_id = f"ice5m_{plan.symbol}_{int(time.time())}"
             result = self.toobit.place_market_order(
                 symbol=toobit_symbol,
                 side=side_to_order_side(plan.direction),
@@ -181,103 +203,32 @@ class Crypto1HBot:
             if not result.get("opened"):
                 self.storage.mark_real_failed(plan.symbol, str(result.get("reason") or "real order not opened"))
                 return self._emit_normal(plan)
-            data = plan.to_legacy_dict()
-            data["toobit_symbol"] = toobit_symbol
-            data["trade_margin_usdt"] = float(settings["trade_dollar_usdt"])
-            data["leverage"] = int(settings["leverage"])
-            if result.get("entry_price"):
-                data["entry_price"] = float(result["entry_price"])
-            if result.get("tp_price"):
-                data["tp_price"] = float(result["tp_price"])
-            if result.get("sl_price"):
-                data["sl_price"] = float(result["sl_price"])
-            signal_id = self.storage.add_signal(data, signal_type="real", real_status="opened", order_id=result.get("order_id"))
-            msg_id = self.telegram.send(render_signal(signal_id, data, "real"))
+            order_id = str(result.get("order_id") or result.get("client_order_id") or "")
+            signal_id = self.storage.add_signal(plan, signal_type="real", order_id=order_id, client_order_id=client_id)
+            msg_id = self.telegram.send(render_signal(signal_id, plan, "real"))
             self.storage.update_message_id(signal_id, msg_id)
             return signal_id
         except Exception as exc:
-            logger.warning("باز کردن Real برای %s ناموفق بود و Normal صادر شد: %s", plan.symbol, exc)
+            logger.warning("real order failed, fallback to normal: %s", exc)
             self.storage.mark_real_failed(plan.symbol, str(exc))
             return self._emit_normal(plan)
 
-    def _build_symbol_registry(self) -> dict[str, dict[str, str]]:
-        registry: dict[str, dict[str, str]] = {}
-        if symbols_config is not None and hasattr(symbols_config, "enabled_symbols"):
-            try:
-                for item in symbols_config.enabled_symbols():
-                    name = normalize_symbol(str(item.get("name") or ""))
-                    if name and not name.endswith("USDT"):
-                        name = f"{name}USDT"
-                    if not name:
-                        continue
-                    registry[name] = {
-                        "okx_symbol": str(item.get("okx_symbol") or "").upper(),
-                        "toobit_symbol": str(item.get("toobit_symbol") or name).upper(),
-                    }
-            except Exception as exc:
-                logger.warning("خواندن symbols_config ناموفق بود و نگاشت ساده استفاده می‌شود: %s", exc)
-        for symbol in config.WATCHLIST:
-            s = normalize_symbol(symbol)
-            if s and s not in registry:
-                registry[s] = {"okx_symbol": "", "toobit_symbol": s}
-        return registry
+    def _resolve_toobit_symbol(self, symbol: str) -> str:
+        try:
+            exchange_symbols = self._get_toobit_exchange_symbols()
+            resolved, _info = self.toobit.validate_symbol(symbol, exchange_symbols)
+            return resolved
+        except Exception:
+            return symbol
 
-    def _resolve_toobit_symbol(self, symbol: str) -> str | None:
-        # فقط نگاشت محلی؛ بدون تماس با Toobit در اسکن. این جلوی HTTP 429 و خوابیدن سیگنال را می‌گیرد.
-        s = normalize_symbol(symbol)
-        item = self._symbol_registry.get(s) or {}
-        toobit_symbol = str(item.get("toobit_symbol") or s).upper().strip()
-        return toobit_symbol or None
+    def _get_toobit_exchange_symbols(self) -> dict[str, dict[str, Any]]:
+        now = time.time()
+        if self._toobit_symbols_cache is not None and now - self._toobit_symbols_cache_at < 3600:
+            return self._toobit_symbols_cache
+        self._toobit_symbols_cache = self.toobit.get_exchange_symbols()
+        self._toobit_symbols_cache_at = now
+        return self._toobit_symbols_cache
 
-
-    def _log_strategy_reject(self, symbol: str, reject_logged: int = 0) -> int:
-        """Log and store the last logical reject reason produced by the strategy.
-
-        This is intentionally not a technical error. It explains why a coin did not
-        become a signal, for example: 4H/1H mismatch, low ADX, invalid ATR, late
-        entry, no pullback, or low score.
-        """
-        if not bool(getattr(config, "LOG_REJECT_REASONS", True)) and not bool(getattr(config, "STORE_REJECT_REASONS", True)):
-            return reject_logged
-
-        max_per_scan = max(0, int(getattr(config, "REJECT_LOG_MAX_PER_SCAN", 60)))
-        if max_per_scan and reject_logged >= max_per_scan:
-            return reject_logged
-
-        reject = getattr(self.strategy, "last_reject", None)
-        stage = str(getattr(reject, "stage", "") or "FILTER").strip()
-        reason = str(getattr(reject, "reason", "") or "شرایط ورود کامل نشد").strip()
-        details = str(getattr(reject, "details", "") or "").strip()
-        symbol = normalize_symbol(str(getattr(reject, "symbol", "") or symbol))
-
-        if not reason:
-            reason = "شرایط ورود کامل نشد"
-        if not stage:
-            stage = "FILTER"
-
-        if bool(getattr(config, "STORE_REJECT_REASONS", True)):
-            try:
-                self.storage.add_reject_log(symbol, stage, reason, details)
-            except Exception as exc:
-                logger.warning("ثبت رد منطقی برای %s ناموفق بود: %s", symbol, exc)
-
-        if bool(getattr(config, "LOG_REJECT_REASONS", True)):
-            msg = f"ارز {symbol} رد شد | مرحله: {stage} | دلیل: {reason}"
-            if details:
-                msg += f" | {details}"
-            level = str(getattr(config, "REJECT_LOG_LEVEL", "INFO")).upper()
-            if level == "WARNING":
-                logger.warning(msg)
-            elif level == "ERROR":
-                logger.error(msg)
-            else:
-                logger.info(msg)
-
-        return reject_logged + 1
-
-    # -------------------------
-    # Telegram commands
-    # -------------------------
     def _handle_update(self, update: dict[str, Any]) -> None:
         msg = update.get("message") or {}
         text = str(msg.get("text") or "").strip()
@@ -293,87 +244,105 @@ class Crypto1HBot:
     def handle_command(self, text: str) -> str:
         t = text.strip()
         low = t.lower()
-        if low in {"/start", "start", "پنل", "وضعیت", "ترید"}:
+        if low in {"/start", "start", "پنل", "وضعیت", "ترید", "پنل ترید"}:
             return self._panel_text()
-        if t == "ترید فعال":
+        if t in {"ترید روشن", "ترید فعال"}:
             self.storage.set_setting("real_trade_enabled", "1")
-            return "✅ ترید واقعی فعال شد. از این به بعد اگر اسلات آزاد باشد سیگنال واجد شرایط به Toobit ارسال می‌شود."
+            return "✅ ترید واقعی روشن شد. اگر اسلات آزاد باشد، سیگنال واجد شرایط روی Toobit اجرا می‌شود."
         if t == "ترید خاموش":
             self.storage.set_setting("real_trade_enabled", "0")
-            return "⛔ ترید واقعی خاموش شد. سیگنال‌ها فقط عادی ثبت و مانیتور می‌شوند."
+            return "⛔ ترید واقعی خاموش شد. سیگنال‌ها معمولی ارسال می‌شوند."
+        if t == "اتو سیگنال روشن":
+            self.storage.set_setting("auto_signal_enabled", "1")
+            return "✅ اتو سیگنال روشن شد."
+        if t == "اتو سیگنال خاموش":
+            self.storage.set_setting("auto_signal_enabled", "0")
+            return "⛔ اتو سیگنال خاموش شد."
+        if low in {"آمار", "stats"}:
+            return render_stats(self.storage.stats())
+        if low in {"هوش", "brain"}:
+            return render_brain(self.storage.settings(), self._runtime_snapshot())
+        if low in {"اسکن", "scan"}:
+            self.scan_once()
+            return "✅ یک اسکن دستی انجام شد. نتیجه در پنل/آمار ثبت شد."
+        if t == "حذف آمار تایید":
+            self.storage.reset_stats()
+            return "🧹 آمار و سیگنال‌های ذخیره‌شده حذف شد."
+        if t == "حذف آمار":
+            return "برای حذف آمار بنویس: حذف آمار تایید"
         m = re.match(r"^ترید\s+دلار\s+([0-9]+(?:\.[0-9]+)?)$", t)
         if m:
-            value = max(1.0, safe_float(m.group(1), config.DEFAULT_TRADE_DOLLAR))
-            self.storage.set_setting("trade_dollar_usdt", value)
-            return f"✅ دلار هر پوزیشن شد: {value:.2f} USDT"
+            v = max(1.0, safe_float(m.group(1), config.DEFAULT_TRADE_DOLLAR))
+            self.storage.set_setting("trade_dollar_usdt", v)
+            return f"✅ مبلغ هر معامله شد: {v:g} USDT"
         m = re.match(r"^ترید\s+لوریج\s+([0-9]+)$", t)
         if m:
-            value = max(1, min(125, safe_int(m.group(1), config.DEFAULT_LEVERAGE)))
-            self.storage.set_setting("leverage", value)
-            return f"✅ لوریج شد: {value}x"
+            v = max(1, min(125, safe_int(m.group(1), config.DEFAULT_LEVERAGE)))
+            self.storage.set_setting("leverage", v)
+            return f"✅ لوریج شد: {v}x"
         m = re.match(r"^حداکثر\s+پوزیشن\s+([0-9]+)$", t)
         if m:
-            value = max(1, min(20, safe_int(m.group(1), config.DEFAULT_MAX_POSITIONS)))
-            self.storage.set_setting("max_positions", value)
-            return f"✅ حداکثر پوزیشن شد: {value}"
-        m = re.match(r"^سرمایه\s+ترید\s+([0-9]+(?:\.[0-9]+)?)$", t)
+            v = max(1, min(20, safe_int(m.group(1), config.DEFAULT_MAX_POSITIONS)))
+            self.storage.set_setting("max_positions", v)
+            return f"✅ حداکثر پوزیشن همزمان شد: {v}"
+        m = re.match(r"^حداقل\s+سود\s+([0-9]+(?:\.[0-9]+)?)$", t)
         if m:
-            value = max(1.0, safe_float(m.group(1), config.DEFAULT_TRADE_CAPITAL))
-            self.storage.set_setting("trade_capital_usdt", value)
-            return f"✅ سرمایه مجاز ربات شد: {value:.2f} USDT"
-        m = re.match(r"^حداقل\s+سود\s+خالص\s+([0-9]+(?:\.[0-9]+)?)$", t)
-        if m:
-            value = max(0.0, safe_float(m.group(1), config.DEFAULT_MIN_NET_PROFIT_USDT))
-            self.storage.set_setting("min_net_profit_usdt", value)
-            return f"✅ حداقل سود خالص Real شد: {value:.2f} USDT"
-        m = re.match(r"^آمار(?:\s+([0-9]+))?$", t)
-        if m:
-            days = max(1, min(365, safe_int(m.group(1), 30)))
-            return render_stats(self.storage.stats(days), days)
-        m = re.match(r"^ردها(?:\s+([0-9]+))?$", t)
-        if m:
-            limit = max(1, min(100, safe_int(m.group(1), 30)))
-            return self.storage.recent_rejects_text(limit)
-        if t in {"پوزیشن", "پوزیشن‌ها", "پوزیشن ها"}:
-            return self.storage.recent_open_positions_text()
-        if t in {"کوین‌ها", "کوین ها", "ارزها", "ارزهای فعال"}:
-            return "📌 ارزهای فعال:\n" + "\n".join(config.WATCHLIST)
-        if t in {"راهنما", "help", "/help"}:
-            return self._help_text()
-        return "دستور شناخته نشد. برای راهنما بنویس: راهنما"
+            v = max(0.0, safe_float(m.group(1), config.DEFAULT_MIN_NET_PROFIT_USDT))
+            self.storage.set_setting("min_net_profit_usdt", v)
+            return f"✅ حداقل سود خالص شد: {v:g} USDT"
+        if low in {"پوزیشن", "positions"}:
+            return self._positions_text()
+        if low in {"کوین‌ها", "coins", "watchlist"}:
+            return "📌 کوین‌های فعال:\n" + ", ".join(config.WATCHLIST)
+        return (
+            "دستور نامشخص است.\n"
+            "دستورات اصلی: ترید، آمار، هوش، ترید روشن، ترید خاموش، اتو سیگنال روشن، اتو سیگنال خاموش"
+        )
 
     def _panel_text(self) -> str:
-        settings = self.storage.settings()
-        # پنل هم به Toobit درخواست نمی‌زند؛ برای جلوگیری از 429 فقط آمار داخلی ربات نمایش داده می‌شود.
-        active = self.storage.active_real_count()
-        free = self.storage.free_real_slots(int(settings["max_positions"]))
-        return render_trade_panel(settings, active_real=active, free_slots=free, margin_summary=None)
+        balance = self._balance_cached()
+        return render_trade_panel(self.storage.settings(), self.storage.stats(), self._runtime_snapshot(), balance)
 
-    @staticmethod
-    def _help_text() -> str:
-        return "\n".join([
-            "راهنما:",
-            "ترید / پنل / وضعیت",
-            "ترید فعال",
-            "ترید خاموش",
-            "ترید دلار 10",
-            "ترید لوریج 10",
-            "حداکثر پوزیشن 3",
-            "سرمایه ترید 100",
-            "حداقل سود خالص 0.01",
-            "آمار یا آمار 7",
-            "ردها یا ردها 50",
-            "پوزیشن",
-            "کوین‌ها",
-        ])
+    def _runtime_snapshot(self) -> dict[str, str]:
+        keys = [
+            "last_scan_summary", "last_real_block_reason", "last_real_failed", "last_signal_block_reason",
+            "last_toobit_open_count", "last_toobit_open_symbols", "last_slot_recheck_error",
+        ]
+        return {k: self.storage.runtime_get(k, "") for k in keys}
+
+    def _balance_cached(self) -> dict[str, float]:
+        now = time.time()
+        if self._panel_balance_cache and now - self._panel_balance_cache[0] < int(config.TOOBIT_PANEL_CACHE_SECONDS):
+            return self._panel_balance_cache[1]
+        if not self.toobit.has_credentials:
+            return {}
+        try:
+            data = self.toobit.get_usdt_balance_summary()
+            self._panel_balance_cache = (now, data)
+            return data
+        except Exception as exc:
+            self.storage.runtime_set("last_balance_error", str(exc)[:300])
+            return {}
+
+    def _positions_text(self) -> str:
+        active = self.storage.active_signals()
+        if not active:
+            return "پوزیشن/سیگنال باز نداریم."
+        lines = ["📌 <b>پوزیشن/سیگنال‌های باز</b>"]
+        for s in active[:20]:
+            lines.append(f"#{s.id} {s.signal_type.upper()} {s.symbol} {s.direction} | Entry {s.entry_price:.6f} | TP {s.tp_price:.6f} | SL {s.sl_price:.6f}")
+        return "\n".join(lines)
 
     def _send_result(self, signal: StoredSignal, result) -> int | None:
-        return self.telegram.send(render_result(signal, result), reply_to_message_id=signal.message_id)
+        text = render_result(signal, result)
+        msg_id = self.telegram.send(text, reply_to_message_id=signal.message_id)
+        if msg_id is None and signal.message_id:
+            msg_id = self.telegram.send("نتیجه مربوط به سیگنال #" + str(signal.id) + "\n" + text)
+        return msg_id
 
 
 def main() -> None:
-    bot = Crypto1HBot()
-    bot.run()
+    Crypto5MICEBot().run()
 
 
 if __name__ == "__main__":

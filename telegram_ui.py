@@ -5,96 +5,121 @@ import time
 from typing import Any
 
 import config
-from monitoring_result_4h import MonitorResult
 from storage import StoredSignal
-from utils import fmt_money, fmt_price
 
 
-def onoff(value: bool) -> str:
-    return "روشن ✅" if value else "خاموش ⛔"
+def _yn(v: bool) -> str:
+    return "روشن ✅" if v else "خاموش ⛔"
 
 
-def render_trade_panel(settings: dict[str, Any], *, active_real: int, free_slots: int, margin_summary: dict[str, Any] | None = None) -> str:
-    margin = "غیرفعال برای جلوگیری از فشار API"
-    if margin_summary:
-        margin = f"{float(margin_summary.get('available') or margin_summary.get('balance') or 0):.2f} USDT"
-    return "\n".join([
-        "⚙️ وضعیت ربات",
-        "",
-        f"💹 ترید واقعی: {onoff(bool(settings['real_trade_enabled']))}",
-        f"💰 مارجین توبیت: {margin}",
-        f"💲 دلار هر پوزیشن: {float(settings['trade_dollar_usdt']):.2f} USDT",
-        f"📈 لوریج: {int(settings['leverage'])}x",
-        f"🎯 حداکثر پوزیشن: {int(settings['max_positions'])}",
-        f"📌 پوزیشن Real فعال: {active_real}",
-        f"🟢 اسلات آزاد: {free_slots}",
-        f"💵 سرمایه مجاز ربات: {float(settings['trade_capital_usdt']):.2f} USDT",
-        f"🧾 کارمزد رفت‌وبرگشت ثابت: {config.ROUND_TRIP_FEE_USDT:.2f} USDT",
-        "",
-        "دستورات:",
-        "ترید فعال | ترید خاموش",
-        "ترید دلار 10 | ترید لوریج 10 | حداکثر پوزیشن 3",
-        "آمار | پوزیشن | کوین‌ها | وضعیت",
-    ])
+def _fmt(x: float, n: int = 4) -> str:
+    try:
+        return f"{float(x):.{n}f}"
+    except Exception:
+        return str(x)
 
 
-def render_signal(signal_id: int, plan: Any, mode: str) -> str:
-    d = plan.to_legacy_dict() if hasattr(plan, "to_legacy_dict") else dict(plan)
-    title = "🏦 سیگنال توبیت" if mode == "real" else "📊 سیگنال"
-    side = "LONG 🟢" if d["direction"] == "LONG" else "SHORT 🔴"
-    rr = float(d.get("risk_reward") or 0)
-    return "\n".join([
-        title,
-        f"#{signal_id} | {d['symbol']}",
-        f"جهت: {side}",
-        f"امتیاز: {float(d['score']):.1f}/100",
-        f"قدرت: {d.get('strength', 'معمولی')}",
-        f"RR: {rr:g}",
-        "",
-        f"Entry: {fmt_price(d['entry_price'])}",
-        f"TP: {fmt_price(d['tp_price'])}",
-        f"SL 1H: {fmt_price(d['sl_price'])}",
-        "",
-        f"سود خام تقریبی: {float(d.get('estimated_profit_usdt') or 0):.2f} USDT",
-        f"سود خالص تقریبی: {float(d.get('estimated_net_profit_usdt') or 0):.2f} USDT",
-        f"کارمزد رفت‌وبرگشت: {float(d.get('round_trip_fee_usdt') or config.ROUND_TRIP_FEE_USDT):.2f} USDT",
-    ])
+def render_trade_panel(settings: dict[str, Any], stats: dict[str, Any], runtime: dict[str, str] | None = None, balance: dict[str, float] | None = None) -> str:
+    runtime = runtime or {}
+    balance = balance or {}
+    last_scan = runtime.get("last_scan_summary", "")
+    scan_line = "نامشخص"
+    if last_scan:
+        try:
+            s = json.loads(last_scan)
+            scan_line = f"اسکن‌شده {s.get('scanned',0)}/{s.get('total',0)} | سیگنال {s.get('signals',0)} | رد {s.get('rejected',0)} | خطا {s.get('errors',0)}"
+        except Exception:
+            scan_line = last_scan[:120]
+    bal_line = "نامشخص"
+    if balance:
+        bal_line = f"USDT کل: {_fmt(balance.get('total',0),2)} | آزاد: {_fmt(balance.get('available',0),2)}"
+    return (
+        "📊 <b>پنل ترید ICE-5M</b>\n\n"
+        f"اتو سیگنال: <b>{_yn(bool(settings['auto_signal_enabled']))}</b>\n"
+        f"ترید واقعی Toobit: <b>{_yn(bool(settings['real_trade_enabled']))}</b>\n"
+        f"دیتا/مانیتور: <b>OKX</b>\n"
+        f"اجرای واقعی: <b>Toobit</b>\n\n"
+        f"موجودی فیوچرز: {bal_line}\n"
+        f"مبلغ هر معامله: <b>{_fmt(settings['trade_dollar_usdt'],2)} USDT</b>\n"
+        f"لوریج: <b>{settings['leverage']}x</b>\n"
+        f"حداکثر پوزیشن همزمان: <b>{settings['max_positions']}</b>\n"
+        f"اسلات واقعی باز: <b>{stats.get('real_open',0)}/{settings['max_positions']}</b>\n"
+        f"حداقل سود خالص: <b>{_fmt(settings['min_net_profit_usdt'],3)} USDT</b>\n"
+        f"RR: <b>{config.ICE_RR:.2f}</b> | فقط یک TP | RR زیر 1 ممنوع\n\n"
+        f"آخرین اسکن: {scan_line}\n\n"
+        "⌨️ <b>دستورات</b>\n"
+        "ترید\n"
+        "ترید روشن / ترید فعال\n"
+        "ترید خاموش\n"
+        "اتو سیگنال روشن\n"
+        "اتو سیگنال خاموش\n"
+        "ترید دلار 10\n"
+        "ترید لوریج 8\n"
+        "حداکثر پوزیشن 3\n"
+        "حداقل سود 0.02\n"
+        "آمار\n"
+        "هوش\n"
+        "حذف آمار تایید\n"
+    )
 
 
-def render_result(signal: StoredSignal, result: MonitorResult) -> str:
-    title = "✅ TP خورد" if result.status == "TP" else "❌ SL خورد" if result.status == "SL" else "ℹ️ خروج/بسته‌شدن"
-    source = "🏦 نتیجه توبیت" if signal.signal_type == "real" else "📊 نتیجه سیگنال"
-    return "\n".join([
-        source,
-        title,
-        f"#{signal.id} | {signal.symbol} | {signal.direction}",
-        f"Entry: {fmt_price(signal.entry_price)}",
-        f"Exit: {fmt_price(result.exit_price)}",
-        f"PnL خام: {result.approx_pnl:.2f} USDT",
-        f"PnL خالص/واقعی: {result.net_pnl:.2f} USDT",
-        f"حرکت: {result.move_pct * 100:.2f}%",
-        f"دلیل: {result.reason}",
-    ])
+def render_signal(signal_id: int, plan, signal_type: str) -> str:
+    t = "REAL / واقعی ✅" if signal_type == "real" else "NORMAL / سیگنال معمولی 🟡"
+    d = "لانگ 🟢" if plan.direction == "LONG" else "شورت 🔴"
+    reasons = "\n".join(f"• {r}" for r in list(plan.reasons)[:8])
+    return (
+        f"🚀 <b>سیگنال ICE-5M #{signal_id}</b>\n"
+        f"نوع: <b>{t}</b>\n"
+        f"ارز: <b>{plan.symbol}</b>\n"
+        f"جهت: <b>{d}</b>\n"
+        f"امتیاز: <b>{plan.score:.1f}</b> | قدرت: {plan.strength}\n\n"
+        f"Entry: <code>{_fmt(plan.entry_price,6)}</code>\n"
+        f"TP: <code>{_fmt(plan.tp_price,6)}</code>\n"
+        f"SL: <code>{_fmt(plan.sl_price,6)}</code>\n"
+        f"RR: <b>{plan.risk_reward:.2f}</b> | یک TP\n"
+        f"سود خالص تخمینی: <b>{plan.estimated_net_profit_usdt:.4f} USDT</b>\n\n"
+        "🧠 دلایل:\n" + reasons
+    )
 
 
-def render_stats(stats: dict[str, Any], days: int) -> str:
-    normal = stats["normal"]
-    real = stats["real"]
-    long = stats["long"]
-    short = stats["short"]
-    failed = stats["real_failed"]
-    return "\n".join([
-        f"📊 آمار {days} روز اخیر",
-        "",
-        f"🟢 لانگ: سیگنال {long['total']} | TP {long['tp']} | SL {long['sl']} | وین‌ریت {long['win_rate']:.1f}%",
-        f"🔴 شورت: سیگنال {short['total']} | TP {short['tp']} | SL {short['sl']} | وین‌ریت {short['win_rate']:.1f}%",
-        "",
-        "📌 عادی:",
-        f"تعداد: {normal['total']} | TP: {normal['tp']} | SL: {normal['sl']} | باز: {normal['open']}",
-        f"وین‌ریت: {normal['win_rate']:.1f}% | PnL خالص تقریبی: {normal['pnl']:.2f} USDT",
-        "",
-        "💰 واقعی:",
-        f"تعداد: {real['total']} | TP: {real['tp']} | SL: {real['sl']} | EXIT: {real['exit']} | باز: {real['open']}",
-        f"وین‌ریت: {real['win_rate']:.1f}% | PnL واقعی/خالص: {real['pnl']:.2f} USDT",
-        f"ارسال واقعی ناموفق: {failed['total']}",
-    ])
+def render_result(signal: StoredSignal, result) -> str:
+    emoji = "✅" if result.result == "TP" else "❌" if result.result == "SL" else "⚠️"
+    return (
+        f"{emoji} <b>نتیجه سیگنال #{signal.id}</b>\n"
+        f"ارز: <b>{signal.symbol}</b> | {signal.direction}\n"
+        f"نتیجه: <b>{result.result}</b>\n"
+        f"قیمت نتیجه: <code>{_fmt(result.price,6)}</code>\n"
+        f"PnL تخمینی: <b>{result.pnl_usdt:.4f} USDT</b>\n"
+        f"زمان باز بودن: {int(result.age_seconds)} ثانیه\n"
+        f"دلیل: {result.reason}"
+    )
+
+
+def render_stats(stats: dict[str, Any]) -> str:
+    rejects = stats.get("last_rejects") or []
+    reject_lines = "\n".join(f"• {r.get('symbol')}: {r.get('reason')}" for r in rejects[:6]) or "ندارد"
+    return (
+        "📈 <b>آمار ربات ICE-5M</b>\n\n"
+        f"پوزیشن/سیگنال باز: <b>{stats.get('open',0)}</b>\n"
+        f"باز واقعی: <b>{stats.get('real_open',0)}</b> | معمولی: <b>{stats.get('normal_open',0)}</b>\n"
+        f"بسته‌شده: <b>{stats.get('closed',0)}</b>\n"
+        f"TP: <b>{stats.get('wins',0)}</b>\n"
+        f"SL: <b>{stats.get('losses',0)}</b>\n"
+        f"Soft Exit: <b>{stats.get('soft',0)}</b>\n"
+        f"Winrate: <b>{stats.get('winrate',0):.1f}%</b>\n"
+        f"PnL تخمینی: <b>{stats.get('pnl',0):.4f} USDT</b>\n\n"
+        "آخرین ردها:\n" + reject_lines
+    )
+
+
+def render_brain(settings: dict[str, Any], runtime: dict[str, str]) -> str:
+    return (
+        "🧠 <b>هوش / وضعیت تحلیل ICE</b>\n\n"
+        "منطق فعال: Imbalance + Compression + Explosion\n"
+        "ورود: اولین انفجار 1M بعد از فشردگی 5M، بدون پولبک اجباری\n"
+        "فیلترها: اسپرد، عمق، دلتا، CVD، حجم، ضد دیرورود، سود خالص\n"
+        "خروج: فقط یک TP و یک SL + Soft Exit مانیتوری\n\n"
+        f"آخرین دلیل بلاک واقعی: {runtime.get('last_real_block_reason','ندارد')}\n"
+        f"آخرین خطای واقعی: {runtime.get('last_real_failed','ندارد')}\n"
+        f"آخرین بلاک سیگنال: {runtime.get('last_signal_block_reason','ندارد')}"
+    )

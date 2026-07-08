@@ -1,7 +1,9 @@
-"""Root config for the 1H OKX -> Toobit futures trend-pullback bot.
+"""Root config for the 5M ICE OKX -> Toobit futures bot.
 
-Everything is intentionally in the project root because the user deploys by pushing
-these files to GitHub and running `git pull` on the VPS.
+Rules kept from the older bots:
+- OKX is used for market data, analysis, and result monitoring.
+- Toobit is used only for real execution through the unchanged toobit_client.py.
+- Telegram commands/panel/statistics stay Persian and root-level for easy VPS deploy.
 """
 from __future__ import annotations
 
@@ -18,10 +20,8 @@ def _load_dotenv(path: str = ".env") -> None:
                 line = line.strip()
                 if not line or line.startswith("#") or "=" not in line:
                     continue
-                key, value = line.split("=", 1)
-                key = key.strip()
-                value = value.strip().strip("\"").strip("'")
-                os.environ.setdefault(key, value)
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
     except Exception:
         pass
 
@@ -49,12 +49,12 @@ def _env_float(name: str, default: float) -> float:
 
 def _env_bool(name: str, default: bool) -> bool:
     value = _env(name, "1" if default else "0").lower()
-    return value in {"1", "true", "yes", "y", "on", "فعال"}
+    return value in {"1", "true", "yes", "y", "on", "فعال", "روشن"}
 
 
-BOT_NAME = _env("BOT_NAME", "Crypto 1H Trend Pullback Toobit Bot")
-BOT_DATA_DIR = _env("BOT_DATA_DIR", "data")
-BOT_DB_PATH = _env("BOT_DB_PATH", os.path.join(BOT_DATA_DIR, "crypto_1h_trend_pullback.sqlite3"))
+BOT_NAME = _env("BOT_NAME", "Crypto 5M ICE Toobit Bot")
+BOT_DATA_DIR = _env("BOT_DATA_DIR", ".")
+BOT_DB_PATH = _env("BOT_DB_PATH", "crypto_5m_ice.sqlite3")
 LOG_LEVEL = _env("LOG_LEVEL", "INFO")
 
 # Telegram
@@ -63,12 +63,12 @@ TELEGRAM_CHAT_ID = _env("TELEGRAM_CHAT_ID")
 OWNER_ID = _env("OWNER_ID")
 TELEGRAM_POLL_TIMEOUT = _env_int("TELEGRAM_POLL_TIMEOUT", 25)
 
-# OKX analysis data only
+# OKX data only
 OKX_BASE_URL = _env("OKX_BASE_URL", "https://www.okx.com")
 OKX_CANDLE_LIMIT = _env_int("OKX_CANDLE_LIMIT", 260)
 OKX_REQUEST_TIMEOUT = _env_int("OKX_REQUEST_TIMEOUT", 12)
 
-# Toobit execution - toobit_client.py reads these names directly.
+# Toobit execution - unchanged toobit_client.py reads these names directly.
 TOOBIT_API_KEY = _env("TOOBIT_API_KEY")
 TOOBIT_API_SECRET = _env("TOOBIT_API_SECRET", _env("TOOBIT_SECRET_KEY"))
 TOOBIT_SECRET_KEY = TOOBIT_API_SECRET
@@ -77,8 +77,6 @@ REQUEST_TIMEOUT = _env_int("TOOBIT_TIMEOUT_SECONDS", 12)
 RECV_WINDOW = _env_int("TOOBIT_RECV_WINDOW", 5000)
 DEFAULT_MARGIN_TYPE = _env("DEFAULT_MARGIN_TYPE", "ISOLATED").upper()
 TOOBIT_VERIFY_AFTER_ERROR_SECONDS = _env_int("TOOBIT_VERIFY_AFTER_ERROR_SECONDS", 70)
-
-# Toobit endpoints are configurable so the unchanged old client remains usable.
 TOOBIT_PATH_BALANCE = _env("TOOBIT_PATH_BALANCE", "/api/v1/futures/balance")
 TOOBIT_PATH_POSITIONS = _env("TOOBIT_PATH_POSITIONS", "/api/v1/futures/positions")
 TOOBIT_PATH_OPEN_ORDERS = _env("TOOBIT_PATH_OPEN_ORDERS", "/api/v1/futures/openOrders")
@@ -95,86 +93,77 @@ TOOBIT_PATH_TODAY_PNL = _env("TOOBIT_PATH_TODAY_PNL", "/api/v1/futures/todayPnl"
 TOOBIT_PATH_CLOSE_ORDER = _env("TOOBIT_PATH_CLOSE_ORDER", TOOBIT_PATH_ORDER)
 TOOBIT_PARAM_TP = _env("TOOBIT_PARAM_TP", "takeProfit")
 TOOBIT_PARAM_SL = _env("TOOBIT_PARAM_SL", "stopLoss")
-
-# Main runtime laws discussed with the user.
-MAX_WATCH_SYMBOLS = _env_int("MAX_WATCH_SYMBOLS", 50)
-FULL_SCAN_SECONDS = _env_int("FULL_SCAN_SECONDS", 70)
-MONITOR_INTERVAL_SECONDS = _env_int("MONITOR_INTERVAL_SECONDS", 10)
-SLOT_RECHECK_SECONDS = _env_int("SLOT_RECHECK_SECONDS", 70)
-COIN_ERROR_COOLDOWN_SECONDS = _env_int("COIN_ERROR_COOLDOWN_SECONDS", 70)
+TOOBIT_PLACE_REAL_TP = _env_bool("TOOBIT_PLACE_REAL_TP", True)
+TOOBIT_PLACE_REAL_SL = _env_bool("TOOBIT_PLACE_REAL_SL", True)
+TOOBIT_TP_PARAM = TOOBIT_PARAM_TP
+TOOBIT_SL_PARAM = TOOBIT_PARAM_SL
 TOOBIT_PANEL_CACHE_SECONDS = _env_int("TOOBIT_PANEL_CACHE_SECONDS", 20)
 
-# OKX-only data law: automatic scan/monitor/panel must not call Toobit.
-# Toobit is only used when opening a Real order and by explicit execution helpers.
+# Runtime laws
+MAX_WATCH_SYMBOLS = _env_int("MAX_WATCH_SYMBOLS", 30)
+FULL_SCAN_SECONDS = _env_int("FULL_SCAN_SECONDS", 35)
+MONITOR_INTERVAL_SECONDS = _env_int("MONITOR_INTERVAL_SECONDS", 5)
+SLOT_RECHECK_SECONDS = _env_int("SLOT_RECHECK_SECONDS", 70)
+COIN_ERROR_COOLDOWN_SECONDS = _env_int("COIN_ERROR_COOLDOWN_SECONDS", 70)
 
-# Reject diagnostics: show why a coin was skipped even when there is no technical error.
-LOG_REJECT_REASONS = _env_bool("LOG_REJECT_REASONS", True)
-STORE_REJECT_REASONS = _env_bool("STORE_REJECT_REASONS", True)
-REJECT_LOG_LEVEL = _env("REJECT_LOG_LEVEL", "INFO").upper()
-REJECT_LOG_MAX_PER_SCAN = _env_int("REJECT_LOG_MAX_PER_SCAN", 60)
-INVALID_SYMBOL_COOLDOWN_SECONDS = _env_int("INVALID_SYMBOL_COOLDOWN_SECONDS", 86400)
-
-# Trade panel defaults - user can change them from Telegram.
+# Trade panel defaults - editable from Telegram.
 DEFAULT_TRADE_ENABLED = _env_bool("DEFAULT_TRADE_ENABLED", False)
+DEFAULT_AUTO_SIGNAL_ENABLED = _env_bool("DEFAULT_AUTO_SIGNAL_ENABLED", True)
 DEFAULT_TRADE_DOLLAR = _env_float("DEFAULT_TRADE_DOLLAR", _env_float("DEFAULT_MARGIN_USDT", 10.0))
 DEFAULT_TRADE_CAPITAL = _env_float("DEFAULT_TRADE_CAPITAL", 100.0)
 DEFAULT_LEVERAGE = _env_int("DEFAULT_LEVERAGE", 10)
 DEFAULT_MAX_POSITIONS = _env_int("DEFAULT_MAX_POSITIONS", 3)
 DEFAULT_MIN_NET_PROFIT_USDT = _env_float("DEFAULT_MIN_NET_PROFIT_USDT", 0.01)
 
-# 1H trend-pullback strategy laws.
-SIGNAL_SCORE_THRESHOLD = _env_float("SIGNAL_SCORE_THRESHOLD", 75.0)
-STRONG_SCORE_THRESHOLD = _env_float("STRONG_SCORE_THRESHOLD", 88.0)
-RR_NORMAL = _env_float("RR_NORMAL", 1.5)
-RR_STRONG = _env_float("RR_STRONG", 2.0)
+# ICE-5M signal laws. One TP only. RR must never be below 1.
+SIGNAL_SCORE_THRESHOLD = _env_float("SIGNAL_SCORE_THRESHOLD", 82.0)
+STRONG_SCORE_THRESHOLD = _env_float("STRONG_SCORE_THRESHOLD", 92.0)
+ICE_RR = max(1.0, _env_float("ICE_RR", 1.15))
+RR_NORMAL = ICE_RR
+RR_STRONG = ICE_RR
 ROUND_TRIP_FEE_USDT = _env_float("ROUND_TRIP_FEE_USDT", 0.05)
+MIN_5M_SL_PCT = _env_float("MIN_5M_SL_PCT", 0.0012)   # 0.12%
+MAX_5M_SL_PCT = _env_float("MAX_5M_SL_PCT", 0.0065)   # 0.65%
+MAX_ENTRY_EXTENSION_PCT = _env_float("MAX_ENTRY_EXTENSION_PCT", 0.0025)  # 0.25% past box edge
 
-SWING_LOOKBACK_4H = _env_int("SWING_LOOKBACK_4H", 8)
-SWING_LOOKBACK_1H = _env_int("SWING_LOOKBACK_1H", 12)
-EMA_SLOPE_LOOKBACK = _env_int("EMA_SLOPE_LOOKBACK", 10)
+# Compression / explosion filters
+COMPRESSION_LOOKBACK_5M = _env_int("COMPRESSION_LOOKBACK_5M", 10)
+COMPRESSION_MAX_RANGE_PCT = _env_float("COMPRESSION_MAX_RANGE_PCT", 0.0100)
+COMPRESSION_MAX_ATR_RATIO = _env_float("COMPRESSION_MAX_ATR_RATIO", 0.85)
+COMPRESSION_MIN_BOX_PCT = _env_float("COMPRESSION_MIN_BOX_PCT", 0.0015)
+TRIGGER_VOLUME_RATIO = _env_float("TRIGGER_VOLUME_RATIO", 1.20)
+TRIGGER_BODY_MIN_RATIO = _env_float("TRIGGER_BODY_MIN_RATIO", 0.45)
+MAX_TWO_CANDLE_MOVE_PCT = _env_float("MAX_TWO_CANDLE_MOVE_PCT", 0.0075)
 
-MIN_TREND_ADX = _env_float("MIN_TREND_ADX", 16.0)
-STRONG_TREND_ADX = _env_float("STRONG_TREND_ADX", 25.0)
-HARD_RANGE_ADX = _env_float("HARD_RANGE_ADX", 14.0)
-EXHAUSTION_ADX = _env_float("EXHAUSTION_ADX", 45.0)
-FLAT_EMA_ATR_MULT = _env_float("FLAT_EMA_ATR_MULT", 0.20)
+# Order-flow approximations from OKX public data.
+ORDERBOOK_DEPTH_LEVELS = _env_int("ORDERBOOK_DEPTH_LEVELS", 20)
+MAX_SPREAD_PCT = _env_float("MAX_SPREAD_PCT", 0.0006)  # 0.06%
+MIN_DEPTH_USDT = _env_float("MIN_DEPTH_USDT", 25000.0)
+IMBALANCE_MIN_ABS = _env_float("IMBALANCE_MIN_ABS", 0.08)
+CVD_LOOKBACK_1M = _env_int("CVD_LOOKBACK_1M", 18)
+DELTA_MIN_RATIO = _env_float("DELTA_MIN_RATIO", 0.08)
 
-PULLBACK_LOOKBACK_1H = _env_int("PULLBACK_LOOKBACK_1H", 5)
-PULLBACK_ATR_BUFFER = _env_float("PULLBACK_ATR_BUFFER", 0.40)
-MIN_ENTRY_BODY_RATIO = _env_float("MIN_ENTRY_BODY_RATIO", 0.35)
+# Soft monitoring: avoids waiting for full SL when explosion fails.
+SOFT_EXIT_ENABLED = _env_bool("SOFT_EXIT_ENABLED", True)
+SOFT_EXIT_MINUTES = _env_int("SOFT_EXIT_MINUTES", 4)
+SOFT_EXIT_MIN_R = _env_float("SOFT_EXIT_MIN_R", 0.30)
+ENABLE_REAL_SOFT_EXIT_CLOSE = _env_bool("ENABLE_REAL_SOFT_EXIT_CLOSE", False)
 
-MAX_DISTANCE_EMA20_ATR = _env_float("MAX_DISTANCE_EMA20_ATR", 1.80)
-MAX_DISTANCE_EMA50_ATR = _env_float("MAX_DISTANCE_EMA50_ATR", 2.80)
-MAX_SAME_DIRECTION_CANDLES = _env_int("MAX_SAME_DIRECTION_CANDLES", 6)
-ATR_SL_BUFFER_MULT = _env_float("ATR_SL_BUFFER_MULT", 0.20)
-MIN_1H_RISK_ATR = _env_float("MIN_1H_RISK_ATR", 0.60)
-MAX_1H_RISK_ATR = _env_float("MAX_1H_RISK_ATR", 2.40)
-MAX_1H_SL_PCT = _env_float("MAX_1H_SL_PCT", 0.040)  # 4.0% maximum 1H structure stop.
-
-# Backward compatible names, in case old VPS env/systemd still uses them.
-MIN_4H_SL_PCT = _env_float("MIN_4H_SL_PCT", 0.008)
-MAX_4H_SL_PCT = _env_float("MAX_4H_SL_PCT", 0.050)
-ATR_SL_MULT = _env_float("ATR_SL_MULT", 1.20)
-
-# Hard rule: no support/resistance filter for now.
+# Disabled risky systems.
 ENABLE_SUPPORT_RESISTANCE_FILTER = False
 ENABLE_AI = False
 ENABLE_DCA = False
 ENABLE_MARTINGALE = False
 ENABLE_TRAILING_STOP = False
 
-# 50 symbols. Keep internal name USDT style. OKX and Toobit mapping/validation happens at runtime.
-DEFAULT_WATCHLIST = (
-    "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,BNBUSDT,DOGEUSDT,ADAUSDT,AVAXUSDT,LINKUSDT,TRXUSDT,"
-    "DOTUSDT,LTCUSDT,BCHUSDT,TONUSDT,SUIUSDT,APTUSDT,OPUSDT,ARBUSDT,NEARUSDT,INJUSDT,"
-    "ATOMUSDT,FILUSDT,ETCUSDT,AAVEUSDT,UNIUSDT,SEIUSDT,WIFUSDT,ORDIUSDT,PEPEUSDT,JUPUSDT,"
-    "TIAUSDT,WLDUSDT,FETUSDT,IMXUSDT,STXUSDT,ICPUSDT,MKRUSDT,LDOUSDT,ENSUSDT,ARUSDT,"
-    "GRTUSDT,ALGOUSDT,XLMUSDT,EOSUSDT,PEOPLEUSDT,FLOKIUSDT,BONKUSDT,NOTUSDT,ONDOUSDT,PENDLEUSDT"
-)
-
 WATCHLIST = tuple(
     s.strip().upper()
-    for s in _env("WATCHLIST", DEFAULT_WATCHLIST).split(",")
+    for s in _env(
+        "WATCHLIST",
+        "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT,ADAUSDT,AVAXUSDT,LINKUSDT,TRXUSDT,"
+        "TONUSDT,DOTUSDT,NEARUSDT,APTUSDT,ARBUSDT,OPUSDT,SUIUSDT,SEIUSDT,FETUSDT,INJUSDT,"
+        "LTCUSDT,BCHUSDT,ETCUSDT,FILUSDT,ATOMUSDT,AAVEUSDT,UNIUSDT,1000PEPEUSDT,WIFUSDT,ORDIUSDT",
+    ).split(",")
     if s.strip()
 )[:MAX_WATCH_SYMBOLS]
 
@@ -182,6 +171,7 @@ WATCHLIST = tuple(
 @dataclass(frozen=True)
 class RuntimeDefaults:
     trade_enabled: bool = DEFAULT_TRADE_ENABLED
+    auto_signal_enabled: bool = DEFAULT_AUTO_SIGNAL_ENABLED
     trade_dollar_usdt: float = DEFAULT_TRADE_DOLLAR
     trade_capital_usdt: float = DEFAULT_TRADE_CAPITAL
     leverage: int = DEFAULT_LEVERAGE

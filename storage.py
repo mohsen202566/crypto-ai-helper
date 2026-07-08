@@ -5,10 +5,10 @@ import os
 import sqlite3
 import time
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any
 
 import config
-from utils import safe_float, safe_int
+from utils import normalize_symbol, safe_float, safe_int
 
 
 @dataclass(frozen=True)
@@ -20,382 +20,282 @@ class StoredSignal:
     direction: str
     signal_type: str
     status: str
-    real_status: str
-    score: float
-    risk_reward: float
     entry_price: float
     tp_price: float
     sl_price: float
-    trade_margin_usdt: float
-    leverage: int
-    round_trip_fee_usdt: float
+    risk_reward: float
+    score: float
+    strength: str
+    created_at: int
     opened_at: int
-    closed_at: int | None
     message_id: int | None
     order_id: str | None
-    approx_pnl: float | None
-    real_pnl: float | None
-    net_pnl: float | None
-    mfe_pct: float
-    mae_pct: float
-    close_reason: str | None
-    reasons: str | None
+    client_order_id: str | None
+    reasons_json: str
+    result: str | None = None
+    result_price: float | None = None
+    result_pnl_usdt: float | None = None
+    closed_at: int | None = None
+
+    @property
+    def reasons(self) -> list[str]:
+        try:
+            return list(json.loads(self.reasons_json or "[]"))
+        except Exception:
+            return []
+
+    @property
+    def risk_per_unit(self) -> float:
+        if self.direction == "LONG":
+            return max(0.0, self.entry_price - self.sl_price)
+        return max(0.0, self.sl_price - self.entry_price)
 
 
 class Storage:
     def __init__(self, path: str = config.BOT_DB_PATH) -> None:
         self.path = path
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        self.conn = sqlite3.connect(path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
         self._init()
 
+    def _conn(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.path, timeout=30)
+        conn.row_factory = sqlite3.Row
+        return conn
+
     def _init(self) -> None:
-        cur = self.conn.cursor()
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
+        with self._conn() as con:
+            con.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS runtime (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS signals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    okx_symbol TEXT NOT NULL,
+                    toobit_symbol TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    signal_type TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    entry_price REAL NOT NULL,
+                    tp_price REAL NOT NULL,
+                    sl_price REAL NOT NULL,
+                    risk_reward REAL NOT NULL,
+                    score REAL NOT NULL,
+                    strength TEXT NOT NULL,
+                    estimated_profit_usdt REAL DEFAULT 0,
+                    estimated_loss_usdt REAL DEFAULT 0,
+                    estimated_net_profit_usdt REAL DEFAULT 0,
+                    round_trip_fee_usdt REAL DEFAULT 0,
+                    reasons_json TEXT DEFAULT '[]',
+                    created_at INTEGER NOT NULL,
+                    opened_at INTEGER NOT NULL,
+                    message_id INTEGER,
+                    order_id TEXT,
+                    client_order_id TEXT,
+                    result TEXT,
+                    result_price REAL,
+                    result_pnl_usdt REAL,
+                    closed_at INTEGER,
+                    close_reason TEXT
+                );
+                CREATE TABLE IF NOT EXISTS scan_rejects (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS coin_errors (
+                    symbol TEXT PRIMARY KEY,
+                    error TEXT NOT NULL,
+                    until_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                """
             )
-            """
-        )
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS runtime (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )
-            """
-        )
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS signals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                symbol TEXT NOT NULL,
-                okx_symbol TEXT NOT NULL,
-                toobit_symbol TEXT NOT NULL,
-                direction TEXT NOT NULL,
-                signal_type TEXT NOT NULL,
-                status TEXT NOT NULL,
-                real_status TEXT NOT NULL DEFAULT '',
-                score REAL NOT NULL,
-                risk_reward REAL NOT NULL,
-                entry_price REAL NOT NULL,
-                tp_price REAL NOT NULL,
-                sl_price REAL NOT NULL,
-                trade_margin_usdt REAL NOT NULL,
-                leverage INTEGER NOT NULL,
-                round_trip_fee_usdt REAL NOT NULL,
-                opened_at INTEGER NOT NULL,
-                closed_at INTEGER,
-                message_id INTEGER,
-                result_message_id INTEGER,
-                order_id TEXT,
-                approx_pnl REAL,
-                real_pnl REAL,
-                net_pnl REAL,
-                mfe_pct REAL NOT NULL DEFAULT 0,
-                mae_pct REAL NOT NULL DEFAULT 0,
-                close_reason TEXT,
-                reasons TEXT
-            )
-            """
-        )
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_open ON signals(status, symbol)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_type ON signals(signal_type, real_status)")
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS coin_errors (
-                symbol TEXT PRIMARY KEY,
-                error_count INTEGER NOT NULL DEFAULT 0,
-                last_error TEXT,
-                last_error_at INTEGER NOT NULL DEFAULT 0,
-                cooldown_until INTEGER NOT NULL DEFAULT 0
-            )
-            """
-        )
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS monitor_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                signal_id INTEGER NOT NULL,
-                event_type TEXT NOT NULL,
-                price REAL,
-                pnl REAL,
-                net_pnl REAL,
-                detail TEXT,
-                created_at INTEGER NOT NULL
-            )
-            """
-        )
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS reject_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                symbol TEXT NOT NULL,
-                stage TEXT NOT NULL,
-                reason TEXT NOT NULL,
-                details TEXT,
-                created_at INTEGER NOT NULL
-            )
-            """
-        )
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_reject_logs_created ON reject_logs(created_at DESC)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_reject_logs_symbol ON reject_logs(symbol, created_at DESC)")
-        self.conn.commit()
-        self._ensure_default_settings()
-
-    def _ensure_default_settings(self) -> None:
-        defaults = {
-            "real_trade_enabled": "1" if config.DEFAULT_TRADE_ENABLED else "0",
-            "trade_dollar_usdt": str(config.DEFAULT_TRADE_DOLLAR),
-            "trade_capital_usdt": str(config.DEFAULT_TRADE_CAPITAL),
-            "leverage": str(config.DEFAULT_LEVERAGE),
-            "max_positions": str(config.DEFAULT_MAX_POSITIONS),
-            "min_net_profit_usdt": str(config.DEFAULT_MIN_NET_PROFIT_USDT),
+        defaults = config.RuntimeDefaults()
+        initial = {
+            "real_trade_enabled": "1" if defaults.trade_enabled else "0",
+            "auto_signal_enabled": "1" if defaults.auto_signal_enabled else "0",
+            "trade_dollar_usdt": str(defaults.trade_dollar_usdt),
+            "trade_capital_usdt": str(defaults.trade_capital_usdt),
+            "leverage": str(defaults.leverage),
+            "max_positions": str(defaults.max_positions),
+            "min_net_profit_usdt": str(defaults.min_net_profit_usdt),
         }
-        for k, v in defaults.items():
-            self.conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k, v))
-        self.conn.commit()
-
-    def get_setting(self, key: str, default: Any = None) -> str | Any:
-        row = self.conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-        return row["value"] if row else default
-
-    def set_setting(self, key: str, value: Any) -> None:
-        self.conn.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (key, str(value)))
-        self.conn.commit()
+        with self._conn() as con:
+            for k, v in initial.items():
+                con.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k, v))
 
     def settings(self) -> dict[str, Any]:
+        with self._conn() as con:
+            rows = con.execute("SELECT key,value FROM settings").fetchall()
+        data = {r["key"]: r["value"] for r in rows}
         return {
-            "real_trade_enabled": self.get_setting("real_trade_enabled", "0") == "1",
-            "trade_dollar_usdt": safe_float(self.get_setting("trade_dollar_usdt", config.DEFAULT_TRADE_DOLLAR), config.DEFAULT_TRADE_DOLLAR),
-            "trade_capital_usdt": safe_float(self.get_setting("trade_capital_usdt", config.DEFAULT_TRADE_CAPITAL), config.DEFAULT_TRADE_CAPITAL),
-            "leverage": safe_int(self.get_setting("leverage", config.DEFAULT_LEVERAGE), config.DEFAULT_LEVERAGE),
-            "max_positions": safe_int(self.get_setting("max_positions", config.DEFAULT_MAX_POSITIONS), config.DEFAULT_MAX_POSITIONS),
-            "min_net_profit_usdt": safe_float(self.get_setting("min_net_profit_usdt", config.DEFAULT_MIN_NET_PROFIT_USDT), config.DEFAULT_MIN_NET_PROFIT_USDT),
+            "real_trade_enabled": str(data.get("real_trade_enabled", "0")) == "1",
+            "auto_signal_enabled": str(data.get("auto_signal_enabled", "1")) == "1",
+            "trade_dollar_usdt": safe_float(data.get("trade_dollar_usdt"), config.DEFAULT_TRADE_DOLLAR),
+            "trade_capital_usdt": safe_float(data.get("trade_capital_usdt"), config.DEFAULT_TRADE_CAPITAL),
+            "leverage": safe_int(data.get("leverage"), config.DEFAULT_LEVERAGE),
+            "max_positions": safe_int(data.get("max_positions"), config.DEFAULT_MAX_POSITIONS),
+            "min_net_profit_usdt": safe_float(data.get("min_net_profit_usdt"), config.DEFAULT_MIN_NET_PROFIT_USDT),
         }
 
-    def runtime_get(self, key: str, default: Any = None) -> str | Any:
-        row = self.conn.execute("SELECT value FROM runtime WHERE key=?", (key,)).fetchone()
-        return row["value"] if row else default
+    def set_setting(self, key: str, value: Any) -> None:
+        with self._conn() as con:
+            con.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (key, str(value)))
 
     def runtime_set(self, key: str, value: Any) -> None:
-        self.conn.execute("INSERT OR REPLACE INTO runtime(key,value) VALUES(?,?)", (key, str(value)))
-        self.conn.commit()
+        with self._conn() as con:
+            con.execute("INSERT OR REPLACE INTO runtime(key,value) VALUES(?,?)", (key, str(value)))
 
-    def add_signal(self, plan: Any, *, signal_type: str, real_status: str = "", order_id: str | None = None, message_id: int | None = None) -> int:
+    def runtime_get(self, key: str, default: str = "") -> str:
+        with self._conn() as con:
+            row = con.execute("SELECT value FROM runtime WHERE key=?", (key,)).fetchone()
+        return str(row["value"]) if row else default
+
+    def add_signal(self, plan, signal_type: str, order_id: str | None = None, client_order_id: str | None = None) -> int:
         now = int(time.time())
-        data = plan.to_legacy_dict() if hasattr(plan, "to_legacy_dict") else dict(plan)
-        cur = self.conn.execute(
-            """
-            INSERT INTO signals(
-                symbol, okx_symbol, toobit_symbol, direction, signal_type, status, real_status,
-                score, risk_reward, entry_price, tp_price, sl_price, trade_margin_usdt, leverage,
-                round_trip_fee_usdt, opened_at, message_id, order_id, reasons
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                str(data["symbol"]).upper(),
-                str(data.get("okx_symbol") or data["symbol"]).upper(),
-                str(data.get("toobit_symbol") or data["symbol"]).upper(),
-                str(data["direction"]).upper(),
-                signal_type,
-                "OPEN",
-                real_status,
-                safe_float(data.get("score")),
-                safe_float(data.get("risk_reward")),
-                safe_float(data.get("entry_price") or data.get("entry")),
-                safe_float(data.get("tp_price") or data.get("tp")),
-                safe_float(data.get("sl_price") or data.get("sl")),
-                safe_float(data.get("trade_margin_usdt") or self.settings()["trade_dollar_usdt"]),
-                safe_int(data.get("leverage") or self.settings()["leverage"]),
-                safe_float(data.get("round_trip_fee_usdt"), config.ROUND_TRIP_FEE_USDT),
-                now,
-                message_id,
-                order_id,
-                json.dumps(data.get("reasons") or [], ensure_ascii=False),
-            ),
-        )
-        self.conn.commit()
-        return int(cur.lastrowid)
+        d = plan.to_legacy_dict() if hasattr(plan, "to_legacy_dict") else dict(plan)
+        reasons = d.get("reasons") or []
+        with self._conn() as con:
+            cur = con.execute(
+                """
+                INSERT INTO signals(symbol,okx_symbol,toobit_symbol,direction,signal_type,status,entry_price,tp_price,sl_price,
+                risk_reward,score,strength,estimated_profit_usdt,estimated_loss_usdt,estimated_net_profit_usdt,round_trip_fee_usdt,
+                reasons_json,created_at,opened_at,order_id,client_order_id)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    normalize_symbol(str(d.get("symbol") or d.get("coin"))),
+                    str(d.get("okx_symbol") or ""),
+                    str(d.get("toobit_symbol") or d.get("symbol") or ""),
+                    str(d.get("direction") or ""),
+                    signal_type,
+                    "OPEN",
+                    safe_float(d.get("entry_price") or d.get("entry")),
+                    safe_float(d.get("tp_price") or d.get("tp")),
+                    safe_float(d.get("sl_price") or d.get("sl")),
+                    safe_float(d.get("risk_reward")),
+                    safe_float(d.get("score")),
+                    str(d.get("strength") or ""),
+                    safe_float(d.get("estimated_profit_usdt")),
+                    safe_float(d.get("estimated_loss_usdt")),
+                    safe_float(d.get("estimated_net_profit_usdt")),
+                    safe_float(d.get("round_trip_fee_usdt")),
+                    json.dumps(reasons, ensure_ascii=False),
+                    now,
+                    now,
+                    order_id,
+                    client_order_id,
+                ),
+            )
+            return int(cur.lastrowid)
 
-    def update_message_id(self, signal_id: int, message_id: int | None) -> None:
-        if message_id is None:
+    def update_message_id(self, signal_id: int, msg_id: int | None) -> None:
+        if msg_id is None:
             return
-        self.conn.execute("UPDATE signals SET message_id=? WHERE id=?", (int(message_id), int(signal_id)))
-        self.conn.commit()
-
-    def mark_real_opened(self, signal_id: int, order_id: str | None = None) -> None:
-        self.conn.execute("UPDATE signals SET signal_type='real', real_status='opened', order_id=COALESCE(?, order_id) WHERE id=?", (order_id, int(signal_id)))
-        self.conn.commit()
+        with self._conn() as con:
+            con.execute("UPDATE signals SET message_id=? WHERE id=?", (int(msg_id), int(signal_id)))
 
     def mark_real_failed(self, symbol: str, reason: str) -> None:
-        self.add_monitor_event(0, "REAL_FAILED", None, None, None, f"{symbol}: {reason}")
-
-    def open_signals(self) -> list[StoredSignal]:
-        rows = self.conn.execute("SELECT * FROM signals WHERE status='OPEN' ORDER BY opened_at ASC").fetchall()
-        return [self._row(row) for row in rows]
-
-    def active_real_signals(self) -> list[StoredSignal]:
-        rows = self.conn.execute("SELECT * FROM signals WHERE status='OPEN' AND signal_type='real' AND real_status IN ('opened','reserved','opening')").fetchall()
-        return [self._row(row) for row in rows]
-
-    def active_real_count(self) -> int:
-        row = self.conn.execute("SELECT COUNT(*) AS c FROM signals WHERE status='OPEN' AND signal_type='real' AND real_status IN ('opened','reserved','opening')").fetchone()
-        return int(row["c"] or 0)
+        self.runtime_set("last_real_failed", f"{normalize_symbol(symbol)} | {reason}")
 
     def has_open_symbol(self, symbol: str) -> bool:
-        row = self.conn.execute("SELECT 1 FROM signals WHERE status='OPEN' AND symbol=? LIMIT 1", (symbol.upper(),)).fetchone()
-        return row is not None
+        symbol = normalize_symbol(symbol)
+        with self._conn() as con:
+            row = con.execute("SELECT 1 FROM signals WHERE symbol=? AND status='OPEN' LIMIT 1", (symbol,)).fetchone()
+        return bool(row)
+
+    def active_signals(self) -> list[StoredSignal]:
+        with self._conn() as con:
+            rows = con.execute("SELECT * FROM signals WHERE status='OPEN' ORDER BY id ASC").fetchall()
+        return [self._row_to_signal(r) for r in rows]
+
+    def active_real_signals(self) -> list[StoredSignal]:
+        with self._conn() as con:
+            rows = con.execute("SELECT * FROM signals WHERE status='OPEN' AND signal_type='real' ORDER BY id ASC").fetchall()
+        return [self._row_to_signal(r) for r in rows]
 
     def free_real_slots(self, max_positions: int) -> int:
-        return max(0, int(max_positions) - self.active_real_count())
+        return max(0, int(max_positions) - len(self.active_real_signals()))
 
-    def update_excursions(self, signal_id: int, price: float) -> tuple[float, float]:
-        sig = self.get_signal(signal_id)
-        if sig is None or sig.entry_price <= 0 or price <= 0:
-            return (0.0, 0.0)
-        if sig.direction == "LONG":
-            move = (price - sig.entry_price) / sig.entry_price
-        else:
-            move = (sig.entry_price - price) / sig.entry_price
-        mfe = max(sig.mfe_pct, move)
-        mae = min(sig.mae_pct, move)
-        self.conn.execute("UPDATE signals SET mfe_pct=?, mae_pct=? WHERE id=?", (mfe, mae, signal_id))
-        self.conn.commit()
-        return mfe, mae
+    def close_signal(self, signal_id: int, result: str, price: float, pnl_usdt: float, reason: str = "") -> None:
+        with self._conn() as con:
+            con.execute(
+                "UPDATE signals SET status='CLOSED', result=?, result_price=?, result_pnl_usdt=?, closed_at=?, close_reason=? WHERE id=? AND status='OPEN'",
+                (result, float(price), float(pnl_usdt), int(time.time()), reason, int(signal_id)),
+            )
 
-    def finish_signal(
-        self,
-        signal_id: int,
-        *,
-        status: str,
-        exit_price: float,
-        approx_pnl: float,
-        net_pnl: float,
-        real_pnl: float | None = None,
-        result_message_id: int | None = None,
-        close_reason: str = "",
-    ) -> None:
-        self.conn.execute(
-            """
-            UPDATE signals
-            SET status=?, real_status=CASE WHEN signal_type='real' THEN 'closed' ELSE real_status END,
-                closed_at=?, approx_pnl=?, real_pnl=?, net_pnl=?, result_message_id=?, close_reason=?
-            WHERE id=?
-            """,
-            (status, int(time.time()), approx_pnl, real_pnl, net_pnl, result_message_id, close_reason, int(signal_id)),
-        )
-        self.conn.commit()
-        self.add_monitor_event(signal_id, status, exit_price, approx_pnl, net_pnl, close_reason)
+    def release_real_slot_external(self, signal_id: int, reason: str = "") -> None:
+        self.close_signal(signal_id, "EXTERNAL_CLOSE", 0.0, 0.0, reason)
 
-    def release_real_slot_external(self, signal_id: int, detail: str = "Toobit position not found after 70s recheck") -> None:
-        self.conn.execute("UPDATE signals SET real_status='external_closed' WHERE id=?", (int(signal_id),))
-        self.conn.commit()
-        self.add_monitor_event(signal_id, "SLOT_RELEASED", None, None, None, detail)
+    def add_scan_reject(self, symbol: str, reason: str) -> None:
+        with self._conn() as con:
+            con.execute("INSERT INTO scan_rejects(symbol,reason,created_at) VALUES(?,?,?)", (normalize_symbol(symbol), reason[:500], int(time.time())))
 
-    def get_signal(self, signal_id: int) -> StoredSignal | None:
-        row = self.conn.execute("SELECT * FROM signals WHERE id=?", (int(signal_id),)).fetchone()
-        return self._row(row) if row else None
-
-    def add_monitor_event(self, signal_id: int, event_type: str, price: float | None, pnl: float | None, net_pnl: float | None, detail: str = "") -> None:
-        self.conn.execute(
-            "INSERT INTO monitor_events(signal_id,event_type,price,pnl,net_pnl,detail,created_at) VALUES(?,?,?,?,?,?,?)",
-            (int(signal_id), event_type, price, pnl, net_pnl, detail, int(time.time())),
-        )
-        self.conn.commit()
-
-    def add_reject_log(self, symbol: str, stage: str, reason: str, details: str = "") -> None:
-        self.conn.execute(
-            "INSERT INTO reject_logs(symbol,stage,reason,details,created_at) VALUES(?,?,?,?,?)",
-            (symbol.upper(), str(stage or "FILTER")[:60], str(reason or "")[:500], str(details or "")[:1000], int(time.time())),
-        )
-        self.conn.commit()
-
-    def recent_rejects_text(self, limit: int = 30) -> str:
-        limit = max(1, min(100, int(limit)))
-        rows = self.conn.execute(
-            "SELECT symbol,stage,reason,details,created_at FROM reject_logs ORDER BY created_at DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
-        if not rows:
-            return "رد منطقی ثبت نشده است."
-        lines = [f"📋 آخرین {len(rows)} رد منطقی:"]
-        for r in rows:
-            detail = str(r["details"] or "")
-            if len(detail) > 130:
-                detail = detail[:127] + "..."
-            lines.append(f"{r['symbol']} | {r['stage']} | {r['reason']}" + (f" | {detail}" if detail else ""))
-        return "\n".join(lines)
-
-    def record_coin_error(self, symbol: str, error: str, cooldown_seconds: int = config.COIN_ERROR_COOLDOWN_SECONDS) -> None:
+    def record_coin_error(self, symbol: str, error: str, cooldown_seconds: int) -> None:
         now = int(time.time())
-        row = self.conn.execute("SELECT error_count FROM coin_errors WHERE symbol=?", (symbol.upper(),)).fetchone()
-        count = int(row["error_count"] or 0) + 1 if row else 1
-        self.conn.execute(
-            "INSERT OR REPLACE INTO coin_errors(symbol,error_count,last_error,last_error_at,cooldown_until) VALUES(?,?,?,?,?)",
-            (symbol.upper(), count, str(error)[:500], now, now + int(cooldown_seconds)),
-        )
-        self.conn.commit()
-
-    def coin_in_cooldown(self, symbol: str) -> bool:
-        row = self.conn.execute("SELECT cooldown_until FROM coin_errors WHERE symbol=?", (symbol.upper(),)).fetchone()
-        return bool(row and int(row["cooldown_until"] or 0) > int(time.time()))
+        with self._conn() as con:
+            con.execute(
+                "INSERT OR REPLACE INTO coin_errors(symbol,error,until_at,updated_at) VALUES(?,?,?,?)",
+                (normalize_symbol(symbol), error[:500], now + int(cooldown_seconds), now),
+            )
 
     def clear_coin_error(self, symbol: str) -> None:
-        self.conn.execute("DELETE FROM coin_errors WHERE symbol=?", (symbol.upper(),))
-        self.conn.commit()
+        with self._conn() as con:
+            con.execute("DELETE FROM coin_errors WHERE symbol=?", (normalize_symbol(symbol),))
 
-    def recent_open_positions_text(self) -> str:
-        rows = self.open_signals()
-        if not rows:
-            return "پوزیشن/سیگنال باز نداریم."
-        lines = ["📌 پوزیشن‌ها / سیگنال‌های باز:"]
-        for s in rows:
-            lines.append(f"#{s.id} {s.symbol} {s.direction} | {s.signal_type} | Entry {s.entry_price:g} | TP {s.tp_price:g} | SL {s.sl_price:g}")
-        return "\n".join(lines)
+    def coin_in_cooldown(self, symbol: str) -> bool:
+        with self._conn() as con:
+            row = con.execute("SELECT until_at FROM coin_errors WHERE symbol=?", (normalize_symbol(symbol),)).fetchone()
+        return bool(row and int(row["until_at"]) > int(time.time()))
 
-    def stats(self, days: int = 30) -> dict[str, Any]:
-        since = int(time.time()) - int(days) * 86400
-        rows = self.conn.execute("SELECT * FROM signals WHERE opened_at>=?", (since,)).fetchall()
-        items = [self._row(r) for r in rows]
-
-        def bucket(filter_fn):
-            selected = [x for x in items if filter_fn(x)]
-            closed = [x for x in selected if x.status in {"TP", "SL", "EXIT"}]
-            tp = len([x for x in selected if x.status == "TP"])
-            sl = len([x for x in selected if x.status == "SL"])
-            pnl = sum(safe_float(x.real_pnl if x.real_pnl is not None else x.net_pnl if x.net_pnl is not None else x.approx_pnl) for x in closed)
-            done = tp + sl
-            return {
-                "total": len(selected),
-                "open": len([x for x in selected if x.status == "OPEN"]),
-                "tp": tp,
-                "sl": sl,
-                "exit": len([x for x in selected if x.status == "EXIT"]),
-                "win_rate": (tp / done * 100.0) if done else 0.0,
-                "pnl": pnl,
-            }
-
-        real_failed = self.conn.execute("SELECT COUNT(*) AS c FROM monitor_events WHERE event_type='REAL_FAILED' AND created_at>=?", (since,)).fetchone()
+    def stats(self) -> dict[str, Any]:
+        with self._conn() as con:
+            rows = con.execute("SELECT * FROM signals WHERE status='CLOSED'").fetchall()
+            open_rows = con.execute("SELECT * FROM signals WHERE status='OPEN'").fetchall()
+            last_rejects = con.execute("SELECT symbol,reason,created_at FROM scan_rejects ORDER BY id DESC LIMIT 8").fetchall()
+        closed = [dict(r) for r in rows]
+        wins = [r for r in closed if r.get("result") == "TP"]
+        losses = [r for r in closed if r.get("result") == "SL"]
+        soft = [r for r in closed if r.get("result") == "SOFT_EXIT"]
+        total = len(wins) + len(losses) + len(soft)
+        pnl = sum(safe_float(r.get("result_pnl_usdt")) for r in closed)
         return {
-            "normal": bucket(lambda x: x.signal_type == "normal"),
-            "real": bucket(lambda x: x.signal_type == "real"),
-            "long": bucket(lambda x: x.direction == "LONG"),
-            "short": bucket(lambda x: x.direction == "SHORT"),
-            "real_failed": {"total": int(real_failed["c"] or 0)},
+            "closed": len(closed),
+            "open": len(open_rows),
+            "wins": len(wins),
+            "losses": len(losses),
+            "soft": len(soft),
+            "winrate": (len(wins) / total * 100) if total else 0.0,
+            "pnl": pnl,
+            "real_open": len([r for r in open_rows if r["signal_type"] == "real"]),
+            "normal_open": len([r for r in open_rows if r["signal_type"] == "normal"]),
+            "last_rejects": [dict(r) for r in last_rejects],
         }
 
-    def _row(self, row: sqlite3.Row) -> StoredSignal:
+    def reset_stats(self) -> None:
+        with self._conn() as con:
+            con.execute("DELETE FROM signals")
+            con.execute("DELETE FROM scan_rejects")
+            con.execute("DELETE FROM runtime WHERE key LIKE 'last_%'")
+
+    def _row_to_signal(self, r: sqlite3.Row) -> StoredSignal:
         return StoredSignal(
-            id=int(row["id"]), symbol=row["symbol"], okx_symbol=row["okx_symbol"], toobit_symbol=row["toobit_symbol"],
-            direction=row["direction"], signal_type=row["signal_type"], status=row["status"], real_status=row["real_status"],
-            score=safe_float(row["score"]), risk_reward=safe_float(row["risk_reward"]), entry_price=safe_float(row["entry_price"]),
-            tp_price=safe_float(row["tp_price"]), sl_price=safe_float(row["sl_price"]), trade_margin_usdt=safe_float(row["trade_margin_usdt"]),
-            leverage=safe_int(row["leverage"]), round_trip_fee_usdt=safe_float(row["round_trip_fee_usdt"]), opened_at=safe_int(row["opened_at"]),
-            closed_at=safe_int(row["closed_at"], 0) or None, message_id=safe_int(row["message_id"], 0) or None,
-            order_id=row["order_id"], approx_pnl=row["approx_pnl"], real_pnl=row["real_pnl"], net_pnl=row["net_pnl"],
-            mfe_pct=safe_float(row["mfe_pct"]), mae_pct=safe_float(row["mae_pct"]), close_reason=row["close_reason"], reasons=row["reasons"],
+            id=int(r["id"]), symbol=r["symbol"], okx_symbol=r["okx_symbol"], toobit_symbol=r["toobit_symbol"],
+            direction=r["direction"], signal_type=r["signal_type"], status=r["status"],
+            entry_price=float(r["entry_price"]), tp_price=float(r["tp_price"]), sl_price=float(r["sl_price"]),
+            risk_reward=float(r["risk_reward"]), score=float(r["score"]), strength=r["strength"],
+            created_at=int(r["created_at"]), opened_at=int(r["opened_at"]),
+            message_id=int(r["message_id"]) if r["message_id"] is not None else None,
+            order_id=r["order_id"], client_order_id=r["client_order_id"], reasons_json=r["reasons_json"] or "[]",
+            result=r["result"], result_price=float(r["result_price"]) if r["result_price"] is not None else None,
+            result_pnl_usdt=float(r["result_pnl_usdt"]) if r["result_pnl_usdt"] is not None else None,
+            closed_at=int(r["closed_at"]) if r["closed_at"] is not None else None,
         )
