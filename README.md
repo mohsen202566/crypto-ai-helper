@@ -1,34 +1,42 @@
-# Crypto 1H Trend Pullback Toobit Bot - OKX Only Data
+# Crypto 1H Trend Pullback Toobit Bot
 
-این نسخه برای جلوگیری از HTTP 429 و فشار API توبیت اصلاح شده است.
+نسخه دقیق‌شده برای سیگنال‌دهی 1H با داده OKX و اجرای واقعی روی Toobit.
 
-## قانون اصلی
+## قانون اصلی معماری
 
-- تمام دیتای بازار، کندل، قیمت، تحلیل، اسکن، مانیتور TP/SL و نتیجه‌گیری سیگنال از OKX گرفته می‌شود.
-- Toobit در چرخه اسکن صدا زده نمی‌شود.
-- Toobit در مانیتور خودکار صدا زده نمی‌شود.
-- پنل تلگرام برای خواندن موجودی/مارجین Toobit صدا نمی‌زند.
+- تمام دیتای تحلیل، کندل، قیمت لحظه‌ای و مانیتور TP/SL فقط از OKX گرفته می‌شود.
 - Toobit فقط هنگام باز کردن Real Order استفاده می‌شود.
-- TP/SL همراه سفارش Real به Toobit ارسال می‌شود؛ مانیتور نتیجه همچنان با قیمت OKX انجام می‌شود.
+- اگر Toobit خطا بدهد، سیگنال Normal ثبت می‌شود و اسکن نمی‌خوابد.
+- Real و Normal از نظر منطق سیگنال هیچ تفاوتی ندارند؛ فقط نحوه اجرا فرق دارد.
 
-## منطق استراتژی
+## منطق سیگنال 1H دقیق‌شده
 
-- جهت مادر از 4H
-- ورود از 1H
-- SL/TP متناسب با 1H
-- RR پیش‌فرض 1.5
-- RR=2 فقط برای سیگنال خیلی قوی
-- فیلتر رنج با ADX/DMI، شیب EMA50 و موقعیت قیمت
-- فیلتر ورود دیر با فاصله قیمت از EMA20/EMA50 نسبت به ATR
-- استاپ: ساختار 1H + بافر ATR
+- 1H تایم اصلی ورود است.
+- 4H فیلتر مادر است: اگر خلاف جهت 1H باشد رد می‌شود؛ اگر رنج/خنثی باشد، با 1H قوی اجازه سیگنال می‌دهد.
+- 1H اگر رنج باشد، معامله رد می‌شود.
+- ADX سخت‌گیر مطلق نیست: ADX بالای 20 قبول است؛ ADX از 16 به بالا اگر رو به رشد باشد قبول مشروط است؛ ADX زیر 14 رد کامل است.
+- DMI باید با جهت معامله همسو باشد.
+- پولبک نرم‌تر شده: تماس با EMA20/EMA50، نزدیکی به EMA20 تا 0.4ATR، یا اصلاح سبک + تریگر برگشتی قابل قبول است.
+- ورود دیر هنوز رد می‌شود: فاصله زیاد از EMA20/EMA50، 6 کندل هم‌جهت پشت‌سرهم، یا ADX خیلی بالا و رو به افت.
+- SL/TP فقط با ساختار و ATR تایم 1H ساخته می‌شود.
 
-## نمادها
+## تنظیمات پیش‌فرض مهم
 
-نمادهای OKX و Toobit از `symbols_config.py` خوانده می‌شوند.
-اگر OKX برای یک ارز خطا دهد، فقط همان ارز موقتاً رد می‌شود و ربات ادامه می‌دهد.
-اگر Toobit موقع باز کردن Real خطا دهد، Real باز نمی‌شود و سیگنال Normal ثبت می‌شود.
+```text
+SIGNAL_SCORE_THRESHOLD = 75
+STRONG_SCORE_THRESHOLD = 88
+RR_NORMAL = 1.5
+RR_STRONG = 2.0
+HARD_RANGE_ADX = 14
+MIN_TREND_ADX = 16
+STRONG_TREND_ADX = 25
+MAX_DISTANCE_EMA20_ATR = 1.8
+MAX_DISTANCE_EMA50_ATR = 2.8
+MIN_1H_RISK_ATR = 0.6
+MAX_1H_RISK_ATR = 2.4
+```
 
-## دستورات تلگرام حفظ شده
+## دستورات تلگرام
 
 ```text
 ترید
@@ -40,13 +48,16 @@
 سرمایه ترید 100
 حداقل سود خالص 0.01
 آمار
+آمار 7
+ردها
+ردها 50
 پوزیشن
 کوین‌ها
 وضعیت
 راهنما
 ```
 
-## نصب / آپدیت VPS
+## نصب/آپدیت روی VPS
 
 ```bash
 cd /root/crypto-ai-helper
@@ -55,34 +66,25 @@ git fetch --all --prune
 git reset --hard origin/main
 
 python -m py_compile *.py
+
 systemctl daemon-reload
 systemctl restart crypto-bot.service
+
 sleep 5
 systemctl status crypto-bot.service --no-pager
-journalctl -u crypto-bot.service -n 100 --no-pager
+journalctl -u crypto-bot.service -n 100 --no-pager -o cat
 ```
 
-اگر branch پروژه `master` است، به‌جای `origin/main` از `origin/master` استفاده کن.
+اگر برنچ `master` است، به‌جای `origin/main` از `origin/master` استفاده کن.
 
-
-## Reject Log / دلیل رد شدن ارزها
-
-این نسخه برای هر ارز ردشده دلیل منطقی ثبت می‌کند؛ مثل هم‌جهت نبودن 4H و 1H، ADX پایین، ATR نامعتبر، ورود دیر، نبود پولبک یا score پایین.
-
-دستور تلگرام:
-
-```text
-ردها
-ردها 50
-```
-
-دستور VPS:
+## لاگ رد شدن‌ها
 
 ```bash
-sqlite3 -line data/crypto_1h_trend_pullback.sqlite3 "
-SELECT symbol,stage,reason,details,datetime(created_at,'unixepoch','localtime') AS time
-FROM reject_logs
-ORDER BY created_at DESC
-LIMIT 50;
-"
+journalctl -u crypto-bot.service -f -o cat | grep --line-buffered -E "رد شد|رنج|خلاف جهت|ADX|DMI|پولبک|ورود دیر|سیگنال"
+```
+
+داخل تلگرام:
+
+```text
+ردها 50
 ```
