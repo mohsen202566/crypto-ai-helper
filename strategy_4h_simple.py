@@ -66,6 +66,19 @@ class DirectionScore:
     reasons: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class RejectInfo:
+    symbol: str
+    stage: str
+    reason: str
+    details: str = ""
+
+    def text(self) -> str:
+        if self.details:
+            return f"{self.reason} | {self.details}"
+        return self.reason
+
+
 class Simple4HStrategy:
     """1H trend-pullback strategy, kept under the old class/file name for compatibility.
 
@@ -81,6 +94,25 @@ class Simple4HStrategy:
     def __init__(self) -> None:
         self.min_score = float(config.SIGNAL_SCORE_THRESHOLD)
         self.strong_score = float(config.STRONG_SCORE_THRESHOLD)
+        self.last_reject = RejectInfo("", "", "")
+
+    def _set_reject(self, symbol: str, stage: str, reason: str, details: str = "") -> None:
+        self.last_reject = RejectInfo(symbol.upper(), stage, reason, details)
+
+    def get_last_reject_text(self) -> str:
+        return self.last_reject.text()
+
+    @staticmethod
+    def _dir_label(direction: Direction | None) -> str:
+        return direction if direction is not None else "نامشخص"
+
+    @staticmethod
+    def _snapshot_summary(prefix: str, s: Snapshot) -> str:
+        ema_slope = s.ema50 - s.ema50_lookback
+        return (
+            f"{prefix}: close={s.close:g}, EMA50={s.ema50:g}, EMA200={s.ema200:g}, "
+            f"EMA50_slope={ema_slope:g}, ADX={s.adx:.1f}, +DI={s.plus_di:.1f}, -DI={s.minus_di:.1f}, ATR={s.atr:g}"
+        )
 
     def analyze(
         self,
@@ -93,41 +125,66 @@ class Simple4HStrategy:
         toobit_symbol: str | None = None,
         round_trip_fee_usdt: float = config.ROUND_TRIP_FEE_USDT,
     ) -> SignalPlan | None:
-        s4h = snapshot(candles_4h, swing_lookback=config.SWING_LOOKBACK_4H, slope_lookback=config.EMA_SLOPE_LOOKBACK)
-        s1h = snapshot(candles_1h, swing_lookback=config.SWING_LOOKBACK_1H, slope_lookback=config.EMA_SLOPE_LOOKBACK)
+        self.last_reject = RejectInfo(symbol.upper(), "", "")
+        try:
+            s4h = snapshot(candles_4h, swing_lookback=config.SWING_LOOKBACK_4H, slope_lookback=config.EMA_SLOPE_LOOKBACK)
+            s1h = snapshot(candles_1h, swing_lookback=config.SWING_LOOKBACK_1H, slope_lookback=config.EMA_SLOPE_LOOKBACK)
+        except Exception as exc:
+            self._set_reject(symbol, "INDICATORS", "اندیکاتورها/کندل‌ها کامل نیستند", str(exc))
+            return None
 
         d4 = self._direction_4h(s4h)
         d1 = self._direction_1h(s1h)
         if d4.direction is None or d1.direction is None:
+            details = (
+                f"4H={self._dir_label(d4.direction)}, 1H={self._dir_label(d1.direction)} | "
+                f"{self._snapshot_summary('4H', s4h)} | {self._snapshot_summary('1H', s1h)}"
+            )
+            self._set_reject(symbol, "DIRECTION", "جهت 4H یا 1H واضح نیست", details)
             return None
         if d4.direction != d1.direction:
+            details = (
+                f"4H={self._dir_label(d4.direction)} ولی 1H={self._dir_label(d1.direction)} | "
+                "شرط ورود: 4H و 1H باید هم‌جهت باشند"
+            )
+            self._set_reject(symbol, "DIRECTION", "4H و 1H هم‌جهت نیستند", details)
             return None
 
         direction: Direction = d1.direction
         reject_reason = self._hard_reject_reason(direction, s1h, candles_1h)
         if reject_reason:
+            self._set_reject(symbol, "FILTER", reject_reason, self._snapshot_summary("1H", s1h))
             return None
 
         score, reasons = self._score(direction, s4h, s1h, candles_1h)
         if score < self.min_score:
+            self._set_reject(symbol, "SCORE", "امتیاز کمتر از حد ورود است", f"score={score:.1f} < min={self.min_score:.1f}")
             return None
 
         entry = s1h.close
         sl = self._make_sl_1h(direction, s1h, entry)
         if sl <= 0 or sl == entry:
+            self._set_reject(symbol, "SL", "استاپ 1H معتبر ساخته نشد", f"entry={entry:g}, sl={sl:g}")
             return None
         risk = entry - sl if direction == "LONG" else sl - entry
-        if risk <= 0 or s1h.atr <= 0:
+        if risk <= 0:
+            self._set_reject(symbol, "SL", "ریسک/استاپ منفی یا صفر است", f"direction={direction}, entry={entry:g}, sl={sl:g}, risk={risk:g}")
+            return None
+        if s1h.atr <= 0:
+            self._set_reject(symbol, "ATR", "ATR فعال/معتبر نیست", f"ATR={s1h.atr:g}")
             return None
 
         risk_atr = risk / s1h.atr
         if risk_atr < float(config.MIN_1H_RISK_ATR):
+            self._set_reject(symbol, "SL", "استاپ 1H زیادی تنگ است", f"risk={risk_atr:.2f}ATR < min={float(config.MIN_1H_RISK_ATR):.2f}ATR")
             return None
         if risk_atr > float(config.MAX_1H_RISK_ATR):
+            self._set_reject(symbol, "SL", "استاپ 1H زیادی بزرگ است / ورود دیر است", f"risk={risk_atr:.2f}ATR > max={float(config.MAX_1H_RISK_ATR):.2f}ATR")
             return None
 
         sl_pct = risk / entry
         if sl_pct > float(config.MAX_1H_SL_PCT):
+            self._set_reject(symbol, "SL", "فاصله SL درصدی بیش از حد مجاز است", f"sl_pct={sl_pct*100:.2f}% > max={float(config.MAX_1H_SL_PCT)*100:.2f}%")
             return None
 
         rr = self._risk_reward(score, direction, s1h)
@@ -185,18 +242,77 @@ class Simple4HStrategy:
         return DirectionScore(None, 0.0, tuple(reasons))
 
     def _hard_reject_reason(self, direction: Direction, s: Snapshot, candles: list[Candle]) -> str | None:
-        if s.adx < float(config.MIN_TREND_ADX):
-            return "رنج: ADX پایین"
         if s.atr <= 0:
-            return "ATR نامعتبر"
-        if abs(s.ema50 - s.ema50_lookback) < float(config.FLAT_EMA_ATR_MULT) * s.atr:
-            return "رنج: EMA50 صاف"
+            return f"ATR فعال/معتبر نیست | ATR={s.atr:g}"
+        if s.adx < float(config.MIN_TREND_ADX):
+            return f"ADX پایین است / بازار روند کافی ندارد | ADX={s.adx:.1f} < {float(config.MIN_TREND_ADX):.1f}"
+        ema_slope_atr = abs(s.ema50 - s.ema50_lookback) / s.atr if s.atr > 0 else 0.0
+        if ema_slope_atr < float(config.FLAT_EMA_ATR_MULT):
+            return f"EMA50 صاف است / احتمال رنج | EMA50_slope={ema_slope_atr:.2f}ATR < {float(config.FLAT_EMA_ATR_MULT):.2f}ATR"
         if min(s.ema50, s.ema200) <= s.close <= max(s.ema50, s.ema200):
-            return "رنج/میانه: قیمت بین EMA50 و EMA200"
-        if self._is_late(direction, s, candles):
-            return "ورود دیر: قیمت بیش از حد از EMA20/EMA50 دور است"
-        if not self._has_pullback_trigger(direction, s, candles):
-            return "بدون پولبک/تریگر معتبر"
+            return f"قیمت بین EMA50 و EMA200 است / ناحیه رنج یا وسط بازار | close={s.close:g}"
+        late_reason = self._late_reason(direction, s, candles)
+        if late_reason:
+            return late_reason
+        pullback_reason = self._pullback_reject_reason(direction, s, candles)
+        if pullback_reason:
+            return pullback_reason
+        return None
+
+    def _late_reason(self, direction: Direction, s: Snapshot, candles: list[Candle]) -> str | None:
+        if s.atr <= 0:
+            return "ATR فعال/معتبر نیست"
+        recent = candles[-6:]
+        bullish = sum(1 for c in recent if c.close > c.open)
+        bearish = sum(1 for c in recent if c.close < c.open)
+        if direction == "LONG":
+            dist20 = (s.close - s.ema20) / s.atr
+            dist50 = (s.close - s.ema50) / s.atr
+            if dist20 > float(config.MAX_DISTANCE_EMA20_ATR):
+                return f"ورود دیر است: فاصله قیمت از EMA20 زیاد است | dist20={dist20:.2f}ATR"
+            if dist50 > float(config.MAX_DISTANCE_EMA50_ATR):
+                return f"ورود دیر است: فاصله قیمت از EMA50 زیاد است | dist50={dist50:.2f}ATR"
+            if bullish >= 5:
+                return f"ورود دیر است: {bullish}/6 کندل اخیر صعودی بوده"
+            if s.adx >= float(config.EXHAUSTION_ADX) and s.adx < s.prev_adx:
+                return f"احتمال انتهای موج: ADX بالا ولی رو به افت | ADX={s.adx:.1f}, prev={s.prev_adx:.1f}"
+        else:
+            dist20 = (s.ema20 - s.close) / s.atr
+            dist50 = (s.ema50 - s.close) / s.atr
+            if dist20 > float(config.MAX_DISTANCE_EMA20_ATR):
+                return f"ورود دیر است: فاصله قیمت از EMA20 زیاد است | dist20={dist20:.2f}ATR"
+            if dist50 > float(config.MAX_DISTANCE_EMA50_ATR):
+                return f"ورود دیر است: فاصله قیمت از EMA50 زیاد است | dist50={dist50:.2f}ATR"
+            if bearish >= 5:
+                return f"ورود دیر است: {bearish}/6 کندل اخیر نزولی بوده"
+            if s.adx >= float(config.EXHAUSTION_ADX) and s.adx < s.prev_adx:
+                return f"احتمال انتهای موج: ADX بالا ولی رو به افت | ADX={s.adx:.1f}, prev={s.prev_adx:.1f}"
+        return None
+
+    def _pullback_reject_reason(self, direction: Direction, s: Snapshot, candles: list[Candle]) -> str | None:
+        lookback = max(2, int(config.PULLBACK_LOOKBACK_1H))
+        recent = candles[-lookback:]
+        buffer = float(config.PULLBACK_ATR_BUFFER) * s.atr
+        if direction == "LONG":
+            touched_zone = any(c.low <= s.ema20 + buffer for c in recent) or any(c.low <= s.ema50 + buffer for c in recent)
+            respected_ema50 = min(c.close for c in recent) >= s.ema50 - buffer
+            trigger = s.close >= s.ema20 and candles[-1].close > candles[-1].open
+            if not touched_zone:
+                return "پولبک معتبر نداریم: قیمت به محدوده EMA20/EMA50 برنگشته"
+            if not respected_ema50:
+                return "پولبک خراب شد: کلوز زیر EMA50 آمده"
+            if not trigger:
+                return "تریگر ورود لانگ کامل نیست: کندل برگشتی/کلوز بالای EMA20 نداریم"
+            return None
+        touched_zone = any(c.high >= s.ema20 - buffer for c in recent) or any(c.high >= s.ema50 - buffer for c in recent)
+        respected_ema50 = max(c.close for c in recent) <= s.ema50 + buffer
+        trigger = s.close <= s.ema20 and candles[-1].close < candles[-1].open
+        if not touched_zone:
+            return "پولبک معتبر نداریم: قیمت به محدوده EMA20/EMA50 برنگشته"
+        if not respected_ema50:
+            return "پولبک خراب شد: کلوز بالای EMA50 آمده"
+        if not trigger:
+            return "تریگر ورود شورت کامل نیست: کندل برگشتی/کلوز زیر EMA20 نداریم"
         return None
 
     def _score(self, direction: Direction, s4h: Snapshot, s1h: Snapshot, candles_1h: list[Candle]) -> tuple[float, list[str]]:

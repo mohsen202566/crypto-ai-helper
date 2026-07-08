@@ -27,8 +27,15 @@ class RuntimeSafety4H:
         return not self.storage.coin_in_cooldown(symbol)
 
     def record_coin_error(self, symbol: str, exc: Exception | str) -> None:
-        logger.warning("ارز %s خطا داد و فقط همان ارز موقتاً رد شد: %s", symbol, exc)
-        self.storage.record_coin_error(symbol, str(exc), int(config.COIN_ERROR_COOLDOWN_SECONDS))
+        text = str(exc)
+        invalid_okx = "51001" in text or "Instrument ID" in text or "doesn't exist" in text or "does not exist" in text
+        if invalid_okx:
+            cooldown = int(getattr(config, "INVALID_SYMBOL_COOLDOWN_SECONDS", 86400))
+            logger.warning("ارز %s رد شد | مرحله: DATA | دلیل: نماد OKX معتبر نیست یا فیوچرز USDT-SWAP ندارد | cooldown=%ss", symbol, cooldown)
+        else:
+            cooldown = int(config.COIN_ERROR_COOLDOWN_SECONDS)
+            logger.warning("ارز %s خطا داد و فقط همان ارز موقتاً رد شد: %s", symbol, text)
+        self.storage.record_coin_error(symbol, text, cooldown)
 
     def clear_coin_error(self, symbol: str) -> None:
         self.storage.clear_coin_error(symbol)

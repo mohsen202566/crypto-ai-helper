@@ -63,3 +63,26 @@ journalctl -u crypto-bot.service -n 100 --no-pager
 ```
 
 اگر branch پروژه `master` است، به‌جای `origin/main` از `origin/master` استفاده کن.
+
+
+## Reject Log / دلیل رد شدن ارزها
+
+این نسخه برای هر ارز ردشده دلیل منطقی ثبت می‌کند؛ مثل هم‌جهت نبودن 4H و 1H، ADX پایین، ATR نامعتبر، ورود دیر، نبود پولبک یا score پایین.
+
+دستور تلگرام:
+
+```text
+ردها
+ردها 50
+```
+
+دستور VPS:
+
+```bash
+sqlite3 -line data/crypto_1h_trend_pullback.sqlite3 "
+SELECT symbol,stage,reason,details,datetime(created_at,'unixepoch','localtime') AS time
+FROM reject_logs
+ORDER BY created_at DESC
+LIMIT 50;
+"
+```

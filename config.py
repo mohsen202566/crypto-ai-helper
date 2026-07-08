@@ -107,6 +107,13 @@ TOOBIT_PANEL_CACHE_SECONDS = _env_int("TOOBIT_PANEL_CACHE_SECONDS", 20)
 # OKX-only data law: automatic scan/monitor/panel must not call Toobit.
 # Toobit is only used when opening a Real order and by explicit execution helpers.
 
+# Reject diagnostics: show why a coin was skipped even when there is no technical error.
+LOG_REJECT_REASONS = _env_bool("LOG_REJECT_REASONS", True)
+STORE_REJECT_REASONS = _env_bool("STORE_REJECT_REASONS", True)
+REJECT_LOG_LEVEL = _env("REJECT_LOG_LEVEL", "INFO").upper()
+REJECT_LOG_MAX_PER_SCAN = _env_int("REJECT_LOG_MAX_PER_SCAN", 60)
+INVALID_SYMBOL_COOLDOWN_SECONDS = _env_int("INVALID_SYMBOL_COOLDOWN_SECONDS", 86400)
+
 # Trade panel defaults - user can change them from Telegram.
 DEFAULT_TRADE_ENABLED = _env_bool("DEFAULT_TRADE_ENABLED", False)
 DEFAULT_TRADE_DOLLAR = _env_float("DEFAULT_TRADE_DOLLAR", _env_float("DEFAULT_MARGIN_USDT", 10.0))

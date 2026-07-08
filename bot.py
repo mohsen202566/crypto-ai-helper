@@ -92,6 +92,7 @@ class Crypto1HBot:
         watchlist = self.safety.limited_watchlist()
         self.storage.runtime_set("last_scan_started_at", int(time.time()))
         found = 0
+        reject_logged = 0
         for symbol in watchlist:
             if self.stop_event.is_set():
                 break
@@ -106,6 +107,7 @@ class Crypto1HBot:
                 plan = self._analyze_symbol(symbol)
                 self.safety.clear_coin_error(symbol)
                 if plan is None:
+                    reject_logged = self._log_strategy_reject(symbol, reject_logged)
                     continue
                 found += 1
                 self._handle_plan(plan)
@@ -282,6 +284,10 @@ class Crypto1HBot:
         if m:
             days = max(1, min(365, safe_int(m.group(1), 30)))
             return render_stats(self.storage.stats(days), days)
+        m = re.match(r"^ردها(?:\s+([0-9]+))?$", t)
+        if m:
+            limit = max(1, min(100, safe_int(m.group(1), 30)))
+            return self.storage.recent_rejects_text(limit)
         if t in {"پوزیشن", "پوزیشن‌ها", "پوزیشن ها"}:
             return self.storage.recent_open_positions_text()
         if t in {"کوین‌ها", "کوین ها", "ارزها", "ارزهای فعال"}:
@@ -310,6 +316,7 @@ class Crypto1HBot:
             "سرمایه ترید 100",
             "حداقل سود خالص 0.01",
             "آمار یا آمار 7",
+            "ردها یا ردها 50",
             "پوزیشن",
             "کوین‌ها",
         ])

@@ -129,6 +129,20 @@ class Storage:
             )
             """
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS reject_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                details TEXT,
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_reject_logs_created ON reject_logs(created_at DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_reject_logs_symbol ON reject_logs(symbol, created_at DESC)")
         self.conn.commit()
         self._ensure_default_settings()
 
@@ -292,6 +306,29 @@ class Storage:
             (int(signal_id), event_type, price, pnl, net_pnl, detail, int(time.time())),
         )
         self.conn.commit()
+
+    def add_reject_log(self, symbol: str, stage: str, reason: str, details: str = "") -> None:
+        self.conn.execute(
+            "INSERT INTO reject_logs(symbol,stage,reason,details,created_at) VALUES(?,?,?,?,?)",
+            (symbol.upper(), str(stage or "FILTER")[:60], str(reason or "")[:500], str(details or "")[:1000], int(time.time())),
+        )
+        self.conn.commit()
+
+    def recent_rejects_text(self, limit: int = 30) -> str:
+        limit = max(1, min(100, int(limit)))
+        rows = self.conn.execute(
+            "SELECT symbol,stage,reason,details,created_at FROM reject_logs ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        if not rows:
+            return "رد منطقی ثبت نشده است."
+        lines = [f"📋 آخرین {len(rows)} رد منطقی:"]
+        for r in rows:
+            detail = str(r["details"] or "")
+            if len(detail) > 130:
+                detail = detail[:127] + "..."
+            lines.append(f"{r['symbol']} | {r['stage']} | {r['reason']}" + (f" | {detail}" if detail else ""))
+        return "\n".join(lines)
 
     def record_coin_error(self, symbol: str, error: str, cooldown_seconds: int = config.COIN_ERROR_COOLDOWN_SECONDS) -> None:
         now = int(time.time())
