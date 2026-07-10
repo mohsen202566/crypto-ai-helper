@@ -86,6 +86,9 @@ class WatchState:
     max_favorable_pct: float = 0.0
     max_adverse_pct: float = 0.0
     weakness_count: int = 0
+    locked_at: float = 0.0
+    proof_seen: bool = False
+    proof_count: int = 0
 
 
 @dataclass
@@ -337,10 +340,12 @@ def detect_watch_candidate(
     min_watch = float(getattr(config, "MDW_MIN_WATCH_CONFIDENCE", 62.0))
     min_pre = float(getattr(config, "PIOM_MIN_PREMOVE_SCORE", 58.0))
     min_dir = float(getattr(config, "DWE_MIN_DIRECTION_FOR_WATCH", 62.0))
-    if not (watch_conf >= min_watch and pre_move_score >= min_pre and max_dir >= min_dir and conflict <= 65.0):
+    # برای جلوگیری از واچ‌های خیلی خام، ابهام جهت در مرحله ورود به واچ هم محدود می‌شود؛
+    # اما هنوز همه شرط‌ها hard نیستند تا حرکت‌های خوب خفه نشوند.
+    if not (watch_conf >= min_watch and pre_move_score >= min_pre and max_dir >= min_dir and conflict <= 55.0):
         return None, "واچ هنوز بالغ نشده؛ نشانه کافی اما خام بود", details
 
-    if gap >= float(getattr(config, "DWE_INITIAL_GAP", 10.0)) and max_dir >= 66.0:
+    if gap >= float(getattr(config, "DWE_INITIAL_GAP", 14.0)) and max_dir >= 68.0:
         side = "LONG" if long_score > short_score else "SHORT"
     else:
         side = "UNCERTAIN"
@@ -416,7 +421,7 @@ def _ltsf_weakness(state: WatchState, side: str, price: float, trade_imbalance: 
         pullback_damage = 0.0
         if state.max_favorable_pct > 0:
             pullback_damage = max(0.0, (state.max_favorable_pct - max(response_pct, 0.0)) / max(state.max_favorable_pct, 1e-9))
-        severe_opposite = price < state.start_price and trade_imbalance < -0.18 and book_imbalance < -0.12
+        severe_opposite = price < state.start_price and trade_imbalance < -0.16 and book_imbalance < -0.10
     else:
         net = obs[0] - obs[-1]
         hold = sum(1 for x in obs if x <= state.start_price) / len(obs)
@@ -424,7 +429,7 @@ def _ltsf_weakness(state: WatchState, side: str, price: float, trade_imbalance: 
         resp_fav = max(-response_pct, 0.0)
         if state.max_favorable_pct > 0:
             pullback_damage = max(0.0, (state.max_favorable_pct - resp_fav) / max(state.max_favorable_pct, 1e-9))
-        severe_opposite = price > state.start_price and trade_imbalance > 0.18 and book_imbalance > 0.12
+        severe_opposite = price > state.start_price and trade_imbalance > 0.16 and book_imbalance > 0.10
 
     total_path = sum(abs(obs[i] - obs[i - 1]) for i in range(1, len(obs))) or 1e-12
     efficiency = max(0.0, net) / total_path
@@ -514,6 +519,13 @@ def evaluate_watch(state: WatchState, snapshot: dict[str, Any], now: float | Non
         if lock_candidate and (state.persistence_count >= persistence_needed or very_strong_lock):
             state.direction_locked = True
             state.side = leading_side
+            state.locked_at = now
+            state.confirm_count = 0
+            state.proof_count = 0
+            state.proof_seen = False
+            state.observations = []
+            state.max_favorable_pct = 0.0
+            state.max_adverse_pct = 0.0
             logger_side = leading_side
         else:
             if conflict > 70.0:
@@ -526,7 +538,7 @@ def evaluate_watch(state: WatchState, snapshot: dict[str, Any], now: float | Non
     else:
         logger_side = state.side
         # اگر بعد از قفل، طرف مقابل با اختلاف خیلی قوی برگردد، واچ حذف می‌شود نه اینکه کورکورانه برعکس شود.
-        if leading_side != state.side and leading_score >= 82.0 and gap >= 22.0:
+        if leading_side != state.side and leading_score >= 80.0 and gap >= 20.0:
             state.bad_count += 1
         else:
             state.bad_count = max(0, state.bad_count - 1)
@@ -561,26 +573,66 @@ def evaluate_watch(state: WatchState, snapshot: dict[str, Any], now: float | Non
     if severe_weakness or weakness_count >= int(getattr(config, "LTSF_BLOCK_WEAKNESS_COUNT", 3)):
         return WatchEvaluation("REMOVE", "LTSF ضعف واضح/چندگانه روند را دید؛ ورود بلاک شد", side, None, metrics)
 
-    ignition_min = float(getattr(config, "IWG_MIN_IGNITION_SCORE", 72.0))
+    # Proof-of-move: سیگنال نباید قبل از نفس‌کشیدن واقعی حرکت صادر شود.
+    # این بریک‌اوت نیست؛ فقط حداقل MFE بالقوه قبل از ورود و حفظ آن است.
+    proof_min = max(
+        float(getattr(config, "PROOF_MIN_FAVORABLE_PCT", 0.10)),
+        state.late_limit_pct * float(getattr(config, "PROOF_MIN_FAVORABLE_FRACTION_OF_LATE", 0.24)),
+    )
+    proof_retain_ratio = float(getattr(config, "PROOF_RETAIN_RATIO", 0.55))
+    proof_max_pullback = float(getattr(config, "PROOF_MAX_PULLBACK_DAMAGE", 0.48))
+    locked_age = max(0.0, now - float(state.locked_at or now))
+    obs_count = len(state.observations)
+    favorable_now = max(favorable_response, 0.0)
+    proof_pullback_damage = 0.0
+    if state.max_favorable_pct > 0:
+        proof_pullback_damage = max(0.0, (state.max_favorable_pct - favorable_now) / max(state.max_favorable_pct, 1e-9))
+    proof_seen_now = state.max_favorable_pct >= proof_min
+    proof_retained = proof_seen_now and favorable_now >= max(proof_min * 0.72, state.max_favorable_pct * proof_retain_ratio) and proof_pullback_damage <= proof_max_pullback
+    if proof_retained:
+        state.proof_count += 1
+        state.proof_seen = True
+    else:
+        state.proof_count = max(0, state.proof_count - 1)
+
+    metrics["ProofMin"] = round(proof_min, 4)
+    metrics["ProofMaxFav"] = round(state.max_favorable_pct, 4)
+    metrics["ProofNow"] = round(favorable_now, 4)
+    metrics["ProofPullback"] = round(proof_pullback_damage, 3)
+    metrics["ProofCount"] = state.proof_count
+    metrics["LockedAge"] = round(locked_age, 1)
+    metrics["Obs"] = obs_count
+
+    ignition_min = float(getattr(config, "IWG_MIN_IGNITION_SCORE", 86.0))
+    min_obs = int(getattr(config, "PROOF_MIN_OBSERVATIONS_AFTER_LOCK", 4))
+    min_locked_seconds = float(getattr(config, "PROOF_MIN_SECONDS_AFTER_LOCK", 40))
+    required_proof_count = int(getattr(config, "PROOF_REQUIRED_COUNT", 2))
+
     if ignition_score < ignition_min or not price_started or not no_strong_opposite:
         return WatchEvaluation("KEEP", "جهت قفل شده؛ منتظر شروع واقعی حرکت در همان جهت", side, None, metrics)
+    if not proof_seen_now:
+        return WatchEvaluation("KEEP", "شروع جهت دیده شد اما proof-of-move هنوز کافی نیست؛ سیگنال صادر نشد", side, None, metrics)
+    if not proof_retained:
+        return WatchEvaluation("KEEP", "حرکت نفس کشید ولی بخش زیادی از پالس پس داده شد؛ منتظر hold معتبر", side, None, metrics)
+    if obs_count < min_obs or locked_age < min_locked_seconds:
+        return WatchEvaluation("KEEP", "جهت و شروع معتبرند اما برای تایم 30-60M پایداری کوتاه بیشتری لازم است", side, None, metrics)
 
-    # اگر ضعف متوسط هست، فقط تأیید بیشتری می‌خواهد؛ سیگنال خوب را خفه نمی‌کند.
-    strong_setup = leading_score >= 84.0 and ignition_score >= 82.0 and gap >= 20.0 and weakness_count <= 2
-    needed = 1 if strong_setup else int(getattr(config, "WATCH_CONFIRMATIONS_REQUIRED", 2))
+    # تأیید نهایی: هیچ fast path تک‌مشاهده‌ای نداریم؛ چون نمونه‌های SL نشان دادند ورود خام MFE صفر می‌دهد.
     state.confirm_count += 1
-    if state.confirm_count < needed:
-        return WatchEvaluation("KEEP", "تأیید اول شروع حرکت دریافت شد؛ برای حذف نویز یک مشاهده دیگر لازم است", side, None, metrics)
+    needed = max(int(getattr(config, "WATCH_CONFIRMATIONS_REQUIRED", 3)), required_proof_count)
+    if state.confirm_count < needed or state.proof_count < required_proof_count:
+        return WatchEvaluation("KEEP", "اثبات شروع حرکت دریافت شد؛ برای حذف فیک‌پالس تأیید پایدارتر لازم است", side, None, metrics)
 
-    ltsf_bonus = 18.0 if weakness_count == 0 else (10.0 if weakness_count == 1 else 3.0)
-    strength_score = max(0.0, min(100.0, leading_score * 0.46 + ignition_score * 0.38 + ltsf_bonus))
+    ltsf_bonus = 18.0 if weakness_count == 0 else (9.0 if weakness_count == 1 else 0.0)
+    strength_score = max(0.0, min(100.0, leading_score * 0.43 + ignition_score * 0.39 + ltsf_bonus + min(6.0, state.proof_count * 1.5)))
     min_strength = float(getattr(config, "MIN_SIGNAL_STRENGTH_SCORE", 62.0))
     if strength_score < min_strength:
         return WatchEvaluation("KEEP", "امتیاز نهایی هنوز برای ورود 30-60M کافی نیست", side, None, metrics)
 
-    if strength_score >= 84:
+    # برچسب قدرت دیگر خوش‌بینانه نیست؛ «خیلی قوی» فقط با proof واقعی، ignition بالا و ضعف صفر مجاز است.
+    if strength_score >= 86 and ignition_score >= 92 and leading_score >= 86 and weakness_count == 0 and state.proof_count >= required_proof_count:
         strength = "خیلی قوی"
-    elif strength_score >= 72:
+    elif strength_score >= 76 and ignition_score >= 88 and weakness_count <= 1:
         strength = "قوی"
     else:
         strength = "متوسط"

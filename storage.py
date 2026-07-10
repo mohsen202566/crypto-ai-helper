@@ -228,6 +228,40 @@ class Storage:
             row = db.execute("SELECT * FROM profiles WHERE symbol_id=?", (symbol_id,)).fetchone()
             return dict(row) if row else None
 
+
+    def recent_closed_signals(self, minutes: int = 90, limit: int = 10) -> list[dict[str, Any]]:
+        since = int(time.time() - max(1, int(minutes)) * 60)
+        with self.connect() as db:
+            rows = db.execute(
+                """SELECT id,symbol_id,side,close_reason,mfe,mae,net_pnl,closed_at,created_at
+                FROM signals
+                WHERE status='closed' AND COALESCE(closed_at,0)>=?
+                ORDER BY closed_at DESC, id DESC
+                LIMIT ?""",
+                (since, int(limit)),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def chop_guard_active(self) -> tuple[bool, str]:
+        if not bool(getattr(config, "CHOP_GUARD_ENABLED", True)):
+            return False, "غیرفعال"
+        recent = self.recent_closed_signals(
+            minutes=int(getattr(config, "CHOP_GUARD_LOOKBACK_MINUTES", 90)),
+            limit=max(3, int(getattr(config, "CHOP_GUARD_SL_COUNT", 3))),
+        )
+        min_closed = int(getattr(config, "CHOP_GUARD_MIN_CLOSED", 3))
+        sl_needed = int(getattr(config, "CHOP_GUARD_SL_COUNT", 3))
+        if len(recent) < min_closed:
+            return False, "نمونه بسته کافی نیست"
+        head = recent[:sl_needed]
+        if len(head) < sl_needed:
+            return False, "نمونه SL کافی نیست"
+        sl_count = sum(1 for r in head if str(r.get("close_reason")) == "SL")
+        avg_mfe = sum(float(r.get("mfe") or 0.0) for r in head) / max(len(head), 1)
+        if sl_count >= sl_needed and avg_mfe <= float(getattr(config, "CHOP_GUARD_MAX_AVG_MFE", 0.16)):
+            return True, f"{sl_count} SL پشت‌سرهم با MFE میانگین {avg_mfe:.3f}%"
+        return False, f"SL={sl_count}/{sl_needed} avg_mfe={avg_mfe:.3f}%"
+
     def add_health_event(self, component: str, severity: str, message: str, symbol_id: str | None = None) -> None:
         with self.connect() as db:
             db.execute(

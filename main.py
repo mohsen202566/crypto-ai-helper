@@ -67,6 +67,9 @@ class TradingBotApp:
         return any(str(x.get("symbol_id")) == symbol_id for x in self.storage.get_open_signals())
 
     def signal_eligibility(self, sym: SymbolMap) -> tuple[bool, str]:
+        guard_active, guard_reason = self.storage.chop_guard_active()
+        if guard_active:
+            return False, f"محافظ بازار چاپی فعال است: {guard_reason}"
         if self.storage.is_blacklisted(sym.id):
             return False, "ارز موقتاً در لیست خطا قرار دارد"
         if self._has_open_signal(sym.id):
