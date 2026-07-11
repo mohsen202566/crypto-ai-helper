@@ -372,11 +372,20 @@ class Monitor:
         self.telegram.send_message(text, reply_to_message_id=sig.get("message_id"))
 
     def check_virtual(self, sig: dict) -> None:
-        candles = self.okx.get_candles(sig["okx_symbol"], limit=120)
-        reason, exit_price, ts = self.okx.reached_tp_or_sl(candles, sig["side"], float(sig["tp"]), float(sig["sl"]), int(sig["created_at"]) * 1000)
+        # قانون ربات: خروج فقط با TP یا SL است.
+        # سیگنال مجازی نباید بعد از چند ساعت با TIMEOUT بسته شود؛ در غیر این صورت
+        # بدون پیام نتیجه از لیست باز خارج می‌شود و همان نماد دوباره سیگنال می‌گیرد.
+        age_hours = max(0.0, (time.time() - int(sig["created_at"])) / 3600.0)
+        candle_limit = min(300, max(120, int(age_hours) + 12))
+        candles = self.okx.get_candles(sig["okx_symbol"], limit=candle_limit)
+        reason, exit_price, ts = self.okx.reached_tp_or_sl(
+            candles,
+            sig["side"],
+            float(sig["tp"]),
+            float(sig["sl"]),
+            int(sig["created_at"]) * 1000,
+        )
         if not reason or exit_price is None:
-            if time.time() - int(sig["created_at"]) > config.VIRTUAL_MONITOR_MAX_MINUTES * 60:
-                self.storage.update_signal(sig["id"], status="closed", closed_at=int(time.time()), close_reason="TIMEOUT")
             return
         trade_usdt = float(self.storage.get("trade_usdt", config.TRADE_USDT_DEFAULT))
         leverage = int(self.storage.get("leverage", config.LEVERAGE_DEFAULT))
