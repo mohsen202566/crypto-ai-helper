@@ -1,4 +1,4 @@
-"""نقطه شروع ربات 30-60M با معماری واچ‌لیست جهت‌دار.
+"""نقطه شروع ربات یک‌ساعته UEM V2.0 با واچ‌لیست جهت‌دار.
 
 پنل‌ها، توبیت، مانیتور، پروفایل و دستورات مستقل از مسیر تحلیل‌اند.
 تلگرام فقط سیگنال نهایی را می‌بیند؛ رویدادهای واچ فقط در لاگ فارسی VPS ثبت می‌شوند.
@@ -89,7 +89,7 @@ class TradingBotApp:
     def send_signal_message(self, signal_data: dict, risk) -> int | None:
         side_icon = "🟢" if signal_data["side"] == "LONG" else "🔴"
         txt = (
-            f"📊 سیگنال 30-60M\n\n"
+            f"📊 سیگنال 1H UEM\n\n"
             f"#{signal_data.get('id','?')} | {signal_data['symbol_id']}\n"
             f"{side_icon} {signal_data['side']}\n"
             f"قدرت تخمینی: {signal_data['strength']}\n"
@@ -98,7 +98,7 @@ class TradingBotApp:
             f"SL: {risk.sl:.8g}\n"
             f"RR: {risk.rr}\n"
             f"سود خالص تخمینی: {risk.estimated_net_profit:.4f} USDT\n"
-            f"مدل: PIOM+MDW+DWE+IWG+LTSF | RR ثابت 1.35"
+            f"مدل: UEM V2.0 | RR ثابت 1.5"
         )
         return self.telegram.send_message(txt)
 
@@ -154,7 +154,7 @@ class TradingBotApp:
             "status": "pending" if is_real else "open",
             "is_real": is_real,
             "slot_id": slot,
-            "raw": {"reason": sig.reason, "risk_reason": risk.reason},
+            "raw": {"reason": sig.reason, "risk_reason": risk.reason, "model": getattr(sig, "model", ""), "signal_class": getattr(sig, "signal_class", ""), "direction_score": getattr(sig, "direction_score", 0.0), "origin_score": getattr(sig, "origin_score", 0.0), "continuation_score": getattr(sig, "continuation_score", 0.0), "path_score": getattr(sig, "path_score", 0.0)},
         }
         signal_id = self.storage.create_signal(data)
         data["id"] = signal_id
@@ -238,6 +238,13 @@ class TradingBotApp:
                         watch_confidence=candidate.watch_confidence,
                         conflict_score=candidate.conflict_score,
                         direction_gap=abs(candidate.long_score - candidate.short_score),
+                        model=candidate.model,
+                        signal_class=candidate.signal_class,
+                        origin_score=candidate.origin_score,
+                        organic_strength=candidate.strength_score,
+                        continuation_score=candidate.continuation_score,
+                        path_score=candidate.path_score,
+                        suggested_sl_pct=candidate.suggested_sl_pct,
                         last_price=candidate.start_price,
                         last_update=time.time(),
                     )
@@ -445,7 +452,7 @@ class TradingBotApp:
             threading.Thread(target=self.toobit_status_loop, daemon=True, name="وضعیت-توبیت"),
             threading.Thread(target=self.startup_profile_update, daemon=True, name="پروفایل-شروع"),
         ]
-        logger.info("[شروع ربات] نسخه=30-60M-PIOM-DWE-IWG | تعداد ارز=%s | فاصله اسکن=%.2f ثانیه", len(SYMBOLS), config.LIGHT_SCAN_INTERVAL_SECONDS)
+        logger.info("[شروع ربات] نسخه=1H-UEM-V2 | تعداد ارز=%s | فاصله اسکن=%.2f ثانیه", len(SYMBOLS), config.LIGHT_SCAN_INTERVAL_SECONDS)
         for thread in threads:
             thread.start()
             logger.info("[شروع بخش] نام=%s", thread.name)

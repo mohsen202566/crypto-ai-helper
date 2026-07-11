@@ -30,15 +30,15 @@ class ProfileBuilder:
         self.storage = storage
 
     def build_symbol_profile(self, sym: SymbolMap) -> dict[str, float | int]:
-        candles = self.okx.get_candles(sym.okx, bar=config.OKX_PRIMARY_BAR, limit=min(1500, config.PROFILE_LOOKBACK_DAYS * 48))
+        candles = self.okx.get_candles(sym.okx, bar=config.OKX_PRIMARY_BAR, limit=min(1500, config.PROFILE_LOOKBACK_DAYS * 24))
         ranges = [pct_range(c) for c in candles if c.get("close", 0) > 0]
         noise_median = median(ranges) if ranges else 0.0
         noise_p70 = percentile(ranges, config.NOISE_PERCENTILE)
         min_sl_pct = noise_p70 * config.NOISE_SL_MULTIPLIER if noise_p70 > 0 else 0.35
 
         favorable_moves: list[float] = []
-        # شبیه‌سازی سبک سیگنال‌های گذشته با همین روش اصلی 30-60M.
-        horizon = 8  # حدود ۴ ساعت بعد از سیگنال روی 30m
+        # شبیه‌سازی سبک سیگنال‌های گذشته با همین روش اصلی UEM یک‌ساعته.
+        horizon = 12  # حدود ۱۲ ساعت بعد از سیگنال روی 1H
         for i in range(80, max(80, len(candles) - horizon)):
             window = candles[: i + 1]
             sig = analyze_symbol(sym.id, sym.okx, sym.toobit, window)

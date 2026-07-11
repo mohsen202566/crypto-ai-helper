@@ -41,9 +41,9 @@ def estimate_net_profit(trade_usdt: float, leverage: int, tp_pct: float) -> tupl
     return net, fee + slip
 
 def build_risk_plan(signal: StrategySignal, storage: Storage) -> RiskPlan | None:
-    """ساخت TP/SL با RR ثابت 1.35.
+    """ساخت TP/SL با RR ثابت تنظیم‌شده برای UEM یک‌ساعته.
 
-    قانون مهم نسخه 30-60M:
+    قانون مهم نسخه 1H UEM:
     - TP همیشه دقیقاً بر اساس SL * RISK_REWARD محاسبه می‌شود.
     - اگر حداقل سود خالص تأمین نشود، سیگنال رد می‌شود؛ RR دستکاری نمی‌شود.
     """
@@ -62,7 +62,7 @@ def build_risk_plan(signal: StrategySignal, storage: Storage) -> RiskPlan | None
     if min_sl_pct <= 0:
         min_sl_pct = float(getattr(config, "RISK_FALLBACK_MIN_SL_PCT", 0.55))
 
-    sl_pct = max(min_sl_pct, 0.05)
+    sl_pct = max(min_sl_pct, float(getattr(signal, "suggested_sl_pct", 0.0) or 0.0), 0.05)
     tp_pct = sl_pct * float(config.RISK_REWARD)
 
     trade_usdt = float(storage.get("trade_usdt", config.TRADE_USDT_DEFAULT))
@@ -70,7 +70,7 @@ def build_risk_plan(signal: StrategySignal, storage: Storage) -> RiskPlan | None
     net, fee_est = estimate_net_profit(trade_usdt, leverage, tp_pct)
 
     tp_profile_p70 = float(profile.get("tp_p70") or 0.0)
-    # پروفایل فقط واقع‌بینانه بودن TP ثابت 1.35R را چک می‌کند؛ TP را تغییر نمی‌دهد.
+    # پروفایل فقط واقع‌بینانه بودن TP ثابت config.RISK_REWARD را چک می‌کند؛ TP را تغییر نمی‌دهد.
     profile_ok = True
     if tp_profile_p70 > 0:
         profile_ok = tp_profile_p70 >= tp_pct * 0.82
@@ -87,8 +87,8 @@ def build_risk_plan(signal: StrategySignal, storage: Storage) -> RiskPlan | None
         estimated_net_profit=net,
         fee_estimate=fee_est,
         reason=(
-            "RR ثابت 1.35 + پروفایل آماده + حداقل سود خالص"
+            "RR ثابت 1.5 + استاپ یک‌ساعته + حداقل سود خالص"
             if ok else
-            "RR ثابت 1.35 حفظ شد؛ حداقل سود خالص یا پروفایل TP کافی نبود"
+            "RR ثابت 1.5 حفظ شد؛ حداقل سود خالص یا پروفایل TP کافی نبود"
         ),
     )
