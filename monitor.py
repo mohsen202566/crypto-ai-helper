@@ -58,7 +58,7 @@ class Monitor:
                     or 0
                 )
                 net = directional * notional - estimated_cost
-                self._close(s, "EXPIRED", last_price, net, estimated_cost, mfe_r, mae_r)
+                self._close(s, "EXPIRED", last_price, net, estimated_cost, mfe_r, mae_r, close_reason="virtual_time_limit")
                 self.storage.resolve_health("virtual_timeout", s["symbol_id"])
             return
         gross = abs(float(price) - float(s["entry"])) / float(s["entry"]) * float(s["notional_usdt"])
@@ -165,7 +165,7 @@ class Monitor:
 
 
 
-    def _close(self, s: dict[str, Any], outcome: str, exit_price: float, net: float, fees: float, mfe_r: float, mae_r: float) -> None:
+    def _close(self, s: dict[str, Any], outcome: str, exit_price: float, net: float, fees: float, mfe_r: float, mae_r: float, close_reason: str | None = None) -> None:
         if not self.storage.close_signal(
             s["id"],
             outcome=outcome,
@@ -174,6 +174,7 @@ class Monitor:
             fees=fees,
             mfe_r=mfe_r,
             mae_r=mae_r,
+            close_reason=close_reason,
         ):
             return
         fresh = self.storage.get_signal(s["id"])
@@ -218,13 +219,14 @@ class Monitor:
     def _send_result_message(self, s: dict[str, Any], exp: dict[str, Any]) -> bool:
         message_id = self.telegram.send_message(self._format_result_message(s, exp), reply_to_message_id=s.get("message_id"))
         if message_id:
-            self.storage.update_signal(s["id"], result_message_sent=1, result_retry_at=0)
+            self.storage.update_signal(s["id"], result_message_sent=1, result_retry_at=0, result_claimed_at=0)
             return True
         retry_count = int(s.get("result_retry_count") or 0) + 1
         self.storage.schedule_result_retry(s["id"], retry_count)
+        self.storage.release_result_claim(s["id"])
         return False
 
     def _retry_unsent_results(self) -> None:
-        for signal in self.storage.get_unsent_closed_signals(20):
+        for signal in self.storage.claim_unsent_closed_signals(20):
             exp = self.storage.get_experience_for_signal(signal["id"]) or {"primary_cause": "UNCLASSIFIED"}
             self._send_result_message(signal, exp)

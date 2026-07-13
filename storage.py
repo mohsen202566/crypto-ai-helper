@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -13,6 +14,9 @@ import config
 class Storage:
     def __init__(self, path: str = config.DB_PATH):
         self.path = path
+        parent = os.path.dirname(os.path.abspath(path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         self.lock = threading.RLock()
         self._init()
 
@@ -42,7 +46,8 @@ class Storage:
             setup_score REAL,trigger_score REAL,final_score REAL,confidence REAL,
             model_version TEXT,raw_json TEXT,result_message_sent INTEGER DEFAULT 0,
             result_retry_count INTEGER DEFAULT 0,result_retry_at INTEGER DEFAULT 0,
-            real_open_confirmed INTEGER DEFAULT 0,real_entry REAL
+            real_open_confirmed INTEGER DEFAULT 0,real_entry REAL,
+            strategy_id TEXT,timeframe TEXT,result_claimed_at INTEGER DEFAULT 0,close_reason TEXT
         );
         CREATE TABLE IF NOT EXISTS experiences(
             id INTEGER PRIMARY KEY AUTOINCREMENT,signal_id INTEGER,symbol_id TEXT,
@@ -98,6 +103,8 @@ class Storage:
                     "result_retry_count": "INTEGER DEFAULT 0",
                     "result_retry_at": "INTEGER DEFAULT 0",
                     "real_open_confirmed": "INTEGER DEFAULT 0", "real_entry": "REAL",
+                    "strategy_id": "TEXT", "timeframe": "TEXT",
+                    "result_claimed_at": "INTEGER DEFAULT 0", "close_reason": "TEXT",
                 },
                 "experiences": {
                     "signal_id": "INTEGER", "symbol_id": "TEXT", "outcome": "TEXT",
@@ -125,6 +132,9 @@ class Storage:
             c.execute("UPDATE signals SET result_retry_count=0 WHERE result_retry_count IS NULL")
             c.execute("UPDATE signals SET result_retry_at=0 WHERE result_retry_at IS NULL")
             c.execute("UPDATE signals SET real_open_confirmed=0 WHERE real_open_confirmed IS NULL")
+            c.execute("UPDATE signals SET result_claimed_at=0 WHERE result_claimed_at IS NULL")
+            c.execute("UPDATE signals SET strategy_id='legacy' WHERE strategy_id IS NULL OR TRIM(strategy_id)=''")
+            c.execute("UPDATE signals SET timeframe='unknown' WHERE timeframe IS NULL OR TRIM(timeframe)=''")
         defaults = {
             "trading_enabled": config.TRADING_ENABLED_DEFAULT,
             "auto_signal_enabled": config.AUTO_SIGNAL_ENABLED_DEFAULT,
@@ -183,8 +193,11 @@ class Storage:
             "estimated_net_profit", "estimated_net_loss", "estimated_cost",
             "estimated_cost_win", "estimated_cost_loss", "slot_id", "direction_score",
             "strength_score", "freshness_score", "setup_score", "trigger_score",
-            "final_score", "confidence", "model_version",
+            "final_score", "confidence", "model_version", "strategy_id", "timeframe",
         ]
+        d = dict(d)
+        d.setdefault("strategy_id", config.STRATEGY_ID)
+        d.setdefault("timeframe", config.STRATEGY_TIMEFRAME)
         vals = [d.get(x) for x in cols]
         now = int(time.time())
         with self.lock, self._conn() as c:
@@ -233,15 +246,67 @@ class Storage:
             ).fetchone()
         return bool(row)
 
+    def quarantine_legacy_virtual_signals(self) -> int:
+        """Archive old virtual rows without sending expiry/result messages.
+
+        Real positions are deliberately preserved so the monitor never loses exchange risk.
+        """
+        now = int(time.time())
+        with self.lock, self._conn() as c:
+            cur = c.execute(
+                """UPDATE signals
+                   SET status='archived', outcome='MIGRATED', closed_at=COALESCE(closed_at,?),
+                       result_message_sent=1, result_claimed_at=0, close_reason='legacy_strategy_migration'
+                   WHERE is_real=0 AND status IN ('open','pending')
+                     AND (COALESCE(strategy_id,'legacy')!=? OR COALESCE(timeframe,'unknown')!=?)""",
+                (now, config.STRATEGY_ID, config.STRATEGY_TIMEFRAME),
+            )
+            return int(cur.rowcount)
+
     def get_open_signals(self) -> list[dict[str, Any]]:
         with self._conn() as c:
-            return [dict(x) for x in c.execute("SELECT * FROM signals WHERE status IN ('open','pending') ORDER BY id")]
+            return [dict(x) for x in c.execute(
+                """SELECT * FROM signals
+                   WHERE status IN ('open','pending')
+                     AND (is_real=1 OR (strategy_id=? AND timeframe=?))
+                   ORDER BY id""",
+                (config.STRATEGY_ID, config.STRATEGY_TIMEFRAME),
+            )]
+
+    def claim_unsent_closed_signals(self, limit: int = 50) -> list[dict[str, Any]]:
+        now = int(time.time())
+        stale_before = now - int(config.RESULT_CLAIM_TIMEOUT_SECONDS)
+        with self.lock, self._conn() as c:
+            rows = [dict(x) for x in c.execute(
+                """SELECT * FROM signals
+                   WHERE status='closed' AND result_message_sent=0
+                     AND COALESCE(result_retry_at,0)<=?
+                     AND COALESCE(result_claimed_at,0)<=?
+                     AND strategy_id=? AND timeframe=?
+                     AND COALESCE(outcome,'') NOT IN ('MIGRATED','ARCHIVED')
+                   ORDER BY id LIMIT ?""",
+                (now, stale_before, config.STRATEGY_ID, config.STRATEGY_TIMEFRAME, max(1, int(limit))),
+            )]
+            if not rows:
+                return []
+            ids = [int(r['id']) for r in rows]
+            q = ','.join('?' for _ in ids)
+            c.execute(f"UPDATE signals SET result_claimed_at=? WHERE id IN ({q})", [now, *ids])
+            for r in rows:
+                r['result_claimed_at'] = now
+            return rows
+
+    def release_result_claim(self, signal_id: int) -> None:
+        self.update_signal(signal_id, result_claimed_at=0)
 
     def get_unsent_closed_signals(self, limit: int = 50) -> list[dict[str, Any]]:
+        # Backward-compatible read-only helper. Retry worker should use claim_unsent_closed_signals.
         with self._conn() as c:
             return [dict(x) for x in c.execute(
-                "SELECT * FROM signals WHERE status='closed' AND result_message_sent=0 AND COALESCE(result_retry_at,0)<=? ORDER BY id LIMIT ?",
-                (int(time.time()), max(1, int(limit))),
+                """SELECT * FROM signals WHERE status='closed' AND result_message_sent=0
+                   AND COALESCE(result_retry_at,0)<=? AND strategy_id=? AND timeframe=?
+                   ORDER BY id LIMIT ?""",
+                (int(time.time()), config.STRATEGY_ID, config.STRATEGY_TIMEFRAME, max(1, int(limit))),
             )]
 
     def schedule_result_retry(self, signal_id: int, retry_count: int) -> None:
@@ -254,7 +319,7 @@ class Storage:
 
     def close_signal(self, signal_id: int, **result: Any) -> bool:
         self.ensure_daily_profit()
-        allowed = {"outcome", "exit_price", "net_pnl", "fees", "slippage", "mfe_r", "mae_r"}
+        allowed = {"outcome", "exit_price", "net_pnl", "fees", "slippage", "mfe_r", "mae_r", "close_reason"}
         unknown = set(result) - allowed
         if unknown:
             raise ValueError(f"Unknown close fields: {sorted(unknown)}")
@@ -262,7 +327,7 @@ class Storage:
             row = c.execute("SELECT status FROM signals WHERE id=?", (signal_id,)).fetchone()
             if not row or row["status"] == "closed":
                 return False
-            result.update(status="closed", closed_at=int(time.time()))
+            result.update(status="closed", closed_at=int(time.time()), result_message_sent=0, result_claimed_at=0)
             cur = c.execute(
                 "UPDATE signals SET " + ",".join(f"{k}=?" for k in result) + " WHERE id=? AND status!='closed'",
                 list(result.values()) + [signal_id],

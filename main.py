@@ -36,6 +36,9 @@ log = logging.getLogger("adaptive_scalper")
 class App:
     def __init__(self):
         self.storage = Storage()
+        archived = self.storage.quarantine_legacy_virtual_signals()
+        if archived:
+            log.warning("مهاجرت دیتابیس | %s معامله مجازی قدیمی آرشیو شد و اعلان نخواهد شد", archived)
         self.health = HealthManager(self.storage)
         self.okx = OKXClient()
         self.toobit = ToobitFuturesClient()
@@ -57,6 +60,7 @@ class App:
         self.active_watches: dict[str, dict[str, Any]] = {}
         self.last_publish_failure: dict[str, float] = {}
         self.watch_lock = threading.RLock()
+        self.watch_log_state: dict[str, tuple[str, float]] = {}
 
     def _open_exists(self, symbol_id: str) -> bool:
         return any(x["symbol_id"] == symbol_id for x in self.storage.get_open_signals())
@@ -83,6 +87,7 @@ class App:
             "setup_score": setup.score, "trigger_score": watch.trigger_score,
             "final_score": decision.final_score, "confidence": decision.confidence,
             "model_version": self.profiles.get(sym.id).version,
+            "strategy_id": config.STRATEGY_ID, "timeframe": config.STRATEGY_TIMEFRAME,
             "raw": {"setup_id": setup.setup_id, "reasons": market.reasons + setup.reasons, "contradictions": decision.contradictions},
         }
         signal_id = self.storage.create_signal(data)
@@ -238,6 +243,7 @@ class App:
                 if watch.state in {"EXPIRED", "INVALIDATED"}:
                     with self.watch_lock:
                         self.active_watches.pop(symbol_id, None)
+                    self.watch_log_state.pop(symbol_id, None)
                     if config.LOG_WATCH_DETAILS:
                         log.info(
                             "واچ | ارز=%s | نتیجه=رد و حذف | حالت=%s | علت=%s | قیمت=%.8g | Trigger=%.8g | Invalidation=%.8g",
@@ -249,19 +255,19 @@ class App:
                 decision = self.decision.decide(market, candidate, watch)
                 if not decision.allowed:
                     if config.LOG_WATCH_DETAILS:
-                        log.info(
-                            "واچ | ارز=%s | نتیجه=انتظار | مرحله=%s | علت=%s | قیمت=%s | عبور=%s | پیشروی=%s | پذیرش=%s | فشار=%s | مومنتوم=%s | کندل=%s | جذب=%s | LateATR=%.3f",
-                            symbol_id, candidate.meta.get("scenario_state"), decision.primary_reason,
-                            f"{watch.entry_price:.8g}" if watch.entry_price else "نامعتبر",
-                            "بله" if watch.meta.get("price_ok") else "خیر",
-                            "بله" if watch.meta.get("progress_ok") else "خیر",
-                            "بله" if watch.meta.get("acceptance_ok") else "خیر",
-                            "بله" if watch.meta.get("pressure_ok") else "خیر",
-                            "بله" if watch.meta.get("momentum_ok") else "خیر",
-                            "بله" if watch.meta.get("candle_ok") else "خیر",
-                            "بله" if watch.meta.get("absorption") else "خیر",
-                            float(watch.meta.get("late_atr") or 0),
-                        )
+                        def yn(key):
+                            return "ناموجود" if not watch.meta.get("data_ok", True) else ("بله" if watch.meta.get(key) else "خیر")
+                        sig = "|".join(str(x) for x in (decision.primary_reason, watch.meta.get("price_ok"), watch.meta.get("progress_ok"), watch.meta.get("acceptance_ok"), watch.meta.get("pressure_ok"), watch.meta.get("momentum_ok"), watch.meta.get("candle_ok")))
+                        prev_sig, prev_ts = self.watch_log_state.get(symbol_id, ("", 0.0))
+                        if sig != prev_sig or time.time() - prev_ts >= config.WATCH_LOG_HEARTBEAT_SECONDS:
+                            log.info(
+                                "واچ | ارز=%s | نتیجه=انتظار | مرحله=%s | علت=%s | قیمت=%.8g | Trigger=%.8g | فاصلهATR=%.3f | لمس=%s | عبور=%s | پیشروی=%s | پذیرش=%s | فشار=%s | مومنتوم=%s | کندل=%s | جذب=%s | RSI=%.1f | Hist=%.6g | Body=%.2f",
+                                symbol_id, candidate.meta.get("scenario_state"), decision.primary_reason,
+                                float(watch.entry_price or 0), float(watch.meta.get("trigger") or candidate.trigger_price),
+                                float(watch.meta.get("progress_atr") or 0), yn("touch_ok"), yn("price_ok"), yn("progress_ok"), yn("acceptance_ok"), yn("pressure_ok"), yn("momentum_ok"), yn("candle_ok"), yn("absorption"),
+                                float(watch.meta.get("rsi") or 0), float(watch.meta.get("macd_hist") or 0), float(watch.meta.get("body_ratio") or 0),
+                            )
+                            self.watch_log_state[symbol_id] = (sig, time.time())
                     continue
 
                 trade_usdt = float(self.storage.get("trade_usdt", config.TRADE_USDT_DEFAULT))
@@ -292,6 +298,7 @@ class App:
                 self._publish(sym, market, candidate, watch, decision, risk)
                 with self.watch_lock:
                     self.active_watches.pop(symbol_id, None)
+                self.watch_log_state.pop(symbol_id, None)
                 published += 1
             except Exception as exc:
                 self.storage.add_health_event("watch", "warning", str(exc), symbol_id)
