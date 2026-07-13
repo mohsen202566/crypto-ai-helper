@@ -92,8 +92,7 @@ class TelegramPanel:
         rows = [row for row in (data.get("result") or []) if isinstance(row, dict)]
         newest = max((int(row.get("update_id") or 0) for row in rows), default=0)
         if newest > 0:
-            self.offset = newest
-            self.storage.set("telegram_offset", newest)
+            self.offset = max(self.offset, self.storage.advance_telegram_offset(newest))
         self.storage.set("telegram_updates_initialized", True)
         self.updates_initialized = True
         self.needs_backlog_sync = False
@@ -123,9 +122,11 @@ class TelegramPanel:
                 update_id = int(update.get("update_id") or 0)
                 if update_id <= 0:
                     continue
-                self.offset = max(self.offset, update_id)
+                # Acknowledge every seen update first, including duplicates. The
+                # duplicate claim is independent from the Telegram polling offset.
+                self.offset = max(self.offset, self.storage.advance_telegram_offset(update_id))
                 if not self.storage.claim_telegram_update(update_id):
-                    logger.info("[TELEGRAM_DUPLICATE_SKIPPED] update_id=%d", update_id)
+                    logger.info("[TELEGRAM_DUPLICATE_SKIPPED] update_id=%d offset=%d", update_id, self.offset)
                     continue
                 message = update.get("message") or {}
                 if str((message.get("chat") or {}).get("id") or "") != str(self.chat_id):

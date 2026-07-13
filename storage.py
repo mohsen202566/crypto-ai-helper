@@ -169,6 +169,12 @@ class Storage:
                 );
                 CREATE INDEX IF NOT EXISTS idx_learning_reviews_open
                     ON learning_reviews(finalized,symbol_id,expires_at);
+                CREATE TABLE IF NOT EXISTS telegram_updates(
+                    update_id INTEGER PRIMARY KEY,
+                    claimed_at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_telegram_updates_claimed_at
+                    ON telegram_updates(claimed_at);
                 CREATE TABLE IF NOT EXISTS health_events(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     component TEXT NOT NULL,
@@ -233,16 +239,16 @@ class Storage:
                 (key, json.dumps(value, ensure_ascii=False), int(time.time())),
             )
 
-    def claim_telegram_update(self, update_id: int) -> bool:
-        """Atomically claim one Telegram update across all bot processes sharing this DB.
+    def advance_telegram_offset(self, update_id: int) -> int:
+        """Persist a monotonically increasing Telegram offset.
 
-        Returning False means the update was already processed (or claimed) by another
-        process. Persisting the claim before command handling prevents duplicate panel
-        replies after restarts or overlapping service instances.
+        This is intentionally separate from duplicate claiming. Even an update
+        already claimed by another process must advance the local/global offset,
+        otherwise getUpdates can return the same item forever.
         """
         update_id = int(update_id or 0)
         if update_id <= 0:
-            return False
+            return int(self.get("telegram_offset", 0) or 0)
         now = int(time.time())
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -254,15 +260,38 @@ class Storage:
                         current = int(json.loads(str(row["value"])))
                     except (TypeError, ValueError, json.JSONDecodeError):
                         current = 0
-                if update_id <= current:
-                    db.execute("ROLLBACK")
-                    return False
+                final = max(current, update_id)
                 db.execute(
                     "INSERT OR REPLACE INTO kv(key,value,updated_at) VALUES(?,?,?)",
-                    ("telegram_offset", json.dumps(update_id), now),
+                    ("telegram_offset", json.dumps(final), now),
                 )
                 db.execute("COMMIT")
-                return True
+                return final
+            except Exception:
+                db.execute("ROLLBACK")
+                raise
+
+    def claim_telegram_update(self, update_id: int) -> bool:
+        """Atomically claim an update without coupling the claim to the offset."""
+        update_id = int(update_id or 0)
+        if update_id <= 0:
+            return False
+        now = int(time.time())
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = db.execute(
+                    "INSERT OR IGNORE INTO telegram_updates(update_id,claimed_at) VALUES(?,?)",
+                    (update_id, now),
+                )
+                claimed = int(cursor.rowcount or 0) == 1
+                if claimed and update_id % 100 == 0:
+                    db.execute(
+                        "DELETE FROM telegram_updates WHERE claimed_at < ?",
+                        (now - 30 * 24 * 3600,),
+                    )
+                db.execute("COMMIT")
+                return claimed
             except Exception:
                 db.execute("ROLLBACK")
                 raise
