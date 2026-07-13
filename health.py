@@ -1,33 +1,50 @@
-"""گزارش سلامت اجزای ربات."""
 from __future__ import annotations
+
 import time
-from storage import Storage
+
 
 class HealthManager:
-    def __init__(self, storage: Storage):
+    EXPECTED_MAX_AGE = {
+        "scan": 180,
+        "watch": 30,
+        "monitor": 30,
+        "telegram": 30,
+        "toobit": 60,
+        "learning": 7200,
+    }
+
+    def __init__(self, storage):
         self.storage = storage
-        self.marks: dict[str, int] = {}
-    def mark(self, name: str) -> None:
-        self.marks[name] = int(time.time())
-    @staticmethod
-    def age(ts: int) -> str:
-        if not ts:
-            return "هنوز ثبت نشده"
-        sec = max(0, int(time.time()) - ts)
-        return f"{sec} ثانیه قبل" if sec < 60 else f"{sec//60} دقیقه قبل"
+
+    def mark(self, component: str, symbol_id: str | None = None) -> None:
+        self.storage.set(f"health_{component}_ts", int(time.time()))
+
     def report(self) -> str:
         events = self.storage.active_health_events()
-        connected = bool(self.storage.get("toobit_connected", False))
-        status = "✅ سالم" if connected and not events else "⚠️ هشدار"
-        lines = ["🩺 سلامت ربات 5m رفتارمحور", "", f"وضعیت کلی: {status}",
-                 f"OKX Data: {self.age(self.marks.get('okx',0))}",
-                 f"Toobit: {'✅ وصل' if connected else '❌ قطع/خطا'} | {self.age(int(self.storage.get('toobit_last_update',0) or 0))}",
-                 f"Signal Engine: {self.age(self.marks.get('signal',0))}",
-                 f"Monitoring: {self.age(self.marks.get('monitor',0))}",
-                 f"Telegram: {self.age(self.marks.get('telegram',0))}"]
-        black = self.storage.blacklist_rows()
-        if black:
-            lines += ["", f"بلک‌لیست موقت: {len(black)} ارز"]
-        if events:
-            lines += ["", "🚨 خطاهای فعال:"] + [f"{e['severity']} | {e['component']} | {e.get('symbol_id') or '-'} | {e['message']}" for e in events[:8]]
+        labels = (
+            ("scan", "اسکن"),
+            ("watch", "واچ"),
+            ("monitor", "مانیتور"),
+            ("telegram", "تلگرام"),
+            ("toobit", "توبیت"),
+            ("learning", "یادگیری"),
+        )
+        lines = ["🩺 پنل سلامت", ""]
+        now = int(time.time())
+        for component, label in labels:
+            ts = int(self.storage.get(f"health_{component}_ts", 0) or 0)
+            if not ts:
+                lines.append(f"{label}: ⚠️ هنوز ثبت نشده")
+                continue
+            age = max(0, now - ts)
+            max_age = self.EXPECTED_MAX_AGE.get(component, 120)
+            icon = "✅" if age <= max_age else "⚠️"
+            state = "فعال" if age <= max_age else "قدیمی/متوقف"
+            lines.append(f"{label}: {icon} {state} | {age} ثانیه قبل")
+        if not events:
+            lines.extend(["", "✅ مشکل فعالی ثبت نشده."])
+        else:
+            lines.extend(["", "🚨 مشکلات فعال:"])
+            for event in events[:10]:
+                lines.append(f"{event['severity']} | {event['component']} | {event.get('symbol_id') or '-'} | {event['message']}")
         return "\n".join(lines)

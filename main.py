@@ -1,269 +1,375 @@
-"""نقطه شروع ربات رفتارمحور پنج‌دقیقه‌ای؛ بدون Watch."""
 from __future__ import annotations
 
 import logging
+import sys
 import threading
 import time
+from typing import Any
 
 import config
+from adaptive_engine import AdaptiveEngine
+from decision_engine import DecisionEngine
+from execution_engine import ExecutionEngine
+from experience_engine import ExperienceEngine
 from health import HealthManager
-from market_engine import analyze_market_diagnostic
-from models import BehaviorState, MarketSignal, RiskPlan
+from learning_engine import LearningEngine
+from market_engine import MarketEngine
 from monitor import Monitor
 from okx_client import OKXClient
-from reject_logger import RejectLogger, configure_application_logging
-from risk_engine import build_risk_plan_diagnostic
+from profiles import Profiles
+from risk_engine import RiskEngine
+from setup_engine import SetupEngine
 from storage import Storage
-from symbols import SYMBOLS, SymbolMap
+from symbols import SYMBOLS
 from telegram_bot import TelegramBot
 from toobit_client import ToobitFuturesClient
+from watch_engine import WatchEngine
 
-configure_application_logging()
-logger = logging.getLogger("uem_5m")
+logging.basicConfig(
+    level=getattr(logging, config.LOG_LEVEL.upper(), logging.INFO),
+    format="%(asctime)s | %(levelname)s | %(threadName)s | %(message)s",
+    stream=sys.stdout,
+)
+log = logging.getLogger("adaptive_scalper")
 
 
-class TradingBotApp:
-    def __init__(self) -> None:
+class App:
+    def __init__(self):
         self.storage = Storage()
         self.health = HealthManager(self.storage)
         self.okx = OKXClient()
         self.toobit = ToobitFuturesClient()
         self.telegram = TelegramBot(self.storage, self.health)
-        self.monitor = Monitor(self.okx, self.toobit, self.storage, self.telegram, self.health)
-        self.rejects = RejectLogger()
-        self.stop_event = threading.Event()
-        self.states: dict[str, BehaviorState] = {s.id: BehaviorState(s.id) for s in SYMBOLS}
+        self.profiles = Profiles(self.storage)
+        self.market = MarketEngine()
+        self.setup = SetupEngine()
+        self.watch = WatchEngine()
+        self.decision = DecisionEngine()
+        self.risk = RiskEngine()
+        self.toobit_lock = threading.RLock()
+        self.execution = ExecutionEngine(self.storage, self.toobit, self.okx, self.health, self.toobit_lock)
+        self.experience = ExperienceEngine()
+        self.learning = LearningEngine(self.storage)
+        self.adaptive = AdaptiveEngine(self.storage, self.profiles)
+        self.monitor = Monitor(self.okx, self.toobit, self.storage, self.telegram, self.experience, self.toobit_lock)
+        self.stop = threading.Event()
+        self.last_signal: dict[str, float] = {}
+        self.active_watches: dict[str, dict[str, Any]] = {}
+        self.last_publish_failure: dict[str, float] = {}
+        self.watch_lock = threading.RLock()
 
-    def _reject(self, stage: str, symbol_id: str, reason: str, metrics: dict | None = None, *, force: bool = False) -> None:
-        self.rejects.write(stage, symbol_id, reason, metrics, force=force)
-        detail = " | ".join(f"{k}={v}" for k, v in sorted((metrics or {}).items()))
-        logger.info("رد | مرحله=%s | ارز=%s | علت=%s%s", stage, symbol_id, reason, f" | {detail}" if detail else "")
+    def _open_exists(self, symbol_id: str) -> bool:
+        return any(x["symbol_id"] == symbol_id for x in self.storage.get_open_signals())
 
-    def _eligibility(self, sym: SymbolMap) -> tuple[bool, str, dict]:
-        if self.storage.is_blacklisted(sym.id):
-            return False, "ارز به‌دلیل خطای داده در بلک‌لیست موقت است", {}
-        open_rows = self.storage.get_open_signals()
-        blocking = [x for x in open_rows if x["symbol_id"] == sym.id]
-        if blocking:
-            return False, "برای این ارز سیگنال باز یا Pending وجود دارد", {
-                "blocking_signal_ids": [int(x["id"]) for x in blocking],
-                "statuses": [str(x["status"]) for x in blocking],
-            }
-        return True, "مجاز", {}
+    @staticmethod
+    def _setup_fa(value: str) -> str:
+        return {
+            "PULLBACK_CONTINUATION": "پولبک ادامه روند",
+            "COMPRESSION_BREAKOUT": "شکست فشردگی",
+            "STRUCTURE_BREAK_RETEST": "شکست ساختار و ریتست",
+        }.get(value, value)
 
-    def _reserve_real_slot(self) -> int | None:
-        max_pos = int(self.storage.get("max_positions", config.MAX_POSITIONS_DEFAULT))
-        count = self.storage.count_real_open()
-        return count + 1 if count < max_pos else None
-
-    def _signal_message(self, signal_id: int, sig: MarketSignal, risk: RiskPlan, mode: str, trade_usdt: float, leverage: int) -> str:
-        icon = "🟢" if sig.side == "LONG" else "🔴"
-        return (
-            f"📊 سیگنال رفتارمحور 5m\n\n#{signal_id} | {sig.symbol_id}\n"
-            f"{icon} {sig.side} | {'واقعی' if mode == 'real' else 'عادی'}\n"
-            f"قدرت: {sig.strength}\nEntry: {risk.entry:.8g}\nTP: {risk.tp:.8g}\nSL: {risk.sl:.8g}\n"
-            f"RR خالص: {risk.rr_net:.3f}\nدلار: {trade_usdt:g} | لوریج: {leverage}x | "
-            f"ارزش پوزیشن: {risk.notional:.4f} USDT\n"
-            f"سود ناخالص تخمینی TP: {risk.estimated_tp_gross:.4f} USDT\n"
-            f"سود خالص تخمینی TP: {risk.estimated_tp_net:.4f} USDT\n"
-            f"زیان خالص تخمینی SL: {risk.estimated_sl_net_loss:.4f} USDT\n"
-            f"جهت: {sig.direction_reason}\nقدرت: {sig.strength_reason}\nورود: {sig.entry_reason}\n"
-            f"TP/SL: {risk.reason}"
-        )
-
-    def publish_signal(self, sig: MarketSignal) -> bool:
-        trade_usdt = float(self.storage.get("trade_usdt", config.TRADE_USDT_DEFAULT))
-        leverage = int(self.storage.get("leverage", config.LEVERAGE_DEFAULT))
-        risk, reject_reason, metrics = build_risk_plan_diagnostic(sig, trade_usdt, leverage)
-        if not risk:
-            self._reject("risk", sig.symbol_id, reject_reason, metrics, force=True)
-            return False
-
-        trading = bool(self.storage.get("trading_enabled", False))
-        auto = bool(self.storage.get("auto_signal_enabled", True))
-        connected = bool(self.storage.get("toobit_connected", False))
-        slot = self._reserve_real_slot() if trading and auto and connected else None
-        is_real = slot is not None
-        mode = "real" if is_real else "virtual"
-        data = {
-            "symbol_id": sig.symbol_id,
-            "okx_symbol": sig.okx_symbol,
-            "toobit_symbol": sig.toobit_symbol,
-            "side": sig.side,
-            "strength": sig.strength,
-            "entry": risk.entry,
-            "tp": risk.tp,
-            "sl": risk.sl,
-            "rr": risk.rr_net,
-            "trade_mode": mode,
-            "status": "pending" if is_real else "open",
-            "is_real": is_real,
-            "slot_id": slot,
-            "message_id": None,
-            "created_at": int(time.time()),
-            "opened_at": None,
-            "entry_real": None,
-            "trade_usdt": trade_usdt,
-            "leverage": leverage,
-            "notional": risk.notional,
-            "order_id": None,
-            "raw": {
-                "direction": sig.direction_reason,
-                "strength": sig.strength_reason,
-                "entry": sig.entry_reason,
-                "risk": risk.reason,
-            },
+    def _publish(self, sym, market, setup, watch, decision, risk) -> None:
+        data: dict[str, Any] = {
+            "symbol_id": sym.id, "okx_symbol": sym.okx, "toobit_symbol": sym.toobit,
+            "side": setup.side, "setup_type": setup.setup_type, "trade_mode": "virtual",
+            "is_real": 0, "status": "open", "entry": risk.entry, "tp": risk.tp, "sl": risk.sl,
+            "gross_rr": risk.gross_rr, "net_rr": risk.net_rr, "trade_usdt": risk.trade_usdt,
+            "leverage": risk.leverage, "notional_usdt": risk.notional_usdt,
+            "estimated_net_profit": risk.estimated_net_profit, "estimated_net_loss": risk.estimated_net_loss,
+            "estimated_cost": risk.estimated_cost_win, "estimated_cost_win": risk.estimated_cost_win,
+            "estimated_cost_loss": risk.estimated_cost_loss, "direction_score": market.direction_score,
+            "strength_score": market.strength_score, "freshness_score": market.freshness_score,
+            "setup_score": setup.score, "trigger_score": watch.trigger_score,
+            "final_score": decision.final_score, "confidence": decision.confidence,
+            "model_version": self.profiles.get(sym.id).version,
+            "raw": {"setup_id": setup.setup_id, "reasons": market.reasons + setup.reasons, "contradictions": decision.contradictions},
         }
         signal_id = self.storage.create_signal(data)
-        msg_id = self.telegram.send_message(self._signal_message(signal_id, sig, risk, mode, trade_usdt, leverage))
-        if msg_id:
-            self.storage.update_signal(signal_id, message_id=msg_id)
-
-        if is_real:
-            try:
-                result = self.toobit.open_futures_position_with_tpsl(
-                    sig.toobit_symbol,
-                    sig.side,
-                    trade_usdt,
-                    leverage,
-                    risk.entry,
-                    risk.tp,
-                    risk.sl,
-                    f"uem5m_{signal_id}_{int(time.time())}",
-                )
-                self.storage.update_signal(signal_id, order_id=result.get("order_id"))
-                threading.Thread(
-                    target=self._check_pending_real,
-                    args=(signal_id,),
-                    daemon=True,
-                    name=f"real-check-{sig.symbol_id}",
-                ).start()
-            except Exception as exc:
-                self.storage.update_signal(
-                    signal_id,
-                    status="open",
-                    is_real=0,
-                    trade_mode="virtual",
-                    slot_id=None,
-                    close_reason="REAL_OPEN_FAILED_TO_VIRTUAL",
-                )
-                self.storage.add_health_event("toobit_order", "warning", str(exc), sig.symbol_id)
-                self.telegram.send_message(
-                    f"⚠️ سفارش واقعی سیگنال #{signal_id} باز نشد و همان سیگنال به حالت عادی منتقل شد.\nخطا: {exc}",
-                    reply_to_message_id=msg_id,
-                )
-                logger.exception("بازکردن سفارش واقعی ناموفق | signal=%s symbol=%s", signal_id, sig.symbol_id)
-
-        logger.info("سیگنال | id=%s | ارز=%s | جهت=%s | حالت=%s", signal_id, sig.symbol_id, sig.side, mode)
-        return True
-
-    def _check_pending_real(self, signal_id: int) -> None:
-        time.sleep(config.ORDER_OPEN_CHECK_SECONDS)
-        try:
-            state = self.monitor.reconcile_pending_real(signal_id)
-            sig = self.storage.get_signal(signal_id) or {}
-            message_id = sig.get("message_id")
-            if state == "opened":
-                self.telegram.send_message(f"✅ پوزیشن واقعی سیگنال #{signal_id} در توبیت تأیید شد.", reply_to_message_id=message_id)
-            elif state == "not_found":
-                self.storage.add_health_event(
-                    "toobit_position",
-                    "warning",
-                    "نه پوزیشن باز و نه نتیجه قطعی پیدا شد؛ وضعیت Pending و بررسی ادامه دارد",
-                    sig.get("symbol_id"),
-                )
-                self.telegram.send_message(
-                    f"⚠️ وضعیت سفارش واقعی #{signal_id} هنوز قطعی نیست؛ بررسی توبیت ادامه دارد.",
-                    reply_to_message_id=message_id,
-                )
-        except Exception as exc:
-            sig = self.storage.get_signal(signal_id) or {}
-            self.storage.add_health_event("toobit_position", "warning", f"pending check failed: {exc}", sig.get("symbol_id"))
-            logger.exception("بررسی سفارش Pending ناموفق | signal=%s", signal_id)
+        side_icon = "🟢" if setup.side == "LONG" else "🔴"
+        trading_enabled = bool(self.storage.get("trading_enabled", False))
+        execution_line = "اجرای واقعی: در حال بررسی" if trading_enabled else "اجرای واقعی: ترید خاموش است"
+        text = (
+            f"📊 سیگنال 5M\n\n#{signal_id} | {sym.id}\n"
+            f"{side_icon} {setup.side} | مجازی مرجع\n\n"
+            f"سناریو: {self._setup_fa(setup.setup_type)}\n"
+            f"فعال‌سازی: {watch.reason}\nاطمینان تشخیصی: {decision.confidence:.0f}٪\n\n"
+            f"Entry: {risk.entry:.8g}\nTP: {risk.tp:.8g}\nSL: {risk.sl:.8g}\n\n"
+            f"Net RR: {risk.net_rr:.2f}\nسود خالص تخمینی: {risk.estimated_net_profit:.4f} USDT\n"
+            f"زیان خالص تخمینی: {risk.estimated_net_loss:.4f} USDT\n{execution_line}\nمدل: {data['model_version']}"
+        )
+        message_id = self.telegram.send_message(text)
+        self.storage.update_signal(signal_id, message_id=message_id)
+        if not message_id:
+            self.storage.update_signal(signal_id, status="publish_failed")
+            self.storage.add_health_event("signal_publish", "critical", "ارسال سیگنال تلگرام ناموفق بود؛ سیگنال وارد مانیتور و اجرای واقعی نشد", sym.id)
+            self.last_publish_failure[sym.id] = time.time()
+            return
+        execution = self.execution.execute(sym, signal_id, setup.side, risk)
+        if execution["status"] == "REAL_PENDING":
+            self.storage.update_signal(signal_id, trade_mode="real", is_real=1, status="pending")
+            self.telegram.send_message("✅ اجرای واقعی در توبیت ارسال شد | Isolated", reply_to_message_id=message_id)
+        elif trading_enabled:
+            self.telegram.send_message(f"⚠️ اجرای واقعی انجام نشد: {execution.get('reason', 'نامشخص')}", reply_to_message_id=message_id)
+        self.last_signal[sym.id] = time.time()
 
     def scan_once(self) -> None:
+        """اسکن کندلی 5M/15M برای ساخت یا تازه‌سازی واچ‌ها.
+
+        تریگر 1M در حلقه جداگانه و سریع‌تر بررسی می‌شود تا اسکن 60 ثانیه‌ای
+        باعث ورود دیرهنگام نشود.
+        """
+        started = time.time()
+        auto_signal_enabled = bool(self.storage.get("auto_signal_enabled", True))
+        if not auto_signal_enabled:
+            with self.watch_lock:
+                self.active_watches.clear()
+
         for sym in SYMBOLS:
-            if self.stop_event.is_set():
-                return
-            eligible, reason, eligibility_metrics = self._eligibility(sym)
-            if not eligible:
-                self._reject("eligibility", sym.id, reason, eligibility_metrics)
-                continue
             try:
-                candles = self.okx.get_candles(sym.okx, bar=config.OKX_PRIMARY_BAR, limit=config.OKX_CANDLE_LIMIT)
-                snapshot = self.okx.get_micro_snapshot(sym.okx)
-                signal, reject_reason, metrics = analyze_market_diagnostic(sym, candles, snapshot, self.states[sym.id])
-                self.health.mark("okx")
-                if signal:
-                    self.publish_signal(signal)
-                else:
-                    self._reject("behavior", sym.id, reject_reason, metrics)
-                self.storage.clear_health_component("okx", sym.id)
+                if self._open_exists(sym.id):
+                    with self.watch_lock:
+                        self.active_watches.pop(sym.id, None)
+                    if config.LOG_SCAN_DETAILS:
+                        log.info("اسکن | ارز=%s | نتیجه=رد | علت=پوزیشن یا سیگنال باز دارد", sym.id)
+                    continue
+                if (time.time() - self.last_signal.get(sym.id, 0) < config.SIGNAL_COOLDOWN_SECONDS_PER_SYMBOL
+                        or time.time() - self.last_publish_failure.get(sym.id, 0) < config.SIGNAL_PUBLISH_RETRY_COOLDOWN_SECONDS
+                        or self.storage.has_recent_signal(sym.id, config.SIGNAL_COOLDOWN_SECONDS_PER_SYMBOL)):
+                    with self.watch_lock:
+                        self.active_watches.pop(sym.id, None)
+                    if config.LOG_SCAN_DETAILS:
+                        log.info("اسکن | ارز=%s | نتیجه=رد | علت=Cooldown سیگنال یا شکست ارسال فعال است", sym.id)
+                    continue
+
+                c5 = self.okx.get_candles(sym.okx, bar=config.OKX_BAR, limit=300)
+                c15 = self.okx.get_candles(sym.okx, bar=config.OKX_CONTEXT_BAR, limit=200)
+                market = self.market.analyze(sym.id, c5, c15)
+                self.storage.resolve_health("scan", sym.id)
+
+                if market.primary_direction in {"LONG", "SHORT"} and self.storage.has_recent_stop(
+                    sym.id, market.primary_direction, config.SCENARIO_REENTRY_AFTER_SL_SECONDS
+                ):
+                    with self.watch_lock:
+                        self.active_watches.pop(sym.id, None)
+                    if config.LOG_SCAN_DETAILS:
+                        log.info("اسکن | ارز=%s | نتیجه=رد | علت=سناریوی هم‌جهت اخیراً SL خورده؛ ساختار تازه لازم است", sym.id)
+                    continue
+
+                with self.watch_lock:
+                    existing = self.active_watches.get(sym.id)
+
+                if existing is not None:
+                    candidate = existing["setup"]
+                    # If the market direction changes or becomes unsafe, discard the stale watch.
+                    if market.hard_veto or market.primary_direction != candidate.side or int(time.time()) > candidate.expires_at:
+                        if market.hard_veto:
+                            stale_reason = "Hard Veto جدید بازار"
+                        elif market.primary_direction != candidate.side:
+                            stale_reason = f"تغییر جهت بازار از {candidate.side} به {market.primary_direction}"
+                        else:
+                            stale_reason = "انقضای واچ"
+                        with self.watch_lock:
+                            self.active_watches.pop(sym.id, None)
+                        if config.LOG_SCAN_DETAILS:
+                            log.info("اسکن | ارز=%s | نتیجه=حذف واچ | علت=%s", sym.id, stale_reason)
+                        continue
+                    with self.watch_lock:
+                        self.active_watches[sym.id]["market"] = market
+                    if config.LOG_SCAN_DETAILS:
+                        log.info(
+                            "اسکن | ارز=%s | نتیجه=ادامه واچ | سناریو=%s | سمت=%s | مرحله=%s | زمان‌مانده=%ss",
+                            sym.id, self._setup_fa(candidate.setup_type), candidate.side, candidate.meta.get("scenario_state"),
+                            max(0, candidate.expires_at-int(time.time())),
+                        )
+                    continue
+
+                if not auto_signal_enabled:
+                    continue
+                candidate, setup_reason, setup_details = self.setup.detect_with_reason(market, c5)
+                if candidate is None:
+                    if config.LOG_SCAN_DETAILS:
+                        log.info(
+                            "اسکن | ارز=%s | نتیجه=رد | علت=%s | زمینه=%s | رژیم=%s",
+                            sym.id, setup_reason, market.primary_direction, market.regime,
+                        )
+                    continue
+                with self.watch_lock:
+                    self.active_watches[sym.id] = {"symbol": sym, "market": market, "setup": candidate}
+                if config.LOG_SCAN_DETAILS:
+                    log.info(
+                        "اسکن | ارز=%s | نتیجه=واچ | سناریو=%s | سمت=%s | مرحله=%s | Trigger=%.8g | Invalidation=%.8g | انقضا=%ss",
+                        sym.id, self._setup_fa(candidate.setup_type), candidate.side, candidate.meta.get("scenario_state"),
+                        candidate.trigger_price, candidate.invalidation_price, max(0, candidate.expires_at-int(time.time())),
+                    )
             except Exception as exc:
-                message = str(exc)
-                self._reject("data-error", sym.id, message, {}, force=True)
-                logger.exception("خطای اسکن | ارز=%s", sym.id)
-                global_error = any(x in message.lower() for x in ("connection", "timeout", "http 5"))
-                if global_error:
-                    self.storage.add_health_event("okx", "warning", message)
-                else:
-                    self.storage.blacklist(sym.id, message, config.SYMBOL_ERROR_BLACKLIST_SECONDS)
-        self.health.mark("signal")
+                self.storage.add_health_event("scan", "warning", str(exc), sym.id)
+                log.exception("خطای اسکن %s", sym.id)
 
-    def signal_loop(self) -> None:
-        while not self.stop_event.is_set():
-            start = time.time()
-            self.scan_once()
-            self.stop_event.wait(max(0.2, config.SCAN_INTERVAL_SECONDS - (time.time() - start)))
+        self.storage.set("scan_last_ts", int(time.time()))
+        self.storage.set("scan_last_symbols", len(SYMBOLS))
+        self.storage.set("scan_last_duration", time.time() - started)
+        with self.watch_lock:
+            watch_count = len(self.active_watches)
+        self.storage.set("watch_count", watch_count)
+        self.health.mark("scan")
+        log.info("پایان اسکن | واچ=%s | زمان=%.2fs", watch_count, time.time() - started)
 
-    def monitor_loop(self) -> None:
-        while not self.stop_event.is_set():
-            self.monitor.run_once()
-            self.stop_event.wait(config.MONITOR_INTERVAL_SECONDS)
+    def watch_once(self) -> None:
+        """بررسی سریع 1M برای واچ‌های فعال و صدور سیگنال نهایی."""
+        if not self.storage.get("auto_signal_enabled", True):
+            return
+        with self.watch_lock:
+            items = list(self.active_watches.items())
 
-    def toobit_status_loop(self) -> None:
-        while not self.stop_event.is_set():
+        published = 0
+        for symbol_id, state in items:
+            sym = state["symbol"]
+            market = state["market"]
+            candidate = state["setup"]
             try:
-                bal = self.toobit.get_futures_balance()
-                self.storage.set("toobit_connected", True)
-                self.storage.set("toobit_available_usdt", bal["available"])
-                self.storage.set("toobit_total_usdt", bal["total"])
-                self.storage.set("toobit_margin_usdt", bal["margin"])
-                self.storage.set("toobit_last_error", "")
-                self.storage.set("toobit_last_update", int(time.time()))
-                self.storage.clear_health_component("toobit")
-                self.health.mark("toobit")
-            except Exception as exc:
-                self.storage.set("toobit_connected", False)
-                self.storage.set("toobit_last_error", str(exc))
-                self.storage.set("toobit_last_update", int(time.time()))
-                self.storage.add_health_event("toobit", "warning", str(exc))
-                logger.warning("خطای وضعیت توبیت: %s", exc)
-            self.stop_event.wait(config.TOOBIT_STATUS_INTERVAL_SECONDS)
+                if self._open_exists(symbol_id):
+                    with self.watch_lock:
+                        self.active_watches.pop(symbol_id, None)
+                    continue
+                c1 = self.okx.get_candles(sym.okx, bar=config.OKX_TRIGGER_BAR, limit=100)
+                watch = self.watch.evaluate(candidate, c1)
+                self.storage.resolve_health("watch", symbol_id)
+                if watch.state in {"EXPIRED", "INVALIDATED"}:
+                    with self.watch_lock:
+                        self.active_watches.pop(symbol_id, None)
+                    if config.LOG_WATCH_DETAILS:
+                        log.info(
+                            "واچ | ارز=%s | نتیجه=رد و حذف | حالت=%s | علت=%s | قیمت=%.8g | Trigger=%.8g | Invalidation=%.8g",
+                            symbol_id, watch.state, watch.reason, watch.entry_price,
+                            candidate.trigger_price, candidate.invalidation_price,
+                        )
+                    continue
 
-    def telegram_loop(self) -> None:
-        while not self.stop_event.is_set():
-            self.telegram.poll_once()
-            self.stop_event.wait(config.TELEGRAM_POLL_SECONDS)
+                decision = self.decision.decide(market, candidate, watch)
+                if not decision.allowed:
+                    if config.LOG_WATCH_DETAILS:
+                        log.info(
+                            "واچ | ارز=%s | نتیجه=انتظار | مرحله=%s | علت=%s | قیمت=%s | عبور=%s | پیشروی=%s | پذیرش=%s | فشار=%s | مومنتوم=%s | کندل=%s | جذب=%s | LateATR=%.3f",
+                            symbol_id, candidate.meta.get("scenario_state"), decision.primary_reason,
+                            f"{watch.entry_price:.8g}" if watch.entry_price else "نامعتبر",
+                            "بله" if watch.meta.get("price_ok") else "خیر",
+                            "بله" if watch.meta.get("progress_ok") else "خیر",
+                            "بله" if watch.meta.get("acceptance_ok") else "خیر",
+                            "بله" if watch.meta.get("pressure_ok") else "خیر",
+                            "بله" if watch.meta.get("momentum_ok") else "خیر",
+                            "بله" if watch.meta.get("candle_ok") else "خیر",
+                            "بله" if watch.meta.get("absorption") else "خیر",
+                            float(watch.meta.get("late_atr") or 0),
+                        )
+                    continue
+
+                trade_usdt = float(self.storage.get("trade_usdt", config.TRADE_USDT_DEFAULT))
+                leverage = int(self.storage.get("leverage", config.LEVERAGE_DEFAULT))
+                risk = self.risk.build(candidate, decision, watch.entry_price, trade_usdt, leverage)
+                if not risk.valid:
+                    removed = risk.reason.startswith("استاپ") or risk.reason.startswith("فضای واقعی")
+                    if removed:
+                        with self.watch_lock:
+                            self.active_watches.pop(symbol_id, None)
+                    if config.LOG_WATCH_DETAILS:
+                        log.info(
+                            "واچ | ارز=%s | نتیجه=%s | مرحله=ریسک | علت=%s | SL%%=%.3f | TP%%=%.3f | NetRR=%.2f | سودخالص=%.4f",
+                            symbol_id, "رد و حذف" if removed else "انتظار", risk.reason,
+                            risk.sl_pct, risk.tp_pct, risk.net_rr, risk.estimated_net_profit,
+                        )
+                    continue
+
+                if not self.telegram.enabled:
+                    self.storage.add_health_event("telegram", "critical", "توکن یا Chat ID تلگرام تنظیم نشده؛ سیگنال صادر نشد", symbol_id)
+                    continue
+                if config.LOG_WATCH_DETAILS:
+                    log.info(
+                        "واچ | ارز=%s | نتیجه=سیگنال | سمت=%s | سناریو=%s | مسیر=%s | NetRR=%.2f",
+                        symbol_id, candidate.side, self._setup_fa(candidate.setup_type),
+                        watch.meta.get("activation_path"), risk.net_rr,
+                    )
+                self._publish(sym, market, candidate, watch, decision, risk)
+                with self.watch_lock:
+                    self.active_watches.pop(symbol_id, None)
+                published += 1
+            except Exception as exc:
+                self.storage.add_health_event("watch", "warning", str(exc), symbol_id)
+                log.exception("خطای واچ %s", symbol_id)
+
+        with self.watch_lock:
+            self.storage.set("watch_count", len(self.active_watches))
+        self.health.mark("watch")
+        if published:
+            log.info("سیگنال‌های صادرشده از واچ: %s", published)
+
+    def monitor_once(self) -> None:
+        self.monitor.run_once()
+        self.health.mark("monitor")
+
+    def status_once(self) -> None:
+        self.storage.ensure_daily_profit()
+        if not self.toobit.has_credentials:
+            self.storage.set("toobit_connected", False)
+            if self.storage.get("trading_enabled", False):
+                self.storage.add_health_event("toobit", "critical", "ترید فعال است اما کلیدهای API توبیت تنظیم نشده‌اند")
+            else:
+                self.storage.resolve_health("toobit")
+            return
+        try:
+            with self.toobit_lock:
+                balance = self.toobit.get_futures_balance()
+            self.storage.set("toobit_connected", True)
+            self.storage.set("toobit_available_usdt", balance["available"])
+            self.storage.set("toobit_total_usdt", balance["total"])
+            self.storage.set("toobit_margin_usdt", balance["margin"])
+            self.storage.resolve_health("toobit")
+            self.health.mark("toobit")
+        except Exception as exc:
+            self.storage.set("toobit_connected", False)
+            self.storage.add_health_event("toobit", "warning", str(exc))
+
+    def learning_once(self) -> None:
+        for sym in SYMBOLS:
+            try:
+                report = self.learning.run(sym.id)
+                candidate = self.adaptive.create_candidate(sym.id, report)
+                if candidate:
+                    log.info("کاندید یادگیری ساخته شد: %s", candidate["candidate_id"])
+            except Exception as exc:
+                self.storage.add_health_event("learning", "warning", str(exc), sym.id)
+        self.health.mark("learning")
+
+    def loop(self, fn, interval: float, name: str) -> None:
+        while not self.stop.is_set():
+            started = time.time()
+            try:
+                fn()
+            except Exception as exc:
+                self.storage.add_health_event(name, "critical", str(exc))
+                log.exception("خطا در حلقه %s", name)
+            self.stop.wait(max(0.1, interval - (time.time() - started)))
 
     def run(self) -> None:
         threads = [
-            threading.Thread(target=self.signal_loop, daemon=True, name="behavior-scan"),
-            threading.Thread(target=self.monitor_loop, daemon=True, name="monitor"),
-            threading.Thread(target=self.toobit_status_loop, daemon=True, name="toobit-status"),
-            threading.Thread(target=self.telegram_loop, daemon=True, name="telegram"),
+            threading.Thread(target=self.loop, args=(self.scan_once, config.SCAN_INTERVAL_SECONDS, "scan"), daemon=True, name="اسکن"),
+            threading.Thread(target=self.loop, args=(self.watch_once, config.WATCH_POLL_INTERVAL_SECONDS, "watch"), daemon=True, name="واچ"),
+            threading.Thread(target=self.loop, args=(self.monitor_once, 5.0, "monitor"), daemon=True, name="مانیتور"),
+            threading.Thread(target=self.loop, args=(self.telegram.poll_once, config.TELEGRAM_POLL_SECONDS, "telegram"), daemon=True, name="تلگرام"),
+            threading.Thread(target=self.loop, args=(self.status_once, 15.0, "toobit"), daemon=True, name="توبیت"),
+            threading.Thread(target=self.loop, args=(self.learning_once, config.LEARNING_INTERVAL_SECONDS, "learning"), daemon=True, name="یادگیری"),
         ]
         for thread in threads:
             thread.start()
-        logger.info("UEM 5m started | symbols=%d | watch=removed", len(SYMBOLS))
+        log.info("ربات 5M تطبیقی اجرا شد | پوزیشن‌های واقعی فقط Isolated")
         try:
             while True:
                 time.sleep(1)
         except KeyboardInterrupt:
-            self.stop_event.set()
+            self.stop.set()
             for thread in threads:
                 thread.join(timeout=3)
 
 
 if __name__ == "__main__":
-    TradingBotApp().run()
+    App().run()

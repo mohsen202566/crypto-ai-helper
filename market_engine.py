@@ -1,159 +1,79 @@
-"""موتور یکپارچه رفتار بازار: کنترل جهت + شروع حرکت + کیفیت ورود."""
 from __future__ import annotations
-from statistics import median
-import time
-import config
-from models import BehaviorState, MarketSignal, MicroSnapshot
-from symbols import SymbolMap
+from dataclasses import dataclass, field
+from typing import Any
+import indicators as ind
 
+@dataclass
+class MarketAnalysis:
+    symbol_id: str
+    regime: str
+    primary_direction: str
+    direction_score: float
+    opposite_score: float
+    strength_score: float
+    fragility_score: float
+    freshness_score: float
+    exhaustion_risk: float
+    confidence: float
+    context_15m: str
+    movement_stage: str
+    value_distance_atr: float
+    atr_pct: float
+    features: dict[str, Any] = field(default_factory=dict)
+    reasons: list[str] = field(default_factory=list)
+    contradictions: list[str] = field(default_factory=list)
+    hard_veto: bool = False
 
-def _median(values: list[float], default: float = 0.0) -> float:
-    return median(values) if values else default
-
-
-def _candle_noise(candles: list[dict[str, float]]) -> float:
-    closed = [c for c in candles if int(c.get("confirm", 1)) == 1]
-    recent = closed[-20:]
-    ranges = [abs(c["high"] - c["low"]) / c["close"] * 100.0 for c in recent if c["close"] > 0]
-    return _median(ranges, 0.0)
-
-
-def _recent_behavior(candles: list[dict[str, float]]) -> dict[str, float]:
-    closed = [c for c in candles if int(c.get("confirm", 1)) == 1]
-    recent = closed[-8:]
-    if len(recent) < 6:
-        return {}
-    close = float(recent[-1]["close"])
-    ranges = [max(float(c["high"]) - float(c["low"]), 1e-12) for c in recent]
-    bodies = [abs(float(c["close"]) - float(c["open"])) for c in recent]
-    signed = [float(c["close"]) - float(c["open"]) for c in recent]
-    net = close - float(recent[0]["open"])
-    path = sum(abs(x) for x in signed) or 1e-12
-    efficiency = abs(net) / path
-    body_quality = _median([b / r for b, r in zip(bodies, ranges)], 0.0)
-    high = max(float(c["high"]) for c in recent[:-1])
-    low = min(float(c["low"]) for c in recent[:-1])
-    return {
-        "close": close,
-        "net_pct": net / float(recent[0]["open"]) * 100.0 if recent[0]["open"] > 0 else 0.0,
-        "efficiency": efficiency,
-        "body_quality": body_quality,
-        "prior_high": high,
-        "prior_low": low,
-        "last_high": float(recent[-1]["high"]),
-        "last_low": float(recent[-1]["low"]),
-    }
-
-
-def analyze_market_diagnostic(
-    sym: SymbolMap,
-    candles_5m: list[dict[str, float]],
-    snapshot: MicroSnapshot,
-    state: BehaviorState,
-) -> tuple[MarketSignal | None, str, dict[str, float | int | str | bool]]:
-    """بدون امتیازدهی؛ چند مشاهده یک داستان واحدِ کنترل مؤثر را می‌سازند."""
-    now = time.time()
-    if state.updated_at and now - state.updated_at > config.STATE_STALE_SECONDS:
-        state.prices.clear(); state.trade_imbalances.clear(); state.book_imbalances.clear()
-        state.micro_biases.clear(); state.spreads.clear(); state.last_control = "RANGE"
-
-    behavior = _recent_behavior(candles_5m)
-    noise = _candle_noise(candles_5m)
-    metrics: dict[str, float | int | str | bool] = {
-        "price": snapshot.last,
-        "spread_pct": snapshot.spread_pct,
-        "trade_imbalance": snapshot.trade_imbalance,
-        "book_imbalance": snapshot.book_imbalance,
-        "micro_bias_pct": snapshot.microprice_bias_pct,
-        "trade_count": snapshot.trade_count,
-        "noise_pct": noise,
-    }
-    metrics.update(behavior)
-    if not behavior or noise <= 0:
-        state.append(snapshot, config.STATE_HISTORY_SIZE); state.updated_at = now
-        return None, "داده پنج‌دقیقه‌ای کافی یا معتبر نیست", metrics
-    if snapshot.spread_pct > config.MAX_SPREAD_PCT:
-        state.append(snapshot, config.STATE_HISTORY_SIZE); state.updated_at = now
-        return None, "اسپرد برای ورود اقتصادی مناسب نیست", metrics
-    if snapshot.trade_count < config.MIN_TRADES_FOR_SNAPSHOT:
-        state.append(snapshot, config.STATE_HISTORY_SIZE); state.updated_at = now
-        return None, "تعداد معاملات لحظه‌ای برای خواندن رفتار کافی نیست", metrics
-
-    prev_price = state.prices[-1] if state.prices else snapshot.last
-    price_change = (snapshot.last - prev_price) / prev_price * 100.0 if prev_price > 0 else 0.0
-    base_trade = _median([abs(x) for x in state.trade_imbalances], abs(snapshot.trade_imbalance))
-    base_book = _median([abs(x) for x in state.book_imbalances], abs(snapshot.book_imbalance))
-    base_micro = _median([abs(x) for x in state.micro_biases], abs(snapshot.microprice_bias_pct))
-    metrics.update({"snapshot_price_change_pct": price_change, "base_trade": base_trade, "base_book": base_book, "base_micro": base_micro})
-
-    # حمله، واکنش نقدینگی، اثر قیمت و نگهداری سطح با هم خوانده می‌شوند.
-    buy_attack = snapshot.trade_imbalance > 0 and snapshot.trade_imbalance >= max(base_trade * 0.9, 0.02)
-    sell_attack = snapshot.trade_imbalance < 0 and abs(snapshot.trade_imbalance) >= max(base_trade * 0.9, 0.02)
-    buy_support = snapshot.book_imbalance > -max(base_book * 0.55, 0.03) and snapshot.microprice_bias_pct >= -max(base_micro * 0.45, 0.001)
-    sell_support = snapshot.book_imbalance < max(base_book * 0.55, 0.03) and snapshot.microprice_bias_pct <= max(base_micro * 0.45, 0.001)
-    price_accepts_up = price_change > 0 or snapshot.last >= behavior["close"]
-    price_accepts_down = price_change < 0 or snapshot.last <= behavior["close"]
-    long_retained = snapshot.last > behavior["prior_low"] and behavior["net_pct"] >= -noise
-    short_retained = snapshot.last < behavior["prior_high"] and behavior["net_pct"] <= noise
-
-    long_control = buy_attack and buy_support and price_accepts_up and long_retained
-    short_control = sell_attack and sell_support and price_accepts_down and short_retained
-
-    # جذب معکوس: حمله طرف مقابل هست ولی قیمت بر خلاف آن حفظ می‌شود.
-    long_absorption = sell_attack and price_change >= 0 and snapshot.book_imbalance >= 0 and snapshot.microprice_bias_pct >= 0
-    short_absorption = buy_attack and price_change <= 0 and snapshot.book_imbalance <= 0 and snapshot.microprice_bias_pct <= 0
-    long_control = long_control or long_absorption
-    short_control = short_control or short_absorption
-
-    if long_control and short_control:
-        control = "RANGE"
-    elif long_control:
-        control = "LONG"
-    elif short_control:
-        control = "SHORT"
-    else:
-        control = "RANGE"
-
-    # شروع حرکت: کنترل تازه یا اولین ادامه معتبر، نه حرکت دیرهنگام.
-    fresh_transfer = control in ("LONG", "SHORT") and state.last_control != control
-    if control == "LONG":
-        extension = max(0.0, (snapshot.last - behavior["prior_high"]) / snapshot.last * 100.0)
-        early = fresh_transfer or extension <= max(noise * 0.65, abs(price_change) * 2.0)
-        invalidation = min(behavior["prior_low"], behavior["last_low"])
-    elif control == "SHORT":
-        extension = max(0.0, (behavior["prior_low"] - snapshot.last) / snapshot.last * 100.0)
-        early = fresh_transfer or extension <= max(noise * 0.65, abs(price_change) * 2.0)
-        invalidation = max(behavior["prior_high"], behavior["last_high"])
-    else:
-        extension = 0.0; early = False; invalidation = snapshot.last
-    metrics.update({"control": control, "fresh_transfer": fresh_transfer, "extension_pct": extension, "early": early})
-
-    state.append(snapshot, config.STATE_HISTORY_SIZE)
-    state.updated_at = now
-    state.last_control = control
-
-    if control == "RANGE":
-        return None, "کنترل مؤثر یک‌طرفه شکل نگرفته یا فشار جذب شده است", metrics
-    if not early:
-        return None, "جهت معتبر است اما ورود دیر شده و نسبت اقتصادی خراب می‌شود", metrics
-
-    # ظرفیت حرکت بر اساس نویز، کارایی حرکت و اثر فشار؛ نه هدف ثابت.
-    behavior_power = max(noise, abs(behavior["net_pct"]) * max(behavior["efficiency"], 0.35))
-    pressure_power = abs(snapshot.trade_imbalance) + abs(snapshot.microprice_bias_pct) / max(noise, 1e-9)
-    expected = behavior_power * (1.25 if fresh_transfer else 1.05)
-    if behavior["efficiency"] > 0.60 and behavior["body_quality"] > 0.55:
-        expected *= 1.18
-    expected = max(expected, noise * 0.9)
-
-    very_strong = fresh_transfer and behavior["efficiency"] > 0.60 and pressure_power > 0.35
-    strength = "بسیار قوی" if very_strong else ("قوی" if fresh_transfer or behavior["efficiency"] > 0.45 else "متوسط")
-    side_fa = "خریدار" if control == "LONG" else "فروشنده"
-    direction_reason = f"کنترل مؤثر دست {side_fa} است؛ فشار، واکنش نقدینگی و اثر قیمت هم‌جهت‌اند"
-    strength_reason = f"انتقال کنترل {'تازه' if fresh_transfer else 'حفظ‌شده'} است و کارایی حرکت {behavior['efficiency']:.2f} است"
-    entry_reason = "حرکت هنوز در بخش آغازین است و قیمت از محدوده ورود اقتصادی دور نشده"
-    signal = MarketSignal(
-        sym.id, sym.okx, sym.toobit, control, snapshot.last, invalidation, noise, expected,
-        strength, direction_reason, strength_reason, entry_reason, snapshot.spread_pct,
-        snapshot.trade_imbalance, snapshot.book_imbalance, snapshot.microprice_bias_pct,
-    )
-    return signal, "سیگنال رفتارمحور تأیید شد", metrics
+class MarketEngine:
+    def analyze(self, symbol_id, c5, c15):
+        if len(c5) < 80 or len(c15) < 55:
+            return MarketAnalysis(symbol_id,'UNKNOWN','NEUTRAL',0,0,0,100,0,100,0,'UNKNOWN','UNKNOWN',0,0,hard_veto=True,reasons=['داده کافی نیست'])
+        v = ind.closes(c5); v15 = ind.closes(c15)
+        e9,e21,e50 = ind.ema(v,9), ind.ema(v,21), ind.ema(v,50)
+        e20h,e50h = ind.ema(v15,20), ind.ema(v15,50)
+        atr_series = ind.atr(c5,14); atrv = atr_series[-1]; px = v[-1]
+        if px <= 0 or atrv <= 0:
+            return MarketAnalysis(symbol_id,'UNKNOWN','NEUTRAL',0,0,0,100,0,100,0,'UNKNOWN','UNKNOWN',0,0,hard_veto=True,reasons=['قیمت یا ATR نامعتبر'])
+        atr_pct = atrv/px*100
+        hs,ls = ind.swing_points(c5[-60:],2)
+        up_struct = len(hs)>=2 and len(ls)>=2 and hs[-1][1]>hs[-2][1] and ls[-1][1]>ls[-2][1]
+        dn_struct = len(hs)>=2 and len(ls)>=2 and hs[-1][1]<hs[-2][1] and ls[-1][1]<ls[-2][1]
+        up_ema = e9[-1]>e21[-1]>e50[-1] and e21[-1]>e21[-4]
+        dn_ema = e9[-1]<e21[-1]<e50[-1] and e21[-1]<e21[-4]
+        context = 'BULLISH' if e20h[-1]>e50h[-1] and e20h[-1]>e20h[-3] else 'BEARISH' if e20h[-1]<e50h[-1] and e20h[-1]<e20h[-3] else 'NEUTRAL'
+        eff = ind.efficiency(v,12); overlap = ind.overlap_ratio(c5,12)
+        rs = ind.rsi(v,14); _,_,hist = ind.macd(v)
+        plus_di,minus_di,adx = ind.dmi_adx(c5,14)
+        cf = [ind.candle_features(x) for x in c5[-6:]]
+        pressure = sum(x['direction']*x['body_ratio'] for x in cf)/len(cf)
+        vr = ind.volume_ratio(c5)
+        vwap = ind.session_vwap(c5)
+        long = 30*(1 if up_struct else .45 if up_ema else .1)+18*(1 if up_ema else .2)+17*(1 if context=='BULLISH' else .45 if context=='NEUTRAL' else 0)+14*max(0,min(1,(pressure+1)/2))+10*max(0,min(1,(rs[-1]-40)/25))+7*(1 if px>=e21[-1] else .2)+4*min(1,vr/1.5)
+        short = 30*(1 if dn_struct else .45 if dn_ema else .1)+18*(1 if dn_ema else .2)+17*(1 if context=='BEARISH' else .45 if context=='NEUTRAL' else 0)+14*max(0,min(1,(1-pressure)/2))+10*max(0,min(1,(60-rs[-1])/25))+7*(1 if px<=e21[-1] else .2)+4*min(1,vr/1.5)
+        side = 'LONG' if long-short>=12 else 'SHORT' if short-long>=12 else 'NEUTRAL'
+        d,opp = max(long,short),min(long,short)
+        di_dom = max(0.0,(plus_di[-1]-minus_di[-1]) if side=='LONG' else (minus_di[-1]-plus_di[-1]))
+        dmi_score = min(100.0, adx[-1]*2.2 + di_dom)
+        progress = min(100.0,eff*125)
+        momentum = min(100.0,50 + abs(hist[-1])*10000/max(px,1e-9))
+        strength = .25*progress+.25*d+.25*dmi_score+.15*momentum+.10*min(100,vr*55)
+        value_ref = (e21[-1]+vwap)/2 if vwap else e21[-1]
+        value_dist = abs(px-value_ref)/atrv
+        displacement = abs(px-v[-8])/atrv
+        decel = abs(hist[-1])<abs(hist[-3]) and abs(hist[-2])<abs(hist[-4])
+        exhaustion = min(100,14*value_dist+7*displacement+(18 if decel else 0))
+        fresh = max(0,100-exhaustion)
+        frag = min(100,(1-eff)*50+overlap*30+(20 if abs(pressure)<.12 else 0))
+        if side=='NEUTRAL' or eff<.13 or overlap>.80:
+            regime='CHAOTIC' if overlap>.72 or eff<.10 else 'RANGE_NOISY'
+        elif strength>=72:
+            regime='STRONG_TREND_UP' if side=='LONG' else 'STRONG_TREND_DOWN'
+        else:
+            regime='WEAK_TREND_UP' if side=='LONG' else 'WEAK_TREND_DOWN'
+        stage='EARLY' if displacement<1.2 else 'DEVELOPING' if displacement<2.2 else 'MATURE' if displacement<3.2 else 'LATE' if displacement<4.2 else 'EXHAUSTED'
+        veto = (regime=='CHAOTIC' and overlap>0.86 and eff<0.07) or exhaustion>=94 or atr_pct<=0
+        contradictions=[]
+        if exhaustion>60: contradictions.append('حرکت فرسوده')
+        if context!='NEUTRAL' and ((side=='LONG' and context=='BEARISH') or (side=='SHORT' and context=='BULLISH')): contradictions.append('تضاد تایم 15M')
+        confidence=max(0,min(100,d-frag*.2-8*len(contradictions)))
+        return MarketAnalysis(symbol_id,regime,side,round(d,2),round(opp,2),round(strength,2),round(frag,2),round(fresh,2),round(exhaustion,2),round(confidence,2),context,stage,round(value_dist,3),round(atr_pct,4),features={'ema9':e9[-1],'ema21':e21[-1],'ema50':e50[-1],'vwap':vwap,'atr':atrv,'rsi':rs[-1],'adx':adx[-1],'plus_di':plus_di[-1],'minus_di':minus_di[-1],'efficiency':eff,'overlap':overlap,'pressure':pressure,'volume_ratio':vr,'last_price':px,'recent_swing_high':hs[-1][1] if hs else None,'recent_swing_low':ls[-1][1] if ls else None},reasons=[f'ساختار/EMA جهت {side}',f'زمینه 15M: {context}',f'ADX {adx[-1]:.1f}',f'کارایی حرکت {eff:.2f}'],contradictions=contradictions,hard_veto=veto)

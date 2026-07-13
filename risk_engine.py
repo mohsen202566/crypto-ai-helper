@@ -1,102 +1,71 @@
-"""موتور پویا و محتاط TP/SL بر پایه رفتار، نویز، هزینه و RR خالص."""
 from __future__ import annotations
+from dataclasses import dataclass, replace
 import config
-from models import MarketSignal, RiskPlan
+from setup_engine import SetupCandidate
+from decision_engine import TradeDecision
 
+@dataclass
+class RiskPlan:
+    entry: float; tp: float; sl: float; sl_pct: float; tp_pct: float; gross_rr: float; net_rr: float
+    trade_usdt: float; leverage: int; notional_usdt: float; estimated_net_profit: float
+    estimated_net_loss: float; estimated_cost_win: float; estimated_cost_loss: float
+    valid: bool; reason: str
 
-def _fee_rate(mode: str) -> float:
-    pct = config.MAKER_FEE_PCT_PER_SIDE if str(mode).upper() == "MAKER" else config.TAKER_FEE_PCT_PER_SIDE
-    return pct / 100.0
+    def rebased(self, new_entry: float) -> 'RiskPlan':
+        if new_entry <= 0:
+            return self
+        tp = new_entry * (1 + self.tp_pct/100) if self.tp > self.entry else new_entry * (1 - self.tp_pct/100)
+        sl = new_entry * (1 - self.sl_pct/100) if self.sl < self.entry else new_entry * (1 + self.sl_pct/100)
+        return replace(self, entry=new_entry, tp=tp, sl=sl)
 
+class RiskEngine:
+    def build(self, s: SetupCandidate, d: TradeDecision, entry: float, trade_usdt: float, leverage: int) -> RiskPlan:
+        if entry <= 0 or not (config.TRADE_USDT_MIN <= trade_usdt <= config.TRADE_USDT_MAX) or not (config.LEVERAGE_MIN <= leverage <= config.LEVERAGE_MAX):
+            return RiskPlan(entry,0,0,0,0,0,0,trade_usdt,leverage,max(0,trade_usdt*leverage),0,0,0,0,False,'ورودی ریسک نامعتبر است')
 
-def _price(entry: float, side: str, pct: float, favorable: bool) -> float:
-    direction = 1.0 if side == "LONG" else -1.0
-    if not favorable:
-        direction *= -1.0
-    return entry * (1.0 + direction * pct / 100.0)
+        atr = float(s.meta.get('atr') or 0)
+        if atr <= 0:
+            return RiskPlan(entry,0,0,0,0,0,0,trade_usdt,leverage,trade_usdt*leverage,0,0,0,0,False,'ATR نامعتبر است')
 
+        atr_pct = atr / entry * 100
+        structural_pct = abs(entry - s.invalidation_price) / entry * 100
+        structure_with_buffer = structural_pct + atr_pct * config.STOP_STRUCTURE_BUFFER_ATR
+        noise_floor = atr_pct * config.STOP_ATR_FLOOR_MULT
+        execution_floor = config.STOP_EXECUTION_FLOOR_PCT + config.ENTRY_SLIPPAGE_PCT + config.SL_SLIPPAGE_PCT
+        sl_pct = max(config.MIN_SL_PCT, structure_with_buffer, noise_floor, execution_floor)
 
-def _costs(notional: float, entry: float, exit_price: float) -> float:
-    qty = notional / entry
-    entry_fee = notional * _fee_rate(config.ENTRY_FEE_MODE)
-    exit_notional = qty * exit_price
-    exit_fee = exit_notional * _fee_rate(config.EXIT_FEE_MODE)
-    slip = (notional + exit_notional) * (config.SLIPPAGE_PCT_PER_SIDE / 100.0)
-    return entry_fee + exit_fee + slip
+        max_sl = config.ADAPTIVE_MAX_SL_PCT if s.setup_type == 'COMPRESSION_BREAKOUT' else config.NORMAL_MAX_SL_PCT
+        if sl_pct > max_sl:
+            return RiskPlan(entry,0,0,sl_pct,0,0,0,trade_usdt,leverage,trade_usdt*leverage,0,0,0,0,False,'استاپ واقعی سناریو بیش از حد دور است')
 
+        sl = entry*(1-sl_pct/100) if s.side=='LONG' else entry*(1+sl_pct/100)
+        fee = 2*config.TOOBIT_FUTURES_TAKER_FEE_PCT
+        win_cost_pct = fee + config.ENTRY_SLIPPAGE_PCT + config.TP_SLIPPAGE_PCT
+        loss_cost_pct = fee + config.ENTRY_SLIPPAGE_PCT + config.SL_SLIPPAGE_PCT
 
-def _net_for_move(notional: float, entry: float, side: str, pct: float) -> tuple[float, float, float, float]:
-    exit_price = _price(entry, side, pct, favorable=True)
-    gross = notional * pct / 100.0
-    fees = _costs(notional, entry, exit_price)
-    return exit_price, gross, fees, gross - fees
+        obstacle = s.meta.get('obstacle_price')
+        capacity = s.meta.get('target_capacity_price')
+        target_candidates = []
+        buffer_abs = atr * config.TARGET_OBSTACLE_BUFFER_ATR
+        if obstacle:
+            obs = float(obstacle)
+            target_candidates.append(obs - buffer_abs if s.side=='LONG' else obs + buffer_abs)
+        if capacity:
+            target_candidates.append(float(capacity))
+        valid_targets = [x for x in target_candidates if (x > entry if s.side=='LONG' else x < entry)]
+        if not valid_targets:
+            return RiskPlan(entry,0,sl,sl_pct,0,0,0,trade_usdt,leverage,trade_usdt*leverage,0,0,0,0,False,'فضای واقعی تا تارگت کافی نیست')
 
-
-def build_risk_plan_diagnostic(signal: MarketSignal, trade_usdt: float, leverage: int) -> tuple[RiskPlan | None, str, dict[str, float | int | str]]:
-    entry = float(signal.entry)
-    metrics: dict[str, float | int | str] = {"entry": entry, "trade_usdt": trade_usdt, "leverage": leverage}
-    if entry <= 0 or trade_usdt <= 0 or leverage <= 0:
-        return None, "ورودی مالی یا قیمت نامعتبر است", metrics
-
-    notional = float(trade_usdt) * int(leverage)
-    raw_invalidation_pct = abs(entry - float(signal.invalidation_price)) / entry * 100.0
-    noise = max(float(signal.noise_pct), float(signal.spread_pct) * 2.0)
-    if signal.strength == "بسیار قوی":
-        noise_fraction = config.NOISE_BUFFER_MIN_FRACTION
-        tp_fraction = config.TP_CAUTION_STRONG_FRACTION
-    elif signal.strength == "متوسط":
-        noise_fraction = config.NOISE_BUFFER_HIGH_FRACTION
-        tp_fraction = config.TP_CAUTION_MIN_FRACTION
-    else:
-        noise_fraction = config.NOISE_BUFFER_NORMAL_FRACTION
-        tp_fraction = config.TP_CAUTION_NORMAL_FRACTION
-
-    # استاپ پشت ابطال واقعی و سپس بیرون نویز؛ هرگز برای ساخت RR مصنوعی کوچک نمی‌شود.
-    sl_pct = raw_invalidation_pct + noise * noise_fraction
-    max_sl = float(signal.expected_move_pct) * config.MAX_STOP_EXPECTED_MOVE_FRACTION
-    metrics.update({"notional": notional, "raw_invalidation_pct": raw_invalidation_pct, "noise_pct": noise,
-                    "noise_buffer_fraction": noise_fraction, "sl_pct": sl_pct, "max_sl_pct": max_sl})
-    if sl_pct <= 0 or sl_pct > max_sl:
-        return None, "استاپ منطقیِ خارج نویز با ظرفیت حرکت سازگار نیست", metrics
-
-    sl = _price(entry, signal.side, sl_pct, favorable=False)
-    sl_gross = notional * sl_pct / 100.0
-    sl_fees = _costs(notional, entry, sl)
-    sl_net_loss = sl_gross + sl_fees
-    required_net = sl_net_loss * config.RISK_REWARD
-
-    # TP کمی قبل از ظرفیت تخمینی قرار می‌گیرد تا احتمال برخورد بالا برود.
-    cautious_cap = float(signal.expected_move_pct) * tp_fraction
-    lo, hi = 0.0, max(cautious_cap, sl_pct * 2.0)
-    for _ in range(50):
-        mid = (lo + hi) / 2.0
-        _, gross, fees, net = _net_for_move(notional, entry, signal.side, mid)
-        required = max(required_net, config.MIN_NET_PROFIT_USDT)
-        if net < required or gross < config.MIN_GROSS_PROFIT_USDT:
-            lo = mid
-        else:
-            hi = mid
-    tp_pct = hi
-    metrics.update({"tp_required_pct": tp_pct, "cautious_capacity_pct": cautious_cap, "tp_fraction": tp_fraction})
-    if tp_pct > cautious_cap:
-        return None, "TP محتاطانه سود خالص و RR لازم را تأمین نمی‌کند", metrics
-
-    tp, tp_gross, tp_fees, tp_net = _net_for_move(notional, entry, signal.side, tp_pct)
-    rr_net = tp_net / sl_net_loss if sl_net_loss > 0 else 0.0
-    if tp_gross + 1e-9 < config.MIN_GROSS_PROFIT_USDT:
-        return None, "سود ناخالص کمتر از کف ۱۰ سنت است", metrics
-    if tp_net + 1e-9 < config.MIN_NET_PROFIT_USDT:
-        return None, "سود خالص کمتر از کف ۵ سنت است", metrics
-    if rr_net + 1e-9 < config.RISK_REWARD:
-        return None, "RR خالص کمتر از ۱.۵ است", metrics
-
-    qty = notional / entry
-    reason = (f"TP روی بخش محتاطانه ظرفیت حرکت ({tp_fraction:.0%}) | "
-              f"SL پشت ابطال + حاشیه نویز ({noise_fraction:.0%}) | RR خالص {rr_net:.3f}")
-    plan = RiskPlan(entry, tp, sl, rr_net, sl_pct, tp_pct, notional, qty, tp_gross, tp_fees, tp_net,
-                    sl_gross, sl_fees, sl_net_loss, True, reason)
-    return plan, "برنامه TP/SL تأیید شد", metrics
-
-
-def build_risk_plan(signal: MarketSignal, trade_usdt: float, leverage: int) -> RiskPlan | None:
-    return build_risk_plan_diagnostic(signal, trade_usdt, leverage)[0]
+        tp = min(valid_targets) if s.side=='LONG' else max(valid_targets)
+        tp_pct = abs(tp-entry)/entry*100
+        gross_rr = tp_pct/sl_pct if sl_pct else 0
+        notional = trade_usdt*leverage
+        win_cost = notional*win_cost_pct/100
+        loss_cost = notional*loss_cost_pct/100
+        net_profit = notional*tp_pct/100-win_cost
+        net_loss = notional*sl_pct/100+loss_cost
+        net_rr = net_profit/net_loss if net_loss else 0
+        min_profit = max(config.MIN_NET_PROFIT_USDT, trade_usdt*config.MIN_NET_RETURN_ON_MARGIN_PCT/100)
+        valid = net_profit >= min_profit and net_rr >= config.MIN_NET_RR_ABSOLUTE and tp > 0 and sl > 0
+        reason = 'معتبر' if valid else 'تارگت واقعی پس از هزینه‌ها RR یا سود خالص کافی ندارد'
+        return RiskPlan(entry,tp,sl,sl_pct,tp_pct,gross_rr,net_rr,trade_usdt,leverage,notional,net_profit,net_loss,win_cost,loss_cost,valid,reason)
