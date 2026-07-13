@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Any
+import hashlib
 import logging
 import sys
 import threading
@@ -32,8 +33,13 @@ class TelegramPanel:
         self.storage = app.storage
         self.token = config.TELEGRAM_BOT_TOKEN
         self.chat_id = config.TELEGRAM_CHAT_ID
-        self.offset = int(self.storage.get("telegram_offset", 0) or 0)
-        self.updates_initialized = bool(self.storage.get("telegram_updates_initialized", False))
+        # Telegram update ids belong to one bot token. Namespace the offset and
+        # duplicate ledger by token so an old/replaced bot cannot poison polling.
+        self.bot_scope = hashlib.sha256(self.token.encode()).hexdigest()[:16] if self.token else "disabled"
+        self.offset = self.storage.get_telegram_offset(self.bot_scope)
+        self.updates_initialized = bool(
+            self.storage.get(f"telegram_updates_initialized:{self.bot_scope}", False)
+        )
         # If the DB/offset was reset, Telegram may still hold many old commands.
         # Never replay that backlog: synchronize to the newest pending update once.
         self.needs_backlog_sync = not self.updates_initialized
@@ -92,8 +98,8 @@ class TelegramPanel:
         rows = [row for row in (data.get("result") or []) if isinstance(row, dict)]
         newest = max((int(row.get("update_id") or 0) for row in rows), default=0)
         if newest > 0:
-            self.offset = max(self.offset, self.storage.advance_telegram_offset(newest))
-        self.storage.set("telegram_updates_initialized", True)
+            self.offset = self.storage.set_telegram_offset(self.bot_scope, newest)
+        self.storage.set(f"telegram_updates_initialized:{self.bot_scope}", True)
         self.updates_initialized = True
         self.needs_backlog_sync = False
         logger.warning("[TELEGRAM_BACKLOG_SYNCED] newest_update_id=%d old_commands_dropped=true", newest)
@@ -118,14 +124,32 @@ class TelegramPanel:
                 (item for item in (data.get("result") or []) if isinstance(item, dict)),
                 key=lambda item: int(item.get("update_id") or 0),
             )
+            # Defensive recovery: Telegram can start a new random update-id
+            # epoch after token replacement/long inactivity. If the stored offset
+            # is far above the ids returned by this bot, rebase to this stream.
+            if updates:
+                newest_seen = max(int(item.get("update_id") or 0) for item in updates)
+                if self.offset > newest_seen + 1_000_000:
+                    old_offset = self.offset
+                    self.offset = self.storage.set_telegram_offset(
+                        self.bot_scope,
+                        max(0, min(int(item.get("update_id") or 0) for item in updates) - 1),
+                    )
+                    logger.warning(
+                        "[TELEGRAM_OFFSET_REBASED] scope=%s old=%d new=%d newest_seen=%d",
+                        self.bot_scope, old_offset, self.offset, newest_seen,
+                    )
             for update in updates:
                 update_id = int(update.get("update_id") or 0)
                 if update_id <= 0:
                     continue
                 # Acknowledge every seen update first, including duplicates. The
                 # duplicate claim is independent from the Telegram polling offset.
-                self.offset = max(self.offset, self.storage.advance_telegram_offset(update_id))
-                if not self.storage.claim_telegram_update(update_id):
+                self.offset = max(
+                    self.offset,
+                    self.storage.advance_telegram_offset(self.bot_scope, update_id),
+                )
+                if not self.storage.claim_telegram_update(self.bot_scope, update_id):
                     logger.info("[TELEGRAM_DUPLICATE_SKIPPED] update_id=%d offset=%d", update_id, self.offset)
                     continue
                 message = update.get("message") or {}

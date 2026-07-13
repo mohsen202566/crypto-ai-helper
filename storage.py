@@ -175,6 +175,14 @@ class Storage:
                 );
                 CREATE INDEX IF NOT EXISTS idx_telegram_updates_claimed_at
                     ON telegram_updates(claimed_at);
+                CREATE TABLE IF NOT EXISTS telegram_updates_v2(
+                    bot_scope TEXT NOT NULL,
+                    update_id INTEGER NOT NULL,
+                    claimed_at INTEGER NOT NULL,
+                    PRIMARY KEY(bot_scope, update_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_telegram_updates_v2_claimed_at
+                    ON telegram_updates_v2(claimed_at);
                 CREATE TABLE IF NOT EXISTS health_events(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     component TEXT NOT NULL,
@@ -239,21 +247,34 @@ class Storage:
                 (key, json.dumps(value, ensure_ascii=False), int(time.time())),
             )
 
-    def advance_telegram_offset(self, update_id: int) -> int:
-        """Persist a monotonically increasing Telegram offset.
+    @staticmethod
+    def _telegram_offset_key(bot_scope: str) -> str:
+        return f"telegram_offset:{str(bot_scope)}"
 
-        This is intentionally separate from duplicate claiming. Even an update
-        already claimed by another process must advance the local/global offset,
-        otherwise getUpdates can return the same item forever.
+    def get_telegram_offset(self, bot_scope: str) -> int:
+        return int(self.get(self._telegram_offset_key(bot_scope), 0) or 0)
+
+    def set_telegram_offset(self, bot_scope: str, update_id: int) -> int:
+        """Set the exact offset for one bot token stream.
+
+        Exact assignment is required when Telegram starts a new update-id epoch
+        or when a database was previously used with another bot token.
         """
+        final = max(0, int(update_id or 0))
+        self.set(self._telegram_offset_key(bot_scope), final)
+        return final
+
+    def advance_telegram_offset(self, bot_scope: str, update_id: int) -> int:
+        """Persist a monotonically increasing offset for one bot token."""
         update_id = int(update_id or 0)
+        key = self._telegram_offset_key(bot_scope)
         if update_id <= 0:
-            return int(self.get("telegram_offset", 0) or 0)
+            return int(self.get(key, 0) or 0)
         now = int(time.time())
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             try:
-                row = db.execute("SELECT value FROM kv WHERE key=?", ("telegram_offset",)).fetchone()
+                row = db.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
                 current = 0
                 if row is not None:
                     try:
@@ -263,7 +284,7 @@ class Storage:
                 final = max(current, update_id)
                 db.execute(
                     "INSERT OR REPLACE INTO kv(key,value,updated_at) VALUES(?,?,?)",
-                    ("telegram_offset", json.dumps(final), now),
+                    (key, json.dumps(final), now),
                 )
                 db.execute("COMMIT")
                 return final
@@ -271,23 +292,24 @@ class Storage:
                 db.execute("ROLLBACK")
                 raise
 
-    def claim_telegram_update(self, update_id: int) -> bool:
-        """Atomically claim an update without coupling the claim to the offset."""
+    def claim_telegram_update(self, bot_scope: str, update_id: int) -> bool:
+        """Atomically claim an update within one bot-token namespace."""
         update_id = int(update_id or 0)
-        if update_id <= 0:
+        bot_scope = str(bot_scope)
+        if update_id <= 0 or not bot_scope:
             return False
         now = int(time.time())
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             try:
                 cursor = db.execute(
-                    "INSERT OR IGNORE INTO telegram_updates(update_id,claimed_at) VALUES(?,?)",
-                    (update_id, now),
+                    "INSERT OR IGNORE INTO telegram_updates_v2(bot_scope,update_id,claimed_at) VALUES(?,?,?)",
+                    (bot_scope, update_id, now),
                 )
                 claimed = int(cursor.rowcount or 0) == 1
                 if claimed and update_id % 100 == 0:
                     db.execute(
-                        "DELETE FROM telegram_updates WHERE claimed_at < ?",
+                        "DELETE FROM telegram_updates_v2 WHERE claimed_at < ?",
                         (now - 30 * 24 * 3600,),
                     )
                 db.execute("COMMIT")
