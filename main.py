@@ -302,15 +302,19 @@ class App:
                 leverage = int(self.storage.get("leverage", config.LEVERAGE_DEFAULT))
                 risk = self.risk.build(candidate, decision, watch.entry_price, trade_usdt, leverage)
                 if not risk.valid:
-                    removed = risk.reason.startswith("استاپ") or risk.reason.startswith("فضای واقعی")
-                    if removed:
-                        with self.watch_lock:
-                            self.active_watches.pop(symbol_id, None)
+                    # A risk/economic failure belongs to this exact entry snapshot. Do not keep
+                    # re-evaluating the same activated scenario every few seconds. A fresh setup
+                    # must be built by the scanner before another attempt is allowed.
+                    with self.watch_lock:
+                        self.active_watches.pop(symbol_id, None)
+                    self.watch_log_state.pop(symbol_id, None)
                     if config.LOG_WATCH_DETAILS:
                         log.info(
-                            "واچ | ارز=%s | نتیجه=%s | مرحله=ریسک | علت=%s | SL%%=%.3f | TP%%=%.3f | NetRR=%.2f | سودخالص=%.4f",
-                            symbol_id, "رد و حذف" if removed else "انتظار", risk.reason,
-                            risk.sl_pct, risk.tp_pct, risk.net_rr, risk.estimated_net_profit,
+                            "واچ | ارز=%s | نتیجه=رد و حذف | مرحله=ریسک | علت=%s | مارجین=%.2f | لوریج=%sx | نُوشنال=%.2f | SL%%=%.4f | TP%%=%.4f | هزینهTP=%.4f | سودخالص=%.4f | زیانخالص=%.4f | NetRR=%.3f | حداقل‌سود=%.4f | حداقلNetRR=%.2f",
+                            symbol_id, risk.reason, risk.trade_usdt, risk.leverage, risk.notional_usdt,
+                            risk.sl_pct, risk.tp_pct, risk.estimated_cost_win, risk.estimated_net_profit,
+                            risk.estimated_net_loss, risk.net_rr, config.MIN_NET_PROFIT_USDT,
+                            config.MIN_NET_RR_ABSOLUTE,
                         )
                     continue
 

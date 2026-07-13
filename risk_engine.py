@@ -65,7 +65,18 @@ class RiskEngine:
         net_profit = notional*tp_pct/100-win_cost
         net_loss = notional*sl_pct/100+loss_cost
         net_rr = net_profit/net_loss if net_loss else 0
-        min_profit = max(config.MIN_NET_PROFIT_USDT, trade_usdt*config.MIN_NET_RETURN_ON_MARGIN_PCT/100)
-        valid = net_profit >= min_profit and net_rr >= config.MIN_NET_RR_ABSOLUTE and tp > 0 and sl > 0
-        reason = 'معتبر' if valid else 'تارگت واقعی پس از هزینه‌ها RR یا سود خالص کافی ندارد'
+        # User rule: the absolute minimum acceptable net profit is 0.05 USDT after fees/slippage.
+        # Leverage changes notional, profit, loss and costs proportionally; it does not improve RR.
+        min_profit = config.MIN_NET_PROFIT_USDT
+        profit_ok = net_profit >= min_profit
+        rr_ok = net_rr >= config.MIN_NET_RR_ABSOLUTE
+        valid = profit_ok and rr_ok and tp > 0 and sl > 0
+        if valid:
+            reason = 'معتبر'
+        elif not profit_ok and not rr_ok:
+            reason = f'سود خالص {net_profit:.4f} کمتر از {min_profit:.4f} و NetRR {net_rr:.2f} کمتر از {config.MIN_NET_RR_ABSOLUTE:.2f} است'
+        elif not profit_ok:
+            reason = f'سود خالص {net_profit:.4f} کمتر از حداقل {min_profit:.4f} USDT است'
+        else:
+            reason = f'NetRR {net_rr:.2f} کمتر از حداقل {config.MIN_NET_RR_ABSOLUTE:.2f} است'
         return RiskPlan(entry,tp,sl,sl_pct,tp_pct,gross_rr,net_rr,trade_usdt,leverage,notional,net_profit,net_loss,win_cost,loss_cost,valid,reason)
