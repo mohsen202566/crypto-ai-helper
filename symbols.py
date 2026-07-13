@@ -1,4 +1,4 @@
-"""ده نماد ثابت نسخه UEM V2.0 و نگاشت OKX/Toobit."""
+"""بیست نماد ثابت و نگاشت OKX/Toobit."""
 from __future__ import annotations
 from dataclasses import dataclass
 
@@ -21,6 +21,17 @@ SYMBOLS: list[SymbolMap] = [
     SymbolMap("AVAX", "AVAX-USDT-SWAP", "AVAXUSDT", "AVAX"),
     SymbolMap("SUI", "SUI-USDT-SWAP", "SUIUSDT", "SUI"),
     SymbolMap("ADA", "ADA-USDT-SWAP", "ADAUSDT", "ADA"),
+    SymbolMap("DOT", "DOT-USDT-SWAP", "DOTUSDT", "DOT"),
+    SymbolMap("LTC", "LTC-USDT-SWAP", "LTCUSDT", "LTC"),
+    SymbolMap("BCH", "BCH-USDT-SWAP", "BCHUSDT", "BCH"),
+    SymbolMap("TRX", "TRX-USDT-SWAP", "TRXUSDT", "TRX"),
+    SymbolMap("TON", "TON-USDT-SWAP", "TONUSDT", "TON"),
+    SymbolMap("NEAR", "NEAR-USDT-SWAP", "NEARUSDT", "NEAR"),
+    SymbolMap("APT", "APT-USDT-SWAP", "APTUSDT", "APT"),
+    SymbolMap("ARB", "ARB-USDT-SWAP", "ARBUSDT", "ARB"),
+    SymbolMap("OP", "OP-USDT-SWAP", "OPUSDT", "OP"),
+    SymbolMap("PEPE", "PEPE-USDT-SWAP", "PEPEUSDT", "PEPE"),
 ]
-BY_ID={s.id:s for s in SYMBOLS}; BY_OKX={s.okx:s for s in SYMBOLS}; BY_TOOBIT={s.toobit:s for s in SYMBOLS}
-def get_symbol(symbol_id:str)->SymbolMap|None:return BY_ID.get(symbol_id.upper())
+BY_ID = {s.id: s for s in SYMBOLS}
+def get_symbol(symbol_id: str) -> SymbolMap | None:
+    return BY_ID.get(symbol_id.upper())

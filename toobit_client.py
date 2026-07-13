@@ -37,6 +37,7 @@ class ToobitFuturesClient:
         self.api_key = config.TOOBIT_API_KEY.strip()
         self.api_secret = config.TOOBIT_API_SECRET.strip()
         self.session = requests.Session()
+        self._rules_cache: dict[str, dict[str, float | str]] = {}
 
     @property
     def has_credentials(self) -> bool:
@@ -107,6 +108,49 @@ class ToobitFuturesClient:
                     return str(v)
         return None
 
+    def get_futures_exchange_info(self) -> Any:
+        return self._request("GET", config.TOOBIT_FUTURES_PATH_EXCHANGE_INFO, signed=False)
+
+    def get_symbol_rules(self, symbol: str) -> dict[str, float | str]:
+        symbol = symbol.upper()
+        cached = self._rules_cache.get(symbol)
+        if cached:
+            return cached
+        payload = self.get_futures_exchange_info()
+        rule: dict[str, float | str] = {"step": "0.000001", "tick": "0.000001", "min_qty": 0.0, "min_notional": 0.0}
+        for item in self._extract_dicts(payload):
+            item_symbol = str(item.get("symbol") or item.get("symbolName") or item.get("s") or "").upper()
+            if item_symbol != symbol:
+                continue
+            filters = item.get("filters") if isinstance(item.get("filters"), list) else []
+            for f in filters:
+                if not isinstance(f, dict):
+                    continue
+                ft = str(f.get("filterType") or "").upper()
+                if ft in ("LOT_SIZE", "MARKET_LOT_SIZE"):
+                    rule["step"] = str(f.get("stepSize") or f.get("qtyStep") or rule["step"])
+                    rule["min_qty"] = safe_float(f.get("minQty") or f.get("minQuantity"), float(rule["min_qty"]))
+                elif ft == "PRICE_FILTER":
+                    rule["tick"] = str(f.get("tickSize") or f.get("priceTick") or rule["tick"])
+                elif ft in ("MIN_NOTIONAL", "NOTIONAL"):
+                    rule["min_notional"] = safe_float(f.get("minNotional") or f.get("notional"), float(rule["min_notional"]))
+            rule["step"] = str(item.get("quantityStep") or item.get("qtyStep") or rule["step"])
+            rule["tick"] = str(item.get("tickSize") or item.get("priceTick") or rule["tick"])
+            rule["min_qty"] = safe_float(item.get("minQty") or item.get("minQuantity"), float(rule["min_qty"]))
+            rule["min_notional"] = safe_float(item.get("minNotional") or item.get("minOrderValue"), float(rule["min_notional"]))
+            break
+        self._rules_cache[symbol] = rule
+        return rule
+
+    @staticmethod
+    def _round_down_step(value: float, step: str) -> str:
+        d = Decimal(str(value))
+        st = Decimal(str(step))
+        if st <= 0:
+            return api_num(value)
+        units = (d / st).to_integral_value(rounding=ROUND_DOWN)
+        return format((units * st).normalize(), "f")
+
     def get_futures_balance(self) -> dict[str, float]:
         payload = self._request("GET", config.TOOBIT_FUTURES_PATH_BALANCE, signed=True)
         best = {"available": 0.0, "total": 0.0, "margin": 0.0}
@@ -168,15 +212,20 @@ class ToobitFuturesClient:
             self.set_isolated_margin(symbol)
         self.set_leverage(symbol, leverage)
         notional = float(usdt_amount) * float(leverage)
-        qty = notional / float(entry_price) if entry_price > 0 else 0.0
-        if qty <= 0:
-            raise ToobitError("quantity صفر است")
+        raw_qty = notional / float(entry_price) if entry_price > 0 else 0.0
+        rules = self.get_symbol_rules(symbol)
+        qty_str = self._round_down_step(raw_qty, str(rules.get("step") or "0.000001"))
+        qty = safe_float(qty_str)
+        if qty <= 0 or qty < float(rules.get("min_qty") or 0.0):
+            raise ToobitError("حجم سفارش پس از گردکردن کمتر از حد مجاز توبیت است")
+        if float(rules.get("min_notional") or 0.0) > 0 and qty * entry_price < float(rules["min_notional"]):
+            raise ToobitError("ارزش سفارش کمتر از حداقل مجاز توبیت است")
         order_side = "BUY" if side_u == "LONG" else "SELL"
         params = {
             "symbol": symbol,
             "side": order_side,
             "type": "MARKET",
-            "quantity": api_num(qty),
+            "quantity": qty_str,
             "newClientOrderId": client_order_id,
             "positionSide": "LONG" if side_u == "LONG" else "SHORT",
             "marginType": "ISOLATED",
@@ -203,3 +252,53 @@ class ToobitFuturesClient:
             params["symbol"] = symbol.upper()
         payload = self._request("GET", config.TOOBIT_FUTURES_PATH_ORDER_HISTORY, params=params, signed=True)
         return self._extract_dicts(payload)
+
+    @staticmethod
+    def _order_symbol(item: dict[str, Any]) -> str:
+        return str(item.get("symbol") or item.get("symbolName") or item.get("s") or "").upper()
+
+    @staticmethod
+    def _order_time_ms(item: dict[str, Any]) -> int:
+        for key in ("updateTime", "transactTime", "time", "createdTime", "closeTime", "executedTime"):
+            value = item.get(key)
+            try:
+                iv = int(value)
+                return iv if iv > 10_000_000_000 else iv * 1000
+            except (TypeError, ValueError):
+                continue
+        return 0
+
+    def get_closed_trade_result(self, symbol: str, side: str, opened_at_ms: int) -> dict[str, Any] | None:
+        """نتیجه واقعی را فقط از تاریخچه توبیت استخراج می‌کند.
+
+        اگر پاسخ API اطلاعات قطعی خروج/PnL نداشته باشد None برمی‌گرداند تا مانیتور
+        حدس نزند و در دور بعد دوباره بررسی کند.
+        """
+        rows = self.get_order_history(symbol=symbol, limit=200)
+        candidates: list[dict[str, Any]] = []
+        wanted_close_side = "SELL" if side.upper() == "LONG" else "BUY"
+        for item in rows:
+            if self._order_symbol(item) not in ("", symbol.upper()):
+                continue
+            ts = self._order_time_ms(item)
+            if ts and ts < int(opened_at_ms):
+                continue
+            item_side = str(item.get("side") or item.get("orderSide") or "").upper()
+            reduce_only = str(item.get("reduceOnly") or item.get("closePosition") or "").lower() in ("true", "1", "yes")
+            status = str(item.get("status") or item.get("orderStatus") or item.get("state") or "").upper()
+            filled = status in ("FILLED", "CLOSED", "DONE", "SUCCESS") or safe_float(item.get("executedQty") or item.get("filledQty") or item.get("cumQty")) > 0
+            if not filled:
+                continue
+            if item_side and item_side != wanted_close_side and not reduce_only:
+                continue
+            candidates.append(item)
+        if not candidates:
+            return None
+        item = max(candidates, key=self._order_time_ms)
+        exit_price = safe_float(item.get("avgPrice") or item.get("averagePrice") or item.get("executedPrice") or item.get("price") or item.get("dealPrice"))
+        realized = safe_float(item.get("realizedPnl") or item.get("realisedPnl") or item.get("closedPnl") or item.get("profit"), float("nan"))
+        fee = safe_float(item.get("fee") or item.get("commission") or item.get("execFee") or item.get("tradeFee"))
+        if exit_price <= 0:
+            return None
+        return {"exit_price": exit_price, "realized_pnl": realized, "fee": fee, "time_ms": self._order_time_ms(item), "raw": item}
+

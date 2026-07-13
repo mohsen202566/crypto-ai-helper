@@ -1,17 +1,16 @@
-"""ذخیره‌سازی سریع SQLite برای وضعیت، سیگنال‌ها، آمار، اسلات و سلامت.
-هیچ دستور تلگرامی نباید مسیر تحلیل را قفل کند؛ همه خواندن‌ها سبک و آماده هستند.
-"""
+"""SQLite thread-safe برای تنظیمات، سیگنال‌ها، آمار و سلامت."""
 from __future__ import annotations
 
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any
 import json
 import sqlite3
 import threading
 import time
-from contextlib import contextmanager
-from pathlib import Path
-from typing import Any
 
 import config
+
 
 class Storage:
     def __init__(self, path: str = config.DB_PATH):
@@ -22,25 +21,50 @@ class Storage:
     @contextmanager
     def connect(self):
         with self._lock:
-            conn = sqlite3.connect(self.path, timeout=10, isolation_level=None)
-            conn.row_factory = sqlite3.Row
+            db = sqlite3.connect(self.path, timeout=10, isolation_level=None)
+            db.row_factory = sqlite3.Row
             try:
-                conn.execute("PRAGMA journal_mode=WAL")
-                conn.execute("PRAGMA synchronous=NORMAL")
-                yield conn
+                db.execute("PRAGMA journal_mode=WAL")
+                db.execute("PRAGMA synchronous=NORMAL")
+                yield db
             finally:
-                conn.close()
+                db.close()
+
+    @staticmethod
+    def _column_names(db: sqlite3.Connection, table: str) -> set[str]:
+        return {str(row[1]) for row in db.execute(f"PRAGMA table_info({table})").fetchall()}
+
+    def _ensure_signal_columns(self, db: sqlite3.Connection) -> None:
+        existing = self._column_names(db, "signals")
+        required = {
+            "trade_usdt": "REAL NOT NULL DEFAULT 0",
+            "leverage": "INTEGER NOT NULL DEFAULT 1",
+            "notional": "REAL NOT NULL DEFAULT 0",
+            "entry_real": "REAL",
+            "exit_price": "REAL",
+            "gross_pnl": "REAL DEFAULT 0",
+            "fee_usdt": "REAL DEFAULT 0",
+            "net_pnl": "REAL DEFAULT 0",
+            "close_reason": "TEXT",
+            "mfe": "REAL DEFAULT 0",
+            "mae": "REAL DEFAULT 0",
+            "order_id": "TEXT",
+            "raw_json": "TEXT DEFAULT '{}'",
+        }
+        for name, ddl in required.items():
+            if name not in existing:
+                db.execute(f"ALTER TABLE signals ADD COLUMN {name} {ddl}")
 
     def _init_db(self) -> None:
         with self.connect() as db:
             db.executescript(
                 """
-                CREATE TABLE IF NOT EXISTS kv (
+                CREATE TABLE IF NOT EXISTS kv(
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL,
                     updated_at INTEGER NOT NULL
                 );
-                CREATE TABLE IF NOT EXISTS signals (
+                CREATE TABLE IF NOT EXISTS signals(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     symbol_id TEXT NOT NULL,
                     okx_symbol TEXT NOT NULL,
@@ -61,6 +85,9 @@ class Storage:
                     closed_at INTEGER,
                     entry_real REAL,
                     exit_price REAL,
+                    trade_usdt REAL NOT NULL DEFAULT 0,
+                    leverage INTEGER NOT NULL DEFAULT 1,
+                    notional REAL NOT NULL DEFAULT 0,
                     gross_pnl REAL DEFAULT 0,
                     fee_usdt REAL DEFAULT 0,
                     net_pnl REAL DEFAULT 0,
@@ -70,17 +97,7 @@ class Storage:
                     order_id TEXT,
                     raw_json TEXT DEFAULT '{}'
                 );
-                CREATE TABLE IF NOT EXISTS profiles (
-                    symbol_id TEXT PRIMARY KEY,
-                    noise_median REAL DEFAULT 0,
-                    noise_p70 REAL DEFAULT 0,
-                    min_sl_pct REAL DEFAULT 0,
-                    tp_median REAL DEFAULT 0,
-                    tp_p70 REAL DEFAULT 0,
-                    signal_count INTEGER DEFAULT 0,
-                    updated_at INTEGER NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS health_events (
+                CREATE TABLE IF NOT EXISTS health_events(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     component TEXT NOT NULL,
                     severity TEXT NOT NULL,
@@ -89,7 +106,7 @@ class Storage:
                     created_at INTEGER NOT NULL,
                     cleared_at INTEGER
                 );
-                CREATE TABLE IF NOT EXISTS blacklist (
+                CREATE TABLE IF NOT EXISTS blacklist(
                     symbol_id TEXT PRIMARY KEY,
                     reason TEXT NOT NULL,
                     until_ts INTEGER NOT NULL,
@@ -97,36 +114,40 @@ class Storage:
                 );
                 """
             )
-            defaults = {
-                "trading_enabled": config.TRADING_ENABLED_DEFAULT,
-                "auto_signal_enabled": config.AUTO_SIGNAL_ENABLED_DEFAULT,
-                "trade_usdt": config.TRADE_USDT_DEFAULT,
-                "leverage": config.LEVERAGE_DEFAULT,
-                "max_positions": config.MAX_POSITIONS_DEFAULT,
-                "profit_today": 0.0,
-                "profit_total": 0.0,
-                "stats_reset_at": int(time.time()),
-                "profit_reset_at": int(time.time()),
-                "toobit_connected": False,
-                "toobit_margin_usdt": 0.0,
-                "toobit_available_usdt": 0.0,
-                "toobit_total_usdt": 0.0,
-                "toobit_last_error": "",
-                "toobit_last_update": 0,
-            }
-            for key, value in defaults.items():
-                if self.get(key, None) is None:
-                    self.set(key, value)
+            self._ensure_signal_columns(db)
+
+        defaults = {
+            "trading_enabled": config.TRADING_ENABLED_DEFAULT,
+            "auto_signal_enabled": config.AUTO_SIGNAL_ENABLED_DEFAULT,
+            "trade_usdt": config.TRADE_USDT_DEFAULT,
+            "leverage": config.LEVERAGE_DEFAULT,
+            "max_positions": config.MAX_POSITIONS_DEFAULT,
+            "profit_today": 0.0,
+            "profit_total": 0.0,
+            "profit_day": time.strftime("%Y-%m-%d", time.gmtime()),
+            "stats_reset_at": int(time.time()),
+            "profit_reset_at": int(time.time()),
+            "telegram_offset": 0,
+            "toobit_connected": False,
+            "toobit_margin_usdt": 0.0,
+            "toobit_available_usdt": 0.0,
+            "toobit_total_usdt": 0.0,
+            "toobit_last_error": "",
+            "toobit_last_update": 0,
+        }
+        for key, value in defaults.items():
+            if self.get(key, None) is None:
+                self.set(key, value)
 
     def get(self, key: str, default: Any = None) -> Any:
         with self.connect() as db:
             row = db.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
-            if not row:
-                return default
-            try:
-                return json.loads(row["value"])
-            except Exception:
-                return default
+        if not row:
+            return default
+        try:
+            return json.loads(row["value"])
+        except Exception:
+            return default
 
     def set(self, key: str, value: Any) -> None:
         with self.connect() as db:
@@ -139,161 +160,196 @@ class Storage:
         now = int(time.time())
         cols = [
             "symbol_id", "okx_symbol", "toobit_symbol", "side", "strength", "entry", "tp", "sl", "rr",
-            "trade_mode", "status", "is_real", "slot_id", "message_id", "created_at", "order_id", "raw_json"
+            "trade_mode", "status", "is_real", "slot_id", "message_id", "created_at", "opened_at", "entry_real",
+            "trade_usdt", "leverage", "notional", "order_id", "raw_json",
         ]
-        vals = [
-            data.get("symbol_id"), data.get("okx_symbol"), data.get("toobit_symbol"), data.get("side"),
-            data.get("strength"), data.get("entry"), data.get("tp"), data.get("sl"), data.get("rr"),
-            data.get("trade_mode", "virtual"), data.get("status", "open"), int(bool(data.get("is_real"))),
-            data.get("slot_id"), data.get("message_id"), data.get("created_at", now), data.get("order_id"),
-            json.dumps(data.get("raw", {}), ensure_ascii=False),
-        ]
+        values = {
+            **data,
+            "created_at": data.get("created_at", now),
+            "is_real": int(bool(data.get("is_real"))),
+            "raw_json": json.dumps(data.get("raw", {}), ensure_ascii=False),
+        }
+        vals = [values.get(k) for k in cols]
         with self.connect() as db:
-            cur = db.execute(f"INSERT INTO signals({','.join(cols)}) VALUES({','.join(['?']*len(cols))})", vals)
+            cur = db.execute(
+                f"INSERT INTO signals({','.join(cols)}) VALUES({','.join(['?'] * len(cols))})",
+                vals,
+            )
             return int(cur.lastrowid)
 
     def update_signal(self, signal_id: int, **fields: Any) -> None:
-        if not fields:
-            return
         allowed = {
             "status", "message_id", "opened_at", "closed_at", "entry_real", "exit_price", "gross_pnl",
-            "fee_usdt", "net_pnl", "close_reason", "mfe", "mae", "order_id", "slot_id", "raw_json"
+            "fee_usdt", "net_pnl", "close_reason", "mfe", "mae", "order_id", "slot_id", "is_real",
+            "trade_mode", "raw_json",
         }
-        parts, vals = [], []
-        for k, v in fields.items():
-            if k in allowed:
-                parts.append(f"{k}=?")
-                vals.append(v if k != "raw_json" or isinstance(v, str) else json.dumps(v, ensure_ascii=False))
-        if not parts:
+        items = [(k, v) for k, v in fields.items() if k in allowed]
+        if not items:
             return
+        parts: list[str] = []
+        vals: list[Any] = []
+        for key, value in items:
+            parts.append(f"{key}=?")
+            vals.append(json.dumps(value, ensure_ascii=False) if key == "raw_json" and not isinstance(value, str) else value)
         vals.append(signal_id)
         with self.connect() as db:
             db.execute(f"UPDATE signals SET {','.join(parts)} WHERE id=?", vals)
 
-    def get_open_signals(self) -> list[dict[str, Any]]:
-        with self.connect() as db:
-            rows = db.execute("SELECT * FROM signals WHERE status IN ('open','pending') ORDER BY id ASC").fetchall()
-            return [dict(r) for r in rows]
-
     def get_signal(self, signal_id: int) -> dict[str, Any] | None:
         with self.connect() as db:
             row = db.execute("SELECT * FROM signals WHERE id=?", (signal_id,)).fetchone()
-            return dict(row) if row else None
+        return dict(row) if row else None
+
+    def get_open_signals(self) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute("SELECT * FROM signals WHERE status IN ('open','pending') ORDER BY id").fetchall()
+        return [dict(row) for row in rows]
 
     def count_real_open(self) -> int:
         with self.connect() as db:
-            row = db.execute("SELECT COUNT(*) c FROM signals WHERE is_real=1 AND status IN ('open','pending')").fetchone()
-            return int(row["c"])
+            row = db.execute(
+                "SELECT COUNT(*) AS n FROM signals WHERE is_real=1 AND status IN ('open','pending')"
+            ).fetchone()
+        return int(row["n"])
 
-    def stats(self) -> dict[str, Any]:
-        reset_at = int(self.get("stats_reset_at", 0) or 0)
-        with self.connect() as db:
-            total = db.execute("SELECT COUNT(*) c FROM signals WHERE created_at>=?", (reset_at,)).fetchone()["c"]
-            open_c = db.execute("SELECT COUNT(*) c FROM signals WHERE created_at>=? AND status IN ('open','pending')", (reset_at,)).fetchone()["c"]
-            tp = db.execute("SELECT COUNT(*) c FROM signals WHERE created_at>=? AND close_reason='TP'", (reset_at,)).fetchone()["c"]
-            sl = db.execute("SELECT COUNT(*) c FROM signals WHERE created_at>=? AND close_reason='SL'", (reset_at,)).fetchone()["c"]
-            real = db.execute("SELECT COUNT(*) c FROM signals WHERE created_at>=? AND is_real=1", (reset_at,)).fetchone()["c"]
-            virt = db.execute("SELECT COUNT(*) c FROM signals WHERE created_at>=? AND is_real=0", (reset_at,)).fetchone()["c"]
-            pnl = db.execute("SELECT COALESCE(SUM(net_pnl),0) p FROM signals WHERE created_at>=? AND status='closed'", (reset_at,)).fetchone()["p"]
-            return {"signals": total, "open": open_c, "tp": tp, "sl": sl, "real": real, "virtual": virt, "net_pnl": float(pnl)}
+    def close_signal(
+        self,
+        signal_id: int,
+        exit_price: float,
+        gross: float,
+        fee: float,
+        net: float,
+        reason: str,
+        mfe: float,
+        mae: float,
+    ) -> None:
+        current = self.get_signal(signal_id)
+        if not current or current.get("status") == "closed":
+            return
+        self.update_signal(
+            signal_id,
+            status="closed",
+            closed_at=int(time.time()),
+            exit_price=exit_price,
+            gross_pnl=gross,
+            fee_usdt=fee,
+            net_pnl=net,
+            close_reason=reason,
+            mfe=mfe,
+            mae=mae,
+        )
+        self.roll_profit_day()
+        self.set("profit_today", float(self.get("profit_today", 0.0)) + net)
+        self.set("profit_total", float(self.get("profit_total", 0.0)) + net)
+
+    def roll_profit_day(self) -> None:
+        today = time.strftime("%Y-%m-%d", time.gmtime())
+        if self.get("profit_day", "") != today:
+            self.set("profit_day", today)
+            self.set("profit_today", 0.0)
 
     def reset_stats(self) -> None:
-        # حذف فیزیکی انجام نمی‌دهد تا مانیتورینگ پوزیشن‌های باز خراب نشود؛ فقط پنل آمار از این لحظه صفر می‌شود.
-        self.set("stats_reset_at", int(time.time()) + 1)
+        self.set("stats_reset_at", int(time.time()))
 
     def reset_profit(self) -> None:
-        # فقط پنل سود/ضرر را صفر می‌کند؛ جزئیات نتایج هر سیگنال دست‌نخورده می‌ماند.
         self.set("profit_today", 0.0)
         self.set("profit_total", 0.0)
         self.set("profit_reset_at", int(time.time()))
+        self.set("profit_day", time.strftime("%Y-%m-%d", time.gmtime()))
 
-    def add_profit(self, amount: float) -> None:
-        self.set("profit_today", float(self.get("profit_today", 0.0)) + float(amount))
-        self.set("profit_total", float(self.get("profit_total", 0.0)) + float(amount))
-
-    def upsert_profile(self, symbol_id: str, data: dict[str, Any]) -> None:
+    def stats(self) -> dict[str, Any]:
+        self.roll_profit_day()
+        reset = int(self.get("stats_reset_at", 0))
         with self.connect() as db:
-            db.execute(
-                """INSERT OR REPLACE INTO profiles(symbol_id,noise_median,noise_p70,min_sl_pct,tp_median,tp_p70,signal_count,updated_at)
-                VALUES(?,?,?,?,?,?,?,?)""",
-                (
-                    symbol_id, float(data.get("noise_median", 0)), float(data.get("noise_p70", 0)),
-                    float(data.get("min_sl_pct", 0)), float(data.get("tp_median", 0)), float(data.get("tp_p70", 0)),
-                    int(data.get("signal_count", 0)), int(data.get("updated_at", time.time())),
-                ),
-            )
+            rows = db.execute("SELECT * FROM signals WHERE created_at>=? ORDER BY id", (reset,)).fetchall()
+        items = [dict(row) for row in rows]
+        closed = [row for row in items if row["status"] == "closed"]
+        tp = sum(1 for row in closed if row.get("close_reason") == "TP")
+        sl = sum(1 for row in closed if row.get("close_reason") == "SL")
+        real = [row for row in items if int(row.get("is_real") or 0) == 1]
+        virtual = [row for row in items if int(row.get("is_real") or 0) == 0]
 
-    def get_profile(self, symbol_id: str) -> dict[str, Any] | None:
-        with self.connect() as db:
-            row = db.execute("SELECT * FROM profiles WHERE symbol_id=?", (symbol_id,)).fetchone()
-            return dict(row) if row else None
+        def net(rows_: list[dict[str, Any]]) -> float:
+            return sum(float(row.get("net_pnl") or 0.0) for row in rows_)
 
-
-    def recent_closed_signals(self, minutes: int = 90, limit: int = 10) -> list[dict[str, Any]]:
-        since = int(time.time() - max(1, int(minutes)) * 60)
-        with self.connect() as db:
-            rows = db.execute(
-                """SELECT id,symbol_id,side,close_reason,mfe,mae,net_pnl,closed_at,created_at
-                FROM signals
-                WHERE status='closed' AND COALESCE(closed_at,0)>=?
-                ORDER BY closed_at DESC, id DESC
-                LIMIT ?""",
-                (since, int(limit)),
-            ).fetchall()
-            return [dict(r) for r in rows]
-
-    def chop_guard_active(self) -> tuple[bool, str]:
-        if not bool(getattr(config, "CHOP_GUARD_ENABLED", True)):
-            return False, "غیرفعال"
-        recent = self.recent_closed_signals(
-            minutes=int(getattr(config, "CHOP_GUARD_LOOKBACK_MINUTES", 90)),
-            limit=max(3, int(getattr(config, "CHOP_GUARD_SL_COUNT", 3))),
-        )
-        min_closed = int(getattr(config, "CHOP_GUARD_MIN_CLOSED", 3))
-        sl_needed = int(getattr(config, "CHOP_GUARD_SL_COUNT", 3))
-        if len(recent) < min_closed:
-            return False, "نمونه بسته کافی نیست"
-        head = recent[:sl_needed]
-        if len(head) < sl_needed:
-            return False, "نمونه SL کافی نیست"
-        sl_count = sum(1 for r in head if str(r.get("close_reason")) == "SL")
-        avg_mfe = sum(float(r.get("mfe") or 0.0) for r in head) / max(len(head), 1)
-        if sl_count >= sl_needed and avg_mfe <= float(getattr(config, "CHOP_GUARD_MAX_AVG_MFE", 0.16)):
-            return True, f"{sl_count} SL پشت‌سرهم با MFE میانگین {avg_mfe:.3f}%"
-        return False, f"SL={sl_count}/{sl_needed} avg_mfe={avg_mfe:.3f}%"
+        return {
+            "signals": len(items),
+            "open": sum(1 for row in items if row["status"] in ("open", "pending")),
+            "pending": sum(1 for row in items if row["status"] == "pending"),
+            "tp": tp,
+            "sl": sl,
+            "real": len(real),
+            "virtual": len(virtual),
+            "net_pnl": net(closed),
+            "real_net": net(real),
+            "virtual_net": net(virtual),
+        }
 
     def add_health_event(self, component: str, severity: str, message: str, symbol_id: str | None = None) -> None:
+        now = int(time.time())
         with self.connect() as db:
+            duplicate = db.execute(
+                """
+                SELECT id FROM health_events
+                WHERE component=? AND severity=? AND message=? AND COALESCE(symbol_id,'')=COALESCE(?, '')
+                  AND cleared_at IS NULL AND created_at>=?
+                LIMIT 1
+                """,
+                (component, severity, message, symbol_id, now - 300),
+            ).fetchone()
+            if duplicate:
+                return
             db.execute(
                 "INSERT INTO health_events(component,severity,message,symbol_id,created_at) VALUES(?,?,?,?,?)",
-                (component, severity, message, symbol_id, int(time.time())),
+                (component, severity, message, symbol_id, now),
             )
 
     def active_health_events(self) -> list[dict[str, Any]]:
         with self.connect() as db:
-            rows = db.execute("SELECT * FROM health_events WHERE cleared_at IS NULL ORDER BY id DESC LIMIT 20").fetchall()
-            return [dict(r) for r in rows]
+            rows = db.execute(
+                "SELECT * FROM health_events WHERE cleared_at IS NULL ORDER BY id DESC LIMIT 20"
+            ).fetchall()
+        return [dict(row) for row in rows]
 
-    def blacklist_symbol(self, symbol_id: str, reason: str, seconds: int) -> None:
-        until_ts = int(time.time() + seconds)
+    def clear_health_component(self, component: str, symbol_id: str | None = None) -> None:
         with self.connect() as db:
-            row = db.execute("SELECT count FROM blacklist WHERE symbol_id=?", (symbol_id,)).fetchone()
-            count = int(row["count"]) + 1 if row else 1
-            db.execute("INSERT OR REPLACE INTO blacklist(symbol_id,reason,until_ts,count) VALUES(?,?,?,?)", (symbol_id, reason, until_ts, count))
+            if symbol_id is None:
+                db.execute(
+                    "UPDATE health_events SET cleared_at=? WHERE component=? AND cleared_at IS NULL",
+                    (int(time.time()), component),
+                )
+            else:
+                db.execute(
+                    """
+                    UPDATE health_events SET cleared_at=?
+                    WHERE component=? AND symbol_id=? AND cleared_at IS NULL
+                    """,
+                    (int(time.time()), component, symbol_id),
+                )
+
+    def blacklist(self, symbol_id: str, reason: str, seconds: int) -> None:
+        until = int(time.time()) + int(seconds)
+        with self.connect() as db:
+            db.execute(
+                """
+                INSERT INTO blacklist(symbol_id,reason,until_ts,count) VALUES(?,?,?,1)
+                ON CONFLICT(symbol_id) DO UPDATE SET
+                    reason=excluded.reason,
+                    until_ts=excluded.until_ts,
+                    count=blacklist.count+1
+                """,
+                (symbol_id, reason, until),
+            )
 
     def is_blacklisted(self, symbol_id: str) -> bool:
-        now = int(time.time())
         with self.connect() as db:
             row = db.execute("SELECT until_ts FROM blacklist WHERE symbol_id=?", (symbol_id,)).fetchone()
-            if not row:
-                return False
-            if int(row["until_ts"]) <= now:
-                db.execute("DELETE FROM blacklist WHERE symbol_id=?", (symbol_id,))
-                return False
-            return True
+        return bool(row and int(row["until_ts"]) > int(time.time()))
 
     def blacklist_rows(self) -> list[dict[str, Any]]:
-        now = int(time.time())
         with self.connect() as db:
-            rows = db.execute("SELECT * FROM blacklist WHERE until_ts>?", (now,)).fetchall()
-            return [dict(r) for r in rows]
+            rows = db.execute(
+                "SELECT * FROM blacklist WHERE until_ts>? ORDER BY until_ts",
+                (int(time.time()),),
+            ).fetchall()
+        return [dict(row) for row in rows]
