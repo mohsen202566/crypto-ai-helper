@@ -1,7 +1,4 @@
-"""کلاینت Toobit Futures/Contract.
-بر اساس سبک امضا و request فایل Spot موجود، اما مخصوص فیوچرز، ایزوله، لوریج و TP/SL همزمان.
-نکته: مسیرهای API در config قابل تنظیم هستند تا با نسخه واقعی Toobit هماهنگ شوند.
-"""
+"""کلاینت فیوچرز USDT-M توبیت با ایزوله، لوریج، TP/SL و نتیجه دقیق."""
 from __future__ import annotations
 
 import hashlib
@@ -15,29 +12,33 @@ import requests
 
 import config
 
+
 class ToobitError(RuntimeError):
     pass
 
-def safe_float(v: Any, default: float = 0.0) -> float:
+
+def safe_float(value: Any, default: float = 0.0) -> float:
     try:
-        if v is None or v == "":
+        if value in (None, ""):
             return default
-        return float(v)
-    except Exception:
+        return float(value)
+    except (TypeError, ValueError):
         return default
 
-def api_num(value: float, digits: int = 8) -> str:
-    d = Decimal(str(value)).quantize(Decimal("1." + "0" * digits), rounding=ROUND_DOWN)
-    return format(d.normalize(), "f")
+
+def api_number(value: float, digits: int = 10) -> str:
+    quant = Decimal("1." + "0" * digits)
+    return format(Decimal(str(value)).quantize(quant, rounding=ROUND_DOWN).normalize(), "f")
+
 
 class ToobitFuturesClient:
-    def __init__(self, base_url: str = config.TOOBIT_BASE_URL, timeout: int = config.REQUEST_TIMEOUT):
-        self.base_url = base_url.rstrip("/")
-        self.timeout = timeout
-        self.api_key = config.TOOBIT_API_KEY.strip()
-        self.api_secret = config.TOOBIT_API_SECRET.strip()
+    def __init__(self) -> None:
+        self.base_url = config.TOOBIT_BASE_URL
+        self.timeout = config.TOOBIT_REQUEST_TIMEOUT
+        self.api_key = config.TOOBIT_API_KEY
+        self.api_secret = config.TOOBIT_API_SECRET
         self.session = requests.Session()
-        self._rules_cache: dict[str, dict[str, float | str]] = {}
+        self._rules: dict[str, dict[str, Any]] = {}
 
     @property
     def has_credentials(self) -> bool:
@@ -47,258 +48,315 @@ class ToobitFuturesClient:
         query = urlencode(params, doseq=True)
         return hmac.new(self.api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
 
-    def _request(self, method: str, path: str, params: dict[str, Any] | None = None, signed: bool = False) -> Any:
-        params = dict(params or {})
+    def _request(
+        self,
+        method: str,
+        path: str,
+        params: dict[str, Any] | None = None,
+        signed: bool = False,
+    ) -> Any:
+        data = dict(params or {})
         headers: dict[str, str] = {}
         if signed:
             if not self.has_credentials:
                 raise ToobitError("کلید API توبیت تنظیم نشده است")
-            params.setdefault("timestamp", int(time.time() * 1000))
-            params.setdefault("recvWindow", config.RECV_WINDOW)
-            params["signature"] = self._sign(params)
+            data.setdefault("timestamp", int(time.time() * 1000))
+            data.setdefault("recvWindow", config.TOOBIT_RECV_WINDOW)
+            data["signature"] = self._sign(data)
             headers["X-BB-APIKEY"] = self.api_key
         url = f"{self.base_url}{path}"
         try:
-            m = method.upper()
-            if m == "GET":
-                r = self.session.get(url, params=params, headers=headers, timeout=self.timeout)
-            elif m == "POST":
-                r = self.session.post(url, data=params, headers=headers, timeout=self.timeout)
-            elif m == "DELETE":
-                r = self.session.delete(url, data=params, headers=headers, timeout=self.timeout)
+            method_u = method.upper()
+            if method_u == "GET":
+                response = self.session.get(url, params=data, headers=headers, timeout=self.timeout)
+            elif method_u == "POST":
+                response = self.session.post(url, data=data, headers=headers, timeout=self.timeout)
+            elif method_u == "DELETE":
+                response = self.session.delete(url, data=data, headers=headers, timeout=self.timeout)
             else:
                 raise ToobitError(f"متد پشتیبانی نمی‌شود: {method}")
-            if r.status_code >= 400:
-                raise ToobitError(f"HTTP {r.status_code}: {r.text[:500]}")
-            payload = r.json()
+            if response.status_code >= 400:
+                raise ToobitError(f"HTTP {response.status_code}: {response.text[:400]}")
+            payload = response.json()
+        except ToobitError:
+            raise
         except Exception as exc:
-            if isinstance(exc, ToobitError):
-                raise
-            raise ToobitError(f"خطا در ارتباط با Toobit Futures: {exc}") from exc
+            raise ToobitError(f"خطا در ارتباط با توبیت: {exc}") from exc
         if isinstance(payload, dict):
-            code = payload.get("code") or payload.get("retCode") or payload.get("status")
-            if code not in (None, 0, 200, "0", "200", "OK", "ok", "success", "SUCCESS", True):
-                raise ToobitError(f"پاسخ ناموفق Toobit: {payload.get('msg') or payload.get('message') or payload}")
+            code = payload.get("code")
+            if code not in (None, 0, 200, "0", "200"):
+                raise ToobitError(str(payload.get("msg") or payload.get("message") or payload))
         return payload
 
     @staticmethod
-    def _extract_dicts(payload: Any) -> list[dict[str, Any]]:
+    def _rows(payload: Any) -> list[dict[str, Any]]:
         if isinstance(payload, list):
-            return [x for x in payload if isinstance(x, dict)]
+            return [row for row in payload if isinstance(row, dict)]
         if not isinstance(payload, dict):
             return []
-        out: list[dict[str, Any]] = []
-        for k in ("data", "result", "rows", "list", "positions", "orders", "assets"):
-            v = payload.get(k)
-            if isinstance(v, dict):
-                out.append(v)
-                out.extend(ToobitFuturesClient._extract_dicts(v))
-            elif isinstance(v, list):
-                out.extend(x for x in v if isinstance(x, dict))
-        if not out:
-            out.append(payload)
+        for key in ("data", "result", "rows", "list", "positions", "orders", "assets"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [row for row in value if isinstance(row, dict)]
+            if isinstance(value, dict):
+                nested = ToobitFuturesClient._rows(value)
+                if nested:
+                    return nested
+        return [payload]
+
+    def list_usdt_contracts(self) -> dict[str, str]:
+        payload = self._request("GET", config.TOOBIT_PATH_EXCHANGE_INFO)
+        contracts: list[dict[str, Any]] = []
+        if isinstance(payload, dict) and isinstance(payload.get("contracts"), list):
+            contracts = [row for row in payload["contracts"] if isinstance(row, dict)]
+        else:
+            for row in self._rows(payload):
+                if "underlying" in row or "marginToken" in row:
+                    contracts.append(row)
+        out: dict[str, str] = {}
+        for row in contracts:
+            base = str(row.get("underlying") or "").upper()
+            symbol = str(row.get("symbol") or row.get("symbolName") or "").upper()
+            margin = str(row.get("marginToken") or row.get("quoteAsset") or "").upper()
+            status = str(row.get("status") or "").upper()
+            inverse = bool(row.get("inverse", False))
+            if base and symbol and margin == "USDT" and not inverse and status == "TRADING":
+                out[base] = symbol
+                self._rules[symbol] = self._parse_rule(row)
         return out
 
     @staticmethod
-    def _extract_order_id(payload: Any) -> str | None:
-        for item in ToobitFuturesClient._extract_dicts(payload):
-            for key in ("orderId", "order_id", "id", "clientOrderId", "newClientOrderId"):
-                v = item.get(key)
-                if v not in (None, ""):
-                    return str(v)
-        return None
-
-    def get_futures_exchange_info(self) -> Any:
-        return self._request("GET", config.TOOBIT_FUTURES_PATH_EXCHANGE_INFO, signed=False)
-
-    def get_symbol_rules(self, symbol: str) -> dict[str, float | str]:
-        symbol = symbol.upper()
-        cached = self._rules_cache.get(symbol)
-        if cached:
-            return cached
-        payload = self.get_futures_exchange_info()
-        rule: dict[str, float | str] = {"step": "0.000001", "tick": "0.000001", "min_qty": 0.0, "min_notional": 0.0}
-        for item in self._extract_dicts(payload):
-            item_symbol = str(item.get("symbol") or item.get("symbolName") or item.get("s") or "").upper()
-            if item_symbol != symbol:
+    def _parse_rule(row: dict[str, Any]) -> dict[str, Any]:
+        rule: dict[str, Any] = {
+            "step": "0.000001",
+            "tick": "0.000001",
+            "min_qty": 0.0,
+            "min_notional": 0.0,
+        }
+        for item in row.get("filters") or []:
+            if not isinstance(item, dict):
                 continue
-            filters = item.get("filters") if isinstance(item.get("filters"), list) else []
-            for f in filters:
-                if not isinstance(f, dict):
-                    continue
-                ft = str(f.get("filterType") or "").upper()
-                if ft in ("LOT_SIZE", "MARKET_LOT_SIZE"):
-                    rule["step"] = str(f.get("stepSize") or f.get("qtyStep") or rule["step"])
-                    rule["min_qty"] = safe_float(f.get("minQty") or f.get("minQuantity"), float(rule["min_qty"]))
-                elif ft == "PRICE_FILTER":
-                    rule["tick"] = str(f.get("tickSize") or f.get("priceTick") or rule["tick"])
-                elif ft in ("MIN_NOTIONAL", "NOTIONAL"):
-                    rule["min_notional"] = safe_float(f.get("minNotional") or f.get("notional"), float(rule["min_notional"]))
-            rule["step"] = str(item.get("quantityStep") or item.get("qtyStep") or rule["step"])
-            rule["tick"] = str(item.get("tickSize") or item.get("priceTick") or rule["tick"])
-            rule["min_qty"] = safe_float(item.get("minQty") or item.get("minQuantity"), float(rule["min_qty"]))
-            rule["min_notional"] = safe_float(item.get("minNotional") or item.get("minOrderValue"), float(rule["min_notional"]))
-            break
-        self._rules_cache[symbol] = rule
+            kind = str(item.get("filterType") or "").upper()
+            if kind in ("LOT_SIZE", "MARKET_LOT_SIZE"):
+                rule["step"] = str(item.get("stepSize") or rule["step"])
+                rule["min_qty"] = safe_float(item.get("minQty"), rule["min_qty"])
+            elif kind == "PRICE_FILTER":
+                rule["tick"] = str(item.get("tickSize") or rule["tick"])
+            elif kind in ("MIN_NOTIONAL", "NOTIONAL"):
+                rule["min_notional"] = safe_float(item.get("minNotional"), rule["min_notional"])
         return rule
 
+    def get_symbol_rules(self, symbol: str) -> dict[str, Any]:
+        symbol_u = symbol.upper()
+        if symbol_u not in self._rules:
+            self.list_usdt_contracts()
+        return self._rules.get(
+            symbol_u,
+            {"step": "0.000001", "tick": "0.000001", "min_qty": 0.0, "min_notional": 0.0},
+        )
+
     @staticmethod
-    def _round_down_step(value: float, step: str) -> str:
-        d = Decimal(str(value))
-        st = Decimal(str(step))
-        if st <= 0:
-            return api_num(value)
-        units = (d / st).to_integral_value(rounding=ROUND_DOWN)
-        return format((units * st).normalize(), "f")
+    def _round_down(value: float, step: str) -> str:
+        number = Decimal(str(value))
+        unit = Decimal(str(step))
+        if unit <= 0:
+            return api_number(value)
+        return format(((number / unit).to_integral_value(rounding=ROUND_DOWN) * unit).normalize(), "f")
 
-    def get_futures_balance(self) -> dict[str, float]:
-        payload = self._request("GET", config.TOOBIT_FUTURES_PATH_BALANCE, signed=True)
-        best = {"available": 0.0, "total": 0.0, "margin": 0.0}
-        for item in self._extract_dicts(payload):
-            coin = str(item.get("asset") or item.get("coin") or item.get("currency") or "USDT").upper()
-            if coin and coin != "USDT":
+    def get_balance(self) -> dict[str, float]:
+        payload = self._request("GET", config.TOOBIT_PATH_BALANCE, signed=True)
+        result = {"available": 0.0, "total": 0.0, "margin": 0.0}
+        for row in self._rows(payload):
+            asset = str(row.get("asset") or row.get("coin") or row.get("currency") or "USDT").upper()
+            if asset != "USDT":
                 continue
-            best["available"] = max(best["available"], safe_float(item.get("available") or item.get("availableBalance") or item.get("free")))
-            best["total"] = max(best["total"], safe_float(item.get("balance") or item.get("total") or item.get("walletBalance")))
-            best["margin"] = max(best["margin"], safe_float(item.get("marginBalance") or item.get("equity") or item.get("total")))
-        if best["margin"] <= 0 and best["available"] > 0:
-            best["margin"] = best["available"]
-        return best
+            result["available"] = max(
+                result["available"], safe_float(row.get("availableBalance") or row.get("available") or row.get("free"))
+            )
+            result["total"] = max(
+                result["total"], safe_float(row.get("balance") or row.get("total") or row.get("walletBalance"))
+            )
+            result["margin"] = max(
+                result["margin"],
+                safe_float(
+                    row.get("positionMargin")
+                    or row.get("marginBalance")
+                    or row.get("equity")
+                    or row.get("total")
+                ),
+            )
+        if result["margin"] <= 0:
+            result["margin"] = result["total"] or result["available"]
+        return result
 
-    def set_isolated_margin(self, symbol: str) -> Any:
-        params = {"symbol": symbol.upper(), "marginType": "ISOLATED"}
-        return self._request("POST", config.TOOBIT_FUTURES_PATH_MARGIN_TYPE, params=params, signed=True)
+    def set_isolated(self, symbol: str) -> None:
+        try:
+            self._request(
+                "POST", config.TOOBIT_PATH_MARGIN_TYPE,
+                {"symbol": symbol.upper(), "marginType": "ISOLATED"}, signed=True,
+            )
+        except ToobitError as exc:
+            # Exchanges often return an error when the requested mode is already active.
+            text = str(exc).lower()
+            if "same" not in text and "already" not in text and "no need" not in text:
+                raise
 
-    def set_leverage(self, symbol: str, leverage: int) -> Any:
-        lev = max(config.LEVERAGE_MIN, min(int(leverage), config.LEVERAGE_MAX))
-        params = {"symbol": symbol.upper(), "leverage": lev}
-        return self._request("POST", config.TOOBIT_FUTURES_PATH_LEVERAGE, params=params, signed=True)
+    def set_leverage(self, symbol: str, leverage: int) -> None:
+        self._request(
+            "POST", config.TOOBIT_PATH_LEVERAGE,
+            {"symbol": symbol.upper(), "leverage": int(leverage)}, signed=True,
+        )
 
     def get_open_positions(self, symbol: str | None = None) -> list[dict[str, Any]]:
         params: dict[str, Any] = {}
         if symbol:
             params["symbol"] = symbol.upper()
-        payload = self._request("GET", config.TOOBIT_FUTURES_PATH_POSITIONS, params=params, signed=True)
-        rows: list[dict[str, Any]] = []
-        for item in self._extract_dicts(payload):
-            sym = str(item.get("symbol") or item.get("symbolName") or "").upper()
-            if symbol and sym not in ("", symbol.upper()):
+        payload = self._request("GET", config.TOOBIT_PATH_POSITIONS, params, signed=True)
+        out: list[dict[str, Any]] = []
+        for row in self._rows(payload):
+            sym = str(row.get("symbol") or "").upper()
+            if symbol and sym != symbol.upper():
                 continue
-            size = safe_float(item.get("positionAmt") or item.get("size") or item.get("qty") or item.get("quantity"))
-            if abs(size) > 0:
-                rows.append(item)
-        return rows
+            qty = safe_float(row.get("position") or row.get("positionAmt") or row.get("size") or row.get("qty"))
+            if abs(qty) > 0:
+                out.append(row)
+        return out
 
-    def check_position_opened(self, symbol: str) -> bool:
+    def is_position_open(self, symbol: str) -> bool:
         return bool(self.get_open_positions(symbol))
 
-    def open_futures_position_with_tpsl(
+    def set_trading_stop(self, symbol: str, side: str, tp: float, sl: float, quantity: str) -> Any:
+        return self._request(
+            "POST",
+            config.TOOBIT_PATH_TRADING_STOP,
+            {
+                "symbol": symbol.upper(),
+                "side": side.upper(),
+                "takeProfit": api_number(tp),
+                "stopLoss": api_number(sl),
+                "tpTriggerBy": "CONTRACT_PRICE",
+                "slTriggerBy": "CONTRACT_PRICE",
+                "tpSize": quantity,
+                "slSize": quantity,
+                "stopType": "FIXED_STOP",
+            },
+            signed=True,
+        )
+
+    def open_position(
         self,
         symbol: str,
         side: str,
-        usdt_amount: float,
+        margin_usdt: float,
         leverage: int,
-        entry_price: float,
-        tp_price: float,
-        sl_price: float,
+        reference_price: float,
+        tp: float,
+        sl: float,
         client_order_id: str,
     ) -> dict[str, Any]:
-        """ارسال پوزیشن با TP/SL همراه.
-        اگر Toobit نام پارامتر متفاوتی داشته باشد، فقط همین متد/params تنظیم می‌شود.
-        """
-        symbol = symbol.upper()
+        symbol_u = symbol.upper()
         side_u = side.upper()
-        if config.ISOLATED_MARGIN_REQUIRED:
-            self.set_isolated_margin(symbol)
-        self.set_leverage(symbol, leverage)
-        notional = float(usdt_amount) * float(leverage)
-        raw_qty = notional / float(entry_price) if entry_price > 0 else 0.0
-        rules = self.get_symbol_rules(symbol)
-        qty_str = self._round_down_step(raw_qty, str(rules.get("step") or "0.000001"))
-        qty = safe_float(qty_str)
-        if qty <= 0 or qty < float(rules.get("min_qty") or 0.0):
-            raise ToobitError("حجم سفارش پس از گردکردن کمتر از حد مجاز توبیت است")
-        if float(rules.get("min_notional") or 0.0) > 0 and qty * entry_price < float(rules["min_notional"]):
+        self.set_isolated(symbol_u)
+        self.set_leverage(symbol_u, leverage)
+        notional = float(margin_usdt) * int(leverage)
+        rules = self.get_symbol_rules(symbol_u)
+        raw_qty = notional / reference_price
+        quantity = self._round_down(raw_qty, str(rules["step"]))
+        qty_value = safe_float(quantity)
+        if qty_value <= 0 or qty_value < float(rules.get("min_qty") or 0.0):
+            raise ToobitError("حجم سفارش پس از گردکردن کمتر از حد مجاز است")
+        if float(rules.get("min_notional") or 0.0) > qty_value * reference_price:
             raise ToobitError("ارزش سفارش کمتر از حداقل مجاز توبیت است")
-        order_side = "BUY" if side_u == "LONG" else "SELL"
+
         params = {
-            "symbol": symbol,
-            "side": order_side,
-            "type": "MARKET",
-            "quantity": qty_str,
+            "symbol": symbol_u,
+            "side": "BUY_OPEN" if side_u == "LONG" else "SELL_OPEN",
+            "type": "LIMIT",
+            "priceType": "MARKET",
+            "quantity": quantity,
             "newClientOrderId": client_order_id,
-            "positionSide": "LONG" if side_u == "LONG" else "SHORT",
-            "marginType": "ISOLATED",
-            "leverage": int(leverage),
-            "takeProfit": api_num(tp_price),
-            "stopLoss": api_num(sl_price),
-            "tpPrice": api_num(tp_price),
-            "slPrice": api_num(sl_price),
+            "takeProfit": api_number(tp),
+            "stopLoss": api_number(sl),
+            "tpTriggerBy": "CONTRACT_PRICE",
+            "slTriggerBy": "CONTRACT_PRICE",
+            "tpOrderType": "MARKET",
+            "slOrderType": "MARKET",
         }
-        raw = self._request("POST", config.TOOBIT_FUTURES_PATH_ORDER, params=params, signed=True)
-        return {"order_id": self._extract_order_id(raw), "qty": qty, "raw": raw if isinstance(raw, dict) else {"response": raw}}
+        raw = self._request("POST", config.TOOBIT_PATH_ORDER, params, signed=True)
+        order_id = ""
+        for row in self._rows(raw):
+            value = row.get("orderId") or row.get("id")
+            if value not in (None, ""):
+                order_id = str(value)
+                break
+        return {"order_id": order_id, "quantity": quantity, "raw": raw}
 
-    def wait_position_opened(self, symbol: str, timeout_seconds: int = config.ORDER_OPEN_CHECK_SECONDS, poll_seconds: int = 5) -> bool:
-        end = time.time() + max(1, int(timeout_seconds))
-        while time.time() <= end:
-            if self.check_position_opened(symbol):
+    def wait_and_protect(
+        self, symbol: str, side: str, tp: float, sl: float, quantity: str, timeout_seconds: int
+    ) -> bool:
+        deadline = time.time() + max(1, timeout_seconds)
+        while time.time() < deadline:
+            if self.is_position_open(symbol):
+                self.set_trading_stop(symbol, side, tp, sl, quantity)
                 return True
-            time.sleep(max(1, int(poll_seconds)))
-        return self.check_position_opened(symbol)
+            time.sleep(4)
+        return False
 
-    def get_order_history(self, symbol: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
-        params: dict[str, Any] = {"limit": max(1, min(int(limit), 1000))}
-        if symbol:
-            params["symbol"] = symbol.upper()
-        payload = self._request("GET", config.TOOBIT_FUTURES_PATH_ORDER_HISTORY, params=params, signed=True)
-        return self._extract_dicts(payload)
-
-    @staticmethod
-    def _order_symbol(item: dict[str, Any]) -> str:
-        return str(item.get("symbol") or item.get("symbolName") or item.get("s") or "").upper()
-
-    @staticmethod
-    def _order_time_ms(item: dict[str, Any]) -> int:
-        for key in ("updateTime", "transactTime", "time", "createdTime", "closeTime", "executedTime"):
-            value = item.get(key)
-            try:
-                iv = int(value)
-                return iv if iv > 10_000_000_000 else iv * 1000
-            except (TypeError, ValueError):
-                continue
-        return 0
-
-    def get_closed_trade_result(self, symbol: str, side: str, opened_at_ms: int) -> dict[str, Any] | None:
-        """نتیجه واقعی را فقط از تاریخچه توبیت استخراج می‌کند.
-
-        اگر پاسخ API اطلاعات قطعی خروج/PnL نداشته باشد None برمی‌گرداند تا مانیتور
-        حدس نزند و در دور بعد دوباره بررسی کند.
-        """
-        rows = self.get_order_history(symbol=symbol, limit=200)
+    def get_closed_position(self, symbol: str, side: str, opened_at_ms: int) -> dict[str, Any] | None:
+        payload = self._request(
+            "GET",
+            config.TOOBIT_PATH_HISTORY_POSITIONS,
+            {"symbol": symbol.upper(), "startTime": max(0, int(opened_at_ms) - 120_000), "limit": 100},
+            signed=True,
+        )
         candidates: list[dict[str, Any]] = []
-        wanted_close_side = "SELL" if side.upper() == "LONG" else "BUY"
-        for item in rows:
-            if self._order_symbol(item) not in ("", symbol.upper()):
+        for row in self._rows(payload):
+            if str(row.get("symbol") or "").upper() != symbol.upper():
                 continue
-            ts = self._order_time_ms(item)
-            if ts and ts < int(opened_at_ms):
+            if str(row.get("side") or "").upper() != side.upper():
                 continue
-            item_side = str(item.get("side") or item.get("orderSide") or "").upper()
-            reduce_only = str(item.get("reduceOnly") or item.get("closePosition") or "").lower() in ("true", "1", "yes")
-            status = str(item.get("status") or item.get("orderStatus") or item.get("state") or "").upper()
-            filled = status in ("FILLED", "CLOSED", "DONE", "SUCCESS") or safe_float(item.get("executedQty") or item.get("filledQty") or item.get("cumQty")) > 0
-            if not filled:
+            if str(row.get("status") or "CLOSED").upper() != "CLOSED":
                 continue
-            if item_side and item_side != wanted_close_side and not reduce_only:
+            open_time = int(safe_float(row.get("openTime"), 0.0))
+            close_time = int(safe_float(row.get("closeTime"), 0.0))
+            if open_time and open_time < opened_at_ms - 120_000:
                 continue
-            candidates.append(item)
+            if close_time <= 0 or close_time < opened_at_ms:
+                continue
+            candidates.append(row)
         if not candidates:
             return None
-        item = max(candidates, key=self._order_time_ms)
-        exit_price = safe_float(item.get("avgPrice") or item.get("averagePrice") or item.get("executedPrice") or item.get("price") or item.get("dealPrice"))
-        realized = safe_float(item.get("realizedPnl") or item.get("realisedPnl") or item.get("closedPnl") or item.get("profit"), float("nan"))
-        fee = safe_float(item.get("fee") or item.get("commission") or item.get("execFee") or item.get("tradeFee"))
-        if exit_price <= 0:
+        row = max(candidates, key=lambda item: int(safe_float(item.get("closeTime"), 0.0)))
+        entry = safe_float(row.get("openAvgPrice"))
+        close = safe_float(row.get("closeAvgPrice"))
+        net = safe_float(row.get("realizedPnL"))
+        gross = safe_float(row.get("realizedPnlWithoutFee"), float("nan"))
+        open_fee = abs(safe_float(row.get("openFee")))
+        close_fee = abs(safe_float(row.get("closeFee")))
+        fees = open_fee + close_fee
+        if gross != gross:  # NaN
+            gross = net + fees
+        if fees <= 0:
+            fees = max(0.0, gross - net)
+        if entry <= 0 or close <= 0:
             return None
-        return {"exit_price": exit_price, "realized_pnl": realized, "fee": fee, "time_ms": self._order_time_ms(item), "raw": item}
-
+        close_reason = ""
+        for key in (
+            "closeType", "closeReason", "positionCloseType", "triggerType",
+            "orderType", "type", "execType", "source",
+        ):
+            value = row.get(key)
+            if value not in (None, ""):
+                close_reason = str(value)
+                break
+        return {
+            "entry_price": entry,
+            "close_price": close,
+            "gross_pnl": gross,
+            "fees": fees,
+            "net_pnl": net,
+            "open_time": int(safe_float(row.get("openTime"), opened_at_ms)),
+            "close_time": int(safe_float(row.get("closeTime"), 0.0)),
+            "close_reason": close_reason,
+            "raw": row,
+        }
