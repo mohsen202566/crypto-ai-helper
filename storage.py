@@ -193,6 +193,7 @@ class Storage:
             "leverage": config.LEVERAGE_DEFAULT,
             "max_positions": config.MAX_POSITIONS_DEFAULT,
             "telegram_offset": 0,
+            "telegram_updates_initialized": False,
             "toobit_connected": False,
             "toobit_available_usdt": 0.0,
             "toobit_total_usdt": 0.0,
@@ -231,6 +232,40 @@ class Storage:
                 "INSERT OR REPLACE INTO kv(key,value,updated_at) VALUES(?,?,?)",
                 (key, json.dumps(value, ensure_ascii=False), int(time.time())),
             )
+
+    def claim_telegram_update(self, update_id: int) -> bool:
+        """Atomically claim one Telegram update across all bot processes sharing this DB.
+
+        Returning False means the update was already processed (or claimed) by another
+        process. Persisting the claim before command handling prevents duplicate panel
+        replies after restarts or overlapping service instances.
+        """
+        update_id = int(update_id or 0)
+        if update_id <= 0:
+            return False
+        now = int(time.time())
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                row = db.execute("SELECT value FROM kv WHERE key=?", ("telegram_offset",)).fetchone()
+                current = 0
+                if row is not None:
+                    try:
+                        current = int(json.loads(str(row["value"])))
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        current = 0
+                if update_id <= current:
+                    db.execute("ROLLBACK")
+                    return False
+                db.execute(
+                    "INSERT OR REPLACE INTO kv(key,value,updated_at) VALUES(?,?,?)",
+                    ("telegram_offset", json.dumps(update_id), now),
+                )
+                db.execute("COMMIT")
+                return True
+            except Exception:
+                db.execute("ROLLBACK")
+                raise
 
     def save_profile(self, symbol_id: str, okx_symbol: str, toobit_symbol: str, profile: dict[str, Any]) -> None:
         now = int(time.time())

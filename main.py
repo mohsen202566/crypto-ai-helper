@@ -33,6 +33,10 @@ class TelegramPanel:
         self.token = config.TELEGRAM_BOT_TOKEN
         self.chat_id = config.TELEGRAM_CHAT_ID
         self.offset = int(self.storage.get("telegram_offset", 0) or 0)
+        self.updates_initialized = bool(self.storage.get("telegram_updates_initialized", False))
+        # If the DB/offset was reset, Telegram may still hold many old commands.
+        # Never replay that backlog: synchronize to the newest pending update once.
+        self.needs_backlog_sync = not self.updates_initialized
         self.session = requests.Session()
         self.lock = threading.RLock()
 
@@ -69,10 +73,39 @@ class TelegramPanel:
             logger.warning("[TELEGRAM_SEND_FAILED] %s", exc)
             return None
 
+    def _sync_startup_backlog(self) -> None:
+        """Forget queued Telegram updates when no trustworthy offset exists.
+
+        A negative offset asks Telegram for only the last pending update and
+        confirms all older updates. We store that ID without executing it, so a
+        reset DB cannot replay hundreds of historical panel commands.
+        """
+        response = self.session.get(
+            f"https://api.telegram.org/bot{self.token}/getUpdates",
+            params={"offset": -1, "limit": 1, "timeout": 0},
+            timeout=6,
+        )
+        response.raise_for_status()
+        data = response.json()
+        if not data.get("ok"):
+            raise RuntimeError(str(data))
+        rows = [row for row in (data.get("result") or []) if isinstance(row, dict)]
+        newest = max((int(row.get("update_id") or 0) for row in rows), default=0)
+        if newest > 0:
+            self.offset = newest
+            self.storage.set("telegram_offset", newest)
+        self.storage.set("telegram_updates_initialized", True)
+        self.updates_initialized = True
+        self.needs_backlog_sync = False
+        logger.warning("[TELEGRAM_BACKLOG_SYNCED] newest_update_id=%d old_commands_dropped=true", newest)
+
     def poll_once(self) -> None:
         if not self.enabled:
             return
         try:
+            if self.needs_backlog_sync:
+                self._sync_startup_backlog()
+                return
             response = self.session.get(
                 f"https://api.telegram.org/bot{self.token}/getUpdates",
                 params={"offset": self.offset + 1, "timeout": 1},
@@ -82,14 +115,35 @@ class TelegramPanel:
             data = response.json()
             if not data.get("ok"):
                 raise RuntimeError(str(data))
-            for update in data.get("result") or []:
-                self.offset = max(self.offset, int(update.get("update_id") or 0))
-                self.storage.set("telegram_offset", self.offset)
+            updates = sorted(
+                (item for item in (data.get("result") or []) if isinstance(item, dict)),
+                key=lambda item: int(item.get("update_id") or 0),
+            )
+            for update in updates:
+                update_id = int(update.get("update_id") or 0)
+                if update_id <= 0:
+                    continue
+                self.offset = max(self.offset, update_id)
+                if not self.storage.claim_telegram_update(update_id):
+                    logger.info("[TELEGRAM_DUPLICATE_SKIPPED] update_id=%d", update_id)
+                    continue
                 message = update.get("message") or {}
                 if str((message.get("chat") or {}).get("id") or "") != str(self.chat_id):
                     continue
+                message_date = int(message.get("date") or 0)
+                max_age = int(getattr(config, "TELEGRAM_COMMAND_MAX_AGE_SECONDS", 300))
+                if message_date > 0 and time.time() - message_date > max_age:
+                    logger.warning(
+                        "[TELEGRAM_STALE_SKIPPED] update_id=%d age_seconds=%d",
+                        update_id, int(time.time() - message_date),
+                    )
+                    continue
                 text = str(message.get("text") or "").strip()
                 if text:
+                    logger.info(
+                        "[TELEGRAM_COMMAND] update_id=%d message_id=%s text=%s",
+                        update_id, message.get("message_id"), text[:80],
+                    )
                     self.handle(text)
             self.storage.clear_health("telegram")
         except Exception as exc:
@@ -964,8 +1018,8 @@ class TradingBotApp:
             logger.info("[PROFILE_BOOTSTRAP_THREAD_DONE] ready=%d", len(self.ready_symbols))
 
     def run(self) -> None:
-        # Telegram and panels must answer immediately. Only the signal scanner waits
-        # for ready_symbols, which remain empty until profile bootstrap completes.
+        # Telegram polling starts immediately; no panel is sent automatically.
+        # Only the signal scanner waits for ready_symbols while profiles are building.
         self._last_profile_day = datetime.now(ZoneInfo(config.TIMEZONE)).strftime("%Y-%m-%d")
         threads = [
             threading.Thread(target=self.telegram_loop, daemon=True, name="telegram"),
@@ -978,7 +1032,7 @@ class TradingBotApp:
         for thread in threads:
             thread.start()
         logger.info(
-            "[BOT_STARTED] telegram_immediate=true requested=%d profile_status=BUILDING",
+            "[BOT_STARTED] telegram_polling=active auto_panel=false requested=%d profile_status=BUILDING",
             len(config.SYMBOL_BASES),
         )
         try:
