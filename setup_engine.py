@@ -150,6 +150,8 @@ class SetupEngine:
             risks=list(m.contradictions),
             meta={
                 'atr': atr,
+                'atr_at_creation': atr,
+                'origin_price': px,
                 'regime': m.regime,
                 'obstacle_price': obstacle,
                 'target_capacity_price': target_capacity_price,

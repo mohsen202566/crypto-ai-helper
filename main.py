@@ -20,7 +20,7 @@ from profiles import Profiles
 from risk_engine import RiskEngine
 from setup_engine import SetupEngine
 from storage import Storage
-from symbols import SYMBOLS
+from symbols import SYMBOLS, select_valid_symbols
 from telegram_bot import TelegramBot
 from toobit_client import ToobitFuturesClient
 from watch_engine import WatchEngine
@@ -41,6 +41,25 @@ class App:
             log.warning("مهاجرت دیتابیس | %s معامله مجازی قدیمی آرشیو شد و اعلان نخواهد شد", archived)
         self.health = HealthManager(self.storage)
         self.okx = OKXClient()
+        self.symbols = list(SYMBOLS)
+        try:
+            valid_ids = self.okx.get_live_swap_instrument_ids()
+        except Exception as exc:
+            # If the validation endpoint itself is temporarily unavailable, keep the
+            # primary 40 and quarantine any bad mapping after its first API error.
+            log.warning("اعتبارسنجی زنده نمادها انجام نشد؛ فهرست ثابت استفاده می‌شود | علت=%s", exc)
+        else:
+            selected = select_valid_symbols(valid_ids, target=40)
+            self.symbols = selected
+            replaced = [(a.id, b.id) for a, b in zip(SYMBOLS, selected) if a.id != b.id]
+            if replaced:
+                log.warning("اعتبارسنجی نمادها | جایگزینی=%s", replaced)
+            if len(selected) < 40:
+                missing = [s.okx for s in SYMBOLS if s.okx not in valid_ids]
+                log.critical("اعتبارسنجی نمادها | فقط %s بازار معتبر پیدا شد؛ نامعتبرها=%s", len(selected), missing)
+            else:
+                log.info("اعتبارسنجی نمادها | 40 بازار فعال OKX تأیید شد")
+        self.invalid_symbols: set[str] = set()
         self.toobit = ToobitFuturesClient()
         self.telegram = TelegramBot(self.storage, self.health)
         self.profiles = Profiles(self.storage)
@@ -130,7 +149,9 @@ class App:
             with self.watch_lock:
                 self.active_watches.clear()
 
-        for sym in SYMBOLS:
+        for sym in self.symbols:
+            if sym.id in self.invalid_symbols:
+                continue
             try:
                 if self._open_exists(sym.id):
                     with self.watch_lock:
@@ -208,11 +229,18 @@ class App:
                         candidate.trigger_price, candidate.invalidation_price, max(0, candidate.expires_at-int(time.time())),
                     )
             except Exception as exc:
-                self.storage.add_health_event("scan", "warning", str(exc), sym.id)
-                log.exception("خطای اسکن %s", sym.id)
+                message = str(exc)
+                self.storage.add_health_event("scan", "warning", message, sym.id)
+                if "Instrument ID" in message or "doesn't exist" in message or "does not exist" in message:
+                    self.invalid_symbols.add(sym.id)
+                    with self.watch_lock:
+                        self.active_watches.pop(sym.id, None)
+                    log.error("نماد قرنطینه شد | ارز=%s | OKX=%s | علت=%s", sym.id, sym.okx, message)
+                else:
+                    log.exception("خطای اسکن %s", sym.id)
 
         self.storage.set("scan_last_ts", int(time.time()))
-        self.storage.set("scan_last_symbols", len(SYMBOLS))
+        self.storage.set("scan_last_symbols", len(self.symbols) - len(self.invalid_symbols))
         self.storage.set("scan_last_duration", time.time() - started)
         with self.watch_lock:
             watch_count = len(self.active_watches)
@@ -261,10 +289,10 @@ class App:
                         prev_sig, prev_ts = self.watch_log_state.get(symbol_id, ("", 0.0))
                         if sig != prev_sig or time.time() - prev_ts >= config.WATCH_LOG_HEARTBEAT_SECONDS:
                             log.info(
-                                "واچ | ارز=%s | نتیجه=انتظار | مرحله=%s | علت=%s | قیمت=%.8g | Trigger=%.8g | فاصلهATR=%.3f | لمس=%s | عبور=%s | پیشروی=%s | پذیرش=%s | فشار=%s | مومنتوم=%s | کندل=%s | جذب=%s | RSI=%.1f | Hist=%.6g | Body=%.2f",
+                                "واچ | ارز=%s | نتیجه=انتظار | مرحله=%s | علت=%s | قیمت=%.8g | مبدأ=%.8g | Trigger=%.8g | ATRساخت=%.8g | فاصلهTriggerATR=%+.3f | پیشرویOriginATR=%+.3f | مصرفATR=%.3f | لمس=%s | عبور=%s | پیشروی=%s | پذیرش=%s | فشار=%s | مومنتوم=%s | کندل=%s | جذب=%s | RSI=%.1f | Hist=%.6g | Body=%.2f",
                                 symbol_id, candidate.meta.get("scenario_state"), decision.primary_reason,
-                                float(watch.entry_price or 0), float(watch.meta.get("trigger") or candidate.trigger_price),
-                                float(watch.meta.get("progress_atr") or 0), yn("touch_ok"), yn("price_ok"), yn("progress_ok"), yn("acceptance_ok"), yn("pressure_ok"), yn("momentum_ok"), yn("candle_ok"), yn("absorption"),
+                                float(watch.entry_price or 0), float(watch.meta.get("origin") or candidate.anchor_price), float(watch.meta.get("trigger") or candidate.trigger_price), float(watch.meta.get("atr_at_creation") or 0),
+                                float(watch.meta.get("trigger_distance_atr") or 0), float(watch.meta.get("origin_progress_atr") or 0), float(watch.meta.get("late_atr") or 0), yn("touch_ok"), yn("price_ok"), yn("progress_ok"), yn("acceptance_ok"), yn("pressure_ok"), yn("momentum_ok"), yn("candle_ok"), yn("absorption"),
                                 float(watch.meta.get("rsi") or 0), float(watch.meta.get("macd_hist") or 0), float(watch.meta.get("body_ratio") or 0),
                             )
                             self.watch_log_state[symbol_id] = (sig, time.time())
@@ -337,7 +365,9 @@ class App:
             self.storage.add_health_event("toobit", "warning", str(exc))
 
     def learning_once(self) -> None:
-        for sym in SYMBOLS:
+        for sym in self.symbols:
+            if sym.id in self.invalid_symbols:
+                continue
             try:
                 report = self.learning.run(sym.id)
                 candidate = self.adaptive.create_candidate(sym.id, report)

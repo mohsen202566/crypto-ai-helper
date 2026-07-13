@@ -29,9 +29,11 @@ class WatchEngine:
 
     def evaluate(self, s: SetupCandidate, c1: list[dict[str, Any]]) -> WatchEvaluation:
         now = int(time.time())
+        origin = float(s.meta.get("origin_price") or s.anchor_price or 0)
+        atr_created = float(s.meta.get("atr_at_creation") or s.meta.get("atr") or 0)
         base_meta = {
             "trigger": float(s.trigger_price), "invalidation": float(s.invalidation_price),
-            "origin": float(s.anchor_price), "atr": float(s.meta.get("atr") or 0),
+            "origin": origin, "atr": atr_created, "atr_at_creation": atr_created,
         }
         if now > s.expires_at:
             return WatchEvaluation(s.setup_id, "EXPIRED", 0, False, 0, "واچ منقضی شد", base_meta)
@@ -39,9 +41,10 @@ class WatchEngine:
             return WatchEvaluation(s.setup_id, "WAITING", 0, False, 0, "داده 1M کافی نیست", {**base_meta, "data_ok": False})
 
         live_price = float(c1[-1].get("close") or 0)
-        atr = float(s.meta.get("atr") or 0)
-        if live_price <= 0 or atr <= 0:
-            return WatchEvaluation(s.setup_id, "WAITING", 0, False, live_price, "قیمت یا ATR نامعتبر است", {**base_meta, "data_ok": False})
+        atr = atr_created
+        if live_price <= 0 or origin <= 0 or atr <= 0:
+            s.meta["scenario_state"] = "DATA_INVALID"
+            return WatchEvaluation(s.setup_id, "INVALIDATED", 0, False, live_price, "Snapshot سناریو ناقص است: قیمت مبدأ یا ATR زمان ایجاد نامعتبر است", {**base_meta, "data_ok": False})
         if (s.side == "LONG" and live_price <= s.invalidation_price) or (s.side == "SHORT" and live_price >= s.invalidation_price):
             s.meta["scenario_state"] = "INVALIDATED"
             return WatchEvaluation(s.setup_id, "INVALIDATED", 0, False, live_price, "سطح ابطال سناریو شکسته شد", {**base_meta, "data_ok": True})
@@ -57,7 +60,13 @@ class WatchEngine:
             return WatchEvaluation(s.setup_id, "WAITING", 0, False, live_price, "اندیکاتور فعال‌سازی آماده نیست", {**base_meta, "data_ok": False})
 
         signed_from_trigger = (live_price - s.trigger_price) if s.side == "LONG" else (s.trigger_price - live_price)
-        progress_atr = max(0.0, signed_from_trigger) / atr
+        trigger_distance_atr = signed_from_trigger / atr
+        progress_atr = max(0.0, trigger_distance_atr)
+        signed_from_origin = (live_price - origin) if s.side == "LONG" else (origin - live_price)
+        origin_progress_atr = signed_from_origin / atr
+        # Entry consumption is measured only after the activation level is crossed.
+        # A negative trigger distance means the market has not activated yet; it is
+        # not silently displayed as a meaningless zero in diagnostics.
         consumed_atr = progress_atr
         if consumed_atr > config.ENTRY_MAX_CONSUMED_ATR:
             s.meta["scenario_state"] = "LATE"
@@ -122,5 +131,5 @@ class WatchEngine:
             elif price_cross and progress_ok and not accepted: reason="پیشروی انجام شده؛ پذیرش یا پاسخ معتبر هنوز کامل نیست"
             else: reason="در انتظار یکی از مسیرهای مستقل فعال‌سازی"
 
-        meta={**base_meta, "data_ok":True, "activation_path":path, "live_price":live_price, "price_ok":price_cross, "touch_ok":touched, "progress_ok":progress_ok, "acceptance_ok":recent.get("accepted",False), "pressure_ok":recent.get("pressure_shift",False), "momentum_ok":recent.get("momentum",False), "candle_ok":recent.get("candle_response",False), "absorption":absorption, "progress_atr":progress_atr, "late_atr":consumed_atr, "rsi":float(rs[-1]), "macd_hist":float(hist[-1]), "body_ratio":float(cf["body_ratio"]), "close_location":float(cf["close_location"]), "events":dict(events), "confirmed_candle_ts":candle_ts}
+        meta={**base_meta, "data_ok":True, "activation_path":path, "live_price":live_price, "price_ok":price_cross, "touch_ok":touched, "progress_ok":progress_ok, "acceptance_ok":recent.get("accepted",False), "pressure_ok":recent.get("pressure_shift",False), "momentum_ok":recent.get("momentum",False), "candle_ok":recent.get("candle_response",False), "absorption":absorption, "progress_atr":progress_atr, "late_atr":consumed_atr, "trigger_distance_atr":trigger_distance_atr, "origin_progress_atr":origin_progress_atr, "rsi":float(rs[-1]), "macd_hist":float(hist[-1]), "body_ratio":float(cf["body_ratio"]), "close_location":float(cf["close_location"]), "events":dict(events), "confirmed_candle_ts":candle_ts}
         return WatchEvaluation(s.setup_id,state,diagnostic,confirmed_now,live_price,reason,meta)

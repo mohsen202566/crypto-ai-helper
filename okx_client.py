@@ -42,6 +42,26 @@ class OKXClient:
             raise OKXError(f"OKX error: {payload.get('msg') or payload}")
         return payload
 
+
+    def get_live_swap_instrument_ids(self) -> set[str]:
+        """Return currently live USDT swap instrument ids from OKX.
+
+        This is used once at startup so an obsolete mapping cannot generate a
+        traceback on every scan cycle.
+        """
+        payload = self._get("/api/v5/public/instruments", {"instType": "SWAP"})
+        rows = payload.get("data") if isinstance(payload, dict) else []
+        out: set[str] = set()
+        for row in rows or []:
+            inst_id = str(row.get("instId") or "")
+            state = str(row.get("state") or "live").lower()
+            settle = str(row.get("settleCcy") or row.get("quoteCcy") or "")
+            if inst_id.endswith("-USDT-SWAP") and state in {"live", "trading", ""} and settle in {"USDT", ""}:
+                out.add(inst_id)
+        if not out:
+            raise OKXError("OKX instruments list is empty")
+        return out
+
     def get_ticker(self, inst_id: str) -> dict[str, Any]:
         payload = self._get("/api/v5/market/ticker", {"instId": inst_id})
         data = payload.get("data") if isinstance(payload, dict) else None

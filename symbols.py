@@ -53,7 +53,7 @@ SYMBOLS = [
     SymbolMap('JUP','JUP-USDT-SWAP','JUPUSDT','JUP',group='HIGH_VOL'),
     SymbolMap('PYTH','PYTH-USDT-SWAP','PYTHUSDT','PYTH',group='HIGH_VOL'),
     SymbolMap('GALA','GALA-USDT-SWAP','GALAUSDT','GALA',group='HIGH_VOL'),
-    SymbolMap('MKR','MKR-USDT-SWAP','MKRUSDT','MKR'),
+    SymbolMap('LDO','LDO-USDT-SWAP','LDOUSDT','LDO',group='HIGH_VOL'),
 ]
 
 BY_ID = {s.id: s for s in SYMBOLS}
@@ -62,3 +62,24 @@ BY_TOOBIT = {s.toobit: s for s in SYMBOLS}
 
 def get_symbol(symbol_id: str):
     return BY_ID.get(symbol_id.upper())
+
+# Extra mappings used only when one of the primary 40 is unavailable on OKX.
+FALLBACK_SYMBOLS = [
+    SymbolMap('CRV','CRV-USDT-SWAP','CRVUSDT','CRV',group='HIGH_VOL'),
+    SymbolMap('SAND','SAND-USDT-SWAP','SANDUSDT','SAND',group='HIGH_VOL'),
+    SymbolMap('MANA','MANA-USDT-SWAP','MANAUSDT','MANA',group='HIGH_VOL'),
+    SymbolMap('DYDX','DYDX-USDT-SWAP','DYDXUSDT','DYDX',group='HIGH_VOL'),
+    SymbolMap('ORDI','ORDI-USDT-SWAP','ORDIUSDT','ORDI',group='HIGH_VOL'),
+]
+
+def select_valid_symbols(valid_okx_ids: set[str], target: int = 40):
+    """Return exactly target unique OKX-valid mappings when enough candidates exist."""
+    selected = []
+    seen = set()
+    for sym in [*SYMBOLS, *FALLBACK_SYMBOLS]:
+        if sym.okx in valid_okx_ids and sym.id not in seen:
+            selected.append(sym)
+            seen.add(sym.id)
+        if len(selected) >= target:
+            break
+    return selected
