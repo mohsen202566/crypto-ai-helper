@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 # Telegram
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -119,8 +120,16 @@ TOOBIT_STATUS_INTERVAL_SECONDS = 20
 REJECT_LOG_REPEAT_SECONDS = 60
 LOG_LEVEL = os.getenv("BOT_LOG_LEVEL", "INFO")
 
-# SQLite is outside the Git repository. Override if service user cannot write /var/lib.
-DB_PATH = os.getenv("BOT_DB_PATH", "/var/lib/forex-signal-bot/bot_state.sqlite3")
+# Persistent state is private to this bot.  Use a bot-specific environment
+# variable so generic BOT_DB_PATH settings from another service cannot make two
+# bots share one SQLite file.  The default lives under this repository's data/
+# directory, which deployment commands preserve across git updates.
+BOT_INSTANCE_ID = "crypto-ai-helper"
+PROJECT_ROOT = Path(__file__).resolve().parent
+DB_PATH = os.getenv(
+    "CRYPTO_AI_HELPER_DB_PATH",
+    str(PROJECT_ROOT / "data" / "crypto_ai_helper.sqlite3"),
+).strip()
 
 # Continuous per-pattern learning. A pattern is:
 # symbol + side + trigger window + support tool + selected horizon.

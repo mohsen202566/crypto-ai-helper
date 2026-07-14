@@ -318,6 +318,11 @@ class TelegramPanel:
 class TradingBotApp:
     def __init__(self) -> None:
         self.storage = Storage()
+        logger.info(
+            "[DATABASE_READY] bot=%s path=%s",
+            config.BOT_INSTANCE_ID,
+            self.storage.path,
+        )
         self.okx = OKXClient()
         self.toobit = ToobitFuturesClient()
         self.engine = AdaptiveStartEngine()
