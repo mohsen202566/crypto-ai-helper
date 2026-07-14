@@ -595,7 +595,7 @@ class Storage:
         with self.connect() as db:
             rows = db.execute(
                 """
-                SELECT pattern_key,horizon,version,status,factors_json
+                SELECT pattern_key,horizon,version,status,factors_json,total_tp,total_sl
                 FROM learning_patterns
                 WHERE symbol_id=? AND side=? AND trigger_window=? AND support_tool=?
                 """,
@@ -608,6 +608,7 @@ class Storage:
                 "version": int(row["version"]),
                 "status": str(row["status"]),
                 "factors": self._json_dict(row["factors_json"]),
+                "live_samples": int(row["total_tp"] or 0) + int(row["total_sl"] or 0),
             }
         return output
 
@@ -615,7 +616,7 @@ class Storage:
         with self.connect() as db:
             rows = db.execute(
                 """
-                SELECT side,trigger_window,support_tool,horizon,version,status,factors_json
+                SELECT side,trigger_window,support_tool,horizon,version,status,factors_json,total_tp,total_sl
                 FROM learning_patterns WHERE symbol_id=?
                 """,
                 (symbol_id,),
@@ -630,6 +631,7 @@ class Storage:
                 "version": int(row["version"]),
                 "status": str(row["status"]),
                 "factors": self._json_dict(row["factors_json"]),
+                "live_samples": int(row["total_tp"] or 0) + int(row["total_sl"] or 0),
             })
         return output
 

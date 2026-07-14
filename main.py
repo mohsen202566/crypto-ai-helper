@@ -345,8 +345,9 @@ class TradingBotApp:
             "min_profit_tp_pct", "tp_pct", "rr", "tp_net_usdt",
             "plan_quality", "notional", "support_tool", "learning_version",
             "learning_status", "pattern_key", "move_required", "support_required",
-            "outcome_source", "outcome_valid_samples", "historical_win_rate",
-            "conservative_win_rate", "expected_net_from_outcomes",
+            "outcome_source", "historical_policy", "outcome_valid_samples", "historical_win_rate",
+            "conservative_win_rate", "expected_net_from_outcomes", "learning_live_samples",
+            "learning_weight", "learning_soft_miss",
         )
         parts: list[str] = []
         for key in important:
@@ -526,7 +527,8 @@ class TradingBotApp:
             f"SL: {plan.sl:.10g} ({plan.sl_pct:.3f}%)\n"
             f"انتظار تقریبی: {plan.expected_minutes} دقیقه\n"
             f"Trigger: {plan.trigger_window} ثانیه | ابزار: {plan.metrics.get('support_tool', 'RANGE')}\n"
-            f"یادگیری: v{int(plan.metrics.get('learning_version', 0))} | {plan.metrics.get('learning_status', 'BASE')}\n"
+            f"یادگیری: v{int(plan.metrics.get('learning_version', 0))} | {plan.metrics.get('learning_status', 'BASE')} | نمونه زنده={int(plan.metrics.get('learning_live_samples', 0))}\n"
+            f"تاریخچه: {plan.metrics.get('historical_policy', 'SOFT')} | برد محافظه‌کارانه={float(plan.metrics.get('conservative_win_rate', 0.0)) * 100:.1f}%\n"
             f"RR: {plan.rr_net:.2f}\n"
             f"مارجین: {trade_usdt:g} USDT | لوریج: {leverage}x\n"
             f"سود خالص تخمینی TP: {plan.estimated_tp_net:.4f} USDT\n"

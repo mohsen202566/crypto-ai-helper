@@ -199,7 +199,13 @@ class AdaptiveStartEngine:
             bonuses: list[float] = []
             for gate in gates:
                 status = str(gate.get("status") or "BASE").upper()
-                factors = normalize_learning_factors(gate.get("factors"))
+                live_samples = int(gate.get("live_samples") or 0)
+                authority = min(1.0, live_samples / max(1, config.LEARNING_FACTOR_FULL_WEIGHT_SAMPLES))
+                raw_factors = normalize_learning_factors(gate.get("factors"))
+                factors = {
+                    key: 1.0 + (float(value) - 1.0) * authority
+                    for key, value in raw_factors.items()
+                }
                 fits = (
                     float(item["move_ratio"]) + 1e-9 >= factors["price_factor"]
                     and float(item["directionality"]) + 1e-9
@@ -210,9 +216,9 @@ class AdaptiveStartEngine:
                     "ACCEPTED": 0.22,
                     "TRIAL": 0.10,
                     "BASE": 0.0,
-                    "QUARANTINED": -0.40,
-                }.get(status, 0.0)
-                bonuses.append(status_bonus + (0.08 if fits else -0.12))
+                    "QUARANTINED": -0.28,
+                }.get(status, 0.0) * authority
+                bonuses.append(status_bonus + ((0.08 if fits else -0.12) * max(0.35, authority)))
             return max(bonuses) if bonuses else 0.0
 
         def window_rank(item: dict[str, float | int]) -> float:
@@ -491,8 +497,19 @@ class AdaptiveStartEngine:
             if samples <= 0:
                 continue
             adjustment = learning_adjustments.get(str(horizon)) or {}
-            factors = normalize_learning_factors(adjustment.get("factors"))
+            raw_factors = normalize_learning_factors(adjustment.get("factors"))
             learning_status = str(adjustment.get("status") or "BASE").upper()
+            live_samples = int(adjustment.get("live_samples") or 0)
+            if learning_status == "BASE":
+                learning_weight = 0.0
+            elif learning_status == "TRIAL":
+                learning_weight = min(0.75, max(0.35, live_samples / max(1, config.LEARNING_TRIAL_MAX_SAMPLES)))
+            else:
+                learning_weight = min(1.0, live_samples / max(1, config.LEARNING_FACTOR_FULL_WEIGHT_SAMPLES))
+            factors = {
+                key: 1.0 + (float(value) - 1.0) * learning_weight
+                for key, value in raw_factors.items()
+            }
             pattern_key = str(
                 adjustment.get("pattern_key")
                 or learning_pattern_key(symbol.id, side, window, support_tool, horizon)
@@ -508,10 +525,19 @@ class AdaptiveStartEngine:
             )
             support_factor = factors["volume_factor"] if support_tool == "VOLUME" else factors["range_factor"]
             directionality_required = config.TRIGGER_MIN_DIRECTIONALITY * factors["directionality_factor"]
+            learning_filter_pass = (
+                move_ratio + 1e-9 >= factors["price_factor"]
+                and directionality + 1e-9 >= directionality_required
+                and support_ratio + 1e-9 >= support_factor
+            )
+            learning_soft_miss = not learning_filter_pass
+            # A learned gate becomes a hard veto only after it has earned enough
+            # authority from live, resolved trades.  Until then it is a ranking
+            # penalty so the learner keeps receiving fresh samples.
             if (
-                move_ratio + 1e-9 < factors["price_factor"]
-                or directionality + 1e-9 < directionality_required
-                or support_ratio + 1e-9 < support_factor
+                learning_soft_miss
+                and learning_status == "TRUSTED"
+                and live_samples >= config.LEARNING_HARD_GATE_MIN_SAMPLES
             ):
                 rejected.append({
                     "horizon": horizon,
@@ -520,6 +546,8 @@ class AdaptiveStartEngine:
                     "required_tp_pct": 999.0,
                     "pattern_key": pattern_key,
                     "learning_version": int(adjustment.get("version") or 0),
+                    "learning_live_samples": live_samples,
+                    "learning_weight": learning_weight,
                     "move_ratio": move_ratio,
                     "move_required": factors["price_factor"],
                     "directionality": directionality,
@@ -564,13 +592,13 @@ class AdaptiveStartEngine:
                     ) / total_non_ambiguous
                     conservative = float(row.get("conservative_win_rate") or 0.0)
                     confident = valid_samples >= config.OUTCOME_MIN_VALID_SAMPLES
-                    if quarantined and (
-                        outcome_source == "LEGACY"
-                        or valid_samples < config.OUTCOME_MIN_EXACT_SAMPLES
-                        or conservative < max(0.55, config.OUTCOME_MIN_CONSERVATIVE_WIN_RATE + 0.07)
+                    history_gap = config.OUTCOME_MIN_CONSERVATIVE_WIN_RATE - conservative
+                    sample_confidence = min(1.0, valid_samples / max(1, config.OUTCOME_MIN_EXACT_SAMPLES))
+                    if (
+                        not config.OUTCOME_HISTORY_SOFT_MODE
+                        and confident
+                        and history_gap > 0
                     ):
-                        continue
-                    if confident and conservative < config.OUTCOME_MIN_CONSERVATIVE_WIN_RATE:
                         rejected.append({
                             "horizon": horizon,
                             "reason": "HISTORICAL_TP_FIRST_TOO_WEAK",
@@ -581,6 +609,11 @@ class AdaptiveStartEngine:
                             "outcome_valid_samples": valid_samples,
                         })
                         continue
+                    historical_policy = "SOFT_OK"
+                    if history_gap > 0:
+                        historical_policy = "SOFT_WEAK"
+                    elif conservative >= config.OUTCOME_MIN_CONSERVATIVE_WIN_RATE + 0.06:
+                        historical_policy = "SOFT_STRONG"
 
                     tp_position = (tp_pct - min_tp) / max(max_tp - min_tp, 1e-9)
                     sl_position = (sl_pct - min_sl) / max(max_sl - min_sl, 1e-9)
@@ -588,6 +621,14 @@ class AdaptiveStartEngine:
                     sl_bias = (factors["sl_factor"] - 1.0) * sl_position
                     quality = float(row.get("quality_score") or 0.0) + 0.20 * (tp_bias + sl_bias)
                     quality += 0.08 * max(-1.0, min(1.0, expected_net / max(abs(sl_net), 1e-9)))
+                    if history_gap > 0:
+                        quality -= config.OUTCOME_HISTORY_PENALTY_STRENGTH * history_gap * sample_confidence
+                    else:
+                        quality += config.OUTCOME_HISTORY_BOOST_STRENGTH * min(0.15, -history_gap) * sample_confidence
+                    if learning_soft_miss:
+                        quality -= config.LEARNING_SOFT_MISS_PENALTY * max(0.35, learning_weight)
+                    if quarantined:
+                        quality -= config.LEARNING_QUARANTINE_QUALITY_PENALTY
                     accepted.append({
                         "horizon": horizon,
                         "samples": int((block or {}).get("samples") or samples),
@@ -607,7 +648,12 @@ class AdaptiveStartEngine:
                         "learning_version": int(adjustment.get("version") or 0),
                         "learning_status": learning_status,
                         "learning_factors": factors,
+                        "learning_raw_factors": raw_factors,
+                        "learning_live_samples": live_samples,
+                        "learning_weight": learning_weight,
+                        "learning_soft_miss": learning_soft_miss,
                         "outcome_source": outcome_source,
+                        "historical_policy": historical_policy,
                         "outcome_valid_samples": valid_samples,
                         "historical_win_rate": float(row.get("win_rate") or 0.0),
                         "conservative_win_rate": conservative,
@@ -622,16 +668,9 @@ class AdaptiveStartEngine:
                     })
                 continue
 
-            # Safe compatibility fallback while old/marginal profiles are being rebuilt.
-            if quarantined:
-                rejected.append({
-                    "horizon": horizon,
-                    "reason": "LEARNING_PATTERN_QUARANTINED_NO_STRONG_OUTCOME",
-                    "pattern_key": pattern_key,
-                    "required_tp_pct": 999.0,
-                    "hard_capacity_pct": 0.0,
-                })
-                continue
+            # Compatibility fallback while old/marginal profiles are being rebuilt.
+            # Quarantine is deliberately soft here so the pattern can keep producing
+            # recovery samples instead of becoming permanently data-starved.
             mfe_q40 = float(stats.get("mfe_q40") or stats.get("mfe_q50") or 0.0) * 0.92
             mfe_q60 = float(stats.get("mfe_q60") or stats.get("mfe_q50") or 0.0)
             mae_to_mfe = self._behavior_mae_to_mfe(stats)
@@ -678,13 +717,22 @@ class AdaptiveStartEngine:
                 "learning_version": int(adjustment.get("version") or 0),
                 "learning_status": learning_status,
                 "learning_factors": factors,
+                "learning_raw_factors": raw_factors,
+                "learning_live_samples": live_samples,
+                "learning_weight": learning_weight,
+                "learning_soft_miss": learning_soft_miss,
                 "outcome_source": "LEGACY",
+                "historical_policy": "SOFT_LEGACY",
                 "outcome_valid_samples": 0,
                 "historical_win_rate": 0.0,
                 "conservative_win_rate": 0.0,
                 "historical_expectancy_pct": 0.0,
                 "expected_net": 0.0,
-                "quality_score": -0.10 - horizon / 10_000.0,
+                "quality_score": (
+                    -0.10 - horizon / 10_000.0
+                    - (config.LEARNING_SOFT_MISS_PENALTY * max(0.35, learning_weight) if learning_soft_miss else 0.0)
+                    - (config.LEARNING_QUARANTINE_QUALITY_PENALTY if quarantined else 0.0)
+                ),
                 "tp_first": 0,
                 "sl_first": 0,
                 "no_hit": 0,
@@ -721,6 +769,7 @@ class AdaptiveStartEngine:
             "expected_minutes": int(chosen["horizon"]),
             "samples": int(chosen["samples"]),
             "outcome_source": str(chosen["outcome_source"]),
+            "historical_policy": str(chosen.get("historical_policy") or "SOFT"),
             "outcome_valid_samples": int(chosen["outcome_valid_samples"]),
             "historical_win_rate": float(chosen["historical_win_rate"]),
             "conservative_win_rate": float(chosen["conservative_win_rate"]),
@@ -742,6 +791,10 @@ class AdaptiveStartEngine:
             "learning_version": int(chosen["learning_version"]),
             "learning_status": str(chosen["learning_status"]),
             "learning_factors": dict(chosen["learning_factors"]),
+            "learning_raw_factors": dict(chosen.get("learning_raw_factors") or chosen["learning_factors"]),
+            "learning_live_samples": int(chosen.get("learning_live_samples") or 0),
+            "learning_weight": float(chosen.get("learning_weight") or 0.0),
+            "learning_soft_miss": bool(chosen.get("learning_soft_miss")),
         }
         plan = TradePlan(
             symbol_id=symbol.id,
@@ -798,6 +851,7 @@ class AdaptiveLearningManager:
                 "version": int(row["version"]),
                 "status": str(row["status"]),
                 "factors": normalize_learning_factors(row.get("factors")),
+                "live_samples": int(row.get("live_samples") or 0),
             })
         with self._cache_lock:
             self._gate_cache[symbol_id] = (now, mapping)
