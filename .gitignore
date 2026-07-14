@@ -1,0 +1,12 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+*.log
+runtime.db
+runtime.db-*
+learning.db
+learning.db-*
+backups/
+.pytest_cache/
+.coverage
