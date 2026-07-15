@@ -24,6 +24,7 @@ from real_monitor import RealMonitor
 from scenario_lab import ScenarioLab
 from signal_engine import SignalEngine
 from storage import LearningStore, Storage
+from symbol_registry import SymbolRegistry
 from toobit_client import ToobitClient, ToobitError
 from trade_engine import TradeEngine
 from tp_sl_engine import TPSLEngine
@@ -920,6 +921,114 @@ class BotOfflineTests(unittest.TestCase):
         self.assertIn("تمدید", reason)
         blocked, _ = news.is_blocked(at_ms=event_ms + 20 * 60_000)
         self.assertFalse(blocked)
+
+    def test_binance_is_second_fallback_and_bundle_stays_single_source(self) -> None:
+        class TripleMarket(MarketDataClient):
+            def _okx_candles(self, symbol, interval, limit):
+                raise MarketDataError("OKX down")
+
+            def _bybit_candles(self, symbol, interval, limit):
+                raise MarketDataError("Bybit down")
+
+            def _binance_candles(self, symbol, interval, limit):
+                step = {"5m":300_000,"15m":900_000,"30m":1_800_000,"1H":3_600_000,"4H":14_400_000,"1D":86_400_000}[interval]
+                return synthetic_candles(limit, step, 300.0)
+
+        mapping = SymbolMapping(
+            "TESTUSDT", "TEST", "TEST-USDT-SWAP", "TESTUSDT", "TEST-SWAP-USDT",
+            binance="TESTUSDT",
+        )
+        source, bundle = TripleMarket().analysis_bundle(mapping)
+        self.assertEqual(source, "BINANCE_FALLBACK")
+        self.assertEqual(set(bundle), set(config.ANALYSIS_CANDLE_LIMITS))
+        self.assertTrue(all(rows and rows[0].open > 290 for rows in bundle.values()))
+
+    def test_empty_interval_is_fixed_before_okx_request(self) -> None:
+        class CaptureMarket(MarketDataClient):
+            def __init__(self):
+                super().__init__()
+                self.params = None
+
+            def _get_payload(self, source, url, params):
+                self.params = dict(params)
+                now = now_ms() // 60_000 * 60_000
+                rows = []
+                for index in range(60):
+                    ts = now - index * 300_000
+                    rows.append([str(ts), "100", "101", "99", "100.5", "10", "10", "1000", "1"])
+                return {"code": "0", "data": rows}
+
+        market = CaptureMarket()
+        rows = market._okx_candles("TEST-USDT-SWAP", "", 60)
+        self.assertEqual(len(rows), 60)
+        self.assertEqual(market.params["bar"], config.PROFILE_BAR)
+        self.assertNotEqual(market.params["bar"], "")
+
+    def test_binance_kline_parser_maps_higher_timeframe_interval(self) -> None:
+        class CaptureMarket(MarketDataClient):
+            def __init__(self):
+                super().__init__()
+                self.params = None
+
+            def _get_payload(self, source, url, params):
+                self.params = dict(params)
+                now = now_ms() // 3_600_000 * 3_600_000
+                rows = []
+                for index in range(60):
+                    ts = now - (59 - index) * 3_600_000
+                    rows.append([ts, "100", "101", "99", "100.5", "10", ts + 3_599_999, "1000"])
+                return rows
+
+        market = CaptureMarket()
+        rows = market._binance_candles("TESTUSDT", "1H", 60)
+        self.assertEqual(len(rows), 60)
+        self.assertEqual(market.params["interval"], "1h")
+        self.assertEqual(market.params["symbol"], "TESTUSDT")
+
+    def test_registry_roundtrip_preserves_binance_mapping(self) -> None:
+        mapping = SymbolMapping(
+            canonical="DOGEUSDT", base="DOGE", okx="DOGE-USDT-SWAP",
+            bybit="DOGEUSDT", toobit="DOGE-SWAP-USDT", binance="DOGEUSDT",
+            binance_aliases=("DOGEUSDT",), active=True, valid=True,
+        )
+        self.storage.learning.upsert_symbol(mapping.to_dict())
+        registry = SymbolRegistry(self.storage, object())
+        loaded = registry.load()
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0].binance, "DOGEUSDT")
+        self.assertEqual(loaded[0].binance_aliases, ("DOGEUSDT",))
+
+    def test_rate_limit_opens_source_circuit_without_retry_storm(self) -> None:
+        class Response:
+            status_code = 429
+            headers = {"Retry-After": "1"}
+
+            def raise_for_status(self):
+                raise RuntimeError("429")
+
+            def json(self):
+                return {}
+
+        class Session:
+            def __init__(self):
+                self.calls = 0
+
+            def get(self, url, params=None, timeout=None):
+                self.calls += 1
+                return Response()
+
+            def close(self):
+                return None
+
+        session = Session()
+        market = MarketDataClient(session)
+        with self.assertRaises(MarketDataError):
+            market._get_payload("OKX", "https://example.invalid", {})
+        first_calls = session.calls
+        with self.assertRaises(MarketDataError):
+            market._get_payload("OKX", "https://example.invalid", {})
+        self.assertEqual(session.calls, first_calls, "open circuit must skip a second HTTP request")
+        self.assertGreater(market.source_health()["OKX"]["cooldown_seconds"], 0)
 
     def test_no_blocking_70_second_sleep_in_source(self) -> None:
         source = (Path(__file__).parent / "toobit_client.py").read_text(encoding="utf-8")

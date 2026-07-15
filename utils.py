@@ -168,7 +168,7 @@ def alias_candidates(base: str, exchange: str) -> tuple[str, ...]:
     b = base.upper()
     if exchange == "okx":
         return (f"{b}-USDT-SWAP", f"{b}USDT", f"{b}-USDT")
-    if exchange == "bybit":
+    if exchange in {"bybit", "binance"}:
         return (f"{b}USDT", f"{b}-USDT")
     if exchange == "toobit":
         return (f"{b}-SWAP-USDT", f"{b}USDT", f"{b}-USDT-SWAP", f"{b}-USDT")

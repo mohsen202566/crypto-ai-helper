@@ -39,6 +39,7 @@ class ProfileStage(str, Enum):
 class DataSource(str, Enum):
     OKX = "OKX"
     BYBIT_FALLBACK = "BYBIT_FALLBACK"
+    BINANCE_FALLBACK = "BINANCE_FALLBACK"
 
 
 @dataclass(slots=True)
@@ -63,8 +64,10 @@ class SymbolMapping:
     okx: str
     bybit: str
     toobit: str
+    binance: str = ""
     okx_aliases: tuple[str, ...] = ()
     bybit_aliases: tuple[str, ...] = ()
+    binance_aliases: tuple[str, ...] = ()
     toobit_aliases: tuple[str, ...] = ()
     tick_size: float = 0.0
     quantity_step: float = 0.0
@@ -79,6 +82,7 @@ class SymbolMapping:
         out = asdict(self)
         out["okx_aliases"] = list(self.okx_aliases)
         out["bybit_aliases"] = list(self.bybit_aliases)
+        out["binance_aliases"] = list(self.binance_aliases)
         out["toobit_aliases"] = list(self.toobit_aliases)
         return out
 
