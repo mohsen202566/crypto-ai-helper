@@ -1,16 +1,12 @@
-گزارش تست نسخه مقاوم چندصرافی
-
-- 35 تست آفلاین: PASS
-- py_compile همه فایل‌های Python: PASS
-- compileall کل پروژه: PASS
-- OKX اصلی + Bybit fallback + Binance Futures fallback
-- تست عدم اختلاط Bundle بین صرافی‌ها: PASS
-- تست اصلاح bar خالی پیش از درخواست OKX: PASS
-- تست Circuit Breaker پس از 429 و جلوگیری از retry storm: PASS
-- هیچ سفارش واقعی در تست‌ها ارسال نشد.
-
-FIX v2:
-- SCAN_MAX_WORKERS default=2
-- Reserve profiles wait for first completed scan
-- Reserve pacing 2s
-- SCAN_START/PROGRESS/DONE logs added
+گزارش تست نسخه Root Scan Fix
+============================
+- رفع NameError مربوط به time در signal_engine.py
+- قفل ضد هم‌پوشانی اسکن
+- اولویت قطعی اسکن فعال بر Reserve Profiler
+- صفرشدن last_scan_ms در هر شروع پردازش
+- آزادشدن Reserve Profiler فقط بعد از SCAN_DONE موفق همان پردازش
+- ثبت SCAN_FAILED و آزادسازی قفل در finally
+- 37 تست از 37 تست موفق
+- py_compile و compileall موفق
+- bash -n اسکریپت‌های نصب و بروزرسانی موفق
+- هیچ سفارش واقعی یا درخواست زنده صرافی در تست‌ها اجرا نشد

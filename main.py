@@ -186,6 +186,10 @@ class BotApplication:
 
     def start(self) -> None:
         # Trading OFF is enforced by RuntimeStore on every process start.
+        # Reset process-local scan readiness: a timestamp from an older process must
+        # never let reserve profiling race the first scan after restart.
+        self.storage.runtime.set_setting("last_scan_ms", 0)
+        self.storage.runtime.set_health("scanner", "warning", "waiting for first scan")
         self.storage.runtime.set_health("main", "ok", "process started; real trading OFF")
         logger.info("ربات شروع شد؛ ترید واقعی به‌صورت اجباری خاموش است")
 

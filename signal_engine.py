@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import logging
 import queue
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable
 
@@ -48,6 +50,9 @@ class SignalEngine:
         self.notifications = notification_queue
         self.rejects = reject_logger
         self.news = news_filter
+        # High-priority live scans and low-priority reserve profiling must never
+        # compete for the same exchange request slots.
+        self._scan_active = threading.Event()
 
     def _profile_bootstraps(self, mapping: Any) -> tuple[str, dict[str, dict[str, Any]]]:
         """Build each timeframe profile from candles of that same timeframe."""
@@ -96,11 +101,17 @@ class SignalEngine:
         self.storage.runtime.set_setting("startup_phase", "READY")
 
     def prepare_reserve_profiles(self, mappings: list[Any], stop_check: Callable[[], bool]) -> None:
-        # Reserve work must never compete with the first live scan. Wait until at least
-        # one full scan has completed, then pace reserve symbols slowly.
+        # Reserve work must never compete with the first live scan. The runtime value
+        # is reset on every process start, so an old successful scan cannot unlock
+        # reserve work immediately after a restart.
         while not stop_check() and int(self.storage.runtime.get_setting("last_scan_ms", 0) or 0) <= 0:
-            time.sleep(2.0)
+            time.sleep(1.0)
         for mapping in [m for m in mappings if not m.active]:
+            if stop_check():
+                return
+            # Live scans always have priority, including all exchange fallback calls.
+            while not stop_check() and self._scan_active.is_set():
+                time.sleep(0.5)
             if stop_check():
                 return
             try:
@@ -181,39 +192,57 @@ class SignalEngine:
     def scan_once(self) -> int:
         if not self.storage.runtime.get_setting("startup_ready", False):
             return 0
+        # Defensive guard even if a caller bypasses BotApplication's non-overlap loop.
+        if self._scan_active.is_set():
+            logger.warning("SCAN_SKIP | previous scan still active")
+            return 0
+        self._scan_active.set()
         active = self.registry.active()
         started = time.monotonic()
-        logger.info("SCAN_START | symbols=%d workers=%d", len(active), config.SCAN_MAX_WORKERS)
-        self.storage.runtime.set_health("scanner", "warning", f"SCAN_START 0/{len(active)}")
-        context = self._context()
         emitted = 0
         completed = 0
-        workers = min(config.SCAN_MAX_WORKERS, max(1, len(active)))
-        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="scan") as pool:
-            futures = {pool.submit(self._analyze_symbol, mapping, context): mapping for mapping in active}
-            for future in as_completed(futures):
-                mapping = futures[future]
-                try:
-                    emitted += int(future.result() or 0)
-                    self.registry.record_data_result(mapping.canonical, True)
-                except Exception as exc:
-                    count = self.registry.record_data_result(mapping.canonical, False)
-                    self.rejects.event("SKIP", mapping.canonical, "DATA_ERROR", str(exc)[:180])
-                    if count >= config.SYMBOL_ERROR_REPLACE_AFTER:
-                        self.registry.replace_failed_active(
-                            mapping.canonical, self.storage.runtime.has_symbol_lock(mapping.canonical)
+        try:
+            logger.info("SCAN_START | symbols=%d workers=%d", len(active), config.SCAN_MAX_WORKERS)
+            self.storage.runtime.set_health("scanner", "warning", f"SCAN_START 0/{len(active)}")
+            context = self._context()
+            workers = min(config.SCAN_MAX_WORKERS, max(1, len(active)))
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="scan") as pool:
+                futures = {pool.submit(self._analyze_symbol, mapping, context): mapping for mapping in active}
+                for future in as_completed(futures):
+                    mapping = futures[future]
+                    try:
+                        emitted += int(future.result() or 0)
+                        self.registry.record_data_result(mapping.canonical, True)
+                    except Exception as exc:
+                        count = self.registry.record_data_result(mapping.canonical, False)
+                        self.rejects.event("SKIP", mapping.canonical, "DATA_ERROR", str(exc)[:180])
+                        if count >= config.SYMBOL_ERROR_REPLACE_AFTER:
+                            self.registry.replace_failed_active(
+                                mapping.canonical, self.storage.runtime.has_symbol_lock(mapping.canonical)
+                            )
+                    completed += 1
+                    if completed == 1 or completed % 5 == 0 or completed == len(active):
+                        logger.info("SCAN_PROGRESS | %d/%d | emitted=%d", completed, len(active), emitted)
+                        self.storage.runtime.set_health(
+                            "scanner", "warning", f"SCAN_PROGRESS {completed}/{len(active)}; emitted={emitted}"
                         )
-                completed += 1
-                if completed == 1 or completed % 5 == 0 or completed == len(active):
-                    logger.info("SCAN_PROGRESS | %d/%d | emitted=%d", completed, len(active), emitted)
-                    self.storage.runtime.set_health(
-                        "scanner", "warning", f"SCAN_PROGRESS {completed}/{len(active)}; emitted={emitted}"
-                    )
-        elapsed = time.monotonic() - started
-        self.storage.runtime.set_health("scanner", "ok", f"SCAN_DONE {len(active)}/{len(active)}; emitted={emitted}; {elapsed:.1f}s")
-        self.storage.runtime.set_setting("last_scan_ms", now_ms())
-        logger.info("SCAN_DONE | symbols=%d emitted=%d elapsed=%.1fs", len(active), emitted, elapsed)
-        return emitted
+            elapsed = time.monotonic() - started
+            self.storage.runtime.set_health(
+                "scanner", "ok", f"SCAN_DONE {len(active)}/{len(active)}; emitted={emitted}; {elapsed:.1f}s"
+            )
+            # Only a fully completed live scan unlocks reserve profiling.
+            self.storage.runtime.set_setting("last_scan_ms", now_ms())
+            logger.info("SCAN_DONE | symbols=%d emitted=%d elapsed=%.1fs", len(active), emitted, elapsed)
+            return emitted
+        except Exception as exc:
+            elapsed = time.monotonic() - started
+            self.storage.runtime.set_health(
+                "scanner", "warning", f"SCAN_FAILED {completed}/{len(active)} after {elapsed:.1f}s: {str(exc)[:180]}"
+            )
+            logger.exception("SCAN_FAILED | completed=%d/%d | %s", completed, len(active), exc)
+            raise
+        finally:
+            self._scan_active.clear()
 
     def _analyze_symbol(self, mapping: Any, context: dict[str, Any]) -> int:
         canonical=mapping.canonical

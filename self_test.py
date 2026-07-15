@@ -883,6 +883,32 @@ class BotOfflineTests(unittest.TestCase):
         self.storage.runtime.set_setting("startup_ready", False)
         self.assertEqual(engine.scan_once(), 0)
 
+    def test_scanner_runtime_path_completes_and_unlocks_reserve(self) -> None:
+        class EmptyRegistry:
+            def active(self):
+                return []
+
+            def get(self, _canonical):
+                return None
+
+        q1: queue.Queue[int] = queue.Queue()
+        q2: queue.Queue[int] = queue.Queue()
+        q3: queue.Queue[dict] = queue.Queue()
+        engine = SignalEngine(
+            self.storage, EmptyRegistry(), None, None, None, None, q1, q2, q3,
+            RejectLogger(lambda: False),
+        )
+        self.storage.runtime.set_setting("startup_ready", True)
+        self.storage.runtime.set_setting("last_scan_ms", 0)
+        self.assertEqual(engine.scan_once(), 0)
+        self.assertGreater(int(self.storage.runtime.get_setting("last_scan_ms", 0)), 0)
+        self.assertFalse(engine._scan_active.is_set())
+
+    def test_runtime_source_has_required_scan_clock_import(self) -> None:
+        source = (Path(__file__).parent / "signal_engine.py").read_text(encoding="utf-8")
+        self.assertIn("import time", source)
+        self.assertIn("self._scan_active = threading.Event()", source)
+
     def test_news_filter_parses_high_impact_and_respects_windows(self) -> None:
         original_url = config.NEWS_CALENDAR_URL
         config.NEWS_CALENDAR_URL = "https://calendar.invalid/events"
