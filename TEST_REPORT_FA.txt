@@ -8,3 +8,9 @@
 - تست اصلاح bar خالی پیش از درخواست OKX: PASS
 - تست Circuit Breaker پس از 429 و جلوگیری از retry storm: PASS
 - هیچ سفارش واقعی در تست‌ها ارسال نشد.
+
+FIX v2:
+- SCAN_MAX_WORKERS default=2
+- Reserve profiles wait for first completed scan
+- Reserve pacing 2s
+- SCAN_START/PROGRESS/DONE logs added
