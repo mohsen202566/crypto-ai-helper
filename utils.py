@@ -1,35 +1,25 @@
-"""ابزارهای کوچک، بدون وابستگی سنگین و قابل استفاده در همه Workerها."""
+"""ابزارهای عمومی؛ بدون وابستگی به ساختار پوشه‌ای."""
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import math
-import os
 import re
-import shutil
 import time
-from datetime import datetime, timezone
-from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
-from pathlib import Path
-from typing import Any, Iterable, Sequence
+from decimal import Decimal, ROUND_DOWN
+from typing import Any, Iterable
 
-logger = logging.getLogger("adaptive_bot")
+import config
 
-PERSIAN_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٫٬", "0123456789..")
+logging.basicConfig(
+    level=getattr(logging, config.LOG_LEVEL, logging.INFO),
+    format="%(asctime)s | %(levelname)s | %(threadName)s | %(message)s",
+)
+logger = logging.getLogger("toobit_pump_bot")
 
 
 def now_ms() -> int:
     return int(time.time() * 1000)
-
-
-def utc_iso(ts_ms: int | None = None) -> str:
-    dt = datetime.fromtimestamp((ts_ms or now_ms()) / 1000, tz=timezone.utc)
-    return dt.isoformat(timespec="seconds")
-
-
-def clamp(value: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, value))
 
 
 def safe_float(value: Any, default: float = 0.0) -> float:
@@ -52,7 +42,7 @@ def json_dumps(value: Any) -> str:
 
 
 def json_loads(value: str | bytes | None, default: Any = None) -> Any:
-    if not value:
+    if value in (None, ""):
         return default
     try:
         return json.loads(value)
@@ -60,166 +50,115 @@ def json_loads(value: str | bytes | None, default: Any = None) -> Any:
         return default
 
 
-def normalize_command(text: str) -> str:
-    return " ".join(str(text or "").translate(PERSIAN_DIGITS).strip().split())
+def clamp(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
 
 
-def parse_float_fa(text: str) -> float:
-    raw = str(text).translate(PERSIAN_DIGITS).replace(",", ".").strip()
-    return float(raw)
+def canonical_base(symbol: str) -> str:
+    text = re.sub(r"[^A-Z0-9]", "", str(symbol).upper())
+    for suffix in ("SWAPUSDT", "USDT", "USDTPERP", "PERP"):
+        if text.endswith(suffix):
+            return text[: -len(suffix)]
+    return text
 
 
-def decimal_round_down(value: float | Decimal, step: str | float | Decimal | None = None, digits: int = 8) -> str:
-    d = Decimal(str(value))
-    if step not in (None, "", 0, "0"):
-        s = Decimal(str(step))
-        if s > 0:
-            d = (d / s).to_integral_value(rounding=ROUND_DOWN) * s
-    q = Decimal("1").scaleb(-digits)
-    d = d.quantize(q, rounding=ROUND_DOWN)
-    return format(d.normalize(), "f")
+def canonical_symbol(symbol: str) -> str:
+    return f"{canonical_base(symbol)}USDT"
 
 
-def round_to_tick(value: float, tick: float, mode: str = "nearest") -> float:
-    if tick <= 0:
-        return value
-    d = Decimal(str(value)) / Decimal(str(tick))
-    rounding = {"down": ROUND_DOWN, "up": ROUND_UP}.get(mode, ROUND_HALF_UP)
-    return float(d.to_integral_value(rounding=rounding) * Decimal(str(tick)))
+def toobit_contract_symbol(symbol: str) -> str:
+    return f"{canonical_base(symbol)}-SWAP-USDT"
 
 
-def percentile(values: Sequence[float], p: float, default: float = 0.0) -> float:
-    vals = sorted(v for v in values if math.isfinite(v))
-    if not vals:
-        return default
-    p = clamp(p, 0.0, 1.0)
-    idx = (len(vals) - 1) * p
-    lo = int(math.floor(idx))
-    hi = int(math.ceil(idx))
-    if lo == hi:
-        return vals[lo]
-    return vals[lo] * (hi - idx) + vals[hi] * (idx - lo)
+def side_to_open(side: str) -> str:
+    return "BUY_OPEN" if str(side).upper() == "LONG" else "SELL_OPEN"
 
 
-def mean(values: Iterable[float], default: float = 0.0) -> float:
-    vals = [v for v in values if math.isfinite(v)]
-    return sum(vals) / len(vals) if vals else default
+def side_to_position(side: str) -> str:
+    return "LONG" if str(side).upper() in {"LONG", "BUY", "BUY_OPEN"} else "SHORT"
 
 
-def stdev(values: Sequence[float], default: float = 0.0) -> float:
-    vals = [v for v in values if math.isfinite(v)]
-    if len(vals) < 2:
-        return default
-    m = sum(vals) / len(vals)
-    return math.sqrt(sum((v - m) ** 2 for v in vals) / (len(vals) - 1))
-
-
-def ema(values: Sequence[float], period: int) -> list[float]:
-    if not values:
-        return []
-    alpha = 2.0 / (period + 1.0)
-    out = [float(values[0])]
-    for v in values[1:]:
-        out.append(alpha * float(v) + (1.0 - alpha) * out[-1])
-    return out
-
-
-def sma(values: Sequence[float], period: int) -> list[float]:
-    if period <= 0:
-        raise ValueError("period must be positive")
-    out: list[float] = []
-    total = 0.0
-    window: list[float] = []
-    for v in values:
-        fv = float(v)
-        window.append(fv)
-        total += fv
-        if len(window) > period:
-            total -= window.pop(0)
-        out.append(total / len(window))
-    return out
-
-
-def true_ranges(highs: Sequence[float], lows: Sequence[float], closes: Sequence[float]) -> list[float]:
-    out: list[float] = []
-    for i, (h, l) in enumerate(zip(highs, lows)):
-        prev = closes[i - 1] if i else closes[i]
-        out.append(max(h - l, abs(h - prev), abs(l - prev)))
-    return out
-
-
-def normalize_symbol(value: str) -> str:
-    return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
-
-
-def canonical_base_from_symbol(value: str) -> str:
-    raw = str(value or "").upper().replace("_", "-")
-    if "-SWAP-USDT" in raw:
-        return raw.split("-SWAP-USDT", 1)[0]
-    if "-USDT-SWAP" in raw:
-        return raw.split("-USDT-SWAP", 1)[0]
-    compact = normalize_symbol(raw)
-    if compact.endswith("USDT"):
-        return compact[:-4]
-    return compact
-
-
-def alias_candidates(base: str, exchange: str) -> tuple[str, ...]:
-    b = base.upper()
-    if exchange == "okx":
-        return (f"{b}-USDT-SWAP", f"{b}USDT", f"{b}-USDT")
-    if exchange in {"bybit", "binance"}:
-        return (f"{b}USDT", f"{b}-USDT")
-    if exchange == "toobit":
-        return (f"{b}-SWAP-USDT", f"{b}USDT", f"{b}-USDT-SWAP", f"{b}-USDT")
-    return (f"{b}USDT",)
-
-
-def atomic_copy(src: Path, dst: Path) -> None:
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dst.with_suffix(dst.suffix + ".tmp")
-    shutil.copy2(src, tmp)
-    os.replace(tmp, dst)
-
-
-def stable_hash(value: Any, length: int = 16) -> str:
-    payload = json_dumps(value).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()[:length]
-
-
-def side_to_toobit_open(side: str) -> str:
-    raw = str(side).upper()
-    if raw in {"LONG", "BUY", "BUY_OPEN"}:
-        return "BUY_OPEN"
-    if raw in {"SHORT", "SELL", "SELL_OPEN"}:
-        return "SELL_OPEN"
-    raise ValueError(f"invalid side: {side}")
-
-
-def side_to_toobit_position(side: str) -> str:
-    raw = str(side).upper()
-    if raw in {"LONG", "BUY", "BUY_OPEN"}:
-        return "LONG"
-    if raw in {"SHORT", "SELL", "SELL_OPEN"}:
-        return "SHORT"
-    raise ValueError(f"invalid side: {side}")
-
-
-def toobit_symbol_candidates(symbol: str) -> tuple[str, ...]:
-    base = canonical_base_from_symbol(symbol)
-    return alias_candidates(base, "toobit")
+def decimal_round_down(value: float | Decimal, step: str | float = "0.00000001", digits: int = 8) -> str:
+    val = Decimal(str(value))
+    step_dec = Decimal(str(step or 0))
+    if step_dec > 0:
+        val = (val / step_dec).to_integral_value(rounding=ROUND_DOWN) * step_dec
+    quant = Decimal(1).scaleb(-digits)
+    val = val.quantize(quant, rounding=ROUND_DOWN)
+    return format(val.normalize(), "f")
 
 
 def extract_filter(info: dict[str, Any], filter_type: str) -> dict[str, Any]:
-    filters = info.get("filters") or []
-    if isinstance(filters, list):
-        for item in filters:
-            if isinstance(item, dict) and str(item.get("filterType", "")).upper() == filter_type.upper():
-                return item
-    if filter_type.upper() == "LOT_SIZE":
-        candidate = info.get("lotSizeFilter") or info.get("quantityFilter")
-        return candidate if isinstance(candidate, dict) else {}
-    if filter_type.upper() == "PRICE_FILTER":
-        candidate = info.get("priceFilter")
-        return candidate if isinstance(candidate, dict) else {}
-    return {}
+    for key in ("filters", "filter", "rules"):
+        rows = info.get(key)
+        if isinstance(rows, list):
+            for row in rows:
+                if isinstance(row, dict) and str(row.get("filterType") or row.get("type") or "").upper() == filter_type.upper():
+                    return row
+    direct = info.get(filter_type) or info.get(filter_type.lower())
+    return direct if isinstance(direct, dict) else {}
+
+
+def percent_change(new: float, old: float) -> float:
+    return ((new / old) - 1.0) * 100.0 if old > 0 else 0.0
+
+
+def ema(values: list[float], period: int) -> float:
+    if not values:
+        return 0.0
+    period = max(1, min(period, len(values)))
+    k = 2.0 / (period + 1.0)
+    out = values[0]
+    for value in values[1:]:
+        out = value * k + out * (1.0 - k)
+    return out
+
+
+def rsi(values: list[float], period: int = 14) -> float:
+    if len(values) < 2:
+        return 50.0
+    deltas = [values[i] - values[i - 1] for i in range(1, len(values))]
+    tail = deltas[-period:]
+    gains = sum(max(0.0, x) for x in tail) / max(1, len(tail))
+    losses = sum(max(0.0, -x) for x in tail) / max(1, len(tail))
+    if losses <= 1e-15:
+        return 100.0 if gains > 0 else 50.0
+    rs = gains / losses
+    return 100.0 - 100.0 / (1.0 + rs)
+
+
+def atr(candles: list[dict[str, float]], period: int = 14) -> float:
+    if len(candles) < 2:
+        return 0.0
+    trs: list[float] = []
+    prev_close = candles[0]["close"]
+    for candle in candles[1:]:
+        tr = max(
+            candle["high"] - candle["low"],
+            abs(candle["high"] - prev_close),
+            abs(candle["low"] - prev_close),
+        )
+        trs.append(tr)
+        prev_close = candle["close"]
+    tail = trs[-period:]
+    return sum(tail) / max(1, len(tail))
+
+
+def median(values: Iterable[float]) -> float:
+    rows = sorted(float(x) for x in values)
+    if not rows:
+        return 0.0
+    mid = len(rows) // 2
+    return rows[mid] if len(rows) % 2 else (rows[mid - 1] + rows[mid]) / 2.0
+
+
+_FA_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+
+
+def normalize_command(text: str) -> str:
+    return " ".join(str(text).translate(_FA_DIGITS).strip().lower().split())
+
+
+def parse_number(text: str) -> float:
+    normalized = str(text).translate(_FA_DIGITS).replace(",", "").strip()
+    return float(normalized)
