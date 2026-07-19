@@ -9,20 +9,65 @@ import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+
+
+def _load_env_file(path: Path) -> None:
+    """Load simple KEY=VALUE files without overriding systemd environment values."""
+    try:
+        if not path.is_file():
+            return
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if value and value[0:1] == value[-1:] and value[0] in {"\"", "'"}:
+                value = value[1:-1]
+            if key:
+                os.environ.setdefault(key, value)
+    except OSError:
+        # systemd Environment/EnvironmentFile remains the primary source.
+        pass
+
+
+def _load_project_environment() -> None:
+    candidates: list[Path] = []
+    explicit = os.getenv("BOT_ENV_FILE", "").strip() or os.getenv("ENV_FILE", "").strip()
+    if explicit:
+        candidates.append(Path(explicit))
+    candidates.extend((
+        ROOT / ".env",
+        Path("/etc/crypto-bot.env"),
+        Path("/etc/crypto-ai-helper.env"),
+        Path("/etc/forex-signal-bot.env"),
+    ))
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        _load_env_file(candidate)
+
+
+_load_project_environment()
+
 RUNTIME_DB = Path(os.getenv("RUNTIME_DB", str(ROOT / "runtime.db")))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
-# اتصال
+# اتصال؛ نام‌های قدیمی پروژه نیز برای سازگاری پذیرفته می‌شوند.
 TOOBIT_BASE_URL = os.getenv("TOOBIT_BASE_URL", "https://api.toobit.com").rstrip("/")
-TOOBIT_API_KEY = os.getenv("TOOBIT_API_KEY", "").strip()
-TOOBIT_API_SECRET = os.getenv("TOOBIT_API_SECRET", "").strip()
+TOOBIT_API_KEY = (os.getenv("TOOBIT_API_KEY") or os.getenv("TOOBIT_KEY") or "").strip()
+TOOBIT_API_SECRET = (os.getenv("TOOBIT_API_SECRET") or os.getenv("TOOBIT_SECRET_KEY") or "").strip()
 TOOBIT_RECV_WINDOW = int(os.getenv("TOOBIT_RECV_WINDOW", "5000"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "10"))
 HTTP_RETRIES = int(os.getenv("HTTP_RETRIES", "2"))
 HTTP_BACKOFF_SECONDS = float(os.getenv("HTTP_BACKOFF_SECONDS", "0.8"))
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or os.getenv("TG_BOT_TOKEN") or "").strip()
+TELEGRAM_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or os.getenv("OWNER_ID") or os.getenv("TELEGRAM_OWNER_ID") or "").strip()
 TELEGRAM_POLL_TIMEOUT = int(os.getenv("TELEGRAM_POLL_TIMEOUT", "25"))
 
 # Endpointها؛ بدون تغییر کد قابل جایگزینی هستند.

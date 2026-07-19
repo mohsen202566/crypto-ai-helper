@@ -11,7 +11,7 @@ import config
 from bot import BotEngine
 from storage import Storage
 from toobit_client import ToobitClient
-from utils import normalize_command, now_ms, parse_number
+from utils import logger, normalize_command, now_ms, parse_number
 
 
 def _n(value: Any, digits: int = 2) -> str:
@@ -405,54 +405,118 @@ class TelegramBot:
     def enabled(self) -> bool:
         return bool(self.token and self.chat_id)
 
+    def _api_url(self, method: str) -> str:
+        return f"https://api.telegram.org/bot{self.token}/{method}"
+
+    @staticmethod
+    def _masked_chat_id(chat_id: str) -> str:
+        text = str(chat_id)
+        return ("*" * max(0, len(text) - 4)) + text[-4:] if text else "missing"
+
     def send_message(self, text: str, reply_to_message_id: int | None = None) -> int | None:
         if not self.enabled:
+            logger.error(
+                "TELEGRAM_SEND_DISABLED | token=%s chat_id=%s",
+                "set" if self.token else "missing",
+                "set" if self.chat_id else "missing",
+            )
             return None
         payload: dict[str, Any] = {"chat_id": self.chat_id, "text": text}
         if reply_to_message_id:
             payload["reply_to_message_id"] = reply_to_message_id
             payload["allow_sending_without_reply"] = True
         try:
-            response = self.send_session.post(
-                f"https://api.telegram.org/bot{self.token}/sendMessage",
-                json=payload,
-                timeout=10,
-            )
+            response = self.send_session.post(self._api_url("sendMessage"), json=payload, timeout=10)
             data = response.json()
-            return int((data.get("result") or {}).get("message_id") or 0) or None if data.get("ok") else None
+            if not response.ok or not data.get("ok"):
+                description = data.get("description") or f"HTTP {response.status_code}"
+                raise RuntimeError(str(description))
+            return int((data.get("result") or {}).get("message_id") or 0) or None
         except Exception as exc:
             self.storage.set_health("telegram", "warning", f"send failed: {exc}")
+            logger.warning("TELEGRAM_SEND_ERROR | %s", str(exc)[:240])
             return None
+
+    def _prepare_polling(self) -> None:
+        # getUpdates is incompatible with an active webhook. Removing it is safe for this
+        # single polling service and prevents a silent non-responsive bot after migration.
+        response = self.poll_session.post(
+            self._api_url("deleteWebhook"),
+            json={"drop_pending_updates": False},
+            timeout=10,
+        )
+        data = response.json()
+        if not response.ok or not data.get("ok"):
+            raise RuntimeError(data.get("description") or f"deleteWebhook HTTP {response.status_code}")
+
+        response = self.poll_session.get(self._api_url("getMe"), timeout=10)
+        data = response.json()
+        if not response.ok or not data.get("ok"):
+            raise RuntimeError(data.get("description") or f"getMe HTTP {response.status_code}")
+        username = str((data.get("result") or {}).get("username") or "unknown")
+        logger.info(
+            "TELEGRAM_POLL_READY | bot=@%s | chat_id=%s",
+            username,
+            self._masked_chat_id(self.chat_id),
+        )
 
     def poll_loop(self) -> None:
         if not self.enabled:
-            self.storage.set_health("telegram", "warning", "Token/Chat ID تنظیم نشده")
+            missing = []
+            if not self.token:
+                missing.append("TELEGRAM_BOT_TOKEN/BOT_TOKEN")
+            if not self.chat_id:
+                missing.append("TELEGRAM_CHAT_ID/OWNER_ID")
+            detail = "متغیر تنظیم‌نشده: " + ", ".join(missing)
+            self.storage.set_health("telegram", "warning", detail)
+            logger.error("TELEGRAM_DISABLED | %s", detail)
             while not self.stop_event.wait(5):
                 pass
             return
+
+        prepared = False
         offset = self.storage.telegram_offset()
-        self.storage.set_health("telegram", "ok", "polling")
         while not self.stop_event.is_set():
             try:
+                if not prepared:
+                    self._prepare_polling()
+                    self.storage.set_health("telegram", "ok", "polling")
+                    prepared = True
+
                 response = self.poll_session.get(
-                    f"https://api.telegram.org/bot{self.token}/getUpdates",
+                    self._api_url("getUpdates"),
                     params={"offset": offset + 1, "timeout": config.TELEGRAM_POLL_TIMEOUT},
                     timeout=config.TELEGRAM_POLL_TIMEOUT + 5,
                 )
                 data = response.json()
+                if not response.ok or not data.get("ok"):
+                    description = str(data.get("description") or f"HTTP {response.status_code}")
+                    if response.status_code == 409 or "webhook" in description.lower():
+                        prepared = False
+                    raise RuntimeError(description)
+
                 for update in data.get("result", []):
                     offset = max(offset, int(update.get("update_id", 0)))
                     self.storage.set_telegram_offset(offset)
-                    msg = update.get("message") or {}
-                    if str((msg.get("chat") or {}).get("id") or "") != str(self.chat_id):
-                        self.storage.add_event("TELEGRAM_SECURITY", "دستور chat_id غیرمجاز نادیده گرفته شد")
+                    msg = update.get("message") or update.get("edited_message") or {}
+                    incoming_chat_id = str((msg.get("chat") or {}).get("id") or "")
+                    if incoming_chat_id != str(self.chat_id):
+                        self.storage.add_event(
+                            "TELEGRAM_SECURITY",
+                            f"chat_id غیرمجاز نادیده گرفته شد: {incoming_chat_id}",
+                        )
+                        logger.warning("TELEGRAM_UNAUTHORIZED_CHAT | chat_id=%s", incoming_chat_id)
                         continue
                     text = str(msg.get("text") or "").strip()
-                    if text:
-                        self.send_message(self.router.handle(text), int(msg.get("message_id") or 0) or None)
+                    if not text:
+                        continue
+                    logger.info("TELEGRAM_COMMAND | %s", normalize_command(text)[:100])
+                    reply = self.router.handle(text)
+                    self.send_message(reply, int(msg.get("message_id") or 0) or None)
             except Exception as exc:
                 self.storage.set_health("telegram", "warning", f"poll failed: {exc}")
-                self.stop_event.wait(2)
+                logger.warning("TELEGRAM_POLL_ERROR | %s", str(exc)[:240])
+                self.stop_event.wait(3)
 
     def notification_loop(self) -> None:
         while not self.stop_event.is_set():
