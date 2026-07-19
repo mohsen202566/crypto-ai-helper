@@ -480,17 +480,36 @@ class Storage:
         with self.lock:
             rows = self.conn.execute("SELECT payload_json FROM signals ORDER BY created_at").fetchall()
         items = [json_loads(row[0], {}) for row in rows]
+        today = datetime.now(timezone.utc).date().isoformat()
+
         for mode in ("REAL", "VIRTUAL"):
-            group = [x for x in items if x.get("mode") == mode]
-            finals = [x for x in group if x.get("result") in {"TP", "STOP", "TRAIL_EXIT", "MANUAL_CLOSE"}]
-            wins = [x for x in finals if float(x.get("net_pnl") or 0) > 0]
+            group = [item for item in items if item.get("mode") == mode]
+            finals = [
+                item for item in group
+                if item.get("result") in {"TP", "STOP", "TRAIL_EXIT", "MANUAL_CLOSE"}
+            ]
+            wins = [item for item in finals if float(item.get("net_pnl") or 0) > 0]
+            today_pnl = 0.0
+            for item in finals:
+                closed_at = int(item.get("closed_at") or 0)
+                if closed_at:
+                    closed_date = datetime.fromtimestamp(closed_at / 1000, tz=timezone.utc).date().isoformat()
+                    if closed_date == today:
+                        today_pnl += float(item.get("net_pnl") or 0)
             out[mode] = {
                 "total": len(group),
-                "active": sum(x.get("status") in ACTIVE_STATUSES for x in group),
+                "active": sum(item.get("status") in ACTIVE_STATUSES for item in group),
+                "tp": sum(item.get("result") == "TP" for item in group),
+                "stop": sum(item.get("result") == "STOP" for item in group),
+                "trail_exit": sum(item.get("result") == "TRAIL_EXIT" for item in group),
+                "manual_close": sum(item.get("result") == "MANUAL_CLOSE" for item in group),
+                "failed_open": sum(item.get("result") == "FAILED_OPEN" for item in group),
+                "cancelled": sum(item.get("result") == "CANCELLED" for item in group),
                 "wins": len(wins),
                 "losses": len(finals) - len(wins),
                 "win_rate": 100.0 * len(wins) / len(finals) if finals else 0.0,
-                "net_pnl": sum(float(x.get("net_pnl") or 0) for x in finals),
+                "today_pnl": today_pnl,
+                "net_pnl": sum(float(item.get("net_pnl") or 0) for item in finals),
             }
         return out
 

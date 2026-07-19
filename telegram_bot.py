@@ -44,21 +44,23 @@ def help_text() -> str:
     return """
 📌 دستورات فارسی
 
-ترید | پنل | وضعیت
+ترید | پنل | وضعیت | موجودی
 آمار
 پوزیشن
 کوین‌ها
-سلامت
+سلامت | چک توبیت
 
 ترید فعال
 ترید خاموش
-ترید دلار 5        (۱ تا ۱۰۰۰۰)
+ترید دلار 5        (۱ تا ۱۰۰۰۰ USDT)
 ترید لوریج 10     (۱ تا ۱۰۰)
 حداکثر پوزیشن 3  (۱ تا ۲۰۰)
 
-نام‌های قدیمی:
+نام‌های جایگزین:
 توبیت روشن | توبیت خاموش
-دلار ترید 5 | لوریج ترید 10
+دلار ترید 5 | مارجین ترید 5 | ترید مارجین 5
+لوریج ترید 10
+تعداد اسلات 3 | ترید اسلات 3
 
 ریست سود
 ریست سود کل
@@ -66,29 +68,48 @@ def help_text() -> str:
 لاگ رد خاموش
 """.strip()
 
-
 def trade_panel(storage: Storage) -> str:
     settings = storage.settings()
     account = storage.account_snapshot()
     slots = storage.slot_counts()
     pnl = storage.displayed_real_pnl()
     active = storage.active_signals()
+
     trade = "🟢 فعال" if settings.get("real_trade_enabled") else "🔴 خاموش"
     connected = "🟢 متصل" if account.get("connected") else "🔴 قطع"
     startup = "✅ آماده" if settings.get("startup_ready") else f"⏳ {settings.get('startup_phase', 'BOOT')}"
-    used_margin = float(account.get("position_margin") or 0) + float(account.get("order_margin") or 0)
+
+    wallet = float(account.get("wallet_balance", account.get("balance", 0)) or 0)
+    equity = float(account.get("equity", account.get("balance", wallet)) or 0)
+    available = float(account.get("available") or 0)
+    position_margin = float(account.get("position_margin") or 0)
+    order_margin = float(account.get("order_margin") or 0)
+    used_margin = float(account.get("used_margin") or (position_margin + order_margin))
+    floating = float(account.get("unrealized_pnl") or 0)
+
+    virtual_active = sum(
+        1 for item in active
+        if item.get("mode") == "VIRTUAL" and item.get("status") in {"ACTIVE", "OPEN", "PENDING_OPEN"}
+    )
+    external_open = int(slots.get("external_open", 0))
+    snapshot_error = str(account.get("error") or "").strip()
+    error_line = f"\n⚠️ خطای آخر Toobit: {snapshot_error}" if snapshot_error else ""
+
     return f"""
 📊 پنل ترید
 ━━━━━━━━━━━━━━━━━━
 ترید واقعی: {trade}
 ربات: {startup}
 Toobit: {connected}
-آخرین بروزرسانی Toobit: {_age(account.get('updated_at'))} قبل
+آخرین بروزرسانی Toobit: {_age(account.get('updated_at'))} قبل{error_line}
 
-💰 موجودی Toobit: {_n(account.get('balance'))} USDT
-💵 مارجین آزاد: {_n(account.get('available'))} USDT
+💰 موجودی کیف پول Toobit: {_n(wallet)} USDT
+💎 اکویتی حساب: {_n(equity)} USDT
+💵 مارجین آزاد: {_n(available)} USDT
+📍 مارجین پوزیشن‌ها: {_n(position_margin)} USDT
+🧾 مارجین سفارش‌ها: {_n(order_margin)} USDT
 📌 مارجین استفاده‌شده: {_n(used_margin)} USDT
-📈 سود/ضرر شناور: {_n(account.get('unrealized_pnl'))} USDT
+📈 سود/ضرر شناور: {_n(floating)} USDT
 
 دلار هر پوزیشن: {_n(settings.get('trade_margin_usdt'))} USDT
 لوریج: {int(settings.get('leverage', 0))}x
@@ -96,34 +117,36 @@ Toobit: {connected}
 حداکثر پوزیشن واقعی: {slots['max']}
 اسلات پُر: {slots['used']}
 اسلات خالی: {slots['free']}
-پوزیشن باز Toobit: {slots['toobit_open']}
-Real باز/Pending ربات: {slots['open']} / {slots['pending']}
-سیگنال Virtual فعال: {sum(x.get('mode') == 'VIRTUAL' for x in active)}
+پوزیشن باز Toobit: {slots.get('toobit_open', account.get('open_positions', 0))}
+پوزیشن تأییدشده ربات: {slots['open']}
+Pending Open ربات: {slots['pending']}
+پوزیشن دستی/خارج از ربات: {external_open}
+سیگنال Virtual فعال: {virtual_active}
 
 سود/ضرر امروز Real: {_n(pnl.get('today'))} USDT
 سود/ضرر کل Real: {_n(pnl.get('total'))} USDT
 
-قراردادهای فعال: {len(storage.contracts())}
+قراردادهای فعال Toobit: {len(storage.contracts())}
 Watchlist پامپ: {len(settings.get('watchlist') or [])}
-نامزدهای عمیق: {len(settings.get('deep_candidates') or [])}
-آخرین اسکن: {_age(settings.get('last_scan_ms'))} قبل
+نامزدهای تحلیل عمیق: {len(settings.get('deep_candidates') or [])}
+آخرین اسکن بازار: {_age(settings.get('last_scan_ms'))} قبل
 ━━━━━━━━━━━━━━━━━━
 """.strip()
 
-
 def stats_panel(storage: Storage) -> str:
     stats = storage.stats()
-    blocks = []
+    blocks: list[str] = []
     for mode, icon, title in (("REAL", "🔴", "Toobit واقعی"), ("VIRTUAL", "🔵", "مجازی")):
         row = stats.get(mode, {})
         blocks.append(
             f"{icon} {title}\n"
             f"کل: {row.get('total', 0)} | فعال: {row.get('active', 0)}\n"
+            f"TP: {row.get('tp', 0)} | Stop: {row.get('stop', 0)} | Trail: {row.get('trail_exit', 0)}\n"
+            f"بستن دستی: {row.get('manual_close', 0)} | بازنشدن: {row.get('failed_open', 0)} | لغو: {row.get('cancelled', 0)}\n"
             f"برد: {row.get('wins', 0)} | باخت: {row.get('losses', 0)} | Win: {_n(row.get('win_rate'), 1)}%\n"
-            f"سود خالص ثبت‌شده: {_n(row.get('net_pnl'))} USDT"
+            f"امروز: {_n(row.get('today_pnl'))} | کل: {_n(row.get('net_pnl'))} USDT"
         )
     return "📊 آمار سیگنال‌ها\n━━━━━━━━━━━━━━━━━━\n" + "\n\n".join(blocks) + "\n━━━━━━━━━━━━━━━━━━"
-
 
 def positions_panel(storage: Storage) -> str:
     signals = storage.active_signals()
@@ -175,48 +198,106 @@ def health_panel(storage: Storage, toobit: ToobitClient) -> str:
 
 
 def signal_message(signal: dict[str, Any]) -> str:
-    reasons = "، ".join(signal.get("reasons") or [])
+    reasons = signal.get("reasons") or []
+    reason_text = "\n".join(f"• {item}" for item in reasons[:6]) or "• تأییدهای ثابت استراتژی"
     metrics = signal.get("metrics") or {}
-    virtual_note = f"\nعلت مجازی: {signal.get('virtual_reason')}" if signal.get("mode") == "VIRTUAL" else ""
+    mode = str(signal.get("mode") or "VIRTUAL")
+    real_status = (
+        "\nوضعیت اجرا: PENDING_OPEN؛ بررسی پوزیشن Toobit بعد از ۷۰ ثانیه"
+        if mode == "REAL" and signal.get("status") == "PENDING_OPEN"
+        else ""
+    )
+    virtual_note = (
+        f"\nعلت مجازی: {signal.get('virtual_reason')}"
+        if mode == "VIRTUAL" and signal.get("virtual_reason")
+        else ""
+    )
+    entry = float(signal.get("entry") or 0)
+    sl = float(signal.get("sl") or 0)
+    tp = float(signal.get("tp") or 0)
+    risk = abs(sl - entry)
+    reward = abs(entry - tp)
+    rr = reward / risk if risk > 0 else 0
     return f"""
-{'🔴' if signal.get('mode') == 'REAL' else '🔵'} سیگنال {signal.get('mode')}
+{'🔴' if mode == 'REAL' else '🔵'} سیگنال {mode} #{signal.get('id')}
 ━━━━━━━━━━━━━━━━━━
-ارز: {signal.get('canonical')}
-جهت: SHORT
-امتیاز: {_n(signal.get('signal_score'), 1)}
-تأییدها: {signal.get('confirmations')}
+{signal.get('canonical')} | SHORT
+ورود: {_price(entry)}
+TP ایمنی: {_price(tp)}
+SL: {_price(sl)}
+RR: {_n(rr)}
 
-ورود: {_price(signal.get('entry'))}
-SL: {_price(signal.get('sl'))}
-TP ایمنی: {_price(signal.get('tp'))}
-مدیریت اصلی: Trailing Stop پویا
+مارجین: {_n(signal.get('margin_usdt'))} USDT
+لوریج: {signal.get('leverage')}x
+ارزش پوزیشن: {_n(signal.get('notional_usdt'))} USDT
+سود خالص پیش‌بینی‌شده: {_n(signal.get('expected_net_profit'))} USDT
+امتیاز سیگنال: {_n(signal.get('signal_score'), 1)}
+تعداد تأییدها: {signal.get('confirmations')}
+مدیریت خروج: Trailing Stop پویا{real_status}{virtual_note}
 
 رشد 24h: {_n(metrics.get('pump_24h_percent'), 1)}%
 رشد 15m: {_n(metrics.get('pump_15m_percent'), 1)}%
 فشار فروش: {_n(float(metrics.get('sell_aggression') or 0) * 100, 1)}%
 Funding: {_n(float(metrics.get('funding_rate') or 0) * 100, 4)}%
+Open Interest: {_n(metrics.get('open_interest'), 2)}
 Long/Short: {_n(metrics.get('long_short_ratio'), 2)}
 
-دلایل: {reasons}
-مارجین: {_n(signal.get('margin_usdt'))} USDT × {signal.get('leverage')}x{virtual_note}
+دلایل:
+{reason_text}
+━━━━━━━━━━━━━━━━━━
+""".strip()
+
+
+def position_open_message(signal: dict[str, Any]) -> str:
+    return f"""
+🟢 پوزیشن Toobit تأیید شد #{signal.get('id')}
+━━━━━━━━━━━━━━━━━━
+{signal.get('canonical')} | SHORT
+قیمت ورود واقعی: {_price(signal.get('actual_entry') or signal.get('entry'))}
+TP ایمنی: {_price(signal.get('tp'))}
+SL: {_price(signal.get('sl'))}
+مارجین: {_n(signal.get('margin_usdt'))} USDT × {signal.get('leverage')}x
+اسلات تا بسته‌شدن قطعی پوزیشن پُر می‌ماند.
+━━━━━━━━━━━━━━━━━━
+""".strip()
+
+
+def failed_open_message(signal: dict[str, Any]) -> str:
+    return f"""
+⚠️ پوزیشن Toobit باز نشد #{signal.get('id')}
+━━━━━━━━━━━━━━━━━━
+{signal.get('canonical')} | SHORT
+بعد از مهلت تأیید، پوزیشن یا نتیجه تحقق‌یافته‌ای پیدا نشد.
+اسلات واقعی آزاد شد و نتیجه FAILED_OPEN ثبت شد.
 ━━━━━━━━━━━━━━━━━━
 """.strip()
 
 
 def result_message(signal: dict[str, Any]) -> str:
+    result = str(signal.get("result") or signal.get("status") or "UNKNOWN")
     pnl = float(signal.get("net_pnl") or 0)
-    icon = "✅" if pnl > 0 else "❌"
+    icon = {
+        "TP": "✅",
+        "TRAIL_EXIT": "✅" if pnl >= 0 else "❌",
+        "STOP": "❌",
+        "FAILED_OPEN": "⚠️",
+        "MANUAL_CLOSE": "ℹ️",
+        "CANCELLED": "⛔",
+    }.get(result, "ℹ️")
+    created = int(signal.get("created_at") or now_ms())
+    closed = int(signal.get("closed_at") or now_ms())
+    duration = max(0, (closed - created) // 60000)
     return f"""
-{icon} نتیجه {signal.get('mode')}
+{icon} نتیجه #{signal.get('id')} | {signal.get('mode')}
 ━━━━━━━━━━━━━━━━━━
-ارز: {signal.get('canonical')} | SHORT
-نتیجه: {signal.get('result')}
-ورود: {_price(signal.get('entry'))}
+{signal.get('canonical')} | SHORT
+نتیجه: {result}
+ورود: {_price(signal.get('actual_entry') or signal.get('entry'))}
 خروج: {_price(signal.get('close_price'))}
 سود/ضرر خالص: {_n(pnl)} USDT
+مدت معامله: {duration} دقیقه
 ━━━━━━━━━━━━━━━━━━
 """.strip()
-
 
 class CommandRouter:
     def __init__(self, storage: Storage, toobit: ToobitClient):
@@ -230,8 +311,9 @@ class CommandRouter:
             return f"❌ مقدار {label} نامعتبر است. بازه: {lo:g} تا {hi:g} {suffix}"
         if value < lo or value > hi:
             return f"❌ مقدار خارج از بازه است. بازه مجاز: {lo:g} تا {hi:g} {suffix}"
+        value = round(float(value), 8)
         self.storage.set_setting(key, value)
-        return f"✅ {label}: {value:g} {suffix}\nتمام سیگنال‌های جدید از این مقدار استفاده می‌کنند."
+        return f"✅ {label}: {value:g} {suffix}\nتمام سیگنال‌های بعدی از این مقدار استفاده می‌کنند."
 
     def _set_int(self, raw: str, prefix: str, key: str, label: str, lo: int, hi: int, suffix: str) -> str:
         try:
@@ -244,13 +326,15 @@ class CommandRouter:
         if value < lo or value > hi:
             return f"❌ مقدار خارج از بازه است. بازه مجاز: {lo} تا {hi} {suffix}"
         self.storage.set_setting(key, value)
-        return f"✅ {label}: {value} {suffix}\nتمام سیگنال‌های جدید از این مقدار استفاده می‌کنند."
+        slots = self.storage.slot_counts() if key == "max_open_positions" else None
+        extra = f"\nوضعیت اسلات اکنون: {slots['used']} پُر / {slots['free']} خالی" if slots else ""
+        return f"✅ {label}: {value} {suffix}\nتمام سیگنال‌های بعدی از این مقدار استفاده می‌کنند.{extra}"
 
     def handle(self, text: str) -> str:
         t = normalize_command(text)
         if not t or t in {"/start", "start", "راهنما", "کمک", "help"}:
             return help_text()
-        if t in {"ترید", "پنل", "وضعیت", "پنل ترید"}:
+        if t in {"ترید", "پنل", "وضعیت", "پنل ترید", "موجودی"}:
             return trade_panel(self.storage)
         if t in {"آمار", "پنل آمار"}:
             return stats_panel(self.storage)
@@ -258,40 +342,52 @@ class CommandRouter:
             return positions_panel(self.storage)
         if t in {"کوین‌ها", "کوین ها", "ارزها"}:
             return coins_panel(self.storage)
-        if t in {"سلامت", "health", "هلس"}:
+        if t in {"سلامت", "health", "هلس", "چک توبیت"}:
             return health_panel(self.storage, self.toobit)
+
         if t in {"ترید فعال", "توبیت روشن"}:
             self.storage.set_setting("real_trade_enabled", True)
             snap = self.storage.account_snapshot()
-            warning = "" if snap.get("connected") else "\n⚠️ Toobit خصوصی فعلاً متصل نیست؛ تا اتصال سالم، سیگنال‌ها Virtual می‌شوند."
-            return "✅ ترید واقعی فعال شد. سیگنال معتبر در صورت اسلات و اتصال سالم وارد Toobit می‌شود." + warning
+            warning = "" if snap.get("connected") else "\n⚠️ Toobit خصوصی فعلاً متصل نیست؛ تا اتصال سالم، سیگنال‌های معتبر Virtual می‌شوند."
+            return "✅ ترید واقعی فعال شد. فقط سیگنال معتبر با اسلات آزاد و اتصال سالم وارد Toobit می‌شود." + warning
         if t in {"ترید خاموش", "توبیت خاموش"}:
             self.storage.set_setting("real_trade_enabled", False)
-            return "⛔ ترید واقعی خاموش شد. سیگنال‌های جدید Virtual می‌شوند؛ Realهای باز همچنان مانیتور می‌شوند."
-        if t.startswith("ترید دلار "):
-            return self._set_float(t, "ترید دلار ", "trade_margin_usdt", "دلار هر پوزیشن", config.TRADE_MARGIN_MIN, config.TRADE_MARGIN_MAX, "USDT")
-        if t.startswith("دلار ترید "):
-            return self._set_float(t, "دلار ترید ", "trade_margin_usdt", "دلار هر پوزیشن", config.TRADE_MARGIN_MIN, config.TRADE_MARGIN_MAX, "USDT")
-        if t.startswith("ترید لوریج "):
-            return self._set_int(t, "ترید لوریج ", "leverage", "لوریج", config.LEVERAGE_MIN, config.LEVERAGE_MAX, "x")
-        if t.startswith("لوریج ترید "):
-            return self._set_int(t, "لوریج ترید ", "leverage", "لوریج", config.LEVERAGE_MIN, config.LEVERAGE_MAX, "x")
-        if t.startswith("حداکثر پوزیشن "):
-            return self._set_int(t, "حداکثر پوزیشن ", "max_open_positions", "حداکثر پوزیشن", config.MAX_POSITIONS_MIN, config.MAX_POSITIONS_MAX, "")
+            return "⛔ ترید واقعی خاموش شد. سفارش جدید باز نمی‌شود؛ سیگنال‌های جدید Virtual و پوزیشن‌های Real باز همچنان مانیتور می‌شوند."
+
+        float_commands = (
+            ("ترید دلار ", "trade_margin_usdt", "دلار هر پوزیشن"),
+            ("دلار ترید ", "trade_margin_usdt", "دلار هر پوزیشن"),
+            ("مارجین ترید ", "trade_margin_usdt", "دلار هر پوزیشن"),
+            ("ترید مارجین ", "trade_margin_usdt", "دلار هر پوزیشن"),
+        )
+        for prefix, key, label in float_commands:
+            if t.startswith(prefix):
+                return self._set_float(t, prefix, key, label, config.TRADE_MARGIN_MIN, config.TRADE_MARGIN_MAX, "USDT")
+
+        int_commands = (
+            ("ترید لوریج ", "leverage", "لوریج", config.LEVERAGE_MIN, config.LEVERAGE_MAX, "x"),
+            ("لوریج ترید ", "leverage", "لوریج", config.LEVERAGE_MIN, config.LEVERAGE_MAX, "x"),
+            ("حداکثر پوزیشن ", "max_open_positions", "حداکثر پوزیشن واقعی", config.MAX_POSITIONS_MIN, config.MAX_POSITIONS_MAX, ""),
+            ("تعداد اسلات ", "max_open_positions", "حداکثر پوزیشن واقعی", config.MAX_POSITIONS_MIN, config.MAX_POSITIONS_MAX, ""),
+            ("ترید اسلات ", "max_open_positions", "حداکثر پوزیشن واقعی", config.MAX_POSITIONS_MIN, config.MAX_POSITIONS_MAX, ""),
+        )
+        for prefix, key, label, lo, hi, suffix in int_commands:
+            if t.startswith(prefix):
+                return self._set_int(t, prefix, key, label, lo, hi, suffix)
+
         if t == "ریست سود":
             self.storage.reset_pnl(total=False)
-            return "✅ مبنای سود/ضرر امروز صفر شد. تاریخچه و آمار خام حذف نشدند."
+            return "✅ مبنای سود/ضرر امروز Real صفر شد. نتیجه‌های خام، آمار و تاریخچه حذف نشدند."
         if t == "ریست سود کل":
             self.storage.reset_pnl(total=True)
-            return "✅ مبنای سود/ضرر کل صفر شد. تاریخچه و آمار خام حذف نشدند."
+            return "✅ مبنای سود/ضرر امروز و کل Real صفر شد. نتیجه‌های خام، آمار و تاریخچه حذف نشدند."
         if t == "لاگ رد فعال":
             self.storage.set_setting("reject_log_enabled", True)
-            return "✅ لاگ دلایل رد فعال شد."
+            return "✅ چاپ زنده دلایل رد سیگنال در لاگ VPS فعال شد."
         if t == "لاگ رد خاموش":
             self.storage.set_setting("reject_log_enabled", False)
-            return "✅ لاگ دلایل رد خاموش شد؛ خطاهای مهم همچنان ثبت می‌شوند."
+            return "✅ چاپ دلایل رد خاموش شد؛ خطاهای حیاتی همچنان ثبت می‌شوند."
         return "دستور نامعتبر است.\n\n" + help_text()
-
 
 class TelegramBot:
     def __init__(self, storage: Storage, engine: BotEngine, toobit: ToobitClient):
@@ -371,9 +467,9 @@ class TelegramBot:
                 if item["type"] == "signal":
                     self.send_message(signal_message(signal))
                 elif item["type"] == "position_open":
-                    self.send_message(f"✅ پوزیشن REAL بازشدن در Toobit تأیید شد.\n{signal.get('canonical')} | SHORT\nورود واقعی: {_price(signal.get('actual_entry') or signal.get('entry'))}")
+                    self.send_message(position_open_message(signal))
                 elif item["type"] == "failed_open":
-                    self.send_message(f"❌ سفارش REAL باز نشد.\n{signal.get('canonical')} | اسلات آزاد شد.")
+                    self.send_message(failed_open_message(signal))
                 elif item["type"] == "result":
                     self.send_message(result_message(signal))
             finally:

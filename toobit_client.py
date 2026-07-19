@@ -373,15 +373,38 @@ class ToobitClient:
 
     def get_usdt_balance_summary(self) -> dict[str, float]:
         rows = self.get_balance()
-        row = next((x for x in rows if str(x.get("coin") or x.get("asset") or x.get("currency") or "").upper() == "USDT"), None)
+        row = next(
+            (item for item in rows if str(item.get("coin") or item.get("asset") or item.get("currency") or "").upper() == "USDT"),
+            None,
+        )
         if row is None:
-            row = next((x for x in rows if not str(x.get("coin") or x.get("asset") or x.get("currency") or "").strip()), {})
+            row = next(
+                (item for item in rows if not str(item.get("coin") or item.get("asset") or item.get("currency") or "").strip()),
+                {},
+            )
+
+        def pick(*keys: str) -> float:
+            for key in keys:
+                value = row.get(key)
+                if value not in (None, ""):
+                    return safe_float(value)
+            return 0.0
+
+        wallet = pick("walletBalance", "balance", "totalWalletBalance", "accountBalance")
+        equity = pick("equity", "accountEquity", "marginBalance", "totalMarginBalance", "balance", "walletBalance")
+        available = pick("availableBalance", "availableMargin", "available", "free")
+        position_margin = pick("positionMargin", "positionInitialMargin", "totalPositionInitialMargin")
+        order_margin = pick("orderMargin", "openOrderInitialMargin", "totalOpenOrderInitialMargin")
+        unrealized = pick("crossUnRealizedPnl", "unrealizedPnL", "unrealizedPnl", "unrealizedProfit", "pnl")
         return {
-            "balance": safe_float(row.get("balance") or row.get("walletBalance") or row.get("equity") or row.get("accountEquity")),
-            "available": safe_float(row.get("availableBalance") or row.get("availableMargin") or row.get("available") or row.get("free")),
-            "position_margin": safe_float(row.get("positionMargin") or row.get("positionInitialMargin")),
-            "order_margin": safe_float(row.get("orderMargin") or row.get("openOrderInitialMargin")),
-            "unrealized_pnl": safe_float(row.get("crossUnRealizedPnl") or row.get("unrealizedPnL") or row.get("unrealizedPnl") or row.get("unrealizedProfit")),
+            "wallet_balance": wallet,
+            "balance": equity or wallet,
+            "equity": equity or wallet,
+            "available": available,
+            "position_margin": position_margin,
+            "order_margin": order_margin,
+            "used_margin": position_margin + order_margin,
+            "unrealized_pnl": unrealized,
         }
 
     def get_positions(self, symbol: str | None = None) -> list[dict[str, Any]]:

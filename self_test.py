@@ -13,7 +13,7 @@ from typing import Any
 import config
 from bot import BotEngine
 from storage import Storage
-from telegram_bot import CommandRouter, trade_panel
+from telegram_bot import CommandRouter, result_message, signal_message, stats_panel, trade_panel
 from toobit_client import RateLimiter
 from utils import now_ms
 
@@ -107,11 +107,32 @@ class OfflineTests(unittest.TestCase):
 
     def test_command_ranges_and_panel(self):
         router = CommandRouter(self.storage, self.fake)  # type: ignore[arg-type]
+        self.storage.save_account_snapshot(True, {
+            "wallet_balance": 100.0,
+            "equity": 101.0,
+            "available": 90.0,
+            "position_margin": 7.0,
+            "order_margin": 3.0,
+            "used_margin": 10.0,
+            "unrealized_pnl": 1.0,
+            "open_positions": 0,
+            "open_position_keys": [],
+        })
         self.assertIn("7 USDT", router.handle("ترید دلار ۷"))
         self.assertEqual(self.storage.get_setting("trade_margin_usdt"), 7.0)
         self.assertIn("9 x", router.handle("ترید لوریج ۹"))
+        self.assertEqual(self.storage.get_setting("leverage"), 9)
+        self.assertIn("حداکثر پوزیشن واقعی", router.handle("تعداد اسلات ۴"))
+        self.assertEqual(self.storage.get_setting("max_open_positions"), 4)
         self.assertIn("خارج از بازه", router.handle("حداکثر پوزیشن ۲۰۱"))
-        self.assertIn("پنل ترید", trade_panel(self.storage))
+        panel = router.handle("ترید")
+        for label in (
+            "موجودی کیف پول Toobit", "اکویتی حساب", "مارجین آزاد", "مارجین پوزیشن‌ها",
+            "مارجین سفارش‌ها", "مارجین استفاده‌شده", "سود/ضرر شناور", "دلار هر پوزیشن",
+            "لوریج", "Isolated اجباری", "اسلات پُر", "اسلات خالی", "پوزیشن باز Toobit",
+            "پوزیشن تأییدشده ربات", "Pending Open ربات", "پوزیشن دستی/خارج از ربات",
+        ):
+            self.assertIn(label, panel)
 
     def test_whole_symbol_lock(self):
         first = self.storage.create_virtual_signal(self.signal())
@@ -163,6 +184,16 @@ class OfflineTests(unittest.TestCase):
         self.assertEqual(saved["result"], "TP")
         self.assertGreater(saved["net_pnl"], 0)
         self.assertEqual(self.storage.stats()["VIRTUAL"]["wins"], 1)
+
+    def test_full_signal_result_and_stats_messages(self):
+        sid = self.storage.create_virtual_signal(self.signal())
+        saved = self.storage.get_signal(int(sid))
+        self.assertIn("سیگنال VIRTUAL", signal_message(saved))
+        final = self.storage.finalize_signal(int(sid), "TP", 0.078, 10.0)
+        self.assertIn("سود/ضرر خالص", result_message(final))
+        panel = stats_panel(self.storage)
+        self.assertIn("TP: 1", panel)
+        self.assertIn("امروز:", panel)
 
     def test_rate_limiter_snapshot(self):
         limiter = RateLimiter()
