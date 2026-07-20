@@ -24,13 +24,16 @@ class Application:
         self.threads: list[threading.Thread] = []
         self.closed = False
 
-    def _spawn(self, name: str, target: Callable[[], Any]) -> None:
+    def _spawn(self, name: str, target: Callable[[], Any], *, expected_return: bool = False) -> None:
         def runner() -> None:
             logger.info("WORKER_START | %s", name)
             try:
                 target()
                 if not self.stop_event.is_set():
-                    logger.warning("WORKER_EXIT | %s returned unexpectedly", name)
+                    if expected_return:
+                        logger.info("WORKER_DONE | %s", name)
+                    else:
+                        logger.warning("WORKER_EXIT | %s returned unexpectedly", name)
             except Exception as exc:
                 self.storage.set_health(name, "warning", str(exc))
                 logger.exception("WORKER_CRASH | %s", name)
@@ -74,7 +77,7 @@ class Application:
         self._spawn("telegram-poll", self.telegram.poll_loop)
         self._spawn("telegram-notify", self.telegram.notification_loop)
         self._spawn("trade-execution", self._trade_loop)
-        self._spawn("startup", self._startup_loop)
+        self._spawn("startup", self._startup_loop, expected_return=True)
 
         # مانیتور Real حتی قبل از آماده‌شدن اسکنر اجرا می‌شود تا پوزیشن قدیمی گم نشود.
         self._periodic("real-monitor", config.REAL_MONITOR_SECONDS, self.engine.monitor_real, immediate=True, ready=False)

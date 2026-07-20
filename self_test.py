@@ -5,7 +5,9 @@
 """
 from __future__ import annotations
 
+import importlib
 import os
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -17,7 +19,7 @@ from bot import BotEngine
 from storage import Storage
 from telegram_bot import CommandRouter, TelegramBot, result_message, signal_message, stats_panel, trade_panel
 from toobit_client import RateLimiter
-from utils import now_ms
+from utils import json_dumps, now_ms
 
 
 class FakeToobit:
@@ -356,6 +358,114 @@ class OfflineTests(unittest.TestCase):
         self.assertEqual(self.storage.get_setting("telegram_chat_id"), "777")
         self.assertEqual(self.storage.telegram_offset(), 102)
         bot.stop()
+
+    def test_all_root_modules_import_cleanly(self):
+        for module_name in (
+            "config", "utils", "storage", "toobit_client", "strategy",
+            "bot", "telegram_bot", "main",
+        ):
+            module = importlib.import_module(module_name)
+            self.assertIsNotNone(module)
+
+    def test_legacy_database_migrates_and_accepts_new_signals(self):
+        legacy_path = Path(self.tmp.name) / "legacy_runtime.db"
+        conn = sqlite3.connect(legacy_path)
+        conn.executescript(
+            """
+            CREATE TABLE settings(key TEXT PRIMARY KEY,value_json TEXT NOT NULL,updated_at INTEGER NOT NULL);
+            CREATE TABLE signals(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                canonical TEXT NOT NULL,
+                exchange_symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                tier TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                telegram_message_id INTEGER,
+                order_id TEXT,
+                payload_json TEXT NOT NULL
+            );
+            CREATE INDEX idx_signals_active ON signals(status,tier,canonical);
+            CREATE TABLE symbol_locks(
+                canonical TEXT PRIMARY KEY,
+                signal_id INTEGER NOT NULL,
+                tier TEXT NOT NULL,
+                side TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE TABLE positions(
+                signal_id INTEGER PRIMARY KEY,
+                canonical TEXT NOT NULL,
+                toobit_symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                status TEXT NOT NULL,
+                reserved_at INTEGER NOT NULL,
+                confirm_after INTEGER NOT NULL,
+                opened_at INTEGER,
+                last_seen_at INTEGER,
+                order_id TEXT,
+                payload_json TEXT NOT NULL
+            );
+            CREATE TABLE account_snapshot(
+                singleton INTEGER PRIMARY KEY,
+                updated_at INTEGER NOT NULL,
+                connected INTEGER NOT NULL,
+                payload_json TEXT NOT NULL,
+                error TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE telegram_state(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at INTEGER NOT NULL);
+            CREATE TABLE health_state(component TEXT PRIMARY KEY,level TEXT NOT NULL,message TEXT NOT NULL,updated_at INTEGER NOT NULL);
+            CREATE TABLE runtime_events(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,kind TEXT NOT NULL,canonical TEXT,
+                message TEXT NOT NULL,created_at INTEGER NOT NULL,payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            """
+        )
+        timestamp = now_ms()
+        legacy_payload = {
+            "id": 1, "canonical": "OLDUSDT", "exchange_symbol": "OLD-SWAP-USDT",
+            "side": "SHORT", "tier": "REAL", "status": "TP", "result": "TP",
+            "created_at": timestamp - 60000, "closed_at": timestamp, "net_pnl": 1.25,
+        }
+        conn.execute(
+            "INSERT INTO signals(canonical,exchange_symbol,side,tier,status,created_at,updated_at,payload_json) VALUES(?,?,?,?,?,?,?,?)",
+            ("OLDUSDT", "OLD-SWAP-USDT", "SHORT", "REAL", "TP", timestamp - 60000, timestamp, json_dumps(legacy_payload)),
+        )
+        conn.commit()
+        conn.close()
+
+        migrated = Storage(legacy_path)
+        try:
+            signal_columns = {row[1] for row in migrated.conn.execute("PRAGMA table_info(signals)")}
+            position_columns = {row[1] for row in migrated.conn.execute("PRAGMA table_info(positions)")}
+            self.assertIn("mode", signal_columns)
+            self.assertIn("exchange_symbol", position_columns)
+            old = migrated.get_signal(1)
+            self.assertEqual(old["mode"], "REAL")
+            self.assertAlmostEqual(migrated.displayed_real_pnl()["total"], 1.25)
+            self.assertIn("پنل ترید", CommandRouter(migrated, self.fake).handle("ترید"))  # type: ignore[arg-type]
+
+            virtual = self.signal()
+            virtual["canonical"] = "NEWVUSDT"
+            virtual["exchange_symbol"] = "NEWV-SWAP-USDT"
+            virtual_id = migrated.create_virtual_signal(virtual)
+            self.assertIsNotNone(virtual_id)
+            self.assertEqual(migrated.get_signal(int(virtual_id))["mode"], "VIRTUAL")
+
+            real = self.signal()
+            real["canonical"] = "NEWRUSDT"
+            real["exchange_symbol"] = "NEWR-SWAP-USDT"
+            real_id = migrated.create_real_signal_and_reserve(real)
+            self.assertIsNotNone(real_id)
+            row = migrated.conn.execute(
+                "SELECT exchange_symbol,toobit_symbol FROM positions WHERE signal_id=?", (real_id,)
+            ).fetchone()
+            self.assertEqual(row[0], "NEWR-SWAP-USDT")
+            self.assertEqual(row[1], "NEWR-SWAP-USDT")
+        finally:
+            migrated.close()
+
 
 
 if __name__ == "__main__":

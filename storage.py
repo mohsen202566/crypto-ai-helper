@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import config
-from utils import json_dumps, json_loads, now_ms
+from utils import json_dumps, json_loads, logger, now_ms
 
 FINAL_STATUSES = {"TP", "STOP", "TRAIL_EXIT", "MANUAL_CLOSE", "FAILED_OPEN", "CANCELLED"}
 ACTIVE_STATUSES = ("ACTIVE", "PENDING_OPEN", "OPEN")
@@ -55,8 +55,43 @@ class Storage:
                         self.conn.execute("ROLLBACK")
                 raise
 
+    @staticmethod
+    def _table_exists(c: sqlite3.Connection, table: str) -> bool:
+        row = c.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()
+        return row is not None
+
+    @staticmethod
+    def _table_columns(c: sqlite3.Connection, table: str) -> set[str]:
+        if not Storage._table_exists(c, table):
+            return set()
+        return {str(row[1]) for row in c.execute(f"PRAGMA table_info({table})").fetchall()}
+
+    @staticmethod
+    def _add_column_if_missing(
+        c: sqlite3.Connection,
+        table: str,
+        column: str,
+        definition: str,
+    ) -> bool:
+        if column in Storage._table_columns(c, table):
+            return False
+        c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        return True
+
     def _migrate(self) -> None:
+        """Create the current schema and upgrade the legacy trend-bot database in place.
+
+        The previous project used ``tier`` instead of ``mode`` and ``toobit_symbol``
+        instead of ``exchange_symbol``.  Those legacy columns are intentionally kept
+        because SQLite cannot remove their NOT NULL constraints safely with ALTER TABLE.
+        New inserts therefore support both layouts; no statistics/history is deleted.
+        """
+        migrated: list[str] = []
         with self.tx(immediate=True) as c:
+            # Do not create indexes that reference new columns until legacy tables have
+            # been upgraded; CREATE TABLE IF NOT EXISTS does not alter an old table.
             c.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS settings(
@@ -68,26 +103,24 @@ class Storage:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     canonical TEXT NOT NULL,
                     exchange_symbol TEXT NOT NULL,
-                    mode TEXT NOT NULL CHECK(mode IN ('REAL','VIRTUAL')),
+                    mode TEXT NOT NULL DEFAULT 'VIRTUAL',
                     side TEXT NOT NULL,
                     status TEXT NOT NULL,
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL,
                     payload_json TEXT NOT NULL
                 );
-                CREATE INDEX IF NOT EXISTS idx_signals_active ON signals(status,mode,canonical);
-                CREATE INDEX IF NOT EXISTS idx_signals_time ON signals(created_at);
                 CREATE TABLE IF NOT EXISTS symbol_locks(
                     canonical TEXT PRIMARY KEY,
                     signal_id INTEGER NOT NULL,
-                    mode TEXT NOT NULL,
+                    mode TEXT NOT NULL DEFAULT 'VIRTUAL',
                     created_at INTEGER NOT NULL,
                     FOREIGN KEY(signal_id) REFERENCES signals(id) ON DELETE CASCADE
                 );
                 CREATE TABLE IF NOT EXISTS positions(
                     signal_id INTEGER PRIMARY KEY,
                     canonical TEXT NOT NULL,
-                    exchange_symbol TEXT NOT NULL,
+                    exchange_symbol TEXT NOT NULL DEFAULT '',
                     side TEXT NOT NULL,
                     status TEXT NOT NULL,
                     reserved_at INTEGER NOT NULL,
@@ -95,7 +128,6 @@ class Storage:
                     payload_json TEXT NOT NULL,
                     FOREIGN KEY(signal_id) REFERENCES signals(id) ON DELETE CASCADE
                 );
-                CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
                 CREATE TABLE IF NOT EXISTS account_snapshot(
                     singleton INTEGER PRIMARY KEY CHECK(singleton=1),
                     updated_at INTEGER NOT NULL,
@@ -125,7 +157,6 @@ class Storage:
                     payload_json TEXT NOT NULL,
                     created_at INTEGER NOT NULL
                 );
-                CREATE INDEX IF NOT EXISTS idx_events_time ON events(created_at);
                 CREATE TABLE IF NOT EXISTS telegram_state(
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL,
@@ -133,6 +164,98 @@ class Storage:
                 );
                 """
             )
+
+            if self._add_column_if_missing(c, "signals", "mode", "TEXT NOT NULL DEFAULT 'VIRTUAL'"):
+                migrated.append("signals.mode")
+            if self._add_column_if_missing(c, "signals", "exchange_symbol", "TEXT NOT NULL DEFAULT ''"):
+                migrated.append("signals.exchange_symbol")
+            if self._add_column_if_missing(c, "symbol_locks", "mode", "TEXT NOT NULL DEFAULT 'VIRTUAL'"):
+                migrated.append("symbol_locks.mode")
+            if self._add_column_if_missing(c, "positions", "exchange_symbol", "TEXT NOT NULL DEFAULT ''"):
+                migrated.append("positions.exchange_symbol")
+            if self._add_column_if_missing(c, "positions", "confirm_after", "INTEGER NOT NULL DEFAULT 0"):
+                migrated.append("positions.confirm_after")
+
+            signal_columns = self._table_columns(c, "signals")
+            lock_columns = self._table_columns(c, "symbol_locks")
+            position_columns = self._table_columns(c, "positions")
+
+            # Map the old learning tiers to the only two modes in the new bot.
+            if "tier" in signal_columns:
+                c.execute(
+                    "UPDATE signals SET mode=CASE WHEN UPPER(COALESCE(tier,''))='REAL' "
+                    "THEN 'REAL' ELSE 'VIRTUAL' END "
+                    "WHERE mode IS NULL OR mode='' OR mode NOT IN ('REAL','VIRTUAL') "
+                    "OR UPPER(COALESCE(tier,''))='REAL'"
+                )
+            else:
+                c.execute("UPDATE signals SET mode='VIRTUAL' WHERE mode IS NULL OR mode='' OR mode NOT IN ('REAL','VIRTUAL')")
+
+            if "tier" in lock_columns:
+                c.execute(
+                    "UPDATE symbol_locks SET mode=COALESCE((SELECT mode FROM signals "
+                    "WHERE signals.id=symbol_locks.signal_id),'VIRTUAL')"
+                )
+            else:
+                c.execute(
+                    "UPDATE symbol_locks SET mode=COALESCE((SELECT mode FROM signals "
+                    "WHERE signals.id=symbol_locks.signal_id),'VIRTUAL') "
+                    "WHERE mode IS NULL OR mode='' OR mode NOT IN ('REAL','VIRTUAL')"
+                )
+
+            if "toobit_symbol" in position_columns:
+                c.execute(
+                    "UPDATE positions SET exchange_symbol=COALESCE(NULLIF(exchange_symbol,''),toobit_symbol,'')"
+                )
+
+            # Keep old health and event history visible in the new panels.
+            if self._table_exists(c, "health_state"):
+                c.execute(
+                    "INSERT OR REPLACE INTO health(component,level,message,updated_at) "
+                    "SELECT component,level,message,updated_at FROM health_state"
+                )
+            if self._table_exists(c, "runtime_events"):
+                c.execute(
+                    "INSERT OR IGNORE INTO events(id,kind,canonical,message,payload_json,created_at) "
+                    "SELECT id,kind,canonical,message,COALESCE(payload_json,'{}'),created_at FROM runtime_events"
+                )
+
+            # Normalize JSON payloads too, because panels and monitors read payload_json.
+            rows = c.execute(
+                "SELECT id,canonical,exchange_symbol,mode,side,status,created_at,updated_at,payload_json FROM signals"
+            ).fetchall()
+            for row in rows:
+                payload = json_loads(row["payload_json"], {})
+                if not isinstance(payload, dict):
+                    payload = {}
+                payload.update({
+                    "id": int(row["id"]),
+                    "canonical": row["canonical"],
+                    "exchange_symbol": row["exchange_symbol"],
+                    "mode": row["mode"],
+                    "side": row["side"],
+                    "status": row["status"],
+                    "created_at": int(row["created_at"]),
+                    "updated_at": int(row["updated_at"]),
+                })
+                c.execute("UPDATE signals SET payload_json=? WHERE id=?", (json_dumps(payload), row["id"]))
+
+            # Rebuild indexes after mode exists. The old index may have the same name but
+            # still reference tier, so IF NOT EXISTS alone is insufficient.
+            c.executescript(
+                """
+                DROP INDEX IF EXISTS idx_signals_active;
+                CREATE INDEX idx_signals_active ON signals(status,mode,canonical);
+                CREATE INDEX IF NOT EXISTS idx_signals_time ON signals(created_at);
+                CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
+                CREATE INDEX IF NOT EXISTS idx_events_time ON events(created_at);
+                PRAGMA user_version=4;
+                """
+            )
+
+        if migrated:
+            logger.warning("DB_MIGRATION_APPLIED | %s", ",".join(migrated))
+        logger.info("DB_SCHEMA_READY | version=4 | path=%s", self.path)
 
     def _defaults(self) -> None:
         defaults = {
@@ -269,20 +392,37 @@ class Storage:
         created = int(signal.get("created_at") or now_ms())
         payload = dict(signal)
         payload["status"] = status
+
+        columns = ["canonical", "exchange_symbol", "mode", "side", "status", "created_at", "updated_at", "payload_json"]
+        values: list[Any] = [
+            payload["canonical"], payload["exchange_symbol"], payload["mode"], payload["side"],
+            status, created, created, json_dumps(payload),
+        ]
+        signal_columns = self._table_columns(c, "signals")
+        if "tier" in signal_columns:
+            columns.append("tier")
+            values.append("REAL" if payload["mode"] == "REAL" else "MEDIUM")
+        placeholders = ",".join("?" for _ in columns)
         cur = c.execute(
-            "INSERT INTO signals(canonical,exchange_symbol,mode,side,status,created_at,updated_at,payload_json) "
-            "VALUES(?,?,?,?,?,?,?,?)",
-            (
-                payload["canonical"], payload["exchange_symbol"], payload["mode"], payload["side"],
-                status, created, created, json_dumps(payload),
-            ),
+            f"INSERT INTO signals({','.join(columns)}) VALUES({placeholders})",
+            values,
         )
         signal_id = int(cur.lastrowid)
         payload["id"] = signal_id
         c.execute("UPDATE signals SET payload_json=? WHERE id=?", (json_dumps(payload), signal_id))
+
+        lock_columns = ["canonical", "signal_id", "mode", "created_at"]
+        lock_values: list[Any] = [payload["canonical"], signal_id, payload["mode"], created]
+        available = self._table_columns(c, "symbol_locks")
+        if "tier" in available:
+            lock_columns.append("tier")
+            lock_values.append("REAL" if payload["mode"] == "REAL" else "MEDIUM")
+        if "side" in available:
+            lock_columns.append("side")
+            lock_values.append(payload["side"])
         c.execute(
-            "INSERT INTO symbol_locks(canonical,signal_id,mode,created_at) VALUES(?,?,?,?)",
-            (payload["canonical"], signal_id, payload["mode"], created),
+            f"INSERT INTO symbol_locks({','.join(lock_columns)}) VALUES({','.join('?' for _ in lock_columns)})",
+            lock_values,
         )
         return signal_id
 
@@ -302,13 +442,22 @@ class Storage:
             if self._slot_state(c, max_positions)["free"] <= 0:
                 return None
             signal_id = self._insert_signal(c, signal, "PENDING_OPEN")
+            position_columns = [
+                "signal_id", "canonical", "exchange_symbol", "side", "status",
+                "reserved_at", "confirm_after", "payload_json",
+            ]
+            position_values: list[Any] = [
+                signal_id, signal["canonical"], signal["exchange_symbol"], signal["side"],
+                "PENDING_OPEN", now_ms(), 0, json_dumps({"signal_id": signal_id}),
+            ]
+            available = self._table_columns(c, "positions")
+            if "toobit_symbol" in available:
+                position_columns.append("toobit_symbol")
+                position_values.append(signal["exchange_symbol"])
             c.execute(
-                "INSERT INTO positions(signal_id,canonical,exchange_symbol,side,status,reserved_at,confirm_after,payload_json) "
-                "VALUES(?,?,?,?,?,?,?,?)",
-                (
-                    signal_id, signal["canonical"], signal["exchange_symbol"], signal["side"], "PENDING_OPEN",
-                    now_ms(), 0, json_dumps({"signal_id": signal_id}),
-                ),
+                f"INSERT INTO positions({','.join(position_columns)}) "
+                f"VALUES({','.join('?' for _ in position_columns)})",
+                position_values,
             )
             return signal_id
 
@@ -320,11 +469,20 @@ class Storage:
                 return None
             payload = json_loads(row["payload_json"], {})
             payload.update({"mode": "VIRTUAL", "status": "ACTIVE", "virtual_reason": reason})
+            signal_set = "mode='VIRTUAL',status='ACTIVE',updated_at=?,payload_json=?"
+            if "tier" in self._table_columns(c, "signals"):
+                signal_set += ",tier='MEDIUM'"
             c.execute(
-                "UPDATE signals SET mode='VIRTUAL',status='ACTIVE',updated_at=?,payload_json=? WHERE id=?",
+                f"UPDATE signals SET {signal_set} WHERE id=?",
                 (now_ms(), json_dumps(payload), signal_id),
             )
-            c.execute("UPDATE symbol_locks SET mode='VIRTUAL' WHERE canonical=? AND signal_id=?", (row["canonical"], signal_id))
+            lock_set = "mode='VIRTUAL'"
+            if "tier" in self._table_columns(c, "symbol_locks"):
+                lock_set += ",tier='MEDIUM'"
+            c.execute(
+                f"UPDATE symbol_locks SET {lock_set} WHERE canonical=? AND signal_id=?",
+                (row["canonical"], signal_id),
+            )
             c.execute("DELETE FROM positions WHERE signal_id=?", (signal_id,))
             return payload
 
