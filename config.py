@@ -75,7 +75,7 @@ def _load_project_environment() -> None:
 
 _load_project_environment()
 
-BUILD_VERSION = "2026.07.20-v5"
+BUILD_VERSION = "2026.07.20-v6"
 RUNTIME_DB = Path(os.getenv("RUNTIME_DB", str(ROOT / "runtime.db")))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
@@ -176,9 +176,19 @@ EXCLUDED_BASES = frozenset(
 )
 MIN_QUOTE_VOLUME_24H = float(os.getenv("MIN_QUOTE_VOLUME_24H", "200000"))
 MAX_SPREAD_RATE = float(os.getenv("MAX_SPREAD_RATE", "0.008"))
-MIN_PUMP_24H_PERCENT = float(os.getenv("MIN_PUMP_24H_PERCENT", "18"))
-MIN_PUMP_15M_PERCENT = float(os.getenv("MIN_PUMP_15M_PERCENT", "8"))
-MIN_PUMP_5M_PERCENT = float(os.getenv("MIN_PUMP_5M_PERCENT", "4"))
+# آستانه‌های پامپ باید همیشه مثبت باشند. حتی اگر مقدار قدیمی/اشتباه منفی
+# در Environment مانده باشد، هرگز ارز نزولی وارد قیف پامپ نمی‌شود.
+def _positive_float_env(name: str, default: float, minimum: float = 0.0001) -> float:
+    try:
+        value = abs(float(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        value = abs(float(default))
+    return max(float(minimum), value)
+
+
+MIN_PUMP_24H_PERCENT = _positive_float_env("MIN_PUMP_24H_PERCENT", 18.0)
+MIN_PUMP_15M_PERCENT = _positive_float_env("MIN_PUMP_15M_PERCENT", 8.0)
+MIN_PUMP_5M_PERCENT = _positive_float_env("MIN_PUMP_5M_PERCENT", 4.0)
 MIN_SIGNAL_SCORE = float(os.getenv("MIN_SIGNAL_SCORE", "72"))
 MIN_CONFIRMATIONS = int(os.getenv("MIN_CONFIRMATIONS", "4"))
 NEW_CONTRACT_WARMUP_MINUTES = int(os.getenv("NEW_CONTRACT_WARMUP_MINUTES", "3"))

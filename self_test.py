@@ -285,6 +285,31 @@ class OfflineTests(unittest.TestCase):
             config.NEW_CONTRACT_WARMUP_MINUTES = old_warmup
             config.DEEP_CANDIDATE_SIZE = old_deep
 
+
+    def test_negative_24h_never_enters_pump_watchlist_even_with_bad_env_threshold(self):
+        old_warmup = config.NEW_CONTRACT_WARMUP_MINUTES
+        old_threshold = config.MIN_PUMP_24H_PERCENT
+        try:
+            config.NEW_CONTRACT_WARMUP_MINUTES = 0
+            # شبیه‌سازی تنظیم قدیمی/اشتباه منفی روی VPS.
+            config.MIN_PUMP_24H_PERCENT = -18.0
+            self.fake.get_24h_tickers = lambda: [{
+                "symbol": "DOGE-SWAP-USDT", "lastPrice": "0.05", "openPrice": "0.10",
+                "priceChangePercent": "-50", "highPrice": "0.11", "lowPrice": "0.04",
+                "volume": "10000000", "quoteVolume": "1000000",
+            }]
+            self.fake.get_all_book_tickers = lambda: {"DOGEUSDT": {"bid": 0.0499, "ask": 0.0501}}
+            self.engine.startup()
+            emitted = self.engine.scan_once()
+            self.assertEqual(emitted, 0)
+            self.assertEqual(self.storage.get_setting("last_scan_ranked_count"), 0)
+            self.assertEqual(self.storage.get_setting("watchlist"), [])
+            self.assertEqual(self.storage.get_setting("deep_candidates"), [])
+            self.assertGreaterEqual(int(self.storage.get_setting("last_scan_rejected_non_positive", 0)), 1)
+        finally:
+            config.NEW_CONTRACT_WARMUP_MINUTES = old_warmup
+            config.MIN_PUMP_24H_PERCENT = old_threshold
+
     def test_rate_limiter_snapshot(self):
         limiter = RateLimiter()
         limiter.acquire(40, "market")

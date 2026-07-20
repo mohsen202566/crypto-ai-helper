@@ -86,10 +86,19 @@ class PumpStrategy:
         contracts_by_name = {x["canonical"]: x for x in self.storage.contracts(active_only=True)}
         ranked: list[dict[str, Any]] = []
         now = now_ms()
+        rejected_non_positive = 0
+        rejected_below_pump = 0
+        min_pump_24h = max(0.0001, abs(float(config.MIN_PUMP_24H_PERCENT)))
         for ticker in tickers:
             canonical = ticker["canonical"]
             base = canonical_base(canonical)
             if base in config.EXCLUDED_BASES or canonical not in contracts_by_name:
+                continue
+            # قانون سخت: این ربات فقط پایان پامپ صعودی را شکار می‌کند.
+            # هیچ ارز با بازده صفر/منفی، حتی با تنظیم محیطی اشتباه، وارد Watchlist نمی‌شود.
+            change_24h = safe_float(ticker.get("change_24h"))
+            if change_24h <= 0:
+                rejected_non_positive += 1
                 continue
             contract = contracts_by_name[canonical]
             first_seen = int(contract.get("first_seen_at") or now)
@@ -102,23 +111,31 @@ class PumpStrategy:
             quote_volume = ticker["quote_volume"] or ticker["base_volume"] * ticker["last"]
             if quote_volume < config.MIN_QUOTE_VOLUME_24H or spread > config.MAX_SPREAD_RATE:
                 continue
-            if ticker["change_24h"] < config.MIN_PUMP_24H_PERCENT:
+            if change_24h < min_pump_24h:
+                rejected_below_pump += 1
                 continue
             ticker.update({
                 "spread": spread,
                 "quote_volume": quote_volume,
                 "contract_age_minutes": max(0, (now - first_seen) / 60_000),
-                "rank_score": ticker["change_24h"] + min(20.0, (quote_volume / max(config.MIN_QUOTE_VOLUME_24H, 1)) ** 0.25 * 4),
+                "change_24h": change_24h,
+                "rank_score": change_24h + min(20.0, (quote_volume / max(config.MIN_QUOTE_VOLUME_24H, 1)) ** 0.25 * 4),
             })
             ranked.append(ticker)
         ranked.sort(key=lambda x: (x["rank_score"], x["quote_volume"]), reverse=True)
         watchlist = ranked[: config.WATCHLIST_SIZE]
         deep = watchlist[: config.DEEP_CANDIDATE_SIZE]
+        # دفاع نهایی: حتی در صورت تغییر بعدی کد رتبه‌بندی، Watchlist نزولی ساخته نشود.
+        watchlist = [x for x in watchlist if safe_float(x.get("change_24h")) > 0]
+        deep = [x for x in deep if safe_float(x.get("change_24h")) > 0]
         self.storage.set_setting("last_scan_ranked_count", len(ranked))
         self.storage.set_setting("last_scan_deep_count", len(deep))
+        self.storage.set_setting("last_scan_rejected_non_positive", rejected_non_positive)
+        self.storage.set_setting("last_scan_rejected_below_pump", rejected_below_pump)
         logger.info(
-            "SCAN_FILTER | contracts=%s tickers=%s books=%s ranked=%s watch=%s deep=%s",
+            "SCAN_FILTER | contracts=%s tickers=%s books=%s ranked=%s watch=%s deep=%s rejected_non_positive=%s rejected_below_pump=%s min_pump_24h=%.2f",
             len(contracts_by_name), len(tickers), len(books), len(ranked), len(watchlist), len(deep),
+            rejected_non_positive, rejected_below_pump, min_pump_24h,
         )
         self.storage.set_setting("watchlist", watchlist)
         self.storage.set_setting("deep_candidates", deep)
@@ -143,6 +160,10 @@ class PumpStrategy:
         return watchlist, signals
 
     def analyze(self, ticker: dict[str, Any], margin_usdt: float, leverage: int) -> dict[str, Any] | None:
+        # تحلیل عمیق نیز مستقل از Scanner از ورود ارز نزولی جلوگیری می‌کند.
+        min_pump_24h = max(0.0001, abs(float(config.MIN_PUMP_24H_PERCENT)))
+        if safe_float(ticker.get("change_24h")) < min_pump_24h:
+            return None
         canonical = ticker["canonical"]
         contract_info = self.contracts.get(canonical) or ticker
         candles = self.toobit.get_klines(canonical, "1m", 90)
@@ -161,8 +182,11 @@ class PumpStrategy:
         r5 = percent_change(current, closes[-6]) if len(closes) >= 6 else 0.0
         r15 = percent_change(current, closes[-16]) if len(closes) >= 16 else 0.0
         pump_ok = (
-            ticker["change_24h"] >= config.MIN_PUMP_24H_PERCENT
-            and (r15 >= config.MIN_PUMP_15M_PERCENT or r5 >= config.MIN_PUMP_5M_PERCENT)
+            ticker["change_24h"] >= min_pump_24h
+            and (
+                r15 >= max(0.0001, abs(float(config.MIN_PUMP_15M_PERCENT)))
+                or r5 >= max(0.0001, abs(float(config.MIN_PUMP_5M_PERCENT)))
+            )
         )
         if not pump_ok:
             return None
@@ -244,8 +268,9 @@ class PumpStrategy:
             return None
 
         score = 0.0
-        score += clamp((ticker["change_24h"] - config.MIN_PUMP_24H_PERCENT) * 0.45, 0, 18)
-        score += clamp((r15 - config.MIN_PUMP_15M_PERCENT) * 0.8, 0, 12)
+        min_pump_15m = max(0.0001, abs(float(config.MIN_PUMP_15M_PERCENT)))
+        score += clamp((ticker["change_24h"] - min_pump_24h) * 0.45, 0, 18)
+        score += clamp((r15 - min_pump_15m) * 0.8, 0, 12)
         score += 18 if structure_break else 0
         score += clamp((sell_aggression - 0.5) * 80, 0, 14)
         score += 8 if (upper_rejection or failed_high) else 0
