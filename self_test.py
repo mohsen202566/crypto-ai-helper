@@ -17,6 +17,7 @@ from typing import Any
 import config
 from bot import BotEngine
 from storage import Storage
+from strategy import PumpStrategy
 from telegram_bot import CommandRouter, TelegramBot, result_message, signal_message, stats_panel, trade_panel
 from toobit_client import RateLimiter
 from utils import json_dumps, now_ms
@@ -421,6 +422,67 @@ class OfflineTests(unittest.TestCase):
         ):
             module = importlib.import_module(module_name)
             self.assertIsNotNone(module)
+
+    def test_exhaustion_reject_has_detailed_diagnostic(self):
+        class ExhaustionFake(FakeToobit):
+            def get_klines(self, symbol, interval, limit):
+                rows = []
+                previous_close = 1.0
+                for index in range(90):
+                    close = 1.0 + index * 0.01
+                    rows.append({
+                        "open_time": index * 60_000,
+                        "open": previous_close,
+                        "high": close + 0.002,
+                        "low": min(previous_close, close) - 0.002,
+                        "close": close,
+                        "volume": 1000.0,
+                    })
+                    previous_close = close
+                return rows
+
+            def get_recent_trades(self, symbol, limit):
+                # همه معاملات خرید تهاجمی‌اند؛ بنابراین خستگی نباید تأیید شود.
+                return [{"p": "1.89", "q": "10", "isBuyerMaker": False} for _ in range(60)]
+
+            def get_depth(self, symbol, limit):
+                return {
+                    "bids": [[1.889, 1000], [1.888, 1000]],
+                    "asks": [[1.891, 1000], [1.892, 1000]],
+                }
+
+            def get_funding_rate(self, symbol):
+                return {"fundingRate": 0.0}
+
+            def get_open_interest(self, symbol):
+                return 1000.0
+
+            def get_long_short_ratio(self, symbol, period):
+                return {"longShortRatio": 1.0}
+
+        fake = ExhaustionFake()
+        strategy = PumpStrategy(self.storage, fake)  # type: ignore[arg-type]
+        strategy.contracts["DOGEUSDT"] = {"exchange_symbol": "DOGE-SWAP-USDT"}
+        candidate = {
+            "canonical": "DOGEUSDT",
+            "exchange_symbol": "DOGE-SWAP-USDT",
+            "change_24h": 40.0,
+            "quote_volume": 10_000_000.0,
+            "spread": 0.001,
+        }
+        self.assertIsNone(strategy.analyze(candidate, margin_usdt=5.0, leverage=10))
+        detail = strategy.last_diagnostic("DOGEUSDT")
+        self.assertEqual(detail["reason"], "exhaustion_not_confirmed")
+        self.assertEqual(detail["stage"], "exhaustion")
+        self.assertIn("structure_break", detail["missing"])
+        self.assertTrue(any(str(item).startswith("sell_aggression") for item in detail["missing"]))
+        for field in (
+            "r5", "r15", "drop_from_peak_percent", "drop_from_peak_atr",
+            "momentum_now", "momentum_before", "volume_ratio", "sell_aggression",
+            "ask_bid_ratio", "confirmations", "required_confirmations", "flags",
+        ):
+            self.assertIn(field, detail)
+
 
     def test_legacy_database_migrates_and_accepts_new_signals(self):
         legacy_path = Path(self.tmp.name) / "legacy_runtime.db"

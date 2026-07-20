@@ -75,7 +75,7 @@ def _load_project_environment() -> None:
 
 _load_project_environment()
 
-BUILD_VERSION = "2026.07.20-v6"
+BUILD_VERSION = "2026.07.20-v7"
 RUNTIME_DB = Path(os.getenv("RUNTIME_DB", str(ROOT / "runtime.db")))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 

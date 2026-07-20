@@ -23,6 +23,23 @@ class PumpStrategy:
         self.contracts: dict[str, dict[str, Any]] = {}
         self.oi_history: dict[str, deque[tuple[int, float]]] = defaultdict(lambda: deque(maxlen=12))
         self.last_contract_refresh = 0
+        # آخرین جزئیات تحلیل هر ارز برای لاگ دقیق دلیل رد.
+        self.analysis_diagnostics: dict[str, dict[str, Any]] = {}
+
+    def _set_diagnostic(self, canonical: str, reason: str, stage: str, **fields: Any) -> None:
+        payload = {
+            "canonical": canonical,
+            "reason": reason,
+            "stage": stage,
+            "updated_at": now_ms(),
+            **fields,
+        }
+        with self.lock:
+            self.analysis_diagnostics[canonical] = payload
+
+    def last_diagnostic(self, canonical: str) -> dict[str, Any]:
+        with self.lock:
+            return dict(self.analysis_diagnostics.get(canonical, {}))
 
     def refresh_contracts(self, force: bool = False) -> int:
         now = now_ms()
@@ -151,23 +168,63 @@ class PumpStrategy:
                 "SCAN_CANDIDATE | %s | change24h=%.2f%% volume=%.0f spread=%.4f",
                 candidate["canonical"], candidate["change_24h"], candidate["quote_volume"], candidate["spread"],
             )
-            analyzed = self.analyze(candidate, margin_usdt=margin_usdt, leverage=leverage)
+            try:
+                analyzed = self.analyze(candidate, margin_usdt=margin_usdt, leverage=leverage)
+            except Exception as exc:
+                self._set_diagnostic(candidate["canonical"], "analysis_exception", "analysis", error=str(exc))
+                logger.exception("SCAN_CANDIDATE_ERROR | %s | %s", candidate["canonical"], exc)
+                analyzed = None
             if analyzed:
                 signals.append(analyzed)
                 logger.info("SCAN_SIGNAL_READY | %s | score=%.1f", candidate["canonical"], safe_float(analyzed.get("signal_score")))
             else:
-                logger.info("SCAN_CANDIDATE_REJECT | %s | exhaustion_not_confirmed", candidate["canonical"])
+                detail = self.last_diagnostic(candidate["canonical"])
+                reason = str(detail.get("reason") or "unknown_reject")
+                stage = str(detail.get("stage") or "unknown")
+                missing = detail.get("missing") or []
+                missing_text = ",".join(str(x) for x in missing) if isinstance(missing, list) else str(missing)
+                logger.info(
+                    "SCAN_CANDIDATE_REJECT | %s | reason=%s stage=%s score=%.1f confirms=%s/%s missing=%s",
+                    candidate["canonical"], reason, stage, safe_float(detail.get("score")),
+                    safe_int(detail.get("confirmations")), safe_int(detail.get("required_confirmations")),
+                    missing_text or "-",
+                )
+                if stage in {"exhaustion", "score", "risk"}:
+                    logger.info(
+                        "EXHAUSTION_DETAIL | %s | r5=%.2f r15=%.2f drop_peak=%.2f%% drop_atr=%.2f "
+                        "mom_now=%.2f mom_before=%.2f volume_ratio=%.2f sell_aggr=%.3f ask_bid=%.2f "
+                        "structure=%s failed_high=%s upper_reject=%s bearish=%s ema_turn=%s rsi=%.1f/%.1f",
+                        candidate["canonical"], safe_float(detail.get("r5")), safe_float(detail.get("r15")),
+                        safe_float(detail.get("drop_from_peak_percent")), safe_float(detail.get("drop_from_peak_atr")),
+                        safe_float(detail.get("momentum_now")), safe_float(detail.get("momentum_before")),
+                        safe_float(detail.get("volume_ratio")), safe_float(detail.get("sell_aggression")),
+                        safe_float(detail.get("ask_bid_ratio")), int(bool(detail.get("structure_break"))),
+                        int(bool(detail.get("failed_high"))), int(bool(detail.get("upper_rejection"))),
+                        int(bool(detail.get("bearish_candle"))), int(bool(detail.get("ema_turn"))),
+                        safe_float(detail.get("rsi_now")), safe_float(detail.get("rsi_prev")),
+                    )
         return watchlist, signals
 
     def analyze(self, ticker: dict[str, Any], margin_usdt: float, leverage: int) -> dict[str, Any] | None:
         # تحلیل عمیق نیز مستقل از Scanner از ورود ارز نزولی جلوگیری می‌کند.
         min_pump_24h = max(0.0001, abs(float(config.MIN_PUMP_24H_PERCENT)))
-        if safe_float(ticker.get("change_24h")) < min_pump_24h:
-            return None
         canonical = ticker["canonical"]
+        change_24h = safe_float(ticker.get("change_24h"))
+        self._set_diagnostic(canonical, "analysis_started", "start", change_24h=change_24h)
+        if change_24h < min_pump_24h:
+            self._set_diagnostic(
+                canonical, "pump_24h_below_minimum", "pump_filter",
+                change_24h=change_24h, min_pump_24h=min_pump_24h,
+                missing=["pump_24h"],
+            )
+            return None
         contract_info = self.contracts.get(canonical) or ticker
         candles = self.toobit.get_klines(canonical, "1m", 90)
         if len(candles) < 30:
+            self._set_diagnostic(
+                canonical, "insufficient_candles", "market_data",
+                candles=len(candles), required_candles=30, missing=["candles"],
+            )
             return None
         trades = self.toobit.get_recent_trades(canonical, 60)
         depth = self.toobit.get_depth(canonical, 20)
@@ -178,6 +235,7 @@ class PumpStrategy:
         closes = [x["close"] for x in candles]
         current = closes[-1]
         if current <= 0:
+            self._set_diagnostic(canonical, "invalid_current_price", "market_data", current=current, missing=["price"])
             return None
         r5 = percent_change(current, closes[-6]) if len(closes) >= 6 else 0.0
         r15 = percent_change(current, closes[-16]) if len(closes) >= 16 else 0.0
@@ -189,10 +247,24 @@ class PumpStrategy:
             )
         )
         if not pump_ok:
+            missing = []
+            if ticker["change_24h"] < min_pump_24h:
+                missing.append("pump_24h")
+            if r15 < max(0.0001, abs(float(config.MIN_PUMP_15M_PERCENT))) and r5 < max(0.0001, abs(float(config.MIN_PUMP_5M_PERCENT))):
+                missing.append("short_term_pump")
+            self._set_diagnostic(
+                canonical, "pump_momentum_not_confirmed", "pump_filter",
+                change_24h=ticker["change_24h"], r5=r5, r15=r15,
+                min_pump_24h=min_pump_24h,
+                min_pump_15m=max(0.0001, abs(float(config.MIN_PUMP_15M_PERCENT))),
+                min_pump_5m=max(0.0001, abs(float(config.MIN_PUMP_5M_PERCENT))),
+                missing=missing,
+            )
             return None
 
         atr_value = atr(candles, config.ATR_PERIOD)
         if atr_value <= 0:
+            self._set_diagnostic(canonical, "invalid_atr", "market_data", atr=atr_value, missing=["atr"])
             return None
         rsi_now = rsi(closes[-30:], config.RSI_PERIOD)
         rsi_prev = rsi(closes[-31:-1], config.RSI_PERIOD) if len(closes) >= 31 else rsi_now
@@ -240,6 +312,10 @@ class PumpStrategy:
         structure_break = current < micro_support or (current < ema5 and last["low"] < previous["low"])
         ema_turn = ema5 < ema12 or (current < ema5 and ema5 - current >= atr_value * 0.12)
         rsi_rollover = rsi_now >= 60 and rsi_now < rsi_prev
+        drop_from_peak = max(0.0, recent_peak - current)
+        drop_from_peak_percent = (drop_from_peak / recent_peak * 100.0) if recent_peak > 0 else 0.0
+        drop_from_peak_atr = drop_from_peak / atr_value if atr_value > 0 else 0.0
+        volume_ratio = recent_volume / max(1e-12, prior_volume)
 
         funding_rate = safe_float(funding.get("rate") or funding.get("fundingRate"))
         long_short = safe_float(ratio.get("longShortRatio") or ratio.get("ratio"), 1.0)
@@ -263,8 +339,47 @@ class PumpStrategy:
             "لانگ گیر افتاده/OI": trapped_longs,
         }
         confirmations = sum(bool(x) for x in flags.values())
+        diagnostic_base = {
+            "r5": r5,
+            "r15": r15,
+            "drop_from_peak_percent": drop_from_peak_percent,
+            "drop_from_peak_atr": drop_from_peak_atr,
+            "momentum_now": momentum_now,
+            "momentum_before": momentum_before,
+            "volume_ratio": volume_ratio,
+            "sell_aggression": sell_aggression,
+            "required_sell_aggression": 0.53,
+            "ask_bid_ratio": ask_bid_ratio,
+            "structure_break": structure_break,
+            "failed_high": failed_high,
+            "upper_rejection": upper_rejection,
+            "bearish_candle": bearish_candle,
+            "ema_turn": ema_turn,
+            "momentum_fade": momentum_fade,
+            "volume_fade": volume_fade,
+            "rsi_rollover": rsi_rollover,
+            "rsi_now": rsi_now,
+            "rsi_prev": rsi_prev,
+            "funding_rate": funding_rate,
+            "long_short_ratio": long_short,
+            "open_interest_change_percent": oi_change,
+            "confirmations": confirmations,
+            "required_confirmations": config.MIN_CONFIRMATIONS,
+            "flags": flags,
+        }
         # دو تأیید اجباری برای جلوگیری از حدس‌زدن سقف.
-        if not structure_break or sell_aggression < 0.53 or confirmations < config.MIN_CONFIRMATIONS:
+        missing: list[str] = []
+        if not structure_break:
+            missing.append("structure_break")
+        if sell_aggression < 0.53:
+            missing.append(f"sell_aggression<{0.53:.2f}")
+        if confirmations < config.MIN_CONFIRMATIONS:
+            missing.append(f"confirmations<{config.MIN_CONFIRMATIONS}")
+        if missing:
+            self._set_diagnostic(
+                canonical, "exhaustion_not_confirmed", "exhaustion",
+                **diagnostic_base, missing=missing,
+            )
             return None
 
         score = 0.0
@@ -282,6 +397,11 @@ class PumpStrategy:
         score += 4 if rsi_rollover else 0
         score = clamp(score, 0, 100)
         if score < config.MIN_SIGNAL_SCORE:
+            self._set_diagnostic(
+                canonical, "signal_score_below_minimum", "score",
+                **diagnostic_base, score=score, min_signal_score=config.MIN_SIGNAL_SCORE,
+                missing=[f"score<{config.MIN_SIGNAL_SCORE}"],
+            )
             return None
 
         raw_stop_distance = max(
@@ -291,6 +411,12 @@ class PumpStrategy:
         )
         stop_percent = raw_stop_distance / current
         if stop_percent > config.MAX_STOP_PERCENT:
+            self._set_diagnostic(
+                canonical, "stop_too_wide", "risk",
+                **diagnostic_base, score=score, stop_percent=stop_percent * 100.0,
+                max_stop_percent=config.MAX_STOP_PERCENT * 100.0,
+                missing=["acceptable_stop_distance"],
+            )
             return None
         stop = current + raw_stop_distance
         safety_tp = current * (1.0 - config.SAFETY_TP_PERCENT)
@@ -299,8 +425,18 @@ class PumpStrategy:
         expected_cost = notional * (config.TAKER_FEE_RATE * 2 + config.ROUND_TRIP_SLIPPAGE_RATE + config.FUNDING_RESERVE_RATE)
         expected_net = notional * expected_move - expected_cost
         if expected_net < config.MIN_EXPECTED_NET_PROFIT_USDT:
+            self._set_diagnostic(
+                canonical, "expected_net_below_minimum", "risk",
+                **diagnostic_base, score=score, expected_net=expected_net,
+                min_expected_net=config.MIN_EXPECTED_NET_PROFIT_USDT,
+                missing=["minimum_net_profit"],
+            )
             return None
 
+        self._set_diagnostic(
+            canonical, "signal_ready", "ready",
+            **diagnostic_base, score=score, expected_net=expected_net, missing=[],
+        )
         reasons = [name for name, ok in flags.items() if ok]
         return {
             "canonical": canonical,
