@@ -75,7 +75,7 @@ def _load_project_environment() -> None:
 
 _load_project_environment()
 
-BUILD_VERSION = "2026.07.20-v7"
+BUILD_VERSION = "2026.07.20-v8"
 RUNTIME_DB = Path(os.getenv("RUNTIME_DB", str(ROOT / "runtime.db")))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
@@ -189,6 +189,12 @@ def _positive_float_env(name: str, default: float, minimum: float = 0.0001) -> f
 MIN_PUMP_24H_PERCENT = _positive_float_env("MIN_PUMP_24H_PERCENT", 18.0)
 MIN_PUMP_15M_PERCENT = _positive_float_env("MIN_PUMP_15M_PERCENT", 8.0)
 MIN_PUMP_5M_PERCENT = _positive_float_env("MIN_PUMP_5M_PERCENT", 4.0)
+# پامپ لازم نیست در همین پنج یا پانزده دقیقه هنوز صعودی باشد؛ هنگام خستگی،
+# بازده کوتاه‌مدت معمولاً تخت یا منفی می‌شود. بنابراین سابقه جهش اخیر یا
+# نزدیک‌بودن قیمت به سقف ۲۴ساعته نیز زمینه پامپ را تأیید می‌کند.
+RECENT_PUMP_LOOKBACK_MINUTES = max(30, int(os.getenv("RECENT_PUMP_LOOKBACK_MINUTES", "90")))
+MIN_RECENT_PUMP_RUNUP_PERCENT = _positive_float_env("MIN_RECENT_PUMP_RUNUP_PERCENT", 8.0)
+MAX_DISTANCE_FROM_24H_HIGH_PERCENT = _positive_float_env("MAX_DISTANCE_FROM_24H_HIGH_PERCENT", 15.0)
 MIN_SIGNAL_SCORE = float(os.getenv("MIN_SIGNAL_SCORE", "72"))
 MIN_CONFIRMATIONS = int(os.getenv("MIN_CONFIRMATIONS", "4"))
 NEW_CONTRACT_WARMUP_MINUTES = int(os.getenv("NEW_CONTRACT_WARMUP_MINUTES", "3"))

@@ -484,6 +484,117 @@ class OfflineTests(unittest.TestCase):
             self.assertIn(field, detail)
 
 
+    def test_recent_pump_then_rollover_reaches_exhaustion_stage(self):
+        class RolloverFake(FakeToobit):
+            def get_klines(self, symbol, interval, limit):
+                rows = []
+                closes = []
+                # 45 دقیقه آرام، 20 دقیقه پامپ وحشی، سپس 25 دقیقه خستگی/افت.
+                for index in range(45):
+                    closes.append(1.0 + index * 0.0002)
+                start = closes[-1]
+                for index in range(20):
+                    closes.append(start + (index + 1) * 0.02)
+                peak = closes[-1]
+                for index in range(25):
+                    closes.append(peak - (index + 1) * 0.003)
+                previous = closes[0]
+                for index, close in enumerate(closes):
+                    rows.append({
+                        "ts": index * 60_000,
+                        "open": previous,
+                        "high": max(previous, close) + 0.002,
+                        "low": min(previous, close) - 0.002,
+                        "close": close,
+                        "volume": 1000.0,
+                    })
+                    previous = close
+                return rows
+
+            def get_recent_trades(self, symbol, limit):
+                return [{"p": "1.33", "q": "10", "isBuyerMaker": False} for _ in range(60)]
+
+            def get_depth(self, symbol, limit):
+                return {"bids": [[1.329, 1000]], "asks": [[1.331, 1000]]}
+
+            def get_funding_rate(self, symbol):
+                return {"fundingRate": 0.0}
+
+            def get_open_interest(self, symbol):
+                return 1000.0
+
+            def get_long_short_ratio(self, symbol, period):
+                return {"longShortRatio": 1.0}
+
+        fake = RolloverFake()
+        strategy = PumpStrategy(self.storage, fake)  # type: ignore[arg-type]
+        strategy.contracts["DOGEUSDT"] = {"exchange_symbol": "DOGE-SWAP-USDT"}
+        candidate = {
+            "canonical": "DOGEUSDT",
+            "exchange_symbol": "DOGE-SWAP-USDT",
+            "change_24h": 40.0,
+            "high": 1.42,
+            "quote_volume": 10_000_000.0,
+            "spread": 0.001,
+        }
+        self.assertIsNone(strategy.analyze(candidate, margin_usdt=5.0, leverage=10))
+        detail = strategy.last_diagnostic("DOGEUSDT")
+        self.assertEqual(detail["stage"], "exhaustion")
+        self.assertEqual(detail["reason"], "exhaustion_not_confirmed")
+        self.assertFalse(detail["active_short_term_pump"])
+        self.assertTrue(detail["recent_pump_event"])
+        self.assertGreater(detail["recent_runup_percent"], config.MIN_RECENT_PUMP_RUNUP_PERCENT)
+
+    def test_old_pump_near_24h_high_reaches_exhaustion_stage(self):
+        class NearHighFake(FakeToobit):
+            def get_klines(self, symbol, interval, limit):
+                rows = []
+                previous = 1.0
+                for index in range(90):
+                    close = 1.0 + (index % 3) * 0.0002
+                    rows.append({
+                        "ts": index * 60_000,
+                        "open": previous,
+                        "high": max(previous, close) + 0.0002,
+                        "low": min(previous, close) - 0.0002,
+                        "close": close,
+                        "volume": 1000.0,
+                    })
+                    previous = close
+                return rows
+
+            def get_recent_trades(self, symbol, limit):
+                return [{"p": "1.0", "q": "10", "isBuyerMaker": False} for _ in range(60)]
+
+            def get_depth(self, symbol, limit):
+                return {"bids": [[0.999, 1000]], "asks": [[1.001, 1000]]}
+
+            def get_funding_rate(self, symbol):
+                return {"fundingRate": 0.0}
+
+            def get_open_interest(self, symbol):
+                return 1000.0
+
+            def get_long_short_ratio(self, symbol, period):
+                return {"longShortRatio": 1.0}
+
+        fake = NearHighFake()
+        strategy = PumpStrategy(self.storage, fake)  # type: ignore[arg-type]
+        strategy.contracts["DOGEUSDT"] = {"exchange_symbol": "DOGE-SWAP-USDT"}
+        candidate = {
+            "canonical": "DOGEUSDT",
+            "exchange_symbol": "DOGE-SWAP-USDT",
+            "change_24h": 40.0,
+            "high": 1.05,
+            "quote_volume": 10_000_000.0,
+            "spread": 0.001,
+        }
+        self.assertIsNone(strategy.analyze(candidate, margin_usdt=5.0, leverage=10))
+        detail = strategy.last_diagnostic("DOGEUSDT")
+        self.assertEqual(detail["stage"], "exhaustion")
+        self.assertTrue(detail["near_24h_high"])
+        self.assertFalse(detail["active_short_term_pump"])
+
     def test_legacy_database_migrates_and_accepts_new_signals(self):
         legacy_path = Path(self.tmp.name) / "legacy_runtime.db"
         conn = sqlite3.connect(legacy_path)

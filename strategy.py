@@ -189,12 +189,25 @@ class PumpStrategy:
                     safe_int(detail.get("confirmations")), safe_int(detail.get("required_confirmations")),
                     missing_text or "-",
                 )
+                if stage == "pump_filter":
+                    logger.info(
+                        "PUMP_CONTEXT_DETAIL | %s | change24h=%.2f r5=%.2f r15=%.2f r60=%.2f "
+                        "recent_runup=%.2f%% peak_age=%sm distance24h_high=%.2f%% active=%s recent=%s near_high=%s",
+                        candidate["canonical"], safe_float(detail.get("change_24h")), safe_float(detail.get("r5")),
+                        safe_float(detail.get("r15")), safe_float(detail.get("r60")),
+                        safe_float(detail.get("recent_runup_percent")), safe_int(detail.get("recent_peak_age_minutes")),
+                        safe_float(detail.get("distance_from_24h_high_percent")),
+                        int(bool(detail.get("active_short_term_pump"))), int(bool(detail.get("recent_pump_event"))),
+                        int(bool(detail.get("near_24h_high"))),
+                    )
                 if stage in {"exhaustion", "score", "risk"}:
                     logger.info(
-                        "EXHAUSTION_DETAIL | %s | r5=%.2f r15=%.2f drop_peak=%.2f%% drop_atr=%.2f "
-                        "mom_now=%.2f mom_before=%.2f volume_ratio=%.2f sell_aggr=%.3f ask_bid=%.2f "
-                        "structure=%s failed_high=%s upper_reject=%s bearish=%s ema_turn=%s rsi=%.1f/%.1f",
+                        "EXHAUSTION_DETAIL | %s | r5=%.2f r15=%.2f r60=%.2f recent_runup=%.2f%% "
+                        "drop_peak=%.2f%% drop_atr=%.2f mom_now=%.2f mom_before=%.2f volume_ratio=%.2f "
+                        "sell_aggr=%.3f ask_bid=%.2f structure=%s failed_high=%s upper_reject=%s "
+                        "bearish=%s ema_turn=%s rsi=%.1f/%.1f",
                         candidate["canonical"], safe_float(detail.get("r5")), safe_float(detail.get("r15")),
+                        safe_float(detail.get("r60")), safe_float(detail.get("recent_runup_percent")),
                         safe_float(detail.get("drop_from_peak_percent")), safe_float(detail.get("drop_from_peak_atr")),
                         safe_float(detail.get("momentum_now")), safe_float(detail.get("momentum_before")),
                         safe_float(detail.get("volume_ratio")), safe_float(detail.get("sell_aggression")),
@@ -239,25 +252,62 @@ class PumpStrategy:
             return None
         r5 = percent_change(current, closes[-6]) if len(closes) >= 6 else 0.0
         r15 = percent_change(current, closes[-16]) if len(closes) >= 16 else 0.0
-        pump_ok = (
-            ticker["change_24h"] >= min_pump_24h
-            and (
-                r15 >= max(0.0001, abs(float(config.MIN_PUMP_15M_PERCENT)))
-                or r5 >= max(0.0001, abs(float(config.MIN_PUMP_5M_PERCENT)))
-            )
+        r60 = percent_change(current, closes[-61]) if len(closes) >= 61 else percent_change(current, closes[0])
+
+        # زمینه پامپ را از «تاریخچه جهش» تشخیص می‌دهیم، نه فقط ادامه رشد همین لحظه.
+        # هنگام خستگی طبیعی است که r5/r15 تخت یا منفی شوند؛ این باید نشانه خستگی
+        # باشد، نه دلیل حذف نامزد پیش از ورود به تحلیل دامپ.
+        lookback_count = min(len(candles), int(config.RECENT_PUMP_LOOKBACK_MINUTES) + 1)
+        recent_rows = candles[-lookback_count:]
+        running_low = float("inf")
+        recent_runup_percent = 0.0
+        recent_peak_index = 0
+        for index, row in enumerate(recent_rows):
+            row_low = safe_float(row.get("low"))
+            row_high = safe_float(row.get("high"))
+            if row_low > 0:
+                running_low = min(running_low, row_low)
+            if running_low < float("inf") and row_high > 0:
+                runup = percent_change(row_high, running_low)
+                if runup > recent_runup_percent:
+                    recent_runup_percent = runup
+                    recent_peak_index = index
+        recent_peak_age_minutes = max(0, len(recent_rows) - 1 - recent_peak_index)
+
+        min_pump_15m = max(0.0001, abs(float(config.MIN_PUMP_15M_PERCENT)))
+        min_pump_5m = max(0.0001, abs(float(config.MIN_PUMP_5M_PERCENT)))
+        min_recent_runup = max(0.0001, abs(float(config.MIN_RECENT_PUMP_RUNUP_PERCENT)))
+        high_24h = safe_float(ticker.get("high"))
+        distance_from_24h_high_percent = (
+            max(0.0, (high_24h - current) / high_24h * 100.0) if high_24h > 0 else 999.0
         )
-        if not pump_ok:
+        active_short_term_pump = r15 >= min_pump_15m or r5 >= min_pump_5m
+        recent_pump_event = recent_runup_percent >= min_recent_runup or r60 >= min_recent_runup
+        near_24h_high = (
+            high_24h > 0
+            and distance_from_24h_high_percent <= float(config.MAX_DISTANCE_FROM_24H_HIGH_PERCENT)
+        )
+        pump_context_ok = (
+            ticker["change_24h"] >= min_pump_24h
+            and (active_short_term_pump or recent_pump_event or near_24h_high)
+        )
+        if not pump_context_ok:
             missing = []
             if ticker["change_24h"] < min_pump_24h:
                 missing.append("pump_24h")
-            if r15 < max(0.0001, abs(float(config.MIN_PUMP_15M_PERCENT))) and r5 < max(0.0001, abs(float(config.MIN_PUMP_5M_PERCENT))):
-                missing.append("short_term_pump")
+            if not (active_short_term_pump or recent_pump_event or near_24h_high):
+                missing.append("recent_pump_context")
             self._set_diagnostic(
-                canonical, "pump_momentum_not_confirmed", "pump_filter",
-                change_24h=ticker["change_24h"], r5=r5, r15=r15,
-                min_pump_24h=min_pump_24h,
-                min_pump_15m=max(0.0001, abs(float(config.MIN_PUMP_15M_PERCENT))),
-                min_pump_5m=max(0.0001, abs(float(config.MIN_PUMP_5M_PERCENT))),
+                canonical, "pump_context_not_confirmed", "pump_filter",
+                change_24h=ticker["change_24h"], r5=r5, r15=r15, r60=r60,
+                recent_runup_percent=recent_runup_percent,
+                recent_peak_age_minutes=recent_peak_age_minutes,
+                distance_from_24h_high_percent=distance_from_24h_high_percent,
+                active_short_term_pump=active_short_term_pump,
+                recent_pump_event=recent_pump_event, near_24h_high=near_24h_high,
+                min_pump_24h=min_pump_24h, min_pump_15m=min_pump_15m,
+                min_pump_5m=min_pump_5m, min_recent_runup=min_recent_runup,
+                max_distance_from_24h_high=float(config.MAX_DISTANCE_FROM_24H_HIGH_PERCENT),
                 missing=missing,
             )
             return None
@@ -342,6 +392,13 @@ class PumpStrategy:
         diagnostic_base = {
             "r5": r5,
             "r15": r15,
+            "r60": r60,
+            "recent_runup_percent": recent_runup_percent,
+            "recent_peak_age_minutes": recent_peak_age_minutes,
+            "distance_from_24h_high_percent": distance_from_24h_high_percent,
+            "active_short_term_pump": active_short_term_pump,
+            "recent_pump_event": recent_pump_event,
+            "near_24h_high": near_24h_high,
             "drop_from_peak_percent": drop_from_peak_percent,
             "drop_from_peak_atr": drop_from_peak_atr,
             "momentum_now": momentum_now,
@@ -383,9 +440,9 @@ class PumpStrategy:
             return None
 
         score = 0.0
-        min_pump_15m = max(0.0001, abs(float(config.MIN_PUMP_15M_PERCENT)))
+        pump_impulse = max(r5, r15, r60, recent_runup_percent)
         score += clamp((ticker["change_24h"] - min_pump_24h) * 0.45, 0, 18)
-        score += clamp((r15 - min_pump_15m) * 0.8, 0, 12)
+        score += clamp((pump_impulse - min_recent_runup) * 0.8, 0, 12)
         score += 18 if structure_break else 0
         score += clamp((sell_aggression - 0.5) * 80, 0, 14)
         score += 8 if (upper_rejection or failed_high) else 0
