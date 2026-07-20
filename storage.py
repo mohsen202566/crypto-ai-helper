@@ -146,6 +146,7 @@ class Storage:
             "watchlist": [],
             "deep_candidates": [],
             "last_scan_ms": 0,
+            "telegram_chat_id": "",
             "pnl_today_baseline": 0.0,
             "pnl_total_baseline": 0.0,
             "pnl_today_baseline_date": datetime.now(timezone.utc).date().isoformat(),

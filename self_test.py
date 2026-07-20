@@ -5,7 +5,9 @@
 """
 from __future__ import annotations
 
+import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from typing import Any
@@ -13,7 +15,7 @@ from typing import Any
 import config
 from bot import BotEngine
 from storage import Storage
-from telegram_bot import CommandRouter, result_message, signal_message, stats_panel, trade_panel
+from telegram_bot import CommandRouter, TelegramBot, result_message, signal_message, stats_panel, trade_panel
 from toobit_client import RateLimiter
 from utils import now_ms
 
@@ -74,10 +76,64 @@ class FakeToobit:
         return None
 
 
+class FakeResponse:
+    def __init__(self, data: dict[str, Any], status_code: int = 200):
+        self._data = data
+        self.status_code = status_code
+        self.ok = 200 <= status_code < 300
+        self.text = str(data)
+
+    def json(self):
+        return self._data
+
+
+class FakePollSession:
+    def __init__(self, updates: list[dict[str, Any]]):
+        self.updates = updates
+        self.get_updates_calls = 0
+        self.closed = False
+
+    def post(self, url, json=None, timeout=None):
+        return FakeResponse({"ok": True, "result": True})
+
+    def get(self, url, params=None, timeout=None):
+        if url.endswith("/getMe"):
+            return FakeResponse({"ok": True, "result": {"username": "OfflineTestBot"}})
+        if url.endswith("/getUpdates"):
+            self.get_updates_calls += 1
+            if self.get_updates_calls == 1:
+                return FakeResponse({"ok": True, "result": list(self.updates)})
+            return FakeResponse({"ok": True, "result": []})
+        raise AssertionError(url)
+
+    def close(self):
+        self.closed = True
+
+
+class FakeSendSession:
+    def __init__(self, on_send, *, success: bool = True):
+        self.on_send = on_send
+        self.success = success
+        self.payloads: list[dict[str, Any]] = []
+        self.closed = False
+
+    def post(self, url, json=None, timeout=None):
+        self.payloads.append(dict(json or {}))
+        self.on_send()
+        if self.success:
+            return FakeResponse({"ok": True, "result": {"message_id": 777}})
+        return FakeResponse({"ok": False, "description": "temporary send failure"}, 500)
+
+    def close(self):
+        self.closed = True
+
+
 class OfflineTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.old_db = config.RUNTIME_DB
+        self.old_token = config.TELEGRAM_BOT_TOKEN
+        self.old_chat_id = config.TELEGRAM_CHAT_ID
         config.RUNTIME_DB = Path(self.tmp.name) / "runtime.db"
         self.storage = Storage(config.RUNTIME_DB)
         self.fake = FakeToobit()
@@ -86,6 +142,8 @@ class OfflineTests(unittest.TestCase):
     def tearDown(self):
         self.storage.close()
         config.RUNTIME_DB = self.old_db
+        config.TELEGRAM_BOT_TOKEN = self.old_token
+        config.TELEGRAM_CHAT_ID = self.old_chat_id
         self.tmp.cleanup()
 
     @staticmethod
@@ -202,6 +260,102 @@ class OfflineTests(unittest.TestCase):
         snap = limiter.snapshot()
         self.assertEqual(snap["total_60s"], 41)
         self.assertEqual(snap["market_60s"], 40)
+
+
+    def test_command_normalization_and_all_trade_mutations(self):
+        router = CommandRouter(self.storage, self.fake)  # type: ignore[arg-type]
+        self.assertIn("7.5 USDT", router.handle("تريد دلار۷٫۵"))
+        self.assertEqual(self.storage.get_setting("trade_margin_usdt"), 7.5)
+        self.assertIn("12 x", router.handle("لوريج‌تريد:۱۲"))
+        self.assertEqual(self.storage.get_setting("leverage"), 12)
+        self.assertIn("حداکثر پوزیشن واقعی", router.handle("حداکثر‌پوزیشن=۵"))
+        self.assertEqual(self.storage.get_setting("max_open_positions"), 5)
+        self.assertIn("پنل ترید", router.handle("/trade@OfflineTestBot"))
+        self.assertIn("آمار سیگنال‌ها", router.handle("/stats"))
+
+    def test_env_file_parser_supports_export_and_systemd_lines(self):
+        key1, key2 = "TOOBIT_V3_TEST_ONE", "TOOBIT_V3_TEST_TWO"
+        os.environ.pop(key1, None)
+        os.environ.pop(key2, None)
+        path = Path(self.tmp.name) / "test.env"
+        path.write_text(
+            f'export {key1}="alpha value" # comment\nEnvironment={key2}=beta\n',
+            encoding="utf-8",
+        )
+        config._load_env_file(path)  # type: ignore[attr-defined]
+        self.assertEqual(os.environ.get(key1), "alpha value")
+        self.assertEqual(os.environ.get(key2), "beta")
+        os.environ.pop(key1, None)
+        os.environ.pop(key2, None)
+
+    def test_telegram_poll_autobinds_private_owner_and_replies(self):
+        config.TELEGRAM_BOT_TOKEN = "123:test-token"
+        config.TELEGRAM_CHAT_ID = ""
+        update = {
+            "update_id": 100,
+            "message": {
+                "message_id": 9,
+                "text": "ترید",
+                "chat": {"id": 555, "type": "private"},
+                "from": {"id": 555, "username": "mohsen", "is_bot": False},
+            },
+        }
+        bot = TelegramBot(self.storage, self.engine, self.fake)  # type: ignore[arg-type]
+        bot.poll_session = FakePollSession([update])  # type: ignore[assignment]
+        bot.send_session = FakeSendSession(bot.stop_event.set, success=True)  # type: ignore[assignment]
+        thread = threading.Thread(target=bot.poll_loop)
+        thread.start()
+        thread.join(timeout=3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(self.storage.telegram_offset(), 100)
+        self.assertEqual(self.storage.get_setting("telegram_chat_id"), "555")
+        self.assertEqual(bot.send_session.payloads[0]["chat_id"], "555")  # type: ignore[attr-defined]
+        self.assertIn("پنل ترید", bot.send_session.payloads[0]["text"])  # type: ignore[attr-defined]
+        bot.stop()
+
+    def test_telegram_does_not_consume_command_when_reply_fails(self):
+        config.TELEGRAM_BOT_TOKEN = "123:test-token"
+        config.TELEGRAM_CHAT_ID = "555"
+        update = {
+            "update_id": 101,
+            "message": {
+                "message_id": 10,
+                "text": "آمار",
+                "chat": {"id": 555, "type": "private"},
+                "from": {"id": 555, "username": "mohsen", "is_bot": False},
+            },
+        }
+        bot = TelegramBot(self.storage, self.engine, self.fake)  # type: ignore[arg-type]
+        bot.poll_session = FakePollSession([update])  # type: ignore[assignment]
+        bot.send_session = FakeSendSession(bot.stop_event.set, success=False)  # type: ignore[assignment]
+        thread = threading.Thread(target=bot.poll_loop)
+        thread.start()
+        thread.join(timeout=3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(self.storage.telegram_offset(), 0)
+        bot.stop()
+
+    def test_telegram_username_owner_is_converted_to_numeric_chat(self):
+        config.TELEGRAM_BOT_TOKEN = "123:test-token"
+        config.TELEGRAM_CHAT_ID = "@mohsen"
+        update = {
+            "update_id": 102,
+            "message": {
+                "message_id": 11,
+                "text": "سلامت",
+                "chat": {"id": 777, "type": "private"},
+                "from": {"id": 777, "username": "Mohsen", "is_bot": False},
+            },
+        }
+        bot = TelegramBot(self.storage, self.engine, self.fake)  # type: ignore[arg-type]
+        bot.poll_session = FakePollSession([update])  # type: ignore[assignment]
+        bot.send_session = FakeSendSession(bot.stop_event.set, success=True)  # type: ignore[assignment]
+        thread = threading.Thread(target=bot.poll_loop)
+        thread.start()
+        thread.join(timeout=3)
+        self.assertEqual(self.storage.get_setting("telegram_chat_id"), "777")
+        self.assertEqual(self.storage.telegram_offset(), 102)
+        bot.stop()
 
 
 if __name__ == "__main__":

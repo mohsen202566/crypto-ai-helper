@@ -156,9 +156,26 @@ _FA_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567
 
 
 def normalize_command(text: str) -> str:
-    return " ".join(str(text).translate(_FA_DIGITS).strip().lower().split())
+    value = str(text).translate(_FA_DIGITS).lower()
+    value = value.replace("ي", "ی").replace("ك", "ک")
+    value = value.replace("ۀ", "ه").replace("ة", "ه")
+    for invisible in ("\u200c", "\u200d", "\u200e", "\u200f", "\ufeff"):
+        value = value.replace(invisible, " ")
+    value = " ".join(value.strip().split())
+    # Telegram may deliver /start@BotUsername in groups.
+    if value.startswith("/") and "@" in value.split()[0]:
+        first, *rest = value.split()
+        value = " ".join([first.split("@", 1)[0], *rest])
+    return value
 
 
 def parse_number(text: str) -> float:
-    normalized = str(text).translate(_FA_DIGITS).replace(",", "").strip()
+    normalized = (
+        str(text)
+        .translate(_FA_DIGITS)
+        .replace("٬", "")
+        .replace(",", "")
+        .replace("٫", ".")
+        .strip()
+    )
     return float(normalized)

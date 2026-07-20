@@ -26,11 +26,14 @@ class Application:
 
     def _spawn(self, name: str, target: Callable[[], Any]) -> None:
         def runner() -> None:
+            logger.info("WORKER_START | %s", name)
             try:
                 target()
+                if not self.stop_event.is_set():
+                    logger.warning("WORKER_EXIT | %s returned unexpectedly", name)
             except Exception as exc:
                 self.storage.set_health(name, "warning", str(exc))
-                logger.exception("Worker %s stopped", name)
+                logger.exception("WORKER_CRASH | %s", name)
         thread = threading.Thread(name=name, target=runner, daemon=True)
         thread.start()
         self.threads.append(thread)
@@ -67,7 +70,7 @@ class Application:
 
     def start(self) -> None:
         self.storage.set_health("main", "ok", "process started; real trading OFF")
-        logger.info("ربات شروع شد؛ ترید واقعی اجباری خاموش است")
+        logger.info("BOT_START | build=%s | db=%s | ترید واقعی اجباری خاموش است", config.BUILD_VERSION, config.RUNTIME_DB)
         self._spawn("telegram-poll", self.telegram.poll_loop)
         self._spawn("telegram-notify", self.telegram.notification_loop)
         self._spawn("trade-execution", self._trade_loop)
@@ -94,11 +97,16 @@ class Application:
         self.closed = True
         self.stop_event.set()
         self.telegram.stop()
+        # Close HTTP sessions before joining so long-poll and market requests unblock.
+        self.toobit.close()
+        deadline = time.monotonic() + 5.0
         for thread in self.threads:
             if thread is threading.current_thread():
                 continue
-            thread.join(timeout=3)
-        self.toobit.close()
+            remaining = max(0.0, deadline - time.monotonic())
+            if remaining <= 0:
+                break
+            thread.join(timeout=remaining)
         self.storage.close()
         logger.info("ربات با حفظ دیتابیس خاموش شد")
 

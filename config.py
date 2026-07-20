@@ -6,26 +6,43 @@
 from __future__ import annotations
 
 import os
+import shlex
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 
 
 def _load_env_file(path: Path) -> None:
-    """Load simple KEY=VALUE files without overriding systemd environment values."""
+    """Load shell-like KEY=VALUE files without overriding systemd values.
+
+    Supports plain ``KEY=value``, ``export KEY=value`` and lines copied from
+    systemd such as ``Environment=KEY=value``. Quoted values and inline comments
+    are handled through :mod:`shlex`.
+    """
     try:
         if not path.is_file():
             return
-        for raw in path.read_text(encoding="utf-8").splitlines():
+        for raw in path.read_text(encoding="utf-8-sig").splitlines():
             line = raw.strip()
-            if not line or line.startswith("#") or "=" not in line:
+            if not line or line.startswith("#"):
                 continue
-            key, value = line.split("=", 1)
+            if line.startswith("export "):
+                line = line[7:].strip()
+            if line.startswith("Environment="):
+                line = line[len("Environment="):].strip()
+            try:
+                parts = shlex.split(line, comments=True, posix=True)
+            except ValueError:
+                parts = [line]
+            if not parts:
+                continue
+            assignment = parts[0]
+            if "=" not in assignment:
+                continue
+            key, value = assignment.split("=", 1)
             key = key.strip()
             value = value.strip()
-            if value and value[0:1] == value[-1:] and value[0] in {"\"", "'"}:
-                value = value[1:-1]
-            if key:
+            if key and key.replace("_", "").isalnum():
                 os.environ.setdefault(key, value)
     except OSError:
         # systemd Environment/EnvironmentFile remains the primary source.
@@ -39,8 +56,12 @@ def _load_project_environment() -> None:
         candidates.append(Path(explicit))
     candidates.extend((
         ROOT / ".env",
+        ROOT / "bot.env",
+        Path("/root/.env"),
         Path("/etc/crypto-bot.env"),
         Path("/etc/crypto-ai-helper.env"),
+        Path("/etc/default/crypto-bot"),
+        Path("/etc/sysconfig/crypto-bot"),
         Path("/etc/forex-signal-bot.env"),
     ))
     seen: set[str] = set()
@@ -54,6 +75,7 @@ def _load_project_environment() -> None:
 
 _load_project_environment()
 
+BUILD_VERSION = "2026.07.20-v3"
 RUNTIME_DB = Path(os.getenv("RUNTIME_DB", str(ROOT / "runtime.db")))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
@@ -66,8 +88,23 @@ REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "10"))
 HTTP_RETRIES = int(os.getenv("HTTP_RETRIES", "2"))
 HTTP_BACKOFF_SECONDS = float(os.getenv("HTTP_BACKOFF_SECONDS", "0.8"))
 
-TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or os.getenv("TG_BOT_TOKEN") or "").strip()
-TELEGRAM_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or os.getenv("OWNER_ID") or os.getenv("TELEGRAM_OWNER_ID") or "").strip()
+TELEGRAM_BOT_TOKEN = (
+    os.getenv("TELEGRAM_BOT_TOKEN")
+    or os.getenv("BOT_TOKEN")
+    or os.getenv("TG_BOT_TOKEN")
+    or os.getenv("TELEGRAM_TOKEN")
+    or os.getenv("BOT_API_TOKEN")
+    or ""
+).strip()
+TELEGRAM_CHAT_ID = (
+    os.getenv("TELEGRAM_CHAT_ID")
+    or os.getenv("OWNER_ID")
+    or os.getenv("CHAT_ID")
+    or os.getenv("TELEGRAM_OWNER_ID")
+    or os.getenv("TELEGRAM_ADMIN_ID")
+    or os.getenv("ADMIN_CHAT_ID")
+    or ""
+).strip()
 TELEGRAM_POLL_TIMEOUT = int(os.getenv("TELEGRAM_POLL_TIMEOUT", "25"))
 
 # Endpointها؛ بدون تغییر کد قابل جایگزینی هستند.

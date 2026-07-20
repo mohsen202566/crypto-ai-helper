@@ -1,6 +1,9 @@
 """تلگرام، دستورات فارسی و تمام پنل‌ها در یک فایل."""
 from __future__ import annotations
 
+import json
+import queue
+import re
 import threading
 import time
 from typing import Any
@@ -304,9 +307,9 @@ class CommandRouter:
         self.storage = storage
         self.toobit = toobit
 
-    def _set_float(self, raw: str, prefix: str, key: str, label: str, lo: float, hi: float, suffix: str) -> str:
+    def _set_float(self, value_text: str, key: str, label: str, lo: float, hi: float, suffix: str) -> str:
         try:
-            value = parse_number(raw[len(prefix):])
+            value = parse_number(value_text)
         except ValueError:
             return f"❌ مقدار {label} نامعتبر است. بازه: {lo:g} تا {hi:g} {suffix}"
         if value < lo or value > hi:
@@ -315,9 +318,9 @@ class CommandRouter:
         self.storage.set_setting(key, value)
         return f"✅ {label}: {value:g} {suffix}\nتمام سیگنال‌های بعدی از این مقدار استفاده می‌کنند."
 
-    def _set_int(self, raw: str, prefix: str, key: str, label: str, lo: int, hi: int, suffix: str) -> str:
+    def _set_int(self, value_text: str, key: str, label: str, lo: int, hi: int, suffix: str) -> str:
         try:
-            parsed = parse_number(raw[len(prefix):])
+            parsed = parse_number(value_text)
         except ValueError:
             return f"❌ مقدار {label} نامعتبر است. بازه: {lo} تا {hi} {suffix}"
         if not parsed.is_integer():
@@ -328,21 +331,30 @@ class CommandRouter:
         self.storage.set_setting(key, value)
         slots = self.storage.slot_counts() if key == "max_open_positions" else None
         extra = f"\nوضعیت اسلات اکنون: {slots['used']} پُر / {slots['free']} خالی" if slots else ""
-        return f"✅ {label}: {value} {suffix}\nتمام سیگنال‌های بعدی از این مقدار استفاده می‌کنند.{extra}"
+        suffix_text = f" {suffix}" if suffix else ""
+        return f"✅ {label}: {value}{suffix_text}\nتمام سیگنال‌های بعدی از این مقدار استفاده می‌کنند.{extra}"
+
+    @staticmethod
+    def _match_value(command: str, patterns: tuple[str, ...]) -> str | None:
+        for pattern in patterns:
+            match = re.fullmatch(pattern, command)
+            if match:
+                return str(match.group(1)).strip()
+        return None
 
     def handle(self, text: str) -> str:
         t = normalize_command(text)
-        if not t or t in {"/start", "start", "راهنما", "کمک", "help"}:
+        if not t or t in {"/start", "/help", "start", "راهنما", "کمک", "help"}:
             return help_text()
-        if t in {"ترید", "پنل", "وضعیت", "پنل ترید", "موجودی"}:
+        if t in {"ترید", "پنل", "وضعیت", "پنل ترید", "موجودی", "/trade", "/status"}:
             return trade_panel(self.storage)
-        if t in {"آمار", "پنل آمار"}:
+        if t in {"آمار", "پنل آمار", "/stats"}:
             return stats_panel(self.storage)
-        if t in {"پوزیشن", "پوزیشن‌ها", "پوزیشن ها"}:
+        if t in {"پوزیشن", "پوزیشن‌ها", "پوزیشن ها", "/positions"}:
             return positions_panel(self.storage)
-        if t in {"کوین‌ها", "کوین ها", "ارزها"}:
+        if t in {"کوین‌ها", "کوین ها", "ارزها", "/coins"}:
             return coins_panel(self.storage)
-        if t in {"سلامت", "health", "هلس", "چک توبیت"}:
+        if t in {"سلامت", "health", "هلس", "چک توبیت", "/health"}:
             return health_panel(self.storage, self.toobit)
 
         if t in {"ترید فعال", "توبیت روشن"}:
@@ -354,26 +366,30 @@ class CommandRouter:
             self.storage.set_setting("real_trade_enabled", False)
             return "⛔ ترید واقعی خاموش شد. سفارش جدید باز نمی‌شود؛ سیگنال‌های جدید Virtual و پوزیشن‌های Real باز همچنان مانیتور می‌شوند."
 
-        float_commands = (
-            ("ترید دلار ", "trade_margin_usdt", "دلار هر پوزیشن"),
-            ("دلار ترید ", "trade_margin_usdt", "دلار هر پوزیشن"),
-            ("مارجین ترید ", "trade_margin_usdt", "دلار هر پوزیشن"),
-            ("ترید مارجین ", "trade_margin_usdt", "دلار هر پوزیشن"),
-        )
-        for prefix, key, label in float_commands:
-            if t.startswith(prefix):
-                return self._set_float(t, prefix, key, label, config.TRADE_MARGIN_MIN, config.TRADE_MARGIN_MAX, "USDT")
+        value = self._match_value(t, (
+            r"(?:ترید\s*دلار|دلار\s*ترید|مارجین\s*ترید|ترید\s*مارجین)\s*[:=]?\s*(.+)",
+        ))
+        if value is not None:
+            return self._set_float(
+                value, "trade_margin_usdt", "دلار هر پوزیشن",
+                config.TRADE_MARGIN_MIN, config.TRADE_MARGIN_MAX, "USDT",
+            )
 
-        int_commands = (
-            ("ترید لوریج ", "leverage", "لوریج", config.LEVERAGE_MIN, config.LEVERAGE_MAX, "x"),
-            ("لوریج ترید ", "leverage", "لوریج", config.LEVERAGE_MIN, config.LEVERAGE_MAX, "x"),
-            ("حداکثر پوزیشن ", "max_open_positions", "حداکثر پوزیشن واقعی", config.MAX_POSITIONS_MIN, config.MAX_POSITIONS_MAX, ""),
-            ("تعداد اسلات ", "max_open_positions", "حداکثر پوزیشن واقعی", config.MAX_POSITIONS_MIN, config.MAX_POSITIONS_MAX, ""),
-            ("ترید اسلات ", "max_open_positions", "حداکثر پوزیشن واقعی", config.MAX_POSITIONS_MIN, config.MAX_POSITIONS_MAX, ""),
-        )
-        for prefix, key, label, lo, hi, suffix in int_commands:
-            if t.startswith(prefix):
-                return self._set_int(t, prefix, key, label, lo, hi, suffix)
+        value = self._match_value(t, (r"(?:ترید\s*لوریج|لوریج\s*ترید)\s*[:=]?\s*(.+)",))
+        if value is not None:
+            return self._set_int(
+                value, "leverage", "لوریج",
+                config.LEVERAGE_MIN, config.LEVERAGE_MAX, "x",
+            )
+
+        value = self._match_value(t, (
+            r"(?:حداکثر\s*پوزیشن|تعداد\s*اسلات|ترید\s*اسلات)\s*[:=]?\s*(.+)",
+        ))
+        if value is not None:
+            return self._set_int(
+                value, "max_open_positions", "حداکثر پوزیشن واقعی",
+                config.MAX_POSITIONS_MIN, config.MAX_POSITIONS_MAX, "",
+            )
 
         if t == "ریست سود":
             self.storage.reset_pnl(total=False)
@@ -390,20 +406,34 @@ class CommandRouter:
         return "دستور نامعتبر است.\n\n" + help_text()
 
 class TelegramBot:
+    """Synchronous Telegram long-polling client with durable offset and owner binding.
+
+    Polling requires only a bot token.  If no owner/chat id is configured, the first
+    private human chat is bound atomically in the runtime database.  A configured
+    numeric chat/user id or ``@username`` is still enforced when present.
+    """
+
     def __init__(self, storage: Storage, engine: BotEngine, toobit: ToobitClient):
         self.storage = storage
         self.engine = engine
         self.toobit = toobit
         self.router = CommandRouter(storage, toobit)
-        self.token = config.TELEGRAM_BOT_TOKEN
-        self.chat_id = config.TELEGRAM_CHAT_ID
+        self.token = str(config.TELEGRAM_BOT_TOKEN or "").strip()
+        configured = str(config.TELEGRAM_CHAT_ID or "").strip()
+        persisted = str(storage.get_setting("telegram_chat_id", "") or "").strip()
+        self.owner_ref = configured or persisted
+        self.chat_id = persisted or (configured if configured.lstrip("-").isdigit() else "")
+        if configured and configured.lstrip("-").isdigit() and configured != persisted:
+            self.storage.set_setting("telegram_chat_id", configured)
+            self.chat_id = configured
         self.poll_session = requests.Session()
         self.send_session = requests.Session()
         self.stop_event = threading.Event()
 
     @property
     def enabled(self) -> bool:
-        return bool(self.token and self.chat_id)
+        # getUpdates itself only needs a token. Chat ownership can be bound later.
+        return bool(self.token)
 
     def _api_url(self, method: str) -> str:
         return f"https://api.telegram.org/bot{self.token}/{method}"
@@ -411,63 +441,123 @@ class TelegramBot:
     @staticmethod
     def _masked_chat_id(chat_id: str) -> str:
         text = str(chat_id)
-        return ("*" * max(0, len(text) - 4)) + text[-4:] if text else "missing"
+        return ("*" * max(0, len(text) - 4)) + text[-4:] if text else "unbound"
 
-    def send_message(self, text: str, reply_to_message_id: int | None = None) -> int | None:
-        if not self.enabled:
+    @staticmethod
+    def _response_json(response: requests.Response) -> dict[str, Any]:
+        try:
+            data = response.json()
+        except Exception as exc:
+            body = str(getattr(response, "text", ""))[:300]
+            raise RuntimeError(f"Telegram JSON نامعتبر: {body}") from exc
+        if not isinstance(data, dict):
+            raise RuntimeError("Telegram پاسخ JSON دیکشنری نداد")
+        return data
+
+    def _bind_chat(self, chat_id: str, reason: str) -> None:
+        chat_id = str(chat_id).strip()
+        if not chat_id:
+            return
+        self.chat_id = chat_id
+        self.owner_ref = chat_id
+        self.storage.set_setting("telegram_chat_id", chat_id)
+        self.storage.add_event("TELEGRAM_OWNER_BOUND", reason, payload={"chat_id": chat_id})
+        logger.warning("TELEGRAM_OWNER_BOUND | chat_id=%s | %s", self._masked_chat_id(chat_id), reason)
+
+    def _is_authorized(self, message: dict[str, Any]) -> tuple[bool, str]:
+        chat = message.get("chat") or {}
+        sender = message.get("from") or {}
+        incoming_chat_id = str(chat.get("id") or "").strip()
+        incoming_user_id = str(sender.get("id") or "").strip()
+        username = str(sender.get("username") or "").strip().lower()
+        chat_type = str(chat.get("type") or "").lower()
+
+        owner = str(self.owner_ref or self.chat_id or "").strip()
+        if not owner:
+            # Safe zero-config recovery: only a private human can claim an unbound bot.
+            if chat_type == "private" and incoming_chat_id and not bool(sender.get("is_bot")):
+                self._bind_chat(incoming_chat_id, "اولین گفت‌وگوی خصوصی پس از نبود Chat ID")
+                return True, incoming_chat_id
+            return False, incoming_chat_id
+
+        if owner.startswith("@"):
+            authorized = bool(username and username == owner[1:].lower())
+        else:
+            authorized = owner in {incoming_chat_id, incoming_user_id}
+
+        if authorized:
+            # Convert username/user-id ownership to the actual replyable private chat id.
+            if incoming_chat_id and self.chat_id != incoming_chat_id and chat_type == "private":
+                self._bind_chat(incoming_chat_id, "تطبیق مالک تنظیم‌شده با Chat ID واقعی")
+            return True, incoming_chat_id
+        return False, incoming_chat_id
+
+    def send_message(
+        self,
+        text: str,
+        reply_to_message_id: int | None = None,
+        *,
+        chat_id: str | int | None = None,
+    ) -> int | None:
+        target = str(chat_id if chat_id is not None else self.chat_id or self.owner_ref or "").strip()
+        if not self.token or not target:
             logger.error(
                 "TELEGRAM_SEND_DISABLED | token=%s chat_id=%s",
                 "set" if self.token else "missing",
-                "set" if self.chat_id else "missing",
+                "set" if target else "missing/unbound",
             )
             return None
-        payload: dict[str, Any] = {"chat_id": self.chat_id, "text": text}
+        payload: dict[str, Any] = {"chat_id": target, "text": str(text)}
         if reply_to_message_id:
-            payload["reply_to_message_id"] = reply_to_message_id
+            payload["reply_to_message_id"] = int(reply_to_message_id)
             payload["allow_sending_without_reply"] = True
         try:
-            response = self.send_session.post(self._api_url("sendMessage"), json=payload, timeout=10)
-            data = response.json()
+            response = self.send_session.post(self._api_url("sendMessage"), json=payload, timeout=15)
+            data = self._response_json(response)
             if not response.ok or not data.get("ok"):
                 description = data.get("description") or f"HTTP {response.status_code}"
                 raise RuntimeError(str(description))
             return int((data.get("result") or {}).get("message_id") or 0) or None
         except Exception as exc:
             self.storage.set_health("telegram", "warning", f"send failed: {exc}")
-            logger.warning("TELEGRAM_SEND_ERROR | %s", str(exc)[:240])
+            logger.warning("TELEGRAM_SEND_ERROR | target=%s | %s", self._masked_chat_id(target), str(exc)[:240])
             return None
 
     def _prepare_polling(self) -> None:
-        # getUpdates is incompatible with an active webhook. Removing it is safe for this
-        # single polling service and prevents a silent non-responsive bot after migration.
         response = self.poll_session.post(
             self._api_url("deleteWebhook"),
             json={"drop_pending_updates": False},
-            timeout=10,
+            timeout=15,
         )
-        data = response.json()
+        data = self._response_json(response)
         if not response.ok or not data.get("ok"):
             raise RuntimeError(data.get("description") or f"deleteWebhook HTTP {response.status_code}")
 
-        response = self.poll_session.get(self._api_url("getMe"), timeout=10)
-        data = response.json()
+        response = self.poll_session.get(self._api_url("getMe"), timeout=15)
+        data = self._response_json(response)
         if not response.ok or not data.get("ok"):
             raise RuntimeError(data.get("description") or f"getMe HTTP {response.status_code}")
         username = str((data.get("result") or {}).get("username") or "unknown")
         logger.info(
-            "TELEGRAM_POLL_READY | bot=@%s | chat_id=%s",
+            "TELEGRAM_POLL_READY | bot=@%s | owner=%s | build=%s",
             username,
-            self._masked_chat_id(self.chat_id),
+            self._masked_chat_id(self.chat_id or self.owner_ref),
+            config.BUILD_VERSION,
         )
 
+    def _commit_offset(self, update_id: int) -> int:
+        update_id = max(0, int(update_id))
+        self.storage.set_telegram_offset(update_id)
+        return update_id
+
     def poll_loop(self) -> None:
-        if not self.enabled:
-            missing = []
-            if not self.token:
-                missing.append("TELEGRAM_BOT_TOKEN/BOT_TOKEN")
-            if not self.chat_id:
-                missing.append("TELEGRAM_CHAT_ID/OWNER_ID")
-            detail = "متغیر تنظیم‌نشده: " + ", ".join(missing)
+        logger.info(
+            "TELEGRAM_THREAD_START | token=%s | owner=%s",
+            "set" if self.token else "missing",
+            self._masked_chat_id(self.chat_id or self.owner_ref),
+        )
+        if not self.token:
+            detail = "متغیر TELEGRAM_BOT_TOKEN/BOT_TOKEN تنظیم نشده است"
             self.storage.set_health("telegram", "warning", detail)
             logger.error("TELEGRAM_DISABLED | %s", detail)
             while not self.stop_event.wait(5):
@@ -483,59 +573,111 @@ class TelegramBot:
                     self.storage.set_health("telegram", "ok", "polling")
                     prepared = True
 
+                params: dict[str, Any] = {
+                    "timeout": max(1, int(config.TELEGRAM_POLL_TIMEOUT)),
+                    "allowed_updates": json.dumps(["message", "edited_message"], separators=(",", ":")),
+                }
+                if offset > 0:
+                    params["offset"] = offset + 1
                 response = self.poll_session.get(
                     self._api_url("getUpdates"),
-                    params={"offset": offset + 1, "timeout": config.TELEGRAM_POLL_TIMEOUT},
-                    timeout=config.TELEGRAM_POLL_TIMEOUT + 5,
+                    params=params,
+                    timeout=max(10, int(config.TELEGRAM_POLL_TIMEOUT) + 10),
                 )
-                data = response.json()
+                data = self._response_json(response)
                 if not response.ok or not data.get("ok"):
                     description = str(data.get("description") or f"HTTP {response.status_code}")
                     if response.status_code == 409 or "webhook" in description.lower():
                         prepared = False
                     raise RuntimeError(description)
 
-                for update in data.get("result", []):
-                    offset = max(offset, int(update.get("update_id", 0)))
-                    self.storage.set_telegram_offset(offset)
-                    msg = update.get("message") or update.get("edited_message") or {}
-                    incoming_chat_id = str((msg.get("chat") or {}).get("id") or "")
-                    if incoming_chat_id != str(self.chat_id):
+                results = data.get("result") or []
+                if not isinstance(results, list):
+                    raise RuntimeError("getUpdates.result لیست نیست")
+
+                for update in results:
+                    if not isinstance(update, dict):
+                        continue
+                    update_id = int(update.get("update_id") or 0)
+                    msg = update.get("message") or update.get("edited_message")
+                    if not isinstance(msg, dict):
+                        offset = self._commit_offset(max(offset, update_id))
+                        continue
+
+                    authorized, incoming_chat_id = self._is_authorized(msg)
+                    if not authorized:
                         self.storage.add_event(
                             "TELEGRAM_SECURITY",
-                            f"chat_id غیرمجاز نادیده گرفته شد: {incoming_chat_id}",
+                            f"پیام غیرمجاز نادیده گرفته شد: chat={incoming_chat_id}",
                         )
-                        logger.warning("TELEGRAM_UNAUTHORIZED_CHAT | chat_id=%s", incoming_chat_id)
+                        logger.warning(
+                            "TELEGRAM_UNAUTHORIZED_CHAT | chat_id=%s | user_id=%s | username=%s",
+                            incoming_chat_id,
+                            str((msg.get("from") or {}).get("id") or ""),
+                            str((msg.get("from") or {}).get("username") or ""),
+                        )
+                        offset = self._commit_offset(max(offset, update_id))
                         continue
+
                     text = str(msg.get("text") or "").strip()
                     if not text:
+                        offset = self._commit_offset(max(offset, update_id))
                         continue
-                    logger.info("TELEGRAM_COMMAND | %s", normalize_command(text)[:100])
+
+                    normalized = normalize_command(text)
+                    logger.info(
+                        "TELEGRAM_COMMAND | chat_id=%s | message_id=%s | %s",
+                        self._masked_chat_id(incoming_chat_id),
+                        int(msg.get("message_id") or 0),
+                        normalized[:160],
+                    )
                     reply = self.router.handle(text)
-                    self.send_message(reply, int(msg.get("message_id") or 0) or None)
+                    sent_id = self.send_message(
+                        reply,
+                        int(msg.get("message_id") or 0) or None,
+                        chat_id=incoming_chat_id,
+                    )
+                    if sent_id is None:
+                        # Do not consume the update: after a transient send failure it is retried.
+                        raise RuntimeError("پاسخ دستور به تلگرام ارسال نشد؛ offset ذخیره نشد")
+                    offset = self._commit_offset(max(offset, update_id))
             except Exception as exc:
+                if self.stop_event.is_set():
+                    break
                 self.storage.set_health("telegram", "warning", f"poll failed: {exc}")
-                logger.warning("TELEGRAM_POLL_ERROR | %s", str(exc)[:240])
+                logger.warning("TELEGRAM_POLL_ERROR | %s", str(exc)[:300])
                 self.stop_event.wait(3)
 
     def notification_loop(self) -> None:
+        logger.info("TELEGRAM_NOTIFY_START")
         while not self.stop_event.is_set():
+            # Preserve queued signal/result notifications until a replyable numeric chat
+            # has been configured or learned from the first authorized private message.
+            if not self.chat_id:
+                self.stop_event.wait(1)
+                continue
             try:
                 item = self.engine.notifications.get(timeout=1)
-            except Exception:
+            except queue.Empty:
                 continue
             try:
                 signal = self.storage.get_signal(int(item["signal_id"]))
                 if not signal:
                     continue
-                if item["type"] == "signal":
+                kind = str(item.get("type") or "")
+                if kind == "signal":
                     self.send_message(signal_message(signal))
-                elif item["type"] == "position_open":
+                elif kind == "position_open":
                     self.send_message(position_open_message(signal))
-                elif item["type"] == "failed_open":
+                elif kind == "failed_open":
                     self.send_message(failed_open_message(signal))
-                elif item["type"] == "result":
+                elif kind == "result":
                     self.send_message(result_message(signal))
+                else:
+                    logger.warning("TELEGRAM_NOTIFY_UNKNOWN | %s", kind)
+            except Exception as exc:
+                self.storage.set_health("telegram_notify", "warning", str(exc))
+                logger.warning("TELEGRAM_NOTIFY_ERROR | %s", str(exc)[:240])
             finally:
                 self.engine.notifications.task_done()
 
