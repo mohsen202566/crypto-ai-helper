@@ -83,7 +83,31 @@ class Application:
         self._periodic("real-monitor", config.REAL_MONITOR_SECONDS, self.engine.monitor_real, immediate=True, ready=False)
         self._periodic("real-confirm", config.PENDING_CHECK_SECONDS, self.engine.confirm_pending, immediate=True, ready=False)
         self._periodic("price-monitor", config.POSITION_PRICE_SECONDS, self.engine.monitor_prices, immediate=True, ready=True)
-        self._periodic("scanner", config.MARKET_SCAN_SECONDS, self.engine.scan_once, immediate=True, ready=True)
+        self._spawn("scanner", self._scanner_loop)
+
+
+    def _scanner_loop(self) -> None:
+        interval = max(1.0, float(config.MARKET_SCAN_SECONDS))
+        logger.info("SCANNER_LOOP_START | interval=%.1fs", interval)
+        waiting_logged = False
+        while not self.stop_event.is_set():
+            if not self.storage.get_setting("startup_ready", False):
+                if not waiting_logged:
+                    logger.info("SCAN_WAIT_STARTUP")
+                    waiting_logged = True
+                if self.stop_event.wait(0.5):
+                    return
+                continue
+            waiting_logged = False
+            started = time.monotonic()
+            try:
+                self.engine.scan_once()
+            except Exception as exc:
+                self.storage.set_health("scanner", "warning", str(exc))
+                logger.exception("SCAN_ERROR | %s", exc)
+            elapsed = time.monotonic() - started
+            if self.stop_event.wait(max(0.1, interval - elapsed)):
+                return
 
     def _trade_loop(self) -> None:
         while not self.stop_event.is_set():

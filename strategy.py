@@ -12,7 +12,7 @@ from typing import Any
 import config
 from storage import Storage
 from toobit_client import ToobitClient
-from utils import atr, canonical_base, canonical_symbol, clamp, ema, median, now_ms, percent_change, rsi, safe_float, safe_int
+from utils import atr, canonical_base, canonical_symbol, clamp, ema, median, now_ms, percent_change, rsi, safe_float, safe_int, logger
 
 
 class PumpStrategy:
@@ -75,8 +75,13 @@ class PumpStrategy:
         }
 
     def scan(self, margin_usdt: float, leverage: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        self.refresh_contracts()
-        tickers = [x for x in (self._ticker(item) for item in self.toobit.get_24h_tickers()) if x]
+        logger.info("SCAN_STAGE | contracts_refresh")
+        new_contracts = self.refresh_contracts()
+        logger.info("SCAN_STAGE | fetch_24h_tickers")
+        raw_tickers = self.toobit.get_24h_tickers()
+        tickers = [x for x in (self._ticker(item) for item in raw_tickers) if x]
+        self.storage.set_setting("last_scan_ticker_count", len(tickers))
+        logger.info("SCAN_STAGE | fetch_book_tickers | tickers=%s new_contracts=%s", len(tickers), new_contracts)
         books = self.toobit.get_all_book_tickers()
         contracts_by_name = {x["canonical"]: x for x in self.storage.contracts(active_only=True)}
         ranked: list[dict[str, Any]] = []
@@ -109,6 +114,12 @@ class PumpStrategy:
         ranked.sort(key=lambda x: (x["rank_score"], x["quote_volume"]), reverse=True)
         watchlist = ranked[: config.WATCHLIST_SIZE]
         deep = watchlist[: config.DEEP_CANDIDATE_SIZE]
+        self.storage.set_setting("last_scan_ranked_count", len(ranked))
+        self.storage.set_setting("last_scan_deep_count", len(deep))
+        logger.info(
+            "SCAN_FILTER | contracts=%s tickers=%s books=%s ranked=%s watch=%s deep=%s",
+            len(contracts_by_name), len(tickers), len(books), len(ranked), len(watchlist), len(deep),
+        )
         self.storage.set_setting("watchlist", watchlist)
         self.storage.set_setting("deep_candidates", deep)
         self.storage.set_setting("last_scan_ms", now)
@@ -117,10 +128,18 @@ class PumpStrategy:
         signals: list[dict[str, Any]] = []
         for candidate in deep:
             if self.storage.has_symbol_lock(candidate["canonical"]):
+                logger.info("SCAN_CANDIDATE_SKIP | %s | symbol_locked", candidate["canonical"])
                 continue
+            logger.info(
+                "SCAN_CANDIDATE | %s | change24h=%.2f%% volume=%.0f spread=%.4f",
+                candidate["canonical"], candidate["change_24h"], candidate["quote_volume"], candidate["spread"],
+            )
             analyzed = self.analyze(candidate, margin_usdt=margin_usdt, leverage=leverage)
             if analyzed:
                 signals.append(analyzed)
+                logger.info("SCAN_SIGNAL_READY | %s | score=%.1f", candidate["canonical"], safe_float(analyzed.get("signal_score")))
+            else:
+                logger.info("SCAN_CANDIDATE_REJECT | %s | exhaustion_not_confirmed", candidate["canonical"])
         return watchlist, signals
 
     def analyze(self, ticker: dict[str, Any], margin_usdt: float, leverage: int) -> dict[str, Any] | None:

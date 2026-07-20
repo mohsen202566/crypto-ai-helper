@@ -74,6 +74,16 @@ class FakeToobit:
     def get_all_prices(self):
         return {"DOGEUSDT": 0.077}
 
+    def get_24h_tickers(self):
+        return [{
+            "symbol": "DOGE-SWAP-USDT", "lastPrice": "0.10", "openPrice": "0.075",
+            "priceChangePercent": "33.3", "highPrice": "0.11", "lowPrice": "0.07",
+            "volume": "10000000", "quoteVolume": "1000000",
+        }]
+
+    def get_all_book_tickers(self):
+        return {"DOGEUSDT": {"bid": 0.0999, "ask": 0.1001}}
+
     def find_realized_result(self, **kwargs):
         return None
 
@@ -254,6 +264,26 @@ class OfflineTests(unittest.TestCase):
         panel = stats_panel(self.storage)
         self.assertIn("TP: 1", panel)
         self.assertIn("امروز:", panel)
+
+    def test_scanner_cycle_updates_heartbeat_and_counts(self):
+        old_warmup = config.NEW_CONTRACT_WARMUP_MINUTES
+        old_deep = config.DEEP_CANDIDATE_SIZE
+        try:
+            config.NEW_CONTRACT_WARMUP_MINUTES = 0
+            config.DEEP_CANDIDATE_SIZE = 0
+            self.engine.startup()
+            with self.assertLogs("toobit_pump_bot", level="INFO") as logs:
+                emitted = self.engine.scan_once()
+            self.assertEqual(emitted, 0)
+            self.assertGreater(int(self.storage.get_setting("last_scan_finished_ms", 0)), 0)
+            self.assertEqual(self.storage.get_setting("last_scan_ticker_count"), 1)
+            self.assertEqual(self.storage.get_setting("last_scan_ranked_count"), 1)
+            joined = "\n".join(logs.output)
+            self.assertIn("SCAN_START", joined)
+            self.assertIn("SCAN_DONE", joined)
+        finally:
+            config.NEW_CONTRACT_WARMUP_MINUTES = old_warmup
+            config.DEEP_CANDIDATE_SIZE = old_deep
 
     def test_rate_limiter_snapshot(self):
         limiter = RateLimiter()

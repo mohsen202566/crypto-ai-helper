@@ -9,7 +9,7 @@ import config
 from storage import Storage
 from strategy import PumpStrategy
 from toobit_client import ToobitClient
-from utils import canonical_base, canonical_symbol, now_ms, safe_float, safe_int
+from utils import canonical_base, canonical_symbol, now_ms, safe_float, safe_int, logger
 
 
 class BotEngine:
@@ -44,17 +44,46 @@ class BotEngine:
 
     def scan_once(self) -> int:
         if not self.storage.get_setting("startup_ready", False):
+            logger.info("SCAN_SKIPPED | startup_not_ready")
             return 0
-        settings = self.storage.settings()
-        _, signals = self.strategy.scan(
-            margin_usdt=float(settings["trade_margin_usdt"]),
-            leverage=int(settings["leverage"]),
-        )
-        emitted = 0
-        for signal in signals:
-            if self.route_signal(signal):
-                emitted += 1
-        return emitted
+        started_ms = now_ms()
+        self.storage.set_setting("last_scan_started_ms", started_ms)
+        self.storage.set_setting("last_scan_error", "")
+        logger.info("SCAN_START | interval=%.1fs", float(config.MARKET_SCAN_SECONDS))
+        try:
+            settings = self.storage.settings()
+            watchlist, signals = self.strategy.scan(
+                margin_usdt=float(settings["trade_margin_usdt"]),
+                leverage=int(settings["leverage"]),
+            )
+            emitted = 0
+            for signal in signals:
+                if self.route_signal(signal):
+                    emitted += 1
+            finished_ms = now_ms()
+            self.storage.set_setting("last_scan_finished_ms", finished_ms)
+            self.storage.set_setting("last_scan_duration_ms", max(0, finished_ms - started_ms))
+            self.storage.set_setting("last_scan_watch_count", len(watchlist))
+            self.storage.set_setting("last_scan_signal_count", len(signals))
+            self.storage.set_setting("last_scan_emitted_count", emitted)
+            logger.info(
+                "SCAN_DONE | tickers=%s ranked=%s watch=%s deep=%s signals=%s emitted=%s elapsed=%.2fs",
+                self.storage.get_setting("last_scan_ticker_count", 0),
+                self.storage.get_setting("last_scan_ranked_count", 0),
+                len(watchlist),
+                self.storage.get_setting("last_scan_deep_count", 0),
+                len(signals),
+                emitted,
+                (finished_ms - started_ms) / 1000.0,
+            )
+            return emitted
+        except Exception as exc:
+            finished_ms = now_ms()
+            self.storage.set_setting("last_scan_finished_ms", finished_ms)
+            self.storage.set_setting("last_scan_duration_ms", max(0, finished_ms - started_ms))
+            self.storage.set_setting("last_scan_error", str(exc)[:500])
+            logger.exception("SCAN_FAILED | %s", exc)
+            raise
 
     def route_signal(self, signal: dict[str, Any]) -> int | None:
         real, reason = self._real_ready()
