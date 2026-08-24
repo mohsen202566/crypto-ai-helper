@@ -149,71 +149,123 @@ ACCOUNT_SNAPSHOT_MAX_AGE_SECONDS = int(os.getenv("ACCOUNT_SNAPSHOT_MAX_AGE_SECON
 DEPTH_REFRESH_SECONDS = float(os.getenv("DEPTH_REFRESH_SECONDS", "10"))
 TRAILING_UPDATE_SECONDS = int(os.getenv("TRAILING_UPDATE_SECONDS", "30"))
 
-# تنظیمات قابل تغییر با دستورات تلگرام
-TRADE_MARGIN_MIN = 1.0
-TRADE_MARGIN_MAX = 10_000.0
-LEVERAGE_MIN = 1
-LEVERAGE_MAX = 100
-MAX_POSITIONS_MIN = 1
-MAX_POSITIONS_MAX = 200
-DEFAULT_TRADE_MARGIN_USDT = float(os.getenv("DEFAULT_TRADE_MARGIN_USDT", "5"))
-DEFAULT_LEVERAGE = int(os.getenv("DEFAULT_LEVERAGE", "10"))
-DEFAULT_MAX_OPEN_POSITIONS = int(os.getenv("DEFAULT_MAX_OPEN_POSITIONS", "3"))
 
-# اقتصاد معامله
+# ============================================================
+#  استراتژی جدید: ورود پله‌ای هوشمند روی یک ارز (DOGE)
+# ============================================================
+
+# --- ارز هدف ---
+# فقط روی یک نماد کار می‌کنیم. برای تغییر ارز فقط این مقدار عوض می‌شود.
+TARGET_SYMBOL = os.getenv("TARGET_SYMBOL", "DOGE-SWAP-USDT").strip().upper()
+
+# --- سرمایه و سقف ریسک ---
+# سرمایه هرگز عدد ثابت نیست: قبل از هر چرخه، موجودی واقعی حساب از صرافی
+# خوانده می‌شود و همهٔ محاسبات پله/لوریج/لیکوئید بر پایهٔ همان انجام می‌شود.
+# این مقدار فقط پشتیبان است؛ اگر به هر دلیل خواندن موجودی شکست بخورد
+# و مقدار پشتیبان هم صفر باشد، ربات وارد ترید واقعی نمی‌شود.
+FALLBACK_CAPITAL_USDT = float(os.getenv("FALLBACK_CAPITAL_USDT", "0"))
+# حداکثر عمر مجاز آخرین موجودی خوانده‌شده؛ بعد از آن دوباره از صرافی می‌گیرد.
+BALANCE_REFRESH_SECONDS = int(os.getenv("BALANCE_REFRESH_SECONDS", "60"))
+# در حالت مجازی (paper) موجودی فرضی شروع، اگر تاریخچه‌ای موجود نباشد.
+VIRTUAL_START_CAPITAL_USDT = float(os.getenv("VIRTUAL_START_CAPITAL_USDT", "40"))
+# حداقل موجودی لازم برای باز کردن چرخه؛ زیر این مقدار، ورود انجام نمی‌شود.
+MIN_CAPITAL_TO_TRADE_USDT = float(os.getenv("MIN_CAPITAL_TO_TRADE_USDT", "10"))
+
+# سقف درصدی از کل سرمایه که همهٔ پله‌ها روی هم مجازند درگیر کنند.
+# ۰.۵ یعنی حتی با همهٔ پله‌ها، بیش از نصف سرمایه در ریسک نیست.
+# این نسبت است، نه عدد دلاری — پس با کم و زیاد شدن سرمایه، خودش مقیاس می‌خورد.
+MAX_CAPITAL_ENGAGED_RATE = float(os.getenv("MAX_CAPITAL_ENGAGED_RATE", "0.5"))
+# حداکثر ضرر مجاز کل چرخه (درصدی از سرمایهٔ درگیر). با رسیدن به آن، حد ضرر سخت.
+MAX_CYCLE_LOSS_RATE = float(os.getenv("MAX_CYCLE_LOSS_RATE", "0.35"))
+
+# --- پله‌بندی ---
+# حداکثر تعداد پله‌های مجاز در یک چرخه (شامل پلهٔ اول).
+MAX_ENTRY_STEPS = int(os.getenv("MAX_ENTRY_STEPS", "3"))
+MAX_ENTRY_STEPS_LIMIT = 6  # سقف سخت؛ حتی با تنظیم دستی از این بالاتر نمی‌رود.
+# ضریب رشد اندازهٔ هر پله نسبت به پلهٔ قبل (۱.۵ = رشد ملایم، نه مارتینگل ۲x).
+STEP_SIZE_MULTIPLIER = float(os.getenv("STEP_SIZE_MULTIPLIER", "1.5"))
+# فاصلهٔ لازم برای فعال شدن پلهٔ بعدی، بر حسب ضریب ATR (نه درصد ثابت).
+STEP_TRIGGER_ATR_MULTIPLIER = float(os.getenv("STEP_TRIGGER_ATR_MULTIPLIER", "1.0"))
+# کف و سقف فاصلهٔ پله‌ها تا نویز عادی بازار پله را بی‌جهت فعال نکند.
+MIN_STEP_GAP_PERCENT = float(os.getenv("MIN_STEP_GAP_PERCENT", "0.025"))
+MAX_STEP_GAP_PERCENT = float(os.getenv("MAX_STEP_GAP_PERCENT", "0.06"))
+
+# --- لوریج و ایمنی لیکوئید ---
+DEFAULT_STAGED_LEVERAGE = int(os.getenv("DEFAULT_STAGED_LEVERAGE", "5"))
+STAGED_LEVERAGE_MIN = 1
+STAGED_LEVERAGE_MAX = 10  # سقف سخت برای این استراتژی؛ بالاتر ریسک لیکوئید را واقعی می‌کند.
+MARGIN_MODE = os.getenv("MARGIN_MODE", "ISOLATED").strip().upper()
+# --- ایمنی لیکوئید ---
+# نکتهٔ کلیدی: فاصلهٔ لیکوئید ریاضاً تقریباً برابر ۱÷لوریج است و با اضافه شدن
+# پله‌ها دورتر نمی‌شود. پس «لیکوئید غیرممکن» با اصرار روی فاصلهٔ بزرگ به دست
+# نمی‌آید (آن فقط لوریج ۱ را مجاز می‌کند که سودش از کارمزد کمتر است).
+# محافظت واقعی این است: حد ضرر سخت همیشه خیلی زودتر از لیکوئید فعال شود.
+# نسبت زیر یعنی فاصلهٔ لیکوئید باید حداقل این چند برابر فاصلهٔ حد ضرر باشد.
+LIQUIDATION_TO_STOP_BUFFER = float(os.getenv("LIQUIDATION_TO_STOP_BUFFER", "2.0"))
+# کف مطلق فاصلهٔ لیکوئید از میانگین ورود پس از آخرین پله (پشتیبان دوم).
+MIN_LIQUIDATION_DISTANCE_FINAL_RATE = float(os.getenv("MIN_LIQUIDATION_DISTANCE_FINAL_RATE", "0.08"))
+# حاشیهٔ نگهداری صرافی (Maintenance Margin) برای محاسبهٔ محافظه‌کارانهٔ لیکوئید.
+MAINTENANCE_MARGIN_RATE = float(os.getenv("MAINTENANCE_MARGIN_RATE", "0.005"))
+
+# --- تشخیص جهت روند (تایم‌فریم بالادست) ---
+TREND_TIMEFRAMES = tuple(
+    x.strip() for x in os.getenv("TREND_TIMEFRAMES", "4h,1d").split(",") if x.strip()
+)
+ENTRY_TIMEFRAME = os.getenv("ENTRY_TIMEFRAME", "15m").strip()
+TREND_EMA_FAST = int(os.getenv("TREND_EMA_FAST", "20"))
+TREND_EMA_SLOW = int(os.getenv("TREND_EMA_SLOW", "50"))
+# حداقل تعداد تأییدهای هم‌جهت لازم برای باز کردن چرخه.
+MIN_TREND_CONFIRMATIONS = int(os.getenv("MIN_TREND_CONFIRMATIONS", "2"))
+# اگر روند خنثی/نامشخص بود، هیچ چرخه‌ای باز نمی‌شود.
+ALLOW_LONG = os.getenv("ALLOW_LONG", "1").strip() not in {"0", "false", "no"}
+ALLOW_SHORT = os.getenv("ALLOW_SHORT", "1").strip() not in {"0", "false", "no"}
+
+# --- خروج ---
+# حد سود بر حسب ضریب ATR؛ هرگز کمتر از کف سود خالص بستن نمی‌شود.
+TAKE_PROFIT_ATR_MULTIPLIER = float(os.getenv("TAKE_PROFIT_ATR_MULTIPLIER", "1.2"))
+MIN_TAKE_PROFIT_PERCENT = float(os.getenv("MIN_TAKE_PROFIT_PERCENT", "0.008"))
+MAX_TAKE_PROFIT_PERCENT = float(os.getenv("MAX_TAKE_PROFIT_PERCENT", "0.05"))
+# حد ضرر سخت پس از آخرین پله (بر حسب ضریب ATR از میانگین ورود).
+HARD_STOP_ATR_MULTIPLIER = float(os.getenv("HARD_STOP_ATR_MULTIPLIER", "2.5"))
+# حداقل سود خالص (بعد از کارمزد و اسپرد) که ارزش بستن داشته باشد.
+MIN_NET_PROFIT_USDT = float(os.getenv("MIN_NET_PROFIT_USDT", "0.30"))
+
+# --- ایمنی اجرا ---
+# اگر اسپرد لحظه‌ای از این بیشتر بود، ورود انجام نمی‌شود.
+MAX_ENTRY_SPREAD_RATE = float(os.getenv("MAX_ENTRY_SPREAD_RATE", "0.0015"))
+# هشدار تلگرام هنگام مصرف آخرین پله.
+WARN_ON_FINAL_STEP = os.getenv("WARN_ON_FINAL_STEP", "1").strip() not in {"0", "false", "no"}
+
+# --- حالت ترید ---
+# پیش‌فرض همیشه مجازی است؛ ترید واقعی فقط با دستور تلگرام فعال می‌شود.
+DEFAULT_REAL_TRADING_ENABLED = False
+
+# --- ثابت‌های تحلیل ---
+ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
+RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
+
+# --- اقتصاد معامله (از نسخهٔ قبلی، بدون تغییر) ---
 TAKER_FEE_RATE = float(os.getenv("TOOBIT_TAKER_FEE_RATE", "0.0005"))
 ROUND_TRIP_SLIPPAGE_RATE = float(os.getenv("ROUND_TRIP_SLIPPAGE_RATE", "0.0006"))
 FUNDING_RESERVE_RATE = float(os.getenv("FUNDING_RESERVE_RATE", "0.0002"))
-MIN_EXPECTED_NET_PROFIT_USDT = float(os.getenv("MIN_EXPECTED_NET_PROFIT_USDT", "0.05"))
 
-# قیف بازار
-WATCHLIST_SIZE = int(os.getenv("WATCHLIST_SIZE", "15"))
-DEEP_CANDIDATE_SIZE = int(os.getenv("DEEP_CANDIDATE_SIZE", "5"))
-EXCLUDED_BASES = frozenset(
-    x.strip().upper() for x in os.getenv(
-        "EXCLUDED_BASES", "BTC,ETH,USDC,USDT,FDUSD,TUSD,DAI"
-    ).split(",") if x.strip()
-)
-MIN_QUOTE_VOLUME_24H = float(os.getenv("MIN_QUOTE_VOLUME_24H", "200000"))
-MAX_SPREAD_RATE = float(os.getenv("MAX_SPREAD_RATE", "0.008"))
-# آستانه‌های پامپ باید همیشه مثبت باشند. حتی اگر مقدار قدیمی/اشتباه منفی
-# در Environment مانده باشد، هرگز ارز نزولی وارد قیف پامپ نمی‌شود.
-def _positive_float_env(name: str, default: float, minimum: float = 0.0001) -> float:
-    try:
-        value = abs(float(os.getenv(name, str(default))))
-    except (TypeError, ValueError):
-        value = abs(float(default))
-    return max(float(minimum), value)
+# --- زمان‌بندی حلقه‌ها ---
+CONTRACT_REFRESH_SECONDS = int(os.getenv("CONTRACT_REFRESH_SECONDS", "300"))
+TREND_REFRESH_SECONDS = int(os.getenv("TREND_REFRESH_SECONDS", "300"))
+PRICE_CHECK_SECONDS = float(os.getenv("PRICE_CHECK_SECONDS", "5"))
+POSITION_MONITOR_SECONDS = float(os.getenv("POSITION_MONITOR_SECONDS", "5"))
+REAL_MONITOR_SECONDS = int(os.getenv("REAL_MONITOR_SECONDS", "60"))
+ACCOUNT_SNAPSHOT_MAX_AGE_SECONDS = int(os.getenv("ACCOUNT_SNAPSHOT_MAX_AGE_SECONDS", "180"))
 
-
-MIN_PUMP_24H_PERCENT = _positive_float_env("MIN_PUMP_24H_PERCENT", 18.0)
-MIN_PUMP_15M_PERCENT = _positive_float_env("MIN_PUMP_15M_PERCENT", 8.0)
-MIN_PUMP_5M_PERCENT = _positive_float_env("MIN_PUMP_5M_PERCENT", 4.0)
-# پامپ لازم نیست در همین پنج یا پانزده دقیقه هنوز صعودی باشد؛ هنگام خستگی،
-# بازده کوتاه‌مدت معمولاً تخت یا منفی می‌شود. بنابراین سابقه جهش اخیر یا
-# نزدیک‌بودن قیمت به سقف ۲۴ساعته نیز زمینه پامپ را تأیید می‌کند.
-RECENT_PUMP_LOOKBACK_MINUTES = max(30, int(os.getenv("RECENT_PUMP_LOOKBACK_MINUTES", "90")))
-MIN_RECENT_PUMP_RUNUP_PERCENT = _positive_float_env("MIN_RECENT_PUMP_RUNUP_PERCENT", 8.0)
-MAX_DISTANCE_FROM_24H_HIGH_PERCENT = _positive_float_env("MAX_DISTANCE_FROM_24H_HIGH_PERCENT", 15.0)
-MIN_SIGNAL_SCORE = float(os.getenv("MIN_SIGNAL_SCORE", "72"))
-MIN_CONFIRMATIONS = int(os.getenv("MIN_CONFIRMATIONS", "4"))
-NEW_CONTRACT_WARMUP_MINUTES = int(os.getenv("NEW_CONTRACT_WARMUP_MINUTES", "3"))
-
-# ورود و خروج ثابت
-ATR_PERIOD = 14
-RSI_PERIOD = 14
-STOP_ATR_MULTIPLIER = float(os.getenv("STOP_ATR_MULTIPLIER", "1.25"))
-MIN_STOP_PERCENT = float(os.getenv("MIN_STOP_PERCENT", "0.012"))
-MAX_STOP_PERCENT = float(os.getenv("MAX_STOP_PERCENT", "0.06"))
-SAFETY_TP_PERCENT = float(os.getenv("SAFETY_TP_PERCENT", "0.22"))
-TRAILING_ACTIVATION_PERCENT = float(os.getenv("TRAILING_ACTIVATION_PERCENT", "0.025"))
-TRAILING_DISTANCE_PERCENT = float(os.getenv("TRAILING_DISTANCE_PERCENT", "0.018"))
-TRAILING_ATR_MULTIPLIER = float(os.getenv("TRAILING_ATR_MULTIPLIER", "1.4"))
-REVERSAL_CONFIRMATIONS_TO_EXIT = int(os.getenv("REVERSAL_CONFIRMATIONS_TO_EXIT", "2"))
-
-# دیتابیس
+# --- دیتابیس ---
 SQLITE_BUSY_TIMEOUT_MS = 5000
 
+# --- محدودهٔ تنظیمات قابل تغییر از تلگرام ---
+# سقف اختیاری روی سرمایهٔ درگیر: اگر کاربر بخواهد حتی وقتی موجودی حساب زیاد
+# است، ربات فقط تا سقف مشخصی وارد شود. صفر یعنی بدون سقف (کل موجودی مبناست).
+CAPITAL_CAP_USDT = float(os.getenv("CAPITAL_CAP_USDT", "0"))
+CAPITAL_CAP_MIN = 5.0
+CAPITAL_CAP_MAX = 100_000.0
 # وزن endpointها. در صورت تغییر مستندات فقط این جدول اصلاح می‌شود.
 ENDPOINT_WEIGHTS = {
     PATH_EXCHANGE_INFO: 1,

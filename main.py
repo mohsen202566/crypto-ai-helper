@@ -1,7 +1,7 @@
-"""نقطه شروع ربات؛ تمام فایل‌ها مستقیم در ریشه پروژه هستند."""
+"""نقطهٔ شروع ربات ورود پله‌ای."""
 from __future__ import annotations
 
-import signal
+import signal as sigmod
 import threading
 import time
 from typing import Any, Callable
@@ -15,25 +15,21 @@ from utils import logger
 
 
 class Application:
-    def __init__(self):
+    def __init__(self) -> None:
         self.storage = Storage()
         self.toobit = ToobitClient()
         self.engine = BotEngine(self.storage, self.toobit)
-        self.telegram = TelegramBot(self.storage, self.engine, self.toobit)
+        self.telegram = TelegramBot(self.storage)
         self.stop_event = threading.Event()
         self.threads: list[threading.Thread] = []
         self.closed = False
 
-    def _spawn(self, name: str, target: Callable[[], Any], *, expected_return: bool = False) -> None:
+    # ------------------------------------------------------------------
+    def _spawn(self, name: str, target: Callable[[], Any]) -> None:
         def runner() -> None:
             logger.info("WORKER_START | %s", name)
             try:
                 target()
-                if not self.stop_event.is_set():
-                    if expected_return:
-                        logger.info("WORKER_DONE | %s", name)
-                    else:
-                        logger.warning("WORKER_EXIT | %s returned unexpectedly", name)
             except Exception as exc:
                 self.storage.set_health(name, "warning", str(exc))
                 logger.exception("WORKER_CRASH | %s", name)
@@ -41,77 +37,57 @@ class Application:
         thread.start()
         self.threads.append(thread)
 
-    def _periodic(self, name: str, seconds: float, fn: Callable[[], Any], *, immediate: bool = False, ready: bool = True) -> None:
+    def _periodic(self, name: str, seconds: float, fn: Callable[[], Any],
+                  *, require_ready: bool = True) -> None:
         def loop() -> None:
-            if not immediate and self.stop_event.wait(seconds):
-                return
             while not self.stop_event.is_set():
                 started = time.monotonic()
                 try:
-                    if not ready or self.storage.get_setting("startup_ready", False):
+                    if not require_ready or self.storage.get_setting("startup_ready", False):
                         fn()
                 except Exception as exc:
                     self.storage.set_health(name, "warning", str(exc))
                     logger.warning("%s | %s", name, exc)
                 elapsed = time.monotonic() - started
-                if self.stop_event.wait(max(0.1, seconds - elapsed)):
-                    break
+                if self.stop_event.wait(max(0.5, seconds - elapsed)):
+                    return
         self._spawn(name, loop)
 
     def _startup_loop(self) -> None:
         while not self.stop_event.is_set():
             try:
                 self.engine.startup()
-                self.telegram.send_message("✅ ربات شکار پایان پامپ آماده شد.\nترید واقعی بعد از استارت خاموش است؛ دستور «ترید فعال» آن را روشن می‌کند.")
+                self.storage.queue_message(
+                    "✅ ربات ورود پله‌ای آماده شد.\n"
+                    f"ارز: {self.engine.symbol}\n"
+                    "ترید واقعی خاموش است؛ با دستور «ترید فعال» روشن می‌شود.\n"
+                    "برای دیدن وضعیت: «پنل»"
+                )
                 return
             except Exception as exc:
                 self.storage.set_setting("startup_ready", False)
-                self.storage.set_setting("startup_phase", f"خطای Toobit: {str(exc)[:160]}")
+                self.storage.set_setting("startup_phase", f"خطای اتصال: {str(exc)[:150]}")
                 self.storage.set_health("startup", "warning", str(exc))
-                if self.stop_event.wait(10):
+                logger.warning("STARTUP_RETRY | %s", exc)
+                if self.stop_event.wait(15):
                     return
 
+    # ------------------------------------------------------------------
     def start(self) -> None:
-        self.storage.set_health("main", "ok", "process started; real trading OFF")
-        logger.info("BOT_START | build=%s | db=%s | ترید واقعی اجباری خاموش است", config.BUILD_VERSION, config.RUNTIME_DB)
+        self.storage.set_health("main", "ok", "ربات شروع شد؛ ترید واقعی خاموش")
+        # ترید واقعی هرگز به‌صورت خودکار پس از ری‌استارت روشن نمی‌ماند نیست —
+        # ولی تنظیم کاربر حفظ می‌شود تا systemd پس از کرش رفتار را عوض نکند.
+        logger.info("BOT_START | build=%s | db=%s", config.BUILD_VERSION, config.RUNTIME_DB)
+
         self._spawn("telegram-poll", self.telegram.poll_loop)
         self._spawn("telegram-notify", self.telegram.notification_loop)
-        self._spawn("trade-execution", self._trade_loop)
-        self._spawn("startup", self._startup_loop, expected_return=True)
+        self._spawn("startup", self._startup_loop)
 
-        # مانیتور Real حتی قبل از آماده‌شدن اسکنر اجرا می‌شود تا پوزیشن قدیمی گم نشود.
-        self._periodic("real-monitor", config.REAL_MONITOR_SECONDS, self.engine.monitor_real, immediate=True, ready=False)
-        self._periodic("real-confirm", config.PENDING_CHECK_SECONDS, self.engine.confirm_pending, immediate=True, ready=False)
-        self._periodic("price-monitor", config.POSITION_PRICE_SECONDS, self.engine.monitor_prices, immediate=True, ready=True)
-        self._spawn("scanner", self._scanner_loop)
-
-
-    def _scanner_loop(self) -> None:
-        interval = max(1.0, float(config.MARKET_SCAN_SECONDS))
-        logger.info("SCANNER_LOOP_START | interval=%.1fs", interval)
-        waiting_logged = False
-        while not self.stop_event.is_set():
-            if not self.storage.get_setting("startup_ready", False):
-                if not waiting_logged:
-                    logger.info("SCAN_WAIT_STARTUP")
-                    waiting_logged = True
-                if self.stop_event.wait(0.5):
-                    return
-                continue
-            waiting_logged = False
-            started = time.monotonic()
-            try:
-                self.engine.scan_once()
-            except Exception as exc:
-                self.storage.set_health("scanner", "warning", str(exc))
-                logger.exception("SCAN_ERROR | %s", exc)
-            elapsed = time.monotonic() - started
-            if self.stop_event.wait(max(0.1, interval - elapsed)):
-                return
-
-    def _trade_loop(self) -> None:
-        while not self.stop_event.is_set():
-            self.engine.process_trade_one(timeout=1.0)
+        self._periodic("engine-tick", config.PRICE_CHECK_SECONDS, self.engine.tick)
+        self._periodic("real-monitor", config.REAL_MONITOR_SECONDS,
+                       self.engine.monitor_real, require_ready=False)
+        self._periodic("balance-refresh", config.BALANCE_REFRESH_SECONDS,
+                       lambda: self.engine.refresh_balance(force=True), require_ready=False)
 
     def run_forever(self) -> None:
         self.start()
@@ -124,7 +100,6 @@ class Application:
         self.closed = True
         self.stop_event.set()
         self.telegram.stop()
-        # Close HTTP sessions before joining so long-poll and market requests unblock.
         self.toobit.close()
         deadline = time.monotonic() + 5.0
         for thread in self.threads:
@@ -145,8 +120,8 @@ def main() -> int:
         app.stop_event.set()
         app.telegram.stop()
 
-    signal.signal(signal.SIGINT, request_stop)
-    signal.signal(signal.SIGTERM, request_stop)
+    sigmod.signal(sigmod.SIGINT, request_stop)
+    sigmod.signal(sigmod.SIGTERM, request_stop)
     try:
         app.run_forever()
         return 0
