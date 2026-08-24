@@ -1,0 +1,20 @@
+[Unit]
+Description=Staged Entry Trading Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/staged-bot
+ExecStart=/usr/bin/python3 /root/staged-bot/main.py
+EnvironmentFile=/root/staged-bot/.env
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=0
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=staged-bot
+
+[Install]
+WantedBy=multi-user.target
