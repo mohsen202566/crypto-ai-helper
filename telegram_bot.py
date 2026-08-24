@@ -94,56 +94,112 @@ def position_panel(cycle: dict[str, Any], plan: dict[str, Any] | None = None) ->
     return "\n".join(lines)
 
 
-def trade_panel(storage: Storage) -> str:
-    """پنل ترید — وضعیت کلی و موجودی."""
-    real_on = bool(storage.get_setting("real_trading_enabled", False))
-    mode = "real" if real_on else "virtual"
-    balance, balance_ts = storage.cached_balance()
-    virtual_balance = safe_float(storage.get_setting("virtual_balance", 0.0))
-    real_stats = storage.stats("real")
-    virt_stats = storage.stats("virtual")
-    stats = real_stats if real_on else virt_stats
+def _wait_reason(storage: Storage) -> str:
+    """آخرین دلیلی که ربات وارد نشده — برای اینکه بدانی منتظر چیست."""
+    waiting = ""
+    for row in storage.health_rows():
+        if row.get("component") in {"strategy", "risk"}:
+            detail = str(row.get("detail") or "")
+            if detail:
+                waiting = detail
+    return waiting
 
-    open_cycles = storage.open_cycles()
-    engaged = sum(safe_float(c.get("total_margin")) for c in open_cycles)
-    shown_balance = balance if real_on else virtual_balance
-    engaged_pct = (engaged / shown_balance * 100.0) if shown_balance > 0 else 0.0
 
-    age = ""
-    if real_on and balance_ts:
-        seconds = max(0, int((time.time() * 1000 - balance_ts) / 1000))
-        age = f" (به‌روزرسانی {seconds}s پیش)"
-
-    lines = [
-        "⚙️ پنل ترید",
-        "",
-        f"ترید: {'✅ فعال' if real_on else '⛔️ خاموش'}",
-        f"حالت: {_mode_label(mode)}",
+def _common_lines(storage: Storage) -> list[str]:
+    return [
         f"ارز: {config.TARGET_SYMBOL}",
-        "",
-        f"💰 موجودی: {_n(shown_balance)}${age}",
-        f"📌 سرمایهٔ درگیر: {_n(engaged)}$ ({engaged_pct:.1f}%)",
-        f"سقف مجاز درگیری: {config.MAX_CAPITAL_ENGAGED_RATE * 100:.0f}% از موجودی",
-        "",
         f"لوریج: خودکار (۱ تا {config.STAGED_LEVERAGE_MAX}x بر پایهٔ ایمنی لیکوئید)",
         f"حالت مارجین: {config.MARGIN_MODE}",
         f"حداکثر پله: {safe_int(storage.get_setting('max_steps', config.MAX_ENTRY_STEPS))}",
+    ]
+
+
+def _positions_block(cycles: list[dict[str, Any]]) -> list[str]:
+    if not cycles:
+        return []
+    lines = ["", "📂 پوزیشن‌های باز:"]
+    for c in cycles:
+        lines.append(
+            f"  {_side_badge(c.get('side'))} {c.get('symbol')} | "
+            f"ورود {_price(c.get('avg_entry_price'))} | "
+            f"پله {safe_int(c.get('filled_steps'))}/{safe_int(c.get('planned_steps'))}"
+        )
+    return lines
+
+
+def real_trade_panel(storage: Storage) -> str:
+    """پنل ترید واقعی."""
+    real_on = bool(storage.get_setting("real_trading_enabled", False))
+    balance, balance_ts = storage.cached_balance()
+    stats = storage.stats("real")
+    cycles = [c for c in storage.open_cycles() if c.get("mode") == "real"]
+    engaged = sum(safe_float(c.get("total_margin")) for c in cycles)
+    engaged_pct = (engaged / balance * 100.0) if balance > 0 else 0.0
+
+    age = ""
+    if balance_ts:
+        seconds = max(0, int((time.time() * 1000 - balance_ts) / 1000))
+        age = f" ({seconds}s پیش)"
+
+    lines = [
+        "🔵 پنل ترید واقعی",
+        "",
+        f"ترید واقعی: {'✅ فعال' if real_on else '⛔️ خاموش'}",
+    ]
+    lines += _common_lines(storage)
+    lines += [
+        "",
+        f"🏦 موجودی توبیت: {_n(balance)}${age}",
+        f"📌 سرمایهٔ درگیر: {_n(engaged)}$ ({engaged_pct:.1f}%)",
+        f"سقف مجاز درگیری: {config.MAX_CAPITAL_ENGAGED_RATE * 100:.0f}% از موجودی",
         "",
         f"پوزیشن‌های باز: {stats['open']}",
         f"سود/ضرر امروز: {_pnl(stats['pnl_today'])}",
         f"سود/ضرر کل: {_pnl(stats['pnl_total'])}",
     ]
+    if balance <= 0:
+        lines += ["", "⚠️ موجودی صفر است — تا واریز نکنید ترید واقعی انجام نمی‌شود."]
+    lines += _positions_block(cycles)
+    if real_on and not cycles:
+        reason = _wait_reason(storage)
+        if reason:
+            lines += ["", f"⏳ {reason}"]
+    return "\n".join(lines)
 
-    if open_cycles:
-        lines.append("")
-        lines.append("📂 پوزیشن‌های باز:")
-        for c in open_cycles:
-            lines.append(
-                f"  {_side_badge(c.get('side'))} {c.get('symbol')} | "
-                f"ورود {_price(c.get('avg_entry_price'))} | "
-                f"پله {safe_int(c.get('filled_steps'))}/{safe_int(c.get('planned_steps'))} | "
-                f"{_mode_label(c.get('mode'))}"
-            )
+
+def virtual_trade_panel(storage: Storage) -> str:
+    """پنل ترید مجازی."""
+    real_on = bool(storage.get_setting("real_trading_enabled", False))
+    balance = safe_float(storage.get_setting("virtual_balance", 0.0))
+    start = safe_float(config.VIRTUAL_START_CAPITAL_USDT)
+    stats = storage.stats("virtual")
+    cycles = [c for c in storage.open_cycles() if c.get("mode") == "virtual"]
+    engaged = sum(safe_float(c.get("total_margin")) for c in cycles)
+    engaged_pct = (engaged / balance * 100.0) if balance > 0 else 0.0
+    growth = ((balance / start - 1.0) * 100.0) if start > 0 else 0.0
+
+    lines = [
+        "🎮 پنل ترید مجازی",
+        "",
+        f"وضعیت: {'⏸ غیرفعال (ترید واقعی روشن است)' if real_on else '✅ در حال اجرا'}",
+    ]
+    lines += _common_lines(storage)
+    lines += [
+        "",
+        f"💰 موجودی مجازی: {_n(balance)}$",
+        f"سرمایهٔ شروع: {_n(start)}$  |  رشد: {growth:+.1f}%",
+        f"📌 سرمایهٔ درگیر: {_n(engaged)}$ ({engaged_pct:.1f}%)",
+        "",
+        f"پوزیشن‌های باز: {stats['open']}",
+        f"کل بسته‌شده: {stats['closed']}  (حد سود {stats['tp']} / حد ضرر {stats['stop']})",
+        f"سود/ضرر امروز: {_pnl(stats['pnl_today'])}",
+        f"سود/ضرر کل: {_pnl(stats['pnl_total'])}",
+    ]
+    lines += _positions_block(cycles)
+    if not cycles:
+        reason = _wait_reason(storage)
+        if reason:
+            lines += ["", f"⏳ {reason}"]
     return "\n".join(lines)
 
 
@@ -205,7 +261,9 @@ def help_text() -> str:
         "دستورات:",
         "• ترید فعال / ترید روشن — فعال کردن ترید واقعی",
         "• ترید غیرفعال / ترید خاموش — بازگشت به حالت مجازی",
-        "• پنل / ترید — نمایش پنل ترید",
+        "• ترید / ترید واقعی — پنل ترید واقعی",
+        "• ترید مجازی — پنل ترید مجازی",
+        "• چرا — دلیل اینکه چرا الان وارد نمی‌شود",
         "• آمار / آمار کل — نمایش آمار",
         "• پوزیشن — پوزیشن‌های باز",
         "• پله <عدد> — تنظیم حداکثر تعداد پله",
@@ -251,8 +309,19 @@ class CommandRouter:
             self.storage.log_event("real_trading_enabled", False)
             return "⛔️ ترید واقعی خاموش شد.\nچرخه‌های جدید فقط مجازی خواهند بود."
 
-        if cmd in {"پنل", "ترید", "/panel", "/trade"}:
-            return trade_panel(self.storage)
+        if cmd in {"پنل", "ترید", "ترید واقعی", "پنل ترید", "/panel", "/trade"}:
+            return real_trade_panel(self.storage)
+
+        if cmd in {"ترید مجازی", "مجازی", "پنل مجازی", "/virtual"}:
+            return virtual_trade_panel(self.storage)
+
+        if cmd in {"چرا", "دلیل", "/why"}:
+            reason = _wait_reason(self.storage)
+            return f"⏳ {reason}" if reason else "دلیلی ثبت نشده — ربات هنوز اولین تحلیل را انجام نداده."
+
+        if cmd in {"تست", "تست مجازی", "/test"}:
+            return ("برای تست، دستور «تست باز» یک چرخهٔ مجازی با قیمت فعلی باز می‌کند "
+                    "(بدون توجه به سیگنال روند). فقط برای دیدن عملکرد پنل‌ها.")
 
         if cmd in {"آمار", "امار", "آمار کل", "امار کل", "/stats"}:
             return stats_panel(self.storage)
