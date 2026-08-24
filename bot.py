@@ -52,7 +52,7 @@ class BotEngine:
         self._contract_ts = time.monotonic()
         self.symbol = key
 
-        if self.toobit.has_credentials():
+        if self.toobit.has_credentials:
             self.refresh_balance(force=True)
             self.storage.set_setting("startup_phase", "آماده")
         else:
@@ -81,7 +81,7 @@ class BotEngine:
         if not force and self.storage.balance_is_fresh():
             balance, _ = self.storage.cached_balance()
             return balance
-        if not self.toobit.has_credentials():
+        if not self.toobit.has_credentials:
             return 0.0
         try:
             summary = self.toobit.get_usdt_balance_summary()
@@ -371,7 +371,7 @@ class BotEngine:
         اگر صرافی خودش پوزیشن را بسته باشد (حد سود/ضرر روی خود صرافی)، چرخه
         در دیتابیس هم بسته می‌شود تا آمار از واقعیت جدا نیفتد.
         """
-        if not self.toobit.has_credentials():
+        if not self.toobit.has_credentials:
             return
         cycle = self.storage.open_cycle(mode="real")
         if not cycle:
