@@ -96,11 +96,12 @@ class BotEngine:
             return balance
 
     def effective_capital(self, *, real_mode: bool) -> float:
-        """سرمایهٔ مبنا — همیشه زنده، هرگز عدد ثابت."""
-        if real_mode:
-            live = self.refresh_balance()
-        else:
-            live = 0.0
+        """سرمایهٔ مبنا — همیشه زنده، هرگز عدد ثابت.
+
+        موجودی واقعی حتی در حالت مجازی هم خوانده و نمایش داده می‌شود؛
+        فقط مبنای محاسبهٔ پله‌ها در حالت مجازی، موجودی مجازی است.
+        """
+        live = self.refresh_balance()
         virtual = safe_float(self.storage.get_setting("virtual_balance", config.VIRTUAL_START_CAPITAL_USDT))
         capital = risk_engine.available_capital(
             live_balance=live, virtual=not real_mode, virtual_balance=virtual
