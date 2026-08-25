@@ -212,10 +212,32 @@ TREND_TIMEFRAMES = tuple(
     x.strip() for x in os.getenv("TREND_TIMEFRAMES", "4h,1d").split(",") if x.strip()
 )
 ENTRY_TIMEFRAME = os.getenv("ENTRY_TIMEFRAME", "15m").strip()
+# محدودهٔ RSI مجاز برای ورود (جلوگیری از ورود در اوج/کف لحظه‌ای).
+ENTRY_RSI_MAX = float(os.getenv("ENTRY_RSI_MAX", "78"))
+ENTRY_RSI_MIN = float(os.getenv("ENTRY_RSI_MIN", "22"))
 TREND_EMA_FAST = int(os.getenv("TREND_EMA_FAST", "20"))
 TREND_EMA_SLOW = int(os.getenv("TREND_EMA_SLOW", "50"))
-# حداقل تعداد تأییدهای هم‌جهت لازم برای باز کردن چرخه.
-MIN_TREND_CONFIRMATIONS = int(os.getenv("MIN_TREND_CONFIRMATIONS", "2"))
+# --- امتیازدهی روند (به‌جای شمارش تأیید دودویی) ---
+# وزن هر جزء در امتیاز یک تایم‌فریم؛ مجموعشان ۱ است.
+EMA_WEIGHT = float(os.getenv("EMA_WEIGHT", "0.45"))
+STRUCTURE_WEIGHT = float(os.getenv("STRUCTURE_WEIGHT", "0.55"))
+# آستانهٔ برچسب‌گذاری یک تایم‌فریم به‌عنوان LONG/SHORT (فقط برای نمایش).
+TREND_SCORE_THRESHOLD = float(os.getenv("TREND_SCORE_THRESHOLD", "0.30"))
+# وزن تایم‌فریم‌ها در امتیاز نهایی؛ روند بالاتر معتبرتر است.
+TIMEFRAME_WEIGHTS = {"1d": 1.5, "4h": 1.0, "1h": 0.6, "15m": 0.3}
+# آستانهٔ امتیاز ترکیبی برای مجاز شدن ورود.
+# پایین‌تر = ورود بیشتر و زودتر، بالاتر = محتاط‌تر و کم‌تعدادتر.
+COMBINED_SCORE_THRESHOLD = float(os.getenv("COMBINED_SCORE_THRESHOLD", "0.25"))
+# اگر تایم‌فریمی قاطعانه در جهت مخالف باشد، ورود لغو می‌شود.
+TREND_CONFLICT_THRESHOLD = float(os.getenv("TREND_CONFLICT_THRESHOLD", "0.55"))
+
+# --- فیلتر بازار رنج (نسبت کارایی کافمن) ---
+# در بازار رنج، قیمت زیاد نوسان می‌کند ولی جایی نمی‌رود؛ بدون این فیلتر
+# هر نوسان محلی به‌اشتباه روند خوانده می‌شود و ربات در سقف و کف رنج
+# پوزیشن باز می‌کند — دقیقاً الگویی که ضرر پیاپی می‌دهد.
+EFFICIENCY_PERIOD = int(os.getenv("EFFICIENCY_PERIOD", "20"))
+# زیر این مقدار، بازار رنج در نظر گرفته می‌شود و امتیاز میرا می‌شود.
+MIN_EFFICIENCY_RATIO = float(os.getenv("MIN_EFFICIENCY_RATIO", "0.30"))
 # اگر روند خنثی/نامشخص بود، هیچ چرخه‌ای باز نمی‌شود.
 ALLOW_LONG = os.getenv("ALLOW_LONG", "1").strip() not in {"0", "false", "no"}
 ALLOW_SHORT = os.getenv("ALLOW_SHORT", "1").strip() not in {"0", "false", "no"}
