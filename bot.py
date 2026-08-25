@@ -156,6 +156,9 @@ class BotEngine:
             price=snapshot["price"],
             best_bid=snapshot["best_bid"],
             best_ask=snapshot["best_ask"],
+            score_threshold=safe_float(
+                self.storage.get_setting("score_threshold", config.COMBINED_SCORE_THRESHOLD)
+            ),
         )
         if not signal.ok:
             self.storage.set_health("strategy", "ok", f"صبر: {signal.reason}")
