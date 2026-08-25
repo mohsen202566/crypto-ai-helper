@@ -264,6 +264,7 @@ def help_text() -> str:
         "• ترید / ترید واقعی — پنل ترید واقعی",
         "• ترید مجازی — پنل ترید مجازی",
         "• چرا — دلیل اینکه چرا الان وارد نمی‌شود",
+        "• حساسیت ۰.۲۵ — آستانهٔ ورود (کمتر = ورود بیشتر)",
         "• آمار / آمار کل — نمایش آمار",
         "• پوزیشن — پوزیشن‌های باز",
         "• پله <عدد> — تنظیم حداکثر تعداد پله",
@@ -314,6 +315,17 @@ class CommandRouter:
 
         if cmd in {"ترید مجازی", "مجازی", "پنل مجازی", "/virtual"}:
             return virtual_trade_panel(self.storage)
+
+        if cmd.startswith("حساسیت "):
+            try:
+                value = float(parse_number(cmd.split(" ", 1)[1]))
+            except (ValueError, IndexError):
+                return "عدد نامعتبر. مثال: حساسیت ۰.۲۵"
+            if not 0.05 <= value <= 1.0:
+                return "عدد باید بین ۰.۰۵ تا ۱.۰ باشد."
+            self.storage.set_setting("score_threshold", value)
+            hint = "حساس‌تر (ورود بیشتر)" if value < 0.25 else ("محتاط‌تر (ورود کمتر)" if value > 0.25 else "متعادل")
+            return f"✅ آستانهٔ ورود روی {value:.2f} تنظیم شد — {hint}"
 
         if cmd in {"چرا", "دلیل", "/why"}:
             reason = _wait_reason(self.storage)
