@@ -23,13 +23,21 @@ Side = Literal["LONG", "SHORT"]
 
 @dataclass
 class TrendRead:
-    """خواندهٔ جهت بازار در یک تایم‌فریم."""
+    """خواندهٔ جهت بازار در یک تایم‌فریم.
+
+    به‌جای برچسب دودویی، امتیاز پیوسته در بازهٔ -۱ تا +۱ می‌دهد:
+    مثبت = صعودی، منفی = نزولی، نزدیک صفر = بی‌جهت.
+    این باعث می‌شود اختلاف جزئی بین EMA و ساختار، کل تایم‌فریم را
+    بی‌اعتبار نکند (اشکال نسخهٔ قبلی).
+    """
 
     timeframe: str
-    direction: str          # LONG | SHORT | NEUTRAL
+    direction: str          # LONG | SHORT | NEUTRAL — فقط برای نمایش
+    score: float = 0.0      # -1 .. +1
     ema_fast: float = 0.0
     ema_slow: float = 0.0
     structure: str = "NEUTRAL"
+    efficiency: float = 0.0   # نسبت کارایی: ۱ = روند تمیز، ۰ = رنج
     rsi_value: float = 50.0
     notes: list[str] = field(default_factory=list)
 
@@ -43,18 +51,37 @@ class Signal:
     price: float = 0.0
     atr_value: float = 0.0
     spread_rate: float = 0.0
-    confirmations: int = 0
+    score: float = 0.0
     reads: list[TrendRead] = field(default_factory=list)
     reason: str = ""
 
     def summary(self) -> str:
-        parts = [f"{r.timeframe}:{r.direction}" for r in self.reads]
+        parts = [f"{r.timeframe}:{r.direction}({r.score:+.2f})" for r in self.reads]
         return " | ".join(parts)
 
 
 # ----------------------------------------------------------------------
 #  لایهٔ ۱ — جهت روند در تایم‌فریم بالادست
 # ----------------------------------------------------------------------
+
+def efficiency_ratio(closes: list[float], period: int) -> float:
+    """نسبت کارایی کافمن: حرکت خالص تقسیم بر مجموع حرکت‌ها.
+
+    نزدیک ۱ = روند تمیز و یک‌طرفه.
+    نزدیک ۰ = بازار رنج/اره‌ای — قیمت زیاد تکان می‌خورد ولی جایی نمی‌رود.
+
+    این همان چیزی است که «نوسان در رنج» را از «روند واقعی» جدا می‌کند؛
+    بدون آن، هر نوسان محلی به‌اشتباه روند خوانده می‌شود.
+    """
+    if len(closes) < period + 1:
+        return 0.0
+    window = closes[-(period + 1):]
+    net_move = abs(window[-1] - window[0])
+    total_move = sum(abs(window[i] - window[i - 1]) for i in range(1, len(window)))
+    if total_move <= 0:
+        return 0.0
+    return net_move / total_move
+
 
 def read_trend(candles: list[dict[str, float]], timeframe: str) -> TrendRead:
     """جهت روند یک تایم‌فریم را از روی کندل‌ها می‌خواند."""
@@ -81,27 +108,80 @@ def read_trend(candles: list[dict[str, float]], timeframe: str) -> TrendRead:
     else:
         read.structure = "NEUTRAL"
 
-    ema_dir = "LONG" if read.ema_fast > read.ema_slow else "SHORT"
+    # --- امتیاز EMA: هم جهت، هم فاصلهٔ نسبی (شیب قوی‌تر = امتیاز بیشتر) ---
+    if read.ema_slow > 0:
+        ema_gap = (read.ema_fast - read.ema_slow) / read.ema_slow
+    else:
+        ema_gap = 0.0
+    # فاصلهٔ ۱٪ یا بیشتر امتیاز کامل می‌گیرد.
+    ema_score = max(-1.0, min(1.0, ema_gap / 0.01))
 
-    # جهت وقتی معتبر است که هم EMA و هم ساختار هم‌جهت باشند.
-    if read.structure == ema_dir:
-        read.direction = ema_dir
-        read.notes.append(f"EMA و ساختار هر دو {ema_dir}")
+    structure_score = {"LONG": 1.0, "SHORT": -1.0}.get(read.structure, 0.0)
+
+    # وزن‌دهی: ساختار قیمت کمی مهم‌تر از EMA است چون دیرتر ولی مطمئن‌تر است.
+    raw_score = ema_score * config.EMA_WEIGHT + structure_score * config.STRUCTURE_WEIGHT
+
+    # --- فیلتر رنج ---
+    # اگر بازار کارایی جهتی پایینی دارد (رنج)، امتیاز به سمت صفر میرا می‌شود.
+    # بدون این، نوسان بالا-پایین داخل یک رنج به‌اشتباه «روند» خوانده می‌شود
+    # و ربات مدام در سقف و کف رنج پوزیشن باز می‌کند.
+    read.efficiency = efficiency_ratio(closes, config.EFFICIENCY_PERIOD)
+    if read.efficiency < config.MIN_EFFICIENCY_RATIO:
+        # این تایم‌فریم رنج است: هیچ اطلاعات جهتی معتبری ندارد، پس امتیاز صفر
+        # می‌گیرد (نه منفی، نه مثبت) و در میانگین نهایی خنثی می‌ماند.
+        read.score = 0.0
+        read.notes.append(
+            f"رنج (کارایی {read.efficiency:.2f} < {config.MIN_EFFICIENCY_RATIO}) — بی‌اطلاع"
+        )
+    else:
+        read.score = raw_score
+
+    if read.score >= config.TREND_SCORE_THRESHOLD:
+        read.direction = "LONG"
+    elif read.score <= -config.TREND_SCORE_THRESHOLD:
+        read.direction = "SHORT"
     else:
         read.direction = "NEUTRAL"
-        read.notes.append(f"EMA={ema_dir} ولی ساختار={read.structure} — بی‌جهت")
+
+    ema_dir = "LONG" if ema_score > 0 else ("SHORT" if ema_score < 0 else "FLAT")
+    read.notes.append(
+        f"EMA={ema_dir}({ema_score:+.2f}) ساختار={read.structure} → امتیاز {read.score:+.2f}"
+    )
     return read
 
 
-def combine_trends(reads: list[TrendRead]) -> tuple[str, int]:
-    """جهت نهایی و تعداد تأییدهای هم‌جهت."""
-    longs = sum(1 for r in reads if r.direction == "LONG")
-    shorts = sum(1 for r in reads if r.direction == "SHORT")
-    if longs >= config.MIN_TREND_CONFIRMATIONS and longs > shorts:
-        return "LONG", longs
-    if shorts >= config.MIN_TREND_CONFIRMATIONS and shorts > longs:
-        return "SHORT", shorts
-    return "NEUTRAL", max(longs, shorts)
+def combine_trends(reads: list[TrendRead], threshold: float | None = None) -> tuple[str, float]:
+    """جهت نهایی از میانگین وزن‌دار امتیاز تایم‌فریم‌ها.
+
+    تایم‌فریم بالاتر وزن بیشتری دارد (روند روزانه از ۴ساعته معتبرتر است).
+    برخلاف نسخهٔ قبلی، یک تایم‌فریم مبهم کل سیگنال را باطل نمی‌کند؛
+    فقط امتیاز کل را پایین می‌آورد.
+
+    یک شرط سخت باقی می‌ماند: هیچ تایم‌فریمی نباید *مخالف* جهت نهایی باشد.
+    """
+    if not reads:
+        return "NEUTRAL", 0.0
+
+    total_weight = 0.0
+    weighted = 0.0
+    for r in reads:
+        w = config.TIMEFRAME_WEIGHTS.get(r.timeframe, 1.0)
+        weighted += r.score * w
+        total_weight += w
+    combined = weighted / total_weight if total_weight > 0 else 0.0
+
+    # تضاد صریح: اگر تایم‌فریمی قاطعانه در جهت مخالف باشد، ورود ممنوع.
+    if combined > 0 and any(r.score <= -config.TREND_CONFLICT_THRESHOLD for r in reads):
+        return "NEUTRAL", combined
+    if combined < 0 and any(r.score >= config.TREND_CONFLICT_THRESHOLD for r in reads):
+        return "NEUTRAL", combined
+
+    limit = config.COMBINED_SCORE_THRESHOLD if threshold is None else float(threshold)
+    if combined >= limit:
+        return "LONG", combined
+    if combined <= -limit:
+        return "SHORT", combined
+    return "NEUTRAL", combined
 
 
 # ----------------------------------------------------------------------
@@ -121,11 +201,11 @@ def entry_is_favorable(side: Side, entry_candles: list[dict[str, float]]) -> tup
     r = rsi(closes, config.RSI_PERIOD)
 
     if side == "LONG":
-        if r > 72:
+        if r > config.ENTRY_RSI_MAX:
             return False, f"RSI ورود بیش از حد بالا ({r:.0f}) — ورود در اوج"
         return True, f"RSI ورود مناسب ({r:.0f})"
 
-    if r < 28:
+    if r < config.ENTRY_RSI_MIN:
         return False, f"RSI ورود بیش از حد پایین ({r:.0f}) — ورود در کف"
     return True, f"RSI ورود مناسب ({r:.0f})"
 
@@ -141,6 +221,7 @@ def build_signal(
     price: float,
     best_bid: float = 0.0,
     best_ask: float = 0.0,
+    score_threshold: float | None = None,
 ) -> Signal:
     """تحلیل کامل و تصمیم به ورود یا صبر."""
     signal = Signal(ok=False, price=float(price))
@@ -163,11 +244,15 @@ def build_signal(
     # --- روند بالادست ---
     reads = [read_trend(candles, tf) for tf, candles in trend_candles.items()]
     signal.reads = reads
-    direction, confirmations = combine_trends(reads)
-    signal.confirmations = confirmations
+    direction, combined_score = combine_trends(reads, score_threshold)
+    signal.score = combined_score
 
     if direction == "NEUTRAL":
-        signal.reason = f"جهت بازار مشخص نیست ({signal.summary()}) — ورود انجام نمی‌شود"
+        signal.reason = (
+            f"جهت بازار به اندازهٔ کافی قوی نیست — امتیاز {combined_score:+.2f} "
+            f"(آستانه {config.COMBINED_SCORE_THRESHOLD if score_threshold is None else score_threshold:.2f}) "
+            f"| {signal.summary()}"
+        )
         return signal
     if direction == "LONG" and not config.ALLOW_LONG:
         signal.reason = "روند صعودی است ولی لانگ غیرفعال شده"
@@ -191,7 +276,7 @@ def build_signal(
 
     signal.ok = True
     signal.side = direction  # type: ignore[assignment]
-    signal.reason = f"{signal.summary()} | {note}"
+    signal.reason = f"امتیاز {combined_score:+.2f} | {signal.summary()} | {note}"
     return signal
 
 
