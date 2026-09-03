@@ -1,4 +1,4 @@
-"""هستهٔ ریاضی ورود پله‌ای.
+"""هستهٔ ریاضی اندازه‌گیری پوزیشن و ریسک.
 
 این ماژول هیچ وابستگی به صرافی یا تلگرام ندارد و کاملاً قابل تست مستقل است.
 همهٔ تصمیم‌های عددی (اندازهٔ هر پله، لوریج، قیمت فعال‌شدن پله‌ها، قیمت لیکوئید،
@@ -6,10 +6,10 @@
 
 اصول ثابت:
 1. سرمایه هرگز عدد ثابت نیست؛ همیشه از بیرون (موجودی زندهٔ حساب) تزریق می‌شود.
-2. مجموع مارجین همهٔ پله‌ها هرگز از ``MAX_CAPITAL_ENGAGED_RATE`` × سرمایه بیشتر نمی‌شود.
-3. پلهٔ اول باید فاصلهٔ لیکوئید عملاً غیرقابل‌دسترس داشته باشد.
-4. اگر بعد از آخرین پله هم قیمت برنگردد، حد ضرر سخت اجرا می‌شود — نه پلهٔ جدید.
-5. هر پله بر اساس ATR واقعی فاصله می‌گیرد، نه درصد دلخواه ثابت.
+2. مجموع مارجین پوزیشن‌های باز از ``MAX_CAPITAL_ENGAGED_RATE`` × سرمایه بیشتر نمی‌شود.
+3. هر پوزیشن از همان لحظهٔ ورود حد ضرر و حد سود دارد؛ خبری از پله و مارتینگل نیست.
+4. حد ضرر بر پایهٔ ATR واقعی همان ارز تعیین می‌شود، نه درصد ثابت.
+5. ورودی که سودش را کارمزد بخورد اصلاً باز نمی‌شود.
 """
 from __future__ import annotations
 
@@ -25,73 +25,6 @@ Side = Literal["LONG", "SHORT"]
 # ----------------------------------------------------------------------
 #  ساختارهای داده
 # ----------------------------------------------------------------------
-
-@dataclass
-class StepPlan:
-    """نقشهٔ یک پلهٔ ورود (هنوز اجرا نشده)."""
-
-    index: int                 # شمارهٔ پله، از ۱
-    trigger_price: float       # قیمتی که این پله در آن فعال می‌شود
-    margin_usdt: float         # مارجین اختصاص‌یافته به این پله
-    notional_usdt: float       # ارزش پوزیشن این پله (مارجین × لوریج)
-    quantity: float            # حجم تقریبی (به واحد ارز)
-    cum_margin_usdt: float     # مجموع مارجین تا این پله
-    cum_notional_usdt: float   # مجموع ارزش پوزیشن تا این پله
-    avg_entry_price: float     # میانگین قیمت ورود پس از این پله
-    liquidation_price: float   # قیمت لیکوئید پس از این پله
-    liq_distance_rate: float   # فاصلهٔ نسبی لیکوئید تا قیمت این پله
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-
-@dataclass
-class CyclePlan:
-    """نقشهٔ کامل یک چرخهٔ معاملاتی، قبل از باز شدن هر پوزیشنی."""
-
-    symbol: str
-    side: Side
-    leverage: int
-    entry_price: float
-    atr: float
-    capital_usdt: float             # سرمایهٔ مبنا (موجودی زندهٔ لحظهٔ برنامه‌ریزی)
-    max_engaged_usdt: float         # سقف مجاز درگیری سرمایه
-    steps: list[StepPlan] = field(default_factory=list)
-    take_profit_price: float = 0.0
-    hard_stop_price: float = 0.0
-    step_gap_rate: float = 0.0      # فاصلهٔ نسبی بین پله‌ها
-    max_loss_usdt: float = 0.0      # بدترین ضرر ممکن (اگر حد ضرر سخت بخورد)
-    expected_profit_usdt: float = 0.0
-    expected_net_profit_usdt: float = 0.0
-    total_fee_usdt: float = 0.0
-    liq_to_stop_ratio: float = 0.0  # فاصلهٔ لیکوئید تقسیم بر فاصلهٔ حد ضرر
-    stop_distance_rate: float = 0.0
-    final_liq_distance_rate: float = 0.0
-    ok: bool = False
-    reason: str = ""
-
-    @property
-    def step_count(self) -> int:
-        return len(self.steps)
-
-    @property
-    def total_margin_usdt(self) -> float:
-        return self.steps[-1].cum_margin_usdt if self.steps else 0.0
-
-    @property
-    def first_step(self) -> StepPlan | None:
-        return self.steps[0] if self.steps else None
-
-    @property
-    def final_step(self) -> StepPlan | None:
-        return self.steps[-1] if self.steps else None
-
-    def to_dict(self) -> dict[str, Any]:
-        data = asdict(self)
-        data["step_count"] = self.step_count
-        data["total_margin_usdt"] = self.total_margin_usdt
-        return data
-
 
 # ----------------------------------------------------------------------
 #  توابع پایه
@@ -130,14 +63,6 @@ def liq_distance_rate(side: Side, price: float, liq_price: float) -> float:
     return max(0.0, (liq_price - price) / price)
 
 
-def step_gap_rate_from_atr(atr_value: float, price: float) -> float:
-    """فاصلهٔ بین پله‌ها بر پایهٔ ATR واقعی، محدودشده به کف و سقف امن."""
-    if price <= 0:
-        return config.MIN_STEP_GAP_PERCENT
-    raw = (atr_value * config.STEP_TRIGGER_ATR_MULTIPLIER) / price
-    return clamp(raw, config.MIN_STEP_GAP_PERCENT, config.MAX_STEP_GAP_PERCENT)
-
-
 def round_trip_cost_rate() -> float:
     """کل هزینهٔ رفت‌وبرگشت یک پوزیشن به‌صورت نسبت (کارمزد + اسلیپیج + فاندینگ)."""
     return (
@@ -168,290 +93,214 @@ def available_capital(
 
 
 # ----------------------------------------------------------------------
-#  برنامه‌ریزی چرخه
+#  برنامه‌ریزی پوزیشن تکی (جایگزین ورود پله‌ای)
 # ----------------------------------------------------------------------
 
-def _step_margins(total_budget: float, step_count: int, multiplier: float) -> list[float]:
-    """تقسیم بودجه بین پله‌ها با ضریب رشد مشخص.
+@dataclass
+class EntryPlan:
+    """نقشهٔ کامل یک پوزیشن، قبل از ارسال سفارش."""
 
-    مجموع سری هندسی ``m × (1 + r + r² + ...)`` برابر بودجه قرار داده می‌شود،
-    پس مجموع پله‌ها هرگز از سقف مجاز عبور نمی‌کند.
+    ok: bool
+    symbol: str
+    side: Side
+    entry_price: float
+    leverage: int
+    margin_usdt: float
+    notional_usdt: float
+    quantity: float
+    stop_price: float
+    take_profit_price: float
+    liquidation_price: float
+    risk_usdt: float              # حداکثر ضرر اگر حد ضرر بخورد (با کارمزد)
+    expected_profit_usdt: float   # سود خالص اگر حد سود بخورد (بعد از کارمزد)
+    cost_usdt: float              # هزینهٔ رفت‌وبرگشت
+    reason: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def stop_distance(entry_price: float, atr_value: float) -> float:
+    """فاصلهٔ حد ضرر بر پایهٔ ATR واقعی، محدودشده به کف و سقف امن.
+
+    ATR یعنی حد ضرر با نوسان همان ارز تنظیم می‌شود: ارز پرنوسان استاپ دورتر
+    می‌گیرد و ارز آرام استاپ نزدیک‌تر. درصد ثابت این تفاوت را نادیده می‌گیرد و
+    باعث می‌شود روی ارز پرنوسان مدام با نویز عادی بازار استاپ بخوریم.
     """
-    step_count = max(1, step_count)
-    multiplier = max(1.0, multiplier)
-    if abs(multiplier - 1.0) < 1e-9:
-        series_sum = float(step_count)
-    else:
-        series_sum = (multiplier ** step_count - 1.0) / (multiplier - 1.0)
-    base = total_budget / series_sum if series_sum > 0 else 0.0
-    return [base * (multiplier ** i) for i in range(step_count)]
-
-
-def plan_cycle(
-    *,
-    symbol: str,
-    side: Side,
-    entry_price: float,
-    atr_value: float,
-    capital_usdt: float,
-    leverage: int | None = None,
-    max_steps: int | None = None,
-    min_qty: float = 0.0,
-    min_notional: float = 0.0,
-) -> CyclePlan:
-    """نقشهٔ کامل یک چرخه را می‌سازد و ایمنی آن را می‌سنجد.
-
-    خروجی همیشه یک ``CyclePlan`` است؛ اگر ``ok`` نادرست باشد، ``reason`` می‌گوید
-    چرا ورود مجاز نیست. هیچ سفارشی اینجا ثبت نمی‌شود.
-    """
-    side = "LONG" if str(side).upper() == "LONG" else "SHORT"
-    leverage = int(leverage or config.DEFAULT_STAGED_LEVERAGE)
-    leverage = int(clamp(leverage, config.STAGED_LEVERAGE_MIN, config.STAGED_LEVERAGE_MAX))
-    max_steps = int(max_steps or config.MAX_ENTRY_STEPS)
-    max_steps = int(clamp(max_steps, 1, config.MAX_ENTRY_STEPS_LIMIT))
-
-    plan = CyclePlan(
-        symbol=symbol,
-        side=side,
-        leverage=leverage,
-        entry_price=float(entry_price),
-        atr=float(atr_value),
-        capital_usdt=float(capital_usdt),
-        max_engaged_usdt=float(capital_usdt) * config.MAX_CAPITAL_ENGAGED_RATE,
-    )
-
     if entry_price <= 0:
-        plan.reason = "قیمت ورود نامعتبر است"
-        return plan
-    if capital_usdt < config.MIN_CAPITAL_TO_TRADE_USDT:
-        plan.reason = (
-            f"سرمایه ({capital_usdt:.2f}$) کمتر از حداقل "
-            f"({config.MIN_CAPITAL_TO_TRADE_USDT:.2f}$) است"
-        )
-        return plan
-    if atr_value <= 0:
-        plan.reason = "ATR نامعتبر است (دادهٔ کندل ناکافی)"
-        return plan
-
-    gap = step_gap_rate_from_atr(atr_value, entry_price)
-    plan.step_gap_rate = gap
-
-    budget = plan.max_engaged_usdt
-    margins = _step_margins(budget, max_steps, config.STEP_SIZE_MULTIPLIER)
-
-    # اگر پلهٔ اول از حداقل سفارش صرافی کوچک‌تر شد، تعداد پله را کم می‌کنیم
-    # تا هر پله واقعاً قابل اجرا باشد (به‌جای رد کردن کل چرخه).
-    while max_steps > 1:
-        first_notional = margins[0] * leverage
-        if min_notional <= 0 or first_notional >= min_notional:
-            break
-        max_steps -= 1
-        margins = _step_margins(budget, max_steps, config.STEP_SIZE_MULTIPLIER)
-
-    first_notional = margins[0] * leverage
-    if min_notional > 0 and first_notional < min_notional:
-        plan.reason = (
-            f"حتی با یک پله، ارزش پوزیشن ({first_notional:.2f}$) کمتر از حداقل "
-            f"صرافی ({min_notional:.2f}$) است"
-        )
-        return plan
-
-    cum_margin = 0.0
-    cum_notional = 0.0
-    cum_qty = 0.0
-    steps: list[StepPlan] = []
-
-    for i in range(max_steps):
-        if side == "LONG":
-            trigger = entry_price * (1.0 - gap * i)
-        else:
-            trigger = entry_price * (1.0 + gap * i)
-        if trigger <= 0:
-            break
-
-        margin = margins[i]
-        notional = margin * leverage
-        qty = notional / trigger
-
-        cum_margin += margin
-        cum_notional += notional
-        cum_qty += qty
-        avg_entry = cum_notional / cum_qty if cum_qty > 0 else trigger
-
-        liq = liquidation_price(
-            side=side,
-            avg_entry=avg_entry,
-            total_margin=cum_margin,
-            total_quantity=cum_qty,
-        )
-        steps.append(
-            StepPlan(
-                index=i + 1,
-                trigger_price=trigger,
-                margin_usdt=margin,
-                notional_usdt=notional,
-                quantity=qty,
-                cum_margin_usdt=cum_margin,
-                cum_notional_usdt=cum_notional,
-                avg_entry_price=avg_entry,
-                liquidation_price=liq,
-                liq_distance_rate=liq_distance_rate(side, trigger, liq),
-            )
-        )
-
-    if not steps:
-        plan.reason = "ساخت پله‌ها ممکن نشد"
-        return plan
-
-    plan.steps = steps
-    first = steps[0]
-    final = steps[-1]
-
-    final_liq_distance = liq_distance_rate(side, final.avg_entry_price, final.liquidation_price)
-    if final_liq_distance < config.MIN_LIQUIDATION_DISTANCE_FINAL_RATE:
-        plan.reason = (
-            f"فاصلهٔ لیکوئید پس از آخرین پله ({final_liq_distance * 100:.1f}%) کمتر از "
-            f"کف مطلق ({config.MIN_LIQUIDATION_DISTANCE_FINAL_RATE * 100:.0f}%) است؛ "
-            f"لوریج {leverage}x برای این سرمایه بیش از حد بالاست"
-        )
-        return plan
-
-    # --- حد سود و حد ضرر ---
-    tp_rate = clamp(
-        (atr_value * config.TAKE_PROFIT_ATR_MULTIPLIER) / entry_price,
-        config.MIN_TAKE_PROFIT_PERCENT,
-        config.MAX_TAKE_PROFIT_PERCENT,
-    )
-    stop_rate = (atr_value * config.HARD_STOP_ATR_MULTIPLIER) / entry_price
-
-    if side == "LONG":
-        plan.take_profit_price = entry_price * (1.0 + tp_rate)
-        plan.hard_stop_price = final.avg_entry_price * (1.0 - stop_rate)
-    else:
-        plan.take_profit_price = entry_price * (1.0 - tp_rate)
-        plan.hard_stop_price = final.avg_entry_price * (1.0 + stop_rate)
-
-    # --- شرط اصلی ایمنی: حد ضرر باید خیلی زودتر از لیکوئید فعال شود ---
-    # اگر استاپ روی ۸٪ و لیکوئید روی ۲۰٪ باشد، عملاً هرگز به لیکوئید نمی‌رسیم
-    # چون پوزیشن خیلی قبل‌تر بسته شده. این «لیکوئید غیرقابل‌دسترس» واقعی است.
-    stop_distance = abs(final.avg_entry_price - plan.hard_stop_price) / final.avg_entry_price
-    if stop_distance <= 0:
-        plan.reason = "فاصلهٔ حد ضرر نامعتبر است"
-        return plan
-    required_liq_distance = stop_distance * config.LIQUIDATION_TO_STOP_BUFFER
-    if final_liq_distance < required_liq_distance:
-        plan.reason = (
-            f"لیکوئید ({final_liq_distance * 100:.1f}%) به حد ضرر "
-            f"({stop_distance * 100:.1f}%) خیلی نزدیک است؛ لازم است حداقل "
-            f"{config.LIQUIDATION_TO_STOP_BUFFER:.1f} برابر فاصله داشته باشد. "
-            f"لوریج {leverage}x امن نیست"
-        )
-        return plan
-    plan.liq_to_stop_ratio = final_liq_distance / stop_distance if stop_distance > 0 else 0.0
-    plan.stop_distance_rate = stop_distance
-    plan.final_liq_distance_rate = final_liq_distance
-
-    # --- اقتصاد معامله ---
-    cost_rate = round_trip_cost_rate()
-    plan.total_fee_usdt = final.cum_notional_usdt * cost_rate
-    # سود مورد انتظار: بستن کل حجم در حد سود، از میانگین ورود
-    if side == "LONG":
-        gross = (plan.take_profit_price - first.avg_entry_price) * first.quantity
-    else:
-        gross = (first.avg_entry_price - plan.take_profit_price) * first.quantity
-    plan.expected_profit_usdt = gross
-    plan.expected_net_profit_usdt = gross - (first.notional_usdt * cost_rate)
-
-    # بدترین حالت: همهٔ پله‌ها پر شده و حد ضرر سخت خورده
-    if side == "LONG":
-        worst = (final.avg_entry_price - plan.hard_stop_price) * (final.cum_notional_usdt / final.avg_entry_price)
-    else:
-        worst = (plan.hard_stop_price - final.avg_entry_price) * (final.cum_notional_usdt / final.avg_entry_price)
-    plan.max_loss_usdt = abs(worst) + plan.total_fee_usdt
-
-    max_allowed_loss = plan.max_engaged_usdt * config.MAX_CYCLE_LOSS_RATE
-    if plan.max_loss_usdt > max_allowed_loss:
-        # حد ضرر را تنگ‌تر می‌کنیم تا در سقف مجاز جا شود، به‌جای رد کردن چرخه.
-        qty_total = final.cum_notional_usdt / final.avg_entry_price
-        allowed_move = max(0.0, (max_allowed_loss - plan.total_fee_usdt) / qty_total) if qty_total > 0 else 0.0
-        if allowed_move <= 0:
-            plan.reason = "حد ضرر قابل تنظیم در سقف ریسک مجاز نیست"
-            return plan
-        if side == "LONG":
-            plan.hard_stop_price = final.avg_entry_price - allowed_move
-        else:
-            plan.hard_stop_price = final.avg_entry_price + allowed_move
-        plan.max_loss_usdt = max_allowed_loss
-
-    if plan.expected_net_profit_usdt < config.MIN_NET_PROFIT_USDT:
-        plan.reason = (
-            f"سود خالص مورد انتظار ({plan.expected_net_profit_usdt:.2f}$) کمتر از "
-            f"حداقل ({config.MIN_NET_PROFIT_USDT:.2f}$) است"
-        )
-        return plan
-
-    plan.ok = True
-    plan.reason = "نقشهٔ چرخه معتبر است"
-    return plan
+        return 0.0
+    raw = atr_value * config.STOP_ATR_MULTIPLIER
+    lo = entry_price * config.MIN_STOP_DISTANCE_RATE
+    hi = entry_price * config.MAX_STOP_DISTANCE_RATE
+    return clamp(raw, lo, hi)
 
 
-def best_leverage_for(
+def plan_entry(
     *,
     symbol: str,
     side: Side,
     entry_price: float,
     atr_value: float,
-    capital_usdt: float,
-    max_steps: int | None = None,
+    slot_margin_usdt: float,
+    leverage: int | None = None,
     min_qty: float = 0.0,
     min_notional: float = 0.0,
-) -> CyclePlan:
-    """کم‌ریسک‌ترین لوریجی را پیدا می‌کند که هنوز سود معنادار بدهد.
+) -> EntryPlan:
+    """یک پوزیشن تکی با حد ضرر و حد سود مشخص می‌سازد.
 
-    عمداً *پایین‌ترین* لوریج معتبر برگردانده می‌شود، نه بالاترین: هر لوریج
-    اضافه فقط ریسک را زیاد می‌کند، و به محض اینکه شرط حداقل سود خالص برآورده
-    شد، بالا رفتن بیشتر توجیهی ندارد.
+    شرط کلیدی: سود مورد انتظار باید بعد از کسر کارمزد و اسلیپیج، حداقل
+    ``MIN_PROFIT_TO_COST_RATIO`` برابر خودِ هزینه باشد. اگر نباشد، ورود رد
+    می‌شود — چون معامله‌ای که سودش را کارمزد می‌خورد، ارزش ریسک ندارد.
     """
-    last_failed: CyclePlan | None = None
-    for lev in range(config.STAGED_LEVERAGE_MIN, config.STAGED_LEVERAGE_MAX + 1):
-        candidate = plan_cycle(
-            symbol=symbol,
-            side=side,
-            entry_price=entry_price,
-            atr_value=atr_value,
-            capital_usdt=capital_usdt,
-            leverage=lev,
-            max_steps=max_steps,
-            min_qty=min_qty,
-            min_notional=min_notional,
+    lev = int(leverage or config.DEFAULT_LEVERAGE)
+    lev = int(clamp(lev, config.LEVERAGE_MIN, config.LEVERAGE_MAX))
+    margin = max(0.0, safe_float(slot_margin_usdt))
+
+    blank = EntryPlan(
+        ok=False, symbol=symbol, side=side, entry_price=entry_price, leverage=lev,
+        margin_usdt=margin, notional_usdt=0.0, quantity=0.0, stop_price=0.0,
+        take_profit_price=0.0, liquidation_price=0.0, risk_usdt=0.0,
+        expected_profit_usdt=0.0, cost_usdt=0.0,
+    )
+    if entry_price <= 0 or margin <= 0:
+        blank.reason = "قیمت یا مارجین نامعتبر"
+        return blank
+
+    distance = stop_distance(entry_price, atr_value)
+    if distance <= 0:
+        blank.reason = "فاصلهٔ حد ضرر قابل محاسبه نیست"
+        return blank
+
+    notional = margin * lev
+    quantity = notional / entry_price
+    if min_qty > 0 and quantity < min_qty:
+        blank.reason = (
+            f"حجم {quantity:.6f} کمتر از حداقل صرافی ({min_qty:.6f}) است — "
+            "سرمایه یا تعداد اسلات را تنظیم کنید"
         )
-        if candidate.ok:
-            return candidate  # اولین (یعنی کم‌ریسک‌ترین) گزینهٔ معتبر
-        last_failed = candidate
-    return last_failed or plan_cycle(
-        symbol=symbol,
-        side=side,
-        entry_price=entry_price,
-        atr_value=atr_value,
-        capital_usdt=capital_usdt,
-        max_steps=max_steps,
+        return blank
+    if min_notional > 0 and notional < min_notional:
+        blank.reason = (
+            f"ارزش پوزیشن {notional:.2f}$ کمتر از حداقل صرافی ({min_notional:.2f}$) است"
+        )
+        return blank
+
+    reward = distance * config.RISK_REWARD_RATIO
+    if side == "LONG":
+        stop_price = entry_price - distance
+        tp_price = entry_price + reward
+    else:
+        stop_price = entry_price + distance
+        tp_price = entry_price - reward
+    if stop_price <= 0 or tp_price <= 0:
+        blank.reason = "سطوح خروج نامعتبر"
+        return blank
+
+    cost = notional * round_trip_cost_rate()
+    gross_profit = reward * quantity
+    gross_loss = distance * quantity
+    net_profit = gross_profit - cost
+    net_loss = gross_loss + cost
+
+    # --- شرط «بعد از کارمزد صرف کند» ---
+    if net_profit < config.MIN_NET_PROFIT_USDT:
+        blank.reason = (
+            f"سود خالص مورد انتظار ({net_profit:.3f}$) از حداقل "
+            f"({config.MIN_NET_PROFIT_USDT:.2f}$) کمتر است"
+        )
+        return blank
+    if cost > 0 and (gross_profit / cost) < config.MIN_PROFIT_TO_COST_RATIO:
+        blank.reason = (
+            f"سود ناخالص فقط {gross_profit / cost:.1f} برابر کارمزد است "
+            f"(حداقل {config.MIN_PROFIT_TO_COST_RATIO:.1f} لازم است)"
+        )
+        return blank
+
+    liq = liquidation_price(
+        side=side, avg_entry=entry_price, total_margin=margin, total_quantity=quantity
+    )
+    liq_gap = abs(entry_price - liq)
+    if liq_gap > 0 and liq_gap < distance * config.LIQUIDATION_TO_STOP_BUFFER:
+        blank.reason = (
+            f"لیکوئید ({liq_gap / entry_price * 100:.1f}%) به حد ضرر "
+            f"({distance / entry_price * 100:.1f}%) خیلی نزدیک است — لوریج را کم کنید"
+        )
+        return blank
+
+    return EntryPlan(
+        ok=True, symbol=symbol, side=side, entry_price=entry_price, leverage=lev,
+        margin_usdt=margin, notional_usdt=notional, quantity=quantity,
+        stop_price=stop_price, take_profit_price=tp_price, liquidation_price=liq,
+        risk_usdt=net_loss, expected_profit_usdt=net_profit, cost_usdt=cost,
+        reason=(
+            f"ریسک {net_loss:.2f}$ در برابر سود {net_profit:.2f}$ "
+            f"(۱:{config.RISK_REWARD_RATIO:.1f}) با لوریج {lev}x"
+        ),
     )
 
 
-def recompute_after_fill(
+def best_leverage_for_entry(
+    *,
+    symbol: str,
+    side: Side,
+    entry_price: float,
+    atr_value: float,
+    slot_margin_usdt: float,
+    min_qty: float = 0.0,
+    min_notional: float = 0.0,
+) -> EntryPlan:
+    """کم‌ریسک‌ترین لوریجی که هنوز شرط سوددهی بعد از کارمزد را برآورده کند.
+
+    از پایین شروع می‌کند: اگر لوریج ۱ کافی بود، همان انتخاب می‌شود. لوریج بالاتر
+    فقط وقتی استفاده می‌شود که بدون آن حجم پوزیشن آن‌قدر کوچک شود که کارمزد
+    سود را بخورد.
+    """
+    last: EntryPlan | None = None
+    for lev in range(config.LEVERAGE_MIN, config.LEVERAGE_MAX + 1):
+        plan = plan_entry(
+            symbol=symbol, side=side, entry_price=entry_price, atr_value=atr_value,
+            slot_margin_usdt=slot_margin_usdt, leverage=lev,
+            min_qty=min_qty, min_notional=min_notional,
+        )
+        if plan.ok:
+            return plan
+        last = plan
+    return last or plan_entry(
+        symbol=symbol, side=side, entry_price=entry_price, atr_value=atr_value,
+        slot_margin_usdt=slot_margin_usdt,
+    )
+
+
+def slot_margin(
+    *, capital_usdt: float, max_positions: int, open_margin_usdt: float = 0.0
+) -> float:
+    """مارجین هر اسلات — سرمایه بین تعداد پوزیشن هم‌زمان پخش می‌شود.
+
+    سقف درگیری کل هم رعایت می‌شود: مجموع مارجین پوزیشن‌های باز به‌علاوهٔ این
+    اسلات جدید هرگز از ``MAX_CAPITAL_ENGAGED_RATE`` × سرمایه بیشتر نمی‌شود.
+    """
+    capital = max(0.0, safe_float(capital_usdt))
+    slots = max(1, int(max_positions))
+    budget = capital * config.MAX_CAPITAL_ENGAGED_RATE
+    remaining = max(0.0, budget - max(0.0, safe_float(open_margin_usdt)))
+    per_slot = budget / slots
+    return min(per_slot, remaining)
+
+
+def position_snapshot(
     *,
     side: Side,
-    filled_steps: list[dict[str, Any]],
+    fills: list[dict[str, Any]],
     leverage: int,
 ) -> dict[str, float]:
-    """وضعیت واقعی پوزیشن را بعد از پرشدن پله‌ها دوباره حساب می‌کند.
+    """وضعیت واقعی پوزیشن را بعد از پرشدن سفارش حساب می‌کند.
 
-    ورودی هر پله باید ``price`` و ``quantity`` و ``margin`` داشته باشد.
+    هر ورودی باید ``price`` و ``quantity`` و ``margin`` داشته باشد.
     """
-    total_qty = sum(safe_float(s.get("quantity")) for s in filled_steps)
-    total_margin = sum(safe_float(s.get("margin")) for s in filled_steps)
+    total_qty = sum(safe_float(s.get("quantity")) for s in fills)
+    total_margin = sum(safe_float(s.get("margin")) for s in fills)
     total_notional = sum(
-        safe_float(s.get("quantity")) * safe_float(s.get("price")) for s in filled_steps
+        safe_float(s.get("quantity")) * safe_float(s.get("price")) for s in fills
     )
     avg_entry = total_notional / total_qty if total_qty > 0 else 0.0
     liq = liquidation_price(

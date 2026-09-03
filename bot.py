@@ -1,9 +1,13 @@
-"""موتور ربات — اتصال استراتژی، هستهٔ ریاضی، صرافی و دیتابیس.
+"""موتور ربات — اسکن چندارزی، امتیازدهی، و مدیریت پوزیشن‌های هم‌زمان.
 
-جریان کار:
-  1. اگر چرخهٔ بازی نیست  → تحلیل کن، اگر سیگنال معتبر بود چرخه بساز و پلهٔ اول را بزن.
-  2. اگر چرخهٔ باز هست   → قیمت را بپا؛ پلهٔ بعدی را در ماشه‌اش بزن،
-                            حد سود/ضرر را چک کن، و در آخرین پله هشدار بده.
+جریان کار در هر چرخه:
+  ۱. پوزیشن‌های باز را بپا (حد سود، حد ضرر، برگشت مومنتوم، عمر پوزیشن).
+  ۲. اگر اسلات خالی داری، همهٔ ارزهای فهرست را امتیاز بده.
+  ۳. نامزدها را بر اساس امتیاز مرتب کن و از بالا به پایین اسلات‌ها را پر کن.
+
+نکتهٔ مهم: امتیاز بالا یعنی «ساختار فعلی بازار در این جهت است»، نه «قیمت
+حتماً بالا می‌رود». برد و باخت هر دو رخ می‌دهد؛ چیزی که سیستم را سرپا نگه
+می‌دارد نسبت ریسک به سود است، نه دقت پیش‌بینی.
 """
 from __future__ import annotations
 
@@ -16,41 +20,28 @@ import strategy
 from storage import Storage
 from telegram_bot import position_panel, result_panel
 from toobit_client import ToobitClient, ToobitError
-from utils import json_loads, logger, now_ms, safe_float, safe_int, toobit_contract_symbol
+from utils import canonical_base, logger, now_ms, safe_float, safe_int
 
 
 class BotEngine:
     def __init__(self, storage: Storage, toobit: ToobitClient):
         self.storage = storage
         self.toobit = toobit
-        self.symbol = config.TARGET_SYMBOL
-        self._contract_info: dict[str, Any] = {}
-        self._contract_ts = 0.0
+        self._contracts: dict[str, dict[str, Any]] = {}
+        self._contracts_ts = 0.0
+        self._universe: list[str] = []
+        self._universe_ts = 0.0
+        self._last_scan = 0.0
 
     # ------------------------------------------------------------------
     #  راه‌اندازی
     # ------------------------------------------------------------------
     def startup(self) -> None:
         self.storage.set_setting("startup_phase", "اتصال به صرافی")
-        contracts = self.toobit.get_contracts()
-        key = None
-        for candidate in (self.symbol, toobit_contract_symbol(self.symbol)):
-            if candidate in contracts:
-                key = candidate
-                break
-        if key is None:
-            # جست‌وجوی انعطاف‌پذیر بر پایهٔ نام پایه
-            from utils import canonical_base
-            base = canonical_base(self.symbol)
-            for name in contracts:
-                if canonical_base(name) == base:
-                    key = name
-                    break
-        if key is None:
-            raise ToobitError(f"نماد {self.symbol} در فهرست قراردادهای صرافی پیدا نشد")
-        self._contract_info = contracts[key]
-        self._contract_ts = time.monotonic()
-        self.symbol = key
+        self._refresh_contracts(force=True)
+        universe = self.refresh_universe(force=True)
+        if not universe:
+            raise ToobitError("هیچ ارز قابل معامله‌ای پیدا نشد")
 
         if self.toobit.has_credentials:
             self.refresh_balance(force=True)
@@ -59,25 +50,78 @@ class BotEngine:
             self.storage.set_setting("startup_phase", "بدون کلید API — فقط حالت مجازی")
 
         self.storage.set_setting("startup_ready", True)
-        self.storage.set_health("startup", "ok", f"نماد {self.symbol} آماده است")
-        logger.info("STARTUP_OK | symbol=%s", self.symbol)
+        self.storage.set_health("startup", "ok", f"{len(universe)} ارز آمادهٔ اسکن")
+        logger.info("STARTUP_OK | symbols=%s", len(universe))
 
-    def contract_info(self) -> dict[str, Any]:
-        if not self._contract_info or (time.monotonic() - self._contract_ts) > config.CONTRACT_REFRESH_SECONDS:
+    def _refresh_contracts(self, force: bool = False) -> dict[str, dict[str, Any]]:
+        stale = (time.monotonic() - self._contracts_ts) > config.CONTRACT_REFRESH_SECONDS
+        if force or not self._contracts or stale:
             try:
-                contracts = self.toobit.get_contracts()
-                if self.symbol in contracts:
-                    self._contract_info = contracts[self.symbol]
-                    self._contract_ts = time.monotonic()
+                self._contracts = self.toobit.get_contracts()
+                self._contracts_ts = time.monotonic()
             except Exception as exc:
                 logger.warning("CONTRACT_REFRESH_FAIL | %s", exc)
-        return self._contract_info
+        return self._contracts
+
+    # ------------------------------------------------------------------
+    #  فهرست ارزها
+    # ------------------------------------------------------------------
+    def refresh_universe(self, force: bool = False) -> list[str]:
+        """فهرست ارزهای قابل اسکن؛ یا دستی از تنظیمات، یا پرحجم‌ترین‌های صرافی.
+
+        نقدینگی مهم است: ارز کم‌حجم اسپرد بزرگ دارد و همان اسپرد، سود یک
+        معاملهٔ کوچک را می‌بلعد.
+        """
+        stale = (time.monotonic() - self._universe_ts) > config.SYMBOL_REFRESH_SECONDS
+        if self._universe and not force and not stale:
+            return self._universe
+
+        contracts = self._refresh_contracts()
+        available = list(contracts.keys())
+        blacklist = {b.upper() for b in config.SYMBOL_BLACKLIST}
+
+        chosen: list[str] = []
+        if config.SYMBOL_LIST:
+            wanted = {canonical_base(x) for x in config.SYMBOL_LIST}
+            chosen = [s for s in available if canonical_base(s) in wanted]
+        else:
+            volumes: dict[str, float] = {}
+            try:
+                for row in self.toobit.get_24h_tickers():
+                    sym = str(row.get("s") or row.get("symbol") or "")
+                    if not sym:
+                        continue
+                    vol = safe_float(
+                        row.get("qv") or row.get("quoteVolume") or row.get("v") or 0
+                    )
+                    volumes[sym] = vol
+            except Exception as exc:
+                logger.warning("TICKER_24H_FAIL | %s", exc)
+
+            ranked = sorted(
+                (s for s in available if canonical_base(s) not in blacklist),
+                key=lambda s: volumes.get(s, 0.0),
+                reverse=True,
+            )
+            if volumes:
+                ranked = [
+                    s for s in ranked
+                    if volumes.get(s, 0.0) >= config.MIN_24H_QUOTE_VOLUME
+                ] or ranked
+            chosen = ranked[: config.SCAN_SYMBOL_COUNT]
+
+        chosen = [s for s in chosen if canonical_base(s) not in blacklist]
+        if chosen:
+            self._universe = chosen
+            self._universe_ts = time.monotonic()
+            self.storage.set_setting("universe", chosen)
+            self.storage.set_health("universe", "ok", f"{len(chosen)} ارز در فهرست اسکن")
+        return self._universe
 
     # ------------------------------------------------------------------
     #  موجودی
     # ------------------------------------------------------------------
     def refresh_balance(self, force: bool = False) -> float:
-        """موجودی زنده را از صرافی می‌گیرد و کش می‌کند."""
         if not force and self.storage.balance_is_fresh():
             balance, _ = self.storage.cached_balance()
             return balance
@@ -96,13 +140,11 @@ class BotEngine:
             return balance
 
     def effective_capital(self, *, real_mode: bool) -> float:
-        """سرمایهٔ مبنا — همیشه زنده، هرگز عدد ثابت.
-
-        موجودی واقعی حتی در حالت مجازی هم خوانده و نمایش داده می‌شود؛
-        فقط مبنای محاسبهٔ پله‌ها در حالت مجازی، موجودی مجازی است.
-        """
+        """سرمایهٔ مبنا — همیشه زنده از صرافی، هرگز عدد ثابت."""
         live = self.refresh_balance()
-        virtual = safe_float(self.storage.get_setting("virtual_balance", config.VIRTUAL_START_CAPITAL_USDT))
+        virtual = safe_float(
+            self.storage.get_setting("virtual_balance", config.VIRTUAL_START_CAPITAL_USDT)
+        )
         capital = risk_engine.available_capital(
             live_balance=live, virtual=not real_mode, virtual_balance=virtual
         )
@@ -112,289 +154,315 @@ class BotEngine:
         return capital
 
     # ------------------------------------------------------------------
-    #  دادهٔ بازار
+    #  تنظیمات کاربر
     # ------------------------------------------------------------------
-    def market_snapshot(self) -> dict[str, Any]:
-        price = self.toobit.get_mark_price(self.symbol)
-        book: dict[str, float] = {}
-        try:
-            tickers = self.toobit.get_all_book_tickers()
-            book = tickers.get(self.symbol) or {}
-        except Exception as exc:
-            logger.debug("BOOK_TICKER_SKIP | %s", exc)
-        trend_candles = {}
-        for tf in config.TREND_TIMEFRAMES:
-            trend_candles[tf] = self.toobit.get_klines(self.symbol, interval=tf, limit=120)
-        entry_candles = self.toobit.get_klines(
-            self.symbol, interval=config.ENTRY_TIMEFRAME, limit=120
+    def max_positions(self) -> int:
+        value = safe_int(
+            self.storage.get_setting("max_positions", config.MAX_CONCURRENT_POSITIONS)
         )
-        return {
-            "price": safe_float(price),
-            "best_bid": safe_float(book.get("bid") or book.get("bidPrice")),
-            "best_ask": safe_float(book.get("ask") or book.get("askPrice")),
-            "trend_candles": trend_candles,
-            "entry_candles": entry_candles,
-        }
+        return max(1, min(value, config.MAX_CONCURRENT_LIMIT))
+
+    def score_threshold(self) -> float:
+        value = safe_float(self.storage.get_setting("score_threshold", config.SCORE_THRESHOLD))
+        return max(config.SCORE_THRESHOLD_MIN, min(value, config.SCORE_THRESHOLD_MAX))
+
+    def leverage(self) -> int:
+        value = safe_int(self.storage.get_setting("leverage", config.DEFAULT_LEVERAGE))
+        return max(config.LEVERAGE_MIN, min(value, config.LEVERAGE_MAX))
+
+    def mode(self) -> str:
+        return "real" if bool(self.storage.get_setting("real_trading_enabled", False)) else "virtual"
 
     # ------------------------------------------------------------------
     #  حلقهٔ اصلی
     # ------------------------------------------------------------------
     def tick(self) -> None:
-        """یک تکرار کامل: یا چرخهٔ باز را مدیریت کن، یا دنبال ورود جدید بگرد."""
-        cycle = self.storage.open_cycle()
-        if cycle:
-            self.manage_open_cycle(cycle)
-        else:
-            self.look_for_entry()
+        """هر تیک: اول پوزیشن‌های باز، بعد (در فواصل بلندتر) اسکن ارزها."""
+        self.manage_open_positions()
+        if (time.monotonic() - self._last_scan) >= config.SCAN_INTERVAL_SECONDS:
+            self._last_scan = time.monotonic()
+            self.scan_for_entries()
 
-    # --- ورود جدید ----------------------------------------------------
-    def look_for_entry(self) -> None:
-        snapshot = self.market_snapshot()
-        signal = strategy.build_signal(
-            trend_candles=snapshot["trend_candles"],
-            entry_candles=snapshot["entry_candles"],
-            price=snapshot["price"],
-            best_bid=snapshot["best_bid"],
-            best_ask=snapshot["best_ask"],
-            score_threshold=safe_float(
-                self.storage.get_setting("score_threshold", config.COMBINED_SCORE_THRESHOLD)
-            ),
-        )
-        if not signal.ok:
-            self.storage.set_health("strategy", "ok", f"صبر: {signal.reason}")
+    # --- مدیریت پوزیشن‌های باز -------------------------------------------
+    def manage_open_positions(self) -> None:
+        cycles = self.storage.open_cycles()
+        if not cycles:
+            return
+        try:
+            prices = self.toobit.get_all_prices()
+        except Exception as exc:
+            logger.warning("PRICE_FETCH_FAIL | %s", exc)
             return
 
-        real_mode = bool(self.storage.get_setting("real_trading_enabled", False))
-        capital = self.effective_capital(real_mode=real_mode)
-        max_steps = safe_int(self.storage.get_setting("max_steps", config.MAX_ENTRY_STEPS))
+        for cycle in cycles:
+            symbol = str(cycle.get("symbol"))
+            price = safe_float(prices.get(symbol))
+            if price <= 0:
+                try:
+                    price = safe_float(self.toobit.get_mark_price(symbol))
+                except Exception:
+                    continue
+            if price <= 0:
+                continue
 
-        info = self.contract_info()
+            opened_at = safe_int(cycle.get("opened_at"))
+            age_minutes = max(0.0, (now_ms() - opened_at) / 60000.0) if opened_at else 0.0
+
+            reason, gross = strategy.exit_decision(
+                side=str(cycle.get("side")),
+                entry_price=safe_float(cycle.get("avg_entry_price")),
+                quantity=safe_float(cycle.get("total_quantity")),
+                current_price=price,
+                take_profit=safe_float(cycle.get("take_profit_price")),
+                hard_stop=safe_float(cycle.get("hard_stop_price")),
+                age_minutes=age_minutes,
+            )
+            if reason:
+                self.close_position(cycle, exit_price=price, exit_reason=reason, gross_pnl=gross)
+
+    # --- اسکن و ورود ------------------------------------------------------
+    def scan_for_entries(self) -> None:
+        mode = self.mode()
+        max_positions = self.max_positions()
+        open_count = self.storage.open_position_count()
+        free_slots = max_positions - open_count
+        if free_slots <= 0:
+            self.storage.set_health(
+                "scan", "ok", f"همهٔ {max_positions} اسلات پر است — منتظر بسته شدن"
+            )
+            return
+
+        universe = self.refresh_universe()
+        if not universe:
+            self.storage.set_health("scan", "warning", "فهرست ارزها خالی است")
+            return
+
+        capital = self.effective_capital(real_mode=(mode == "real"))
+        if capital < config.MIN_CAPITAL_TO_TRADE_USDT:
+            self.storage.set_health(
+                "scan", "warning",
+                f"سرمایه ({capital:.2f}$) کمتر از حداقل "
+                f"({config.MIN_CAPITAL_TO_TRADE_USDT:.2f}$) است",
+            )
+            return
+
+        busy = self.storage.open_symbols()
+        threshold = self.score_threshold()
+        candidates: list[strategy.SymbolScore] = []
+        best_rejected: strategy.SymbolScore | None = None
+        scanned = 0
+
+        for symbol in universe:
+            if config.ONE_POSITION_PER_SYMBOL and symbol in busy:
+                continue
+            try:
+                entry_candles = self.toobit.get_klines(
+                    symbol, interval=config.ENTRY_TIMEFRAME, limit=config.ENTRY_CANDLE_LIMIT
+                )
+                trend_candles = self.toobit.get_klines(
+                    symbol, interval=config.TREND_TIMEFRAME, limit=config.TREND_CANDLE_LIMIT
+                )
+            except Exception as exc:
+                logger.debug("KLINE_SKIP | %s | %s", symbol, exc)
+                continue
+
+            scanned += 1
+            result = strategy.score_symbol(
+                symbol=symbol,
+                entry_candles=entry_candles,
+                trend_candles=trend_candles,
+                threshold=threshold,
+            )
+            if result.ok:
+                candidates.append(result)
+            elif best_rejected is None or result.score > best_rejected.score:
+                best_rejected = result
+
+        if not candidates:
+            detail = (
+                f"{scanned} ارز اسکن شد — هیچ‌کدام به آستانهٔ {threshold:.0f} نرسید"
+            )
+            if best_rejected and best_rejected.symbol:
+                detail += (
+                    f" | بهترین: {canonical_base(best_rejected.symbol)} "
+                    f"{best_rejected.score:.0f}"
+                )
+            self.storage.set_health("scan", "ok", detail)
+            return
+
+        # بالاترین امتیاز اول — اسلات کمیاب است، پس به بهترین سیگنال می‌رسد.
+        candidates.sort(key=lambda c: c.score, reverse=True)
+        self.storage.set_health(
+            "scan", "ok",
+            f"{len(candidates)} نامزد از {scanned} ارز | {free_slots} اسلات خالی",
+        )
+
+        for candidate in candidates[:free_slots]:
+            self.open_position(candidate, mode=mode, capital=capital)
+
+    # --- باز کردن پوزیشن --------------------------------------------------
+    def open_position(self, candidate: strategy.SymbolScore, *, mode: str, capital: float) -> None:
+        symbol = candidate.symbol
+        contracts = self._refresh_contracts()
+        info = contracts.get(symbol, {})
         try:
             _, _, min_qty, min_notional = self.toobit.get_symbol_rules(info)
         except Exception:
             min_qty, min_notional = 0.0, 0.0
 
-        plan = strategy.plan_for_signal(
-            signal=signal,
+        try:
+            price = safe_float(self.toobit.get_mark_price(symbol)) or candidate.price
+        except Exception:
+            price = candidate.price
+        if price <= 0:
+            return
+
+        margin = risk_engine.slot_margin(
             capital_usdt=capital,
-            max_steps=max_steps,
+            max_positions=self.max_positions(),
+            open_margin_usdt=self.storage.open_margin_total(),
+        )
+        if margin <= 0:
+            self.storage.set_health("risk", "ok", "سقف درگیری سرمایه پر است")
+            return
+
+        plan = risk_engine.best_leverage_for_entry(
+            symbol=symbol,
+            side=candidate.side or "LONG",
+            entry_price=price,
+            atr_value=candidate.atr_value,
+            slot_margin_usdt=margin,
             min_qty=min_qty,
             min_notional=min_notional,
         )
         if not plan.ok:
-            self.storage.set_health("risk", "ok", f"ورود رد شد: {plan.reason}")
-            logger.info("ENTRY_REJECTED | %s", plan.reason)
+            self.storage.set_health("risk", "ok", f"{canonical_base(symbol)}: {plan.reason}")
+            logger.info("ENTRY_REJECTED | %s | %s", symbol, plan.reason)
             return
 
-        mode = "real" if real_mode else "virtual"
         cycle_id = self.storage.create_cycle(
-            symbol=self.symbol,
+            symbol=symbol,
             side=plan.side,
             mode=mode,
             leverage=plan.leverage,
-            planned_steps=plan.step_count,
             capital_at_open=capital,
             plan=plan.to_dict(),
             take_profit_price=plan.take_profit_price,
-            hard_stop_price=plan.hard_stop_price,
-        )
-        self.storage.log_event("cycle_opened", {"id": cycle_id, "reason": signal.reason})
-        logger.info(
-            "CYCLE_OPEN | id=%s side=%s lev=%s steps=%s capital=%.2f",
-            cycle_id, plan.side, plan.leverage, plan.step_count, capital,
+            hard_stop_price=plan.stop_price,
+            entry_score=candidate.score,
+            entry_reason=candidate.reason,
         )
 
-        # پلهٔ اول بلافاصله اجرا می‌شود.
-        first_step = self.storage.cycle_steps(cycle_id)[0]
-        self.execute_step(cycle_id, first_step, snapshot["price"])
-
-        cycle = self.storage.get_cycle(cycle_id) or {}
-        text = position_panel(cycle, plan.to_dict())
-        text += f"\n\n🧭 دلیل ورود: {signal.reason}"
-        self.storage.queue_message(text, cycle_id=cycle_id)
-
-    # --- مدیریت چرخهٔ باز ----------------------------------------------
-    def manage_open_cycle(self, cycle: dict[str, Any]) -> None:
-        cycle_id = safe_int(cycle.get("id"))
-        side = str(cycle.get("side"))
-        price = safe_float(self.toobit.get_mark_price(self.symbol))
-        if price <= 0:
-            return
-
-        steps = self.storage.cycle_steps(cycle_id)
-        filled = [s for s in steps if s.get("status") == "filled"]
-        planned = [s for s in steps if s.get("status") == "planned"]
-
-        # --- آیا پلهٔ بعدی باید اجرا شود؟ ---
-        due = strategy.next_step_due(side=side, steps=steps, current_price=price)
-        if due is not None:
-            self.execute_step(cycle_id, due, price)
-            cycle = self.storage.get_cycle(cycle_id) or cycle
-            steps = self.storage.cycle_steps(cycle_id)
-            filled = [s for s in steps if s.get("status") == "filled"]
-            planned = [s for s in steps if s.get("status") == "planned"]
-
-            self.storage.queue_message(
-                f"📉 پلهٔ {safe_int(due.get('step_index'))} در {price:.6f} اجرا شد.\n"
-                f"میانگین ورود: {safe_float(cycle.get('avg_entry_price')):.6f}\n"
-                f"پله‌های مصرف‌شده: {len(filled)}/{len(steps)}",
-                reply_to=cycle.get("tg_message_id"),
-                cycle_id=cycle_id,
-            )
-
-            # هشدار آخرین پله
-            if config.WARN_ON_FINAL_STEP and not planned and not cycle.get("final_step_warned"):
-                self.storage.mark_final_step_warned(cycle_id)
-                self.storage.queue_message(
-                    "⚠️ هشدار: آخرین پله مصرف شد.\n"
-                    "پلهٔ جدیدی باز نمی‌شود؛ از این پس فقط حد سود یا حد ضرر سخت عمل می‌کند.\n"
-                    f"حد ضرر: {safe_float(cycle.get('hard_stop_price')):.6f}",
-                    reply_to=cycle.get("tg_message_id"),
-                    cycle_id=cycle_id,
-                )
-
-        # --- آیا وقت خروج است؟ ---
-        avg_entry = safe_float(cycle.get("avg_entry_price"))
-        quantity = safe_float(cycle.get("total_quantity"))
-        reason, gross = strategy.exit_decision(
-            side=side,
-            avg_entry=avg_entry,
-            quantity=quantity,
-            current_price=price,
-            take_profit=safe_float(cycle.get("take_profit_price")),
-            hard_stop=safe_float(cycle.get("hard_stop_price")),
-            all_steps_filled=not planned,
-        )
-        if reason:
-            self.close_cycle(cycle, exit_price=price, exit_reason=reason, gross_pnl=gross)
-
-    # --- اجرای یک پله --------------------------------------------------
-    def execute_step(self, cycle_id: int, step: dict[str, Any], price: float) -> None:
-        cycle = self.storage.get_cycle(cycle_id)
-        if not cycle:
-            return
-        side = str(cycle.get("side"))
-        margin = safe_float(step.get("margin"))
-        leverage = safe_int(cycle.get("leverage"))
-        step_index = safe_int(step.get("step_index"))
-        quantity = (margin * leverage) / price if price > 0 else 0.0
         order_id = None
-
-        if str(cycle.get("mode")) == "real":
+        quantity = plan.quantity
+        actual_margin = plan.margin_usdt
+        if mode == "real":
             try:
                 result = self.toobit.place_market_order(
-                    symbol=self.symbol,
-                    side=side,
+                    symbol=symbol,
+                    side=plan.side,
                     entry_price=price,
-                    margin_usdt=margin,
-                    leverage=leverage,
-                    tp_price=safe_float(cycle.get("take_profit_price")),
-                    sl_price=safe_float(cycle.get("hard_stop_price")),
-                    client_order_id=f"staged-{cycle_id}-{step_index}-{now_ms()}",
-                    symbol_info=self.contract_info(),
+                    margin_usdt=plan.margin_usdt,
+                    leverage=plan.leverage,
+                    tp_price=plan.take_profit_price,
+                    sl_price=plan.stop_price,
+                    client_order_id=f"scan-{cycle_id}-{now_ms()}",
+                    symbol_info=info,
                 )
                 quantity = safe_float(result.get("quantity")) or quantity
-                margin = safe_float(result.get("actual_margin_usdt")) or margin
+                actual_margin = safe_float(result.get("actual_margin_usdt")) or actual_margin
                 order_id = result.get("order_id")
             except Exception as exc:
-                logger.exception("ORDER_FAIL | step=%s", step_index)
+                logger.exception("ORDER_FAIL | %s", symbol)
                 self.storage.set_health("order", "warning", str(exc))
+                self.storage.close_cycle(
+                    cycle_id, exit_price=price, exit_reason="failed",
+                    gross_pnl=0.0, net_pnl=0.0, fees=0.0,
+                )
                 self.storage.queue_message(
-                    f"❌ اجرای پلهٔ {step_index} ناموفق بود:\n{exc}",
-                    reply_to=cycle.get("tg_message_id"),
-                    cycle_id=cycle_id,
+                    f"❌ ارسال سفارش {canonical_base(symbol)} ناموفق بود:\n{exc}"
                 )
                 return
 
         self.storage.mark_step_filled(
-            cycle_id=cycle_id,
-            step_index=step_index,
-            fill_price=price,
-            quantity=quantity,
-            margin=margin,
-            order_id=order_id,
+            cycle_id=cycle_id, step_index=1, fill_price=price,
+            quantity=quantity, margin=actual_margin, order_id=order_id,
         )
-        filled = self.storage.filled_steps(cycle_id)
-        snapshot = risk_engine.recompute_after_fill(
-            side=side,
-            filled_steps=[
-                {
-                    "price": safe_float(s.get("fill_price")),
-                    "quantity": safe_float(s.get("quantity")),
-                    "margin": safe_float(s.get("margin")),
-                }
-                for s in filled
-            ],
-            leverage=leverage,
+        snapshot = risk_engine.position_snapshot(
+            side=plan.side,
+            fills=[{"price": price, "quantity": quantity, "margin": actual_margin}],
+            leverage=plan.leverage,
         )
         self.storage.update_cycle_position(cycle_id, snapshot)
+
+        cycle = self.storage.get_cycle(cycle_id) or {}
+        self.storage.queue_message(position_panel(cycle, plan.to_dict()), cycle_id=cycle_id)
+        self.storage.log_event("position_opened", {
+            "id": cycle_id, "symbol": symbol, "score": candidate.score,
+        })
         logger.info(
-            "STEP_FILLED | cycle=%s step=%s price=%.6f avg=%.6f liq=%.6f",
-            cycle_id, step_index, price,
-            snapshot["avg_entry"], snapshot["liquidation_price"],
+            "POSITION_OPEN | %s %s score=%.0f lev=%sx margin=%.2f",
+            symbol, plan.side, candidate.score, plan.leverage, actual_margin,
         )
 
-    # --- بستن چرخه -----------------------------------------------------
-    def close_cycle(self, cycle: dict[str, Any], *, exit_price: float,
-                    exit_reason: str, gross_pnl: float) -> None:
+    # --- بستن پوزیشن ------------------------------------------------------
+    def close_position(self, cycle: dict[str, Any], *, exit_price: float,
+                       exit_reason: str, gross_pnl: float) -> None:
         cycle_id = safe_int(cycle.get("id"))
+        symbol = str(cycle.get("symbol"))
         notional = safe_float(cycle.get("total_notional"))
         fees = notional * risk_engine.round_trip_cost_rate()
         net = gross_pnl - fees
 
         if str(cycle.get("mode")) == "real":
             try:
-                self.toobit.flash_close(self.symbol, str(cycle.get("side")))
+                self.toobit.flash_close(symbol, str(cycle.get("side")))
             except Exception as exc:
-                logger.warning("CLOSE_FAIL | %s", exc)
+                logger.warning("CLOSE_FAIL | %s | %s", symbol, exc)
                 self.storage.set_health("close", "warning", str(exc))
         else:
             self.storage.adjust_virtual_balance(net)
 
         self.storage.close_cycle(
-            cycle_id,
-            exit_price=exit_price,
-            exit_reason=exit_reason,
-            gross_pnl=gross_pnl,
-            net_pnl=net,
-            fees=fees,
+            cycle_id, exit_price=exit_price, exit_reason=exit_reason,
+            gross_pnl=gross_pnl, net_pnl=net, fees=fees,
         )
         closed = self.storage.get_cycle(cycle_id) or {}
         self.storage.queue_message(
-            result_panel(closed),
-            reply_to=cycle.get("tg_message_id"),
-            cycle_id=cycle_id,
+            result_panel(closed), reply_to=cycle.get("tg_message_id"), cycle_id=cycle_id
         )
-        self.storage.log_event("cycle_closed", {"id": cycle_id, "reason": exit_reason, "net": net})
-        logger.info("CYCLE_CLOSED | id=%s reason=%s net=%.2f", cycle_id, exit_reason, net)
+        self.storage.log_event("position_closed", {
+            "id": cycle_id, "symbol": symbol, "reason": exit_reason, "net": net,
+        })
+        logger.info("POSITION_CLOSED | %s reason=%s net=%.2f", symbol, exit_reason, net)
 
-    # --- همگام‌سازی با صرافی -------------------------------------------
+    # --- همگام‌سازی با صرافی ----------------------------------------------
     def monitor_real(self) -> None:
-        """چک می‌کند پوزیشن واقعی روی صرافی هنوز باز است یا نه.
+        """اگر صرافی خودش پوزیشن را بسته باشد، دیتابیس هم به‌روز می‌شود.
 
-        اگر صرافی خودش پوزیشن را بسته باشد (حد سود/ضرر روی خود صرافی)، چرخه
-        در دیتابیس هم بسته می‌شود تا آمار از واقعیت جدا نیفتد.
+        بدون این، آمار ربات از واقعیت حساب جدا می‌افتد.
         """
         if not self.toobit.has_credentials:
             return
-        cycle = self.storage.open_cycle(mode="real")
-        if not cycle:
-            return
-        try:
-            still_open = self.toobit.has_open_position(self.symbol)
-        except Exception as exc:
-            self.storage.set_health("monitor", "warning", str(exc))
-            return
-        if still_open:
-            self.storage.set_health("monitor", "ok", "پوزیشن واقعی باز است")
-            return
-
-        price = safe_float(self.toobit.get_mark_price(self.symbol))
-        gross = risk_engine.unrealized_pnl(
-            side=str(cycle.get("side")),
-            avg_entry=safe_float(cycle.get("avg_entry_price")),
-            quantity=safe_float(cycle.get("total_quantity")),
-            current_price=price,
-        )
-        self.close_cycle(cycle, exit_price=price, exit_reason="tp" if gross > 0 else "stop",
-                         gross_pnl=gross)
+        for cycle in self.storage.open_cycles_for_mode("real"):
+            symbol = str(cycle.get("symbol"))
+            try:
+                if self.toobit.has_open_position(symbol):
+                    continue
+                price = safe_float(self.toobit.get_mark_price(symbol))
+            except Exception as exc:
+                self.storage.set_health("monitor", "warning", str(exc))
+                continue
+            if price <= 0:
+                continue
+            gross = risk_engine.unrealized_pnl(
+                side=str(cycle.get("side")),
+                avg_entry=safe_float(cycle.get("avg_entry_price")),
+                quantity=safe_float(cycle.get("total_quantity")),
+                current_price=price,
+            )
+            self.close_position(
+                cycle, exit_price=price,
+                exit_reason="tp" if gross > 0 else "stop", gross_pnl=gross,
+            )
+        self.storage.set_health("monitor", "ok", "همگام با صرافی")

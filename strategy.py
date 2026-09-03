@@ -1,13 +1,19 @@
-"""استراتژی ورود پله‌ای در جهت روند.
+"""موتور امتیازدهی سه‌بخشی برای اسکن چندارزی.
 
-منطق در سه لایه:
-1. تشخیص جهت روند در تایم‌فریم بالادست (۴ساعته/روزانه) — با EMA و ساختار سقف/کف.
-2. تأیید نقطهٔ ورود در تایم‌فریم پایین‌تر (۱۵ دقیقه) — پول‌بک در جهت روند.
-3. تحویل به هستهٔ ریاضی (risk_engine) برای ساخت نقشهٔ پله‌ها.
+هر ارز در هر چرخهٔ اسکن دو امتیاز می‌گیرد: یکی برای لانگ، یکی برای شورت.
+هر امتیاز میانگین وزن‌دار سه بخش مستقل است:
 
-نکتهٔ مهم و صادقانه: هیچ‌کدام از این سیگنال‌ها جهت آینده را «تضمین» نمی‌کنند.
-کاری که می‌کنند فقط این است که ورود را به سمتی که ساختار فعلی بازار نشان
-می‌دهد سوگیری کنند و از ورود در بازار بی‌جهت (رنج مبهم) جلوگیری کنند.
+    ۱. روند    (وزن ۳۵٪) — EMA سریع/کند، شیب، جایگاه قیمت، تأیید تایم‌فریم بالاتر
+    ۲. مومنتوم (وزن ۴۰٪) — RSI و کراس آن، MACD و کراس هیستوگرام
+    ۳. حجم     (وزن ۲۵٪) — حجم نسبت به میانگین، جهت بدنهٔ کندل
+
+چرا امتیازی و نه «همهٔ شرط‌ها باید درست باشند»؟ چون اندیکاتورها به‌ندرت کاملاً
+هم‌جهت می‌شوند؛ شرط AND سیگنال را تقریباً صفر می‌کند و شرط OR سیگنال بی‌کیفیت
+می‌دهد. امتیاز پیوسته اجازه می‌دهد یک بخش خیلی قوی، ضعف نسبی بخش دیگر را جبران
+کند، و در عین حال آستانه جلوی ورودهای ضعیف را بگیرد.
+
+هیچ‌کدام از این‌ها آینده را پیش‌بینی نمی‌کند. کاری که می‌کنند فقط این است که
+ورود را به سمتی سوگیری کنند که ساختار فعلی بازار نشان می‌دهد.
 """
 from __future__ import annotations
 
@@ -15,352 +21,360 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import config
-import risk_engine
-from utils import atr as atr_of, ema, logger, percent_change, rsi, safe_float
+from utils import (
+    atr as atr_of,
+    clamp,
+    ema_series,
+    logger,
+    macd_series,
+    rsi_series,
+    safe_float,
+    sma_series,
+)
 
 Side = Literal["LONG", "SHORT"]
 
 
+# ----------------------------------------------------------------------
+#  ساختار خروجی
+# ----------------------------------------------------------------------
+
 @dataclass
-class TrendRead:
-    """خواندهٔ جهت بازار در یک تایم‌فریم.
+class PartScore:
+    """امتیاز یک بخش (روند/مومنتوم/حجم) در هر دو جهت."""
 
-    به‌جای برچسب دودویی، امتیاز پیوسته در بازهٔ -۱ تا +۱ می‌دهد:
-    مثبت = صعودی، منفی = نزولی، نزدیک صفر = بی‌جهت.
-    این باعث می‌شود اختلاف جزئی بین EMA و ساختار، کل تایم‌فریم را
-    بی‌اعتبار نکند (اشکال نسخهٔ قبلی).
-    """
-
-    timeframe: str
-    direction: str          # LONG | SHORT | NEUTRAL — فقط برای نمایش
-    score: float = 0.0      # -1 .. +1
-    ema_fast: float = 0.0
-    ema_slow: float = 0.0
-    structure: str = "NEUTRAL"
-    efficiency: float = 0.0   # نسبت کارایی: ۱ = روند تمیز، ۰ = رنج
-    rsi_value: float = 50.0
+    name: str
+    long: float = 50.0
+    short: float = 50.0
     notes: list[str] = field(default_factory=list)
 
 
 @dataclass
-class Signal:
-    """خروجی نهایی تحلیل — آماده برای تبدیل به چرخه."""
+class SymbolScore:
+    """نتیجهٔ کامل تحلیل یک ارز."""
 
-    ok: bool
+    symbol: str
+    ok: bool = False
     side: Side | None = None
+    score: float = 0.0            # امتیاز جهت انتخاب‌شده (۰..۱۰۰)
+    opposite: float = 0.0         # امتیاز جهت مخالف
     price: float = 0.0
     atr_value: float = 0.0
-    spread_rate: float = 0.0
-    score: float = 0.0
-    reads: list[TrendRead] = field(default_factory=list)
+    efficiency: float = 0.0
+    parts: list[PartScore] = field(default_factory=list)
     reason: str = ""
 
-    def summary(self) -> str:
-        parts = [f"{r.timeframe}:{r.direction}({r.score:+.2f})" for r in self.reads]
-        return " | ".join(parts)
+    def breakdown(self) -> str:
+        if not self.side:
+            return "—"
+        key = "long" if self.side == "LONG" else "short"
+        return " | ".join(f"{p.name} {getattr(p, key):.0f}" for p in self.parts)
 
 
 # ----------------------------------------------------------------------
-#  لایهٔ ۱ — جهت روند در تایم‌فریم بالادست
+#  کمکی‌ها
 # ----------------------------------------------------------------------
+
+def _closes(candles: list[dict[str, float]]) -> list[float]:
+    return [safe_float(c["close"]) for c in candles]
+
 
 def efficiency_ratio(closes: list[float], period: int) -> float:
     """نسبت کارایی کافمن: حرکت خالص تقسیم بر مجموع حرکت‌ها.
 
-    نزدیک ۱ = روند تمیز و یک‌طرفه.
-    نزدیک ۰ = بازار رنج/اره‌ای — قیمت زیاد تکان می‌خورد ولی جایی نمی‌رود.
-
-    این همان چیزی است که «نوسان در رنج» را از «روند واقعی» جدا می‌کند؛
-    بدون آن، هر نوسان محلی به‌اشتباه روند خوانده می‌شود.
+    نزدیک ۱ = روند تمیز. نزدیک ۰ = رنج اره‌ای؛ قیمت تکان می‌خورد ولی جایی نمی‌رود.
     """
     if len(closes) < period + 1:
         return 0.0
     window = closes[-(period + 1):]
-    net_move = abs(window[-1] - window[0])
-    total_move = sum(abs(window[i] - window[i - 1]) for i in range(1, len(window)))
-    if total_move <= 0:
-        return 0.0
-    return net_move / total_move
-
-
-def read_trend(candles: list[dict[str, float]], timeframe: str) -> TrendRead:
-    """جهت روند یک تایم‌فریم را از روی کندل‌ها می‌خواند."""
-    read = TrendRead(timeframe=timeframe, direction="NEUTRAL")
-    if len(candles) < config.TREND_EMA_SLOW + 5:
-        read.notes.append("کندل ناکافی")
-        return read
-
-    closes = [safe_float(c["close"]) for c in candles]
-    read.ema_fast = ema(closes[-(config.TREND_EMA_FAST * 3):], config.TREND_EMA_FAST)
-    read.ema_slow = ema(closes[-(config.TREND_EMA_SLOW * 3):], config.TREND_EMA_SLOW)
-    read.rsi_value = rsi(closes, config.RSI_PERIOD)
-
-    # --- ساختار سقف/کف: ۱۰ کندل اخیر در برابر ۱۰ کندل قبل از آن ---
-    highs = [safe_float(c["high"]) for c in candles]
-    lows = [safe_float(c["low"]) for c in candles]
-    recent_high, prior_high = max(highs[-10:]), max(highs[-20:-10])
-    recent_low, prior_low = min(lows[-10:]), min(lows[-20:-10])
-
-    if recent_high > prior_high and recent_low > prior_low:
-        read.structure = "LONG"           # سقف بالاتر + کف بالاتر
-    elif recent_high < prior_high and recent_low < prior_low:
-        read.structure = "SHORT"          # سقف پایین‌تر + کف پایین‌تر
-    else:
-        read.structure = "NEUTRAL"
-
-    # --- امتیاز EMA: هم جهت، هم فاصلهٔ نسبی (شیب قوی‌تر = امتیاز بیشتر) ---
-    if read.ema_slow > 0:
-        ema_gap = (read.ema_fast - read.ema_slow) / read.ema_slow
-    else:
-        ema_gap = 0.0
-    # فاصلهٔ ۱٪ یا بیشتر امتیاز کامل می‌گیرد.
-    ema_score = max(-1.0, min(1.0, ema_gap / 0.01))
-
-    structure_score = {"LONG": 1.0, "SHORT": -1.0}.get(read.structure, 0.0)
-
-    # وزن‌دهی: ساختار قیمت کمی مهم‌تر از EMA است چون دیرتر ولی مطمئن‌تر است.
-    raw_score = ema_score * config.EMA_WEIGHT + structure_score * config.STRUCTURE_WEIGHT
-
-    # --- فیلتر رنج ---
-    # اگر بازار کارایی جهتی پایینی دارد (رنج)، امتیاز به سمت صفر میرا می‌شود.
-    # بدون این، نوسان بالا-پایین داخل یک رنج به‌اشتباه «روند» خوانده می‌شود
-    # و ربات مدام در سقف و کف رنج پوزیشن باز می‌کند.
-    read.efficiency = efficiency_ratio(closes, config.EFFICIENCY_PERIOD)
-    if read.efficiency < config.MIN_EFFICIENCY_RATIO:
-        # این تایم‌فریم رنج است: هیچ اطلاعات جهتی معتبری ندارد، پس امتیاز صفر
-        # می‌گیرد (نه منفی، نه مثبت) و در میانگین نهایی خنثی می‌ماند.
-        read.score = 0.0
-        read.notes.append(
-            f"رنج (کارایی {read.efficiency:.2f} < {config.MIN_EFFICIENCY_RATIO}) — بی‌اطلاع"
-        )
-    else:
-        read.score = raw_score
-
-    if read.score >= config.TREND_SCORE_THRESHOLD:
-        read.direction = "LONG"
-    elif read.score <= -config.TREND_SCORE_THRESHOLD:
-        read.direction = "SHORT"
-    else:
-        read.direction = "NEUTRAL"
-
-    ema_dir = "LONG" if ema_score > 0 else ("SHORT" if ema_score < 0 else "FLAT")
-    read.notes.append(
-        f"EMA={ema_dir}({ema_score:+.2f}) ساختار={read.structure} → امتیاز {read.score:+.2f}"
-    )
-    return read
-
-
-def combine_trends(reads: list[TrendRead], threshold: float | None = None) -> tuple[str, float]:
-    """جهت نهایی از میانگین وزن‌دار امتیاز تایم‌فریم‌ها.
-
-    تایم‌فریم بالاتر وزن بیشتری دارد (روند روزانه از ۴ساعته معتبرتر است).
-    برخلاف نسخهٔ قبلی، یک تایم‌فریم مبهم کل سیگنال را باطل نمی‌کند؛
-    فقط امتیاز کل را پایین می‌آورد.
-
-    یک شرط سخت باقی می‌ماند: هیچ تایم‌فریمی نباید *مخالف* جهت نهایی باشد.
-    """
-    if not reads:
-        return "NEUTRAL", 0.0
-
-    total_weight = 0.0
-    weighted = 0.0
-    for r in reads:
-        w = config.TIMEFRAME_WEIGHTS.get(r.timeframe, 1.0)
-        weighted += r.score * w
-        total_weight += w
-    combined = weighted / total_weight if total_weight > 0 else 0.0
-
-    # تضاد صریح: اگر تایم‌فریمی قاطعانه در جهت مخالف باشد، ورود ممنوع.
-    if combined > 0 and any(r.score <= -config.TREND_CONFLICT_THRESHOLD for r in reads):
-        return "NEUTRAL", combined
-    if combined < 0 and any(r.score >= config.TREND_CONFLICT_THRESHOLD for r in reads):
-        return "NEUTRAL", combined
-
-    limit = config.COMBINED_SCORE_THRESHOLD if threshold is None else float(threshold)
-    if combined >= limit:
-        return "LONG", combined
-    if combined <= -limit:
-        return "SHORT", combined
-    return "NEUTRAL", combined
+    net = abs(window[-1] - window[0])
+    total = sum(abs(window[i] - window[i - 1]) for i in range(1, len(window)))
+    return net / total if total > 0 else 0.0
 
 
 # ----------------------------------------------------------------------
-#  لایهٔ ۲ — تأیید نقطهٔ ورود
+#  بخش ۱ — روند
 # ----------------------------------------------------------------------
 
-def entry_is_favorable(side: Side, entry_candles: list[dict[str, float]]) -> tuple[bool, str]:
-    """آیا نقطهٔ فعلی برای ورود در جهت روند مناسب است؟
-
-    اصل ساده: در روند صعودی، ورود بعد از یک پول‌بک بهتر از ورود در اوج است
-    (و برعکس). با RSI تایم‌فریم ورود سنجیده می‌شود.
-    """
-    if len(entry_candles) < config.RSI_PERIOD + 2:
-        return False, "کندل ورود ناکافی"
-
-    closes = [safe_float(c["close"]) for c in entry_candles]
-    r = rsi(closes, config.RSI_PERIOD)
-
-    if side == "LONG":
-        if r > config.ENTRY_RSI_MAX:
-            return False, f"RSI ورود بیش از حد بالا ({r:.0f}) — ورود در اوج"
-        return True, f"RSI ورود مناسب ({r:.0f})"
-
-    if r < config.ENTRY_RSI_MIN:
-        return False, f"RSI ورود بیش از حد پایین ({r:.0f}) — ورود در کف"
-    return True, f"RSI ورود مناسب ({r:.0f})"
-
-
-# ----------------------------------------------------------------------
-#  لایهٔ ۳ — تولید سیگنال کامل
-# ----------------------------------------------------------------------
-
-def build_signal(
-    *,
-    trend_candles: dict[str, list[dict[str, float]]],
+def score_trend(
     entry_candles: list[dict[str, float]],
-    price: float,
+    trend_candles: list[dict[str, float]] | None,
+) -> PartScore:
+    """جایگاه قیمت نسبت به EMAها، شیب EMA و تأیید تایم‌فریم بالاتر."""
+    part = PartScore("روند")
+    closes = _closes(entry_candles)
+    if len(closes) < config.EMA_SLOW + config.EMA_SLOPE_LOOKBACK:
+        part.notes.append("کندل ناکافی")
+        return part
+
+    fast = ema_series(closes, config.EMA_FAST)
+    slow = ema_series(closes, config.EMA_SLOW)
+    price = closes[-1]
+
+    long_score = 50.0
+    long_score += 14.0 if price > fast[-1] else -14.0
+    long_score += 14.0 if price > slow[-1] else -14.0
+    long_score += 10.0 if fast[-1] > slow[-1] else -10.0
+
+    # شیب EMA سریع: روند قوی‌تر امتیاز بیشتر می‌گیرد.
+    lookback = config.EMA_SLOPE_LOOKBACK
+    if fast[-1 - lookback] > 0:
+        slope = (fast[-1] - fast[-1 - lookback]) / fast[-1 - lookback]
+        long_score += clamp(slope * 2000.0, -12.0, 12.0)
+
+    # تأیید تایم‌فریم بالاتر: روند ۱ساعته از ۱۵دقیقه معتبرتر است.
+    if trend_candles:
+        hcloses = _closes(trend_candles)
+        if len(hcloses) >= config.EMA_FAST + 2:
+            hfast = ema_series(hcloses, config.EMA_FAST)
+            hprice = hcloses[-1]
+            long_score += 10.0 if hprice > hfast[-1] else -10.0
+            part.notes.append(f"تایم بالاتر {'صعودی' if hprice > hfast[-1] else 'نزولی'}")
+
+    part.long = clamp(long_score, 0.0, 100.0)
+    part.short = 100.0 - part.long
+    part.notes.append(f"EMA{config.EMA_FAST}/{config.EMA_SLOW}")
+    return part
+
+
+# ----------------------------------------------------------------------
+#  بخش ۲ — مومنتوم
+# ----------------------------------------------------------------------
+
+def score_momentum(entry_candles: list[dict[str, float]]) -> PartScore:
+    """RSI و MACD — با تأکید روی «کراس تازه»، نه فقط مقدار مطلق."""
+    part = PartScore("مومنتوم")
+    closes = _closes(entry_candles)
+    if len(closes) < config.MACD_SLOW + config.MACD_SIGNAL + 2:
+        part.notes.append("کندل ناکافی")
+        return part
+
+    rsi_vals = rsi_series(closes, config.RSI_PERIOD)
+    _, _, hist = macd_series(closes, config.MACD_FAST, config.MACD_SLOW, config.MACD_SIGNAL)
+
+    r_now, r_prev = rsi_vals[-1], rsi_vals[-2]
+    h_now, h_prev = hist[-1], hist[-2]
+
+    long_score = short_score = 50.0
+
+    # کراس خروج از اشباع: قوی‌ترین سیگنال این بخش.
+    if r_prev < config.RSI_OVERSOLD <= r_now:
+        long_score += 26.0
+        part.notes.append(f"خروج از اشباع فروش (RSI {r_now:.0f})")
+    if r_prev > config.RSI_OVERBOUGHT >= r_now:
+        short_score += 26.0
+        part.notes.append(f"خروج از اشباع خرید (RSI {r_now:.0f})")
+
+    # موقعیت RSI: هرچه پایین‌تر، فضای رشد بیشتر (و برعکس).
+    long_score += clamp((55.0 - r_now) * 0.45, -13.0, 13.0)
+    short_score += clamp((r_now - 45.0) * 0.45, -13.0, 13.0)
+
+    # کراس هیستوگرام MACD.
+    if h_prev < 0 <= h_now:
+        long_score += 17.0
+        part.notes.append("کراس صعودی MACD")
+    if h_prev > 0 >= h_now:
+        short_score += 17.0
+        part.notes.append("کراس نزولی MACD")
+
+    # جهت فعلی هیستوگرام و اینکه در حال قوی‌تر شدن است یا نه.
+    if h_now > 0:
+        long_score += 8.0 + (4.0 if h_now > h_prev else 0.0)
+    else:
+        short_score += 8.0 + (4.0 if h_now < h_prev else 0.0)
+
+    part.long = clamp(long_score, 0.0, 100.0)
+    part.short = clamp(short_score, 0.0, 100.0)
+    return part
+
+
+# ----------------------------------------------------------------------
+#  بخش ۳ — حجم
+# ----------------------------------------------------------------------
+
+def score_volume(entry_candles: list[dict[str, float]]) -> PartScore:
+    """حجم نسبت به میانگین، همراه با جهت بدنهٔ کندل.
+
+    حرکت با حجم بالا معتبرتر از حرکت با حجم پایین است؛ حجم کم‌تر از میانگین
+    یعنی حرکت پشتوانه ندارد و احتمال فیک‌اوت بیشتر است.
+    """
+    part = PartScore("حجم")
+    if len(entry_candles) < config.VOLUME_SMA_PERIOD + 2:
+        part.notes.append("کندل ناکافی")
+        return part
+
+    volumes = [safe_float(c.get("volume")) for c in entry_candles]
+    if max(volumes) <= 0:
+        part.notes.append("دادهٔ حجم موجود نیست")
+        return part
+
+    avg = sma_series(volumes, config.VOLUME_SMA_PERIOD)
+    ratio = volumes[-1] / avg[-1] if avg[-1] > 0 else 1.0
+    last = entry_candles[-1]
+    body = safe_float(last["close"]) - safe_float(last["open"])
+
+    long_score = short_score = 50.0
+    push = clamp((ratio - 1.0) * 40.0, 0.0, 34.0)
+    if body > 0:
+        long_score += push
+        short_score -= push * 0.4
+    elif body < 0:
+        short_score += push
+        long_score -= push * 0.4
+
+    if ratio < 0.8:
+        long_score -= 12.0
+        short_score -= 12.0
+        part.notes.append(f"حجم کم‌رمق ({ratio:.2f}× میانگین)")
+    else:
+        part.notes.append(f"حجم {ratio:.2f}× میانگین")
+
+    part.long = clamp(long_score, 0.0, 100.0)
+    part.short = clamp(short_score, 0.0, 100.0)
+    return part
+
+
+# ----------------------------------------------------------------------
+#  ترکیب و تصمیم
+# ----------------------------------------------------------------------
+
+def score_symbol(
+    *,
+    symbol: str,
+    entry_candles: list[dict[str, float]],
+    trend_candles: list[dict[str, float]] | None = None,
+    price: float = 0.0,
     best_bid: float = 0.0,
     best_ask: float = 0.0,
-    score_threshold: float | None = None,
-) -> Signal:
-    """تحلیل کامل و تصمیم به ورود یا صبر."""
-    signal = Signal(ok=False, price=float(price))
+    threshold: float | None = None,
+) -> SymbolScore:
+    """تحلیل کامل یک ارز و تصمیم به ورود یا رد شدن."""
+    out = SymbolScore(symbol=symbol)
+    limit = config.SCORE_THRESHOLD if threshold is None else float(threshold)
 
-    if price <= 0:
-        signal.reason = "قیمت نامعتبر"
-        return signal
+    if len(entry_candles) < config.EMA_SLOW + 10:
+        out.reason = "کندل کافی برای تحلیل موجود نیست"
+        return out
 
-    # --- اسپرد لحظه‌ای ---
+    closes = _closes(entry_candles)
+    out.price = float(price) if price > 0 else closes[-1]
+    if out.price <= 0:
+        out.reason = "قیمت نامعتبر"
+        return out
+
+    # --- اسپرد: ورود در بازار کم‌عمق یعنی هزینهٔ پنهان ---
     if best_bid > 0 and best_ask > 0:
         spread = (best_ask - best_bid) / ((best_ask + best_bid) / 2.0)
-        signal.spread_rate = spread
         if spread > config.MAX_ENTRY_SPREAD_RATE:
-            signal.reason = (
-                f"اسپرد لحظه‌ای ({spread * 100:.3f}%) بیشتر از سقف مجاز "
-                f"({config.MAX_ENTRY_SPREAD_RATE * 100:.3f}%) است"
-            )
-            return signal
+            out.reason = f"اسپرد بالا ({spread * 100:.3f}%)"
+            return out
 
-    # --- روند بالادست ---
-    reads = [read_trend(candles, tf) for tf, candles in trend_candles.items()]
-    signal.reads = reads
-    direction, combined_score = combine_trends(reads, score_threshold)
-    signal.score = combined_score
+    parts = [
+        score_trend(entry_candles, trend_candles),
+        score_momentum(entry_candles),
+        score_volume(entry_candles),
+    ]
+    out.parts = parts
+    weights = (config.WEIGHT_TREND, config.WEIGHT_MOMENTUM, config.WEIGHT_VOLUME)
+    total_weight = sum(weights) or 1.0
 
-    if direction == "NEUTRAL":
-        signal.reason = (
-            f"جهت بازار به اندازهٔ کافی قوی نیست — امتیاز {combined_score:+.2f} "
-            f"(آستانه {config.COMBINED_SCORE_THRESHOLD if score_threshold is None else score_threshold:.2f}) "
-            f"| {signal.summary()}"
-        )
-        return signal
-    if direction == "LONG" and not config.ALLOW_LONG:
-        signal.reason = "روند صعودی است ولی لانگ غیرفعال شده"
-        return signal
-    if direction == "SHORT" and not config.ALLOW_SHORT:
-        signal.reason = "روند نزولی است ولی شورت غیرفعال شده"
-        return signal
+    long_total = sum(p.long * w for p, w in zip(parts, weights)) / total_weight
+    short_total = sum(p.short * w for p, w in zip(parts, weights)) / total_weight
 
-    # --- ATR از تایم‌فریم ورود ---
-    atr_value = atr_of(entry_candles, config.ATR_PERIOD)
-    if atr_value <= 0:
-        signal.reason = "ATR قابل محاسبه نیست"
-        return signal
-    signal.atr_value = atr_value
+    # --- فیلتر رنج: در بازار بی‌جهت، امتیاز به سمت خنثی میرا می‌شود ---
+    out.efficiency = efficiency_ratio(closes, config.EFFICIENCY_PERIOD)
+    if out.efficiency < config.MIN_EFFICIENCY_RATIO:
+        damp = out.efficiency / config.MIN_EFFICIENCY_RATIO if config.MIN_EFFICIENCY_RATIO > 0 else 0.0
+        long_total = 50.0 + (long_total - 50.0) * damp
+        short_total = 50.0 + (short_total - 50.0) * damp
 
-    # --- تأیید نقطهٔ ورود ---
-    favorable, note = entry_is_favorable(direction, entry_candles)
-    if not favorable:
-        signal.reason = note
-        return signal
+    if long_total >= short_total:
+        out.side, out.score, out.opposite = "LONG", long_total, short_total
+    else:
+        out.side, out.score, out.opposite = "SHORT", short_total, long_total
 
-    signal.ok = True
-    signal.side = direction  # type: ignore[assignment]
-    signal.reason = f"امتیاز {combined_score:+.2f} | {signal.summary()} | {note}"
-    return signal
+    # --- ATR: مبنای حد ضرر و حد سود ---
+    out.atr_value = atr_of(entry_candles, config.ATR_PERIOD)
+    if out.atr_value <= 0:
+        out.reason = "ATR قابل محاسبه نیست"
+        out.side = None
+        return out
+
+    # --- شرط‌های رد ---
+    if out.score < limit:
+        out.reason = f"امتیاز {out.score:.0f} زیر آستانهٔ {limit:.0f}"
+        return out
+    if out.opposite > config.MAX_OPPOSITE_SCORE:
+        out.reason = f"بازار مبهم — امتیاز جهت مخالف هم بالاست ({out.opposite:.0f})"
+        return out
+    if out.efficiency < config.MIN_EFFICIENCY_RATIO:
+        out.reason = f"بازار رنج (کارایی {out.efficiency:.2f})"
+        return out
+    if out.side == "LONG" and not config.ALLOW_LONG:
+        out.reason = "لانگ غیرفعال است"
+        return out
+    if out.side == "SHORT" and not config.ALLOW_SHORT:
+        out.reason = "شورت غیرفعال است"
+        return out
+
+    out.ok = True
+    out.reason = f"امتیاز {out.score:.0f} | {out.breakdown()} | کارایی {out.efficiency:.2f}"
+    return out
 
 
 # ----------------------------------------------------------------------
-#  تصمیم دربارهٔ چرخهٔ باز
+#  تصمیم خروج
 # ----------------------------------------------------------------------
-
-def next_step_due(
-    *,
-    side: Side,
-    steps: list[dict[str, Any]],
-    current_price: float,
-) -> dict[str, Any] | None:
-    """اولین پلهٔ برنامه‌ریزی‌شده‌ای که قیمت به ماشهٔ آن رسیده."""
-    for step in steps:
-        if str(step.get("status")) != "planned":
-            continue
-        trigger = safe_float(step.get("trigger_price"))
-        if trigger <= 0:
-            continue
-        if side == "LONG" and current_price <= trigger:
-            return step
-        if side == "SHORT" and current_price >= trigger:
-            return step
-        # پله‌ها مرتب‌اند؛ اگر این یکی نرسیده، بعدی‌ها هم نرسیده‌اند.
-        break
-    return None
-
 
 def exit_decision(
     *,
     side: Side,
-    avg_entry: float,
+    entry_price: float,
     quantity: float,
     current_price: float,
     take_profit: float,
     hard_stop: float,
-    all_steps_filled: bool,
+    age_minutes: float = 0.0,
+    reversal_score: float = 0.0,
 ) -> tuple[str | None, float]:
-    """آیا وقت بستن پوزیشن است؟ خروجی: (دلیل خروج یا None، سود/زیان ناخالص)."""
-    if quantity <= 0 or avg_entry <= 0:
+    """آیا وقت بستن پوزیشن است؟ خروجی: (دلیل خروج یا None، سود/زیان ناخالص).
+
+    اولویت با حد ضرر است: اگر هر دو سطح در یک کندل لمس شده باشند، محافظه‌کارانه
+    فرض می‌شود اول حد ضرر خورده — چون خلافش قابل اثبات نیست.
+    """
+    import risk_engine
+
+    if quantity <= 0 or entry_price <= 0 or current_price <= 0:
         return None, 0.0
 
     gross = risk_engine.unrealized_pnl(
-        side=side, avg_entry=avg_entry, quantity=quantity, current_price=current_price
+        side=side, avg_entry=entry_price, quantity=quantity, current_price=current_price
     )
-    notional = avg_entry * quantity
-    net = risk_engine.net_pnl_after_costs(gross, notional)
 
     if side == "LONG":
-        hit_tp = current_price >= take_profit > 0
         hit_stop = 0 < hard_stop and current_price <= hard_stop
+        hit_tp = current_price >= take_profit > 0
     else:
-        hit_tp = 0 < take_profit and current_price <= take_profit
         hit_stop = current_price >= hard_stop > 0
+        hit_tp = 0 < take_profit and current_price <= take_profit
 
-    # حد سود فقط وقتی معتبر است که بعد از کسر هزینه‌ها واقعاً سود بدهد.
-    if hit_tp and net >= config.MIN_NET_PROFIT_USDT:
+    if hit_stop:
+        return "stop", gross
+    if hit_tp:
         return "tp", gross
-    # حد ضرر سخت فقط پس از مصرف همهٔ پله‌ها معنا دارد؛ قبل از آن، پلهٔ بعدی
-    # وظیفهٔ مدیریت را دارد — مگر اینکه قیمت از حد ضرر هم عبور کرده باشد.
-    if hit_stop and all_steps_filled:
-        return "stop", gross
-    if hit_stop and not all_steps_filled:
-        return "stop", gross
+
+    # خروج زودهنگام وقتی مومنتوم قاطعانه برگشته و پوزیشن در سود است.
+    if (
+        config.EARLY_EXIT_ON_REVERSAL
+        and reversal_score >= config.REVERSAL_EXIT_SCORE
+        and gross > 0
+    ):
+        notional = entry_price * quantity
+        if risk_engine.net_pnl_after_costs(gross, notional) >= config.MIN_NET_PROFIT_USDT:
+            return "reversal", gross
+
+    # پوزیشن راکد: اسلات را آزاد کن تا سیگنال بهتری جایش بنشیند.
+    if config.MAX_POSITION_AGE_MINUTES > 0 and age_minutes >= config.MAX_POSITION_AGE_MINUTES:
+        return "timeout", gross
+
     return None, gross
-
-
-def plan_for_signal(
-    *,
-    signal: Signal,
-    capital_usdt: float,
-    max_steps: int,
-    min_qty: float = 0.0,
-    min_notional: float = 0.0,
-) -> risk_engine.CyclePlan:
-    """سیگنال تأییدشده را به نقشهٔ عددی چرخه تبدیل می‌کند."""
-    return risk_engine.best_leverage_for(
-        symbol=config.TARGET_SYMBOL,
-        side=signal.side or "LONG",
-        entry_price=signal.price,
-        atr_value=signal.atr_value,
-        capital_usdt=capital_usdt,
-        max_steps=max_steps,
-        min_qty=min_qty,
-        min_notional=min_notional,
-    )

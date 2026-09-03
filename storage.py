@@ -1,6 +1,7 @@
-"""لایهٔ ذخیره‌سازی (SQLite) برای ربات ورود پله‌ای.
+"""لایهٔ ذخیره‌سازی (SQLite) برای ربات اسکن چندارزی.
 
-هر «چرخه» (cycle) یک پوزیشن کامل است که ممکن است چند پله داشته باشد.
+هر «چرخه» (cycle) یک پوزیشن مستقل روی یک ارز است. چند چرخه می‌توانند هم‌زمان
+باز باشند (تا سقفی که کاربر تعیین می‌کند)، ولی روی هر ارز فقط یکی.
 آمار واقعی و مجازی کاملاً از هم جدا نگهداری می‌شوند.
 """
 from __future__ import annotations
@@ -45,8 +46,11 @@ CREATE TABLE IF NOT EXISTS cycles (
     opened_at         INTEGER NOT NULL,
     closed_at         INTEGER,
     tg_message_id     INTEGER,                     -- برای ریپلای نتیجه روی سیگنال
-    final_step_warned INTEGER NOT NULL DEFAULT 0
+    final_step_warned INTEGER NOT NULL DEFAULT 0,
+    entry_score       REAL    NOT NULL DEFAULT 0,   -- امتیاز لحظهٔ ورود
+    entry_reason      TEXT                          -- تفکیک امتیاز بخش‌ها
 );
+CREATE INDEX IF NOT EXISTS idx_cycles_symbol ON cycles(symbol, status);
 CREATE INDEX IF NOT EXISTS idx_cycles_status ON cycles(status, mode);
 CREATE INDEX IF NOT EXISTS idx_cycles_closed ON cycles(closed_at);
 
@@ -97,7 +101,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "startup_ready": False,
     "startup_phase": "در حال راه‌اندازی",
     "virtual_balance": config.VIRTUAL_START_CAPITAL_USDT,
-    "max_steps": config.MAX_ENTRY_STEPS,
+    "max_positions": config.MAX_CONCURRENT_POSITIONS,
+    "score_threshold": config.SCORE_THRESHOLD,
+    "leverage": config.DEFAULT_LEVERAGE,
     "margin_mode": config.MARGIN_MODE,
     "capital_cap": config.CAPITAL_CAP_USDT,
     "last_balance": 0.0,
@@ -198,26 +204,29 @@ class Storage:
 
     # --- cycles -------------------------------------------------------
     def create_cycle(self, *, symbol: str, side: str, mode: str, leverage: int,
-                     planned_steps: int, capital_at_open: float, plan: dict[str, Any],
-                     take_profit_price: float, hard_stop_price: float) -> int:
+                     capital_at_open: float, plan: dict[str, Any],
+                     take_profit_price: float, hard_stop_price: float,
+                     entry_score: float = 0.0, entry_reason: str = "") -> int:
+        """یک پوزیشن جدید ثبت می‌کند (تک‌ورودی، نه پله‌ای)."""
         with self._lock:
             cur = self._conn.execute(
                 "INSERT INTO cycles(symbol,side,mode,status,leverage,planned_steps,"
-                "capital_at_open,plan_json,take_profit_price,hard_stop_price,opened_at) "
-                "VALUES(?,?,?,'open',?,?,?,?,?,?,?)",
-                (symbol, side, mode, int(leverage), int(planned_steps),
+                "capital_at_open,plan_json,take_profit_price,hard_stop_price,"
+                "entry_score,entry_reason,opened_at) "
+                "VALUES(?,?,?,'open',?,1,?,?,?,?,?,?,?)",
+                (symbol, side, mode, int(leverage),
                  float(capital_at_open), json_dumps(plan),
-                 float(take_profit_price), float(hard_stop_price), now_ms()),
+                 float(take_profit_price), float(hard_stop_price),
+                 float(entry_score), str(entry_reason)[:400], now_ms()),
             )
             cycle_id = int(cur.lastrowid)
-            for step in plan.get("steps", []):
-                self._conn.execute(
-                    "INSERT INTO cycle_steps(cycle_id,step_index,trigger_price,"
-                    "margin,notional,quantity,status) VALUES(?,?,?,?,?,?, 'planned')",
-                    (cycle_id, safe_int(step.get("index")), safe_float(step.get("trigger_price")),
-                     safe_float(step.get("margin_usdt")), safe_float(step.get("notional_usdt")),
-                     safe_float(step.get("quantity"))),
-                )
+            self._conn.execute(
+                "INSERT INTO cycle_steps(cycle_id,step_index,trigger_price,"
+                "margin,notional,quantity,status) VALUES(?,1,?,?,?,?,'planned')",
+                (cycle_id, safe_float(plan.get("entry_price")),
+                 safe_float(plan.get("margin_usdt")), safe_float(plan.get("notional_usdt")),
+                 safe_float(plan.get("quantity"))),
+            )
             self._conn.commit()
         return cycle_id
 
@@ -227,7 +236,7 @@ class Storage:
         return dict(row) if row else None
 
     def open_cycle(self, mode: str | None = None) -> dict[str, Any] | None:
-        """چرخهٔ باز فعلی؛ همیشه حداکثر یکی است (چون فقط یک ارز داریم)."""
+        """آخرین چرخهٔ باز (برای سازگاری؛ معمولاً open_cycles استفاده می‌شود)."""
         query = "SELECT * FROM cycles WHERE status='open'"
         params: tuple[Any, ...] = ()
         if mode:
@@ -244,6 +253,43 @@ class Storage:
                 "SELECT * FROM cycles WHERE status='open' ORDER BY id DESC"
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def open_cycles_for_mode(self, mode: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM cycles WHERE status='open' AND mode=? ORDER BY id DESC",
+                (mode,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def open_symbols(self, mode: str | None = None) -> set[str]:
+        """ارزهایی که همین حالا پوزیشن باز دارند — برای جلوگیری از ورود تکراری."""
+        query = "SELECT DISTINCT symbol FROM cycles WHERE status='open'"
+        params: tuple[Any, ...] = ()
+        if mode:
+            query += " AND mode=?"
+            params = (mode,)
+        with self._lock:
+            rows = self._conn.execute(query, params).fetchall()
+        return {str(r["symbol"]) for r in rows}
+
+    def open_position_count(self, mode: str | None = None) -> int:
+        query = "SELECT COUNT(*) c FROM cycles WHERE status='open'"
+        params: tuple[Any, ...] = ()
+        if mode:
+            query += " AND mode=?"
+            params = (mode,)
+        with self._lock:
+            return int(self._conn.execute(query, params).fetchone()["c"])
+
+    def open_margin_total(self, mode: str | None = None) -> float:
+        query = "SELECT COALESCE(SUM(total_margin),0) m FROM cycles WHERE status='open'"
+        params: tuple[Any, ...] = ()
+        if mode:
+            query += " AND mode=?"
+            params = (mode,)
+        with self._lock:
+            return safe_float(self._conn.execute(query, params).fetchone()["m"])
 
     def cycle_steps(self, cycle_id: int) -> list[dict[str, Any]]:
         with self._lock:

@@ -144,6 +144,72 @@ def atr(candles: list[dict[str, float]], period: int = 14) -> float:
     return sum(tail) / max(1, len(tail))
 
 
+def ema_series(values: list[float], period: int) -> list[float]:
+    """کل سری EMA (نه فقط آخرین مقدار) — برای دیدن شیب و کراس لازم است."""
+    if not values:
+        return []
+    period = max(1, min(period, len(values)))
+    k = 2.0 / (period + 1.0)
+    out = [float(values[0])]
+    for value in values[1:]:
+        out.append(float(value) * k + out[-1] * (1.0 - k))
+    return out
+
+
+def sma_series(values: list[float], period: int) -> list[float]:
+    """میانگین متحرک ساده؛ برای مقایسهٔ حجم با میانگین حجم استفاده می‌شود."""
+    period = max(1, period)
+    out: list[float] = []
+    running = 0.0
+    for i, value in enumerate(values):
+        running += float(value)
+        if i >= period:
+            running -= float(values[i - period])
+        out.append(running / min(i + 1, period))
+    return out
+
+
+def rsi_series(values: list[float], period: int = 14) -> list[float]:
+    """سری کامل RSI با هموارسازی وایلدر.
+
+    نسخهٔ اسکالر ``rsi`` فقط عدد آخر را می‌دهد؛ برای تشخیص «کراس» (خروج از
+    اشباع فروش/خرید) به مقدار کندل قبلی هم نیاز داریم.
+    """
+    n = len(values)
+    if n < period + 1:
+        return [50.0] * n
+    out = [50.0] * n
+    gain = loss = 0.0
+    for i in range(1, period + 1):
+        delta = values[i] - values[i - 1]
+        gain += max(0.0, delta)
+        loss += max(0.0, -delta)
+    gain /= period
+    loss /= period
+    out[period] = 100.0 - 100.0 / (1.0 + gain / loss) if loss > 1e-15 else 100.0
+    for i in range(period + 1, n):
+        delta = values[i] - values[i - 1]
+        gain = (gain * (period - 1) + max(0.0, delta)) / period
+        loss = (loss * (period - 1) + max(0.0, -delta)) / period
+        out[i] = 100.0 - 100.0 / (1.0 + gain / loss) if loss > 1e-15 else 100.0
+    return out
+
+
+def macd_series(
+    values: list[float], fast: int = 12, slow: int = 26, signal: int = 9
+) -> tuple[list[float], list[float], list[float]]:
+    """خروجی: (خط MACD، خط سیگنال، هیستوگرام)."""
+    if len(values) < slow + signal:
+        zeros = [0.0] * len(values)
+        return zeros, list(zeros), list(zeros)
+    fast_line = ema_series(values, fast)
+    slow_line = ema_series(values, slow)
+    macd_line = [f - s for f, s in zip(fast_line, slow_line)]
+    signal_line = ema_series(macd_line, signal)
+    hist = [m - s for m, s in zip(macd_line, signal_line)]
+    return macd_line, signal_line, hist
+
+
 def median(values: Iterable[float]) -> float:
     rows = sorted(float(x) for x in values)
     if not rows:

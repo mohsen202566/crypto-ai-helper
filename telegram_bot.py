@@ -1,6 +1,6 @@
 """پنل‌ها و دستورات تلگرام.
 
-چهار پنل طبق مشخصات:
+چهار پنل:
   • پنل پوزیشن  — هنگام باز شدن هر پوزیشن
   • پنل ترید    — وضعیت کلی و موجودی
   • پنل نتیجه   — با ریپلای روی پیام سیگنال اصلی
@@ -19,7 +19,15 @@ import requests
 
 import config
 from storage import Storage
-from utils import json_loads, logger, normalize_command, parse_number, safe_float, safe_int
+from utils import (
+    canonical_base,
+    json_loads,
+    logger,
+    normalize_command,
+    parse_number,
+    safe_float,
+    safe_int,
+)
 
 # ----------------------------------------------------------------------
 #  کمکی‌های قالب‌بندی
@@ -47,6 +55,11 @@ def _pnl(value: Any) -> str:
     return f"{emoji} {sign}{v:,.2f}$"
 
 
+def _coin(symbol: Any) -> str:
+    """نام کوتاه ارز برای نمایش (مثلاً DOGE به‌جای DOGE-SWAP-USDT)."""
+    return canonical_base(str(symbol or "")) or str(symbol or "—")
+
+
 def _side_badge(side: str) -> str:
     return "🟢 لانگ" if str(side).upper() == "LONG" else "🔴 شورت"
 
@@ -62,35 +75,33 @@ def _mode_label(mode: str) -> str:
 def position_panel(cycle: dict[str, Any], plan: dict[str, Any] | None = None) -> str:
     """پنل پیام پوزیشن — هنگام باز شدن."""
     plan = plan or json_loads(cycle.get("plan_json"), {}) or {}
-    steps = plan.get("steps", [])
+    entry = safe_float(cycle.get("avg_entry_price")) or safe_float(plan.get("entry_price"))
+    score = safe_float(cycle.get("entry_score"))
     lines = [
-        f"{_side_badge(cycle.get('side'))} — {cycle.get('symbol')}",
+        f"{_side_badge(cycle.get('side'))} — {_coin(cycle.get('symbol'))}",
         "",
-        f"نقطهٔ ورود: {_price(cycle.get('avg_entry_price') or (steps[0]['trigger_price'] if steps else 0))}",
-        f"لوریج: {safe_int(cycle.get('leverage'))}x  |  حالت: {config.MARGIN_MODE}",
-        f"مارجین پلهٔ اول: {_n(steps[0]['margin_usdt']) if steps else '—'}$",
-        f"پله‌های برنامه‌ریزی‌شده: {safe_int(cycle.get('planned_steps'))}",
+        f"امتیاز ورود: {score:.0f}/100",
+        f"نقطهٔ ورود: {_price(entry)}",
+        f"لوریج: {safe_int(cycle.get('leverage'))}x  |  {config.MARGIN_MODE}",
+        f"مارجین: {_n(plan.get('margin_usdt') or cycle.get('total_margin'))}$"
+        f"  |  ارزش پوزیشن: {_n(plan.get('notional_usdt') or cycle.get('total_notional'))}$",
         f"نوع: {_mode_label(cycle.get('mode'))}",
         "",
         f"🎯 حد سود: {_price(cycle.get('take_profit_price'))}",
         f"🛑 حد ضرر: {_price(cycle.get('hard_stop_price'))}",
     ]
-    if plan.get("final_liq_distance_rate"):
-        lines.append(
-            f"⚠️ لیکوئید: {_price(steps[-1]['liquidation_price']) if steps else '—'}"
-            f"  ({safe_float(plan.get('final_liq_distance_rate')) * 100:.1f}% دورتر)"
-        )
-    if steps:
-        lines.append("")
-        lines.append("📊 نقشهٔ پله‌ها:")
-        for s in steps:
-            lines.append(
-                f"  {s['index']}) {_price(s['trigger_price'])} — "
-                f"{_n(s['margin_usdt'])}$ (تجمعی {_n(s['cum_margin_usdt'])}$)"
-            )
-    if plan.get("max_loss_usdt"):
-        lines.append("")
-        lines.append(f"بدترین حالت: {_n(plan.get('max_loss_usdt'))}$ ضرر")
+    if plan.get("liquidation_price"):
+        lines.append(f"⚠️ لیکوئید: {_price(plan.get('liquidation_price'))}")
+    if plan.get("expected_profit_usdt"):
+        lines += [
+            "",
+            f"سود خالص در صورت حد سود: {_n(plan.get('expected_profit_usdt'))}$",
+            f"ضرر در صورت حد ضرر: {_n(plan.get('risk_usdt'))}$",
+            f"(کارمزد رفت‌وبرگشت: {_n(plan.get('cost_usdt'))}$)",
+        ]
+    reason = str(cycle.get("entry_reason") or "")
+    if reason:
+        lines += ["", f"🧭 {reason}"]
     return "\n".join(lines)
 
 
@@ -106,23 +117,27 @@ def _wait_reason(storage: Storage) -> str:
 
 
 def _common_lines(storage: Storage) -> list[str]:
+    universe = storage.get_setting("universe", []) or []
     return [
-        f"ارز: {config.TARGET_SYMBOL}",
-        f"لوریج: خودکار (۱ تا {config.STAGED_LEVERAGE_MAX}x بر پایهٔ ایمنی لیکوئید)",
-        f"حالت مارجین: {config.MARGIN_MODE}",
-        f"حداکثر پله: {safe_int(storage.get_setting('max_steps', config.MAX_ENTRY_STEPS))}",
+        f"ارزهای تحت اسکن: {len(universe)}",
+        f"تایم‌فریم: {config.ENTRY_TIMEFRAME} (روند: {config.TREND_TIMEFRAME})",
+        f"حداکثر پوزیشن هم‌زمان: {safe_int(storage.get_setting('max_positions', config.MAX_CONCURRENT_POSITIONS))}",
+        f"آستانهٔ امتیاز: {safe_float(storage.get_setting('score_threshold', config.SCORE_THRESHOLD)):.0f}/100",
+        f"لوریج: تا {safe_int(storage.get_setting('leverage', config.DEFAULT_LEVERAGE))}x  |  {config.MARGIN_MODE}",
+        f"نسبت سود به ضرر: ۱ به {config.RISK_REWARD_RATIO:.1f}",
     ]
 
 
 def _positions_block(cycles: list[dict[str, Any]]) -> list[str]:
     if not cycles:
         return []
-    lines = ["", "📂 پوزیشن‌های باز:"]
+    lines = ["", f"📂 پوزیشن‌های باز ({len(cycles)}):"]
     for c in cycles:
         lines.append(
-            f"  {_side_badge(c.get('side'))} {c.get('symbol')} | "
+            f"  {_side_badge(c.get('side'))} {_coin(c.get('symbol'))} | "
             f"ورود {_price(c.get('avg_entry_price'))} | "
-            f"پله {safe_int(c.get('filled_steps'))}/{safe_int(c.get('planned_steps'))}"
+            f"امتیاز {safe_float(c.get('entry_score')):.0f} | "
+            f"{safe_int(c.get('leverage'))}x"
         )
     return lines
 
@@ -204,21 +219,28 @@ def virtual_trade_panel(storage: Storage) -> str:
 
 
 def result_panel(cycle: dict[str, Any]) -> str:
-    """پنل نتیجه — با ریپلای روی سیگنال اصلی ارسال می‌شود."""
+    """پنل نتیجه — با ریپلای روی پیام سیگنال اصلی ارسال می‌شود."""
     reason = str(cycle.get("exit_reason") or "")
     label = {
         "tp": "🎯 حد سود",
         "stop": "🛑 حد ضرر",
+        "reversal": "↩️ برگشت مومنتوم",
+        "timeout": "⏱ پایان مهلت پوزیشن",
         "manual": "✋️ بستن دستی",
         "liquidation": "💥 لیکوئید",
+        "failed": "⚠️ سفارش ناموفق",
     }.get(reason, reason)
     net = safe_float(cycle.get("net_pnl"))
+    entry = safe_float(cycle.get("avg_entry_price"))
+    exit_price = safe_float(cycle.get("exit_price"))
+    move = ((exit_price / entry - 1.0) * 100.0) if entry > 0 else 0.0
+    if str(cycle.get("side")).upper() == "SHORT":
+        move = -move
     return "\n".join([
-        f"{_side_badge(cycle.get('side'))} — {cycle.get('symbol')}",
+        f"{_side_badge(cycle.get('side'))} — {_coin(cycle.get('symbol'))}",
         f"نتیجه: {label}",
-        f"قیمت خروج: {_price(cycle.get('exit_price'))}",
-        f"میانگین ورود: {_price(cycle.get('avg_entry_price'))}",
-        f"پله‌های مصرف‌شده: {safe_int(cycle.get('filled_steps'))}/{safe_int(cycle.get('planned_steps'))}",
+        f"ورود {_price(entry)} → خروج {_price(exit_price)}  ({move:+.2f}%)",
+        f"امتیاز ورود بود: {safe_float(cycle.get('entry_score')):.0f}/100",
         "",
         f"سود/ضرر خالص: {_pnl(net)}",
         f"(ناخالص {_n(cycle.get('gross_pnl'))}$ − کارمزد {_n(cycle.get('fees'))}$)",
@@ -256,21 +278,38 @@ def stats_panel(storage: Storage) -> str:
 
 def help_text() -> str:
     return "\n".join([
-        "🤖 ربات ورود پله‌ای",
+        "🤖 ربات اسکن چندارزی",
         "",
         "دستورات:",
-        "• ترید فعال / ترید روشن — فعال کردن ترید واقعی",
-        "• ترید غیرفعال / ترید خاموش — بازگشت به حالت مجازی",
-        "• ترید / ترید واقعی — پنل ترید واقعی",
+        "• ترید فعال / ترید خاموش — روشن و خاموش کردن ترید واقعی",
+        "• پنل — پنل ترید واقعی",
         "• ترید مجازی — پنل ترید مجازی",
-        "• چرا — دلیل اینکه چرا الان وارد نمی‌شود",
-        "• حساسیت ۰.۲۵ — آستانهٔ ورود (کمتر = ورود بیشتر)",
-        "• آمار / آمار کل — نمایش آمار",
         "• پوزیشن — پوزیشن‌های باز",
-        "• پله <عدد> — تنظیم حداکثر تعداد پله",
-        "• سقف <عدد> — سقف سرمایهٔ درگیر (۰ = بدون سقف)",
+        "• پوزیشن ۵ — حداکثر پوزیشن هم‌زمان (۱ تا ۳۰)",
+        "• امتیاز ۸۰ — آستانهٔ ورود (۵۵ تا ۹۵؛ بالاتر = محتاط‌تر)",
+        "• اهرم ۵ — سقف لوریج (۱ تا ۱۰)",
+        "• سقف ۵۰ — سقف سرمایهٔ درگیر (۰ = کل موجودی)",
+        "• ارزها — فهرست ارزهای تحت اسکن",
+        "• چرا — دلیل اینکه چرا الان وارد نمی‌شود",
+        "• آمار — آمار واقعی و مجازی",
         "• وضعیت — سلامت سیستم",
     ])
+
+
+def symbols_panel(storage: Storage) -> str:
+    universe = storage.get_setting("universe", []) or []
+    if not universe:
+        return "فهرست ارزها هنوز ساخته نشده — ربات در حال راه‌اندازی است."
+    names = [canonical_base(str(s)) for s in universe]
+    busy = {canonical_base(str(s)) for s in storage.open_symbols()}
+    rows = [
+        f"{'🟡' if n in busy else '▫️'} {n}" for n in names
+    ]
+    lines = [f"🔎 {len(names)} ارز تحت اسکن", ""]
+    for i in range(0, len(rows), 3):
+        lines.append("  ".join(rows[i:i + 3]))
+    lines += ["", "🟡 = پوزیشن باز دارد"]
+    return "\n".join(lines)
 
 
 def health_panel(storage: Storage) -> str:
@@ -316,24 +355,28 @@ class CommandRouter:
         if cmd in {"ترید مجازی", "مجازی", "پنل مجازی", "/virtual"}:
             return virtual_trade_panel(self.storage)
 
-        if cmd.startswith("حساسیت "):
+        if cmd.startswith("امتیاز ") or cmd.startswith("حساسیت "):
             try:
                 value = float(parse_number(cmd.split(" ", 1)[1]))
             except (ValueError, IndexError):
-                return "عدد نامعتبر. مثال: حساسیت ۰.۲۵"
-            if not 0.05 <= value <= 1.0:
-                return "عدد باید بین ۰.۰۵ تا ۱.۰ باشد."
+                return "عدد نامعتبر. مثال: امتیاز ۸۰"
+            if not config.SCORE_THRESHOLD_MIN <= value <= config.SCORE_THRESHOLD_MAX:
+                return (
+                    f"عدد باید بین {config.SCORE_THRESHOLD_MIN:.0f} تا "
+                    f"{config.SCORE_THRESHOLD_MAX:.0f} باشد."
+                )
             self.storage.set_setting("score_threshold", value)
-            hint = "حساس‌تر (ورود بیشتر)" if value < 0.25 else ("محتاط‌تر (ورود کمتر)" if value > 0.25 else "متعادل")
-            return f"✅ آستانهٔ ورود روی {value:.2f} تنظیم شد — {hint}"
+            if value >= 85:
+                hint = "خیلی محتاط — سیگنال کم ولی باکیفیت‌تر"
+            elif value <= 65:
+                hint = "حساس — سیگنال زیاد، کارمزد بیشتر"
+            else:
+                hint = "متعادل"
+            return f"✅ آستانهٔ ورود روی {value:.0f}/100 تنظیم شد — {hint}"
 
         if cmd in {"چرا", "دلیل", "/why"}:
             reason = _wait_reason(self.storage)
             return f"⏳ {reason}" if reason else "دلیلی ثبت نشده — ربات هنوز اولین تحلیل را انجام نداده."
-
-        if cmd in {"تست", "تست مجازی", "/test"}:
-            return ("برای تست، دستور «تست باز» یک چرخهٔ مجازی با قیمت فعلی باز می‌کند "
-                    "(بدون توجه به سیگنال روند). فقط برای دیدن عملکرد پنل‌ها.")
 
         if cmd in {"آمار", "امار", "آمار کل", "امار کل", "/stats"}:
             return stats_panel(self.storage)
@@ -344,17 +387,36 @@ class CommandRouter:
                 return "هیچ پوزیشن بازی وجود ندارد."
             return "\n\n".join(position_panel(c) for c in cycles)
 
+        if cmd in {"ارزها", "ارز ها", "لیست ارز", "نمادها", "/symbols"}:
+            return symbols_panel(self.storage)
+
         if cmd in {"وضعیت", "سلامت", "/health"}:
             return health_panel(self.storage)
 
-        if cmd.startswith("پله "):
+        if cmd.startswith("پوزیشن ") and cmd.split(" ", 1)[1].strip().isdigit():
             try:
                 value = int(parse_number(cmd.split(" ", 1)[1]))
             except (ValueError, IndexError):
-                return "عدد نامعتبر است. مثال: پله ۳"
-            value = max(1, min(value, config.MAX_ENTRY_STEPS_LIMIT))
-            self.storage.set_setting("max_steps", value)
-            return f"✅ حداکثر پله روی {value} تنظیم شد."
+                return "عدد نامعتبر است. مثال: پوزیشن ۵"
+            value = max(1, min(value, config.MAX_CONCURRENT_LIMIT))
+            self.storage.set_setting("max_positions", value)
+            return (
+                f"✅ حداکثر پوزیشن هم‌زمان روی {value} تنظیم شد.\n"
+                "سرمایه بین همین تعداد اسلات پخش می‌شود — تعداد بیشتر یعنی "
+                "پوزیشن‌های کوچک‌تر و پخش‌شده‌تر."
+            )
+
+        if cmd.startswith("اهرم ") or cmd.startswith("لوریج "):
+            try:
+                value = int(parse_number(cmd.split(" ", 1)[1]))
+            except (ValueError, IndexError):
+                return "عدد نامعتبر است. مثال: اهرم ۵"
+            value = max(config.LEVERAGE_MIN, min(value, config.LEVERAGE_MAX))
+            self.storage.set_setting("leverage", value)
+            return (
+                f"✅ سقف لوریج روی {value}x تنظیم شد.\n"
+                "ربات کم‌ریسک‌ترین لوریجی را که هنوز بعد از کارمزد صرف کند انتخاب می‌کند."
+            )
 
         if cmd.startswith("سقف "):
             try:

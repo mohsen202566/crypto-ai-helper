@@ -1,4 +1,4 @@
-"""نقطهٔ شروع ربات ورود پله‌ای."""
+"""نقطهٔ شروع ربات اسکن چندارزی."""
 from __future__ import annotations
 
 import signal as sigmod
@@ -57,9 +57,11 @@ class Application:
         while not self.stop_event.is_set():
             try:
                 self.engine.startup()
+                universe = self.storage.get_setting("universe", []) or []
                 self.storage.queue_message(
-                    "✅ ربات ورود پله‌ای آماده شد.\n"
-                    f"ارز: {self.engine.symbol}\n"
+                    "✅ ربات آماده شد.\n"
+                    f"ارزهای تحت اسکن: {len(universe)}\n"
+                    f"تایم‌فریم: {config.ENTRY_TIMEFRAME}\n"
                     "ترید واقعی خاموش است؛ با دستور «ترید فعال» روشن می‌شود.\n"
                     "برای دیدن وضعیت: «پنل»"
                 )
@@ -83,11 +85,13 @@ class Application:
         self._spawn("telegram-notify", self.telegram.notification_loop)
         self._spawn("startup", self._startup_loop)
 
-        self._periodic("engine-tick", config.PRICE_CHECK_SECONDS, self.engine.tick)
+        self._periodic("engine-tick", config.POSITION_MONITOR_SECONDS, self.engine.tick)
         self._periodic("real-monitor", config.REAL_MONITOR_SECONDS,
                        self.engine.monitor_real, require_ready=False)
         self._periodic("balance-refresh", config.BALANCE_REFRESH_SECONDS,
                        lambda: self.engine.refresh_balance(force=True), require_ready=False)
+        self._periodic("universe-refresh", config.SYMBOL_REFRESH_SECONDS,
+                       lambda: self.engine.refresh_universe(force=True))
 
     def run_forever(self) -> None:
         self.start()
