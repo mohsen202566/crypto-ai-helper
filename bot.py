@@ -374,11 +374,27 @@ class BotEngine:
             f"{len(candidates)} نامزد از {scanned} ارز | {free_slots} اسلات خالی",
         )
 
+        opened = 0
+        rejected: list[str] = []
         for candidate in candidates[:free_slots]:
-            self.open_position(candidate, mode=mode, capital=capital)
+            if self.open_position(candidate, mode=mode, capital=capital):
+                opened += 1
+            else:
+                rejected.append(canonical_base(candidate.symbol))
+
+        if opened:
+            # وضعیت ریسک تازه می‌شود تا دلیل قدیمی روی صفحه نماند.
+            self.storage.set_health("risk", "ok", f"{opened} پوزیشن جدید باز شد")
+        elif rejected:
+            self.storage.set_health(
+                "scan", "ok",
+                f"{len(candidates)} نامزد داشتیم ولی هیچ‌کدام باز نشد "
+                f"({'، '.join(rejected[:4])}) — دلیل در «چرا»",
+            )
 
     # --- باز کردن پوزیشن --------------------------------------------------
-    def open_position(self, candidate: strategy.SymbolScore, *, mode: str, capital: float) -> None:
+    def open_position(self, candidate: strategy.SymbolScore, *, mode: str, capital: float) -> bool:
+        """پوزیشن را باز می‌کند. خروجی True یعنی موفق بود."""
         symbol = candidate.symbol
         contracts = self._refresh_contracts()
         info = contracts.get(symbol, {})
@@ -392,7 +408,7 @@ class BotEngine:
         except Exception:
             price = candidate.price
         if price <= 0:
-            return
+            return False
 
         margin = risk_engine.slot_margin(
             capital_usdt=capital,
@@ -411,7 +427,7 @@ class BotEngine:
             else:
                 detail = "سقف درگیری سرمایه پر است"
             self.storage.set_health("risk", "ok", detail)
-            return
+            return False
 
         # لوریج دقیقاً همانی است که کاربر تعیین کرده — نه بیشتر، نه کمتر.
         plan = risk_engine.plan_entry(
@@ -427,7 +443,7 @@ class BotEngine:
         if not plan.ok:
             self.storage.set_health("risk", "ok", f"{canonical_base(symbol)}: {plan.reason}")
             logger.info("ENTRY_REJECTED | %s | %s", symbol, plan.reason)
-            return
+            return False
 
         cycle_id = self.storage.create_cycle(
             symbol=symbol,
@@ -471,7 +487,7 @@ class BotEngine:
                 self.storage.queue_message(
                     f"❌ ارسال سفارش {canonical_base(symbol)} ناموفق بود:\n{exc}"
                 )
-                return
+                return False
 
         self.storage.mark_step_filled(
             cycle_id=cycle_id, step_index=1, fill_price=price,
@@ -493,6 +509,7 @@ class BotEngine:
             "POSITION_OPEN | %s %s score=%.0f lev=%sx margin=%.2f",
             symbol, plan.side, candidate.score, plan.leverage, actual_margin,
         )
+        return True
 
     # --- بستن پوزیشن ------------------------------------------------------
     def close_position(self, cycle: dict[str, Any], *, exit_price: float,

@@ -120,15 +120,32 @@ def position_panel(cycle: dict[str, Any], plan: dict[str, Any] | None = None) ->
 
 
 def _wait_reason(storage: Storage) -> str:
-    """آخرین دلیلی که ربات وارد نشده — برای اینکه بدانی منتظر چیست.
+    """آخرین دلیلی که ربات وارد نشده.
 
-    ترتیب اهمیت: اول دلیل رد شدن در محاسبهٔ ریسک، بعد نتیجهٔ اسکن.
+    مهم: بین ردیف‌های سلامت، **تازه‌ترین** انتخاب می‌شود، نه اولی که پیدا شد.
+    وگرنه یک دلیل قدیمی (مثلاً رد شدن با تنظیمات قبلی) تا ابد نمایش داده
+    می‌شود و کاربر فکر می‌کند مشکل هنوز پابرجاست.
     """
-    rows = {str(r.get("component")): str(r.get("detail") or "") for r in storage.health_rows()}
-    for key in ("risk", "scan", "universe"):
-        if rows.get(key):
-            return rows[key]
-    return ""
+    best_detail = ""
+    best_ts = -1
+    for row in storage.health_rows():
+        if str(row.get("component")) not in {"risk", "scan", "universe"}:
+            continue
+        detail = str(row.get("detail") or "")
+        if not detail:
+            continue
+        ts = safe_int(row.get("ts"))
+        if ts > best_ts:
+            best_ts, best_detail = ts, detail
+
+    if not best_detail:
+        return ""
+    age = max(0, int((time.time() * 1000 - best_ts) / 1000)) if best_ts > 0 else 0
+    if age < 90:
+        return best_detail
+    if age < 3600:
+        return f"{best_detail}  ({age // 60} دقیقه پیش)"
+    return f"{best_detail}  ({age // 3600} ساعت پیش)"
 
 
 def _size_label(storage: Storage, balance: float = 0.0) -> list[str]:
