@@ -356,6 +356,21 @@ class BotEngine:
                 best_rejected = result
 
         if not candidates:
+            self.storage.set_setting("last_scan_report", {
+                "ts": now_ms(),
+                "scanned": scanned,
+                "candidates": 0,
+                "free_slots": free_slots,
+                "threshold": threshold,
+                "opened": 0,
+                "rows": [],
+                "best_rejected": (
+                    {"symbol": canonical_base(best_rejected.symbol),
+                     "score": round(best_rejected.score, 1),
+                     "why": best_rejected.reason}
+                    if best_rejected else None
+                ),
+            })
             detail = (
                 f"{scanned} ارز اسکن شد — هیچ‌کدام به آستانهٔ {threshold:.0f} نرسید"
             )
@@ -375,26 +390,51 @@ class BotEngine:
         )
 
         opened = 0
-        rejected: list[str] = []
+        report: list[dict[str, Any]] = []
         for candidate in candidates[:free_slots]:
-            if self.open_position(candidate, mode=mode, capital=capital):
+            ok, why = self.open_position(candidate, mode=mode, capital=capital)
+            report.append({
+                "symbol": canonical_base(candidate.symbol),
+                "side": candidate.side,
+                "score": round(candidate.score, 1),
+                "ok": ok,
+                "why": why,
+            })
+            if ok:
                 opened += 1
-            else:
-                rejected.append(canonical_base(candidate.symbol))
+
+        # گزارش کامل ذخیره می‌شود تا «چرا» بتواند دلیل تک‌تک ارزها را نشان دهد.
+        self.storage.set_setting("last_scan_report", {
+            "ts": now_ms(),
+            "scanned": scanned,
+            "candidates": len(candidates),
+            "free_slots": free_slots,
+            "threshold": threshold,
+            "opened": opened,
+            "rows": report,
+            "best_rejected": (
+                {"symbol": canonical_base(best_rejected.symbol),
+                 "score": round(best_rejected.score, 1),
+                 "why": best_rejected.reason}
+                if best_rejected else None
+            ),
+        })
 
         if opened:
-            # وضعیت ریسک تازه می‌شود تا دلیل قدیمی روی صفحه نماند.
             self.storage.set_health("risk", "ok", f"{opened} پوزیشن جدید باز شد")
-        elif rejected:
+        elif report:
+            first = report[0]
             self.storage.set_health(
                 "scan", "ok",
-                f"{len(candidates)} نامزد داشتیم ولی هیچ‌کدام باز نشد "
-                f"({'، '.join(rejected[:4])}) — دلیل در «چرا»",
+                f"{len(candidates)} نامزد داشتیم ولی هیچ‌کدام باز نشد — "
+                f"{first['symbol']}: {first['why'][:90]}",
             )
 
     # --- باز کردن پوزیشن --------------------------------------------------
-    def open_position(self, candidate: strategy.SymbolScore, *, mode: str, capital: float) -> bool:
-        """پوزیشن را باز می‌کند. خروجی True یعنی موفق بود."""
+    def open_position(
+        self, candidate: strategy.SymbolScore, *, mode: str, capital: float
+    ) -> tuple[bool, str]:
+        """پوزیشن را باز می‌کند. خروجی: (موفق بود؟، دلیل اگر نشد)."""
         symbol = candidate.symbol
         contracts = self._refresh_contracts()
         info = contracts.get(symbol, {})
@@ -408,7 +448,7 @@ class BotEngine:
         except Exception:
             price = candidate.price
         if price <= 0:
-            return False
+            return False, "قیمت لحظه‌ای از صرافی گرفته نشد"
 
         margin = risk_engine.slot_margin(
             capital_usdt=capital,
@@ -427,7 +467,7 @@ class BotEngine:
             else:
                 detail = "سقف درگیری سرمایه پر است"
             self.storage.set_health("risk", "ok", detail)
-            return False
+            return False, detail
 
         # لوریج دقیقاً همانی است که کاربر تعیین کرده — نه بیشتر، نه کمتر.
         plan = risk_engine.plan_entry(
@@ -443,7 +483,7 @@ class BotEngine:
         if not plan.ok:
             self.storage.set_health("risk", "ok", f"{canonical_base(symbol)}: {plan.reason}")
             logger.info("ENTRY_REJECTED | %s | %s", symbol, plan.reason)
-            return False
+            return False, plan.reason
 
         cycle_id = self.storage.create_cycle(
             symbol=symbol,
@@ -487,7 +527,7 @@ class BotEngine:
                 self.storage.queue_message(
                     f"❌ ارسال سفارش {canonical_base(symbol)} ناموفق بود:\n{exc}"
                 )
-                return False
+                return False, f"سفارش صرافی ناموفق: {exc}"
 
         self.storage.mark_step_filled(
             cycle_id=cycle_id, step_index=1, fill_price=price,
@@ -509,7 +549,7 @@ class BotEngine:
             "POSITION_OPEN | %s %s score=%.0f lev=%sx margin=%.2f",
             symbol, plan.side, candidate.score, plan.leverage, actual_margin,
         )
-        return True
+        return True, ""
 
     # --- بستن پوزیشن ------------------------------------------------------
     def close_position(self, cycle: dict[str, Any], *, exit_price: float,

@@ -453,6 +453,57 @@ def summary_panel(cycles: list[dict[str, Any]], title: str) -> str:
     return "\n".join(lines)
 
 
+def why_panel(storage: Storage) -> str:
+    """گزارش کامل آخرین اسکن — دقیقاً چه شد و هر ارز چرا رد شد."""
+    report = storage.get_setting("last_scan_report", None)
+    if not isinstance(report, dict) or not report:
+        fallback = _wait_reason(storage)
+        return f"⏳ {fallback}" if fallback else "هنوز اولین اسکن انجام نشده."
+
+    ts = safe_int(report.get("ts"))
+    age = max(0, int((time.time() * 1000 - ts) / 1000)) if ts else 0
+    when = f"{age} ثانیه پیش" if age < 90 else f"{age // 60} دقیقه پیش"
+
+    scanned = safe_int(report.get("scanned"))
+    cands = safe_int(report.get("candidates"))
+    opened = safe_int(report.get("opened"))
+    slots = safe_int(report.get("free_slots"))
+    threshold = safe_float(report.get("threshold"))
+
+    lines = [
+        f"🔍 آخرین اسکن ({when})",
+        "",
+        f"ارز بررسی‌شده: {scanned}",
+        f"آستانهٔ امتیاز: {threshold:.0f}",
+        f"نامزد (امتیاز کافی): {cands}",
+        f"اسلات خالی: {slots}",
+        f"پوزیشن باز شد: {opened}",
+    ]
+
+    rows = report.get("rows") or []
+    if rows:
+        lines += ["", "نتیجهٔ هر نامزد:"]
+        for r in rows:
+            icon = "✅" if r.get("ok") else "⛔️"
+            side = "لانگ" if str(r.get("side")).upper() == "LONG" else "شورت"
+            head = f"{icon} {r.get('symbol')} {side} (امتیاز {safe_float(r.get('score')):.0f})"
+            lines.append(head)
+            if not r.get("ok"):
+                lines.append(f"    └ {str(r.get('why') or 'دلیل ثبت نشده')}")
+    elif cands == 0:
+        best = report.get("best_rejected")
+        if isinstance(best, dict) and best.get("symbol"):
+            lines += [
+                "",
+                f"نزدیک‌ترین به آستانه: {best.get('symbol')} با امتیاز "
+                f"{safe_float(best.get('score')):.0f}",
+                f"    └ {str(best.get('why') or '')}",
+            ]
+        lines += ["", "این عادی است — بیشتر وقت‌ها هیچ ارزی امتیاز کافی ندارد."]
+
+    return "\n".join(lines)
+
+
 def help_text() -> str:
     return "\n".join([
         "🤖 ربات اسکن چندارزی",
@@ -590,8 +641,7 @@ class CommandRouter:
             return f"✅ آستانهٔ ورود روی {value:.0f}/100 تنظیم شد — {hint}"
 
         if cmd in {"چرا", "دلیل", "/why"}:
-            reason = _wait_reason(self.storage)
-            return f"⏳ {reason}" if reason else "دلیلی ثبت نشده — ربات هنوز اولین تحلیل را انجام نداده."
+            return why_panel(self.storage)
 
         if cmd in {"آمار", "امار", "آمار کل", "امار کل", "/stats"}:
             return stats_panel(self.storage)
