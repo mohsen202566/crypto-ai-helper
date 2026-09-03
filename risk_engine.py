@@ -283,22 +283,30 @@ def slot_margin(
 ) -> float:
     """مارجین هر پوزیشن.
 
-    دو حالت:
-      • ``fixed_size_usdt`` بزرگ‌تر از صفر → همان عدد ثابت برای هر پوزیشن
-        (کاربر خودش تعیین کرده مثلاً هر پوزیشن ۱۰ دلار).
-      • صفر → خودکار: سرمایهٔ مجاز بین اسلات‌ها پخش می‌شود.
+    دو حالت کاملاً متفاوت:
 
-    در هر دو حالت سقف درگیری کل رعایت می‌شود: مجموع مارجین پوزیشن‌های باز
-    به‌علاوهٔ این پوزیشن از ``MAX_CAPITAL_ENGAGED_RATE`` × سرمایه بیشتر نمی‌شود.
+    • **اندازهٔ ثابت** (``fixed_size_usdt`` > 0): کاربر گفته هر پوزیشن دقیقاً
+      چند دلار باشد. این عدد هرگز کوچک نمی‌شود — یا دقیقاً همان مقدار باز
+      می‌شود، یا اگر موجودی آزاد کافی نباشد صفر برمی‌گردد و ورود انجام
+      نمی‌شود. مبنای موجودی آزاد در این حالت کل سرمایه است، نه درصد آن،
+      چون خودِ کاربر با تعیین عدد، ریسکش را انتخاب کرده.
+
+    • **خودکار** (صفر): سرمایهٔ مجاز (``MAX_CAPITAL_ENGAGED_RATE`` × سرمایه)
+      بین اسلات‌ها پخش می‌شود و با پر شدن اسلات‌ها کوچک‌تر می‌شود.
     """
     capital = max(0.0, safe_float(capital_usdt))
     slots = max(1, int(max_positions))
-    budget = capital * config.MAX_CAPITAL_ENGAGED_RATE
-    remaining = max(0.0, budget - max(0.0, safe_float(open_margin_usdt)))
-
+    used = max(0.0, safe_float(open_margin_usdt))
     fixed = max(0.0, safe_float(fixed_size_usdt))
-    per_slot = fixed if fixed > 0 else (budget / slots)
-    return min(per_slot, remaining)
+
+    if fixed > 0:
+        free = capital - used
+        # یا دقیقاً همان عدد، یا هیچ. هرگز نصفه‌نیمه.
+        return fixed if free >= fixed else 0.0
+
+    budget = capital * config.MAX_CAPITAL_ENGAGED_RATE
+    remaining = max(0.0, budget - used)
+    return min(budget / slots, remaining)
 
 
 def position_snapshot(

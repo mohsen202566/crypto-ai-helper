@@ -401,16 +401,26 @@ class BotEngine:
             fixed_size_usdt=self.position_size(),
         )
         if margin <= 0:
-            self.storage.set_health("risk", "ok", "سقف درگیری سرمایه پر است")
+            fixed = self.position_size()
+            if fixed > 0:
+                free = capital - self.storage.open_margin_total()
+                detail = (
+                    f"هر پوزیشن {fixed:,.2f}$ تنظیم شده ولی فقط {free:,.2f}$ آزاد است — "
+                    "یا «دلار» را کم کنید یا «پوزیشن» را"
+                )
+            else:
+                detail = "سقف درگیری سرمایه پر است"
+            self.storage.set_health("risk", "ok", detail)
             return
 
-        plan = risk_engine.best_leverage_for_entry(
+        # لوریج دقیقاً همانی است که کاربر تعیین کرده — نه بیشتر، نه کمتر.
+        plan = risk_engine.plan_entry(
             symbol=symbol,
             side=candidate.side or "LONG",
             entry_price=price,
             atr_value=candidate.atr_value,
             slot_margin_usdt=margin,
-            max_leverage=self.leverage(),
+            leverage=self.leverage(),
             min_qty=min_qty,
             min_notional=min_notional,
         )

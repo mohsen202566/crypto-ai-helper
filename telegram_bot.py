@@ -131,22 +131,62 @@ def _wait_reason(storage: Storage) -> str:
     return ""
 
 
-def _size_label(storage: Storage) -> str:
-    size = safe_float(storage.get_setting("position_size", config.POSITION_SIZE_USDT))
-    if size > 0:
-        return f"{size:,.2f}$ ثابت"
-    return "خودکار (تقسیم سرمایه بین اسلات‌ها)"
+def _size_label(storage: Storage, balance: float = 0.0) -> list[str]:
+    """اندازهٔ هر پوزیشن — همیشه با عدد دلاری واقعی و ارزش پوزیشن با لوریج."""
+    import risk_engine
+
+    slots = max(1, safe_int(storage.get_setting("max_positions", config.MAX_CONCURRENT_POSITIONS)))
+    fixed = safe_float(storage.get_setting("position_size", config.POSITION_SIZE_USDT))
+    leverage = max(1, safe_int(storage.get_setting("leverage", config.DEFAULT_LEVERAGE)))
+    used = safe_float(storage.open_margin_total())
+
+    if fixed > 0:
+        margin = fixed
+        source = "ثابت (تنظیم شما)"
+    elif balance > 0:
+        budget = balance * config.MAX_CAPITAL_ENGAGED_RATE
+        margin = budget / slots
+        source = (
+            f"خودکار — {balance:,.2f}$ × "
+            f"{config.MAX_CAPITAL_ENGAGED_RATE * 100:.0f}٪ ÷ {slots} اسلات"
+        )
+    else:
+        return [f"💵 مارجین هر پوزیشن: خودکار (تقسیم بین {slots} اسلات)"]
+
+    lines = [
+        f"💵 مارجین هر پوزیشن: {margin:,.2f}$   ({source})",
+        f"   ارزش پوزیشن با {leverage}x: {margin * leverage:,.2f}$",
+        f"   مجموع در صورت پر شدن {slots} اسلات: {margin * slots:,.2f}$",
+    ]
+
+    if balance > 0:
+        if fixed > 0:
+            free = balance - used
+            if free < fixed:
+                lines.append(
+                    f"   ⛔️ فقط {free:,.2f}$ آزاد است — پوزیشن جدید باز نمی‌شود"
+                )
+            elif fixed * slots > balance:
+                possible = max(1, int(balance // fixed))
+                lines.append(
+                    f"   ⚠️ موجودی فقط برای {possible} پوزیشن کافی است، نه {slots} تا"
+                )
+        else:
+            free = max(0.0, balance * config.MAX_CAPITAL_ENGAGED_RATE - used)
+            if free < margin:
+                lines.append(f"   ⏳ فعلاً {free:,.2f}$ آزاد است (بقیه درگیر پوزیشن‌های باز)")
+    return lines
 
 
-def _common_lines(storage: Storage) -> list[str]:
+def _common_lines(storage: Storage, balance: float = 0.0) -> list[str]:
     universe = storage.get_setting("universe", []) or []
     return [
         f"ارزهای تحت اسکن: {len(universe)}",
         f"تایم‌فریم: {config.ENTRY_TIMEFRAME} (روند: {config.TREND_TIMEFRAME})",
         f"حداکثر پوزیشن هم‌زمان: {safe_int(storage.get_setting('max_positions', config.MAX_CONCURRENT_POSITIONS))}",
-        f"اندازهٔ هر پوزیشن: {_size_label(storage)}",
+        *_size_label(storage, balance),
         f"آستانهٔ امتیاز: {safe_float(storage.get_setting('score_threshold', config.SCORE_THRESHOLD)):.0f}/100",
-        f"لوریج: تا {safe_int(storage.get_setting('leverage', config.DEFAULT_LEVERAGE))}x  |  {config.MARGIN_MODE}",
+        f"لوریج: {safe_int(storage.get_setting('leverage', config.DEFAULT_LEVERAGE))}x  |  {config.MARGIN_MODE}",
         f"نسبت سود به ضرر: ۱ به {config.RISK_REWARD_RATIO:.1f}",
     ]
 
@@ -184,7 +224,7 @@ def real_trade_panel(storage: Storage) -> str:
         "",
         f"ترید واقعی: {'✅ فعال' if real_on else '⛔️ خاموش'}",
     ]
-    lines += _common_lines(storage)
+    lines += _common_lines(storage, balance)
     lines += [
         "",
         f"🏦 موجودی توبیت: {_n(balance)}${age}",
@@ -229,7 +269,7 @@ def virtual_trade_panel(storage: Storage) -> str:
         "",
         f"وضعیت: {_virtual_state(storage, real_on)}",
     ]
-    lines += _common_lines(storage)
+    lines += _common_lines(storage, balance)
     lines += [
         "",
         f"💰 موجودی مجازی: {_n(balance)}$",
@@ -621,11 +661,36 @@ class CommandRouter:
                 )
             self.storage.set_setting("position_size", value)
             slots = safe_int(self.storage.get_setting("max_positions", config.MAX_CONCURRENT_POSITIONS))
-            return (
-                f"✅ مارجین هر پوزیشن روی {value:,.2f}$ تنظیم شد.\n"
-                f"با {slots} پوزیشن هم‌زمان، حداکثر {value * slots:,.2f}$ درگیر می‌شود.\n"
-                "اگر این مقدار از سقف مجاز سرمایه بیشتر باشد، ربات خودش کمترش می‌کند."
-            )
+            lev = safe_int(self.storage.get_setting("leverage", config.DEFAULT_LEVERAGE))
+            real_on = bool(self.storage.get_setting("real_trading_enabled", False))
+            if real_on:
+                balance, _ = self.storage.cached_balance()
+            else:
+                balance = safe_float(self.storage.get_setting("virtual_balance", 0.0))
+
+            out = [
+                f"✅ هر پوزیشن دقیقاً {value:,.2f}$ مارجین می‌گیرد.",
+                "",
+                f"با لوریج {lev}x → ارزش هر پوزیشن {value * lev:,.2f}$",
+                f"با {slots} پوزیشن هم‌زمان → مجموع {value * slots:,.2f}$ درگیر",
+                f"موجودی فعلی: {balance:,.2f}$",
+            ]
+            if balance > 0 and value > balance:
+                out += [
+                    "",
+                    f"⛔️ این عدد از کل موجودی ({balance:,.2f}$) بیشتر است — "
+                    "هیچ پوزیشنی باز نمی‌شود.",
+                    f"بیشترین مقدار ممکن: «دلار {balance:,.0f}»",
+                ]
+            elif balance > 0 and value * slots > balance:
+                possible = max(1, int(balance // value))
+                out += [
+                    "",
+                    f"⚠️ موجودی برای {slots} اسلات کافی نیست — عملاً {possible} "
+                    f"پوزیشن باز می‌شود.",
+                    f"برای اصلاح: «پوزیشن {possible}» یا «دلار {balance / slots:,.0f}»",
+                ]
+            return "\n".join(out)
 
         if cmd.startswith("گزارش "):
             try:
@@ -645,10 +710,10 @@ class CommandRouter:
                 return "عدد نامعتبر است. مثال: اهرم ۵"
             value = max(config.LEVERAGE_MIN, min(value, config.LEVERAGE_MAX))
             self.storage.set_setting("leverage", value)
-            note = (
-                f"✅ سقف لوریج روی {value}x تنظیم شد.\n"
-                "ربات کم‌ریسک‌ترین لوریجی را که هنوز بعد از کارمزد صرف کند انتخاب می‌کند."
-            )
+            size = safe_float(self.storage.get_setting("position_size", config.POSITION_SIZE_USDT))
+            note = f"✅ لوریج روی {value}x تنظیم شد — همین عدد برای همهٔ پوزیشن‌ها استفاده می‌شود."
+            if size > 0:
+                note += f"\nبا مارجین {size:,.2f}$ → ارزش هر پوزیشن {size * value:,.2f}$"
             if value >= 25:
                 note += (
                     f"\n\n⚠️ با {value}x فاصلهٔ لیکوئید حدود {100.0 / value:.1f}٪ است. "
