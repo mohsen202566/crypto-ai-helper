@@ -246,6 +246,7 @@ def best_leverage_for_entry(
     entry_price: float,
     atr_value: float,
     slot_margin_usdt: float,
+    max_leverage: int | None = None,
     min_qty: float = 0.0,
     min_notional: float = 0.0,
 ) -> EntryPlan:
@@ -255,8 +256,10 @@ def best_leverage_for_entry(
     فقط وقتی استفاده می‌شود که بدون آن حجم پوزیشن آن‌قدر کوچک شود که کارمزد
     سود را بخورد.
     """
+    ceiling = int(max_leverage or config.LEVERAGE_MAX)
+    ceiling = int(clamp(ceiling, config.LEVERAGE_MIN, config.LEVERAGE_MAX))
     last: EntryPlan | None = None
-    for lev in range(config.LEVERAGE_MIN, config.LEVERAGE_MAX + 1):
+    for lev in range(config.LEVERAGE_MIN, ceiling + 1):
         plan = plan_entry(
             symbol=symbol, side=side, entry_price=entry_price, atr_value=atr_value,
             slot_margin_usdt=slot_margin_usdt, leverage=lev,
@@ -267,23 +270,34 @@ def best_leverage_for_entry(
         last = plan
     return last or plan_entry(
         symbol=symbol, side=side, entry_price=entry_price, atr_value=atr_value,
-        slot_margin_usdt=slot_margin_usdt,
+        slot_margin_usdt=slot_margin_usdt, leverage=ceiling,
     )
 
 
 def slot_margin(
-    *, capital_usdt: float, max_positions: int, open_margin_usdt: float = 0.0
+    *,
+    capital_usdt: float,
+    max_positions: int,
+    open_margin_usdt: float = 0.0,
+    fixed_size_usdt: float = 0.0,
 ) -> float:
-    """مارجین هر اسلات — سرمایه بین تعداد پوزیشن هم‌زمان پخش می‌شود.
+    """مارجین هر پوزیشن.
 
-    سقف درگیری کل هم رعایت می‌شود: مجموع مارجین پوزیشن‌های باز به‌علاوهٔ این
-    اسلات جدید هرگز از ``MAX_CAPITAL_ENGAGED_RATE`` × سرمایه بیشتر نمی‌شود.
+    دو حالت:
+      • ``fixed_size_usdt`` بزرگ‌تر از صفر → همان عدد ثابت برای هر پوزیشن
+        (کاربر خودش تعیین کرده مثلاً هر پوزیشن ۱۰ دلار).
+      • صفر → خودکار: سرمایهٔ مجاز بین اسلات‌ها پخش می‌شود.
+
+    در هر دو حالت سقف درگیری کل رعایت می‌شود: مجموع مارجین پوزیشن‌های باز
+    به‌علاوهٔ این پوزیشن از ``MAX_CAPITAL_ENGAGED_RATE`` × سرمایه بیشتر نمی‌شود.
     """
     capital = max(0.0, safe_float(capital_usdt))
     slots = max(1, int(max_positions))
     budget = capital * config.MAX_CAPITAL_ENGAGED_RATE
     remaining = max(0.0, budget - max(0.0, safe_float(open_margin_usdt)))
-    per_slot = budget / slots
+
+    fixed = max(0.0, safe_float(fixed_size_usdt))
+    per_slot = fixed if fixed > 0 else (budget / slots)
     return min(per_slot, remaining)
 
 

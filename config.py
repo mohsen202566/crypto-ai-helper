@@ -185,6 +185,13 @@ MIN_CAPITAL_TO_TRADE_USDT = float(os.getenv("MIN_CAPITAL_TO_TRADE_USDT", "10"))
 # سقف درصدی از کل سرمایه که همهٔ پوزیشن‌های باز روی هم مجازند درگیر کنند.
 MAX_CAPITAL_ENGAGED_RATE = float(os.getenv("MAX_CAPITAL_ENGAGED_RATE", "0.6"))
 
+# --- اندازهٔ هر پوزیشن ---
+# دلار مارجین هر پوزیشن. صفر = خودکار (سرمایه بین اسلات‌ها پخش می‌شود).
+# از تلگرام با «دلار ۱۰» تنظیم می‌شود.
+POSITION_SIZE_USDT = float(os.getenv("POSITION_SIZE_USDT", "0"))
+POSITION_SIZE_MIN = 1.0
+POSITION_SIZE_MAX = 1_000.0
+
 # --- تعداد پوزیشن هم‌زمان ---
 # از تلگرام با «پوزیشن ۵» تغییر می‌کند. سرمایه بین این تعداد اسلات پخش می‌شود.
 MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "3"))
@@ -195,7 +202,9 @@ ONE_POSITION_PER_SYMBOL = True
 # --- لوریج و مارجین ---
 DEFAULT_LEVERAGE = int(os.getenv("DEFAULT_LEVERAGE", "5"))
 LEVERAGE_MIN = 1
-LEVERAGE_MAX = int(os.getenv("LEVERAGE_MAX", "10"))
+# سقف مجاز تنظیم کاربر. لوریج بالا فاصلهٔ لیکوئید را کوچک می‌کند
+# (فاصله ≈ ۱÷لوریج)، ولی حد ضرر همیشه خیلی زودتر از لیکوئید فعال می‌شود.
+LEVERAGE_MAX = int(os.getenv("LEVERAGE_MAX", "100"))
 MARGIN_MODE = os.getenv("MARGIN_MODE", "ISOLATED").strip().upper()
 MAINTENANCE_MARGIN_RATE = float(os.getenv("MAINTENANCE_MARGIN_RATE", "0.005"))
 # حد ضرر باید همیشه خیلی زودتر از لیکوئید فعال شود.
@@ -261,11 +270,21 @@ MIN_PROFIT_TO_COST_RATIO = float(os.getenv("MIN_PROFIT_TO_COST_RATIO", "2.5"))
 
 # --- حالت ترید ---
 DEFAULT_REAL_TRADING_ENABLED = False
+# ترید مجازی مستقل روشن/خاموش می‌شود؛ اگر هر دو خاموش باشند ربات فقط اسکن می‌کند.
+DEFAULT_VIRTUAL_TRADING_ENABLED = True
 
 # --- اقتصاد معامله ---
 TAKER_FEE_RATE = float(os.getenv("TOOBIT_TAKER_FEE_RATE", "0.0005"))
 ROUND_TRIP_SLIPPAGE_RATE = float(os.getenv("ROUND_TRIP_SLIPPAGE_RATE", "0.0006"))
 FUNDING_RESERVE_RATE = float(os.getenv("FUNDING_RESERVE_RATE", "0.0002"))
+
+# --- گزارش‌دهی تلگرام ---
+# گزارش لحظه‌ای پوزیشن‌های باز؛ صفر = خاموش. از تلگرام: «گزارش ۱۰»
+LIVE_REPORT_MINUTES = int(os.getenv("LIVE_REPORT_MINUTES", "15"))
+LIVE_REPORT_MIN = 0
+LIVE_REPORT_MAX = 240
+# خلاصهٔ روزانه در پایان هر روز
+DAILY_SUMMARY_ENABLED = os.getenv("DAILY_SUMMARY_ENABLED", "1").strip() not in {"0", "false", "no"}
 
 # --- زمان‌بندی حلقه‌ها ---
 CONTRACT_REFRESH_SECONDS = int(os.getenv("CONTRACT_REFRESH_SECONDS", "300"))

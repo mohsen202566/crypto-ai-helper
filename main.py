@@ -19,7 +19,8 @@ class Application:
         self.storage = Storage()
         self.toobit = ToobitClient()
         self.engine = BotEngine(self.storage, self.toobit)
-        self.telegram = TelegramBot(self.storage)
+        # «زنده» باید قیمت لحظه‌ای بگیرد، پس به موتور وصل می‌شود.
+        self.telegram = TelegramBot(self.storage, live_provider=self.engine.live_report_text)
         self.stop_event = threading.Event()
         self.threads: list[threading.Thread] = []
         self.closed = False

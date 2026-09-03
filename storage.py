@@ -98,10 +98,13 @@ CREATE TABLE IF NOT EXISTS health (
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     "real_trading_enabled": False,
+    "virtual_trading_enabled": config.DEFAULT_VIRTUAL_TRADING_ENABLED,
     "startup_ready": False,
     "startup_phase": "در حال راه‌اندازی",
     "virtual_balance": config.VIRTUAL_START_CAPITAL_USDT,
     "max_positions": config.MAX_CONCURRENT_POSITIONS,
+    "position_size": config.POSITION_SIZE_USDT,
+    "live_report_minutes": config.LIVE_REPORT_MINUTES,
     "score_threshold": config.SCORE_THRESHOLD,
     "leverage": config.DEFAULT_LEVERAGE,
     "margin_mode": config.MARGIN_MODE,
@@ -423,6 +426,34 @@ class Storage:
             "pnl_total": safe_float(closed["pnl"]),
             "pnl_today": safe_float(today["pnl"]),
         }
+
+    def closed_since(self, since_ms: int, mode: str | None = None) -> list[dict[str, Any]]:
+        """پوزیشن‌های بسته‌شده بعد از یک زمان مشخص — برای خلاصهٔ دوره‌ای."""
+        query = "SELECT * FROM cycles WHERE status='closed' AND closed_at>=?"
+        params: list[Any] = [int(since_ms)]
+        if mode:
+            query += " AND mode=?"
+            params.append(mode)
+        query += " ORDER BY closed_at"
+        with self._lock:
+            rows = self._conn.execute(query, tuple(params)).fetchall()
+        return [dict(r) for r in rows]
+
+    def reset_statistics(self, mode: str | None = None) -> int:
+        """پاک کردن تاریخچهٔ معاملات؛ برای شروع تمیز بعد از تغییر استراتژی."""
+        query = "DELETE FROM cycles WHERE status='closed'"
+        params: tuple[Any, ...] = ()
+        if mode:
+            query += " AND mode=?"
+            params = (mode,)
+        with self._lock:
+            cur = self._conn.execute(query, params)
+            removed = cur.rowcount or 0
+            self._conn.execute(
+                "DELETE FROM cycle_steps WHERE cycle_id NOT IN (SELECT id FROM cycles)"
+            )
+            self._conn.commit()
+        return int(removed)
 
     def recent_cycles(self, limit: int = 10) -> list[dict[str, Any]]:
         with self._lock:

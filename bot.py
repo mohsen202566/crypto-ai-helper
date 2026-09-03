@@ -18,7 +18,7 @@ import config
 import risk_engine
 import strategy
 from storage import Storage
-from telegram_bot import position_panel, result_panel
+from telegram_bot import live_panel, position_panel, result_panel, summary_panel
 from toobit_client import ToobitClient, ToobitError
 from utils import canonical_base, logger, now_ms, safe_float, safe_int
 
@@ -32,6 +32,8 @@ class BotEngine:
         self._universe: list[str] = []
         self._universe_ts = 0.0
         self._last_scan = 0.0
+        self._last_live_report = 0.0
+        self._last_summary_day = ""
 
     # ------------------------------------------------------------------
     #  راه‌اندازی
@@ -166,22 +168,91 @@ class BotEngine:
         value = safe_float(self.storage.get_setting("score_threshold", config.SCORE_THRESHOLD))
         return max(config.SCORE_THRESHOLD_MIN, min(value, config.SCORE_THRESHOLD_MAX))
 
+    def position_size(self) -> float:
+        """مارجین ثابت هر پوزیشن؛ صفر یعنی تقسیم خودکار سرمایه."""
+        return max(0.0, safe_float(self.storage.get_setting("position_size", config.POSITION_SIZE_USDT)))
+
+    def live_report_minutes(self) -> int:
+        value = safe_int(self.storage.get_setting("live_report_minutes", config.LIVE_REPORT_MINUTES))
+        return max(config.LIVE_REPORT_MIN, min(value, config.LIVE_REPORT_MAX))
+
     def leverage(self) -> int:
         value = safe_int(self.storage.get_setting("leverage", config.DEFAULT_LEVERAGE))
         return max(config.LEVERAGE_MIN, min(value, config.LEVERAGE_MAX))
 
-    def mode(self) -> str:
-        return "real" if bool(self.storage.get_setting("real_trading_enabled", False)) else "virtual"
+    def mode(self) -> str | None:
+        """حالت فعلی؛ None یعنی هر دو خاموش‌اند و فقط اسکن انجام می‌شود."""
+        if bool(self.storage.get_setting("real_trading_enabled", False)):
+            return "real"
+        if bool(self.storage.get_setting("virtual_trading_enabled", True)):
+            return "virtual"
+        return None
 
     # ------------------------------------------------------------------
     #  حلقهٔ اصلی
     # ------------------------------------------------------------------
     def tick(self) -> None:
-        """هر تیک: اول پوزیشن‌های باز، بعد (در فواصل بلندتر) اسکن ارزها."""
+        """هر تیک: پوزیشن‌های باز، اسکن ارزها، و گزارش‌های دوره‌ای."""
         self.manage_open_positions()
         if (time.monotonic() - self._last_scan) >= config.SCAN_INTERVAL_SECONDS:
             self._last_scan = time.monotonic()
             self.scan_for_entries()
+        self.maybe_send_live_report()
+        self.maybe_send_daily_summary()
+
+    # --- گزارش‌های دوره‌ای -------------------------------------------------
+    def live_report_text(self) -> str:
+        """متن گزارش لحظه‌ای با قیمت‌های زنده."""
+        cycles = self.storage.open_cycles()
+        if not cycles:
+            return "هیچ پوزیشن بازی نیست."
+        try:
+            prices = self.toobit.get_all_prices()
+        except Exception as exc:
+            logger.warning("LIVE_PRICE_FAIL | %s", exc)
+            prices = {}
+        for cycle in cycles:
+            symbol = str(cycle.get("symbol"))
+            if safe_float(prices.get(symbol)) <= 0:
+                try:
+                    prices[symbol] = safe_float(self.toobit.get_mark_price(symbol))
+                except Exception:
+                    continue
+        return live_panel(cycles, prices)
+
+    def maybe_send_live_report(self) -> None:
+        """گزارش خودکار پوزیشن‌های باز — فقط وقتی پوزیشنی هست."""
+        minutes = self.live_report_minutes()
+        if minutes <= 0:
+            return
+        if (time.monotonic() - self._last_live_report) < minutes * 60:
+            return
+        if not self.storage.open_cycles():
+            self._last_live_report = time.monotonic()
+            return
+        self._last_live_report = time.monotonic()
+        self.storage.queue_message(self.live_report_text())
+
+    def maybe_send_daily_summary(self) -> None:
+        """خلاصهٔ روز قبل، یک بار در ابتدای هر روز."""
+        if not config.DAILY_SUMMARY_ENABLED:
+            return
+        today = time.strftime("%Y-%m-%d")
+        stored = str(self.storage.get_setting("last_summary_day", "") or "")
+        if not stored:
+            self.storage.set_setting("last_summary_day", today)
+            return
+        if stored == today:
+            return
+        day_seconds = time.time() - (time.time() % 86400)
+        start_ms = int((day_seconds - 86400) * 1000)
+        rows = [
+            c for c in self.storage.closed_since(start_ms)
+            if safe_int(c.get("closed_at")) < int(day_seconds * 1000)
+        ]
+        self.storage.set_setting("last_summary_day", today)
+        if rows:
+            self.storage.queue_message(summary_panel(rows, "📅 خلاصهٔ دیروز"))
 
     # --- مدیریت پوزیشن‌های باز -------------------------------------------
     def manage_open_positions(self) -> None:
@@ -223,6 +294,12 @@ class BotEngine:
     # --- اسکن و ورود ------------------------------------------------------
     def scan_for_entries(self) -> None:
         mode = self.mode()
+        if mode is None:
+            self.storage.set_health(
+                "scan", "ok",
+                "ترید واقعی و مجازی هر دو خاموش‌اند — با «ترید مجازی فعال» روشن کنید",
+            )
+            return
         max_positions = self.max_positions()
         open_count = self.storage.open_position_count()
         free_slots = max_positions - open_count
@@ -321,6 +398,7 @@ class BotEngine:
             capital_usdt=capital,
             max_positions=self.max_positions(),
             open_margin_usdt=self.storage.open_margin_total(),
+            fixed_size_usdt=self.position_size(),
         )
         if margin <= 0:
             self.storage.set_health("risk", "ok", "سقف درگیری سرمایه پر است")
@@ -332,6 +410,7 @@ class BotEngine:
             entry_price=price,
             atr_value=candidate.atr_value,
             slot_margin_usdt=margin,
+            max_leverage=self.leverage(),
             min_qty=min_qty,
             min_notional=min_notional,
         )
