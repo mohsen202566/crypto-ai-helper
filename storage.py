@@ -125,6 +125,7 @@ class Storage:
         with self._lock:
             self._conn.executescript(SCHEMA)
             self._conn.commit()
+        self._migrate()
         self._ensure_defaults()
 
     # ------------------------------------------------------------------
@@ -134,6 +135,36 @@ class Storage:
                 self._conn.commit()
             finally:
                 self._conn.close()
+
+    # ستون‌هایی که در نسخه‌های بعدی اضافه شده‌اند. ``CREATE TABLE IF NOT EXISTS``
+    # به جدولی که از قبل وجود دارد ستون اضافه نمی‌کند، پس دیتابیس‌های قدیمی
+    # بدون این مهاجرت با خطای «no such column» می‌خوابند.
+    _MIGRATIONS: tuple[tuple[str, str, str], ...] = (
+        ("cycles", "entry_score", "REAL NOT NULL DEFAULT 0"),
+        ("cycles", "entry_reason", "TEXT"),
+    )
+
+    def _migrate(self) -> None:
+        """ستون‌های جاافتاده را به جدول‌های موجود اضافه می‌کند."""
+        with self._lock:
+            for table, column, ddl in self._MIGRATIONS:
+                try:
+                    rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+                except sqlite3.Error:
+                    continue
+                if not rows:
+                    continue
+                existing = {str(r["name"]) for r in rows}
+                if column in existing:
+                    continue
+                try:
+                    self._conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"
+                    )
+                    self._conn.commit()
+                    logger.info("DB_MIGRATE | %s.%s اضافه شد", table, column)
+                except sqlite3.Error as exc:
+                    logger.warning("DB_MIGRATE_FAIL | %s.%s | %s", table, column, exc)
 
     def _ensure_defaults(self) -> None:
         for key, value in DEFAULT_SETTINGS.items():

@@ -392,7 +392,14 @@ class BotEngine:
         opened = 0
         report: list[dict[str, Any]] = []
         for candidate in candidates[:free_slots]:
-            ok, why = self.open_position(candidate, mode=mode, capital=capital)
+            # خطای یک ارز نباید کل اسکن را متوقف کند؛ وگرنه بقیهٔ نامزدها
+            # بررسی نمی‌شوند و گزارش هم ذخیره نمی‌شود.
+            try:
+                ok, why = self.open_position(candidate, mode=mode, capital=capital)
+            except Exception as exc:
+                logger.exception("OPEN_FAIL | %s", candidate.symbol)
+                self.storage.set_health("order", "warning", str(exc))
+                ok, why = False, f"خطای داخلی: {exc}"
             report.append({
                 "symbol": canonical_base(candidate.symbol),
                 "side": candidate.side,
