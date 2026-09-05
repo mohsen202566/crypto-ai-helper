@@ -257,8 +257,6 @@ MAX_STOP_DISTANCE_RATE = float(os.getenv("MAX_STOP_DISTANCE_RATE", "0.05"))
 EARLY_EXIT_ON_REVERSAL = os.getenv("EARLY_EXIT_ON_REVERSAL", "1").strip() not in {"0", "false", "no"}
 # امتیاز جهت مخالف که برای خروج زودهنگام لازم است.
 REVERSAL_EXIT_SCORE = float(os.getenv("REVERSAL_EXIT_SCORE", "78"))
-# حداکثر عمر یک پوزیشن؛ بعد از آن اگر نه سود نه ضرر، بسته می‌شود تا اسلات آزاد شود.
-MAX_POSITION_AGE_MINUTES = int(os.getenv("MAX_POSITION_AGE_MINUTES", "480"))
 # حداقل سود خالص (بعد از کارمزد و اسلیپیج) که بستن ارزش داشته باشد.
 MIN_NET_PROFIT_USDT = float(os.getenv("MIN_NET_PROFIT_USDT", "0.05"))
 

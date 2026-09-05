@@ -345,13 +345,13 @@ def stats_panel(storage: Storage) -> str:
 
     def block(title: str, s: dict[str, Any], bal: float) -> list[str]:
         total_closed = s["closed"]
-        win_rate = (s["tp"] / total_closed * 100.0) if total_closed else 0.0
+        win_rate = (s["wins"] / total_closed * 100.0) if total_closed else 0.0
         return [
             title,
             f"  موجودی: {_n(bal)}$",
             f"  پوزیشن باز: {s['open']}",
-            f"  کل بسته‌شده: {total_closed}",
-            f"  حد سود: {s['tp']}  |  حد ضرر: {s['stop']}",
+            f"  کل بسته‌شده: {total_closed}  (برد: {s['wins']}  |  باخت: {s['losses']})",
+            f"  از این میان — حد سود: {s['tp']}  |  حد ضرر: {s['stop']}",
             f"  نرخ برد: {win_rate:.1f}%",
             f"  سود/ضرر امروز: {_pnl(s['pnl_today'])}",
             f"  سود/ضرر کل: {_pnl(s['pnl_total'])}",
@@ -429,12 +429,14 @@ def summary_panel(cycles: list[dict[str, Any]], title: str) -> str:
     other = [c for c in cycles if c not in tp and c not in sl]
     net = sum(safe_float(c.get("net_pnl")) for c in cycles)
     fees = sum(safe_float(c.get("fees")) for c in cycles)
-    win_rate = (len(tp) / len(cycles) * 100.0) if cycles else 0.0
+    # نرخ برد بر اساس سود/زیان خالص واقعی هر معامله، نه فقط دلیل خروج
+    wins = [c for c in cycles if safe_float(c.get("net_pnl")) > 0]
+    win_rate = (len(wins) / len(cycles) * 100.0) if cycles else 0.0
 
     lines = [
         title,
         "",
-        f"معاملات: {len(cycles)}  |  نرخ برد: {win_rate:.0f}%",
+        f"معاملات: {len(cycles)}  |  نرخ برد: {win_rate:.0f}%  (برد: {len(wins)})",
         f"🎯 حد سود: {len(tp)}   🛑 حد ضرر: {len(sl)}" + (f"   ↩️ سایر: {len(other)}" if other else ""),
         f"سود/ضرر خالص: {_pnl(net)}",
         f"کارمزد پرداختی: {_n(fees)}$",

@@ -334,7 +334,6 @@ def exit_decision(
     current_price: float,
     take_profit: float,
     hard_stop: float,
-    age_minutes: float = 0.0,
     reversal_score: float = 0.0,
 ) -> tuple[str | None, float]:
     """آیا وقت بستن پوزیشن است؟ خروجی: (دلیل خروج یا None، سود/زیان ناخالص).
@@ -373,8 +372,5 @@ def exit_decision(
         if risk_engine.net_pnl_after_costs(gross, notional) >= config.MIN_NET_PROFIT_USDT:
             return "reversal", gross
 
-    # پوزیشن راکد: اسلات را آزاد کن تا سیگنال بهتری جایش بنشیند.
-    if config.MAX_POSITION_AGE_MINUTES > 0 and age_minutes >= config.MAX_POSITION_AGE_MINUTES:
-        return "timeout", gross
-
+    # پوزیشن تا رسیدن به حد سود یا حد ضرر باز می‌ماند — بستن به‌خاطر گذشت زمان حذف شده است.
     return None, gross

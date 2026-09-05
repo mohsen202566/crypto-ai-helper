@@ -158,11 +158,29 @@ class BotEngine:
     # ------------------------------------------------------------------
     #  تنظیمات کاربر
     # ------------------------------------------------------------------
-    def max_positions(self) -> int:
+    def max_positions(self, capital: float | None = None) -> int:
+        """سقف پوزیشن همزمان.
+
+        دو محدودیت هم‌زمان اعمال می‌شود و کوچک‌تر برنده است:
+        ۱. عددی که کاربر دستی تعیین کرده (مثلاً «۱۰ تا مجاز است»).
+        ۲. ظرفیت واقعی سرمایه — وقتی هر پوزیشن اندازهٔ ثابت دارد
+           (``position_size`` > 0)، تعداد پوزیشنی که موجودی فعلی واقعاً
+           جواب می‌دهد: ``floor(capital / margin_per_position)``. با رشد
+           موجودی (سود) این عدد بالا می‌رود، با افت آن (ضرر) پایین می‌آید —
+           بدون این‌که مقدار دستی کاربر تغییر کند.
+        در حالت خودکار (``position_size`` صفر) این محدودیت دوم اعمال نمی‌شود،
+        چون آنجا اندازهٔ هر اسلات خودش با تعداد اسلات تنظیم می‌شود.
+        """
         value = safe_int(
             self.storage.get_setting("max_positions", config.MAX_CONCURRENT_POSITIONS)
         )
-        return max(1, min(value, config.MAX_CONCURRENT_LIMIT))
+        value = max(1, min(value, config.MAX_CONCURRENT_LIMIT))
+
+        fixed_margin = self.position_size()
+        if fixed_margin > 0 and capital is not None:
+            capacity = int(capital // fixed_margin)
+            value = min(value, max(0, capacity))
+        return value
 
     def score_threshold(self) -> float:
         value = safe_float(self.storage.get_setting("score_threshold", config.SCORE_THRESHOLD))
@@ -276,9 +294,6 @@ class BotEngine:
             if price <= 0:
                 continue
 
-            opened_at = safe_int(cycle.get("opened_at"))
-            age_minutes = max(0.0, (now_ms() - opened_at) / 60000.0) if opened_at else 0.0
-
             reason, gross = strategy.exit_decision(
                 side=str(cycle.get("side")),
                 entry_price=safe_float(cycle.get("avg_entry_price")),
@@ -286,7 +301,6 @@ class BotEngine:
                 current_price=price,
                 take_profit=safe_float(cycle.get("take_profit_price")),
                 hard_stop=safe_float(cycle.get("hard_stop_price")),
-                age_minutes=age_minutes,
             )
             if reason:
                 self.close_position(cycle, exit_price=price, exit_reason=reason, gross_pnl=gross)
@@ -300,20 +314,6 @@ class BotEngine:
                 "ترید واقعی و مجازی هر دو خاموش‌اند — با «ترید مجازی فعال» روشن کنید",
             )
             return
-        max_positions = self.max_positions()
-        open_count = self.storage.open_position_count()
-        free_slots = max_positions - open_count
-        if free_slots <= 0:
-            self.storage.set_health(
-                "scan", "ok", f"همهٔ {max_positions} اسلات پر است — منتظر بسته شدن"
-            )
-            return
-
-        universe = self.refresh_universe()
-        if not universe:
-            self.storage.set_health("scan", "warning", "فهرست ارزها خالی است")
-            return
-
         capital = self.effective_capital(real_mode=(mode == "real"))
         if capital < config.MIN_CAPITAL_TO_TRADE_USDT:
             self.storage.set_health(
@@ -321,6 +321,22 @@ class BotEngine:
                 f"سرمایه ({capital:.2f}$) کمتر از حداقل "
                 f"({config.MIN_CAPITAL_TO_TRADE_USDT:.2f}$) است",
             )
+            return
+
+        max_positions = self.max_positions(capital=capital)
+        open_count = self.storage.open_position_count()
+        free_slots = max_positions - open_count
+        if free_slots <= 0:
+            self.storage.set_health(
+                "scan", "ok", f"همهٔ {max_positions} اسلات پر است — منتظر بسته شدن"
+                if max_positions > 0 else
+                "سرمایهٔ آزاد کافی برای باز کردن پوزیشن جدید نیست"
+            )
+            return
+
+        universe = self.refresh_universe()
+        if not universe:
+            self.storage.set_health("scan", "warning", "فهرست ارزها خالی است")
             return
 
         busy = self.storage.open_symbols()

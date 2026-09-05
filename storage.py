@@ -441,6 +441,19 @@ class Storage:
                 "SELECT COALESCE(SUM(net_pnl),0) pnl FROM cycles "
                 "WHERE status='closed' AND mode=? AND closed_at>=?", (mode, day_start)
             ).fetchone()
+            # برد/باخت بر اساس سود/زیان خالص واقعی تعیین می‌شود، نه دلیل خروج —
+            # چون دلیل خروج (tp/stop/reversal/manual/...) هیچ‌وقت نباید مجموعش
+            # با «کل بسته‌شده» فرق کند؛ اینجا wins+losses همیشه دقیقاً برابر closed است.
+            wins = self._conn.execute(
+                "SELECT COUNT(*) c FROM cycles WHERE status='closed' AND mode=? "
+                "AND net_pnl > 0", (mode,)
+            ).fetchone()["c"]
+            losses = self._conn.execute(
+                "SELECT COUNT(*) c FROM cycles WHERE status='closed' AND mode=? "
+                "AND net_pnl <= 0", (mode,)
+            ).fetchone()["c"]
+            # فقط برای اطلاع — کدام‌ها دقیقاً با برخورد TP/SL بسته شدند
+            # (ممکن است بعضی وین‌ها با «reversal» یا بستن دستی بسته شده باشند).
             tp_count = self._conn.execute(
                 "SELECT COUNT(*) c FROM cycles WHERE status='closed' AND mode=? "
                 "AND exit_reason='tp'", (mode,)
@@ -452,6 +465,8 @@ class Storage:
         return {
             "open": int(open_count),
             "closed": int(closed["c"]),
+            "wins": int(wins),
+            "losses": int(losses),
             "tp": int(tp_count),
             "stop": int(stop_count),
             "pnl_total": safe_float(closed["pnl"]),
