@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS cycles (
     liquidation_price REAL    NOT NULL DEFAULT 0,
     take_profit_price REAL    NOT NULL DEFAULT 0,
     hard_stop_price   REAL    NOT NULL DEFAULT 0,
+    best_price        REAL    NOT NULL DEFAULT 0,
     exit_price        REAL    NOT NULL DEFAULT 0,
     exit_reason       TEXT,                        -- tp | stop | manual | liquidation
     gross_pnl         REAL    NOT NULL DEFAULT 0,
@@ -105,7 +106,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "max_positions": config.MAX_CONCURRENT_POSITIONS,
     "position_size": config.POSITION_SIZE_USDT,
     "live_report_minutes": config.LIVE_REPORT_MINUTES,
-    "score_threshold": config.SCORE_THRESHOLD,
+    "pump_threshold": config.PUMP_THRESHOLD_PCT,
+    "vol_mult": config.VOL_MULT,
+    "trail_pct": config.TRAIL_PCT,
     "leverage": config.DEFAULT_LEVERAGE,
     "margin_mode": config.MARGIN_MODE,
     "capital_cap": config.CAPITAL_CAP_USDT,
@@ -142,6 +145,8 @@ class Storage:
     _MIGRATIONS: tuple[tuple[str, str, str], ...] = (
         ("cycles", "entry_score", "REAL NOT NULL DEFAULT 0"),
         ("cycles", "entry_reason", "TEXT"),
+        # بهترین قیمت طی عمر پوزیشن — مبنای محاسبهٔ استاپ دنبال‌کننده.
+        ("cycles", "best_price", "REAL NOT NULL DEFAULT 0"),
     )
 
     def _migrate(self) -> None:
@@ -240,17 +245,21 @@ class Storage:
     def create_cycle(self, *, symbol: str, side: str, mode: str, leverage: int,
                      capital_at_open: float, plan: dict[str, Any],
                      take_profit_price: float, hard_stop_price: float,
-                     entry_score: float = 0.0, entry_reason: str = "") -> int:
-        """یک پوزیشن جدید ثبت می‌کند (تک‌ورودی، نه پله‌ای)."""
+                     entry_score: float = 0.0, entry_reason: str = "",
+                     best_price: float = 0.0) -> int:
+        """یک پوزیشن جدید ثبت می‌کند (تک‌ورودی، نه پله‌ای).
+
+        ``best_price`` نقطهٔ شروع استاپ دنبال‌کننده است — معمولاً همان قیمت ورود.
+        """
         with self._lock:
             cur = self._conn.execute(
                 "INSERT INTO cycles(symbol,side,mode,status,leverage,planned_steps,"
-                "capital_at_open,plan_json,take_profit_price,hard_stop_price,"
+                "capital_at_open,plan_json,take_profit_price,hard_stop_price,best_price,"
                 "entry_score,entry_reason,opened_at) "
-                "VALUES(?,?,?,'open',?,1,?,?,?,?,?,?,?)",
+                "VALUES(?,?,?,'open',?,1,?,?,?,?,?,?,?,?)",
                 (symbol, side, mode, int(leverage),
                  float(capital_at_open), json_dumps(plan),
-                 float(take_profit_price), float(hard_stop_price),
+                 float(take_profit_price), float(hard_stop_price), float(best_price),
                  float(entry_score), str(entry_reason)[:400], now_ms()),
             )
             cycle_id = int(cur.lastrowid)
@@ -391,6 +400,15 @@ class Storage:
             )
             self._conn.commit()
 
+    def update_trailing(self, cycle_id: int, *, best_price: float, active_stop: float) -> None:
+        """بهترین قیمت و استاپ فعال (دنبال‌کننده یا اولیه، هرکدام تنگ‌تر) را ذخیره می‌کند."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE cycles SET best_price=?, hard_stop_price=? WHERE id=?",
+                (float(best_price), float(active_stop), cycle_id),
+            )
+            self._conn.commit()
+
     def close_cycle(self, cycle_id: int, *, exit_price: float, exit_reason: str,
                     gross_pnl: float, net_pnl: float, fees: float) -> None:
         with self._lock:
@@ -452,11 +470,12 @@ class Storage:
                 "SELECT COUNT(*) c FROM cycles WHERE status='closed' AND mode=? "
                 "AND net_pnl <= 0", (mode,)
             ).fetchone()["c"]
-            # فقط برای اطلاع — کدام‌ها دقیقاً با برخورد TP/SL بسته شدند
-            # (ممکن است بعضی وین‌ها با «reversal» یا بستن دستی بسته شده باشند).
-            tp_count = self._conn.execute(
+            # فقط برای اطلاع — کدام‌ها دقیقاً با استاپ دنبال‌کننده (سود قفل‌شده)
+            # یا حد ضرر بسته شدند (ممکن است بعضی وین‌ها با «timeout» یا بستن
+            # دستی هم بسته شده باشند).
+            trail_count = self._conn.execute(
                 "SELECT COUNT(*) c FROM cycles WHERE status='closed' AND mode=? "
-                "AND exit_reason='tp'", (mode,)
+                "AND exit_reason='trail'", (mode,)
             ).fetchone()["c"]
             stop_count = self._conn.execute(
                 "SELECT COUNT(*) c FROM cycles WHERE status='closed' AND mode=? "
@@ -467,7 +486,7 @@ class Storage:
             "closed": int(closed["c"]),
             "wins": int(wins),
             "losses": int(losses),
-            "tp": int(tp_count),
+            "trail": int(trail_count),
             "stop": int(stop_count),
             "pnl_total": safe_float(closed["pnl"]),
             "pnl_today": safe_float(today["pnl"]),

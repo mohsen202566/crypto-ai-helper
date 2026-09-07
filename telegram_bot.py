@@ -90,28 +90,28 @@ def position_panel(cycle: dict[str, Any], plan: dict[str, Any] | None = None) ->
     """پنل پیام پوزیشن — هنگام باز شدن."""
     plan = plan or json_loads(cycle.get("plan_json"), {}) or {}
     entry = safe_float(cycle.get("avg_entry_price")) or safe_float(plan.get("entry_price"))
-    score = safe_float(cycle.get("entry_score"))
+    move = safe_float(cycle.get("entry_score"))
     lines = [
         f"{_side_badge(cycle.get('side'))} — {_coin(cycle.get('symbol'))}",
         "",
-        f"امتیاز ورود: {score:.0f}/100",
+        f"شدت حرکت ورود: {move:.2f}%",
         f"نقطهٔ ورود: {_price(entry)}",
         f"لوریج: {safe_int(cycle.get('leverage'))}x  |  {config.MARGIN_MODE}",
         f"مارجین: {_n(plan.get('margin_usdt') or cycle.get('total_margin'))}$"
         f"  |  ارزش پوزیشن: {_n(plan.get('notional_usdt') or cycle.get('total_notional'))}$",
         f"نوع: {_mode_label(cycle.get('mode'))}",
         "",
-        f"🎯 حد سود: {_price(cycle.get('take_profit_price'))}",
-        f"🛑 حد ضرر: {_price(cycle.get('hard_stop_price'))}",
+        f"🛑 حد ضرر اولیه: {_price(cycle.get('hard_stop_price'))}",
+        f"📈 استاپ دنبال‌کننده: {config.TRAIL_PCT:.1f}% از بهترین قیمت",
     ]
     if plan.get("liquidation_price"):
         lines.append(f"⚠️ لیکوئید: {_price(plan.get('liquidation_price'))}")
-    if plan.get("expected_profit_usdt"):
+    if plan.get("risk_usdt"):
         lines += [
             "",
-            f"سود خالص در صورت حد سود: {_n(plan.get('expected_profit_usdt'))}$",
-            f"ضرر در صورت حد ضرر: {_n(plan.get('risk_usdt'))}$",
+            f"حداکثر ضرر در صورت حد ضرر: {_n(plan.get('risk_usdt'))}$",
             f"(کارمزد رفت‌وبرگشت: {_n(plan.get('cost_usdt'))}$)",
+            "سود سقف ندارد — با استاپ دنبال‌کننده باز می‌ماند.",
         ]
     reason = str(cycle.get("entry_reason") or "")
     if reason:
@@ -199,12 +199,14 @@ def _common_lines(storage: Storage, balance: float = 0.0) -> list[str]:
     universe = storage.get_setting("universe", []) or []
     return [
         f"ارزهای تحت اسکن: {len(universe)}",
-        f"تایم‌فریم: {config.ENTRY_TIMEFRAME} (روند: {config.TREND_TIMEFRAME})",
+        f"تایم‌فریم: {config.ENTRY_TIMEFRAME}",
         f"حداکثر پوزیشن هم‌زمان: {safe_int(storage.get_setting('max_positions', config.MAX_CONCURRENT_POSITIONS))}",
         *_size_label(storage, balance),
-        f"آستانهٔ امتیاز: {safe_float(storage.get_setting('score_threshold', config.SCORE_THRESHOLD)):.0f}/100",
+        f"آستانهٔ پامپ/دامپ: {safe_float(storage.get_setting('pump_threshold', config.PUMP_THRESHOLD_PCT)):.1f}%"
+        f"  |  ضریب حجم: {safe_float(storage.get_setting('vol_mult', config.VOL_MULT)):.1f}×",
         f"لوریج: {safe_int(storage.get_setting('leverage', config.DEFAULT_LEVERAGE))}x  |  {config.MARGIN_MODE}",
-        f"نسبت سود به ضرر: ۱ به {config.RISK_REWARD_RATIO:.1f}",
+        f"حد ضرر اولیه: {config.INITIAL_STOP_PCT:.1f}%  |  استاپ دنبال‌کننده: "
+        f"{safe_float(storage.get_setting('trail_pct', config.TRAIL_PCT)):.1f}%",
     ]
 
 
@@ -216,7 +218,7 @@ def _positions_block(cycles: list[dict[str, Any]]) -> list[str]:
         lines.append(
             f"  {_side_badge(c.get('side'))} {_coin(c.get('symbol'))} | "
             f"ورود {_price(c.get('avg_entry_price'))} | "
-            f"امتیاز {safe_float(c.get('entry_score')):.0f} | "
+            f"شدت حرکت {safe_float(c.get('entry_score')):.1f}% | "
             f"{safe_int(c.get('leverage'))}x"
         )
     return lines
@@ -294,7 +296,7 @@ def virtual_trade_panel(storage: Storage) -> str:
         f"📌 سرمایهٔ درگیر: {_n(engaged)}$ ({engaged_pct:.1f}%)",
         "",
         f"پوزیشن‌های باز: {stats['open']}",
-        f"کل بسته‌شده: {stats['closed']}  (حد سود {stats['tp']} / حد ضرر {stats['stop']})",
+        f"کل بسته‌شده: {stats['closed']}  (استاپ دنبال‌کننده {stats['trail']} / حد ضرر {stats['stop']})",
         f"سود/ضرر امروز: {_pnl(stats['pnl_today'])}",
         f"سود/ضرر کل: {_pnl(stats['pnl_total'])}",
     ]
@@ -310,9 +312,8 @@ def result_panel(cycle: dict[str, Any]) -> str:
     """پنل نتیجه — با ریپلای روی پیام سیگنال اصلی ارسال می‌شود."""
     reason = str(cycle.get("exit_reason") or "")
     label = {
-        "tp": "🎯 حد سود",
+        "trail": "📈 استاپ دنبال‌کننده",
         "stop": "🛑 حد ضرر",
-        "reversal": "↩️ برگشت مومنتوم",
         "timeout": "⏱ پایان مهلت پوزیشن",
         "manual": "✋️ بستن دستی",
         "liquidation": "💥 لیکوئید",
@@ -328,7 +329,7 @@ def result_panel(cycle: dict[str, Any]) -> str:
         f"{_side_badge(cycle.get('side'))} — {_coin(cycle.get('symbol'))}",
         f"نتیجه: {label}",
         f"ورود {_price(entry)} → خروج {_price(exit_price)}  ({move:+.2f}%)",
-        f"امتیاز ورود بود: {safe_float(cycle.get('entry_score')):.0f}/100",
+        f"شدت حرکت ورود بود: {safe_float(cycle.get('entry_score')):.2f}%",
         "",
         f"سود/ضرر خالص: {_pnl(net)}",
         f"(ناخالص {_n(cycle.get('gross_pnl'))}$ − کارمزد {_n(cycle.get('fees'))}$)",
@@ -351,7 +352,7 @@ def stats_panel(storage: Storage) -> str:
             f"  موجودی: {_n(bal)}$",
             f"  پوزیشن باز: {s['open']}",
             f"  کل بسته‌شده: {total_closed}  (برد: {s['wins']}  |  باخت: {s['losses']})",
-            f"  از این میان — حد سود: {s['tp']}  |  حد ضرر: {s['stop']}",
+            f"  از این میان — استاپ دنبال‌کننده: {s['trail']}  |  حد ضرر: {s['stop']}",
             f"  نرخ برد: {win_rate:.1f}%",
             f"  سود/ضرر امروز: {_pnl(s['pnl_today'])}",
             f"  سود/ضرر کل: {_pnl(s['pnl_total'])}",
@@ -394,18 +395,15 @@ def live_panel(cycles: list[dict[str, Any]], prices: dict[str, float]) -> str:
             move = -move
         roi = (net / margin * 100.0) if margin > 0 else 0.0
 
-        tp = safe_float(c.get("take_profit_price"))
-        sl = safe_float(c.get("hard_stop_price"))
-        # چقدر از مسیر تا حد سود طی شده
-        span = abs(tp - entry)
-        done = abs(price - entry) if (price - entry) * (tp - entry) > 0 else 0.0
-        progress = min(100.0, done / span * 100.0) if span > 0 else 0.0
+        stop = safe_float(c.get("hard_stop_price"))
+        best = safe_float(c.get("best_price")) or entry
+        stop_gap = abs(price - stop) / price * 100.0 if price > 0 and stop > 0 else 0.0
 
         lines += [
             f"{_side_badge(c.get('side'))} {_coin(symbol)}  {safe_int(c.get('leverage'))}x",
             f"  ورود {_price(entry)} → حالا {_price(price)}  ({move:+.2f}%)",
             f"  {_pnl(net)}  (بازده مارجین {roi:+.1f}%)",
-            f"  🎯 {_price(tp)}  🛑 {_price(sl)}  |  {progress:.0f}% تا حد سود",
+            f"  🛑 استاپ فعال: {_price(stop)}  ({stop_gap:.1f}% فاصله)  |  بهترین قیمت: {_price(best)}",
             f"  ⏱ {_age(c.get('opened_at'))}",
             "",
         ]
@@ -420,13 +418,13 @@ def live_panel(cycles: list[dict[str, Any]], prices: dict[str, float]) -> str:
 
 
 def summary_panel(cycles: list[dict[str, Any]], title: str) -> str:
-    """خلاصهٔ یک دوره: چند معامله، روی کدام ارزها، چند تا TP و چند تا SL."""
+    """خلاصهٔ یک دوره: چند معامله، روی کدام ارزها، چند تا با استاپ دنبال‌کننده و چند تا حد ضرر."""
     if not cycles:
         return f"{title}\n\nهیچ معامله‌ای بسته نشد."
 
-    tp = [c for c in cycles if str(c.get("exit_reason")) == "tp"]
+    trail = [c for c in cycles if str(c.get("exit_reason")) == "trail"]
     sl = [c for c in cycles if str(c.get("exit_reason")) in {"stop", "liquidation"}]
-    other = [c for c in cycles if c not in tp and c not in sl]
+    other = [c for c in cycles if c not in trail and c not in sl]
     net = sum(safe_float(c.get("net_pnl")) for c in cycles)
     fees = sum(safe_float(c.get("fees")) for c in cycles)
     # نرخ برد بر اساس سود/زیان خالص واقعی هر معامله، نه فقط دلیل خروج
@@ -437,15 +435,16 @@ def summary_panel(cycles: list[dict[str, Any]], title: str) -> str:
         title,
         "",
         f"معاملات: {len(cycles)}  |  نرخ برد: {win_rate:.0f}%  (برد: {len(wins)})",
-        f"🎯 حد سود: {len(tp)}   🛑 حد ضرر: {len(sl)}" + (f"   ↩️ سایر: {len(other)}" if other else ""),
+        f"📈 استاپ دنبال‌کننده: {len(trail)}   🛑 حد ضرر: {len(sl)}" + (f"   ▫️ سایر: {len(other)}" if other else ""),
         f"سود/ضرر خالص: {_pnl(net)}",
         f"کارمزد پرداختی: {_n(fees)}$",
         "",
         "جزئیات:",
     ]
     for c in cycles[-15:]:
-        icon = {"tp": "🎯", "stop": "🛑", "liquidation": "💥",
-                "reversal": "↩️", "timeout": "⏱"}.get(str(c.get("exit_reason")), "▫️")
+        icon = {"trail": "📈", "stop": "🛑", "liquidation": "💥", "timeout": "⏱"}.get(
+            str(c.get("exit_reason")), "▫️"
+        )
         lines.append(
             f"  {icon} {_coin(c.get('symbol'))} {_side_badge(c.get('side')).split()[1]} "
             f"→ {_pnl(c.get('net_pnl'))}"
@@ -470,14 +469,15 @@ def why_panel(storage: Storage) -> str:
     cands = safe_int(report.get("candidates"))
     opened = safe_int(report.get("opened"))
     slots = safe_int(report.get("free_slots"))
-    threshold = safe_float(report.get("threshold"))
+    pump_th = safe_float(report.get("pump_threshold"))
+    vmult = safe_float(report.get("vol_mult"))
 
     lines = [
         f"🔍 آخرین اسکن ({when})",
         "",
         f"ارز بررسی‌شده: {scanned}",
-        f"آستانهٔ امتیاز: {threshold:.0f}",
-        f"نامزد (امتیاز کافی): {cands}",
+        f"آستانهٔ پامپ/دامپ: {pump_th:.1f}%  |  ضریب حجم: {vmult:.1f}×",
+        f"نامزد (پامپ/دامپ تأییدشده): {cands}",
         f"اسلات خالی: {slots}",
         f"پوزیشن باز شد: {opened}",
     ]
@@ -488,7 +488,7 @@ def why_panel(storage: Storage) -> str:
         for r in rows:
             icon = "✅" if r.get("ok") else "⛔️"
             side = "لانگ" if str(r.get("side")).upper() == "LONG" else "شورت"
-            head = f"{icon} {r.get('symbol')} {side} (امتیاز {safe_float(r.get('score')):.0f})"
+            head = f"{icon} {r.get('symbol')} {side} (حرکت {safe_float(r.get('score')):.1f}%)"
             lines.append(head)
             if not r.get("ok"):
                 lines.append(f"    └ {str(r.get('why') or 'دلیل ثبت نشده')}")
@@ -497,18 +497,18 @@ def why_panel(storage: Storage) -> str:
         if isinstance(best, dict) and best.get("symbol"):
             lines += [
                 "",
-                f"نزدیک‌ترین به آستانه: {best.get('symbol')} با امتیاز "
-                f"{safe_float(best.get('score')):.0f}",
+                f"نزدیک‌ترین به آستانه: {best.get('symbol')} با حرکت "
+                f"{safe_float(best.get('score')):.1f}%",
                 f"    └ {str(best.get('why') or '')}",
             ]
-        lines += ["", "این عادی است — بیشتر وقت‌ها هیچ ارزی امتیاز کافی ندارد."]
+        lines += ["", "این عادی است — بیشتر وقت‌ها هیچ ارزی پامپ/دامپ تازه با حجم کافی ندارد."]
 
     return "\n".join(lines)
 
 
 def help_text() -> str:
     return "\n".join([
-        "🤖 ربات اسکن چندارزی",
+        "🤖 ربات اسکن چندارزی — Momentum Ignition",
         "",
         "دستورات:",
         "• ترید فعال / ترید خاموش — روشن و خاموش کردن ترید واقعی",
@@ -522,7 +522,9 @@ def help_text() -> str:
         "• امروز — خلاصهٔ معاملات امروز",
         "• گزارش ۱۵ — فاصلهٔ گزارش خودکار به دقیقه (۰ = خاموش)",
         "• ریست آمار — پاک کردن تاریخچهٔ استراتژی قبلی",
-        "• امتیاز ۸۰ — آستانهٔ ورود (۵۵ تا ۹۵؛ بالاتر = محتاط‌تر)",
+        "• پامپ ۸ — آستانهٔ حرکت پامپ/دامپ به درصد (۳ تا ۲۵)",
+        "• ضریب حجم ۱.۵ — حداقل ضریب حجم نسبت به میانگین (۱ تا ۵)",
+        "• تریل ۲ — فاصلهٔ استاپ دنبال‌کننده به درصد (۰.۵ تا ۱۰)",
         "• اهرم ۱۰ — سقف لوریج (۱ تا ۱۰۰)",
         "• سقف ۵۰ — سقف سرمایهٔ درگیر (۰ = کل موجودی)",
         "• ارزها — فهرست ارزهای تحت اسکن",
@@ -623,24 +625,56 @@ class CommandRouter:
         if cmd in {"ترید مجازی", "مجازی", "پنل مجازی", "/virtual"}:
             return virtual_trade_panel(self.storage)
 
-        if cmd.startswith("امتیاز ") or cmd.startswith("حساسیت "):
+        if cmd.startswith("پامپ "):
             try:
                 value = float(parse_number(cmd.split(" ", 1)[1]))
             except (ValueError, IndexError):
-                return "عدد نامعتبر. مثال: امتیاز ۸۰"
-            if not config.SCORE_THRESHOLD_MIN <= value <= config.SCORE_THRESHOLD_MAX:
+                return "عدد نامعتبر. مثال: پامپ ۸"
+            if not config.PUMP_THRESHOLD_MIN <= value <= config.PUMP_THRESHOLD_MAX:
                 return (
-                    f"عدد باید بین {config.SCORE_THRESHOLD_MIN:.0f} تا "
-                    f"{config.SCORE_THRESHOLD_MAX:.0f} باشد."
+                    f"عدد باید بین {config.PUMP_THRESHOLD_MIN:.0f} تا "
+                    f"{config.PUMP_THRESHOLD_MAX:.0f} باشد."
                 )
-            self.storage.set_setting("score_threshold", value)
-            if value >= 85:
-                hint = "خیلی محتاط — سیگنال کم ولی باکیفیت‌تر"
-            elif value <= 65:
-                hint = "حساس — سیگنال زیاد، کارمزد بیشتر"
+            self.storage.set_setting("pump_threshold", value)
+            if value >= 12:
+                hint = "محتاط — فقط پامپ/دامپ‌های خیلی شدید"
+            elif value <= 5:
+                hint = "حساس — سیگنال بیشتر، احتمال نویز بیشتر"
             else:
-                hint = "متعادل"
-            return f"✅ آستانهٔ ورود روی {value:.0f}/100 تنظیم شد — {hint}"
+                hint = "متعادل (نتیجهٔ بک‌تست حدود همین بازه بود)"
+            return f"✅ آستانهٔ پامپ/دامپ روی {value:.1f}% تنظیم شد — {hint}"
+
+        if cmd.startswith("ضریب حجم "):
+            try:
+                value = float(parse_number(cmd.split(" ", 2)[2]))
+            except (ValueError, IndexError):
+                return "عدد نامعتبر. مثال: ضریب حجم ۱.۵"
+            if not config.VOL_MULT_MIN <= value <= config.VOL_MULT_MAX:
+                return (
+                    f"عدد باید بین {config.VOL_MULT_MIN:.1f} تا "
+                    f"{config.VOL_MULT_MAX:.1f} باشد."
+                )
+            self.storage.set_setting("vol_mult", value)
+            return (
+                f"✅ ضریب حجم روی {value:.1f}× میانگین تنظیم شد "
+                "— فقط پامپ/دامپ‌های همراه با این‌قدر حجم قبول می‌شوند."
+            )
+
+        if cmd.startswith("تریل "):
+            try:
+                value = float(parse_number(cmd.split(" ", 1)[1]))
+            except (ValueError, IndexError):
+                return "عدد نامعتبر. مثال: تریل ۲"
+            if not config.TRAIL_PCT_MIN <= value <= config.TRAIL_PCT_MAX:
+                return (
+                    f"عدد باید بین {config.TRAIL_PCT_MIN:.1f} تا "
+                    f"{config.TRAIL_PCT_MAX:.1f} باشد."
+                )
+            self.storage.set_setting("trail_pct", value)
+            return (
+                f"✅ استاپ دنبال‌کننده روی {value:.1f}% تنظیم شد "
+                "— با رشد قیمت به نفع پوزیشن، استاپ همین‌قدر پشت سرش می‌آید."
+            )
 
         if cmd in {"چرا", "دلیل", "/why"}:
             return why_panel(self.storage)

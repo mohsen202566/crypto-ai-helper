@@ -1,13 +1,13 @@
-"""موتور ربات — اسکن چندارزی، امتیازدهی، و مدیریت پوزیشن‌های هم‌زمان.
+"""موتور ربات — اسکن چندارزی برای پامپ/دامپ با حجم تأییدشده، و مدیریت پوزیشن‌های هم‌زمان.
 
 جریان کار در هر چرخه:
-  ۱. پوزیشن‌های باز را بپا (حد سود، حد ضرر، برگشت مومنتوم، عمر پوزیشن).
-  ۲. اگر اسلات خالی داری، همهٔ ارزهای فهرست را امتیاز بده.
-  ۳. نامزدها را بر اساس امتیاز مرتب کن و از بالا به پایین اسلات‌ها را پر کن.
+  ۱. پوزیشن‌های باز را بپا (استاپ دنبال‌کننده، حد ضرر اولیه، پایان مهلت).
+  ۲. اگر اسلات خالی داری، همهٔ ارزهای فهرست را برای پامپ/دامپ تازه بررسی کن.
+  ۳. نامزدها را بر اساس شدت حرکت مرتب کن و از قوی‌ترین به ضعیف‌ترین اسلات‌ها را پر کن.
 
-نکتهٔ مهم: امتیاز بالا یعنی «ساختار فعلی بازار در این جهت است»، نه «قیمت
-حتماً بالا می‌رود». برد و باخت هر دو رخ می‌دهد؛ چیزی که سیستم را سرپا نگه
-می‌دارد نسبت ریسک به سود است، نه دقت پیش‌بینی.
+نکتهٔ مهم: سیگنال یعنی «همین الان پول واقعی با حجم بالا وارد این ارز شده»،
+نه پیش‌بینی قطعی ادامهٔ مسیر. برد و باخت هر دو رخ می‌دهد؛ چیزی که سیستم را
+سرپا نگه می‌دارد نسبت ریسک به سود (استاپ دنبال‌کننده) است، نه دقت پیش‌بینی.
 """
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ import strategy
 from storage import Storage
 from telegram_bot import live_panel, position_panel, result_panel, summary_panel
 from toobit_client import ToobitClient, ToobitError
-from utils import canonical_base, logger, now_ms, safe_float, safe_int
+from utils import canonical_base, logger, now_ms, safe_float, safe_int, timeframe_seconds
 
 
 class BotEngine:
@@ -182,9 +182,21 @@ class BotEngine:
             value = min(value, max(0, capacity))
         return value
 
-    def score_threshold(self) -> float:
-        value = safe_float(self.storage.get_setting("score_threshold", config.SCORE_THRESHOLD))
-        return max(config.SCORE_THRESHOLD_MIN, min(value, config.SCORE_THRESHOLD_MAX))
+    def pump_threshold(self) -> float:
+        value = safe_float(self.storage.get_setting("pump_threshold", config.PUMP_THRESHOLD_PCT))
+        return max(config.PUMP_THRESHOLD_MIN, min(value, config.PUMP_THRESHOLD_MAX))
+
+    def vol_mult(self) -> float:
+        value = safe_float(self.storage.get_setting("vol_mult", config.VOL_MULT))
+        return max(config.VOL_MULT_MIN, min(value, config.VOL_MULT_MAX))
+
+    def trail_pct(self) -> float:
+        value = safe_float(self.storage.get_setting("trail_pct", config.TRAIL_PCT))
+        return max(config.TRAIL_PCT_MIN, min(value, config.TRAIL_PCT_MAX))
+
+    def max_hold_seconds(self) -> float:
+        """مهلت نگه‌داشتن پوزیشن به ثانیه، از روی تایم‌فریم و تعداد کندل."""
+        return timeframe_seconds(config.ENTRY_TIMEFRAME) * config.MAX_HOLD_BARS
 
     def position_size(self) -> float:
         """مارجین ثابت هر پوزیشن؛ صفر یعنی تقسیم خودکار سرمایه."""
@@ -294,16 +306,31 @@ class BotEngine:
             if price <= 0:
                 continue
 
-            reason, gross = strategy.exit_decision(
+            entry_price = safe_float(cycle.get("avg_entry_price"))
+            best_price = safe_float(cycle.get("best_price")) or entry_price
+            decision = strategy.exit_decision(
                 side=str(cycle.get("side")),
-                entry_price=safe_float(cycle.get("avg_entry_price")),
+                entry_price=entry_price,
                 quantity=safe_float(cycle.get("total_quantity")),
                 current_price=price,
-                take_profit=safe_float(cycle.get("take_profit_price")),
+                best_price=best_price,
                 hard_stop=safe_float(cycle.get("hard_stop_price")),
+                trail_pct=self.trail_pct(),
+                opened_at_ms=safe_int(cycle.get("opened_at")),
+                max_hold_seconds=self.max_hold_seconds(),
             )
-            if reason:
-                self.close_position(cycle, exit_price=price, exit_reason=reason, gross_pnl=gross)
+            if decision.reason:
+                self.close_position(
+                    cycle, exit_price=price, exit_reason=decision.reason,
+                    gross_pnl=decision.gross_pnl,
+                )
+            else:
+                # استاپ دنبال‌کننده حتی وقتی هنوز خارج نشده باید ذخیره شود —
+                # وگرنه با هر ری‌استارت ربات، پیشرفت تریل از دست می‌رود.
+                self.storage.update_trailing(
+                    safe_int(cycle.get("id")),
+                    best_price=decision.best_price, active_stop=decision.active_stop,
+                )
 
     # --- اسکن و ورود ------------------------------------------------------
     def scan_for_entries(self) -> None:
@@ -340,7 +367,8 @@ class BotEngine:
             return
 
         busy = self.storage.open_symbols()
-        threshold = self.score_threshold()
+        pump_th = self.pump_threshold()
+        vmult = self.vol_mult()
         candidates: list[strategy.SymbolScore] = []
         best_rejected: strategy.SymbolScore | None = None
         scanned = 0
@@ -352,9 +380,7 @@ class BotEngine:
                 entry_candles = self.toobit.get_klines(
                     symbol, interval=config.ENTRY_TIMEFRAME, limit=config.ENTRY_CANDLE_LIMIT
                 )
-                trend_candles = self.toobit.get_klines(
-                    symbol, interval=config.TREND_TIMEFRAME, limit=config.TREND_CANDLE_LIMIT
-                )
+                price = safe_float(self.toobit.get_mark_price(symbol))
             except Exception as exc:
                 logger.debug("KLINE_SKIP | %s | %s", symbol, exc)
                 continue
@@ -363,8 +389,9 @@ class BotEngine:
             result = strategy.score_symbol(
                 symbol=symbol,
                 entry_candles=entry_candles,
-                trend_candles=trend_candles,
-                threshold=threshold,
+                price=price,
+                pump_threshold=pump_th,
+                vol_mult=vmult,
             )
             if result.ok:
                 candidates.append(result)
@@ -377,7 +404,8 @@ class BotEngine:
                 "scanned": scanned,
                 "candidates": 0,
                 "free_slots": free_slots,
-                "threshold": threshold,
+                "pump_threshold": pump_th,
+                "vol_mult": vmult,
                 "opened": 0,
                 "rows": [],
                 "best_rejected": (
@@ -388,7 +416,8 @@ class BotEngine:
                 ),
             })
             detail = (
-                f"{scanned} ارز اسکن شد — هیچ‌کدام به آستانهٔ {threshold:.0f} نرسید"
+                f"{scanned} ارز اسکن شد — هیچ‌کدام پامپ/دامپ {pump_th:.1f}%+ "
+                f"با حجم {vmult:.1f}× نداشت"
             )
             if best_rejected and best_rejected.symbol:
                 detail += (
@@ -398,7 +427,7 @@ class BotEngine:
             self.storage.set_health("scan", "ok", detail)
             return
 
-        # بالاترین امتیاز اول — اسلات کمیاب است، پس به بهترین سیگنال می‌رسد.
+        # قوی‌ترین حرکت اول — اسلات کمیاب است، پس به بهترین سیگنال می‌رسد.
         candidates.sort(key=lambda c: c.score, reverse=True)
         self.storage.set_health(
             "scan", "ok",
@@ -432,7 +461,8 @@ class BotEngine:
             "scanned": scanned,
             "candidates": len(candidates),
             "free_slots": free_slots,
-            "threshold": threshold,
+            "pump_threshold": pump_th,
+            "vol_mult": vmult,
             "opened": opened,
             "rows": report,
             "best_rejected": (
@@ -497,7 +527,6 @@ class BotEngine:
             symbol=symbol,
             side=candidate.side or "LONG",
             entry_price=price,
-            atr_value=candidate.atr_value,
             slot_margin_usdt=margin,
             leverage=self.leverage(),
             min_qty=min_qty,
@@ -519,6 +548,7 @@ class BotEngine:
             hard_stop_price=plan.stop_price,
             entry_score=candidate.score,
             entry_reason=candidate.reason,
+            best_price=price,
         )
 
         order_id = None

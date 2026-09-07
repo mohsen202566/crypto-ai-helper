@@ -7,9 +7,10 @@
 اصول ثابت:
 1. سرمایه هرگز عدد ثابت نیست؛ همیشه از بیرون (موجودی زندهٔ حساب) تزریق می‌شود.
 2. مجموع مارجین پوزیشن‌های باز از ``MAX_CAPITAL_ENGAGED_RATE`` × سرمایه بیشتر نمی‌شود.
-3. هر پوزیشن از همان لحظهٔ ورود حد ضرر و حد سود دارد؛ خبری از پله و مارتینگل نیست.
-4. حد ضرر بر پایهٔ ATR واقعی همان ارز تعیین می‌شود، نه درصد ثابت.
-5. ورودی که سودش را کارمزد بخورد اصلاً باز نمی‌شود.
+3. هر پوزیشن از همان لحظهٔ ورود حد ضرر اولیه دارد؛ خبری از پله و مارتینگل نیست.
+4. حد ضرر اولیه درصد ثابت از قیمت ورود است (نتیجهٔ بک‌تست)؛ خروج نهایی با
+   استاپ دنبال‌کننده در ``strategy.py`` انجام می‌شود، نه حد سود ثابت.
+5. ورودی که فاصلهٔ حد ضررش را کارمزد ببلعد اصلاً باز نمی‌شود.
 """
 from __future__ import annotations
 
@@ -120,19 +121,16 @@ class EntryPlan:
         return asdict(self)
 
 
-def stop_distance(entry_price: float, atr_value: float) -> float:
-    """فاصلهٔ حد ضرر بر پایهٔ ATR واقعی، محدودشده به کف و سقف امن.
+def initial_stop_distance(entry_price: float) -> float:
+    """فاصلهٔ حد ضرر اولیه — درصد ثابت از قیمت ورود (نتیجهٔ بک‌تست).
 
-    ATR یعنی حد ضرر با نوسان همان ارز تنظیم می‌شود: ارز پرنوسان استاپ دورتر
-    می‌گیرد و ارز آرام استاپ نزدیک‌تر. درصد ثابت این تفاوت را نادیده می‌گیرد و
-    باعث می‌شود روی ارز پرنوسان مدام با نویز عادی بازار استاپ بخوریم.
+    برخلاف نسخهٔ قبلی (ATR)، این استراتژی مبتنی بر درصد حرکت است، نه نوسان
+    معمول ارز؛ پس حد ضرر هم درصد ثابت می‌ماند. حد سود ثابتی وجود ندارد —
+    خروج با استاپ دنبال‌کننده در ``strategy.exit_decision`` انجام می‌شود.
     """
     if entry_price <= 0:
         return 0.0
-    raw = atr_value * config.STOP_ATR_MULTIPLIER
-    lo = entry_price * config.MIN_STOP_DISTANCE_RATE
-    hi = entry_price * config.MAX_STOP_DISTANCE_RATE
-    return clamp(raw, lo, hi)
+    return entry_price * config.INITIAL_STOP_PCT / 100.0
 
 
 def plan_entry(
@@ -140,17 +138,17 @@ def plan_entry(
     symbol: str,
     side: Side,
     entry_price: float,
-    atr_value: float,
     slot_margin_usdt: float,
     leverage: int | None = None,
     min_qty: float = 0.0,
     min_notional: float = 0.0,
 ) -> EntryPlan:
-    """یک پوزیشن تکی با حد ضرر و حد سود مشخص می‌سازد.
+    """یک پوزیشن تکی با حد ضرر اولیه می‌سازد؛ خروج نهایی با تریلینگ استاپ است.
 
-    شرط کلیدی: سود مورد انتظار باید بعد از کسر کارمزد و اسلیپیج، حداقل
-    ``MIN_PROFIT_TO_COST_RATIO`` برابر خودِ هزینه باشد. اگر نباشد، ورود رد
-    می‌شود — چون معامله‌ای که سودش را کارمزد می‌خورد، ارزش ریسک ندارد.
+    چون این استراتژی هدف سود ثابت ندارد (تریلینگ استاپ سود را باز می‌گذارد)،
+    شرط ورود «سود مورد انتظار × N برابر کارمزد» بی‌معناست — سود از قبل معلوم
+    نیست. در عوض، تنها شرط این است که فاصلهٔ حد ضرر به‌تنهایی چند برابر هزینهٔ
+    رفت‌وبرگشت باشد؛ وگرنه حتی یک نوسان عادی بازار کل ریسک را کارمزد می‌کند.
     """
     lev = int(leverage or config.DEFAULT_LEVERAGE)
     lev = int(clamp(lev, config.LEVERAGE_MIN, config.LEVERAGE_MAX))
@@ -166,7 +164,7 @@ def plan_entry(
         blank.reason = "قیمت یا مارجین نامعتبر"
         return blank
 
-    distance = stop_distance(entry_price, atr_value)
+    distance = initial_stop_distance(entry_price)
     if distance <= 0:
         blank.reason = "فاصلهٔ حد ضرر قابل محاسبه نیست"
         return blank
@@ -185,34 +183,23 @@ def plan_entry(
         )
         return blank
 
-    reward = distance * config.RISK_REWARD_RATIO
     if side == "LONG":
         stop_price = entry_price - distance
-        tp_price = entry_price + reward
     else:
         stop_price = entry_price + distance
-        tp_price = entry_price - reward
-    if stop_price <= 0 or tp_price <= 0:
-        blank.reason = "سطوح خروج نامعتبر"
+    if stop_price <= 0:
+        blank.reason = "حد ضرر نامعتبر"
         return blank
 
     cost = notional * round_trip_cost_rate()
-    gross_profit = reward * quantity
     gross_loss = distance * quantity
-    net_profit = gross_profit - cost
     net_loss = gross_loss + cost
 
-    # --- شرط «بعد از کارمزد صرف کند» ---
-    if net_profit < config.MIN_NET_PROFIT_USDT:
+    # --- شرط «کارمزد ریسک را نبلعد» ---
+    if cost > 0 and (gross_loss / cost) < 1.0:
         blank.reason = (
-            f"سود خالص مورد انتظار ({net_profit:.3f}$) از حداقل "
-            f"({config.MIN_NET_PROFIT_USDT:.2f}$) کمتر است"
-        )
-        return blank
-    if cost > 0 and (gross_profit / cost) < config.MIN_PROFIT_TO_COST_RATIO:
-        blank.reason = (
-            f"سود ناخالص فقط {gross_profit / cost:.1f} برابر کارمزد است "
-            f"(حداقل {config.MIN_PROFIT_TO_COST_RATIO:.1f} لازم است)"
+            f"فاصلهٔ حد ضرر ({gross_loss:.3f}$) کوچک‌تر از هزینهٔ رفت‌وبرگشت "
+            f"({cost:.3f}$) است — لوریج را کم کنید یا مارجین را زیاد کنید"
         )
         return blank
 
@@ -230,47 +217,12 @@ def plan_entry(
     return EntryPlan(
         ok=True, symbol=symbol, side=side, entry_price=entry_price, leverage=lev,
         margin_usdt=margin, notional_usdt=notional, quantity=quantity,
-        stop_price=stop_price, take_profit_price=tp_price, liquidation_price=liq,
-        risk_usdt=net_loss, expected_profit_usdt=net_profit, cost_usdt=cost,
+        stop_price=stop_price, take_profit_price=0.0, liquidation_price=liq,
+        risk_usdt=net_loss, expected_profit_usdt=0.0, cost_usdt=cost,
         reason=(
-            f"ریسک {net_loss:.2f}$ در برابر سود {net_profit:.2f}$ "
-            f"(۱:{config.RISK_REWARD_RATIO:.1f}) با لوریج {lev}x"
+            f"حد ضرر اولیه {config.INITIAL_STOP_PCT:.1f}% (ریسک {net_loss:.2f}$) | "
+            f"استاپ دنبال‌کننده {config.TRAIL_PCT:.1f}% | لوریج {lev}x"
         ),
-    )
-
-
-def best_leverage_for_entry(
-    *,
-    symbol: str,
-    side: Side,
-    entry_price: float,
-    atr_value: float,
-    slot_margin_usdt: float,
-    max_leverage: int | None = None,
-    min_qty: float = 0.0,
-    min_notional: float = 0.0,
-) -> EntryPlan:
-    """کم‌ریسک‌ترین لوریجی که هنوز شرط سوددهی بعد از کارمزد را برآورده کند.
-
-    از پایین شروع می‌کند: اگر لوریج ۱ کافی بود، همان انتخاب می‌شود. لوریج بالاتر
-    فقط وقتی استفاده می‌شود که بدون آن حجم پوزیشن آن‌قدر کوچک شود که کارمزد
-    سود را بخورد.
-    """
-    ceiling = int(max_leverage or config.LEVERAGE_MAX)
-    ceiling = int(clamp(ceiling, config.LEVERAGE_MIN, config.LEVERAGE_MAX))
-    last: EntryPlan | None = None
-    for lev in range(config.LEVERAGE_MIN, ceiling + 1):
-        plan = plan_entry(
-            symbol=symbol, side=side, entry_price=entry_price, atr_value=atr_value,
-            slot_margin_usdt=slot_margin_usdt, leverage=lev,
-            min_qty=min_qty, min_notional=min_notional,
-        )
-        if plan.ok:
-            return plan
-        last = plan
-    return last or plan_entry(
-        symbol=symbol, side=side, entry_price=entry_price, atr_value=atr_value,
-        slot_margin_usdt=slot_margin_usdt, leverage=ceiling,
     )
 
 

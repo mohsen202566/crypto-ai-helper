@@ -1,7 +1,8 @@
-"""تنظیمات ثابت ربات شکار پایان پامپ Toobit.
+"""تنظیمات ثابت ربات Momentum Ignition روی Toobit.
 
 همه فایل‌ها در ریشه پروژه قرار می‌گیرند. ربات هیچ موتور یادگیری ندارد؛
-قوانین سیگنال، ترید، اسلات و محدودیت API ثابت هستند.
+قوانین سیگنال (پامپ+حجم)، ترید، اسلات و محدودیت API ثابت هستند و نتیجهٔ
+بک‌تست چندباره روی دادهٔ واقعی توبیت‌اند.
 """
 from __future__ import annotations
 
@@ -75,7 +76,7 @@ def _load_project_environment() -> None:
 
 _load_project_environment()
 
-BUILD_VERSION = "2026.07.20-v8"
+BUILD_VERSION = "2026.09.07-momentum-v1"
 RUNTIME_DB = Path(os.getenv("RUNTIME_DB", str(ROOT / "runtime.db")))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
@@ -151,10 +152,9 @@ TRAILING_UPDATE_SECONDS = int(os.getenv("TRAILING_UPDATE_SECONDS", "30"))
 
 
 # ============================================================
-#  استراتژی: اسکن چندارزی با امتیازدهی وزن‌دار
+#  اسکن چندارزی — جهان ارزها (منطق استراتژی پایین‌تر است)
 # ============================================================
-# تغییر نسبت به نسخهٔ قبل: ورود پله‌ای/مارتینگل کنار گذاشته شد.
-# حالا هر سیگنال = یک پوزیشن مستقل با حد ضرر و حد سود مشخص از همان لحظه.
+# هر سیگنال = یک پوزیشن مستقل، بدون پله و مارتینگل.
 
 # --- جهان ارزها ---
 # اگر SYMBOL_LIST تنظیم شود، دقیقاً همان‌ها اسکن می‌شوند؛ وگرنه ربات خودش
@@ -171,11 +171,10 @@ SYMBOL_BLACKLIST = tuple(
 # حداقل حجم ۲۴ ساعته برای اینکه یک ارز اصلاً وارد فهرست اسکن شود.
 MIN_24H_QUOTE_VOLUME = float(os.getenv("MIN_24H_QUOTE_VOLUME", "2000000"))
 
-# --- تایم‌فریم‌ها ---
-ENTRY_TIMEFRAME = os.getenv("ENTRY_TIMEFRAME", "15m").strip()
-TREND_TIMEFRAME = os.getenv("TREND_TIMEFRAME", "1h").strip()
-ENTRY_CANDLE_LIMIT = int(os.getenv("ENTRY_CANDLE_LIMIT", "250"))
-TREND_CANDLE_LIMIT = int(os.getenv("TREND_CANDLE_LIMIT", "250"))
+# --- تایم‌فریم ---
+# نتیجهٔ بک‌تست: ۱h و ۴h بهترین بودند؛ ۱h برای واکنش سریع‌تر به پامپ انتخاب شد.
+ENTRY_TIMEFRAME = os.getenv("ENTRY_TIMEFRAME", "1h").strip()
+ENTRY_CANDLE_LIMIT = int(os.getenv("ENTRY_CANDLE_LIMIT", "150"))
 
 # --- سرمایه ---
 FALLBACK_CAPITAL_USDT = float(os.getenv("FALLBACK_CAPITAL_USDT", "0"))
@@ -210,61 +209,46 @@ MAINTENANCE_MARGIN_RATE = float(os.getenv("MAINTENANCE_MARGIN_RATE", "0.005"))
 # حد ضرر باید همیشه خیلی زودتر از لیکوئید فعال شود.
 LIQUIDATION_TO_STOP_BUFFER = float(os.getenv("LIQUIDATION_TO_STOP_BUFFER", "2.0"))
 
-# --- امتیازدهی سه‌بخشی ---
-# هر بخش عددی بین ۰ تا ۱۰۰ به سمت لانگ و ۰ تا ۱۰۰ به سمت شورت می‌دهد؛
-# امتیاز نهایی میانگین وزن‌دار همان‌هاست. ورود فقط بالای آستانه.
-WEIGHT_TREND = float(os.getenv("WEIGHT_TREND", "0.35"))
-WEIGHT_MOMENTUM = float(os.getenv("WEIGHT_MOMENTUM", "0.40"))
-WEIGHT_VOLUME = float(os.getenv("WEIGHT_VOLUME", "0.25"))
-# آستانهٔ ورود؛ از تلگرام با «امتیاز ۸۰» تغییر می‌کند.
-SCORE_THRESHOLD = float(os.getenv("SCORE_THRESHOLD", "80"))
-SCORE_THRESHOLD_MIN = 55.0
-SCORE_THRESHOLD_MAX = 95.0
-# اگر امتیاز جهت مخالف هم بالا باشد، بازار مبهم است و ورود لغو می‌شود.
-MAX_OPPOSITE_SCORE = float(os.getenv("MAX_OPPOSITE_SCORE", "55"))
+# ============================================================
+#  استراتژی: Momentum Ignition (دنبال کردن پامپ/دامپ واقعی)
+# ============================================================
+# نتیجهٔ بک‌تست روی توبیت (۱، ۷، ۱۰ و ۳۰ روز، ۱۵۰ ارز پرحجم): این سه پارامتر
+# در همهٔ بازه‌ها برنده بودند. منطق: حرکت شدید + حجم بالا = پول واقعی وارد
+# شده، نه نویز؛ در همان جهت وارد می‌شویم، نه برخلافش.
 
-# --- اندیکاتورها ---
-EMA_FAST = int(os.getenv("EMA_FAST", "50"))
-EMA_SLOW = int(os.getenv("EMA_SLOW", "200"))
-EMA_SLOPE_LOOKBACK = int(os.getenv("EMA_SLOPE_LOOKBACK", "10"))
-RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
-RSI_OVERSOLD = float(os.getenv("RSI_OVERSOLD", "32"))
-RSI_OVERBOUGHT = float(os.getenv("RSI_OVERBOUGHT", "68"))
-MACD_FAST = int(os.getenv("MACD_FAST", "12"))
-MACD_SLOW = int(os.getenv("MACD_SLOW", "26"))
-MACD_SIGNAL = int(os.getenv("MACD_SIGNAL", "9"))
-VOLUME_SMA_PERIOD = int(os.getenv("VOLUME_SMA_PERIOD", "20"))
-ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
-
-# --- فیلتر بازار رنج (نسبت کارایی کافمن) ---
-# در رنج، قیمت زیاد نوسان می‌کند ولی جایی نمی‌رود؛ بدون این فیلتر هر نوسان
-# محلی به‌اشتباه روند خوانده می‌شود و ربات در سقف و کف رنج پوزیشن باز می‌کند.
-EFFICIENCY_PERIOD = int(os.getenv("EFFICIENCY_PERIOD", "20"))
-MIN_EFFICIENCY_RATIO = float(os.getenv("MIN_EFFICIENCY_RATIO", "0.25"))
+# پنجرهٔ تشخیص پامپ (تعداد کندل ENTRY_TIMEFRAME).
+PUMP_WINDOW_BARS = int(os.getenv("PUMP_WINDOW_BARS", "6"))
+# حداقل درصد حرکت در همان پنجره برای اینکه «پامپ/دامپ» حساب شود.
+# از تلگرام با «پامپ ۸» تغییر می‌کند.
+PUMP_THRESHOLD_PCT = float(os.getenv("PUMP_THRESHOLD_PCT", "8.0"))
+PUMP_THRESHOLD_MIN = 3.0
+PUMP_THRESHOLD_MAX = 25.0
+# حجم پنجرهٔ پامپ باید حداقل این ضریب میانگین حجم باشد؛ تأیید که حرکت با پول
+# واقعی همراه بوده، نه فقط نوسان کم‌حجم. از تلگرام با «ضریب حجم ۱.۵».
+VOL_MULT = float(os.getenv("VOL_MULT", "1.5"))
+VOL_MULT_MIN = 1.0
+VOL_MULT_MAX = 5.0
+VOLUME_AVG_PERIOD = int(os.getenv("VOLUME_AVG_PERIOD", "20"))
 
 ALLOW_LONG = os.getenv("ALLOW_LONG", "1").strip() not in {"0", "false", "no"}
 ALLOW_SHORT = os.getenv("ALLOW_SHORT", "1").strip() not in {"0", "false", "no"}
 
-# --- خروج: حد ضرر و حد سود ---
-# حد ضرر بر پایهٔ ATR واقعی هر ارز (نه درصد ثابت) — نوسان هر ارز فرق دارد.
-STOP_ATR_MULTIPLIER = float(os.getenv("STOP_ATR_MULTIPLIER", "1.5"))
-# حد سود = ریسک × این نسبت. با نسبت ۲، حتی نرخ برد ۴۰٪ هم سودده می‌ماند.
-RISK_REWARD_RATIO = float(os.getenv("RISK_REWARD_RATIO", "2.0"))
-# کف و سقف فاصلهٔ حد ضرر تا قیمت (جلوگیری از استاپ بیش از حد نزدیک یا دور).
-MIN_STOP_DISTANCE_RATE = float(os.getenv("MIN_STOP_DISTANCE_RATE", "0.004"))
-MAX_STOP_DISTANCE_RATE = float(os.getenv("MAX_STOP_DISTANCE_RATE", "0.05"))
-# خروج زودهنگام اگر مومنتوم کاملاً برگردد (قبل از رسیدن به حد سود یا ضرر).
-EARLY_EXIT_ON_REVERSAL = os.getenv("EARLY_EXIT_ON_REVERSAL", "1").strip() not in {"0", "false", "no"}
-# امتیاز جهت مخالف که برای خروج زودهنگام لازم است.
-REVERSAL_EXIT_SCORE = float(os.getenv("REVERSAL_EXIT_SCORE", "78"))
-# حداقل سود خالص (بعد از کارمزد و اسلیپیج) که بستن ارزش داشته باشد.
-MIN_NET_PROFIT_USDT = float(os.getenv("MIN_NET_PROFIT_USDT", "0.05"))
+# --- خروج: حد ضرر ثابت + تریلینگ استاپ ---
+# حد ضرر اولیه، درصد ثابت از قیمت ورود (نه ATR — استراتژی مبتنی بر درصد
+# حرکت است، نه نوسان معمول ارز).
+INITIAL_STOP_PCT = float(os.getenv("INITIAL_STOP_PCT", "4.0"))
+# به‌جای حد سود ثابت، استاپ دنبال‌کننده (trailing) — چون در حرکت‌های پارابولیک
+# هدف ثابت زودتر از موعد سود را می‌بندد. با رشد قیمت به نفع پوزیشن، استاپ
+# دنبالش می‌آید ولی هرگز عقب نمی‌رود. از تلگرام با «تریل ۲».
+TRAIL_PCT = float(os.getenv("TRAIL_PCT", "2.0"))
+TRAIL_PCT_MIN = 0.5
+TRAIL_PCT_MAX = 10.0
+# حداکثر مدت نگه‌داشتن پوزیشن (تعداد کندل ENTRY_TIMEFRAME) اگر نه تریل و نه
+# حد ضرر خورده باشد.
+MAX_HOLD_BARS = int(os.getenv("MAX_HOLD_BARS", "72"))
 
 # --- ایمنی اجرا ---
 MAX_ENTRY_SPREAD_RATE = float(os.getenv("MAX_ENTRY_SPREAD_RATE", "0.0015"))
-# حداقل نسبت «سود مورد انتظار به هزینهٔ رفت‌وبرگشت»؛ زیر این، ورود بی‌معناست
-# چون کارمزد سود را می‌خورد. این همان شرط «بعد از کارمزد صرف کند» است.
-MIN_PROFIT_TO_COST_RATIO = float(os.getenv("MIN_PROFIT_TO_COST_RATIO", "2.5"))
 
 # --- حالت ترید ---
 DEFAULT_REAL_TRADING_ENABLED = False
