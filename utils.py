@@ -106,7 +106,7 @@ def percent_change(new: float, old: float) -> float:
 def timeframe_seconds(timeframe: str) -> int:
     """تبدیل رشتهٔ تایم‌فریم (مثل ``1h``، ``15m``، ``1d``) به ثانیه.
 
-    برای محاسبهٔ مهلت نگه‌داشتن پوزیشن (MAX_HOLD_BARS × طول هر کندل) لازم است.
+    برای تبدیل تایم‌فریم به ثانیه در محاسبات نرخ حرکت لازم است.
     """
     text = str(timeframe).strip().lower()
     if not text:

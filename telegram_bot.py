@@ -101,8 +101,8 @@ def position_panel(cycle: dict[str, Any], plan: dict[str, Any] | None = None) ->
         f"  |  ارزش پوزیشن: {_n(plan.get('notional_usdt') or cycle.get('total_notional'))}$",
         f"نوع: {_mode_label(cycle.get('mode'))}",
         "",
-        f"🛑 حد ضرر اولیه: {_price(cycle.get('hard_stop_price'))}",
-        f"📈 استاپ دنبال‌کننده: {config.TRAIL_PCT:.1f}% از بهترین قیمت",
+        f"🛑 حد ضرر ساختاری: {_price(cycle.get('hard_stop_price'))}",
+        "📉 خروج: فقط با برگشت ساختاری تأییدشده (بدون حد سود ثابت)",
     ]
     if plan.get("liquidation_price"):
         lines.append(f"⚠️ لیکوئید: {_price(plan.get('liquidation_price'))}")
@@ -111,7 +111,7 @@ def position_panel(cycle: dict[str, Any], plan: dict[str, Any] | None = None) ->
             "",
             f"حداکثر ضرر در صورت حد ضرر: {_n(plan.get('risk_usdt'))}$",
             f"(کارمزد رفت‌وبرگشت: {_n(plan.get('cost_usdt'))}$)",
-            "سود سقف ندارد — با استاپ دنبال‌کننده باز می‌ماند.",
+            "سود سقف ندارد — تا وقتی ساختار نزولی معتبر است باز می‌ماند.",
         ]
     reason = str(cycle.get("entry_reason") or "")
     if reason:
@@ -196,17 +196,18 @@ def _size_label(storage: Storage, balance: float = 0.0) -> list[str]:
 
 
 def _common_lines(storage: Storage, balance: float = 0.0) -> list[str]:
-    universe = storage.get_setting("universe", []) or []
     return [
-        f"ارزهای تحت اسکن: {len(universe)}",
-        f"تایم‌فریم: {config.ENTRY_TIMEFRAME}",
+        f"استراتژی: V3 — شورت بعد از پامپ افراطی",
+        f"تایم‌فریم: اسکن {config.CONTEXT_TIMEFRAME} / اجرا {config.ENTRY_TIMEFRAME}",
         f"حداکثر پوزیشن هم‌زمان: {safe_int(storage.get_setting('max_positions', config.MAX_CONCURRENT_POSITIONS))}",
         *_size_label(storage, balance),
-        f"آستانهٔ پامپ/دامپ: {safe_float(storage.get_setting('pump_threshold', config.PUMP_THRESHOLD_PCT)):.1f}%"
-        f"  |  ضریب حجم: {safe_float(storage.get_setting('vol_mult', config.VOL_MULT)):.1f}×",
+        f"آستانهٔ کاندید: 24h ≥ {config.WATCHLIST_MIN_GAIN_PCT:.0f}%"
+        f"  |  زیر نظر: {safe_int(storage.get_setting('watchlist_size', 0))} نماد",
         f"لوریج: {safe_int(storage.get_setting('leverage', config.DEFAULT_LEVERAGE))}x  |  {config.MARGIN_MODE}",
-        f"حد ضرر اولیه: {config.INITIAL_STOP_PCT:.1f}%  |  استاپ دنبال‌کننده: "
-        f"{safe_float(storage.get_setting('trail_pct', config.TRAIL_PCT)):.1f}%",
+        f"استراحت بعد از خروج: "
+        f"{safe_float(storage.get_setting('cooldown_hours', config.COOLDOWN_HOURS)):.0f} ساعت",
+        f"حد ضرر: سقف تأییدشده + {config.STOP_ATR_MULT:.1f}×ATR({config.ATR_PERIOD})"
+        "  |  بدون حد سود ثابت",
     ]
 
 
@@ -218,7 +219,7 @@ def _positions_block(cycles: list[dict[str, Any]]) -> list[str]:
         lines.append(
             f"  {_side_badge(c.get('side'))} {_coin(c.get('symbol'))} | "
             f"ورود {_price(c.get('avg_entry_price'))} | "
-            f"شدت حرکت {safe_float(c.get('entry_score')):.1f}% | "
+            f"پامپ ۲۴س {safe_float(c.get('entry_score')):.1f}% | "
             f"{safe_int(c.get('leverage'))}x"
         )
     return lines
@@ -455,82 +456,156 @@ def summary_panel(cycles: list[dict[str, Any]], title: str) -> str:
 
 
 def why_panel(storage: Storage) -> str:
-    """گزارش کامل آخرین اسکن — دقیقاً چه شد و هر ارز چرا رد شد."""
-    report = storage.get_setting("last_scan_report", None)
+    """گزارش آخرین مانیتور — چند نماد بررسی شد و چرا وارد نشدیم."""
+    report = storage.get_setting("last_monitor_report", None)
     if not isinstance(report, dict) or not report:
         fallback = _wait_reason(storage)
-        return f"⏳ {fallback}" if fallback else "هنوز اولین اسکن انجام نشده."
+        return f"⏳ {fallback}" if fallback else "هنوز اولین مانیتور انجام نشده."
 
     ts = safe_int(report.get("ts"))
     age = max(0, int((time.time() * 1000 - ts) / 1000)) if ts else 0
     when = f"{age} ثانیه پیش" if age < 90 else f"{age // 60} دقیقه پیش"
 
-    scanned = safe_int(report.get("scanned"))
-    cands = safe_int(report.get("candidates"))
-    opened = safe_int(report.get("opened"))
-    slots = safe_int(report.get("free_slots"))
-    pump_th = safe_float(report.get("pump_threshold"))
-    vmult = safe_float(report.get("vol_mult"))
-
     lines = [
-        f"🔍 آخرین اسکن ({when})",
+        f"🔍 آخرین مانیتور ({when})",
         "",
-        f"ارز بررسی‌شده: {scanned}",
-        f"آستانهٔ پامپ/دامپ: {pump_th:.1f}%  |  ضریب حجم: {vmult:.1f}×",
-        f"نامزد (پامپ/دامپ تأییدشده): {cands}",
-        f"اسلات خالی: {slots}",
-        f"پوزیشن باز شد: {opened}",
+        f"نماد زیر نظر (Watchlist): {safe_int(report.get('watchlist'))}",
+        f"بررسی‌شده: {safe_int(report.get('checked'))}",
+        f"ستاپ معتبر: {safe_int(report.get('setups'))}",
+        f"ورود انجام‌شده: {safe_int(report.get('opened'))}",
+        f"اسلات خالی: {safe_int(report.get('free_slots'))}",
     ]
 
-    rows = report.get("rows") or []
-    if rows:
-        lines += ["", "نتیجهٔ هر نامزد:"]
-        for r in rows:
-            icon = "✅" if r.get("ok") else "⛔️"
-            side = "لانگ" if str(r.get("side")).upper() == "LONG" else "شورت"
-            head = f"{icon} {r.get('symbol')} {side} (حرکت {safe_float(r.get('score')):.1f}%)"
-            lines.append(head)
-            if not r.get("ok"):
-                lines.append(f"    └ {str(r.get('why') or 'دلیل ثبت نشده')}")
-    elif cands == 0:
-        best = report.get("best_rejected")
-        if isinstance(best, dict) and best.get("symbol"):
-            lines += [
-                "",
-                f"نزدیک‌ترین به آستانه: {best.get('symbol')} با حرکت "
-                f"{safe_float(best.get('score')):.1f}%",
-                f"    └ {str(best.get('why') or '')}",
-            ]
-        lines += ["", "این عادی است — بیشتر وقت‌ها هیچ ارزی پامپ/دامپ تازه با حجم کافی ندارد."]
+    rejects = report.get("rejects") or {}
+    if isinstance(rejects, dict) and rejects:
+        lines += ["", "دلیل رد شدن:"]
+        for code, count in sorted(rejects.items(), key=lambda kv: -kv[1]):
+            lines.append(f"  • {_reject_label(code)}: {count}")
+    else:
+        lines += ["", "هیچ نمادی به مرحلهٔ ارزیابی نرسید."]
+
+    lines += [
+        "",
+        "این عادی است — بیشتر پامپ‌ها هیچ‌وقت شرایط ورود را کامل نمی‌کنند.",
+    ]
+    return "\n".join(lines)
+
+
+_REJECT_LABELS = {
+    "cooldown": "در استراحت بعد از معاملهٔ قبلی",
+    "no_exhaustion": "نشانهٔ خستگی نیامده (سایهٔ بالا کافی نیست)",
+    "no_deceleration": "شتاب صعود هنوز کم نشده",
+    "no_structure_break": "کف تأییدشده هنوز نشکسته",
+    "cascade_blocked_no_volume": "دادهٔ حجم معتبر نبود (آبشار مجاز نیست)",
+    "cascade_too_early_in_bar": "کندل جاری تازه شروع شده",
+    "cascade_no_acceleration": "افت شتاب‌گیرنده نیست",
+    "cascade_no_range_expansion": "دامنه به اندازهٔ کافی باز نشده",
+    "cascade_no_volume_expansion": "حجم به اندازهٔ کافی بالا نرفته",
+    "cascade_not_enough_history": "تاریخچهٔ کندل کافی نیست",
+    "cascade_invalid_price": "قیمت نامعتبر",
+    "spread_too_wide": "اسپرد بالا (هزینهٔ پنهان)",
+    "stop_unavailable": "حد ضرر ساختاری قابل محاسبه نبود",
+    "not_enough_candles": "کندل کافی موجود نیست",
+    "invalid_price": "قیمت نامعتبر",
+    "risk_rejected": "ریسک/مارجین اجازه نداد",
+}
+
+
+def _reject_label(code: str) -> str:
+    return _REJECT_LABELS.get(str(code), str(code))
+
+
+def watchlist_panel(storage: Storage) -> str:
+    """نمادهایی که الان زیر نظرند — با پامپ فعلی و بیشترین پامپ ثبت‌شده."""
+    rows = storage.watchlist_active()
+    if not rows:
+        return "هیچ نمادی زیر نظر نیست (هیچ‌کدام به آستانهٔ کاندید نرسیده‌اند)."
+
+    cooldowns = {str(c.get("symbol")) for c in storage.active_cooldowns()}
+    busy = {str(x) for x in storage.open_symbols()}
+
+    lines = [
+        f"👀 {len(rows)} نماد زیر نظر (آستانه: 24h ≥ {config.WATCHLIST_MIN_GAIN_PCT:.0f}%)",
+        "",
+    ]
+    for r in rows[:25]:
+        symbol = str(r.get("symbol"))
+        mark = "🟡" if symbol in busy else ("😴" if symbol in cooldowns else "▫️")
+        lines.append(
+            f"{mark} {_coin(symbol)} | الان {safe_float(r.get('last_gain_pct')):+.1f}% "
+            f"| اوج {safe_float(r.get('peak_gain_pct')):+.1f}% "
+            f"| ستاپ {safe_int(r.get('setup_count'))} | ترید {safe_int(r.get('trade_count'))}"
+        )
+    if len(rows) > 25:
+        lines.append(f"… و {len(rows) - 25} نماد دیگر")
+    lines += ["", "🟡 پوزیشن باز  |  😴 در استراحت  |  ▫️ فقط زیر نظر"]
+    return "\n".join(lines)
+
+
+def funnel_panel(storage: Storage) -> str:
+    """قیف کامل: از کاندید تا معامله — مهم‌ترین گزارش برای تحلیل بعدی."""
+    f = storage.watchlist_funnel()
+    total = f.get("total_candidates", 0)
+    if not total:
+        return "هنوز هیچ کاندیدی ثبت نشده."
+
+    with_setup = f.get("candidates_with_setup", 0)
+    with_trade = f.get("candidates_with_trade", 0)
+
+    def pct(part: int) -> str:
+        return f"{part / total * 100:.0f}%" if total else "-"
+
+    lines = [
+        "🔻 قیف V3",
+        "",
+        f"کاندید (وارد Watchlist): {total}",
+        f"  └ حداقل یک ستاپ داشت: {with_setup} ({pct(with_setup)})",
+        f"      └ حداقل یک معامله شد: {with_trade} ({pct(with_trade)})",
+        "",
+        f"مجموع ستاپ‌ها: {f.get('total_setups', 0)}",
+        f"مجموع معاملات: {f.get('total_trades', 0)}",
+    ]
+
+    rejects = storage.reject_breakdown()
+    if rejects:
+        lines += ["", "گلوگاه‌ها (دلیل رد شدن ستاپ‌های نزدیک):"]
+        for row in rejects[:8]:
+            lines.append(f"  • {_reject_label(row.get('reject_code'))}: {row.get('n')}")
 
     return "\n".join(lines)
 
 
 def help_text() -> str:
     return "\n".join([
-        "🤖 ربات اسکن چندارزی — Momentum Ignition",
+        "🤖 ربات V3 — شورت بعد از پامپ افراطی (Paper Test)",
+        "",
+        "جریان کار:",
+        f"  پامپ ۲۴ ساعته ≥ {config.WATCHLIST_MIN_GAIN_PCT:.0f}% → زیر نظر گرفتن",
+        "  → نشانهٔ خستگی یا آبشار فروش → شورت",
+        "  → حد ضرر ساختاری یا برگشت تأییدشده → خروج → استراحت",
         "",
         "دستورات:",
         "• ترید فعال / ترید خاموش — روشن و خاموش کردن ترید واقعی",
         "• ترید مجازی فعال / ترید مجازی خاموش — روشن و خاموش کردن مجازی",
         "• پنل — پنل ترید واقعی",
         "• ترید مجازی — پنل ترید مجازی",
+        "• واچ — نمادهای زیر نظر",
+        "• قیف — از چند کاندید، چند ستاپ و چند معامله",
         "• پوزیشن — پوزیشن‌های باز",
         "• پوزیشن ۵ — حداکثر پوزیشن هم‌زمان (۱ تا ۳۰)",
         "• دلار ۱۰ — مارجین هر پوزیشن، ۱ تا ۱۰۰۰ (۰ = خودکار)",
+        "• اهرم ۱۰ — لوریج (۱ تا ۱۰۰)",
+        "• استراحت ۲ — ساعت استراحت هر نماد بعد از خروج (۱ تا ۱۲)",
+        "• سقف ۵۰ — سقف سرمایهٔ درگیر (۰ = کل موجودی)",
         "• زنده — مانیتورینگ لحظه‌ای پوزیشن‌های باز",
         "• امروز — خلاصهٔ معاملات امروز",
         "• گزارش ۱۵ — فاصلهٔ گزارش خودکار به دقیقه (۰ = خاموش)",
-        "• ریست آمار — پاک کردن تاریخچهٔ استراتژی قبلی",
-        "• پامپ ۸ — آستانهٔ حرکت پامپ/دامپ به درصد (۳ تا ۲۵)",
-        "• ضریب حجم ۱.۵ — حداقل ضریب حجم نسبت به میانگین (۱ تا ۵)",
-        "• تریل ۲ — فاصلهٔ استاپ دنبال‌کننده به درصد (۰.۵ تا ۱۰)",
-        "• اهرم ۱۰ — سقف لوریج (۱ تا ۱۰۰)",
-        "• سقف ۵۰ — سقف سرمایهٔ درگیر (۰ = کل موجودی)",
-        "• ارزها — فهرست ارزهای تحت اسکن",
-        "• چرا — دلیل اینکه چرا الان وارد نمی‌شود",
+        "• چرا — گزارش آخرین مانیتور و دلیل ورود نکردن",
         "• آمار — آمار واقعی و مجازی",
+        "• ریست آمار — پاک کردن تاریخچه",
         "• وضعیت — سلامت سیستم",
+        "",
+        "⚠️ قوانین استراتژی در طول این تست قفل‌اند و تغییر نمی‌کنند.",
     ])
 
 
@@ -625,56 +700,27 @@ class CommandRouter:
         if cmd in {"ترید مجازی", "مجازی", "پنل مجازی", "/virtual"}:
             return virtual_trade_panel(self.storage)
 
-        if cmd.startswith("پامپ "):
+        if cmd.startswith("استراحت "):
             try:
                 value = float(parse_number(cmd.split(" ", 1)[1]))
             except (ValueError, IndexError):
-                return "عدد نامعتبر. مثال: پامپ ۸"
-            if not config.PUMP_THRESHOLD_MIN <= value <= config.PUMP_THRESHOLD_MAX:
+                return "عدد نامعتبر. مثال: استراحت ۲"
+            if not config.COOLDOWN_HOURS_MIN <= value <= config.COOLDOWN_HOURS_MAX:
                 return (
-                    f"عدد باید بین {config.PUMP_THRESHOLD_MIN:.0f} تا "
-                    f"{config.PUMP_THRESHOLD_MAX:.0f} باشد."
+                    f"عدد باید بین {config.COOLDOWN_HOURS_MIN} تا "
+                    f"{config.COOLDOWN_HOURS_MAX} ساعت باشد."
                 )
-            self.storage.set_setting("pump_threshold", value)
-            if value >= 12:
-                hint = "محتاط — فقط پامپ/دامپ‌های خیلی شدید"
-            elif value <= 5:
-                hint = "حساس — سیگنال بیشتر، احتمال نویز بیشتر"
-            else:
-                hint = "متعادل (نتیجهٔ بک‌تست حدود همین بازه بود)"
-            return f"✅ آستانهٔ پامپ/دامپ روی {value:.1f}% تنظیم شد — {hint}"
-
-        if cmd.startswith("ضریب حجم "):
-            try:
-                value = float(parse_number(cmd.split(" ", 2)[2]))
-            except (ValueError, IndexError):
-                return "عدد نامعتبر. مثال: ضریب حجم ۱.۵"
-            if not config.VOL_MULT_MIN <= value <= config.VOL_MULT_MAX:
-                return (
-                    f"عدد باید بین {config.VOL_MULT_MIN:.1f} تا "
-                    f"{config.VOL_MULT_MAX:.1f} باشد."
-                )
-            self.storage.set_setting("vol_mult", value)
+            self.storage.set_setting("cooldown_hours", value)
             return (
-                f"✅ ضریب حجم روی {value:.1f}× میانگین تنظیم شد "
-                "— فقط پامپ/دامپ‌های همراه با این‌قدر حجم قبول می‌شوند."
+                f"✅ استراحت روی {value:.0f} ساعت تنظیم شد — بعد از هر خروج، "
+                "همان نماد تا این مدت معامله نمی‌شود، حتی اگر دوباره پامپ کند."
             )
 
-        if cmd.startswith("تریل "):
-            try:
-                value = float(parse_number(cmd.split(" ", 1)[1]))
-            except (ValueError, IndexError):
-                return "عدد نامعتبر. مثال: تریل ۲"
-            if not config.TRAIL_PCT_MIN <= value <= config.TRAIL_PCT_MAX:
-                return (
-                    f"عدد باید بین {config.TRAIL_PCT_MIN:.1f} تا "
-                    f"{config.TRAIL_PCT_MAX:.1f} باشد."
-                )
-            self.storage.set_setting("trail_pct", value)
-            return (
-                f"✅ استاپ دنبال‌کننده روی {value:.1f}% تنظیم شد "
-                "— با رشد قیمت به نفع پوزیشن، استاپ همین‌قدر پشت سرش می‌آید."
-            )
+        if cmd in {"واچ", "واچ لیست", "واچ‌لیست", "/watchlist"}:
+            return watchlist_panel(self.storage)
+
+        if cmd in {"قیف", "فانل", "/funnel"}:
+            return funnel_panel(self.storage)
 
         if cmd in {"چرا", "دلیل", "/why"}:
             return why_panel(self.storage)

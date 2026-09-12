@@ -89,6 +89,46 @@ CREATE TABLE IF NOT EXISTS outbox (
 );
 CREATE INDEX IF NOT EXISTS idx_outbox_sent ON outbox(sent, id);
 
+-- نمادهایی که شرط کاندید (24h >= آستانه) را پاس کرده‌اند.
+-- عضویت در این جدول به معنی معامله نیست؛ فقط زیر نظر گرفتن است.
+CREATE TABLE IF NOT EXISTS watchlist (
+    symbol            TEXT PRIMARY KEY,
+    added_ts          INTEGER,
+    last_seen_ts      INTEGER,
+    entry_gain_pct    REAL,
+    peak_gain_pct     REAL,
+    peak_price        REAL,
+    last_gain_pct     REAL,
+    last_price        REAL,
+    setup_count       INTEGER DEFAULT 0,
+    trade_count       INTEGER DEFAULT 0,
+    last_reject_code  TEXT,
+    active            INTEGER DEFAULT 1
+);
+
+-- عکس لحظه‌ای کامل شرایط در زمان هر تریگر (ورود یا رد شدن).
+-- این جدول ستون فقرات Audit است: بعداً باید بتوانیم دقیقاً بفهمیم چرا
+-- یک معامله باز شد یا نشد، بدون حدس زدن.
+CREATE TABLE IF NOT EXISTS signal_snapshots (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    cycle_id      INTEGER,
+    symbol        TEXT,
+    trigger_ts    INTEGER,
+    accepted      INTEGER,
+    reject_code   TEXT,
+    entry_type    TEXT,
+    payload       TEXT,
+    created_ts    INTEGER
+);
+
+-- دورهٔ استراحت هر نماد بعد از خروج.
+CREATE TABLE IF NOT EXISTS cooldowns (
+    symbol      TEXT PRIMARY KEY,
+    until_ts    INTEGER,
+    reason      TEXT,
+    set_ts      INTEGER
+);
+
 CREATE TABLE IF NOT EXISTS health (
     component TEXT PRIMARY KEY,
     status    TEXT,
@@ -106,9 +146,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "max_positions": config.MAX_CONCURRENT_POSITIONS,
     "position_size": config.POSITION_SIZE_USDT,
     "live_report_minutes": config.LIVE_REPORT_MINUTES,
-    "pump_threshold": config.PUMP_THRESHOLD_PCT,
-    "vol_mult": config.VOL_MULT,
-    "trail_pct": config.TRAIL_PCT,
+    "cooldown_hours": config.COOLDOWN_HOURS,
     "leverage": config.DEFAULT_LEVERAGE,
     "margin_mode": config.MARGIN_MODE,
     "capital_cap": config.CAPITAL_CAP_USDT,
@@ -524,5 +562,223 @@ class Storage:
         with self._lock:
             rows = self._conn.execute(
                 "SELECT * FROM cycles ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ==================================================================
+    #  V3 — Watchlist
+    # ==================================================================
+    # عضویت در Watchlist به معنی معامله نیست. این جدول فقط نمادهایی را
+    # نگه می‌دارد که شرط کاندید (24h >= آستانه) را پاس کرده‌اند تا با
+    # فرکانس بالاتر مانیتور شوند.
+
+    def watchlist_upsert(
+        self,
+        *,
+        symbol: str,
+        gain_pct: float,
+        price: float,
+        now_ts: int,
+    ) -> dict[str, Any]:
+        """افزودن نماد به Watchlist یا به‌روزرسانی آن.
+
+        ``peak_gain_pct`` و ``peak_price`` بالاترین مقدار مشاهده‌شده از زمان
+        ورود به Watchlist هستند و هرگز عقب نمی‌روند — برای محاسبهٔ «چقدر از
+        سقف ریخته» در تحلیل بعدی لازم‌اند.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM watchlist WHERE symbol=?", (symbol,)
+            ).fetchone()
+            if row is None:
+                self._conn.execute(
+                    "INSERT INTO watchlist (symbol, added_ts, last_seen_ts, entry_gain_pct,"
+                    " peak_gain_pct, peak_price, last_gain_pct, last_price, active)"
+                    " VALUES (?,?,?,?,?,?,?,?,1)",
+                    (symbol, now_ts, now_ts, gain_pct, gain_pct, price, gain_pct, price),
+                )
+            else:
+                self._conn.execute(
+                    "UPDATE watchlist SET last_seen_ts=?, last_gain_pct=?, last_price=?,"
+                    " peak_gain_pct=MAX(peak_gain_pct, ?), peak_price=MAX(peak_price, ?),"
+                    " active=1 WHERE symbol=?",
+                    (now_ts, gain_pct, price, gain_pct, price, symbol),
+                )
+            self._conn.commit()
+            out = self._conn.execute(
+                "SELECT * FROM watchlist WHERE symbol=?", (symbol,)
+            ).fetchone()
+        return dict(out) if out else {}
+
+    def watchlist_active(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM watchlist WHERE active=1 ORDER BY peak_gain_pct DESC"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def watchlist_get(self, symbol: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM watchlist WHERE symbol=?", (symbol,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def watchlist_expire(self, older_than_ts: int) -> int:
+        """خروج نمادهایی که مدت نگه‌داری‌شان تمام شده.
+
+        حذف فوری وقتی نماد زیر آستانه می‌آید انجام *نمی‌شود* — چون ممکن است
+        دقیقاً همان لحظه وارد فاز برگشت شده باشد. فقط بر اساس گذر زمان.
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE watchlist SET active=0 WHERE active=1 AND last_seen_ts < ?",
+                (older_than_ts,),
+            )
+            self._conn.commit()
+        return int(cur.rowcount or 0)
+
+    def watchlist_touch_counter(self, symbol: str, field: str) -> None:
+        """افزایش شمارندهٔ Funnel: ``setup_count`` یا ``trade_count``."""
+        if field not in {"setup_count", "trade_count"}:
+            return
+        with self._lock:
+            self._conn.execute(
+                f"UPDATE watchlist SET {field} = COALESCE({field},0) + 1 WHERE symbol=?",
+                (symbol,),
+            )
+            self._conn.commit()
+
+    def watchlist_set_reject(self, symbol: str, reject_code: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE watchlist SET last_reject_code=? WHERE symbol=?",
+                (reject_code, symbol),
+            )
+            self._conn.commit()
+
+    def watchlist_funnel(self) -> dict[str, Any]:
+        """آمار قیف: از چند کاندید، چند Setup و چند معامله بیرون آمد."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS total,"
+                " SUM(CASE WHEN setup_count>0 THEN 1 ELSE 0 END) AS with_setup,"
+                " SUM(CASE WHEN trade_count>0 THEN 1 ELSE 0 END) AS with_trade,"
+                " SUM(COALESCE(setup_count,0)) AS setups,"
+                " SUM(COALESCE(trade_count,0)) AS trades"
+                " FROM watchlist"
+            ).fetchone()
+        data = dict(row) if row else {}
+        return {
+            "total_candidates": int(data.get("total") or 0),
+            "candidates_with_setup": int(data.get("with_setup") or 0),
+            "candidates_with_trade": int(data.get("with_trade") or 0),
+            "total_setups": int(data.get("setups") or 0),
+            "total_trades": int(data.get("trades") or 0),
+        }
+
+    # ==================================================================
+    #  V3 — Signal Snapshots (ستون فقرات Audit)
+    # ==================================================================
+
+    def save_snapshot(
+        self,
+        *,
+        symbol: str,
+        trigger_ts: int,
+        accepted: bool,
+        payload: Any,
+        cycle_id: int | None = None,
+        reject_code: str = "",
+        entry_type: str = "",
+    ) -> int:
+        """ثبت عکس لحظه‌ای شرایط — هم برای ورودها و هم برای ردها.
+
+        ردها هم ذخیره می‌شوند چون برای تحلیل قیف (چرا معامله نشد) لازم‌اند.
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO signal_snapshots (cycle_id, symbol, trigger_ts, accepted,"
+                " reject_code, entry_type, payload, created_ts) VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    cycle_id,
+                    symbol,
+                    int(trigger_ts),
+                    1 if accepted else 0,
+                    reject_code,
+                    entry_type,
+                    json_dumps(payload),
+                    now_ms(),
+                ),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid or 0)
+
+    def snapshot_for_cycle(self, cycle_id: int) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM signal_snapshots WHERE cycle_id=? AND accepted=1"
+                " ORDER BY id DESC LIMIT 1",
+                (cycle_id,),
+            ).fetchone()
+        if not row:
+            return None
+        out = dict(row)
+        out["payload"] = json_loads(out.get("payload"), {})
+        return out
+
+    def reject_breakdown(self, since_ms_ts: int = 0) -> list[dict[str, Any]]:
+        """شمارش دلایل رد شدن — برای فهمیدن گلوگاه قیف."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT reject_code, COUNT(*) AS n FROM signal_snapshots"
+                " WHERE accepted=0 AND trigger_ts >= ? AND reject_code <> ''"
+                " GROUP BY reject_code ORDER BY n DESC",
+                (int(since_ms_ts),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ==================================================================
+    #  V3 — Cooldown
+    # ==================================================================
+
+    def set_cooldown(self, symbol: str, *, hours: float, reason: str = "") -> int:
+        """شروع دورهٔ استراحت برای یک نماد بعد از خروج.
+
+        در این مدت هیچ معامله‌ای روی این نماد باز نمی‌شود — حتی اگر دوباره
+        پامپ کند یا سیگنال جدید بدهد. هدف: جلوگیری از چند معامله روی یک
+        Pump Episode واحد.
+        """
+        until = now_ms() + int(max(0.0, hours) * 3600 * 1000)
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO cooldowns (symbol, until_ts, reason, set_ts) VALUES (?,?,?,?)"
+                " ON CONFLICT(symbol) DO UPDATE SET until_ts=excluded.until_ts,"
+                " reason=excluded.reason, set_ts=excluded.set_ts",
+                (symbol, until, reason, now_ms()),
+            )
+            self._conn.commit()
+        return until
+
+    def in_cooldown(self, symbol: str) -> tuple[bool, int]:
+        """آیا نماد در استراحت است؟ خروجی: (بله/نه، زمان پایان).
+
+        نکته: رکورد منقضی‌شده پاک نمی‌شود تا تاریخچهٔ استراحت‌ها برای
+        تحلیل بعدی باقی بماند.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT until_ts FROM cooldowns WHERE symbol=?", (symbol,)
+            ).fetchone()
+        if not row:
+            return False, 0
+        until = int(row["until_ts"] or 0)
+        return (now_ms() < until), until
+
+    def active_cooldowns(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM cooldowns WHERE until_ts > ? ORDER BY until_ts",
+                (now_ms(),),
             ).fetchall()
         return [dict(r) for r in rows]

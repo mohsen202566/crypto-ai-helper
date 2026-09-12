@@ -1,13 +1,21 @@
-"""موتور ربات — اسکن چندارزی برای پامپ/دامپ با حجم تأییدشده، و مدیریت پوزیشن‌های هم‌زمان.
+"""موتور ربات V3 — Extreme Pump Fade (Short-Only).
 
-جریان کار در هر چرخه:
-  ۱. پوزیشن‌های باز را بپا (استاپ دنبال‌کننده، حد ضرر اولیه، پایان مهلت).
-  ۲. اگر اسلات خالی داری، همهٔ ارزهای فهرست را برای پامپ/دامپ تازه بررسی کن.
-  ۳. نامزدها را بر اساس شدت حرکت مرتب کن و از قوی‌ترین به ضعیف‌ترین اسلات‌ها را پر کن.
+دو حلقهٔ کاملاً جدا:
 
-نکتهٔ مهم: سیگنال یعنی «همین الان پول واقعی با حجم بالا وارد این ارز شده»،
-نه پیش‌بینی قطعی ادامهٔ مسیر. برد و باخت هر دو رخ می‌دهد؛ چیزی که سیستم را
-سرپا نگه می‌دارد نسبت ریسک به سود (استاپ دنبال‌کننده) است، نه دقت پیش‌بینی.
+  ۱. Watchlist Scanner (هر ۱۵ دقیقه)
+     نمادهایی که 24h Change >= آستانه دارند وارد Watchlist می‌شوند.
+     این فقط «زیر نظر گرفتن» است، نه معامله.
+
+  ۲. Monitoring (هر ۵ دقیقه)
+     فقط اعضای Watchlist بررسی می‌شوند: آیا همین الان شرایط ورود SHORT
+     برقرار است؟ ورود intra-candle است و منتظر بسته‌شدن کندل نمی‌ماند.
+
+و مدیریت پوزیشن‌های باز که در هر تیک اجرا می‌شود: حد ضرر سخت (فوری،
+بدون تأیید تکنیکال) یا برگشت ساختاری تأییدشده.
+
+اصل روش‌شناختی: این یک آزمون است، نه یک سیستم اثبات‌شده. هدف جمع‌آوری
+دادهٔ causal و قابل‌ممیزی است تا بعداً بتوان فهمید آیا این پدیده در زمان
+واقعی قابل شکار هست یا نه. هیچ قانونی در طول جمع‌آوری داده تغییر نمی‌کند.
 """
 from __future__ import annotations
 
@@ -31,7 +39,8 @@ class BotEngine:
         self._contracts_ts = 0.0
         self._universe: list[str] = []
         self._universe_ts = 0.0
-        self._last_scan = 0.0
+        self._last_watchlist_scan = 0.0
+        self._last_monitor = 0.0
         self._last_live_report = 0.0
         self._last_summary_day = ""
 
@@ -182,21 +191,18 @@ class BotEngine:
             value = min(value, max(0, capacity))
         return value
 
-    def pump_threshold(self) -> float:
-        value = safe_float(self.storage.get_setting("pump_threshold", config.PUMP_THRESHOLD_PCT))
-        return max(config.PUMP_THRESHOLD_MIN, min(value, config.PUMP_THRESHOLD_MAX))
-
-    def vol_mult(self) -> float:
-        value = safe_float(self.storage.get_setting("vol_mult", config.VOL_MULT))
-        return max(config.VOL_MULT_MIN, min(value, config.VOL_MULT_MAX))
-
-    def trail_pct(self) -> float:
-        value = safe_float(self.storage.get_setting("trail_pct", config.TRAIL_PCT))
-        return max(config.TRAIL_PCT_MIN, min(value, config.TRAIL_PCT_MAX))
+    def cooldown_hours(self) -> float:
+        """مدت استراحت هر نماد بعد از خروج (ساعت). از پنل: «استراحت ۲»."""
+        value = safe_float(self.storage.get_setting("cooldown_hours", config.COOLDOWN_HOURS))
+        return max(config.COOLDOWN_HOURS_MIN, min(value, config.COOLDOWN_HOURS_MAX))
 
     def max_hold_seconds(self) -> float:
-        """مهلت نگه‌داشتن پوزیشن به ثانیه، از روی تایم‌فریم و تعداد کندل."""
-        return timeframe_seconds(config.ENTRY_TIMEFRAME) * config.MAX_HOLD_BARS
+        """شبکهٔ ایمنی برای پوزیشن فراموش‌شده؛ صفر یعنی بدون مهلت.
+
+        این بخشی از استراتژی نیست — خروج واقعی فقط با حد ضرر یا برگشت
+        ساختاری انجام می‌شود.
+        """
+        return max(0.0, config.MAX_HOLD_HOURS) * 3600.0
 
     def position_size(self) -> float:
         """مارجین ثابت هر پوزیشن؛ صفر یعنی تقسیم خودکار سرمایه."""
@@ -222,11 +228,24 @@ class BotEngine:
     #  حلقهٔ اصلی
     # ------------------------------------------------------------------
     def tick(self) -> None:
-        """هر تیک: پوزیشن‌های باز، اسکن ارزها، و گزارش‌های دوره‌ای."""
+        """هر تیک: پوزیشن‌های باز، اسکن Watchlist، مانیتور ورود، گزارش‌ها.
+
+        دو فرکانس متفاوت و عمدی:
+          * Watchlist هر ۱۵ دقیقه — کشف کاندید کافی است همین‌قدر کند باشد.
+          * Monitoring هر ۵ دقیقه — چون یک Cascade می‌تواند در همان بازه
+            بخش بزرگی از حرکت را طی کند و انتظار برای کندل ۱۵ دقیقه‌ای
+            یعنی از دست دادن آن.
+        """
         self.manage_open_positions()
-        if (time.monotonic() - self._last_scan) >= config.SCAN_INTERVAL_SECONDS:
-            self._last_scan = time.monotonic()
-            self.scan_for_entries()
+
+        if (time.monotonic() - self._last_watchlist_scan) >= config.WATCHLIST_SCAN_SECONDS:
+            self._last_watchlist_scan = time.monotonic()
+            self.scan_watchlist()
+
+        if (time.monotonic() - self._last_monitor) >= config.MONITOR_INTERVAL_SECONDS:
+            self._last_monitor = time.monotonic()
+            self.monitor_watchlist()
+
         self.maybe_send_live_report()
         self.maybe_send_daily_summary()
 
@@ -286,6 +305,14 @@ class BotEngine:
 
     # --- مدیریت پوزیشن‌های باز -------------------------------------------
     def manage_open_positions(self) -> None:
+        """پایش پوزیشن‌های باز: حد ضرر سخت یا برگشت ساختاری.
+
+        حد ضرر سخت مطلق است — به محض فعال شدن، فوراً بسته می‌شود و منتظر
+        هیچ تأیید تکنیکالی نمی‌ماند. این محافظت از حساب است، نه تحلیل.
+
+        در غیر این صورت تنها راه خروج، برگشت ساختاری تأییدشده است. هیچ TP
+        ثابتی وجود ندارد و نویز (یک کندل سبز، یک wick) خروج ایجاد نمی‌کند.
+        """
         cycles = self.storage.open_cycles()
         if not cycles:
             return
@@ -307,44 +334,177 @@ class BotEngine:
                 continue
 
             entry_price = safe_float(cycle.get("avg_entry_price"))
-            best_price = safe_float(cycle.get("best_price")) or entry_price
+            quantity = safe_float(cycle.get("total_quantity"))
+            hard_stop = safe_float(cycle.get("hard_stop_price"))
+            opened_at = safe_int(cycle.get("opened_at"))
+
+            # بهترین قیمت (کمترین برای شورت) فقط برای گزارش MFE ذخیره می‌شود،
+            # نه برای تصمیم خروج — چون V3 تریلینگ درصدی ندارد.
+            best_price = safe_float(cycle.get("best_price"))
+            new_best = min(best_price, price) if best_price > 0 else price
+
+            # حد ضرر سخت را بدون نیاز به کندل می‌سنجیم (سریع‌ترین مسیر).
+            if hard_stop > 0 and price >= hard_stop:
+                gross = risk_engine.unrealized_pnl(
+                    side="SHORT", avg_entry=entry_price,
+                    quantity=quantity, current_price=price,
+                )
+                self.close_position(
+                    cycle, exit_price=price, exit_reason="HARD_STOP", gross_pnl=gross,
+                )
+                continue
+
+            # برای برگشت ساختاری به کندل نیاز داریم.
+            candles: list[dict[str, Any]] = []
+            try:
+                candles = self.toobit.get_klines(
+                    symbol, config.ENTRY_TIMEFRAME, config.ENTRY_CANDLE_LIMIT
+                )
+            except Exception as exc:
+                logger.warning("EXIT_KLINE_FAIL | %s | %s", symbol, exc)
+
             decision = strategy.exit_decision(
-                side=str(cycle.get("side")),
                 entry_price=entry_price,
-                quantity=safe_float(cycle.get("total_quantity")),
+                quantity=quantity,
                 current_price=price,
-                best_price=best_price,
-                hard_stop=safe_float(cycle.get("hard_stop_price")),
-                trail_pct=self.trail_pct(),
-                opened_at_ms=safe_int(cycle.get("opened_at")),
-                max_hold_seconds=self.max_hold_seconds(),
+                hard_stop=hard_stop,
+                candles=candles,
+                entry_time_ms=opened_at,
             )
+
+            # شبکهٔ ایمنی اختیاری برای پوزیشن فراموش‌شده (پیش‌فرض: خاموش).
+            max_hold = self.max_hold_seconds()
+            if decision.reason is None and max_hold > 0 and opened_at > 0:
+                if (now_ms() - opened_at) / 1000.0 >= max_hold:
+                    decision = strategy.ExitDecision(
+                        "MAX_HOLD", decision.gross_pnl, price, "پایان مهلت ایمنی"
+                    )
+
             if decision.reason:
                 self.close_position(
                     cycle, exit_price=price, exit_reason=decision.reason,
-                    gross_pnl=decision.gross_pnl,
+                    gross_pnl=decision.gross_pnl, detail=decision.detail,
                 )
             else:
-                # استاپ دنبال‌کننده حتی وقتی هنوز خارج نشده باید ذخیره شود —
-                # وگرنه با هر ری‌استارت ربات، پیشرفت تریل از دست می‌رود.
                 self.storage.update_trailing(
                     safe_int(cycle.get("id")),
-                    best_price=decision.best_price, active_stop=decision.active_stop,
+                    best_price=new_best, active_stop=hard_stop,
                 )
 
     # --- اسکن و ورود ------------------------------------------------------
-    def scan_for_entries(self) -> None:
+    def scan_watchlist(self) -> None:
+        """اسکن هر ۱۵ دقیقه: چه نمادهایی شرط کاندید را دارند؟
+
+        تنها شرط: 24h Change >= WATCHLIST_MIN_GAIN_PCT.
+
+        ورود به Watchlist هیچ ربطی به ورود به معامله ندارد؛ فقط یعنی این
+        نماد از حالا با فرکانس بالاتر (هر ۵ دقیقه) زیر نظر گرفته می‌شود.
+
+        نمادی که زیر آستانه برمی‌گردد فوراً حذف نمی‌شود — ممکن است دقیقاً
+        همان لحظه وارد فاز برگشت شده باشد که هدف اصلی ماست. حذف فقط بر
+        اساس گذر زمان (WATCHLIST_RETENTION_HOURS) انجام می‌شود.
+        """
+        try:
+            tickers = self.toobit.get_24h_tickers()
+        except Exception as exc:
+            self.storage.set_health("watchlist", "warning", f"دریافت تیکر ناموفق: {exc}")
+            logger.warning("WATCHLIST_TICKER_FAIL | %s", exc)
+            return
+
+        contracts = self._refresh_contracts()
+        blacklist = {b.upper() for b in config.SYMBOL_BLACKLIST}
+        threshold = config.WATCHLIST_MIN_GAIN_PCT
+        now = now_ms()
+        added = 0
+        scanned = 0
+
+        for row in tickers:
+            symbol = str(row.get("s") or row.get("symbol") or "")
+            if not symbol or symbol not in contracts:
+                continue
+            if canonical_base(symbol) in blacklist:
+                continue
+
+            change = self._ticker_change_pct(row)
+            price = safe_float(row.get("c") or row.get("lastPrice") or row.get("close"))
+            volume = safe_float(row.get("qv") or row.get("quoteVolume") or 0)
+            scanned += 1
+
+            if change < threshold:
+                continue
+            if volume > 0 and volume < config.MIN_24H_QUOTE_VOLUME:
+                # نماد کم‌حجم: اسپرد و لغزش، هر سودی را می‌بلعد.
+                continue
+
+            existing = self.storage.watchlist_get(symbol)
+            self.storage.watchlist_upsert(
+                symbol=symbol, gain_pct=change, price=price, now_ts=now
+            )
+            if existing is None or not existing.get("active"):
+                added += 1
+                self.storage.log_event("watchlist_add", {
+                    "symbol": symbol, "change_24h": round(change, 2), "price": price,
+                })
+
+        # انقضای اعضای قدیمی
+        cutoff = now - int(config.WATCHLIST_RETENTION_HOURS * 3600 * 1000)
+        expired = self.storage.watchlist_expire(cutoff)
+
+        active = self.storage.watchlist_active()
+        self.storage.set_setting("watchlist_size", len(active))
+        self.storage.set_health(
+            "watchlist", "ok",
+            f"{len(active)} نماد زیر نظر | {added} جدید | {expired} منقضی "
+            f"(از {scanned} نماد بررسی‌شده، آستانه {threshold:.0f}%)",
+        )
+
+    @staticmethod
+    def _ticker_change_pct(row: dict[str, Any]) -> float:
+        """درصد تغییر ۲۴ ساعته از ردیف تیکر.
+
+        بعضی endpointها درصد می‌دهند و بعضی نسبت خام؛ هر دو پوشش داده
+        می‌شوند تا یک نماد به‌اشتباه از قلم نیفتد.
+        """
+        for key in ("pcp", "priceChangePercent", "changeRate", "rose"):
+            if key in row:
+                value = safe_float(row.get(key))
+                if value == 0:
+                    continue
+                # نسبت خام (مثلاً 0.18) در برابر درصد (مثلاً 18.0)
+                return value * 100.0 if abs(value) <= 1.5 else value
+        open_price = safe_float(row.get("o") or row.get("openPrice"))
+        last_price = safe_float(row.get("c") or row.get("lastPrice"))
+        if open_price > 0 and last_price > 0:
+            return (last_price - open_price) / open_price * 100.0
+        return 0.0
+
+    # ------------------------------------------------------------------
+    #  مانیتور و ورود
+    # ------------------------------------------------------------------
+    def monitor_watchlist(self) -> None:
+        """بررسی هر ۵ دقیقه: آیا شرایط ورود SHORT برقرار است؟
+
+        فقط اعضای Watchlist بررسی می‌شوند. برای هر نماد، عکس لحظه‌ای کامل
+        شرایط ذخیره می‌شود — چه ورود انجام شود چه نشود — تا بعداً بتوان
+        قیف را تحلیل کرد (از چند کاندید، چند Setup، چند معامله).
+        """
         mode = self.mode()
         if mode is None:
             self.storage.set_health(
-                "scan", "ok",
+                "monitor", "ok",
                 "ترید واقعی و مجازی هر دو خاموش‌اند — با «ترید مجازی فعال» روشن کنید",
             )
             return
+
+        watch = self.storage.watchlist_active()
+        if not watch:
+            self.storage.set_health("monitor", "ok", "Watchlist خالی است")
+            return
+
         capital = self.effective_capital(real_mode=(mode == "real"))
         if capital < config.MIN_CAPITAL_TO_TRADE_USDT:
             self.storage.set_health(
-                "scan", "warning",
+                "monitor", "warning",
                 f"سرمایه ({capital:.2f}$) کمتر از حداقل "
                 f"({config.MIN_CAPITAL_TO_TRADE_USDT:.2f}$) است",
             )
@@ -355,140 +515,127 @@ class BotEngine:
         free_slots = max_positions - open_count
         if free_slots <= 0:
             self.storage.set_health(
-                "scan", "ok", f"همهٔ {max_positions} اسلات پر است — منتظر بسته شدن"
-                if max_positions > 0 else
-                "سرمایهٔ آزاد کافی برای باز کردن پوزیشن جدید نیست"
+                "monitor", "ok",
+                f"همهٔ {max_positions} اسلات پر است — منتظر بسته شدن",
             )
             return
 
-        universe = self.refresh_universe()
-        if not universe:
-            self.storage.set_health("scan", "warning", "فهرست ارزها خالی است")
-            return
-
         busy = self.storage.open_symbols()
-        pump_th = self.pump_threshold()
-        vmult = self.vol_mult()
-        candidates: list[strategy.SymbolScore] = []
-        best_rejected: strategy.SymbolScore | None = None
-        scanned = 0
+        bar_seconds = float(timeframe_seconds(config.ENTRY_TIMEFRAME))
+        now = now_ms()
+        checked = 0
+        setups = 0
+        opened = 0
+        rejects: dict[str, int] = {}
 
-        for symbol in universe:
+        for row in watch:
+            if free_slots <= 0:
+                break
+            symbol = str(row.get("symbol"))
+
             if config.ONE_POSITION_PER_SYMBOL and symbol in busy:
                 continue
+
+            # استراحت: مطلق است. حتی سیگنال قوی هم نادیده گرفته می‌شود.
+            cooling, until = self.storage.in_cooldown(symbol)
+            if cooling:
+                rejects["cooldown"] = rejects.get("cooldown", 0) + 1
+                continue
+
             try:
-                entry_candles = self.toobit.get_klines(
+                candles = self.toobit.get_klines(
                     symbol, interval=config.ENTRY_TIMEFRAME, limit=config.ENTRY_CANDLE_LIMIT
                 )
                 price = safe_float(self.toobit.get_mark_price(symbol))
             except Exception as exc:
-                logger.debug("KLINE_SKIP | %s | %s", symbol, exc)
+                logger.debug("MONITOR_SKIP | %s | %s", symbol, exc)
+                continue
+            if not candles or price <= 0:
                 continue
 
-            scanned += 1
-            result = strategy.score_symbol(
+            checked += 1
+
+            # کندل جاری (ناقص) — برای ارزیابی intra-candle لازم است.
+            live = candles[-1] if candles else {}
+            live_open_ms = safe_int(live.get("time"))
+            elapsed = max(0.0, (now - live_open_ms) / 1000.0) if live_open_ms else 0.0
+            live_high = safe_float(live.get("high"))
+            live_low = safe_float(live.get("low"))
+            live_volume = safe_float(live.get("volume"))
+            volume_ok = live_volume > 0
+
+            signal = strategy.evaluate_entry(
                 symbol=symbol,
-                entry_candles=entry_candles,
-                price=price,
-                pump_threshold=pump_th,
-                vol_mult=vmult,
+                candles=candles,
+                current_price=price,
+                change_24h=safe_float(row.get("last_gain_pct")),
+                current_high=live_high,
+                current_low=live_low,
+                current_volume=live_volume,
+                elapsed_seconds=elapsed,
+                volume_data_available=volume_ok,
+                bar_seconds=bar_seconds,
+                trigger_time_ms=now,
             )
-            if result.ok:
-                candidates.append(result)
-            elif best_rejected is None or result.score > best_rejected.score:
-                best_rejected = result
 
-        if not candidates:
-            self.storage.set_setting("last_scan_report", {
-                "ts": now_ms(),
-                "scanned": scanned,
-                "candidates": 0,
-                "free_slots": free_slots,
-                "pump_threshold": pump_th,
-                "vol_mult": vmult,
-                "opened": 0,
-                "rows": [],
-                "best_rejected": (
-                    {"symbol": canonical_base(best_rejected.symbol),
-                     "score": round(best_rejected.score, 1),
-                     "why": best_rejected.reason}
-                    if best_rejected else None
-                ),
-            })
-            detail = (
-                f"{scanned} ارز اسکن شد — هیچ‌کدام پامپ/دامپ {pump_th:.1f}%+ "
-                f"با حجم {vmult:.1f}× نداشت"
+            if not signal.ok:
+                code = signal.reject_code or "unknown"
+                rejects[code] = rejects.get(code, 0) + 1
+                self.storage.watchlist_set_reject(symbol, code)
+                # فقط ردهای «نزدیک به ورود» ذخیره می‌شوند تا دیتابیس پر
+                # از ردهای بی‌اهمیت (مثل نبود کندل) نشود.
+                if code in {"no_structure_break", "no_deceleration",
+                            "cascade_no_volume_expansion", "cascade_no_range_expansion",
+                            "spread_too_wide", "stop_unavailable"}:
+                    self.storage.save_snapshot(
+                        symbol=symbol, trigger_ts=now, accepted=False,
+                        payload=signal.snapshot.as_dict(), reject_code=code,
+                    )
+                continue
+
+            setups += 1
+            self.storage.watchlist_touch_counter(symbol, "setup_count")
+
+            cycle_id = self.open_position(
+                symbol=symbol, signal=signal, mode=mode, capital=capital,
+                max_positions=max_positions,
             )
-            if best_rejected and best_rejected.symbol:
-                detail += (
-                    f" | بهترین: {canonical_base(best_rejected.symbol)} "
-                    f"{best_rejected.score:.0f}"
-                )
-            self.storage.set_health("scan", "ok", detail)
-            return
+            if cycle_id:
+                opened += 1
+                free_slots -= 1
+                busy.add(symbol)
+                self.storage.watchlist_touch_counter(symbol, "trade_count")
 
-        # قوی‌ترین حرکت اول — اسلات کمیاب است، پس به بهترین سیگنال می‌رسد.
-        candidates.sort(key=lambda c: c.score, reverse=True)
+        self.storage.set_setting("last_monitor_report", {
+            "ts": now,
+            "watchlist": len(watch),
+            "checked": checked,
+            "setups": setups,
+            "opened": opened,
+            "free_slots": free_slots,
+            "rejects": rejects,
+        })
+        top_reject = max(rejects.items(), key=lambda kv: kv[1])[0] if rejects else "-"
         self.storage.set_health(
-            "scan", "ok",
-            f"{len(candidates)} نامزد از {scanned} ارز | {free_slots} اسلات خالی",
+            "monitor", "ok",
+            f"{checked} نماد بررسی شد | {setups} ستاپ | {opened} ورود | "
+            f"بیشترین دلیل رد: {top_reject}",
         )
 
-        opened = 0
-        report: list[dict[str, Any]] = []
-        for candidate in candidates[:free_slots]:
-            # خطای یک ارز نباید کل اسکن را متوقف کند؛ وگرنه بقیهٔ نامزدها
-            # بررسی نمی‌شوند و گزارش هم ذخیره نمی‌شود.
-            try:
-                ok, why = self.open_position(candidate, mode=mode, capital=capital)
-            except Exception as exc:
-                logger.exception("OPEN_FAIL | %s", candidate.symbol)
-                self.storage.set_health("order", "warning", str(exc))
-                ok, why = False, f"خطای داخلی: {exc}"
-            report.append({
-                "symbol": canonical_base(candidate.symbol),
-                "side": candidate.side,
-                "score": round(candidate.score, 1),
-                "ok": ok,
-                "why": why,
-            })
-            if ok:
-                opened += 1
-
-        # گزارش کامل ذخیره می‌شود تا «چرا» بتواند دلیل تک‌تک ارزها را نشان دهد.
-        self.storage.set_setting("last_scan_report", {
-            "ts": now_ms(),
-            "scanned": scanned,
-            "candidates": len(candidates),
-            "free_slots": free_slots,
-            "pump_threshold": pump_th,
-            "vol_mult": vmult,
-            "opened": opened,
-            "rows": report,
-            "best_rejected": (
-                {"symbol": canonical_base(best_rejected.symbol),
-                 "score": round(best_rejected.score, 1),
-                 "why": best_rejected.reason}
-                if best_rejected else None
-            ),
-        })
-
-        if opened:
-            self.storage.set_health("risk", "ok", f"{opened} پوزیشن جدید باز شد")
-        elif report:
-            first = report[0]
-            self.storage.set_health(
-                "scan", "ok",
-                f"{len(candidates)} نامزد داشتیم ولی هیچ‌کدام باز نشد — "
-                f"{first['symbol']}: {first['why'][:90]}",
-            )
-
-    # --- باز کردن پوزیشن --------------------------------------------------
     def open_position(
-        self, candidate: strategy.SymbolScore, *, mode: str, capital: float
-    ) -> tuple[bool, str]:
-        """پوزیشن را باز می‌کند. خروجی: (موفق بود؟، دلیل اگر نشد)."""
-        symbol = candidate.symbol
+        self,
+        *,
+        symbol: str,
+        signal: strategy.EntrySignal,
+        mode: str,
+        capital: float,
+        max_positions: int = 0,
+    ) -> int | None:
+        """پوزیشن SHORT را باز می‌کند. خروجی: شناسهٔ چرخه یا None.
+
+        حد ضرر از خود سیگنال می‌آید (سقف تأییدشده + بافر ATR) و همان‌جا
+        فریز می‌شود؛ اینجا هیچ استاپی ساخته یا حدس زده نمی‌شود.
+        """
         contracts = self._refresh_contracts()
         info = contracts.get(symbol, {})
         try:
@@ -496,16 +643,19 @@ class BotEngine:
         except Exception:
             min_qty, min_notional = 0.0, 0.0
 
-        try:
-            price = safe_float(self.toobit.get_mark_price(symbol)) or candidate.price
-        except Exception:
-            price = candidate.price
+        # قیمت ورود همان قیمت لحظهٔ تریگر است؛ اگر نشد، قیمت تازه گرفته می‌شود.
+        price = signal.price
         if price <= 0:
-            return False, "قیمت لحظه‌ای از صرافی گرفته نشد"
+            try:
+                price = safe_float(self.toobit.get_mark_price(symbol))
+            except Exception:
+                price = 0.0
+        if price <= 0:
+            return None
 
         margin = risk_engine.slot_margin(
             capital_usdt=capital,
-            max_positions=self.max_positions(),
+            max_positions=max_positions or self.max_positions(),
             open_margin_usdt=self.storage.open_margin_total(),
             fixed_size_usdt=self.position_size(),
         )
@@ -520,22 +670,30 @@ class BotEngine:
             else:
                 detail = "سقف درگیری سرمایه پر است"
             self.storage.set_health("risk", "ok", detail)
-            return False, detail
+            return None
 
         # لوریج دقیقاً همانی است که کاربر تعیین کرده — نه بیشتر، نه کمتر.
         plan = risk_engine.plan_entry(
             symbol=symbol,
-            side=candidate.side or "LONG",
+            side="SHORT",
             entry_price=price,
+            stop_price=signal.stop_price,
             slot_margin_usdt=margin,
             leverage=self.leverage(),
             min_qty=min_qty,
             min_notional=min_notional,
         )
         if not plan.ok:
+            # «معامله نکردن» یک خروجی معتبر سیستم است — مثلاً وقتی فاصلهٔ
+            # استاپ ساختاری با مارجین موجود، لیکوئید را نزدیک می‌کند.
             self.storage.set_health("risk", "ok", f"{canonical_base(symbol)}: {plan.reason}")
             logger.info("ENTRY_REJECTED | %s | %s", symbol, plan.reason)
-            return False, plan.reason
+            self.storage.save_snapshot(
+                symbol=symbol, trigger_ts=signal.snapshot.trigger_time_ms,
+                accepted=False, payload=signal.snapshot.as_dict(),
+                reject_code="risk_rejected", entry_type=signal.entry_type or "",
+            )
+            return None
 
         cycle_id = self.storage.create_cycle(
             symbol=symbol,
@@ -546,9 +704,16 @@ class BotEngine:
             plan=plan.to_dict(),
             take_profit_price=plan.take_profit_price,
             hard_stop_price=plan.stop_price,
-            entry_score=candidate.score,
-            entry_reason=candidate.reason,
+            entry_score=safe_float(signal.snapshot.change_24h),
+            entry_reason=f"[{signal.entry_type}] {signal.reason}",
             best_price=price,
+        )
+
+        # عکس لحظه‌ای شرایط ورود — ستون فقرات Audit بعدی.
+        self.storage.save_snapshot(
+            symbol=symbol, trigger_ts=signal.snapshot.trigger_time_ms,
+            accepted=True, payload=signal.snapshot.as_dict(),
+            cycle_id=cycle_id, entry_type=signal.entry_type or "",
         )
 
         order_id = None
@@ -580,7 +745,7 @@ class BotEngine:
                 self.storage.queue_message(
                     f"❌ ارسال سفارش {canonical_base(symbol)} ناموفق بود:\n{exc}"
                 )
-                return False, f"سفارش صرافی ناموفق: {exc}"
+                return None
 
         self.storage.mark_step_filled(
             cycle_id=cycle_id, step_index=1, fill_price=price,
@@ -596,17 +761,26 @@ class BotEngine:
         cycle = self.storage.get_cycle(cycle_id) or {}
         self.storage.queue_message(position_panel(cycle, plan.to_dict()), cycle_id=cycle_id)
         self.storage.log_event("position_opened", {
-            "id": cycle_id, "symbol": symbol, "score": candidate.score,
+            "id": cycle_id, "symbol": symbol,
+            "entry_type": signal.entry_type,
+            "stop_distance_pct": round(signal.stop_distance_pct, 3),
         })
         logger.info(
-            "POSITION_OPEN | %s %s score=%.0f lev=%sx margin=%.2f",
-            symbol, plan.side, candidate.score, plan.leverage, actual_margin,
+            "POSITION_OPEN | %s SHORT type=%s stop=%.4f%% lev=%sx margin=%.2f",
+            symbol, signal.entry_type, signal.stop_distance_pct,
+            plan.leverage, actual_margin,
         )
-        return True, ""
+        return cycle_id
 
     # --- بستن پوزیشن ------------------------------------------------------
     def close_position(self, cycle: dict[str, Any], *, exit_price: float,
-                       exit_reason: str, gross_pnl: float) -> None:
+                       exit_reason: str, gross_pnl: float, detail: str = "") -> None:
+        """بستن پوزیشن، ثبت کامل نتیجه، و شروع استراحت نماد.
+
+        استراحت بدون استثنا اعمال می‌شود: تا پایان آن، هیچ معاملهٔ جدیدی
+        روی این نماد باز نمی‌شود — حتی اگر دوباره پامپ کند یا سیگنال
+        قوی‌تری بدهد. هدف: جلوگیری از چند معامله روی یک Pump Episode.
+        """
         cycle_id = safe_int(cycle.get("id"))
         symbol = str(cycle.get("symbol"))
         notional = safe_float(cycle.get("total_notional"))
@@ -630,10 +804,38 @@ class BotEngine:
         self.storage.queue_message(
             result_panel(closed), reply_to=cycle.get("tg_message_id"), cycle_id=cycle_id
         )
+        # --- استراحت نماد ---
+        hours = self.cooldown_hours()
+        until = self.storage.set_cooldown(symbol, hours=hours, reason=exit_reason)
+
+        # --- MFE/MAE فقط برای تحلیل بعد از معامله ---
+        # این اعداد هیچ نقشی در تصمیم ورود یا خروج نداشتند و ندارند؛
+        # صرفاً برای فهمیدن اینکه بهترین و بدترین لحظهٔ معامله کجا بود.
+        entry_price = safe_float(cycle.get("avg_entry_price"))
+        best_price = safe_float(closed.get("best_price")) or entry_price
+        mfe_pct = ((entry_price - best_price) / entry_price * 100.0) if entry_price > 0 else 0.0
+        hard_stop = safe_float(cycle.get("hard_stop_price"))
+
         self.storage.log_event("position_closed", {
-            "id": cycle_id, "symbol": symbol, "reason": exit_reason, "net": net,
+            "id": cycle_id,
+            "symbol": symbol,
+            "reason": exit_reason,
+            "detail": detail,
+            "net": round(net, 4),
+            "gross": round(gross_pnl, 4),
+            "fees": round(fees, 4),
+            "entry_price": entry_price,
+            "exit_price": exit_price,
+            "hard_stop": hard_stop,
+            "mfe_pct": round(mfe_pct, 4),
+            "duration_ms": now_ms() - safe_int(cycle.get("opened_at")),
+            "cooldown_until": until,
+            "cooldown_hours": hours,
         })
-        logger.info("POSITION_CLOSED | %s reason=%s net=%.2f", symbol, exit_reason, net)
+        logger.info(
+            "POSITION_CLOSED | %s reason=%s net=%.2f mfe=%.2f%% cooldown=%.0fh",
+            symbol, exit_reason, net, mfe_pct, hours,
+        )
 
     # --- همگام‌سازی با صرافی ----------------------------------------------
     def monitor_real(self) -> None:

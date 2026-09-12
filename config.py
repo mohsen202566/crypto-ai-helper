@@ -1,8 +1,11 @@
-"""تنظیمات ثابت ربات Momentum Ignition روی Toobit.
+"""تنظیمات ربات V3 — Extreme Pump Fade (Short-Only) روی Toobit.
 
-همه فایل‌ها در ریشه پروژه قرار می‌گیرند. ربات هیچ موتور یادگیری ندارد؛
-قوانین سیگنال (پامپ+حجم)، ترید، اسلات و محدودیت API ثابت هستند و نتیجهٔ
-بک‌تست چندباره روی دادهٔ واقعی توبیت‌اند.
+قوانین استراتژی FROZEN هستند: از ابتدای Paper Test تا پایان آن هیچ‌یک از
+پارامترهای بخش «استراتژی» تغییر نمی‌کنند. تغییر آن‌ها بعد از دیدن نتایج،
+همان دام Overfitting است که پنج فرضیهٔ قبلی را از بین برد.
+
+تنظیمات اجرایی (دلار هر پوزیشن، تعداد پوزیشن، لوریج، استراحت) از پنل
+تلگرام کنترل می‌شوند و جزو قوانین استراتژی نیستند.
 """
 from __future__ import annotations
 
@@ -76,7 +79,7 @@ def _load_project_environment() -> None:
 
 _load_project_environment()
 
-BUILD_VERSION = "2026.09.07-momentum-v1"
+BUILD_VERSION = "2026.09.11-v3-pumpfade-paper"
 RUNTIME_DB = Path(os.getenv("RUNTIME_DB", str(ROOT / "runtime.db")))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
@@ -210,42 +213,79 @@ MAINTENANCE_MARGIN_RATE = float(os.getenv("MAINTENANCE_MARGIN_RATE", "0.005"))
 LIQUIDATION_TO_STOP_BUFFER = float(os.getenv("LIQUIDATION_TO_STOP_BUFFER", "2.0"))
 
 # ============================================================
-#  استراتژی: Momentum Ignition (دنبال کردن پامپ/دامپ واقعی)
+#  استراتژی V3: Extreme Pump Fade  (FROZEN — تغییر ممنوع)
 # ============================================================
-# نتیجهٔ بک‌تست روی توبیت (۱، ۷، ۱۰ و ۳۰ روز، ۱۵۰ ارز پرحجم): این سه پارامتر
-# در همهٔ بازه‌ها برنده بودند. منطق: حرکت شدید + حجم بالا = پول واقعی وارد
-# شده، نه نویز؛ در همان جهت وارد می‌شویم، نه برخلافش.
+# جریان:
+#   24h Change >= WATCHLIST_MIN_GAIN_PCT  ->  Watchlist (اسکن هر 15 دقیقه)
+#   Monitoring هر 5 دقیقه روی اعضای Watchlist
+#   مسیر A (FAST_CASCADE):  شتاب نزولی + انبساط دامنه + انبساط حجم
+#   مسیر B (NORMAL_REVERSAL): خستگی -> کاهش شتاب -> شکست کف تأییدشده
+#   خروج: فقط حد ضرر سخت یا برگشت ساختاری تأییدشده (بدون TP ثابت)
+#
+# هیچ‌یک از اعداد این بخش در طول Paper Test تغییر نمی‌کند.
 
-# پنجرهٔ تشخیص پامپ (تعداد کندل ENTRY_TIMEFRAME).
-PUMP_WINDOW_BARS = int(os.getenv("PUMP_WINDOW_BARS", "6"))
-# حداقل درصد حرکت در همان پنجره برای اینکه «پامپ/دامپ» حساب شود.
-# از تلگرام با «پامپ ۸» تغییر می‌کند.
-PUMP_THRESHOLD_PCT = float(os.getenv("PUMP_THRESHOLD_PCT", "8.0"))
-PUMP_THRESHOLD_MIN = 3.0
-PUMP_THRESHOLD_MAX = 25.0
-# حجم پنجرهٔ پامپ باید حداقل این ضریب میانگین حجم باشد؛ تأیید که حرکت با پول
-# واقعی همراه بوده، نه فقط نوسان کم‌حجم. از تلگرام با «ضریب حجم ۱.۵».
-VOL_MULT = float(os.getenv("VOL_MULT", "1.5"))
-VOL_MULT_MIN = 1.0
-VOL_MULT_MAX = 5.0
-VOLUME_AVG_PERIOD = int(os.getenv("VOLUME_AVG_PERIOD", "20"))
+# --- دروازهٔ Watchlist ---
+# تنها شرط کاندید شدن. ورود به Watchlist به معنی ورود به معامله نیست.
+WATCHLIST_MIN_GAIN_PCT = float(os.getenv("WATCHLIST_MIN_GAIN_PCT", "15.0"))
+# اگر نماد زیر آستانه برگشت، فوراً حذف نمی‌شود؛ ممکن است دقیقاً وارد فاز
+# برگشت شده باشد. این مهلت نگه‌داری بر حسب ساعت است.
+WATCHLIST_RETENTION_HOURS = float(os.getenv("WATCHLIST_RETENTION_HOURS", "12.0"))
 
-ALLOW_LONG = os.getenv("ALLOW_LONG", "1").strip() not in {"0", "false", "no"}
-ALLOW_SHORT = os.getenv("ALLOW_SHORT", "1").strip() not in {"0", "false", "no"}
+# --- تایم‌فریم‌ها ---
+# 15m = کشف کاندید / زمینه | 5m = مانیتور و اجرا
+CONTEXT_TIMEFRAME = os.getenv("CONTEXT_TIMEFRAME", "15m").strip()
+ENTRY_TIMEFRAME = os.getenv("ENTRY_TIMEFRAME", "5m").strip()
+ENTRY_CANDLE_LIMIT = int(os.getenv("ENTRY_CANDLE_LIMIT", "120"))
+# حداقل کندل لازم برای همهٔ محاسبات (ATR + pivot + baseline + deceleration)
+MIN_CANDLES_REQUIRED = 40
 
-# --- خروج: حد ضرر ثابت + تریلینگ استاپ ---
-# حد ضرر اولیه، درصد ثابت از قیمت ورود (نه ATR — استراتژی مبتنی بر درصد
-# حرکت است، نه نوسان معمول ارز).
-INITIAL_STOP_PCT = float(os.getenv("INITIAL_STOP_PCT", "4.0"))
-# به‌جای حد سود ثابت، استاپ دنبال‌کننده (trailing) — چون در حرکت‌های پارابولیک
-# هدف ثابت زودتر از موعد سود را می‌بندد. با رشد قیمت به نفع پوزیشن، استاپ
-# دنبالش می‌آید ولی هرگز عقب نمی‌رود. از تلگرام با «تریل ۲».
-TRAIL_PCT = float(os.getenv("TRAIL_PCT", "2.0"))
-TRAIL_PCT_MIN = 0.5
-TRAIL_PCT_MAX = 10.0
-# حداکثر مدت نگه‌داشتن پوزیشن (تعداد کندل ENTRY_TIMEFRAME) اگر نه تریل و نه
-# حد ضرر خورده باشد.
-MAX_HOLD_BARS = int(os.getenv("MAX_HOLD_BARS", "72"))
+# --- ۱) خستگی (Exhaustion) ---
+# نسبت سایهٔ بالایی به کل دامنهٔ کندل. >= 0.5 یعنی بیش از نصف حرکت صعودی
+# پس زده شده: خریدارها نتوانستند سطح را نگه دارند.
+WICK_RATIO_MIN = float(os.getenv("WICK_RATIO_MIN", "0.5"))
+
+# --- ۲) کاهش شتاب (Deceleration) ---
+# بازدهی N کندل اخیر با N کندل قبل از آن مقایسه می‌شود.
+DECEL_WINDOW_BARS = int(os.getenv("DECEL_WINDOW_BARS", "3"))
+
+# --- ۳) ساختار (Swing Pivot) ---
+# تعداد کندل تأیید در هر طرف. تأیید راست باعث تأخیر عمدی می‌شود
+# (2 کندل 5 دقیقه‌ای = 10 دقیقه) — این Look-Ahead نیست، فقط دیرتر فهمیدن.
+PIVOT_CONFIRM_BARS = int(os.getenv("PIVOT_CONFIRM_BARS", "2"))
+
+# --- ۴) آبشار فروش (Cascade) ---
+# ضریب انبساط برای دامنه و حجم نسبت به میانهٔ پنجرهٔ پایه.
+CASCADE_EXPANSION_MULT = float(os.getenv("CASCADE_EXPANSION_MULT", "2.0"))
+# پنجرهٔ پایه: 12 کندل 5 دقیقه‌ای = یک ساعت گذشته (همه بسته‌شده).
+CASCADE_BASELINE_BARS = int(os.getenv("CASCADE_BASELINE_BARS", "12"))
+# حداقل زمان سپری‌شده از شروع کندل جاری برای اینکه نرمال‌سازی نرخ معنی
+# داشته باشد. زیر یک دقیقه، نمونه خیلی کوچک است و نویز تشدید می‌شود.
+CASCADE_MIN_ELAPSED_SECONDS = float(os.getenv("CASCADE_MIN_ELAPSED_SECONDS", "60"))
+
+# --- ۵) حد ضرر تطبیقی ---
+# stop = آخرین سقف تأییدشده + k × ATR
+# ATR در لحظهٔ ورود فریز می‌شود و بعد از آن هرگز بازمحاسبه نمی‌شود؛
+# وگرنه ریسک پوزیشن بعد از ورود تغییر می‌کند.
+ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
+STOP_ATR_MULT = float(os.getenv("STOP_ATR_MULT", "1.5"))
+
+# --- جهت ---
+# V3 فقط شورت است. لانگ وجود ندارد.
+ALLOW_LONG = False
+ALLOW_SHORT = True
+
+# --- استراحت (Cooldown) ---
+# بعد از هر خروج، همان نماد این تعداد ساعت قابل معامله نیست — حتی اگر
+# دوباره پامپ کند یا سیگنال جدید بدهد. جلوگیری از Overtrading روی یک
+# Pump Episode. از تلگرام با «استراحت ۲» تنظیم می‌شود.
+COOLDOWN_HOURS = float(os.getenv("COOLDOWN_HOURS", "2"))
+COOLDOWN_HOURS_MIN = 1
+COOLDOWN_HOURS_MAX = 12
+
+# --- مهلت نگه‌داشتن ---
+# صفر = بدون مهلت. خروج فقط با حد ضرر یا برگشت ساختاری. این عدد صرفاً
+# یک شبکهٔ ایمنی برای پوزیشن‌های فراموش‌شده است، نه بخشی از استراتژی.
+MAX_HOLD_HOURS = float(os.getenv("MAX_HOLD_HOURS", "0"))
 
 # --- ایمنی اجرا ---
 MAX_ENTRY_SPREAD_RATE = float(os.getenv("MAX_ENTRY_SPREAD_RATE", "0.0015"))
@@ -270,6 +310,11 @@ DAILY_SUMMARY_ENABLED = os.getenv("DAILY_SUMMARY_ENABLED", "1").strip() not in {
 
 # --- زمان‌بندی حلقه‌ها ---
 CONTRACT_REFRESH_SECONDS = int(os.getenv("CONTRACT_REFRESH_SECONDS", "300"))
+# اسکن Watchlist: هر ۱۵ دقیقه. کشف کاندید کافی است همین‌قدر کند باشد.
+WATCHLIST_SCAN_SECONDS = float(os.getenv("WATCHLIST_SCAN_SECONDS", "900"))
+# مانیتور ورود: هر ۵ دقیقه. یک Cascade می‌تواند در همین بازه بخش بزرگی از
+# حرکت را طی کند؛ انتظار برای کندل ۱۵ دقیقه‌ای یعنی از دست دادن آن.
+MONITOR_INTERVAL_SECONDS = float(os.getenv("MONITOR_INTERVAL_SECONDS", "300"))
 SCAN_INTERVAL_SECONDS = float(os.getenv("SCAN_INTERVAL_SECONDS", "60"))
 POSITION_MONITOR_SECONDS = float(os.getenv("POSITION_MONITOR_SECONDS", "5"))
 REAL_MONITOR_SECONDS = int(os.getenv("REAL_MONITOR_SECONDS", "60"))

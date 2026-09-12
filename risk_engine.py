@@ -121,16 +121,16 @@ class EntryPlan:
         return asdict(self)
 
 
-def initial_stop_distance(entry_price: float) -> float:
-    """فاصلهٔ حد ضرر اولیه — درصد ثابت از قیمت ورود (نتیجهٔ بک‌تست).
+def initial_stop_distance(entry_price: float, stop_price: float) -> float:
+    """فاصلهٔ حد ضرر — از قیمت استاپِ ساختاری که استراتژی داده است.
 
-    برخلاف نسخهٔ قبلی (ATR)، این استراتژی مبتنی بر درصد حرکت است، نه نوسان
-    معمول ارز؛ پس حد ضرر هم درصد ثابت می‌ماند. حد سود ثابتی وجود ندارد —
-    خروج با استاپ دنبال‌کننده در ``strategy.exit_decision`` انجام می‌شود.
+    در V3 حد ضرر درصد ثابت نیست: ``strategy.compute_hard_stop`` آن را از
+    آخرین سقف تأییدشده به‌علاوهٔ بافر ATR می‌سازد و همان مقدار در لحظهٔ
+    ورود فریز می‌شود. اینجا فقط فاصله محاسبه می‌شود، بدون هیچ فرضی.
     """
-    if entry_price <= 0:
+    if entry_price <= 0 or stop_price <= 0:
         return 0.0
-    return entry_price * config.INITIAL_STOP_PCT / 100.0
+    return abs(stop_price - entry_price)
 
 
 def plan_entry(
@@ -138,17 +138,23 @@ def plan_entry(
     symbol: str,
     side: Side,
     entry_price: float,
+    stop_price: float,
     slot_margin_usdt: float,
     leverage: int | None = None,
     min_qty: float = 0.0,
     min_notional: float = 0.0,
 ) -> EntryPlan:
-    """یک پوزیشن تکی با حد ضرر اولیه می‌سازد؛ خروج نهایی با تریلینگ استاپ است.
+    """یک پوزیشن SHORT با حد ضرر ساختاری می‌سازد.
 
-    چون این استراتژی هدف سود ثابت ندارد (تریلینگ استاپ سود را باز می‌گذارد)،
-    شرط ورود «سود مورد انتظار × N برابر کارمزد» بی‌معناست — سود از قبل معلوم
-    نیست. در عوض، تنها شرط این است که فاصلهٔ حد ضرر به‌تنهایی چند برابر هزینهٔ
-    رفت‌وبرگشت باشد؛ وگرنه حتی یک نوسان عادی بازار کل ریسک را کارمزد می‌کند.
+    ``stop_price`` از ``strategy.compute_hard_stop`` می‌آید (سقف تأییدشده +
+    بافر ATR) و اینجا هیچ استاپی ساخته یا حدس زده نمی‌شود.
+
+    چون V3 حد سود ثابت ندارد، شرط «سود مورد انتظار × N برابر کارمزد» بی‌معناست
+    — سود از قبل معلوم نیست. تنها شرط این است که فاصلهٔ حد ضرر از هزینهٔ
+    رفت‌وبرگشت بزرگ‌تر باشد؛ وگرنه یک نوسان عادی کل ریسک را کارمزد می‌کند.
+
+    اگر فاصلهٔ استاپ آن‌قدر بزرگ باشد که با مارجین موجود لیکوئید نزدیک شود،
+    نتیجه ``ok=False`` است — یعنی «معامله نکردن» یک خروجی معتبر است.
     """
     lev = int(leverage or config.DEFAULT_LEVERAGE)
     lev = int(clamp(lev, config.LEVERAGE_MIN, config.LEVERAGE_MAX))
@@ -164,9 +170,9 @@ def plan_entry(
         blank.reason = "قیمت یا مارجین نامعتبر"
         return blank
 
-    distance = initial_stop_distance(entry_price)
+    distance = initial_stop_distance(entry_price, stop_price)
     if distance <= 0:
-        blank.reason = "فاصلهٔ حد ضرر قابل محاسبه نیست"
+        blank.reason = "حد ضرر ساختاری از استراتژی دریافت نشد"
         return blank
 
     notional = margin * lev
@@ -183,12 +189,9 @@ def plan_entry(
         )
         return blank
 
-    if side == "LONG":
-        stop_price = entry_price - distance
-    else:
-        stop_price = entry_price + distance
-    if stop_price <= 0:
-        blank.reason = "حد ضرر نامعتبر"
+    # V3 فقط شورت است و استاپ همیشه بالای قیمت ورود قرار دارد.
+    if stop_price <= entry_price:
+        blank.reason = "حد ضرر شورت باید بالاتر از قیمت ورود باشد"
         return blank
 
     cost = notional * round_trip_cost_rate()
@@ -220,8 +223,8 @@ def plan_entry(
         stop_price=stop_price, take_profit_price=0.0, liquidation_price=liq,
         risk_usdt=net_loss, expected_profit_usdt=0.0, cost_usdt=cost,
         reason=(
-            f"حد ضرر اولیه {config.INITIAL_STOP_PCT:.1f}% (ریسک {net_loss:.2f}$) | "
-            f"استاپ دنبال‌کننده {config.TRAIL_PCT:.1f}% | لوریج {lev}x"
+            f"حد ضرر ساختاری {distance / entry_price * 100:.2f}% "
+            f"(ریسک {net_loss:.2f}$) | خروج: برگشت ساختاری | لوریج {lev}x"
         ),
     )
 
