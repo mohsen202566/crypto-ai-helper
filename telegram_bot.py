@@ -197,8 +197,9 @@ def _size_label(storage: Storage, balance: float = 0.0) -> list[str]:
 
 def _common_lines(storage: Storage, balance: float = 0.0) -> list[str]:
     return [
-        f"استراتژی: V3 — شورت بعد از پامپ افراطی",
-        f"تایم‌فریم: اسکن {config.CONTEXT_TIMEFRAME} / اجرا {config.ENTRY_TIMEFRAME}",
+        "استراتژی: V3 — شورت بعد از پامپ افراطی",
+        f"اسکن: کل بازار ({safe_int(storage.get_setting('tradable_count', 0))} قرارداد)"
+        f"  |  اجرا: {config.ENTRY_TIMEFRAME}",
         f"حداکثر پوزیشن هم‌زمان: {safe_int(storage.get_setting('max_positions', config.MAX_CONCURRENT_POSITIONS))}",
         *_size_label(storage, balance),
         f"آستانهٔ کاندید: 24h ≥ {config.WATCHLIST_MIN_GAIN_PCT:.0f}%"
@@ -516,29 +517,45 @@ def _reject_label(code: str) -> str:
 
 
 def watchlist_panel(storage: Storage) -> str:
-    """نمادهایی که الان زیر نظرند — با پامپ فعلی و بیشترین پامپ ثبت‌شده."""
+    """فهرست نمادهای زیر نظر: تعداد، نام، و درصد پامپ.
+
+    مرتب‌شده بر اساس پامپ فعلی (بیشترین اول) تا سریع ببینی کدام‌ها
+    داغ‌ترند. اوج ثبت‌شده هم کنارش می‌آید چون گاهی نماد از سقفش برگشته
+    ولی هنوز زیر نظر است — و دقیقاً همان‌جا ممکن است فرصت شورت باشد.
+    """
     rows = storage.watchlist_active()
     if not rows:
-        return "هیچ نمادی زیر نظر نیست (هیچ‌کدام به آستانهٔ کاندید نرسیده‌اند)."
+        return (
+            "👀 هیچ نمادی زیر نظر نیست.\n\n"
+            f"هیچ ارزی پامپ ۲۴ ساعته ≥ {config.WATCHLIST_MIN_GAIN_PCT:.0f}% ندارد.\n"
+            f"اسکن بعدی تا حداکثر {config.WATCHLIST_SCAN_SECONDS / 60:.0f} دقیقهٔ دیگر."
+        )
 
     cooldowns = {str(c.get("symbol")) for c in storage.active_cooldowns()}
     busy = {str(x) for x in storage.open_symbols()}
 
-    lines = [
-        f"👀 {len(rows)} نماد زیر نظر (آستانه: 24h ≥ {config.WATCHLIST_MIN_GAIN_PCT:.0f}%)",
-        "",
-    ]
-    for r in rows[:25]:
+    ordered = sorted(rows, key=lambda r: safe_float(r.get("last_gain_pct")), reverse=True)
+
+    lines = [f"👀 {len(ordered)} نماد زیر نظر", ""]
+    for i, r in enumerate(ordered, 1):
         symbol = str(r.get("symbol"))
+        now_pct = safe_float(r.get("last_gain_pct"))
+        peak_pct = safe_float(r.get("peak_gain_pct"))
         mark = "🟡" if symbol in busy else ("😴" if symbol in cooldowns else "▫️")
-        lines.append(
-            f"{mark} {_coin(symbol)} | الان {safe_float(r.get('last_gain_pct')):+.1f}% "
-            f"| اوج {safe_float(r.get('peak_gain_pct')):+.1f}% "
-            f"| ستاپ {safe_int(r.get('setup_count'))} | ترید {safe_int(r.get('trade_count'))}"
-        )
-    if len(rows) > 25:
-        lines.append(f"… و {len(rows) - 25} نماد دیگر")
-    lines += ["", "🟡 پوزیشن باز  |  😴 در استراحت  |  ▫️ فقط زیر نظر"]
+        line = f"{i}. {mark} {_coin(symbol)} — {now_pct:+.1f}%"
+        # اوج فقط وقتی نمایش داده می‌شود که واقعاً بالاتر از الان باشد
+        if peak_pct - now_pct >= 1.0:
+            line += f"  (اوج {peak_pct:+.1f}%)"
+        trades = safe_int(r.get("trade_count"))
+        if trades:
+            line += f"  [{trades} ترید]"
+        lines.append(line)
+
+    lines += [
+        "",
+        f"🟡 پوزیشن باز  |  😴 در استراحت  |  ▫️ فقط زیر نظر",
+        f"آستانهٔ ورود به این فهرست: پامپ ۲۴ ساعته ≥ {config.WATCHLIST_MIN_GAIN_PCT:.0f}%",
+    ]
     return "\n".join(lines)
 
 
@@ -575,6 +592,85 @@ def funnel_panel(storage: Storage) -> str:
     return "\n".join(lines)
 
 
+def research_panel(storage: Storage, mode: str = "virtual") -> str:
+    """گزارش کامل تحقیقاتی — همان چیزی که بعد از چند روز باید بررسی شود."""
+    rep = storage.research_report(mode)
+    t = rep["trades"]
+    f = rep["funnel"]
+
+    if t["total"] == 0:
+        total_c = f.get("total_candidates", 0)
+        return "\n".join([
+            "📊 گزارش تحقیقاتی V3",
+            "",
+            f"کاندید تا الان: {total_c}",
+            f"ستاپ: {f.get('total_setups', 0)}  |  معامله: 0",
+            "",
+            "هنوز هیچ معاملهٔ بسته‌شده‌ای نیست.",
+            "برای دیدن گلوگاه‌ها: «قیف»",
+        ])
+
+    pf = t["profit_factor"]
+    lines = [
+        f"📊 گزارش تحقیقاتی V3 ({_mode_label(mode)})",
+        "",
+        "── قیف ──",
+        f"کاندید: {f.get('total_candidates', 0)}"
+        f"  →  ستاپ: {f.get('total_setups', 0)}"
+        f"  →  معامله: {t['total']}",
+        "",
+        "── نتیجه ──",
+        f"برد: {t['wins']}  |  باخت: {t['losses']}  |  نرخ برد: {t['win_rate']:.1f}%",
+        f"سود ناخالص: {_n(t['gross_profit'])}$  |  ضرر ناخالص: {_n(t['gross_loss'])}$",
+        f"کارمزد کل: {_n(t['total_fees'])}$",
+        f"سود/ضرر خالص: {_n(t['net_pnl'])}$",
+        f"ضریب سود (PF): {pf:.2f}" if pf else "ضریب سود (PF): —",
+        f"انتظار هر معامله: {_n(t['expectancy'])}$",
+        "",
+        "── ریسک ──",
+        f"میانگین برد: {_n(t['avg_win'])}$  |  میانگین باخت: {_n(t['avg_loss'])}$",
+        f"بزرگ‌ترین برد: {_n(t['largest_win'])}$  |  بزرگ‌ترین باخت: {_n(t['largest_loss'])}$",
+        f"حداکثر افت سرمایه: {_n(t['max_drawdown'])}$",
+        f"میانگین مدت معامله: {t['avg_duration_min']:.0f} دقیقه",
+    ]
+
+    # تفکیک بر اساس نوع ورود — سؤال کلیدی تحقیق
+    by_type = rep.get("by_entry_type") or {}
+    if by_type:
+        lines += ["", "── بر اساس نوع ورود ──"]
+        for etype, b in sorted(by_type.items()):
+            wr = (b["wins"] / b["n"] * 100.0) if b["n"] else 0.0
+            label = {"FAST_CASCADE": "آبشار سریع",
+                     "NORMAL_REVERSAL": "برگشت عادی"}.get(etype, etype)
+            lines.append(
+                f"{label}: {b['n']} معامله | برد {wr:.0f}% | خالص {_n(b['net'])}$"
+            )
+
+    by_exit = rep.get("by_exit_reason") or {}
+    if by_exit:
+        lines += ["", "── دلیل خروج ──"]
+        labels = {"HARD_STOP": "حد ضرر", "TECHNICAL_REVERSAL": "برگشت ساختاری",
+                  "MAX_HOLD": "پایان مهلت"}
+        for reason, n in sorted(by_exit.items(), key=lambda kv: -kv[1]):
+            lines.append(f"{labels.get(reason, reason)}: {n}")
+
+    # تمرکز — آیا چند نماد کل نتیجه را می‌سازند؟
+    by_symbol = rep.get("by_symbol") or {}
+    if len(by_symbol) >= 2:
+        ranked = sorted(by_symbol.items(), key=lambda kv: kv[1]["net"], reverse=True)
+        total_pos = sum(v["net"] for _, v in ranked if v["net"] > 0)
+        lines += ["", "── تمرکز ──", f"نمادهای درگیر: {len(by_symbol)}"]
+        if total_pos > 0:
+            top1 = max(ranked[0][1]["net"], 0) / total_pos * 100.0
+            top3 = sum(max(v["net"], 0) for _, v in ranked[:3]) / total_pos * 100.0
+            lines.append(f"سهم بهترین نماد: {top1:.0f}%  |  سه نماد برتر: {top3:.0f}%")
+            if top1 > 50:
+                lines.append("⚠️ بیش از نیمی از سود از یک نماد — نتیجه متمرکز است.")
+
+    lines += ["", "برای فایل کامل: «خروجی»"]
+    return "\n".join(lines)
+
+
 def help_text() -> str:
     return "\n".join([
         "🤖 ربات V3 — شورت بعد از پامپ افراطی (Paper Test)",
@@ -601,6 +697,8 @@ def help_text() -> str:
         "• امروز — خلاصهٔ معاملات امروز",
         "• گزارش ۱۵ — فاصلهٔ گزارش خودکار به دقیقه (۰ = خاموش)",
         "• چرا — گزارش آخرین مانیتور و دلیل ورود نکردن",
+        "• گزارش کامل — آمار کامل تحقیقاتی (برد، PF، تمرکز، تفکیک نوع ورود)",
+        "• خروجی — ساخت فایل CSV کامل معاملات برای تحلیل بیرونی",
         "• آمار — آمار واقعی و مجازی",
         "• ریست آمار — پاک کردن تاریخچه",
         "• وضعیت — سلامت سیستم",
@@ -610,19 +708,18 @@ def help_text() -> str:
 
 
 def symbols_panel(storage: Storage) -> str:
-    universe = storage.get_setting("universe", []) or []
-    if not universe:
-        return "فهرست ارزها هنوز ساخته نشده — ربات در حال راه‌اندازی است."
-    names = [canonical_base(str(s)) for s in universe]
-    busy = {canonical_base(str(s)) for s in storage.open_symbols()}
-    rows = [
-        f"{'🟡' if n in busy else '▫️'} {n}" for n in names
-    ]
-    lines = [f"🔎 {len(names)} ارز تحت اسکن", ""]
-    for i in range(0, len(rows), 3):
-        lines.append("  ".join(rows[i:i + 3]))
-    lines += ["", "🟡 = پوزیشن باز دارد"]
-    return "\n".join(lines)
+    """V3 لیست ثابت ندارد — کل بازار اسکن می‌شود."""
+    count = safe_int(storage.get_setting("tradable_count", 0))
+    watch = storage.watchlist_active()
+    return "\n".join([
+        f"🌐 کل بازار اسکن می‌شود: {count} قرارداد",
+        f"👀 الان زیر نظر: {len(watch)} نماد",
+        "",
+        f"هر نمادی که پامپ ۲۴ ساعته‌اش به {config.WATCHLIST_MIN_GAIN_PCT:.0f}% برسد",
+        "خودکار وارد فهرست زیر نظر می‌شود — لیست ثابتی وجود ندارد.",
+        "",
+        "برای دیدن فهرست: «واچ»",
+    ])
 
 
 def health_panel(storage: Storage) -> str:
@@ -721,6 +818,26 @@ class CommandRouter:
 
         if cmd in {"قیف", "فانل", "/funnel"}:
             return funnel_panel(self.storage)
+
+        if cmd in {"گزارش کامل", "گزارش تحقیق", "تحقیق", "/research"}:
+            return research_panel(self.storage, "virtual")
+
+        if cmd in {"خروجی", "اکسپورت", "/export"}:
+            import os as _os
+            path = _os.path.join(_os.path.dirname(config.RUNTIME_DB) or ".",
+                                 "v3_paper_trades.csv")
+            try:
+                n = self.storage.export_trades_csv(path, "virtual")
+            except Exception as exc:
+                return f"خروجی گرفته نشد: {exc}"
+            if not n:
+                return "هنوز معاملهٔ بسته‌شده‌ای برای خروجی نیست."
+            return (
+                f"✅ {n} معامله در فایل زیر ذخیره شد:\n"
+                f"{path}\n\n"
+                "شامل: قیمت ورود/خروج، حد ضرر، دلیل خروج، MFE، و همهٔ "
+                "اعداد لحظهٔ سیگنال (سایهٔ بالا، شتاب، دامنه، حجم، ATR)."
+            )
 
         if cmd in {"چرا", "دلیل", "/why"}:
             return why_panel(self.storage)

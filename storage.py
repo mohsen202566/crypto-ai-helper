@@ -782,3 +782,164 @@ class Storage:
                 (now_ms(),),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # ==================================================================
+    #  V3 — گزارش تحقیقاتی کامل
+    # ==================================================================
+
+    def research_report(self, mode: str = "virtual") -> dict[str, Any]:
+        """همهٔ آماری که برای تحلیل بعد از Paper Test لازم است.
+
+        این همان چیزی است که باید بعد از چند روز جمع‌آوری، بررسی شود:
+        آیا پدیده در زمان واقعی قابل شکار بود یا نه.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM cycles WHERE status='closed' AND mode=? ORDER BY closed_at",
+                (mode,),
+            ).fetchall()
+        trades = [dict(r) for r in rows]
+
+        # تفکیک بر اساس نوع ورود — سؤال کلیدی: آیا سود فقط از یک مسیر می‌آید؟
+        by_type: dict[str, dict[str, Any]] = {}
+        by_exit: dict[str, int] = {}
+        for t in trades:
+            reason = str(t.get("entry_reason") or "")
+            etype = "FAST_CASCADE" if "FAST_CASCADE" in reason else (
+                "NORMAL_REVERSAL" if "NORMAL_REVERSAL" in reason else "UNKNOWN"
+            )
+            bucket = by_type.setdefault(etype, {"n": 0, "wins": 0, "net": 0.0,
+                                                "gross": 0.0, "fees": 0.0})
+            net = safe_float(t.get("net_pnl"))
+            bucket["n"] += 1
+            bucket["net"] += net
+            bucket["gross"] += safe_float(t.get("gross_pnl"))
+            bucket["fees"] += safe_float(t.get("fees"))
+            if net > 0:
+                bucket["wins"] += 1
+
+            exit_reason = str(t.get("exit_reason") or "?")
+            by_exit[exit_reason] = by_exit.get(exit_reason, 0) + 1
+
+        # تمرکز: آیا چند نماد کل نتیجه را می‌سازند؟
+        by_symbol: dict[str, dict[str, Any]] = {}
+        for t in trades:
+            sym = str(t.get("symbol"))
+            b = by_symbol.setdefault(sym, {"n": 0, "net": 0.0})
+            b["n"] += 1
+            b["net"] += safe_float(t.get("net_pnl"))
+
+        nets = [safe_float(t.get("net_pnl")) for t in trades]
+        wins = [x for x in nets if x > 0]
+        losses = [x for x in nets if x <= 0]
+        gross_profit = sum(wins)
+        gross_loss = abs(sum(losses))
+
+        # حداکثر افت سرمایه (روی توالی واقعی معاملات)
+        equity = 0.0
+        peak = 0.0
+        max_dd = 0.0
+        for x in nets:
+            equity += x
+            peak = max(peak, equity)
+            max_dd = max(max_dd, peak - equity)
+
+        durations = [
+            (safe_int(t.get("closed_at")) - safe_int(t.get("opened_at"))) / 60000.0
+            for t in trades
+            if safe_int(t.get("closed_at")) and safe_int(t.get("opened_at"))
+        ]
+
+        return {
+            "mode": mode,
+            "funnel": self.watchlist_funnel(),
+            "reject_breakdown": self.reject_breakdown(),
+            "trades": {
+                "total": len(trades),
+                "wins": len(wins),
+                "losses": len(losses),
+                "win_rate": (len(wins) / len(trades) * 100.0) if trades else 0.0,
+                "gross_profit": gross_profit,
+                "gross_loss": gross_loss,
+                "net_pnl": sum(nets),
+                "total_fees": sum(safe_float(t.get("fees")) for t in trades),
+                "profit_factor": (gross_profit / gross_loss) if gross_loss > 0 else None,
+                "expectancy": (sum(nets) / len(nets)) if nets else 0.0,
+                "avg_win": (sum(wins) / len(wins)) if wins else 0.0,
+                "avg_loss": (sum(losses) / len(losses)) if losses else 0.0,
+                "largest_win": max(nets) if nets else 0.0,
+                "largest_loss": min(nets) if nets else 0.0,
+                "max_drawdown": max_dd,
+                "avg_duration_min": (sum(durations) / len(durations)) if durations else 0.0,
+            },
+            "by_entry_type": by_type,
+            "by_exit_reason": by_exit,
+            "by_symbol": by_symbol,
+        }
+
+    def export_trades_csv(self, path: str, mode: str = "virtual") -> int:
+        """خروجی CSV کامل معاملات همراه با عکس لحظه‌ای سیگنال هر ورود.
+
+        این فایل همان چیزی است که برای تحلیل بیرونی (مثل کاری که روی
+        دادهٔ Binance کردیم) لازم می‌شود.
+        """
+        import csv as _csv
+
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM cycles WHERE status='closed' AND mode=? ORDER BY opened_at",
+                (mode,),
+            ).fetchall()
+        trades = [dict(r) for r in rows]
+        if not trades:
+            return 0
+
+        out_rows = []
+        for t in trades:
+            snap = self.snapshot_for_cycle(safe_int(t.get("id"))) or {}
+            payload = snap.get("payload") or {}
+            entry = safe_float(t.get("avg_entry_price"))
+            best = safe_float(t.get("best_price")) or entry
+            out_rows.append({
+                "cycle_id": t.get("id"),
+                "symbol": t.get("symbol"),
+                "entry_type": snap.get("entry_type") or "",
+                "opened_at": t.get("opened_at"),
+                "closed_at": t.get("closed_at"),
+                "duration_min": round(
+                    (safe_int(t.get("closed_at")) - safe_int(t.get("opened_at"))) / 60000.0, 2
+                ),
+                "entry_price": entry,
+                "exit_price": t.get("exit_price"),
+                "hard_stop": t.get("hard_stop_price"),
+                "exit_reason": t.get("exit_reason"),
+                "leverage": t.get("leverage"),
+                "quantity": t.get("total_quantity"),
+                "notional": t.get("total_notional"),
+                "margin": t.get("total_margin"),
+                "gross_pnl": t.get("gross_pnl"),
+                "fees": t.get("fees"),
+                "net_pnl": t.get("net_pnl"),
+                "mfe_pct": round(((entry - best) / entry * 100.0) if entry > 0 else 0.0, 4),
+                "change_24h_at_entry": payload.get("change_24h"),
+                "upper_wick_ratio": payload.get("upper_wick_ratio"),
+                "ret_recent": payload.get("ret_recent"),
+                "ret_prior": payload.get("ret_prior"),
+                "rate_current": payload.get("rate_current"),
+                "rate_previous": payload.get("rate_previous"),
+                "range_partial": payload.get("range_partial"),
+                "range_baseline": payload.get("range_baseline"),
+                "volume_partial": payload.get("volume_partial"),
+                "volume_baseline": payload.get("volume_baseline"),
+                "swing_low": payload.get("swing_low"),
+                "swing_high": payload.get("swing_high"),
+                "atr14": payload.get("atr14"),
+                "stop_distance_pct": payload.get("stop_distance_pct"),
+                "entry_reason": t.get("entry_reason"),
+            })
+
+        with open(path, "w", newline="", encoding="utf-8") as fh:
+            writer = _csv.DictWriter(fh, fieldnames=list(out_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(out_rows)
+        return len(out_rows)

@@ -37,8 +37,6 @@ class BotEngine:
         self.toobit = toobit
         self._contracts: dict[str, dict[str, Any]] = {}
         self._contracts_ts = 0.0
-        self._universe: list[str] = []
-        self._universe_ts = 0.0
         self._last_watchlist_scan = 0.0
         self._last_monitor = 0.0
         self._last_live_report = 0.0
@@ -49,10 +47,9 @@ class BotEngine:
     # ------------------------------------------------------------------
     def startup(self) -> None:
         self.storage.set_setting("startup_phase", "اتصال به صرافی")
-        self._refresh_contracts(force=True)
-        universe = self.refresh_universe(force=True)
-        if not universe:
-            raise ToobitError("هیچ ارز قابل معامله‌ای پیدا نشد")
+        contracts = self._refresh_contracts(force=True)
+        if not contracts:
+            raise ToobitError("هیچ قرارداد قابل معامله‌ای پیدا نشد")
 
         if self.toobit.has_credentials:
             self.refresh_balance(force=True)
@@ -61,8 +58,12 @@ class BotEngine:
             self.storage.set_setting("startup_phase", "بدون کلید API — فقط حالت مجازی")
 
         self.storage.set_setting("startup_ready", True)
-        self.storage.set_health("startup", "ok", f"{len(universe)} ارز آمادهٔ اسکن")
-        logger.info("STARTUP_OK | symbols=%s", len(universe))
+        self.storage.set_setting("tradable_count", len(contracts))
+        self.storage.set_health(
+            "startup", "ok",
+            f"{len(contracts)} قرارداد قابل معامله | اسکن کل بازار برای پامپ",
+        )
+        logger.info("STARTUP_OK | tradable=%s", len(contracts))
 
     def _refresh_contracts(self, force: bool = False) -> dict[str, dict[str, Any]]:
         stale = (time.monotonic() - self._contracts_ts) > config.CONTRACT_REFRESH_SECONDS
@@ -77,58 +78,6 @@ class BotEngine:
     # ------------------------------------------------------------------
     #  فهرست ارزها
     # ------------------------------------------------------------------
-    def refresh_universe(self, force: bool = False) -> list[str]:
-        """فهرست ارزهای قابل اسکن؛ یا دستی از تنظیمات، یا پرحجم‌ترین‌های صرافی.
-
-        نقدینگی مهم است: ارز کم‌حجم اسپرد بزرگ دارد و همان اسپرد، سود یک
-        معاملهٔ کوچک را می‌بلعد.
-        """
-        stale = (time.monotonic() - self._universe_ts) > config.SYMBOL_REFRESH_SECONDS
-        if self._universe and not force and not stale:
-            return self._universe
-
-        contracts = self._refresh_contracts()
-        available = list(contracts.keys())
-        blacklist = {b.upper() for b in config.SYMBOL_BLACKLIST}
-
-        chosen: list[str] = []
-        if config.SYMBOL_LIST:
-            wanted = {canonical_base(x) for x in config.SYMBOL_LIST}
-            chosen = [s for s in available if canonical_base(s) in wanted]
-        else:
-            volumes: dict[str, float] = {}
-            try:
-                for row in self.toobit.get_24h_tickers():
-                    sym = str(row.get("s") or row.get("symbol") or "")
-                    if not sym:
-                        continue
-                    vol = safe_float(
-                        row.get("qv") or row.get("quoteVolume") or row.get("v") or 0
-                    )
-                    volumes[sym] = vol
-            except Exception as exc:
-                logger.warning("TICKER_24H_FAIL | %s", exc)
-
-            ranked = sorted(
-                (s for s in available if canonical_base(s) not in blacklist),
-                key=lambda s: volumes.get(s, 0.0),
-                reverse=True,
-            )
-            if volumes:
-                ranked = [
-                    s for s in ranked
-                    if volumes.get(s, 0.0) >= config.MIN_24H_QUOTE_VOLUME
-                ] or ranked
-            chosen = ranked[: config.SCAN_SYMBOL_COUNT]
-
-        chosen = [s for s in chosen if canonical_base(s) not in blacklist]
-        if chosen:
-            self._universe = chosen
-            self._universe_ts = time.monotonic()
-            self.storage.set_setting("universe", chosen)
-            self.storage.set_health("universe", "ok", f"{len(chosen)} ارز در فهرست اسکن")
-        return self._universe
-
     # ------------------------------------------------------------------
     #  موجودی
     # ------------------------------------------------------------------

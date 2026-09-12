@@ -58,13 +58,15 @@ class Application:
         while not self.stop_event.is_set():
             try:
                 self.engine.startup()
-                universe = self.storage.get_setting("universe", []) or []
+                tradable = self.storage.get_setting("tradable_count", 0)
                 self.storage.queue_message(
-                    "✅ ربات آماده شد.\n"
-                    f"ارزهای تحت اسکن: {len(universe)}\n"
-                    f"تایم‌فریم: {config.ENTRY_TIMEFRAME}\n"
-                    "ترید واقعی خاموش است؛ با دستور «ترید فعال» روشن می‌شود.\n"
-                    "برای دیدن وضعیت: «پنل»"
+                    "✅ ربات آماده شد — استراتژی V3 (شورت بعد از پامپ افراطی)\n"
+                    f"کل بازار اسکن می‌شود: {tradable} قرارداد\n"
+                    f"کاندید: پامپ ۲۴ ساعته ≥ {config.WATCHLIST_MIN_GAIN_PCT:.0f}%\n"
+                    f"اسکن هر {config.WATCHLIST_SCAN_SECONDS / 60:.0f} دقیقه | "
+                    f"مانیتور هر {config.MONITOR_INTERVAL_SECONDS / 60:.0f} دقیقه\n"
+                    "ترید واقعی خاموش است؛ با «ترید مجازی فعال» تست شروع می‌شود.\n"
+                    "دستورها: «پنل» | «واچ» | «قیف»"
                 )
                 return
             except Exception as exc:
@@ -91,8 +93,8 @@ class Application:
                        self.engine.monitor_real, require_ready=False)
         self._periodic("balance-refresh", config.BALANCE_REFRESH_SECONDS,
                        lambda: self.engine.refresh_balance(force=True), require_ready=False)
-        self._periodic("universe-refresh", config.SYMBOL_REFRESH_SECONDS,
-                       lambda: self.engine.refresh_universe(force=True))
+        self._periodic("contracts-refresh", config.CONTRACT_REFRESH_SECONDS,
+                       lambda: self.engine._refresh_contracts(force=True))
 
     def run_forever(self) -> None:
         self.start()
