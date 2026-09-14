@@ -73,6 +73,25 @@ def round_trip_cost_rate() -> float:
     )
 
 
+def dollar_target_price(
+    *, entry_price: float, notional_usdt: float, target_usd: float, favorable: bool,
+) -> float:
+    """قیمتی که با رسیدنش، سود/ضرر خالص (بعد از کارمزد+اسلیپیج+فاندینگ) این
+    پوزیشن دقیقاً ``target_usd`` دلار می‌شود -- برای تست دستی TP/SL دلاری.
+
+    فقط برای SHORT: ``favorable=True`` یعنی جهت سود (قیمت پایین‌تر، برای TP)،
+    ``favorable=False`` یعنی جهت ضرر (قیمت بالاتر، برای SL).
+    ``target_usd`` و ``notional_usdt`` باید مثبت باشند وگرنه ۰ برمی‌گردد.
+    """
+    if entry_price <= 0 or notional_usdt <= 0 or target_usd <= 0:
+        return 0.0
+    target_rate = target_usd / notional_usdt
+    gross_rate = target_rate + round_trip_cost_rate()
+    if favorable:
+        return entry_price * (1.0 - gross_rate)
+    return entry_price * (1.0 + gross_rate)
+
+
 def available_capital(
     *,
     live_balance: float,
