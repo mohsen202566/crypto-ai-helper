@@ -18,6 +18,7 @@ from typing import Any
 import requests
 
 import config
+import risk_engine
 from storage import Storage
 from utils import (
     canonical_base,
@@ -696,6 +697,9 @@ def help_text() -> str:
         "• زنده — مانیتورینگ لحظه‌ای پوزیشن‌های باز",
         "• امروز — خلاصهٔ معاملات امروز",
         "• گزارش ۱۵ — فاصلهٔ گزارش خودکار به دقیقه (۰ = خاموش)",
+        "• تیپی ۵ / تیپی خاموش — تی‌پی دلاری ثابت برای تست دقیق دستی (۱ تا ۱۰۰۰$، جایگزین برگشت ساختاری)",
+        "• استاپ دلاری ۱ / استاپ دلاری خاموش — استاپ دلاری ثابت (۱ تا ۱۰۰$، جایگزین حد ضرر ATR)",
+        "• وضعیت دلاری — نمایش تی‌پی/استاپ دلاری فعلی",
         "• چرا — گزارش آخرین مانیتور و دلیل ورود نکردن",
         "• گزارش کامل — آمار کامل تحقیقاتی (برد، PF، تمرکز، تفکیک نوع ورود)",
         "• خروجی — ساخت فایل CSV کامل معاملات برای تحلیل بیرونی",
@@ -752,6 +756,44 @@ class CommandRouter:
         except Exception as exc:
             logger.warning("LIVE_PANEL_FAIL | %s", exc)
             self.storage.queue_message(f"دریافت قیمت لحظه‌ای ناموفق بود: {exc}")
+
+    def _apply_fixed_targets_to_open_cycles(self) -> int:
+        """تی‌پی/استاپ دلاری فعلی را روی تمام پوزیشن‌های باز اعمال می‌کند.
+
+        هر کدام از ``fixed_tp_usd``/``fixed_sl_usd`` که ۰ یا خاموش باشد،
+        همان مقدار قبلیِ آن پوزیشن دست‌نخورده می‌ماند -- یعنی می‌شود فقط
+        یکی از این دو را تنظیم کرد بدون این‌که آن‌یکی عوض شود.
+        """
+        tp_usd = safe_float(self.storage.get_setting("fixed_tp_usd", 0.0))
+        sl_usd = safe_float(self.storage.get_setting("fixed_sl_usd", 0.0))
+        if tp_usd <= 0 and sl_usd <= 0:
+            return 0
+        count = 0
+        for c in self.storage.open_cycles():
+            entry = safe_float(c.get("avg_entry_price"))
+            notional = safe_float(c.get("total_notional"))
+            cycle_id = c.get("id")
+            if entry <= 0 or notional <= 0 or cycle_id is None:
+                continue
+            new_tp = safe_float(c.get("take_profit_price"))
+            new_sl = safe_float(c.get("hard_stop_price"))
+            if tp_usd > 0:
+                computed = risk_engine.dollar_target_price(
+                    entry_price=entry, notional_usdt=notional,
+                    target_usd=tp_usd, favorable=True,
+                )
+                if computed > 0:
+                    new_tp = computed
+            if sl_usd > 0:
+                computed = risk_engine.dollar_target_price(
+                    entry_price=entry, notional_usdt=notional,
+                    target_usd=sl_usd, favorable=False,
+                )
+                if computed > 0:
+                    new_sl = computed
+            self.storage.update_stops(int(cycle_id), take_profit=new_tp, hard_stop=new_sl)
+            count += 1
+        return count
 
     def handle(self, text: str) -> str:
         cmd = normalize_command(text)
@@ -811,6 +853,63 @@ class CommandRouter:
             return (
                 f"✅ استراحت روی {value:.0f} ساعت تنظیم شد — بعد از هر خروج، "
                 "همان نماد تا این مدت معامله نمی‌شود، حتی اگر دوباره پامپ کند."
+            )
+
+        if cmd.startswith("تیپی ") or cmd.startswith("/tp "):
+            arg = cmd.split(" ", 1)[1].strip()
+            if arg in {"خاموش", "غیرفعال", "off"}:
+                self.storage.set_setting("fixed_tp_usd", 0.0)
+                return (
+                    "✅ تی‌پی دلاری خاموش شد.\n"
+                    "پوزیشن‌های جدید دیگر TP ثابت نمی‌گیرند. پوزیشن‌های باز فعلی "
+                    "همان مقدار قبلی را حفظ می‌کنند (برای پاک کردنشان هم یکی‌یکی «پوزیشن N» را ببندید)."
+                )
+            try:
+                value = float(parse_number(arg))
+            except (ValueError, IndexError):
+                return "عدد نامعتبر. مثال: «تیپی ۵» یعنی هر پوزیشن با ۵ دلار سود خالص بسته شود."
+            if not 1 <= value <= 1000:
+                return "عدد باید بین ۱ تا ۱۰۰۰ دلار باشد."
+            self.storage.set_setting("fixed_tp_usd", value)
+            n = self._apply_fixed_targets_to_open_cycles()
+            return (
+                f"✅ تی‌پی دلاری روی ${value:,.2f} (خالص، بعد از کارمزد) تنظیم شد.\n"
+                f"روی {n} پوزیشن باز فعلی همین الان اعمال شد؛ پوزیشن‌های بعدی هم "
+                "با همین هدف باز می‌شوند تا وقتی «تیپی خاموش» بفرستی."
+            )
+
+        if cmd.startswith("استاپ دلاری ") or cmd.startswith("/sl "):
+            prefix_len = len("استاپ دلاری ") if cmd.startswith("استاپ دلاری ") else len("/sl ")
+            arg = cmd[prefix_len:].strip()
+            if arg in {"خاموش", "غیرفعال", "off"}:
+                self.storage.set_setting("fixed_sl_usd", 0.0)
+                return (
+                    "✅ استاپ دلاری خاموش شد.\n"
+                    "پوزیشن‌های جدید دوباره از حد ضرر ساختاری (ATR) استفاده می‌کنند. "
+                    "پوزیشن‌های باز فعلی همان مقدار قبلی را حفظ می‌کنند."
+                )
+            try:
+                value = float(parse_number(arg))
+            except (ValueError, IndexError):
+                return "عدد نامعتبر. مثال: «استاپ دلاری ۱» یعنی هر پوزیشن دقیقاً با ۱ دلار ضرر خالص بسته شود."
+            if not 1 <= value <= 100:
+                return "عدد باید بین ۱ تا ۱۰۰ دلار باشد."
+            self.storage.set_setting("fixed_sl_usd", value)
+            n = self._apply_fixed_targets_to_open_cycles()
+            return (
+                f"✅ استاپ دلاری روی ${value:,.2f} (خالص، بعد از کارمزد) تنظیم شد -- "
+                "جایگزین حد ضرر ساختاری میشه.\n"
+                f"روی {n} پوزیشن باز فعلی همین الان اعمال شد؛ پوزیشن‌های بعدی هم "
+                "با همین هدف باز می‌شوند تا وقتی «استاپ دلاری خاموش» بفرستی."
+            )
+
+        if cmd in {"وضعیت دلاری", "وضعیت تیپی استاپ", "/tpsl_status"}:
+            tp_usd = safe_float(self.storage.get_setting("fixed_tp_usd", 0.0))
+            sl_usd = safe_float(self.storage.get_setting("fixed_sl_usd", 0.0))
+            return (
+                "📌 وضعیت تی‌پی/استاپ دلاری:\n"
+                f"تی‌پی دلاری: {'$' + f'{tp_usd:,.2f}' if tp_usd > 0 else 'خاموش (برگشت ساختاری عادی)'}\n"
+                f"استاپ دلاری: {'$' + f'{sl_usd:,.2f}' if sl_usd > 0 else 'خاموش (حد ضرر ساختاری عادی)'}"
             )
 
         if cmd in {"واچ", "واچ لیست", "واچ‌لیست", "/watchlist"}:
