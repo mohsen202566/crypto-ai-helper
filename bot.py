@@ -303,6 +303,19 @@ class BotEngine:
                 )
                 continue
 
+            # تی‌پی دلاری دستی (دستور «تیپی») -- فقط وقتی روشن باشه؛ عادی V3
+            # هیچ TP ثابتی نداره، پس این ستون معمولاً ۰ و بی‌اثره.
+            take_profit = safe_float(cycle.get("take_profit_price"))
+            if take_profit > 0 and price <= take_profit:
+                gross = risk_engine.unrealized_pnl(
+                    side="SHORT", avg_entry=entry_price,
+                    quantity=quantity, current_price=price,
+                )
+                self.close_position(
+                    cycle, exit_price=price, exit_reason="TAKE_PROFIT", gross_pnl=gross,
+                )
+                continue
+
             # برای برگشت ساختاری به کندل نیاز داریم.
             candles: list[dict[str, Any]] = []
             try:
@@ -644,6 +657,24 @@ class BotEngine:
             )
             return None
 
+        # اگر تی‌پی/استاپ دلاری دستی (دستورات «تیپی»/«استاپ دلاری» تو تلگرام)
+        # روشن باشه، همینجا جایگزین منطق پیش‌فرض میشه -- فقط برای پوزیشن‌های
+        # جدید؛ پوزیشن‌های باز فعلی با همون دستور به‌صورت جداگانه آپدیت میشن.
+        take_profit_price = plan.take_profit_price
+        stop_price = plan.stop_price
+        fixed_tp_usd = safe_float(self.storage.get_setting("fixed_tp_usd", 0.0))
+        fixed_sl_usd = safe_float(self.storage.get_setting("fixed_sl_usd", 0.0))
+        if fixed_tp_usd > 0:
+            take_profit_price = risk_engine.dollar_target_price(
+                entry_price=price, notional_usdt=plan.notional_usdt,
+                target_usd=fixed_tp_usd, favorable=True,
+            ) or take_profit_price
+        if fixed_sl_usd > 0:
+            stop_price = risk_engine.dollar_target_price(
+                entry_price=price, notional_usdt=plan.notional_usdt,
+                target_usd=fixed_sl_usd, favorable=False,
+            ) or stop_price
+
         cycle_id = self.storage.create_cycle(
             symbol=symbol,
             side=plan.side,
@@ -651,8 +682,8 @@ class BotEngine:
             leverage=plan.leverage,
             capital_at_open=capital,
             plan=plan.to_dict(),
-            take_profit_price=plan.take_profit_price,
-            hard_stop_price=plan.stop_price,
+            take_profit_price=take_profit_price,
+            hard_stop_price=stop_price,
             entry_score=safe_float(signal.snapshot.change_24h),
             entry_reason=f"[{signal.entry_type}] {signal.reason}",
             best_price=price,
@@ -676,8 +707,8 @@ class BotEngine:
                     entry_price=price,
                     margin_usdt=plan.margin_usdt,
                     leverage=plan.leverage,
-                    tp_price=plan.take_profit_price,
-                    sl_price=plan.stop_price,
+                    tp_price=take_profit_price,
+                    sl_price=stop_price,
                     client_order_id=f"scan-{cycle_id}-{now_ms()}",
                     symbol_info=info,
                 )
