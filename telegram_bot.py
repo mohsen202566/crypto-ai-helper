@@ -679,7 +679,7 @@ def help_text() -> str:
         "جریان کار:",
         f"  پامپ ۲۴ ساعته ≥ {config.WATCHLIST_MIN_GAIN_PCT:.0f}% → زیر نظر گرفتن",
         "  → نشانهٔ خستگی یا آبشار فروش → شورت",
-        "  → حد ضرر ساختاری یا برگشت تأییدشده → خروج → استراحت",
+        "  → حد ضرر سخت، یا برگشت ساختاری، یا تریلینگ سود (از بهترین قیمت) → خروج → استراحت",
         "",
         "دستورات:",
         "• ترید فعال / ترید خاموش — روشن و خاموش کردن ترید واقعی",
@@ -687,6 +687,8 @@ def help_text() -> str:
         "• پنل — پنل ترید واقعی",
         "• ترید مجازی — پنل ترید مجازی",
         "• واچ — نمادهای زیر نظر",
+        "• واچ ۱۵ — آستانهٔ رشد ۲۴ساعته برای ورود به واچ‌لیست (۱ تا ۱۰۰۰)",
+        "• دستورات — همین لیست، همراه با مقدار فعلی هر تنظیم",
         "• قیف — از چند کاندید، چند ستاپ و چند معامله",
         "• پوزیشن — پوزیشن‌های باز",
         "• پوزیشن ۵ — حداکثر پوزیشن هم‌زمان (۱ تا ۳۰)",
@@ -698,7 +700,7 @@ def help_text() -> str:
         "• امروز — خلاصهٔ معاملات امروز",
         "• گزارش ۱۵ — فاصلهٔ گزارش خودکار به دقیقه (۰ = خاموش)",
         "• تیپی ۵ / تیپی خاموش — تی‌پی دلاری ثابت برای تست دقیق دستی (۱ تا ۱۰۰۰$، جایگزین برگشت ساختاری)",
-        "• استاپ دلاری ۱ / استاپ دلاری خاموش — استاپ دلاری ثابت (۱ تا ۱۰۰$، جایگزین حد ضرر ATR)",
+        "• استاپ ۱ / استاپ خاموش (یا «استاپ دلاری ۱») — استاپ دلاری ثابت (۱ تا ۱۰۰$، جایگزین حد ضرر ATR)",
         "• وضعیت دلاری — نمایش تی‌پی/استاپ دلاری فعلی",
         "• چرا — گزارش آخرین مانیتور و دلیل ورود نکردن",
         "• گزارش کامل — آمار کامل تحقیقاتی (برد، PF، تمرکز، تفکیک نوع ورود)",
@@ -708,6 +710,57 @@ def help_text() -> str:
         "• وضعیت — سلامت سیستم",
         "",
         "⚠️ قوانین استراتژی در طول این تست قفل‌اند و تغییر نمی‌کنند.",
+    ])
+
+
+def commands_status_panel(storage: Storage) -> str:
+    """همون لیست دستورات، ولی کنار هر تنظیم، مقدار فعلی و بازه‌ی مجازش.
+
+    وقتی کاربر می‌نویسه «دستورات»، هدف اینه که هم بدونه چطور دستور بده هم
+    همین الان چه عددی تنظیمه -- بدون نیاز به زدن چندتا دستور جدا.
+    """
+    real_on = bool(storage.get_setting("real_trading_enabled", False))
+    virtual_on = bool(storage.get_setting("virtual_trading_enabled", True))
+    max_pos = safe_int(storage.get_setting("max_positions", config.MAX_CONCURRENT_POSITIONS))
+    pos_size = safe_float(storage.get_setting("position_size", config.POSITION_SIZE_USDT))
+    lev = safe_int(storage.get_setting("leverage", config.DEFAULT_LEVERAGE))
+    cooldown = safe_float(storage.get_setting("cooldown_hours", config.COOLDOWN_HOURS))
+    cap = safe_float(storage.get_setting("capital_cap", 0.0))
+    live_report = safe_int(storage.get_setting("live_report_minutes", config.LIVE_REPORT_MINUTES))
+    watch_th = safe_float(storage.get_setting("watchlist_threshold", config.WATCHLIST_MIN_GAIN_PCT))
+    tp_usd = safe_float(storage.get_setting("fixed_tp_usd", 0.0))
+    sl_usd = safe_float(storage.get_setting("fixed_sl_usd", 0.0))
+
+    return "\n".join([
+        "📋 دستورات و وضعیت فعلی",
+        "",
+        "🔸 روشن/خاموش",
+        f"  ترید فعال / ترید خاموش — الان: {'روشن' if real_on else 'خاموش'}",
+        f"  ترید مجازی فعال / ترید مجازی خاموش — الان: {'روشن' if virtual_on else 'خاموش'}",
+        "",
+        "🔸 تنظیمات (فرمت: «اسم دستور + عدد»)",
+        f"  پوزیشن N  (۱ تا ۳۰) — حداکثر پوزیشن هم‌زمان — الان: {max_pos}",
+        f"  دلار N  (۰ تا ۱۰۰۰، ۰=خودکار) — مارجین هر پوزیشن — الان: "
+        f"{'خودکار' if pos_size <= 0 else f'{pos_size:,.2f}$'}",
+        f"  اهرم N  (۱ تا ۱۰۰) — لوریج — الان: {lev}x",
+        f"  استراحت N  (۱ تا ۱۲) — کول‌داون هر نماد بعد از خروج — الان: {cooldown:.0f} ساعت",
+        f"  سقف N  (۰=کل موجودی) — سقف سرمایهٔ درگیر — الان: "
+        f"{'کل موجودی' if cap <= 0 else f'{cap:,.2f}$'}",
+        f"  گزارش N  (۰ تا ۲۴۰، ۰=خاموش) — فاصلهٔ گزارش خودکار (دقیقه) — الان: {live_report}",
+        f"  واچ N  (۱ تا ۱۰۰۰) — آستانهٔ رشد ۲۴ساعته برای واچ‌لیست — الان: {watch_th:.0f}٪",
+        "",
+        "🔸 تی‌پی/استاپ دلاری دستی (برای تست دقیق -- جایگزین خروج عادی)",
+        f"  تیپی N / تیپی خاموش  (۱ تا ۱۰۰۰$) — الان: "
+        f"{'خاموش' if tp_usd <= 0 else f'{tp_usd:,.2f}$'}",
+        f"  استاپ N / استاپ خاموش  (۱ تا ۱۰۰$) — الان: "
+        f"{'خاموش (حد ضرر ساختاری عادی)' if sl_usd <= 0 else f'{sl_usd:,.2f}$'}",
+        "",
+        "🔸 گزارش‌ها (بدون عدد، فقط اسمشون رو بفرست)",
+        "  پنل | ترید مجازی | پوزیشن | واچ | قیف | زنده | امروز | گزارش کامل | "
+        "خروجی | آمار | ریست آمار | وضعیت | وضعیت دلاری | چرا",
+        "",
+        "⚠️ الگوریتم ورود (Wick + Deceleration + Structure Break) قفله و از این "
+        "طریق قابل‌تغییر نیست -- فقط آستانهٔ واچ‌لیست و پارامترهای بالا تنظیم‌پذیرن.",
     ])
 
 
@@ -801,6 +854,9 @@ class CommandRouter:
         if cmd in {"/start", "/help", "راهنما", "کمک", "شروع"}:
             return help_text()
 
+        if cmd in {"دستورات", "دستور", "/commands"}:
+            return commands_status_panel(self.storage)
+
         if cmd in {"ترید فعال", "ترید روشن", "/trade_on", "فعال"}:
             self.storage.set_setting("real_trading_enabled", True)
             self.storage.log_event("real_trading_enabled", True)
@@ -878,9 +934,10 @@ class CommandRouter:
                 "با همین هدف باز می‌شوند تا وقتی «تیپی خاموش» بفرستی."
             )
 
-        if cmd.startswith("استاپ دلاری ") or cmd.startswith("/sl "):
-            prefix_len = len("استاپ دلاری ") if cmd.startswith("استاپ دلاری ") else len("/sl ")
-            arg = cmd[prefix_len:].strip()
+        _stop_prefixes = ["استاپ دلاری ", "استاپ ", "/sl "]
+        _stop_prefix = next((p for p in _stop_prefixes if cmd.startswith(p)), None)
+        if _stop_prefix:
+            arg = cmd[len(_stop_prefix):].strip()
             if arg in {"خاموش", "غیرفعال", "off"}:
                 self.storage.set_setting("fixed_sl_usd", 0.0)
                 return (
@@ -910,6 +967,25 @@ class CommandRouter:
                 "📌 وضعیت تی‌پی/استاپ دلاری:\n"
                 f"تی‌پی دلاری: {'$' + f'{tp_usd:,.2f}' if tp_usd > 0 else 'خاموش (برگشت ساختاری عادی)'}\n"
                 f"استاپ دلاری: {'$' + f'{sl_usd:,.2f}' if sl_usd > 0 else 'خاموش (حد ضرر ساختاری عادی)'}"
+            )
+
+        if cmd.startswith("واچ ") and not cmd.startswith("واچ لیست"):
+            arg = cmd.split(" ", 1)[1].strip()
+            try:
+                value = float(parse_number(arg))
+            except (ValueError, IndexError):
+                return "عدد نامعتبر. مثال: «واچ ۱۵» یعنی رشد ۲۴ساعته باید حداقل ۱۵٪ باشد تا وارد واچ‌لیست شود."
+            if not config.WATCHLIST_THRESHOLD_MIN <= value <= config.WATCHLIST_THRESHOLD_MAX:
+                return (
+                    f"عدد باید بین {config.WATCHLIST_THRESHOLD_MIN:.0f} تا "
+                    f"{config.WATCHLIST_THRESHOLD_MAX:.0f} درصد باشد."
+                )
+            self.storage.set_setting("watchlist_threshold", value)
+            return (
+                f"✅ آستانهٔ واچ‌لیست روی {value:.0f}٪ تنظیم شد.\n"
+                "یعنی از این پس فقط نمادی که رشد ۲۴ساعته‌اش به این عدد برسد وارد "
+                "واچ‌لیست می‌شود (تو اسکن ۱۵ دقیقه‌ای بعدی اعمال میشه). "
+                "نمادهای از قبل تو واچ‌لیست تا انقضای طبیعی‌شون می‌مونن."
             )
 
         if cmd in {"واچ", "واچ لیست", "واچ‌لیست", "/watchlist"}:
