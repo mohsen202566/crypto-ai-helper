@@ -165,6 +165,16 @@ class BotEngine:
         value = safe_int(self.storage.get_setting("leverage", config.DEFAULT_LEVERAGE))
         return max(config.LEVERAGE_MIN, min(value, config.LEVERAGE_MAX))
 
+    def watchlist_threshold(self) -> float:
+        """آستانهٔ رشد ۲۴ساعته برای ورود به واچ‌لیست (٪). از پنل: «واچ ۱۵».
+
+        فقط این عدد آستانه قابل‌تنظیمه؛ خود الگوریتم ورود دست‌نخورده است.
+        """
+        value = safe_float(
+            self.storage.get_setting("watchlist_threshold", config.WATCHLIST_MIN_GAIN_PCT)
+        )
+        return max(config.WATCHLIST_THRESHOLD_MIN, min(value, config.WATCHLIST_THRESHOLD_MAX))
+
     def mode(self) -> str | None:
         """حالت فعلی؛ None یعنی هر دو خاموش‌اند و فقط اسکن انجام می‌شود."""
         if bool(self.storage.get_setting("real_trading_enabled", False)):
@@ -254,13 +264,16 @@ class BotEngine:
 
     # --- مدیریت پوزیشن‌های باز -------------------------------------------
     def manage_open_positions(self) -> None:
-        """پایش پوزیشن‌های باز: حد ضرر سخت یا برگشت ساختاری.
+        """پایش پوزیشن‌های باز -- دو راه خروج مستقل، هرکدام زودتر برسه اعمال میشه:
 
-        حد ضرر سخت مطلق است — به محض فعال شدن، فوراً بسته می‌شود و منتظر
-        هیچ تأیید تکنیکالی نمی‌ماند. این محافظت از حساب است، نه تحلیل.
+        ۱. برگشت ساختاری تأییدشده (۲ Swing High + ۲ Swing Low صعودی از لحظهٔ
+           ورود) -- بدون نیاز به رسیدن به سود مشخص.
+        ۲. تریلینگ سود (config.TRAIL_PROFIT_PCT٪، پیش‌فرض ۳٪): اگر قیمت از
+           بهترین نقطهٔ رسیده‌شده به همین اندازه برگرده بالا -- فقط وقتی
+           واقعاً در سودیم، نه ضرر.
 
-        در غیر این صورت تنها راه خروج، برگشت ساختاری تأییدشده است. هیچ TP
-        ثابتی وجود ندارد و نویز (یک کندل سبز، یک wick) خروج ایجاد نمی‌کند.
+        حد ضرر سخت هم مطلق و مستقل از این دو تاست -- به محض فعال شدن، فوراً
+        بسته می‌شود، منتظر هیچ تأییدی نمی‌ماند؛ این محافظت از حساب است.
         """
         cycles = self.storage.open_cycles()
         if not cycles:
@@ -287,8 +300,8 @@ class BotEngine:
             hard_stop = safe_float(cycle.get("hard_stop_price"))
             opened_at = safe_int(cycle.get("opened_at"))
 
-            # بهترین قیمت (کمترین برای شورت) فقط برای گزارش MFE ذخیره می‌شود،
-            # نه برای تصمیم خروج — چون V3 تریلینگ درصدی ندارد.
+            # بهترین قیمت (کمترین برای شورت) -- هم برای گزارش MFE و هم برای
+            # تریلینگ سود (پایین‌تر) استفاده می‌شود.
             best_price = safe_float(cycle.get("best_price"))
             new_best = min(best_price, price) if best_price > 0 else price
 
@@ -313,6 +326,21 @@ class BotEngine:
                 )
                 self.close_position(
                     cycle, exit_price=price, exit_reason="TAKE_PROFIT", gross_pnl=gross,
+                )
+                continue
+
+            # تریلینگ سود -- لایهٔ دوم خروج، مستقل از برگشت ساختاری. فقط وقتی
+            # واقعاً در سودیم: اگر قیمت از بهترین نقطهٔ رسیده‌شده (new_best)
+            # به‌اندازهٔ TRAIL_PROFIT_PCT برگردد بالا، می‌بندیم. فقط قیمت
+            # لازم داره (نه کندل) -- بعد از Hard Stop سریع‌ترین مسیره.
+            trail_stop = new_best * (1 + config.TRAIL_PROFIT_PCT / 100.0)
+            if trail_stop < entry_price and price >= trail_stop:
+                gross = risk_engine.unrealized_pnl(
+                    side="SHORT", avg_entry=entry_price,
+                    quantity=quantity, current_price=price,
+                )
+                self.close_position(
+                    cycle, exit_price=price, exit_reason="TRAIL_PROFIT", gross_pnl=gross,
                 )
                 continue
 
@@ -375,7 +403,7 @@ class BotEngine:
 
         contracts = self._refresh_contracts()
         blacklist = {b.upper() for b in config.SYMBOL_BLACKLIST}
-        threshold = config.WATCHLIST_MIN_GAIN_PCT
+        threshold = self.watchlist_threshold()
         now = now_ms()
         added = 0
         scanned = 0
@@ -462,6 +490,11 @@ class BotEngine:
         if not watch:
             self.storage.set_health("monitor", "ok", "Watchlist خالی است")
             return
+
+        # اولویت با نمادی‌ست که همین الان بیشتر پمپ کرده (صدر لیست ۲۴ساعته) --
+        # وقتی اسلات محدوده، این‌ها زودتر بررسی و در صورت واجد شرایط بودن باز
+        # می‌شوند؛ بقیه فقط برای همین دور رد می‌شوند و دور بعد دوباره دیده می‌شوند.
+        watch = sorted(watch, key=lambda r: safe_float(r.get("last_gain_pct")), reverse=True)
 
         capital = self.effective_capital(real_mode=(mode == "real"))
         if capital < config.MIN_CAPITAL_TO_TRADE_USDT:
