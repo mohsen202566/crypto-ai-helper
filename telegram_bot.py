@@ -688,6 +688,7 @@ def help_text() -> str:
         "• ترید مجازی — پنل ترید مجازی",
         "• واچ — نمادهای زیر نظر",
         "• واچ ۱۵ — آستانهٔ رشد ۲۴ساعته برای ورود به واچ‌لیست (۱ تا ۱۰۰۰)",
+        "• تریل ۳ / تریل خاموش — درصد تریلینگ سود (۰ تا ۲۰)، خاموش=فقط Hard Stop+برگشت ساختاری",
         "• دستورات — همین لیست، همراه با مقدار فعلی هر تنظیم",
         "• قیف — از چند کاندید، چند ستاپ و چند معامله",
         "• پوزیشن — پوزیشن‌های باز",
@@ -728,6 +729,7 @@ def commands_status_panel(storage: Storage) -> str:
     cap = safe_float(storage.get_setting("capital_cap", 0.0))
     live_report = safe_int(storage.get_setting("live_report_minutes", config.LIVE_REPORT_MINUTES))
     watch_th = safe_float(storage.get_setting("watchlist_threshold", config.WATCHLIST_MIN_GAIN_PCT))
+    trail_pct = safe_float(storage.get_setting("trail_profit_pct", config.TRAIL_PROFIT_PCT))
     tp_usd = safe_float(storage.get_setting("fixed_tp_usd", 0.0))
     sl_usd = safe_float(storage.get_setting("fixed_sl_usd", 0.0))
 
@@ -748,6 +750,8 @@ def commands_status_panel(storage: Storage) -> str:
         f"{'کل موجودی' if cap <= 0 else f'{cap:,.2f}$'}",
         f"  گزارش N  (۰ تا ۲۴۰، ۰=خاموش) — فاصلهٔ گزارش خودکار (دقیقه) — الان: {live_report}",
         f"  واچ N  (۱ تا ۱۰۰۰) — آستانهٔ رشد ۲۴ساعته برای واچ‌لیست — الان: {watch_th:.0f}٪",
+        f"  تریل N / تریل خاموش  (۰ تا ۲۰) — درصد تریلینگ سود — الان: "
+        f"{'خاموش' if trail_pct <= 0 else f'{trail_pct:.1f}٪'}",
         "",
         "🔸 تی‌پی/استاپ دلاری دستی (برای تست دقیق -- جایگزین خروج عادی)",
         f"  تیپی N / تیپی خاموش  (۱ تا ۱۰۰۰$) — الان: "
@@ -986,6 +990,27 @@ class CommandRouter:
                 "یعنی از این پس فقط نمادی که رشد ۲۴ساعته‌اش به این عدد برسد وارد "
                 "واچ‌لیست می‌شود (تو اسکن ۱۵ دقیقه‌ای بعدی اعمال میشه). "
                 "نمادهای از قبل تو واچ‌لیست تا انقضای طبیعی‌شون می‌مونن."
+            )
+
+        if cmd.startswith("تریل "):
+            arg = cmd.split(" ", 1)[1].strip()
+            if arg in {"خاموش", "غیرفعال", "off"}:
+                self.storage.set_setting("trail_profit_pct", 0.0)
+                return (
+                    "✅ تریلینگ سود خاموش شد.\n"
+                    "از این پس فقط Hard Stop و برگشت ساختاری (و تیپی/استاپ دلاری اگه "
+                    "روشن باشن) خروج رو تصمیم می‌گیرن -- بدون مزاحمت تریلینگ."
+                )
+            try:
+                value = float(parse_number(arg))
+            except (ValueError, IndexError):
+                return "عدد نامعتبر. مثال: «تریل ۳» یعنی اگه قیمت ۳٪ از بهترین نقطه برگرده بالا (در سود)، ببنده."
+            if not config.TRAIL_PROFIT_PCT_MIN < value <= config.TRAIL_PROFIT_PCT_MAX:
+                return f"عدد باید بین ۰ (یا «تریل خاموش») تا {config.TRAIL_PROFIT_PCT_MAX:.0f} درصد باشد."
+            self.storage.set_setting("trail_profit_pct", value)
+            return (
+                f"✅ تریلینگ سود روی {value:.1f}٪ تنظیم شد.\n"
+                "روی پوزیشن‌های باز فعلی هم از همین چک بعدی (کمتر از ۵ ثانیه دیگه) اعمال میشه."
             )
 
         if cmd in {"واچ", "واچ لیست", "واچ‌لیست", "/watchlist"}:
