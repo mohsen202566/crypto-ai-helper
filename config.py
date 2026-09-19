@@ -246,6 +246,17 @@ TRAIL_PROFIT_PCT = float(os.getenv("TRAIL_PROFIT_PCT", "3.0"))
 TRAIL_PROFIT_PCT_MIN = 0.0    # ۰ = کاملاً خاموش
 TRAIL_PROFIT_PCT_MAX = 20.0
 
+# --- رزرو اسلات برای شکار پامپ‌های قوی ---
+# نمادی که پامپش به این آستانه برسه «رزرو» می‌شه: اگه بعداً سیگنال بده و
+# همهٔ اسلات‌ها پر باشه، جای ضعیف‌ترین پوزیشن باز (کمترین پامپ ورودی، اگه
+# به‌قدر کافی قدیمی باشه) براش آزاد می‌شه. از پنل: «رزرو N».
+RESERVE_THRESHOLD_PCT = float(os.getenv("RESERVE_THRESHOLD_PCT", "50.0"))
+RESERVE_THRESHOLD_MIN = 1.0
+RESERVE_THRESHOLD_MAX = 1000.0
+# پوزیشنی که کمتر از این مدت (دقیقه) باز شده، هیچ‌وقت preempt نمی‌شود --
+# حتی اگه ضعیف‌ترینه -- تا فرصت واقعی برای جواب دادن داشته باشد.
+RESERVE_MIN_HOLD_MINUTES = float(os.getenv("RESERVE_MIN_HOLD_MINUTES", "15.0"))
+
 # --- تایم‌فریم‌ها ---
 # 15m = کشف کاندید / زمینه | 5m = مانیتور و اجرا
 CONTEXT_TIMEFRAME = os.getenv("CONTEXT_TIMEFRAME", "15m").strip()
