@@ -186,6 +186,13 @@ class BotEngine:
         )
         return max(config.TRAIL_PROFIT_PCT_MIN, min(value, config.TRAIL_PROFIT_PCT_MAX))
 
+    def reserve_threshold(self) -> float:
+        """آستانهٔ رزرو اسلات برای شکار پامپ‌های قوی. از پنل: «رزرو ۵۰»."""
+        value = safe_float(
+            self.storage.get_setting("reserve_threshold", config.RESERVE_THRESHOLD_PCT)
+        )
+        return max(config.RESERVE_THRESHOLD_MIN, min(value, config.RESERVE_THRESHOLD_MAX))
+
     def mode(self) -> str | None:
         """حالت فعلی؛ None یعنی هر دو خاموش‌اند و فقط اسکن انجام می‌شود."""
         if bool(self.storage.get_setting("real_trading_enabled", False)):
@@ -528,7 +535,11 @@ class BotEngine:
         max_positions = self.max_positions(capital=capital)
         open_count = self.storage.open_position_count()
         free_slots = max_positions - open_count
-        if free_slots <= 0:
+        reserve_th = self.reserve_threshold()
+        has_reserved_candidate = any(
+            safe_float(r.get("last_gain_pct")) >= reserve_th for r in watch
+        )
+        if free_slots <= 0 and not has_reserved_candidate:
             self.storage.set_health(
                 "monitor", "ok",
                 f"همهٔ {max_positions} اسلات پر است — منتظر بسته شدن",
@@ -544,9 +555,14 @@ class BotEngine:
         rejects: dict[str, int] = {}
 
         for row in watch:
-            if free_slots <= 0:
-                break
             symbol = str(row.get("symbol"))
+            gain_pct = safe_float(row.get("last_gain_pct"))
+            is_reserved_tier = gain_pct >= reserve_th
+
+            if free_slots <= 0 and not is_reserved_tier:
+                # چون watch نزولی مرتبه، از اینجا به بعد هیچ نماد رزرو-سطحی
+                # نمونده -- امن می‌شه کل بقیهٔ حلقه رو رد کرد.
+                break
 
             if config.ONE_POSITION_PER_SYMBOL and symbol in busy:
                 continue
@@ -610,6 +626,16 @@ class BotEngine:
 
             setups += 1
             self.storage.watchlist_touch_counter(symbol, "setup_count")
+
+            if free_slots <= 0:
+                # فقط نمادهای رزرو-سطح به اینجا با اسلات خالی صفر می‌رسند.
+                freed = self._preempt_for_reserved(
+                    symbol=symbol, candidate_gain_pct=gain_pct,
+                )
+                if not freed:
+                    rejects["no_slot_reserved"] = rejects.get("no_slot_reserved", 0) + 1
+                    continue
+                free_slots += 1
 
             cycle_id = self.open_position(
                 symbol=symbol, signal=signal, mode=mode, capital=capital,
@@ -906,6 +932,54 @@ class BotEngine:
             )
             closed_count += 1
         logger.info("CLOSE_ALL | %d/%d cycle closed", closed_count, len(cycles))
+
+    def _preempt_for_reserved(self, *, symbol: str, candidate_gain_pct: float) -> bool:
+        """وقتی نمادی رزرو-سطح (پامپ >= reserve_threshold) سیگنال داده ولی
+        اسلات خالی نیست، ضعیف‌ترین پوزیشن باز (کمترین پامپ ورودی) را --
+        فقط اگر به‌قدر کافی قدیمی باشد -- می‌بندد تا جا باز شود.
+
+        خروجی True یعنی جا واقعاً آزاد شد (و می‌شود روی همان اسلات وارد شد).
+        """
+        cycles = self.storage.open_cycles()
+        if not cycles:
+            return False
+
+        now = now_ms()
+        min_hold_ms = config.RESERVE_MIN_HOLD_MINUTES * 60 * 1000
+        eligible = [
+            c for c in cycles
+            if (now - safe_int(c.get("opened_at"))) >= min_hold_ms
+        ]
+        if not eligible:
+            return False
+
+        weakest = min(eligible, key=lambda c: safe_float(c.get("entry_score")))
+        weakest_gain = safe_float(weakest.get("entry_score"))
+        if candidate_gain_pct <= weakest_gain:
+            return False
+
+        weakest_symbol = str(weakest.get("symbol"))
+        try:
+            price = safe_float(self.toobit.get_mark_price(weakest_symbol))
+        except Exception as exc:
+            logger.debug("PREEMPT_PRICE_FAIL | %s | %s", weakest_symbol, exc)
+            return False
+        if price <= 0:
+            return False
+
+        entry_price = safe_float(weakest.get("avg_entry_price"))
+        quantity = safe_float(weakest.get("total_quantity"))
+        gross = risk_engine.unrealized_pnl(
+            side="SHORT", avg_entry=entry_price, quantity=quantity, current_price=price,
+        )
+        self.close_position(
+            weakest, exit_price=price, exit_reason="PREEMPTED_RESERVE", gross_pnl=gross,
+        )
+        logger.info(
+            "PREEMPT | closed %s (entry_gain=%.1f%%) to free slot for %s (gain=%.1f%%)",
+            weakest_symbol, weakest_gain, symbol, candidate_gain_pct,
+        )
+        return True
 
     # --- همگام‌سازی با صرافی ----------------------------------------------
     def monitor_real(self) -> None:
