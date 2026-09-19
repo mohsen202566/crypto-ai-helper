@@ -243,6 +243,8 @@ WATCHLIST_RETENTION_HOURS = float(os.getenv("WATCHLIST_RETENTION_HOURS", "12.0")
 # پوزیشن بسته می‌شود. مستقل از Hard Stop و برگشت ساختاری؛ هرکدام زودتر
 # برسد همان اعمال می‌شود.
 TRAIL_PROFIT_PCT = float(os.getenv("TRAIL_PROFIT_PCT", "3.0"))
+TRAIL_PROFIT_PCT_MIN = 0.0    # ۰ = کاملاً خاموش
+TRAIL_PROFIT_PCT_MAX = 20.0
 
 # --- تایم‌فریم‌ها ---
 # 15m = کشف کاندید / زمینه | 5m = مانیتور و اجرا
