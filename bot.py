@@ -175,6 +175,17 @@ class BotEngine:
         )
         return max(config.WATCHLIST_THRESHOLD_MIN, min(value, config.WATCHLIST_THRESHOLD_MAX))
 
+    def trail_profit_pct(self) -> float:
+        """درصد تریلینگ سود. از پنل: «تریل ۳» یا «تریل خاموش» (= ۰).
+
+        ۰ یعنی این لایه‌ی خروج کاملاً خاموشه -- فقط Hard Stop و برگشت
+        ساختاری فعال می‌مونن (تا بشه تیپی/استاپ دلاری رو بدون مزاحمت تست کرد).
+        """
+        value = safe_float(
+            self.storage.get_setting("trail_profit_pct", config.TRAIL_PROFIT_PCT)
+        )
+        return max(config.TRAIL_PROFIT_PCT_MIN, min(value, config.TRAIL_PROFIT_PCT_MAX))
+
     def mode(self) -> str | None:
         """حالت فعلی؛ None یعنی هر دو خاموش‌اند و فقط اسکن انجام می‌شود."""
         if bool(self.storage.get_setting("real_trading_enabled", False)):
@@ -268,13 +279,19 @@ class BotEngine:
 
         ۱. برگشت ساختاری تأییدشده (۲ Swing High + ۲ Swing Low صعودی از لحظهٔ
            ورود) -- بدون نیاز به رسیدن به سود مشخص.
-        ۲. تریلینگ سود (config.TRAIL_PROFIT_PCT٪، پیش‌فرض ۳٪): اگر قیمت از
-           بهترین نقطهٔ رسیده‌شده به همین اندازه برگرده بالا -- فقط وقتی
-           واقعاً در سودیم، نه ضرر.
+        ۲. تریلینگ سود (پیش‌فرض ۳٪، با «تریل N»/«تریل خاموش» قابل‌تنظیم): اگر
+           قیمت از بهترین نقطهٔ رسیده‌شده به همین اندازه برگرده بالا -- فقط
+           وقتی واقعاً در سودیم، نه ضرر. با «تریل خاموش» این لایه کلاً غیرفعال
+           میشه (مثلاً برای تست تمیز تیپی/استاپ دلاری بدون مزاحمت).
 
         حد ضرر سخت هم مطلق و مستقل از این دو تاست -- به محض فعال شدن، فوراً
         بسته می‌شود، منتظر هیچ تأییدی نمی‌ماند؛ این محافظت از حساب است.
         """
+        if bool(self.storage.get_setting("close_all_execute", False)):
+            self.storage.set_setting("close_all_execute", False)
+            self._close_all_open_positions()
+            return
+
         cycles = self.storage.open_cycles()
         if not cycles:
             return
@@ -331,18 +348,21 @@ class BotEngine:
 
             # تریلینگ سود -- لایهٔ دوم خروج، مستقل از برگشت ساختاری. فقط وقتی
             # واقعاً در سودیم: اگر قیمت از بهترین نقطهٔ رسیده‌شده (new_best)
-            # به‌اندازهٔ TRAIL_PROFIT_PCT برگردد بالا، می‌بندیم. فقط قیمت
+            # به‌اندازهٔ trail_profit_pct() برگردد بالا، می‌بندیم. فقط قیمت
             # لازم داره (نه کندل) -- بعد از Hard Stop سریع‌ترین مسیره.
-            trail_stop = new_best * (1 + config.TRAIL_PROFIT_PCT / 100.0)
-            if trail_stop < entry_price and price >= trail_stop:
-                gross = risk_engine.unrealized_pnl(
-                    side="SHORT", avg_entry=entry_price,
-                    quantity=quantity, current_price=price,
-                )
-                self.close_position(
-                    cycle, exit_price=price, exit_reason="TRAIL_PROFIT", gross_pnl=gross,
-                )
-                continue
+            # اگر با «تریل خاموش» صفر شده باشه، کاملاً رد میشه.
+            trail_pct = self.trail_profit_pct()
+            if trail_pct > 0:
+                trail_stop = new_best * (1 + trail_pct / 100.0)
+                if trail_stop < entry_price and price >= trail_stop:
+                    gross = risk_engine.unrealized_pnl(
+                        side="SHORT", avg_entry=entry_price,
+                        quantity=quantity, current_price=price,
+                    )
+                    self.close_position(
+                        cycle, exit_price=price, exit_reason="TRAIL_PROFIT", gross_pnl=gross,
+                    )
+                    continue
 
             # برای برگشت ساختاری به کندل نیاز داریم.
             candles: list[dict[str, Any]] = []
@@ -849,6 +869,43 @@ class BotEngine:
             "POSITION_CLOSED | %s reason=%s net=%.2f mfe=%.2f%% cooldown=%.0fh",
             symbol, exit_reason, net, mfe_pct, hours,
         )
+
+    def _close_all_open_positions(self) -> None:
+        """اجرای درخواست «بستن همه» -- همهٔ چرخه‌های باز (واقعی و مجازی) را
+        با قیمت لحظه‌ای می‌بندد. از همون close_position استفاده می‌کنه، پس
+        برای حالت واقعی هم سفارش بستن واقعاً رو صرافی گذاشته میشه.
+        """
+        cycles = self.storage.open_cycles()
+        if not cycles:
+            return
+        try:
+            prices = self.toobit.get_all_prices()
+        except Exception as exc:
+            logger.warning("CLOSE_ALL_PRICE_FAIL | %s", exc)
+            prices = {}
+
+        closed_count = 0
+        for cycle in cycles:
+            symbol = str(cycle.get("symbol"))
+            price = safe_float(prices.get(symbol))
+            if price <= 0:
+                try:
+                    price = safe_float(self.toobit.get_mark_price(symbol))
+                except Exception:
+                    continue
+            if price <= 0:
+                continue
+            entry_price = safe_float(cycle.get("avg_entry_price"))
+            quantity = safe_float(cycle.get("total_quantity"))
+            gross = risk_engine.unrealized_pnl(
+                side="SHORT", avg_entry=entry_price,
+                quantity=quantity, current_price=price,
+            )
+            self.close_position(
+                cycle, exit_price=price, exit_reason="MANUAL_CLOSE_ALL", gross_pnl=gross,
+            )
+            closed_count += 1
+        logger.info("CLOSE_ALL | %d/%d cycle closed", closed_count, len(cycles))
 
     # --- همگام‌سازی با صرافی ----------------------------------------------
     def monitor_real(self) -> None:
