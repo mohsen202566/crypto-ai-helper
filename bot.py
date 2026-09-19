@@ -588,7 +588,7 @@ class BotEngine:
 
             # کندل جاری (ناقص) — برای ارزیابی intra-candle لازم است.
             live = candles[-1] if candles else {}
-            live_open_ms = safe_int(live.get("time"))
+            live_open_ms = safe_int(live.get("ts"))  # کلید صحیح از get_klines: "ts" نه "time"
             elapsed = max(0.0, (now - live_open_ms) / 1000.0) if live_open_ms else 0.0
             live_high = safe_float(live.get("high"))
             live_low = safe_float(live.get("low"))
