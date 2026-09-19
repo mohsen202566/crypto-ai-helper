@@ -275,10 +275,10 @@ def find_confirmed_pivots(
         right = [_f(closed[i + k], key) for k in range(1, n + 1)]
         if kind == "high":
             if all(value > x for x in left) and all(value > x for x in right):
-                out.append(Pivot(i, value, int(safe_float(closed[i].get("time")))))
+                out.append(Pivot(i, value, int(safe_float(closed[i].get("ts")))))
         else:
             if all(value < x for x in left) and all(value < x for x in right):
-                out.append(Pivot(i, value, int(safe_float(closed[i].get("time")))))
+                out.append(Pivot(i, value, int(safe_float(closed[i].get("ts")))))
     return out
 
 
