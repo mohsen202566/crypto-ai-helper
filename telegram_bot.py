@@ -523,12 +523,19 @@ def watchlist_panel(storage: Storage) -> str:
     مرتب‌شده بر اساس پامپ فعلی (بیشترین اول) تا سریع ببینی کدام‌ها
     داغ‌ترند. اوج ثبت‌شده هم کنارش می‌آید چون گاهی نماد از سقفش برگشته
     ولی هنوز زیر نظر است — و دقیقاً همان‌جا ممکن است فرصت شورت باشد.
+
+    نمادهایی که پامپشان به آستانهٔ رزرو رسیده («رزرو N») با 🎯 مشخص
+    می‌شوند: یعنی اگر سیگنال بدهند و همهٔ اسلات‌ها پر باشد، جای ضعیف‌ترین
+    پوزیشن باز (کمترین پامپ ورودی، اگر به‌قدر کافی قدیمی باشد) برایشان
+    آزاد می‌شود -- برای همین «دقیق رصد» می‌شوند.
     """
+    threshold = safe_float(storage.get_setting("watchlist_threshold", config.WATCHLIST_MIN_GAIN_PCT))
+    reserve_th = safe_float(storage.get_setting("reserve_threshold", config.RESERVE_THRESHOLD_PCT))
     rows = storage.watchlist_active()
     if not rows:
         return (
             "👀 هیچ نمادی زیر نظر نیست.\n\n"
-            f"هیچ ارزی پامپ ۲۴ ساعته ≥ {config.WATCHLIST_MIN_GAIN_PCT:.0f}% ندارد.\n"
+            f"هیچ ارزی پامپ ۲۴ ساعته ≥ {threshold:.0f}% ندارد.\n"
             f"اسکن بعدی تا حداکثر {config.WATCHLIST_SCAN_SECONDS / 60:.0f} دقیقهٔ دیگر."
         )
 
@@ -536,13 +543,28 @@ def watchlist_panel(storage: Storage) -> str:
     busy = {str(x) for x in storage.open_symbols()}
 
     ordered = sorted(rows, key=lambda r: safe_float(r.get("last_gain_pct")), reverse=True)
+    reserved = [r for r in ordered if safe_float(r.get("last_gain_pct")) >= reserve_th]
 
     lines = [f"👀 {len(ordered)} نماد زیر نظر", ""]
+    if reserved:
+        names = "، ".join(
+            f"{_coin(str(r.get('symbol')))} ({safe_float(r.get('last_gain_pct')):+.1f}%)"
+            for r in reserved
+        )
+        lines += [f"🎯 رزرو شکار دامپ ({len(reserved)}): {names}", ""]
+
     for i, r in enumerate(ordered, 1):
         symbol = str(r.get("symbol"))
         now_pct = safe_float(r.get("last_gain_pct"))
         peak_pct = safe_float(r.get("peak_gain_pct"))
-        mark = "🟡" if symbol in busy else ("😴" if symbol in cooldowns else "▫️")
+        if now_pct >= reserve_th:
+            mark = "🎯"
+        elif symbol in busy:
+            mark = "🟡"
+        elif symbol in cooldowns:
+            mark = "😴"
+        else:
+            mark = "▫️"
         line = f"{i}. {mark} {_coin(symbol)} — {now_pct:+.1f}%"
         # اوج فقط وقتی نمایش داده می‌شود که واقعاً بالاتر از الان باشد
         if peak_pct - now_pct >= 1.0:
@@ -554,8 +576,8 @@ def watchlist_panel(storage: Storage) -> str:
 
     lines += [
         "",
-        f"🟡 پوزیشن باز  |  😴 در استراحت  |  ▫️ فقط زیر نظر",
-        f"آستانهٔ ورود به این فهرست: پامپ ۲۴ ساعته ≥ {config.WATCHLIST_MIN_GAIN_PCT:.0f}%",
+        "🎯 رزرو (اولویت جایگزینی)  |  🟡 پوزیشن باز  |  😴 در استراحت  |  ▫️ فقط زیر نظر",
+        f"آستانهٔ ورود به این فهرست: پامپ ۲۴ ساعته ≥ {threshold:.0f}%  |  آستانهٔ رزرو: ≥ {reserve_th:.0f}%",
     ]
     return "\n".join(lines)
 
@@ -689,6 +711,7 @@ def help_text() -> str:
         "• واچ — نمادهای زیر نظر",
         "• واچ ۱۵ — آستانهٔ رشد ۲۴ساعته برای ورود به واچ‌لیست (۱ تا ۱۰۰۰)",
         "• تریل ۳ / تریل خاموش — درصد تریلینگ سود (۰ تا ۲۰)، خاموش=فقط Hard Stop+برگشت ساختاری",
+        "• رزرو ۵۰ — آستانهٔ رزرو اسلات برای شکار پامپ قوی (۱ تا ۱۰۰۰)؛ در «واچ» با 🎯 دیده میشه",
         "• دستورات — همین لیست، همراه با مقدار فعلی هر تنظیم",
         "• قیف — از چند کاندید، چند ستاپ و چند معامله",
         "• پوزیشن — پوزیشن‌های باز",
@@ -730,6 +753,7 @@ def commands_status_panel(storage: Storage) -> str:
     live_report = safe_int(storage.get_setting("live_report_minutes", config.LIVE_REPORT_MINUTES))
     watch_th = safe_float(storage.get_setting("watchlist_threshold", config.WATCHLIST_MIN_GAIN_PCT))
     trail_pct = safe_float(storage.get_setting("trail_profit_pct", config.TRAIL_PROFIT_PCT))
+    reserve_th = safe_float(storage.get_setting("reserve_threshold", config.RESERVE_THRESHOLD_PCT))
     tp_usd = safe_float(storage.get_setting("fixed_tp_usd", 0.0))
     sl_usd = safe_float(storage.get_setting("fixed_sl_usd", 0.0))
 
@@ -752,6 +776,7 @@ def commands_status_panel(storage: Storage) -> str:
         f"  واچ N  (۱ تا ۱۰۰۰) — آستانهٔ رشد ۲۴ساعته برای واچ‌لیست — الان: {watch_th:.0f}٪",
         f"  تریل N / تریل خاموش  (۰ تا ۲۰) — درصد تریلینگ سود — الان: "
         f"{'خاموش' if trail_pct <= 0 else f'{trail_pct:.1f}٪'}",
+        f"  رزرو N  (۱ تا ۱۰۰۰) — آستانهٔ رزرو اسلات برای شکار پامپ قوی — الان: {reserve_th:.0f}٪",
         "",
         "🔸 تی‌پی/استاپ دلاری دستی (برای تست دقیق -- جایگزین خروج عادی)",
         f"  تیپی N / تیپی خاموش  (۱ تا ۱۰۰۰$) — الان: "
@@ -1011,6 +1036,25 @@ class CommandRouter:
             return (
                 f"✅ تریلینگ سود روی {value:.1f}٪ تنظیم شد.\n"
                 "روی پوزیشن‌های باز فعلی هم از همین چک بعدی (کمتر از ۵ ثانیه دیگه) اعمال میشه."
+            )
+
+        if cmd.startswith("رزرو "):
+            arg = cmd.split(" ", 1)[1].strip()
+            try:
+                value = float(parse_number(arg))
+            except (ValueError, IndexError):
+                return "عدد نامعتبر. مثال: «رزرو ۵۰» یعنی نمادی که پامپش به ۵۰٪ برسه، اسلات براش رزرو میشه."
+            if not config.RESERVE_THRESHOLD_MIN <= value <= config.RESERVE_THRESHOLD_MAX:
+                return (
+                    f"عدد باید بین {config.RESERVE_THRESHOLD_MIN:.0f} تا "
+                    f"{config.RESERVE_THRESHOLD_MAX:.0f} درصد باشد."
+                )
+            self.storage.set_setting("reserve_threshold", value)
+            return (
+                f"✅ آستانهٔ رزرو روی {value:.0f}٪ تنظیم شد.\n"
+                "از این پس هر نمادی که پامپش به این عدد برسه رزرو میشه (تو «واچ» با 🎯 مشخصه): "
+                "اگه بعداً سیگنال بده و همهٔ اسلات‌ها پر باشن، جای ضعیف‌ترین پوزیشن باز "
+                f"(کمترین پامپ ورودی، اگه حداقل {config.RESERVE_MIN_HOLD_MINUTES:.0f} دقیقه ازش گذشته باشه) براش آزاد میشه."
             )
 
         if cmd in {"واچ", "واچ لیست", "واچ‌لیست", "/watchlist"}:
