@@ -39,6 +39,7 @@ class BotEngine:
         self._contracts_ts = 0.0
         self._last_watchlist_scan = 0.0
         self._last_monitor = 0.0
+        self._last_peak_pullback = 0.0
         self._last_live_report = 0.0
         self._last_summary_day = ""
 
@@ -193,6 +194,19 @@ class BotEngine:
         )
         return max(config.RESERVE_THRESHOLD_MIN, min(value, config.RESERVE_THRESHOLD_MAX))
 
+    def top_n_count(self) -> int:
+        """فقط N تای برتر واچ‌لیست (بیشترین پامپ ۲۴ساعته) معامله می‌شوند؛
+        ۰ یعنی خاموش (بدون محدودیت). از پنل: «تاپ ۳» یا «تاپ ۰»."""
+        value = safe_int(self.storage.get_setting("top_n_count", config.TOP_N_COUNT))
+        return max(config.TOP_N_MIN, min(value, config.TOP_N_MAX))
+
+    def pullback_entry_pct(self) -> float:
+        """درصد برگشت از سقف که ورود Peak-Pullback رو تریگر می‌کنه. از پنل: «برگشت N»."""
+        value = safe_float(
+            self.storage.get_setting("pullback_entry_pct", config.PULLBACK_ENTRY_PCT)
+        )
+        return max(config.PULLBACK_ENTRY_MIN, min(value, config.PULLBACK_ENTRY_MAX))
+
     def mode(self) -> str | None:
         """حالت فعلی؛ None یعنی هر دو خاموش‌اند و فقط اسکن انجام می‌شود."""
         if bool(self.storage.get_setting("real_trading_enabled", False)):
@@ -205,13 +219,13 @@ class BotEngine:
     #  حلقهٔ اصلی
     # ------------------------------------------------------------------
     def tick(self) -> None:
-        """هر تیک: پوزیشن‌های باز، اسکن Watchlist، مانیتور ورود، گزارش‌ها.
+        """هر تیک: پوزیشن‌های باز، اسکن Watchlist، ورود Peak-Pullback، گزارش‌ها.
 
-        دو فرکانس متفاوت و عمدی:
+        سه فرکانس متفاوت و عمدی:
           * Watchlist هر ۱۵ دقیقه — کشف کاندید کافی است همین‌قدر کند باشد.
-          * Monitoring هر ۵ دقیقه — چون یک Cascade می‌تواند در همان بازه
-            بخش بزرگی از حرکت را طی کند و انتظار برای کندل ۱۵ دقیقه‌ای
-            یعنی از دست دادن آن.
+          * Peak-Pullback هر چند ثانیه — چون کل هدفش نبستن به کندل یا
+            تأیید چندلحظه‌ای است؛ صبر کردن یعنی از دست دادن دقیقاً همون
+            برگشتی که دنبالشیم.
         """
         self.manage_open_positions()
 
@@ -219,9 +233,9 @@ class BotEngine:
             self._last_watchlist_scan = time.monotonic()
             self.scan_watchlist()
 
-        if (time.monotonic() - self._last_monitor) >= config.MONITOR_INTERVAL_SECONDS:
-            self._last_monitor = time.monotonic()
-            self.monitor_watchlist()
+        if (time.monotonic() - self._last_peak_pullback) >= config.PEAK_PULLBACK_CHECK_SECONDS:
+            self._last_peak_pullback = time.monotonic()
+            self.monitor_peak_pullback()
 
         self.maybe_send_live_report()
         self.maybe_send_daily_summary()
@@ -498,6 +512,147 @@ class BotEngine:
     # ------------------------------------------------------------------
     #  مانیتور و ورود
     # ------------------------------------------------------------------
+    def monitor_peak_pullback(self) -> None:
+        """ورود لحظه‌ای Peak-Pullback -- جایگزین کامل منطق قبلی.
+
+        برخلاف monitor_watchlist قدیمی که هر ۵ دقیقه اجرا می‌شد، این تابع
+        با تیک سریع (هر چند ثانیه، مستقل از بسته‌شدن هر کندلی) صدا زده
+        می‌شود، چون کل هدف Peak-Pullback همینه: صبر نکردن.
+
+        برای ارزان ماندن، هر چرخه فقط یک فراخوانی get_all_prices (وزن ۱)
+        برای همهٔ نمادها می‌زند؛ کندل (get_klines) فقط دقیقاً همون لحظه‌ای
+        گرفته می‌شود که یک نماد واقعاً تریگر بزنه (برای محاسبهٔ ATR/استاپ).
+        """
+        mode = self.mode()
+        if mode is None:
+            return
+
+        watch = self.storage.watchlist_active()
+        if not watch:
+            return
+
+        watch = sorted(watch, key=lambda r: safe_float(r.get("last_gain_pct")), reverse=True)
+        focus_n = self.top_n_count()
+        if focus_n > 0:
+            watch = watch[:focus_n]
+
+        capital = self.effective_capital(real_mode=(mode == "real"))
+        if capital < config.MIN_CAPITAL_TO_TRADE_USDT:
+            return
+
+        max_positions = self.max_positions(capital=capital)
+        open_count = self.storage.open_position_count()
+        free_slots = max_positions - open_count
+        reserve_th = self.reserve_threshold()
+        has_reserved_candidate = any(
+            safe_float(r.get("last_gain_pct")) >= reserve_th for r in watch
+        )
+        if free_slots <= 0 and not has_reserved_candidate:
+            return
+
+        try:
+            prices = self.toobit.get_all_prices()
+        except Exception as exc:
+            logger.debug("PEAK_PULLBACK_PRICE_FAIL | %s", exc)
+            return
+
+        busy = self.storage.open_symbols()
+        pullback_pct = self.pullback_entry_pct()
+        now = now_ms()
+        opened = 0
+        checked = 0
+        setups = 0
+        rejects: dict[str, int] = {}
+
+        for row in watch:
+            symbol = str(row.get("symbol"))
+            gain_pct = safe_float(row.get("last_gain_pct"))
+            is_reserved_tier = gain_pct >= reserve_th
+
+            if free_slots <= 0 and not is_reserved_tier:
+                break
+
+            if config.ONE_POSITION_PER_SYMBOL and symbol in busy:
+                continue
+
+            cooling, _until = self.storage.in_cooldown(symbol)
+            if cooling:
+                rejects["cooldown"] = rejects.get("cooldown", 0) + 1
+                continue
+
+            price = safe_float(prices.get(symbol))
+            if price <= 0:
+                continue
+
+            checked += 1
+
+            # سقف رو با قیمت لحظه‌ای آپدیت کن -- بدون کندل، بدون تأخیر
+            peak_price = safe_float(row.get("peak_price"))
+            if price > peak_price:
+                peak_price = price
+                self.storage.watchlist_bump_peak(symbol, price)
+
+            trigger_price = peak_price * (1 - pullback_pct / 100.0)
+            if price > trigger_price:
+                rejects["pullback_not_reached"] = rejects.get("pullback_not_reached", 0) + 1
+                continue
+
+            try:
+                candles = self.toobit.get_klines(
+                    symbol, interval=config.ENTRY_TIMEFRAME, limit=config.ENTRY_CANDLE_LIMIT
+                )
+            except Exception as exc:
+                logger.debug("PEAK_PULLBACK_KLINES_FAIL | %s | %s", symbol, exc)
+                continue
+            if not candles:
+                continue
+
+            signal = strategy.evaluate_peak_pullback_entry(
+                symbol=symbol, candles=candles, current_price=price,
+                peak_price=peak_price, pullback_pct=pullback_pct,
+                change_24h=gain_pct, trigger_time_ms=now,
+            )
+            if not signal.ok:
+                code = signal.reject_code or "unknown"
+                rejects[code] = rejects.get(code, 0) + 1
+                continue
+
+            setups += 1
+            self.storage.watchlist_touch_counter(symbol, "setup_count")
+
+            if free_slots <= 0:
+                freed = self._preempt_for_reserved(symbol=symbol, candidate_gain_pct=gain_pct)
+                if not freed:
+                    rejects["no_slot_reserved"] = rejects.get("no_slot_reserved", 0) + 1
+                    continue
+                free_slots += 1
+
+            cycle_id = self.open_position(
+                symbol=symbol, signal=signal, mode=mode, capital=capital,
+                max_positions=max_positions,
+            )
+            if cycle_id:
+                opened += 1
+                free_slots -= 1
+                busy.add(symbol)
+                self.storage.watchlist_touch_counter(symbol, "trade_count")
+
+        self.storage.set_setting("last_monitor_report", {
+            "ts": now,
+            "watchlist": len(watch),
+            "checked": checked,
+            "setups": setups,
+            "opened": opened,
+            "free_slots": free_slots,
+            "rejects": rejects,
+        })
+        top_reject = max(rejects.items(), key=lambda kv: kv[1])[0] if rejects else "-"
+        self.storage.set_health(
+            "monitor", "ok",
+            f"{checked} نماد بررسی شد | {setups} ستاپ | {opened} ورود | "
+            f"برگشت={pullback_pct:.1f}٪ | تاپ={focus_n or 'خاموش'} | بیشترین دلیل رد: {top_reject}",
+        )
+
     def monitor_watchlist(self) -> None:
         """بررسی هر ۵ دقیقه: آیا شرایط ورود SHORT برقرار است؟
 
@@ -741,7 +896,7 @@ class BotEngine:
         # جدید؛ پوزیشن‌های باز فعلی با همون دستور به‌صورت جداگانه آپدیت میشن.
         take_profit_price = plan.take_profit_price
         stop_price = plan.stop_price
-        fixed_tp_usd = safe_float(self.storage.get_setting("fixed_tp_usd", 0.0))
+        fixed_tp_usd = safe_float(self.storage.get_setting("fixed_tp_usd", config.DEFAULT_FIXED_TP_USD))
         fixed_sl_usd = safe_float(self.storage.get_setting("fixed_sl_usd", 0.0))
         if fixed_tp_usd > 0:
             take_profit_price = risk_engine.dollar_target_price(
