@@ -242,7 +242,7 @@ WATCHLIST_RETENTION_HOURS = float(os.getenv("WATCHLIST_RETENTION_HOURS", "12.0")
 # برگردد بالا -- فقط در حالی که هنوز واقعاً زیر قیمت ورود (در سود) هستیم --
 # پوزیشن بسته می‌شود. مستقل از Hard Stop و برگشت ساختاری؛ هرکدام زودتر
 # برسد همان اعمال می‌شود.
-TRAIL_PROFIT_PCT = float(os.getenv("TRAIL_PROFIT_PCT", "3.0"))
+TRAIL_PROFIT_PCT = float(os.getenv("TRAIL_PROFIT_PCT", "0.0"))  # پیش‌فرض خاموش
 TRAIL_PROFIT_PCT_MIN = 0.0    # ۰ = کاملاً خاموش
 TRAIL_PROFIT_PCT_MAX = 20.0
 
@@ -256,6 +256,29 @@ RESERVE_THRESHOLD_MAX = 1000.0
 # پوزیشنی که کمتر از این مدت (دقیقه) باز شده، هیچ‌وقت preempt نمی‌شود --
 # حتی اگه ضعیف‌ترینه -- تا فرصت واقعی برای جواب دادن داشته باشد.
 RESERVE_MIN_HOLD_MINUTES = float(os.getenv("RESERVE_MIN_HOLD_MINUTES", "15.0"))
+
+# --- تی‌پی دلاری پیش‌فرض ---
+# برخلاف قبل که پیش‌فرض خاموش بود، حالا خروج فقط دلاریه و از همون اول
+# روشنه (کاربر می‌تونه با «تیپی N» عوضش کنه یا «تیپی خاموش» کاملاً خاموش کنه).
+DEFAULT_FIXED_TP_USD = float(os.getenv("DEFAULT_FIXED_TP_USD", "5.0"))
+
+# --- تاپ N: فقط N تای برتر واچ‌لیست معامله بشن ---
+# ۰ = خاموش (هیچ محدودیتی، هر نماد واجد شرایط واچ‌لیست قابل معامله‌ست).
+TOP_N_COUNT = int(os.getenv("TOP_N_COUNT", "3"))
+TOP_N_MIN = 0
+TOP_N_MAX = 18
+
+# --- ورود Peak-Pullback (جایگزین کامل منطق قبلی) ---
+# به محض این‌که قیمت لحظه‌ای از سقف ردیابی‌شده (از لحظه‌ی ورود به واچ‌لیست)
+# به این‌اندازه برگرده، بلافاصله وارد میشیم -- بدون نیاز به بسته‌شدن کندل،
+# بدون تأیید چندکندلی. از پنل: «برگشت N».
+PULLBACK_ENTRY_PCT = float(os.getenv("PULLBACK_ENTRY_PCT", "3.0"))
+PULLBACK_ENTRY_MIN = 0.5
+PULLBACK_ENTRY_MAX = 30.0
+
+# چرخه‌ی چک ورود Peak-Pullback (ثانیه) -- سریع و مستقل از اسکن ۱۵دقیقه‌ای
+# واچ‌لیست، چون کل هدف همینه که منتظر چیزی نمونیم.
+PEAK_PULLBACK_CHECK_SECONDS = float(os.getenv("PEAK_PULLBACK_CHECK_SECONDS", "5.0"))
 
 # --- تایم‌فریم‌ها ---
 # 15m = کشف کاندید / زمینه | 5m = مانیتور و اجرا
