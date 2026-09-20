@@ -617,6 +617,16 @@ class Storage:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def watchlist_bump_peak(self, symbol: str, price: float) -> None:
+        """آپدیت سریع سقف قیمت، بدون نیاز به gain% -- برای چرخهٔ سریع
+        Peak-Pullback که هر چند ثانیه اجرا می‌شود و کندل/درصد نمی‌خواهد."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE watchlist SET peak_price=MAX(peak_price, ?) WHERE symbol=?",
+                (price, symbol),
+            )
+            self._conn.commit()
+
     def watchlist_get(self, symbol: str) -> dict[str, Any] | None:
         with self._lock:
             row = self._conn.execute(
