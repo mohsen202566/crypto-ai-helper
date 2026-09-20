@@ -28,7 +28,7 @@ import strategy
 from storage import Storage
 from telegram_bot import live_panel, position_panel, result_panel, summary_panel
 from toobit_client import ToobitClient, ToobitError
-from utils import canonical_base, logger, now_ms, safe_float, safe_int, timeframe_seconds
+from utils import canonical_base, canonical_symbol, logger, now_ms, safe_float, safe_int, timeframe_seconds
 
 
 class BotEngine:
@@ -614,7 +614,12 @@ class BotEngine:
                 rejects["cooldown"] = rejects.get("cooldown", 0) + 1
                 continue
 
-            price = safe_float(prices.get(symbol))
+            price = safe_float(prices.get(canonical_symbol(symbol)))
+            if price <= 0:
+                try:
+                    price = safe_float(self.toobit.get_mark_price(symbol))
+                except Exception:
+                    price = 0.0
             if price <= 0:
                 continue
 
