@@ -103,8 +103,13 @@ def position_panel(cycle: dict[str, Any], plan: dict[str, Any] | None = None) ->
         f"نوع: {_mode_label(cycle.get('mode'))}",
         "",
         f"🛑 حد ضرر ساختاری: {_price(cycle.get('hard_stop_price'))}",
-        "📉 خروج: فقط با برگشت ساختاری تأییدشده (بدون حد سود ثابت)",
     ]
+    tp_price = safe_float(cycle.get("take_profit_price"))
+    if tp_price > 0:
+        lines.append(f"🎯 تی‌پی دلاری: {_price(tp_price)}")
+        lines.append("📉 خروج: تی‌پی دلاری، یا حد ضرر ساختاری -- هرکدوم زودتر")
+    else:
+        lines.append("📉 خروج: فقط با برگشت ساختاری تأییدشده (بدون حد سود ثابت)")
     if plan.get("liquidation_price"):
         lines.append(f"⚠️ لیکوئید: {_price(plan.get('liquidation_price'))}")
     if plan.get("risk_usdt"):
@@ -197,19 +202,24 @@ def _size_label(storage: Storage, balance: float = 0.0) -> list[str]:
 
 
 def _common_lines(storage: Storage, balance: float = 0.0) -> list[str]:
+    watch_th = safe_float(storage.get_setting("watchlist_threshold", config.WATCHLIST_MIN_GAIN_PCT))
+    focus_n = safe_int(storage.get_setting("top_n_count", config.TOP_N_COUNT))
+    pullback_pct = safe_float(storage.get_setting("pullback_entry_pct", config.PULLBACK_ENTRY_PCT))
+    tp_usd = safe_float(storage.get_setting("fixed_tp_usd", config.DEFAULT_FIXED_TP_USD))
     return [
-        "استراتژی: V3 — شورت بعد از پامپ افراطی",
+        "استراتژی: Peak-Pullback — شورت لحظه‌ای بعد از پامپ (بدون کندل/تأیید)",
         f"اسکن: کل بازار ({safe_int(storage.get_setting('tradable_count', 0))} قرارداد)"
-        f"  |  اجرا: {config.ENTRY_TIMEFRAME}",
-        f"حداکثر پوزیشن هم‌زمان: {safe_int(storage.get_setting('max_positions', config.MAX_CONCURRENT_POSITIONS))}",
+        f"  |  ورود: لحظه‌ای (هر {config.PEAK_PULLBACK_CHECK_SECONDS:.0f} ثانیه)",
+        f"حداکثر پوزیشن هم‌زمان: {safe_int(storage.get_setting('max_positions', config.MAX_CONCURRENT_POSITIONS))}"
+        f"  |  تاپ: {'خاموش' if focus_n == 0 else f'{focus_n} تای برتر'}",
         *_size_label(storage, balance),
-        f"آستانهٔ کاندید: 24h ≥ {config.WATCHLIST_MIN_GAIN_PCT:.0f}%"
+        f"آستانهٔ کاندید: 24h ≥ {watch_th:.0f}%  |  برگشت ورود: {pullback_pct:.1f}٪ از سقف"
         f"  |  زیر نظر: {safe_int(storage.get_setting('watchlist_size', 0))} نماد",
         f"لوریج: {safe_int(storage.get_setting('leverage', config.DEFAULT_LEVERAGE))}x  |  {config.MARGIN_MODE}",
         f"استراحت بعد از خروج: "
         f"{safe_float(storage.get_setting('cooldown_hours', config.COOLDOWN_HOURS)):.0f} ساعت",
         f"حد ضرر: سقف تأییدشده + {config.STOP_ATR_MULT:.1f}×ATR({config.ATR_PERIOD})"
-        "  |  بدون حد سود ثابت",
+        f"  |  تی‌پی دلاری: {'خاموش' if tp_usd <= 0 else f'{tp_usd:,.2f}$'}",
     ]
 
 
@@ -495,6 +505,8 @@ def why_panel(storage: Storage) -> str:
 
 _REJECT_LABELS = {
     "cooldown": "در استراحت بعد از معاملهٔ قبلی",
+    "pullback_not_reached": "هنوز به آستانهٔ برگشت از سقف نرسیده",
+    "no_peak_data": "هنوز سقفی ثبت نشده",
     "no_exhaustion": "نشانهٔ خستگی نیامده (سایهٔ بالا کافی نیست)",
     "no_deceleration": "شتاب صعود هنوز کم نشده",
     "no_structure_break": "کف تأییدشده هنوز نشکسته",
@@ -528,9 +540,13 @@ def watchlist_panel(storage: Storage) -> str:
     می‌شوند: یعنی اگر سیگنال بدهند و همهٔ اسلات‌ها پر باشد، جای ضعیف‌ترین
     پوزیشن باز (کمترین پامپ ورودی، اگر به‌قدر کافی قدیمی باشد) برایشان
     آزاد می‌شود -- برای همین «دقیق رصد» می‌شوند.
+
+    فقط N تای اول (تنظیم با «تاپ N») واقعاً معامله می‌شوند -- این‌ها با
+    🔒 مشخص‌اند؛ اگر «تاپ ۰» (خاموش) باشد، همه واجد شرایطن.
     """
     threshold = safe_float(storage.get_setting("watchlist_threshold", config.WATCHLIST_MIN_GAIN_PCT))
     reserve_th = safe_float(storage.get_setting("reserve_threshold", config.RESERVE_THRESHOLD_PCT))
+    focus_n = safe_int(storage.get_setting("top_n_count", config.TOP_N_COUNT))
     rows = storage.watchlist_active()
     if not rows:
         return (
@@ -566,6 +582,8 @@ def watchlist_panel(storage: Storage) -> str:
         else:
             mark = "▫️"
         line = f"{i}. {mark} {_coin(symbol)} — {now_pct:+.1f}%"
+        if focus_n > 0 and i <= focus_n:
+            line += "  🔒تاپ"
         # اوج فقط وقتی نمایش داده می‌شود که واقعاً بالاتر از الان باشد
         if peak_pct - now_pct >= 1.0:
             line += f"  (اوج {peak_pct:+.1f}%)"
@@ -577,6 +595,7 @@ def watchlist_panel(storage: Storage) -> str:
     lines += [
         "",
         "🎯 رزرو (اولویت جایگزینی)  |  🟡 پوزیشن باز  |  😴 در استراحت  |  ▫️ فقط زیر نظر",
+        f"🔒تاپ = فقط این {focus_n} تا واقعاً معامله می‌شن" if focus_n > 0 else "🔒تاپ خاموشه -- هر رتبه‌ای معامله می‌شه",
         f"آستانهٔ ورود به این فهرست: پامپ ۲۴ ساعته ≥ {threshold:.0f}%  |  آستانهٔ رزرو: ≥ {reserve_th:.0f}%",
     ]
     return "\n".join(lines)
@@ -700,8 +719,8 @@ def help_text() -> str:
         "",
         "جریان کار:",
         f"  پامپ ۲۴ ساعته ≥ {config.WATCHLIST_MIN_GAIN_PCT:.0f}% → زیر نظر گرفتن",
-        "  → نشانهٔ خستگی یا آبشار فروش → شورت",
-        "  → حد ضرر سخت، یا برگشت ساختاری، یا تریلینگ سود (از بهترین قیمت) → خروج → استراحت",
+        "  → قیمت لحظه‌ای X٪ از سقف ردیابی‌شده برگرده → شورت فوری (بدون کندل، بدون تأیید)",
+        "  → تی‌پی دلاری ثابت، یا حد ضرر ساختاری، یا تریلینگ (اگه روشن باشه) → خروج → استراحت",
         "",
         "دستورات:",
         "• ترید فعال / ترید خاموش — روشن و خاموش کردن ترید واقعی",
@@ -710,7 +729,9 @@ def help_text() -> str:
         "• ترید مجازی — پنل ترید مجازی",
         "• واچ — نمادهای زیر نظر",
         "• واچ ۱۵ — آستانهٔ رشد ۲۴ساعته برای ورود به واچ‌لیست (۱ تا ۱۰۰۰)",
-        "• تریل ۳ / تریل خاموش — درصد تریلینگ سود (۰ تا ۲۰)، خاموش=فقط Hard Stop+برگشت ساختاری",
+        "• تاپ ۳ / تاپ ۰ — فقط N تای برتر لیست معامله بشن، ۰=خاموش (۰ تا ۱۸)",
+        "• برگشت ۳ — درصد برگشت از سقف که فوراً وارد میشیم (۰.۵ تا ۳۰)",
+        "• تریل ۳ / تریل خاموش — درصد تریلینگ سود (۰ تا ۲۰)، پیش‌فرض خاموشه",
         "• رزرو ۵۰ — آستانهٔ رزرو اسلات برای شکار پامپ قوی (۱ تا ۱۰۰۰)؛ در «واچ» با 🎯 دیده میشه",
         "• دستورات — همین لیست، همراه با مقدار فعلی هر تنظیم",
         "• قیف — از چند کاندید، چند ستاپ و چند معامله",
@@ -723,7 +744,7 @@ def help_text() -> str:
         "• زنده — مانیتورینگ لحظه‌ای پوزیشن‌های باز",
         "• امروز — خلاصهٔ معاملات امروز",
         "• گزارش ۱۵ — فاصلهٔ گزارش خودکار به دقیقه (۰ = خاموش)",
-        "• تیپی ۵ / تیپی خاموش — تی‌پی دلاری ثابت برای تست دقیق دستی (۱ تا ۱۰۰۰$، جایگزین برگشت ساختاری)",
+        f"• تیپی ۵ / تیپی خاموش — تی‌پی دلاری ثابت (۱ تا ۱۰۰۰$، پیش‌فرض روشن رو ${config.DEFAULT_FIXED_TP_USD:.0f})",
         "• استاپ ۱ / استاپ خاموش (یا «استاپ دلاری ۱») — استاپ دلاری ثابت (۱ تا ۱۰۰$، جایگزین حد ضرر ATR)",
         "• وضعیت دلاری — نمایش تی‌پی/استاپ دلاری فعلی",
         "• چرا — گزارش آخرین مانیتور و دلیل ورود نکردن",
@@ -733,7 +754,7 @@ def help_text() -> str:
         "• ریست آمار — پاک کردن تاریخچه",
         "• وضعیت — سلامت سیستم",
         "",
-        "⚠️ قوانین استراتژی در طول این تست قفل‌اند و تغییر نمی‌کنند.",
+        "⚠️ ورود = Peak-Pullback لحظه‌ای؛ خروج پیش‌فرض = تی‌پی دلاری + حد ضرر ساختاری.",
     ])
 
 
@@ -754,7 +775,9 @@ def commands_status_panel(storage: Storage) -> str:
     watch_th = safe_float(storage.get_setting("watchlist_threshold", config.WATCHLIST_MIN_GAIN_PCT))
     trail_pct = safe_float(storage.get_setting("trail_profit_pct", config.TRAIL_PROFIT_PCT))
     reserve_th = safe_float(storage.get_setting("reserve_threshold", config.RESERVE_THRESHOLD_PCT))
-    tp_usd = safe_float(storage.get_setting("fixed_tp_usd", 0.0))
+    focus_n = safe_int(storage.get_setting("top_n_count", config.TOP_N_COUNT))
+    pullback_pct = safe_float(storage.get_setting("pullback_entry_pct", config.PULLBACK_ENTRY_PCT))
+    tp_usd = safe_float(storage.get_setting("fixed_tp_usd", config.DEFAULT_FIXED_TP_USD))
     sl_usd = safe_float(storage.get_setting("fixed_sl_usd", 0.0))
 
     return "\n".join([
@@ -777,8 +800,11 @@ def commands_status_panel(storage: Storage) -> str:
         f"  تریل N / تریل خاموش  (۰ تا ۲۰) — درصد تریلینگ سود — الان: "
         f"{'خاموش' if trail_pct <= 0 else f'{trail_pct:.1f}٪'}",
         f"  رزرو N  (۱ تا ۱۰۰۰) — آستانهٔ رزرو اسلات برای شکار پامپ قوی — الان: {reserve_th:.0f}٪",
+        f"  تاپ N  (۰ تا ۱۸، ۰=خاموش) — فقط N تای برتر لیست معامله بشن — الان: "
+        f"{'خاموش (بدون محدودیت)' if focus_n == 0 else focus_n}",
+        f"  برگشت N  (۰.۵ تا ۳۰) — درصد برگشت از سقف برای ورود Peak-Pullback — الان: {pullback_pct:.1f}٪",
         "",
-        "🔸 تی‌پی/استاپ دلاری دستی (برای تست دقیق -- جایگزین خروج عادی)",
+        "🔸 تی‌پی/استاپ دلاری دستی (خروج پیش‌فرض همینه؛ استاپ ساختاری هم زیرشه)",
         f"  تیپی N / تیپی خاموش  (۱ تا ۱۰۰۰$) — الان: "
         f"{'خاموش' if tp_usd <= 0 else f'{tp_usd:,.2f}$'}",
         f"  استاپ N / استاپ خاموش  (۱ تا ۱۰۰$) — الان: "
@@ -788,8 +814,8 @@ def commands_status_panel(storage: Storage) -> str:
         "  پنل | ترید مجازی | پوزیشن | واچ | قیف | زنده | امروز | گزارش کامل | "
         "خروجی | آمار | ریست آمار | وضعیت | وضعیت دلاری | چرا",
         "",
-        "⚠️ الگوریتم ورود (Wick + Deceleration + Structure Break) قفله و از این "
-        "طریق قابل‌تغییر نیست -- فقط آستانهٔ واچ‌لیست و پارامترهای بالا تنظیم‌پذیرن.",
+        "⚠️ ورود = Peak-Pullback لحظه‌ای (بدون کندل، بدون تأیید) -- فقط آستانهٔ "
+        "واچ‌لیست، تاپ، و برگشت قابل‌تنظیمن. خروج پیش‌فرض = تی‌پی دلاری + حد ضرر ساختاری.",
     ])
 
 
@@ -846,7 +872,7 @@ class CommandRouter:
         همان مقدار قبلیِ آن پوزیشن دست‌نخورده می‌ماند -- یعنی می‌شود فقط
         یکی از این دو را تنظیم کرد بدون این‌که آن‌یکی عوض شود.
         """
-        tp_usd = safe_float(self.storage.get_setting("fixed_tp_usd", 0.0))
+        tp_usd = safe_float(self.storage.get_setting("fixed_tp_usd", config.DEFAULT_FIXED_TP_USD))
         sl_usd = safe_float(self.storage.get_setting("fixed_sl_usd", 0.0))
         if tp_usd <= 0 and sl_usd <= 0:
             return 0
@@ -990,7 +1016,7 @@ class CommandRouter:
             )
 
         if cmd in {"وضعیت دلاری", "وضعیت تیپی استاپ", "/tpsl_status"}:
-            tp_usd = safe_float(self.storage.get_setting("fixed_tp_usd", 0.0))
+            tp_usd = safe_float(self.storage.get_setting("fixed_tp_usd", config.DEFAULT_FIXED_TP_USD))
             sl_usd = safe_float(self.storage.get_setting("fixed_sl_usd", 0.0))
             return (
                 "📌 وضعیت تی‌پی/استاپ دلاری:\n"
@@ -1055,6 +1081,41 @@ class CommandRouter:
                 "از این پس هر نمادی که پامپش به این عدد برسه رزرو میشه (تو «واچ» با 🎯 مشخصه): "
                 "اگه بعداً سیگنال بده و همهٔ اسلات‌ها پر باشن، جای ضعیف‌ترین پوزیشن باز "
                 f"(کمترین پامپ ورودی، اگه حداقل {config.RESERVE_MIN_HOLD_MINUTES:.0f} دقیقه ازش گذشته باشه) براش آزاد میشه."
+            )
+
+        if cmd.startswith("تاپ "):
+            arg = cmd.split(" ", 1)[1].strip()
+            try:
+                value = int(float(parse_number(arg)))
+            except (ValueError, IndexError):
+                return "عدد نامعتبر. مثال: «تاپ ۳» یعنی فقط ۳ تای برتر لیست پامپ معامله بشن؛ «تاپ ۰» یعنی خاموش."
+            if not config.TOP_N_MIN <= value <= config.TOP_N_MAX:
+                return f"عدد باید بین {config.TOP_N_MIN} تا {config.TOP_N_MAX} باشد (۰=خاموش)."
+            self.storage.set_setting("top_n_count", value)
+            if value == 0:
+                return "✅ «تاپ» خاموش شد -- هر نماد واجد شرایط واچ‌لیست، هر رتبه‌ای، قابل معامله‌ست."
+            return (
+                f"✅ تاپ روی {value} نماد برتر تنظیم شد.\n"
+                f"از این پس فقط {value} تای اول لیست (بیشترین پامپ ۲۴ساعته، رتبه‌بندی لحظه‌ای) "
+                "معامله می‌شن؛ بقیه حتی چک هم نمی‌شن."
+            )
+
+        if cmd.startswith("برگشت "):
+            arg = cmd.split(" ", 1)[1].strip()
+            try:
+                value = float(parse_number(arg))
+            except (ValueError, IndexError):
+                return "عدد نامعتبر. مثال: «برگشت ۳» یعنی وقتی قیمت ۳٪ از سقف برگرده، فوراً وارد میشیم."
+            if not config.PULLBACK_ENTRY_MIN <= value <= config.PULLBACK_ENTRY_MAX:
+                return (
+                    f"عدد باید بین {config.PULLBACK_ENTRY_MIN:.1f} تا "
+                    f"{config.PULLBACK_ENTRY_MAX:.0f} درصد باشد."
+                )
+            self.storage.set_setting("pullback_entry_pct", value)
+            return (
+                f"✅ آستانهٔ ورود Peak-Pullback روی {value:.1f}٪ تنظیم شد.\n"
+                "یعنی به محض این‌که قیمت لحظه‌ای از سقف ردیابی‌شده به این‌اندازه برگرده، "
+                "بلافاصله وارد میشیم -- بدون نیاز به بسته‌شدن کندل یا تأیید."
             )
 
         if cmd in {"واچ", "واچ لیست", "واچ‌لیست", "/watchlist"}:
