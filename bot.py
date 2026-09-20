@@ -40,6 +40,7 @@ class BotEngine:
         self._last_watchlist_scan = 0.0
         self._last_monitor = 0.0
         self._last_peak_pullback = 0.0
+        self._last_gain_refresh = 0.0
         self._last_live_report = 0.0
         self._last_summary_day = ""
 
@@ -512,6 +513,28 @@ class BotEngine:
     # ------------------------------------------------------------------
     #  مانیتور و ورود
     # ------------------------------------------------------------------
+    def _refresh_watchlist_gains(self, watch: list[dict[str, Any]]) -> None:
+        """تازه‌سازی سریع last_gain_pct/peak برای نمادهای فعلاً در واچ‌لیست --
+        بدون اسکن کل بازار، فقط همون نمادهایی که از قبل زیر نظرن."""
+        try:
+            tickers = self.toobit.get_24h_tickers()
+        except Exception as exc:
+            logger.debug("GAIN_REFRESH_FAIL | %s", exc)
+            return
+
+        by_symbol = {str(row.get("s") or row.get("symbol") or ""): row for row in tickers}
+        now = now_ms()
+        for row in watch:
+            symbol = str(row.get("symbol"))
+            ticker = by_symbol.get(symbol)
+            if not ticker:
+                continue
+            change = self._ticker_change_pct(ticker)
+            price = safe_float(ticker.get("c") or ticker.get("lastPrice") or ticker.get("close"))
+            if price <= 0:
+                continue
+            self.storage.watchlist_upsert(symbol=symbol, gain_pct=change, price=price, now_ts=now)
+
     def monitor_peak_pullback(self) -> None:
         """ورود لحظه‌ای Peak-Pullback -- جایگزین کامل منطق قبلی.
 
@@ -522,6 +545,12 @@ class BotEngine:
         برای ارزان ماندن، هر چرخه فقط یک فراخوانی get_all_prices (وزن ۱)
         برای همهٔ نمادها می‌زند؛ کندل (get_klines) فقط دقیقاً همون لحظه‌ای
         گرفته می‌شود که یک نماد واقعاً تریگر بزنه (برای محاسبهٔ ATR/استاپ).
+
+        درصد پامپ (last_gain_pct) -- که رتبه‌بندی «تاپ» رویش انجام می‌شه --
+        جدا و هر GAIN_REFRESH_SECONDS (نه هر ۵ ثانیه، چون گرفتن تیکر کل بازار
+        سنگین‌تره) با یه فراخوانی get_24h_tickers تازه می‌شه؛ وگرنه رتبه‌بندی
+        می‌تونه تا ۱۵ دقیقه (فاصله‌ی اسکن قدیمی) عقب بیفته و نمادی که دیگه
+        تو صدر نیست هنوز رتبه‌ی بالا نشون بده.
         """
         mode = self.mode()
         if mode is None:
@@ -530,6 +559,11 @@ class BotEngine:
         watch = self.storage.watchlist_active()
         if not watch:
             return
+
+        if (time.monotonic() - self._last_gain_refresh) >= config.GAIN_REFRESH_SECONDS:
+            self._last_gain_refresh = time.monotonic()
+            self._refresh_watchlist_gains(watch)
+            watch = self.storage.watchlist_active()
 
         watch = sorted(watch, key=lambda r: safe_float(r.get("last_gain_pct")), reverse=True)
         focus_n = self.top_n_count()
