@@ -473,6 +473,61 @@ def compute_hard_stop(
 #  ۶) ارزیابی ورود
 # ======================================================================
 
+def evaluate_peak_pullback_entry(
+    *,
+    symbol: str,
+    candles: list[dict[str, Any]],
+    current_price: float,
+    peak_price: float,
+    pullback_pct: float,
+    change_24h: float,
+    trigger_time_ms: int,
+) -> EntrySignal:
+    """ورود بر پایهٔ برگشت از سقف -- جایگزین کامل منطق قبلی (Wick+Deceleration
+    +Structure Break و Cascade).
+
+    هیچ تأیید چندکندلی، هیچ نیاز به بسته‌شدن کندل: به محض این‌که قیمت
+    لحظه‌ای از ``peak_price`` (بالاترین قیمتی که از لحظهٔ ورود به واچ‌لیست
+    دیده شده، لحظه‌به‌لحظه آپدیت می‌شود) به‌اندازهٔ ``pullback_pct`` برگردد،
+    سیگنال صادر می‌شود.
+
+    حد ضرر همچنان از ATR کندل‌های بسته‌شده محاسبه می‌شود (تنها جایی که به
+    کندل نیاز داریم، و فقط برای تعیین فاصلهٔ ریسک، نه برای خودِ تریگر).
+    """
+    snapshot = SignalSnapshot(
+        symbol=symbol, trigger_time_ms=trigger_time_ms,
+        entry_price=current_price, entry_type="PEAK_PULLBACK",
+        change_24h=change_24h, swing_high=peak_price,
+    )
+
+    if peak_price <= 0 or current_price <= 0:
+        return EntrySignal(symbol=symbol, ok=False, reject_code="no_peak_data", snapshot=snapshot)
+
+    trigger_price = peak_price * (1 - pullback_pct / 100.0)
+    if current_price > trigger_price:
+        return EntrySignal(symbol=symbol, ok=False, reject_code="pullback_not_reached", snapshot=snapshot)
+
+    atr_value = atr(candles)
+    if atr_value <= 0:
+        return EntrySignal(symbol=symbol, ok=False, reject_code="stop_unavailable", snapshot=snapshot)
+
+    reference = max(peak_price, current_price)
+    stop_price = reference + config.STOP_ATR_MULT * atr_value
+    stop_distance_pct = (stop_price - current_price) / current_price * 100.0
+
+    snapshot.atr14 = atr_value
+    snapshot.initial_stop = stop_price
+    snapshot.stop_distance_pct = stop_distance_pct
+
+    return EntrySignal(
+        symbol=symbol, ok=True, entry_type="PEAK_PULLBACK",
+        price=current_price, stop_price=stop_price,
+        stop_distance_pct=stop_distance_pct, atr_at_entry=atr_value,
+        reason=f"برگشت {pullback_pct:.1f}٪ از سقف {peak_price:.8g}",
+        snapshot=snapshot,
+    )
+
+
 def evaluate_entry(
     *,
     symbol: str,
