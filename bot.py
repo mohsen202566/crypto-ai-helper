@@ -592,6 +592,7 @@ class BotEngine:
 
         busy = self.storage.open_symbols()
         pullback_pct = self.pullback_entry_pct()
+        watch_th = self.watchlist_threshold()
         now = now_ms()
         opened = 0
         checked = 0
@@ -605,6 +606,14 @@ class BotEngine:
 
             if free_slots <= 0 and not is_reserved_tier:
                 break
+
+            # نماد ممکنه از وقتی وارد واچ‌لیست شده (وقتی بالای آستانه بوده)
+            # تا الان افت کرده باشه و زیر آستانه رفته باشه؛ RETENTION هنوز
+            # نگهش داشته برای دید، ولی نباید معامله بشه مگه الان هم واقعاً
+            # بالای آستانه‌ی واچ باشه.
+            if gain_pct < watch_th:
+                rejects["below_watch_threshold_now"] = rejects.get("below_watch_threshold_now", 0) + 1
+                continue
 
             if config.ONE_POSITION_PER_SYMBOL and symbol in busy:
                 continue
