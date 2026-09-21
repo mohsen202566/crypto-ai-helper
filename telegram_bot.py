@@ -505,6 +505,7 @@ def why_panel(storage: Storage) -> str:
 
 _REJECT_LABELS = {
     "cooldown": "در استراحت بعد از معاملهٔ قبلی",
+    "below_watch_threshold_now": "پامپ فعلی زیر آستانهٔ واچ‌لیسته (هرچند قبلاً بالاتر بوده)",
     "pullback_not_reached": "هنوز به آستانهٔ برگشت از سقف نرسیده",
     "no_peak_data": "هنوز سقفی ثبت نشده",
     "no_exhaustion": "نشانهٔ خستگی نیامده (سایهٔ بالا کافی نیست)",
