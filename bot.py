@@ -177,17 +177,6 @@ class BotEngine:
         )
         return max(config.WATCHLIST_THRESHOLD_MIN, min(value, config.WATCHLIST_THRESHOLD_MAX))
 
-    def trail_profit_pct(self) -> float:
-        """درصد تریلینگ سود. از پنل: «تریل ۳» یا «تریل خاموش» (= ۰).
-
-        ۰ یعنی این لایه‌ی خروج کاملاً خاموشه -- فقط Hard Stop و برگشت
-        ساختاری فعال می‌مونن (تا بشه تیپی/استاپ دلاری رو بدون مزاحمت تست کرد).
-        """
-        value = safe_float(
-            self.storage.get_setting("trail_profit_pct", config.TRAIL_PROFIT_PCT)
-        )
-        return max(config.TRAIL_PROFIT_PCT_MIN, min(value, config.TRAIL_PROFIT_PCT_MAX))
-
     def reserve_threshold(self) -> float:
         """آستانهٔ رزرو اسلات برای شکار پامپ‌های قوی. از پنل: «رزرو ۵۰»."""
         value = safe_float(
@@ -207,6 +196,22 @@ class BotEngine:
             self.storage.get_setting("pullback_entry_pct", config.PULLBACK_ENTRY_PCT)
         )
         return max(config.PULLBACK_ENTRY_MIN, min(value, config.PULLBACK_ENTRY_MAX))
+
+    def staleness_minutes(self) -> float:
+        """حداقل زمان (دقیقه) از آخرین رکورد قیمتی سقف تا مجاز شدن ورود.
+        از پنل: «کهنگی N» (۱ تا ۵۰۰ دقیقه، پیش‌فرض ۳۰)."""
+        value = safe_float(
+            self.storage.get_setting("staleness_minutes", config.STALENESS_MINUTES_DEFAULT)
+        )
+        return max(config.STALENESS_MINUTES_MIN, min(value, config.STALENESS_MINUTES_MAX))
+
+    def trail_usd(self) -> float:
+        """بعد از لمس کف «تیپی»، اگه سود از بالاترین نقطه‌ی لمس‌شده به این
+        مقدار (دلار) برگرده، می‌بندیم. از پنل: «تریل N» (۱ تا ۱۰۰، پیش‌فرض ۱)."""
+        value = safe_float(
+            self.storage.get_setting("trail_usd", config.TRAIL_USD_DEFAULT)
+        )
+        return max(config.TRAIL_USD_MIN, min(value, config.TRAIL_USD_MAX))
 
     def mode(self) -> str | None:
         """حالت فعلی؛ None یعنی هر دو خاموش‌اند و فقط اسکن انجام می‌شود."""
@@ -297,17 +302,19 @@ class BotEngine:
 
     # --- مدیریت پوزیشن‌های باز -------------------------------------------
     def manage_open_positions(self) -> None:
-        """پایش پوزیشن‌های باز -- دو راه خروج مستقل، هرکدام زودتر برسه اعمال میشه:
+        """پایش پوزیشن‌های باز -- فقط دو راه خروج، هیچ‌کدام دیگر به کندل یا
+        زمان نیاز ندارد؛ پوزیشن تا برخورد به یکی از این دو باز می‌ماند،
+        حتی اگر چند روز طول بکشد:
 
-        ۱. برگشت ساختاری تأییدشده (۲ Swing High + ۲ Swing Low صعودی از لحظهٔ
-           ورود) -- بدون نیاز به رسیدن به سود مشخص.
-        ۲. تریلینگ سود (پیش‌فرض ۳٪، با «تریل N»/«تریل خاموش» قابل‌تنظیم): اگر
-           قیمت از بهترین نقطهٔ رسیده‌شده به همین اندازه برگرده بالا -- فقط
-           وقتی واقعاً در سودیم، نه ضرر. با «تریل خاموش» این لایه کلاً غیرفعال
-           میشه (مثلاً برای تست تمیز تیپی/استاپ دلاری بدون مزاحمت).
+        ۱. حد ضرر (سخت یا دلاری دستی) -- محافظت مطلق حساب، بدون تأیید.
+        ۲. تیپی+تریل شناور: به محض رسیدن سود به آستانه‌ی «تیپی N» (دلار)،
+           همون سطح قفل و محافظت می‌شه (هیچ‌وقت پایین‌تر از اون نمی‌بندیم)؛
+           بعدش سود می‌تونه هرجا بره، فقط وقتی از بالاترین سودِ لمس‌شده به
+           اندازه‌ی «تریل N» (دلار) برگرده، می‌بندیم. قبل از لمس تیپی، این
+           لایه اصلاً کاری نمی‌کنه -- فقط حد ضرر فعاله.
 
-        حد ضرر سخت هم مطلق و مستقل از این دو تاست -- به محض فعال شدن، فوراً
-        بسته می‌شود، منتظر هیچ تأییدی نمی‌ماند؛ این محافظت از حساب است.
+        برگشت ساختاری و مهلت ایمنی زمانی (MAX_HOLD) دیگر بخشی از خروج
+        نیستند -- طبق تصمیم صریح: پوزیشن تا استاپ یا تیپی نخورده باز می‌ماند.
         """
         if bool(self.storage.get_setting("close_all_execute", False)):
             self.storage.set_setting("close_all_execute", False)
@@ -323,6 +330,8 @@ class BotEngine:
             logger.warning("PRICE_FETCH_FAIL | %s", exc)
             return
 
+        trail_usd = self.trail_usd()
+
         for cycle in cycles:
             symbol = str(cycle.get("symbol"))
             price = safe_float(prices.get(symbol))
@@ -336,15 +345,16 @@ class BotEngine:
 
             entry_price = safe_float(cycle.get("avg_entry_price"))
             quantity = safe_float(cycle.get("total_quantity"))
+            notional = safe_float(cycle.get("total_notional"))
             hard_stop = safe_float(cycle.get("hard_stop_price"))
-            opened_at = safe_int(cycle.get("opened_at"))
 
-            # بهترین قیمت (کمترین برای شورت) -- هم برای گزارش MFE و هم برای
-            # تریلینگ سود (پایین‌تر) استفاده می‌شود.
+            # بهترین قیمت (کمترین برای شورت) -- هم برای گزارش MFE، هم برای
+            # تعیین اینکه کف «تیپی» لمس شده یا نه و تریل چقدر تنگ شده.
             best_price = safe_float(cycle.get("best_price"))
             new_best = min(best_price, price) if best_price > 0 else price
 
-            # حد ضرر سخت را بدون نیاز به کندل می‌سنجیم (سریع‌ترین مسیر).
+            # حد ضرر سخت (یا دلاری دستی -- هر دو تو hard_stop_price ذخیره
+            # می‌شن) را بدون نیاز به کندل می‌سنجیم (سریع‌ترین و مطمئن‌ترین مسیر).
             if hard_stop > 0 and price >= hard_stop:
                 gross = risk_engine.unrealized_pnl(
                     side="SHORT", avg_entry=entry_price,
@@ -355,73 +365,45 @@ class BotEngine:
                 )
                 continue
 
-            # تی‌پی دلاری دستی (دستور «تیپی») -- فقط وقتی روشن باشه؛ عادی V3
-            # هیچ TP ثابتی نداره، پس این ستون معمولاً ۰ و بی‌اثره.
-            take_profit = safe_float(cycle.get("take_profit_price"))
-            if take_profit > 0 and price <= take_profit:
-                gross = risk_engine.unrealized_pnl(
+            # تیپی+تریل شناور -- فقط وقتی «تیپی» روشن باشه (take_profit_price>0).
+            floor_price = safe_float(cycle.get("take_profit_price"))
+            dynamic_stop = 0.0
+            if floor_price > 0 and notional > 0 and new_best <= floor_price:
+                gross_best = risk_engine.unrealized_pnl(
                     side="SHORT", avg_entry=entry_price,
-                    quantity=quantity, current_price=price,
+                    quantity=quantity, current_price=new_best,
                 )
-                self.close_position(
-                    cycle, exit_price=price, exit_reason="TAKE_PROFIT", gross_pnl=gross,
+                net_best_usd = risk_engine.net_pnl_after_costs(gross_best, notional)
+                gross_floor = risk_engine.unrealized_pnl(
+                    side="SHORT", avg_entry=entry_price,
+                    quantity=quantity, current_price=floor_price,
                 )
-                continue
+                floor_usd = risk_engine.net_pnl_after_costs(gross_floor, notional)
+                trail_target_usd = net_best_usd - trail_usd
+                dynamic_stop = floor_price
+                if trail_target_usd > floor_usd:
+                    trail_price = risk_engine.dollar_target_price(
+                        entry_price=entry_price, notional_usdt=notional,
+                        target_usd=trail_target_usd, favorable=True,
+                    )
+                    if trail_price > 0:
+                        dynamic_stop = trail_price
 
-            # تریلینگ سود -- لایهٔ دوم خروج، مستقل از برگشت ساختاری. فقط وقتی
-            # واقعاً در سودیم: اگر قیمت از بهترین نقطهٔ رسیده‌شده (new_best)
-            # به‌اندازهٔ trail_profit_pct() برگردد بالا، می‌بندیم. فقط قیمت
-            # لازم داره (نه کندل) -- بعد از Hard Stop سریع‌ترین مسیره.
-            # اگر با «تریل خاموش» صفر شده باشه، کاملاً رد میشه.
-            trail_pct = self.trail_profit_pct()
-            if trail_pct > 0:
-                trail_stop = new_best * (1 + trail_pct / 100.0)
-                if trail_stop < entry_price and price >= trail_stop:
+                if price >= dynamic_stop:
+                    reason = "TRAIL_FLOAT" if dynamic_stop < floor_price else "TAKE_PROFIT"
                     gross = risk_engine.unrealized_pnl(
                         side="SHORT", avg_entry=entry_price,
                         quantity=quantity, current_price=price,
                     )
                     self.close_position(
-                        cycle, exit_price=price, exit_reason="TRAIL_PROFIT", gross_pnl=gross,
+                        cycle, exit_price=price, exit_reason=reason, gross_pnl=gross,
                     )
                     continue
 
-            # برای برگشت ساختاری به کندل نیاز داریم.
-            candles: list[dict[str, Any]] = []
-            try:
-                candles = self.toobit.get_klines(
-                    symbol, config.ENTRY_TIMEFRAME, config.ENTRY_CANDLE_LIMIT
-                )
-            except Exception as exc:
-                logger.warning("EXIT_KLINE_FAIL | %s | %s", symbol, exc)
-
-            decision = strategy.exit_decision(
-                entry_price=entry_price,
-                quantity=quantity,
-                current_price=price,
-                hard_stop=hard_stop,
-                candles=candles,
-                entry_time_ms=opened_at,
+            self.storage.update_trailing(
+                safe_int(cycle.get("id")),
+                best_price=new_best, active_stop=hard_stop,
             )
-
-            # شبکهٔ ایمنی اختیاری برای پوزیشن فراموش‌شده (پیش‌فرض: خاموش).
-            max_hold = self.max_hold_seconds()
-            if decision.reason is None and max_hold > 0 and opened_at > 0:
-                if (now_ms() - opened_at) / 1000.0 >= max_hold:
-                    decision = strategy.ExitDecision(
-                        "MAX_HOLD", decision.gross_pnl, price, "پایان مهلت ایمنی"
-                    )
-
-            if decision.reason:
-                self.close_position(
-                    cycle, exit_price=price, exit_reason=decision.reason,
-                    gross_pnl=decision.gross_pnl, detail=decision.detail,
-                )
-            else:
-                self.storage.update_trailing(
-                    safe_int(cycle.get("id")),
-                    best_price=new_best, active_stop=hard_stop,
-                )
 
     # --- اسکن و ورود ------------------------------------------------------
     def scan_watchlist(self) -> None:
@@ -592,6 +574,7 @@ class BotEngine:
 
         busy = self.storage.open_symbols()
         pullback_pct = self.pullback_entry_pct()
+        staleness_req_min = self.staleness_minutes()
         watch_th = self.watchlist_threshold()
         now = now_ms()
         opened = 0
@@ -634,15 +617,25 @@ class BotEngine:
 
             checked += 1
 
-            # سقف رو با قیمت لحظه‌ای آپدیت کن -- بدون کندل، بدون تأخیر
+            # سقف رو با قیمت لحظه‌ای آپدیت کن -- بدون کندل، بدون تأخیر.
+            # peak_price_time فقط وقتی جلو می‌ره که رکورد واقعاً جدید باشه.
             peak_price = safe_float(row.get("peak_price"))
+            peak_price_time = safe_int(row.get("peak_price_time")) or now
             if price > peak_price:
                 peak_price = price
-                self.storage.watchlist_bump_peak(symbol, price)
+                peak_price_time = now
+                self.storage.watchlist_bump_peak(symbol, price, now)
 
             trigger_price = peak_price * (1 - pullback_pct / 100.0)
             if price > trigger_price:
                 rejects["pullback_not_reached"] = rejects.get("pullback_not_reached", 0) + 1
+                continue
+
+            # کهنگی سقف: از آخرین رکورد جدید این نماد، حداقل این‌قدر (دقیقه)
+            # باید گذشته باشه -- یعنی پامپ واقعاً نفس بریده، نه یه مکث موقت.
+            staleness_min = (now - peak_price_time) / 60000.0
+            if staleness_min < staleness_req_min:
+                rejects["peak_too_fresh"] = rejects.get("peak_too_fresh", 0) + 1
                 continue
 
             try:

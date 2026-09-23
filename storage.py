@@ -185,6 +185,9 @@ class Storage:
         ("cycles", "entry_reason", "TEXT"),
         # بهترین قیمت طی عمر پوزیشن — مبنای محاسبهٔ استاپ دنبال‌کننده.
         ("cycles", "best_price", "REAL NOT NULL DEFAULT 0"),
+        # لحظه‌ای که peak_price آخرین‌بار واقعاً رکورد جدید زد -- مبنای
+        # محاسبه‌ی «کهنگی سقف» (چقدر از آخرین رکورد گذشته، به میلی‌ثانیه).
+        ("watchlist", "peak_price_time", "INTEGER DEFAULT 0"),
     )
 
     def _migrate(self) -> None:
@@ -584,7 +587,9 @@ class Storage:
 
         ``peak_gain_pct`` و ``peak_price`` بالاترین مقدار مشاهده‌شده از زمان
         ورود به Watchlist هستند و هرگز عقب نمی‌روند — برای محاسبهٔ «چقدر از
-        سقف ریخته» در تحلیل بعدی لازم‌اند.
+        سقف ریخته» در تحلیل بعدی لازم‌اند. ``peak_price_time`` فقط زمانی
+        جلو می‌رود که ``price`` واقعاً از ``peak_price`` قبلی بیشتر باشد --
+        یعنی لحظهٔ دقیق آخرین رکورد جدید، مبنای محاسبهٔ «کهنگی سقف».
         """
         with self._lock:
             row = self._conn.execute(
@@ -593,16 +598,18 @@ class Storage:
             if row is None:
                 self._conn.execute(
                     "INSERT INTO watchlist (symbol, added_ts, last_seen_ts, entry_gain_pct,"
-                    " peak_gain_pct, peak_price, last_gain_pct, last_price, active)"
-                    " VALUES (?,?,?,?,?,?,?,?,1)",
-                    (symbol, now_ts, now_ts, gain_pct, gain_pct, price, gain_pct, price),
+                    " peak_gain_pct, peak_price, peak_price_time, last_gain_pct, last_price, active)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,1)",
+                    (symbol, now_ts, now_ts, gain_pct, gain_pct, price, now_ts, gain_pct, price),
                 )
             else:
                 self._conn.execute(
                     "UPDATE watchlist SET last_seen_ts=?, last_gain_pct=?, last_price=?,"
-                    " peak_gain_pct=MAX(peak_gain_pct, ?), peak_price=MAX(peak_price, ?),"
+                    " peak_gain_pct=MAX(peak_gain_pct, ?),"
+                    " peak_price_time=CASE WHEN ? > peak_price THEN ? ELSE peak_price_time END,"
+                    " peak_price=MAX(peak_price, ?),"
                     " active=1 WHERE symbol=?",
-                    (now_ts, gain_pct, price, gain_pct, price, symbol),
+                    (now_ts, gain_pct, price, gain_pct, price, now_ts, price, symbol),
                 )
             self._conn.commit()
             out = self._conn.execute(
@@ -617,13 +624,17 @@ class Storage:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def watchlist_bump_peak(self, symbol: str, price: float) -> None:
-        """آپدیت سریع سقف قیمت، بدون نیاز به gain% -- برای چرخهٔ سریع
-        Peak-Pullback که هر چند ثانیه اجرا می‌شود و کندل/درصد نمی‌خواهد."""
+    def watchlist_bump_peak(self, symbol: str, price: float, now_ts: int) -> None:
+        """آپدیت سریع سقف قیمت (و لحظه‌ی رکورد، اگه واقعاً جدید بود)، بدون
+        نیاز به gain% -- برای چرخهٔ سریع Peak-Pullback که هر چند ثانیه اجرا
+        می‌شود و کندل/درصد نمی‌خواهد."""
         with self._lock:
             self._conn.execute(
-                "UPDATE watchlist SET peak_price=MAX(peak_price, ?) WHERE symbol=?",
-                (price, symbol),
+                "UPDATE watchlist SET"
+                " peak_price_time=CASE WHEN ? > peak_price THEN ? ELSE peak_price_time END,"
+                " peak_price=MAX(peak_price, ?)"
+                " WHERE symbol=?",
+                (price, now_ts, price, symbol),
             )
             self._conn.commit()
 

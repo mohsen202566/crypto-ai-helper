@@ -284,6 +284,23 @@ PULLBACK_ENTRY_MAX = 30.0
 # واچ‌لیست، چون کل هدف همینه که منتظر چیزی نمونیم.
 PEAK_PULLBACK_CHECK_SECONDS = float(os.getenv("PEAK_PULLBACK_CHECK_SECONDS", "5.0"))
 
+# --- کهنگی سقف (Peak Staleness) -- زمان واقعی به دقیقه، نه کندل ---
+# ورود Peak-Pullback فقط وقتی مجازه که سقفِ ردیابی‌شده حداقل این‌قدر «کهنه»
+# باشه -- یعنی از آخرین باری که این نماد رکورد قیمتی جدید زده، این‌همه دقیقه
+# گذشته باشه (بدون رکورد جدید). هدف: صبر برای اینکه پامپ واقعاً نفس بریده
+# باشه، نه یه مکث موقت. از پنل: «کهنگی N» (۱ تا ۵۰۰ دقیقه).
+STALENESS_MINUTES_DEFAULT = float(os.getenv("STALENESS_MINUTES_DEFAULT", "30.0"))
+STALENESS_MINUTES_MIN = 1.0
+STALENESS_MINUTES_MAX = 500.0
+
+# --- تریل دلاری بعد از تیپی (جایگزین کامل تریل درصدی قدیمی) ---
+# وقتی سود به آستانه‌ی «تیپی N» برسه، اون سطح قفل و محافظت می‌شه (هیچ‌وقت
+# کمتر از اون نمی‌بندیم)؛ بعدش سود می‌تونه هرجا بره، فقط وقتی از بالاترین
+# سودِ لمس‌شده دقیقاً به این‌اندازه (دلار) برگرده، می‌بندیم. از پنل: «تریل N».
+TRAIL_USD_DEFAULT = float(os.getenv("TRAIL_USD_DEFAULT", "1.0"))
+TRAIL_USD_MIN = 1.0
+TRAIL_USD_MAX = 100.0
+
 # --- تایم‌فریم‌ها ---
 # 15m = کشف کاندید / زمینه | 5m = مانیتور و اجرا
 CONTEXT_TIMEFRAME = os.getenv("CONTEXT_TIMEFRAME", "15m").strip()
