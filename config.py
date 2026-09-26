@@ -196,7 +196,7 @@ POSITION_SIZE_MAX = 1_000.0
 
 # --- تعداد پوزیشن هم‌زمان ---
 # از تلگرام با «پوزیشن ۵» تغییر می‌کند. سرمایه بین این تعداد اسلات پخش می‌شود.
-MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "3"))
+MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "4"))
 MAX_CONCURRENT_LIMIT = 30
 # هر ارز حداکثر یک پوزیشن باز دارد (نه چند پوزیشن روی یک نماد).
 ONE_POSITION_PER_SYMBOL = True
@@ -264,7 +264,7 @@ DEFAULT_FIXED_TP_USD = float(os.getenv("DEFAULT_FIXED_TP_USD", "5.0"))
 
 # --- تاپ N: فقط N تای برتر واچ‌لیست معامله بشن ---
 # ۰ = خاموش (هیچ محدودیتی، هر نماد واجد شرایط واچ‌لیست قابل معامله‌ست).
-TOP_N_COUNT = int(os.getenv("TOP_N_COUNT", "3"))
+TOP_N_COUNT = int(os.getenv("TOP_N_COUNT", "4"))
 TOP_N_MIN = 0
 TOP_N_MAX = 18
 # چرخه‌ی تازه‌سازی درصد پامپ (برای رتبه‌بندی «تاپ») -- جدا از چک قیمت هر
@@ -300,6 +300,15 @@ STALENESS_MINUTES_MAX = 500.0
 TRAIL_USD_DEFAULT = float(os.getenv("TRAIL_USD_DEFAULT", "1.0"))
 TRAIL_USD_MIN = 1.0
 TRAIL_USD_MAX = 100.0
+
+
+# --- FAST1 locked live-test parameters (validated backtest configuration) ---
+# Peak -> 3% pullback -> additional 1% drop -> SHORT. No time breathing / staleness gate.
+FAST_CONFIRM_PCT = float(os.getenv("FAST_CONFIRM_PCT", "1.0"))
+FAST_CANCEL_REBOUND_PCT = float(os.getenv("FAST_CANCEL_REBOUND_PCT", "1.0"))
+STOP_MARGIN_PCT = float(os.getenv("STOP_MARGIN_PCT", "38.0"))
+TRAIL_START_MARGIN_PCT = float(os.getenv("TRAIL_START_MARGIN_PCT", "30.0"))
+TRAIL_RETRACE_MARGIN_PCT = float(os.getenv("TRAIL_RETRACE_MARGIN_PCT", "10.0"))
 
 # --- تایم‌فریم‌ها ---
 # 15m = کشف کاندید / زمینه | 5m = مانیتور و اجرا
@@ -367,8 +376,8 @@ DEFAULT_VIRTUAL_TRADING_ENABLED = True
 
 # --- اقتصاد معامله ---
 TAKER_FEE_RATE = float(os.getenv("TOOBIT_TAKER_FEE_RATE", "0.0005"))
-ROUND_TRIP_SLIPPAGE_RATE = float(os.getenv("ROUND_TRIP_SLIPPAGE_RATE", "0.0006"))
-FUNDING_RESERVE_RATE = float(os.getenv("FUNDING_RESERVE_RATE", "0.0002"))
+ROUND_TRIP_SLIPPAGE_RATE = float(os.getenv("ROUND_TRIP_SLIPPAGE_RATE", "0.0010"))
+FUNDING_RESERVE_RATE = float(os.getenv("FUNDING_RESERVE_RATE", "0.0"))
 
 # --- گزارش‌دهی تلگرام ---
 # گزارش لحظه‌ای پوزیشن‌های باز؛ صفر = خاموش. از تلگرام: «گزارش ۱۰»
