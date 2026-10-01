@@ -60,11 +60,11 @@ class Application:
                 self.engine.startup()
                 tradable = self.storage.get_setting("tradable_count", 0)
                 self.storage.queue_message(
-                    "✅ ربات آماده شد — استراتژی V3 (شورت بعد از پامپ افراطی)\n"
+                    "✅ ربات آماده شد — استراتژی V4 DumpState (Paper)\n"
                     f"کل بازار اسکن می‌شود: {tradable} قرارداد\n"
                     f"کاندید: پامپ ۲۴ ساعته ≥ {config.WATCHLIST_MIN_GAIN_PCT:.0f}%\n"
                     f"اسکن هر {config.WATCHLIST_SCAN_SECONDS / 60:.0f} دقیقه | "
-                    f"مانیتور هر {config.MONITOR_INTERVAL_SECONDS / 60:.0f} دقیقه\n"
+                    f"تریگر روی کندل بسته 5m\n"
                     "ترید واقعی خاموش است؛ با «ترید مجازی فعال» تست شروع می‌شود.\n"
                     "دستورها: «پنل» | «واچ» | «قیف»"
                 )

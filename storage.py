@@ -188,9 +188,6 @@ class Storage:
         # لحظه‌ای که peak_price آخرین‌بار واقعاً رکورد جدید زد -- مبنای
         # محاسبه‌ی «کهنگی سقف» (چقدر از آخرین رکورد گذشته، به میلی‌ثانیه).
         ("watchlist", "peak_price_time", "INTEGER DEFAULT 0"),
-        ("watchlist", "fast_armed", "INTEGER NOT NULL DEFAULT 0"),
-        ("watchlist", "fast_trigger_price", "REAL NOT NULL DEFAULT 0"),
-        ("watchlist", "fast_resolved_peak", "REAL NOT NULL DEFAULT 0"),
     )
 
     def _migrate(self) -> None:
@@ -638,15 +635,6 @@ class Storage:
                 " peak_price=MAX(peak_price, ?)"
                 " WHERE symbol=?",
                 (price, now_ts, price, symbol),
-            )
-            self._conn.commit()
-
-    def watchlist_set_fast_state(self, symbol: str, *, armed: bool, trigger_price: float = 0.0, resolved_peak: float = 0.0) -> None:
-        """Persist FAST1 setup state so restarts cannot re-arm an already-resolved peak."""
-        with self._lock:
-            self._conn.execute(
-                "UPDATE watchlist SET fast_armed=?, fast_trigger_price=?, fast_resolved_peak=? WHERE symbol=?",
-                (1 if armed else 0, float(trigger_price), float(resolved_peak), symbol),
             )
             self._conn.commit()
 

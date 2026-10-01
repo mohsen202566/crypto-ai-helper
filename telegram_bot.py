@@ -102,12 +102,12 @@ def position_panel(cycle: dict[str, Any], plan: dict[str, Any] | None = None) ->
         f"  |  ارزش پوزیشن: {_n(plan.get('notional_usdt') or cycle.get('total_notional'))}$",
         f"نوع: {_mode_label(cycle.get('mode'))}",
         "",
-        f"🛑 استاپ FAST1 ({config.STOP_MARGIN_PCT:.0f}٪ مارجین): {_price(cycle.get('hard_stop_price'))}",
+        f"🛑 حد ضرر ساختاری: {_price(cycle.get('hard_stop_price'))}",
     ]
     tp_price = safe_float(cycle.get("take_profit_price"))
     if tp_price > 0:
-        lines.append(f"🎯 فعال‌سازی تریل (+{config.TRAIL_START_MARGIN_PCT:.0f}٪ مارجین): {_price(tp_price)}")
-        lines.append(f"📉 تریل: برگشت {config.TRAIL_RETRACE_MARGIN_PCT:.0f}٪ مارجین از اوج سود")
+        lines.append(f"🎯 کف تیپی: {_price(tp_price)}")
+        lines.append("📉 خروج: حد ضرر، یا تیپی+تریل شناور (بعد از لمس کف، هر برگشتی از اوج سود -- هرکدوم زودتر)")
     else:
         lines.append("📉 خروج: فقط حد ضرر -- سود سقف ندارد، تا برخورد به حد ضرر باز می‌ماند")
     if plan.get("liquidation_price"):
@@ -209,18 +209,21 @@ def _common_lines(storage: Storage, balance: float = 0.0) -> list[str]:
     tp_usd = safe_float(storage.get_setting("fixed_tp_usd", config.DEFAULT_FIXED_TP_USD))
     trail_usd = safe_float(storage.get_setting("trail_usd", config.TRAIL_USD_DEFAULT))
     return [
-        "استراتژی: FAST1 — Peak → Pullback → افت اضافه → SHORT",
+        "استراتژی: Peak-Pullback — شورت لحظه‌ای بعد از پامپ (بدون کندل/تأیید)",
         f"اسکن: کل بازار ({safe_int(storage.get_setting('tradable_count', 0))} قرارداد)"
         f"  |  ورود: لحظه‌ای (هر {config.PEAK_PULLBACK_CHECK_SECONDS:.0f} ثانیه)",
         f"حداکثر پوزیشن هم‌زمان: {safe_int(storage.get_setting('max_positions', config.MAX_CONCURRENT_POSITIONS))}"
         f"  |  تاپ: {'خاموش' if focus_n == 0 else f'{focus_n} تای برتر'}",
         *_size_label(storage, balance),
-        f"آستانهٔ کاندید: 24h ≥ {watch_th:.0f}%  |  Pullback: {pullback_pct:.1f}٪ | FAST: {config.FAST_CONFIRM_PCT:.1f}٪ اضافه"
+        f"آستانهٔ کاندید: 24h ≥ {watch_th:.0f}%  |  برگشت ورود: {pullback_pct:.1f}٪ از سقف"
+        f"  |  کهنگی سقف: ≥{staleness_min:.0f} دقیقه"
         f"  |  زیر نظر: {safe_int(storage.get_setting('watchlist_size', 0))} نماد",
         f"لوریج: {safe_int(storage.get_setting('leverage', config.DEFAULT_LEVERAGE))}x  |  {config.MARGIN_MODE}",
-        "Cooldown: خاموش",
-        f"حد ضرر: {config.STOP_MARGIN_PCT:.0f}٪ مارجین | فعال‌سازی تریل: {config.TRAIL_START_MARGIN_PCT:.0f}٪ مارجین"
-        f" | برگشت تریل: {config.TRAIL_RETRACE_MARGIN_PCT:.0f}٪ مارجین",
+        f"استراحت بعد از خروج: "
+        f"{safe_float(storage.get_setting('cooldown_hours', config.COOLDOWN_HOURS)):.0f} ساعت",
+        f"حد ضرر: سقف تأییدشده + {config.STOP_ATR_MULT:.1f}×ATR({config.ATR_PERIOD})"
+        f"  |  تیپی: {'خاموش' if tp_usd <= 0 else f'{tp_usd:,.2f}$'}"
+        f"  |  تریل: ${trail_usd:.0f}",
     ]
 
 
@@ -797,28 +800,30 @@ def commands_status_panel(storage: Storage) -> str:
         f"  دلار N  (۰ تا ۱۰۰۰، ۰=خودکار) — مارجین هر پوزیشن — الان: "
         f"{'خودکار' if pos_size <= 0 else f'{pos_size:,.2f}$'}",
         f"  اهرم N  (۱ تا ۱۰۰) — لوریج — الان: {lev}x",
-        "  استراحت — در FAST1 حذف شده (Cooldown=OFF)",
+        f"  استراحت N  (۱ تا ۱۲) — کول‌داون هر نماد بعد از خروج — الان: {cooldown:.0f} ساعت",
         f"  سقف N  (۰=کل موجودی) — سقف سرمایهٔ درگیر — الان: "
         f"{'کل موجودی' if cap <= 0 else f'{cap:,.2f}$'}",
         f"  گزارش N  (۰ تا ۲۴۰، ۰=خاموش) — فاصلهٔ گزارش خودکار (دقیقه) — الان: {live_report}",
         f"  واچ N  (۱ تا ۱۰۰۰) — آستانهٔ رشد ۲۴ساعته برای واچ‌لیست — الان: {watch_th:.0f}٪",
-        "  کهنگی — در FAST1 حذف شده (تنفس زمانی نداریم)",
+        f"  کهنگی N  (۱ تا ۵۰۰ دقیقه) — حداقل زمان بدون رکورد جدید قبل از ورود — الان: {staleness_min:.0f} دقیقه",
         f"  رزرو N  (۱ تا ۱۰۰۰) — آستانهٔ رزرو اسلات برای شکار پامپ قوی — الان: {reserve_th:.0f}٪",
         f"  تاپ N  (۰ تا ۱۸، ۰=خاموش) — فقط N تای برتر لیست معامله بشن — الان: "
         f"{'خاموش (بدون محدودیت)' if focus_n == 0 else focus_n}",
         f"  برگشت N  (۰.۵ تا ۳۰) — درصد برگشت از سقف برای ورود Peak-Pullback — الان: {pullback_pct:.1f}٪",
         "",
-        "🔸 خروج FAST1 (فریز شده برای تست لایو)",
-        f"  استاپ: {config.STOP_MARGIN_PCT:.0f}٪ مارجین",
-        f"  شروع تریل: +{config.TRAIL_START_MARGIN_PCT:.0f}٪ مارجین خالص",
-        f"  برگشت تریل: {config.TRAIL_RETRACE_MARGIN_PCT:.0f}٪ مارجین",
+        "🔸 تیپی+تریل شناور (خروج پیش‌فرض؛ حد ضرر همیشه زیرشه)",
+        f"  تیپی N / تیپی خاموش  (۱ تا ۱۰۰۰$) — آستانهٔ فعال‌سازی کف — الان: "
+        f"{'خاموش' if tp_usd <= 0 else f'{tp_usd:,.2f}$'}",
+        f"  تریل N  (۱ تا ۱۰۰$) — بعد از لمس کف، برگشت از اوج سود که می‌بنده — الان: ${trail_usd:.0f}",
+        f"  استاپ N / استاپ خاموش  (۱ تا ۱۰۰$) — الان: "
+        f"{'خاموش (حد ضرر ساختاری عادی)' if sl_usd <= 0 else f'{sl_usd:,.2f}$'}",
         "",
         "🔸 گزارش‌ها (بدون عدد، فقط اسمشون رو بفرست)",
         "  پنل | ترید مجازی | پوزیشن | واچ | قیف | زنده | امروز | گزارش کامل | "
         "خروجی | آمار | ریست آمار | وضعیت | وضعیت دلاری | چرا",
         "",
-        f"⚠️ ورود = Pullback {pullback_pct:.1f}٪ + FAST {config.FAST_CONFIRM_PCT:.1f}٪ اضافه؛ بدون تنفس زمانی. "
-        f"خروج = استاپ {config.STOP_MARGIN_PCT:.0f}٪ مارجین یا تریل {config.TRAIL_START_MARGIN_PCT:.0f}/{config.TRAIL_RETRACE_MARGIN_PCT:.0f}٪.",
+        "⚠️ ورود = Peak-Pullback لحظه‌ای (با گیت کهنگی) -- بدون کندل، بدون تأیید. "
+        "خروج = فقط حد ضرر یا تیپی+تریل شناور؛ پوزیشن تا برخورد به یکی از این دو باز می‌ماند.",
     ])
 
 
@@ -954,25 +959,81 @@ class CommandRouter:
             return virtual_trade_panel(self.storage)
 
         if cmd.startswith("استراحت "):
-            return "ℹ️ در FAST1 کول‌داون کاملاً حذف شده و دستور «استراحت» غیرفعال است."
+            try:
+                value = float(parse_number(cmd.split(" ", 1)[1]))
+            except (ValueError, IndexError):
+                return "عدد نامعتبر. مثال: استراحت ۲"
+            if not config.COOLDOWN_HOURS_MIN <= value <= config.COOLDOWN_HOURS_MAX:
+                return (
+                    f"عدد باید بین {config.COOLDOWN_HOURS_MIN} تا "
+                    f"{config.COOLDOWN_HOURS_MAX} ساعت باشد."
+                )
+            self.storage.set_setting("cooldown_hours", value)
+            return (
+                f"✅ استراحت روی {value:.0f} ساعت تنظیم شد — بعد از هر خروج، "
+                "همان نماد تا این مدت معامله نمی‌شود، حتی اگر دوباره پامپ کند."
+            )
 
         if cmd.startswith("تیپی ") or cmd.startswith("/tp "):
-            return (f"ℹ️ FAST1 فریز است: شروع تریل = {config.TRAIL_START_MARGIN_PCT:.0f}٪ مارجین؛ "
-                    "تیپی دلاری در این تست غیرفعال است.")
+            arg = cmd.split(" ", 1)[1].strip()
+            if arg in {"خاموش", "غیرفعال", "off"}:
+                self.storage.set_setting("fixed_tp_usd", 0.0)
+                return (
+                    "✅ تیپی خاموش شد.\n"
+                    "پوزیشن‌های جدید دیگر کف/تریل نمی‌گیرند -- فقط حد ضرر. پوزیشن‌های باز فعلی "
+                    "همان مقدار قبلی را حفظ می‌کنند (برای پاک کردنشان هم یکی‌یکی «پوزیشن N» را ببندید)."
+                )
+            try:
+                value = float(parse_number(arg))
+            except (ValueError, IndexError):
+                return "عدد نامعتبر. مثال: «تیپی ۵» یعنی وقتی سود به ۵ دلار رسید، کف قفل و تریل فعال بشه."
+            if not 1 <= value <= 1000:
+                return "عدد باید بین ۱ تا ۱۰۰۰ دلار باشد."
+            self.storage.set_setting("fixed_tp_usd", value)
+            n = self._apply_fixed_targets_to_open_cycles()
+            return (
+                f"✅ تیپی روی ${value:,.2f} (خالص، بعد از کارمزد) تنظیم شد.\n"
+                f"یعنی وقتی سود به این عدد برسه، همون سطح قفل می‌شه (هیچ‌وقت کمتر از اون نمی‌بنده)؛ "
+                f"بعدش سود هرجا بره، فقط با «تریل N» دلار برگشت از اوج می‌بنده.\n"
+                f"روی {n} پوزیشن باز فعلی همین الان اعمال شد؛ پوزیشن‌های بعدی هم "
+                "با همین هدف باز می‌شوند تا وقتی «تیپی خاموش» بفرستی."
+            )
 
         _stop_prefixes = ["استاپ دلاری ", "استاپ ", "/sl "]
         _stop_prefix = next((p for p in _stop_prefixes if cmd.startswith(p)), None)
         if _stop_prefix:
-            return (f"ℹ️ FAST1 فریز است: استاپ = {config.STOP_MARGIN_PCT:.0f}٪ مارجین؛ "
-                    "استاپ دلاری دستی در این تست غیرفعال است.")
+            arg = cmd[len(_stop_prefix):].strip()
+            if arg in {"خاموش", "غیرفعال", "off"}:
+                self.storage.set_setting("fixed_sl_usd", 0.0)
+                return (
+                    "✅ استاپ دلاری خاموش شد.\n"
+                    "پوزیشن‌های جدید دوباره از حد ضرر ساختاری (ATR) استفاده می‌کنند. "
+                    "پوزیشن‌های باز فعلی همان مقدار قبلی را حفظ می‌کنند."
+                )
+            try:
+                value = float(parse_number(arg))
+            except (ValueError, IndexError):
+                return "عدد نامعتبر. مثال: «استاپ دلاری ۱» یعنی هر پوزیشن دقیقاً با ۱ دلار ضرر خالص بسته شود."
+            if not 1 <= value <= 100:
+                return "عدد باید بین ۱ تا ۱۰۰ دلار باشد."
+            self.storage.set_setting("fixed_sl_usd", value)
+            n = self._apply_fixed_targets_to_open_cycles()
+            return (
+                f"✅ استاپ دلاری روی ${value:,.2f} (خالص، بعد از کارمزد) تنظیم شد -- "
+                "جایگزین حد ضرر ساختاری میشه.\n"
+                f"روی {n} پوزیشن باز فعلی همین الان اعمال شد؛ پوزیشن‌های بعدی هم "
+                "با همین هدف باز می‌شوند تا وقتی «استاپ دلاری خاموش» بفرستی."
+            )
 
         if cmd in {"وضعیت دلاری", "وضعیت تیپی استاپ", "/tpsl_status"}:
+            tp_usd = safe_float(self.storage.get_setting("fixed_tp_usd", config.DEFAULT_FIXED_TP_USD))
+            trail_usd = safe_float(self.storage.get_setting("trail_usd", config.TRAIL_USD_DEFAULT))
+            sl_usd = safe_float(self.storage.get_setting("fixed_sl_usd", 0.0))
             return (
-                "📌 FAST1 درصدی (فریز برای تست لایو):\n"
-                f"استاپ: {config.STOP_MARGIN_PCT:.0f}٪ مارجین\n"
-                f"شروع تریل: +{config.TRAIL_START_MARGIN_PCT:.0f}٪ مارجین خالص\n"
-                f"برگشت تریل: {config.TRAIL_RETRACE_MARGIN_PCT:.0f}٪ مارجین\n"
-                "Cooldown: OFF | تنفس/کهنگی: OFF"
+                "📌 وضعیت تیپی/تریل/استاپ دلاری:\n"
+                f"تیپی (کف): {'$' + f'{tp_usd:,.2f}' if tp_usd > 0 else 'خاموش (فقط حد ضرر)'}\n"
+                f"تریل (بعد از کف): ${trail_usd:,.2f}\n"
+                f"استاپ دلاری: {'$' + f'{sl_usd:,.2f}' if sl_usd > 0 else 'خاموش (حد ضرر ساختاری عادی)'}"
             )
 
         if cmd.startswith("واچ ") and not cmd.startswith("واچ لیست"):
@@ -995,11 +1056,46 @@ class CommandRouter:
             )
 
         if cmd.startswith("تریل "):
-            return (f"ℹ️ FAST1 فریز است: برگشت تریل = {config.TRAIL_RETRACE_MARGIN_PCT:.0f}٪ مارجین؛ "
-                    "تریل دلاری دستی در این تست غیرفعال است.")
+            arg = cmd.split(" ", 1)[1].strip()
+            try:
+                value = float(parse_number(arg))
+            except (ValueError, IndexError):
+                return (
+                    "عدد نامعتبر. مثال: «تریل ۱» یعنی بعد از لمس کف «تیپی»، اگه سود از "
+                    "بالاترین نقطه‌ی لمس‌شده ۱ دلار برگرده، ببنده."
+                )
+            if not config.TRAIL_USD_MIN <= value <= config.TRAIL_USD_MAX:
+                return f"عدد باید بین {config.TRAIL_USD_MIN:.0f} تا {config.TRAIL_USD_MAX:.0f} دلار باشد."
+            self.storage.set_setting("trail_usd", value)
+            return (
+                f"✅ تریل روی ${value:.0f} تنظیم شد.\n"
+                "بعد از این‌که سود پوزیشن به آستانه‌ی «تیپی» برسه، همون سطح قفل و محافظت "
+                f"می‌شه (هیچ‌وقت پایین‌تر از اون نمی‌بنده)؛ بعدش سود هرجا بره، وقتی از "
+                f"بالاترین سودِ لمس‌شده دقیقاً ${value:.0f} برگرده، می‌بنده. روی پوزیشن‌های "
+                "باز فعلی هم از همین چک بعدی اعمال میشه."
+            )
 
         if cmd.startswith("کهنگی "):
-            return "ℹ️ در FAST1 تنفس/کهنگی زمانی حذف شده؛ ورود فقط با Pullback + FAST انجام می‌شود."
+            arg = cmd.split(" ", 1)[1].strip()
+            try:
+                value = float(parse_number(arg))
+            except (ValueError, IndexError):
+                return (
+                    "عدد نامعتبر. مثال: «کهنگی ۳۰» یعنی سقف باید حداقل ۳۰ دقیقه بدون "
+                    "رکورد جدید مونده باشه تا ورود مجاز بشه."
+                )
+            if not config.STALENESS_MINUTES_MIN <= value <= config.STALENESS_MINUTES_MAX:
+                return (
+                    f"عدد باید بین {config.STALENESS_MINUTES_MIN:.0f} تا "
+                    f"{config.STALENESS_MINUTES_MAX:.0f} دقیقه باشد."
+                )
+            self.storage.set_setting("staleness_minutes", value)
+            return (
+                f"✅ کهنگی روی {value:.0f} دقیقه تنظیم شد.\n"
+                "یعنی از این پس فقط وقتی وارد می‌شیم که از آخرین رکورد قیمتی این نماد "
+                f"حداقل {value:.0f} دقیقه گذشته باشه (بدون رکورد جدید) -- صبر برای اینکه "
+                "پامپ واقعاً نفس بریده باشه، نه یه مکث موقت."
+            )
 
         if cmd.startswith("رزرو "):
             arg = cmd.split(" ", 1)[1].strip()

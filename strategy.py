@@ -54,7 +54,7 @@ import config
 from utils import median, safe_float
 
 Side = Literal["SHORT"]
-EntryType = Literal["NORMAL_REVERSAL", "FAST_CASCADE"]
+EntryType = Literal["DUMPSTATE_V4"]
 
 
 # ======================================================================
@@ -483,29 +483,60 @@ def evaluate_peak_pullback_entry(
     change_24h: float,
     trigger_time_ms: int,
 ) -> EntrySignal:
-    """Validate the price-side Peak/Pullback condition for FAST1.
+    """V4 — ورود فقط بعد از بسته‌شدن کندل 5m.
 
-    FAST confirmation/state is handled by BotEngine.  No ATR, candle close,
-    staleness or structural-stop dependency remains in the entry decision.
-    The final 38%-of-margin stop is calculated after position margin is known.
+    شروط دقیق بک‌تست:
+      1) 24h gain >= 50% (در Bot/Watchlist)
+      2) close کندل بسته‌شده >= 7% زیر running peak
+      3) lower wick همان کندل <= 1.82% از open
+      4) mean(volume last 6) / mean(volume previous 24) >= 1.10
+    ورود با قیمت لحظه‌ای بلافاصله بعد از مشاهدهٔ کندل بسته‌شده انجام می‌شود؛
+    معادل اجرایی open کندل بعدی در بک‌تست.
     """
     snapshot = SignalSnapshot(
         symbol=symbol, trigger_time_ms=trigger_time_ms,
-        entry_price=current_price, entry_type="FAST1",
+        entry_price=current_price, entry_type="DUMPSTATE_V4",
         change_24h=change_24h, swing_high=peak_price,
     )
-    if peak_price <= 0 or current_price <= 0:
-        return EntrySignal(symbol=symbol, ok=False, reject_code="no_peak_data", snapshot=snapshot)
-    trigger_price = peak_price * (1 - pullback_pct / 100.0)
-    if current_price > trigger_price:
-        return EntrySignal(symbol=symbol, ok=False, reject_code="pullback_not_reached", snapshot=snapshot)
-    # Placeholder only; open_position replaces this with the exact net-loss stop
-    # after margin/notional are known.
-    placeholder_stop = current_price * 1.000001
+    closed = _closed_candles(candles)
+    if len(closed) < 30 or peak_price <= 0 or current_price <= 0:
+        return EntrySignal(symbol=symbol, ok=False, reject_code="not_enough_closed_bars", snapshot=snapshot)
+
+    c = closed[-1]
+    o, h, l, close = (_f(c, k) for k in ("open", "high", "low", "close"))
+    if min(o, h, l, close) <= 0:
+        return EntrySignal(symbol=symbol, ok=False, reject_code="bad_trigger_candle", snapshot=snapshot)
+
+    dd_pct = (peak_price - close) / peak_price * 100.0
+    if dd_pct < pullback_pct:
+        return EntrySignal(symbol=symbol, ok=False, reject_code="pullback_not_reached_closed", snapshot=snapshot)
+
+    lower_wick_pct = max(0.0, min(o, close) - l) / o * 100.0
+    if lower_wick_pct > config.ENTRY_LOWER_WICK_MAX_PCT:
+        return EntrySignal(symbol=symbol, ok=False, reject_code="lower_wick_too_large", snapshot=snapshot)
+
+    vols = [_f(x, "volume") for x in closed]
+    last6 = vols[-6:]
+    prev24 = vols[-30:-6]
+    if len(last6) != 6 or len(prev24) != 24 or min(last6 + prev24) < 0:
+        return EntrySignal(symbol=symbol, ok=False, reject_code="volume_unavailable", snapshot=snapshot)
+    base = sum(prev24) / 24.0
+    vol6_ratio = (sum(last6) / 6.0) / base if base > 0 else 0.0
+    if vol6_ratio < config.ENTRY_VOL6_RATIO_MIN:
+        return EntrySignal(symbol=symbol, ok=False, reject_code="vol6_too_low", snapshot=snapshot)
+
+    stop_price = current_price * (1.0 + config.STOP_LOSS_PRICE_PCT / 100.0)
+    stop_distance = config.STOP_LOSS_PRICE_PCT
+    snapshot.ret_recent = lower_wick_pct       # audit: lower wick %
+    snapshot.volume_partial = vol6_ratio       # audit: vol6 ratio
+    snapshot.initial_stop = stop_price
+    snapshot.stop_distance_pct = stop_distance
+
     return EntrySignal(
-        symbol=symbol, ok=True, entry_type="FAST1", price=current_price,
-        stop_price=placeholder_stop, stop_distance_pct=0.0, atr_at_entry=0.0,
-        reason=f"FAST1 after {pullback_pct:.1f}% pullback from peak {peak_price:.8g}",
+        symbol=symbol, ok=True, entry_type="DUMPSTATE_V4", price=current_price,
+        stop_price=stop_price, stop_distance_pct=stop_distance, atr_at_entry=0.0,
+        reason=(f"V4 dd={dd_pct:.2f}% lower={lower_wick_pct:.2f}% "
+                f"vol6={vol6_ratio:.2f} gain24={change_24h:.1f}%"),
         snapshot=snapshot,
     )
 

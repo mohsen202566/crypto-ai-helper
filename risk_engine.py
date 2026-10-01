@@ -255,33 +255,32 @@ def slot_margin(
     open_margin_usdt: float = 0.0,
     fixed_size_usdt: float = 0.0,
 ) -> float:
-    """مارجین هر پوزیشن.
+    """مارجین V4: پویا بر اساس Equity، با سقف 100 دلار.
 
-    دو حالت کاملاً متفاوت:
-
-    • **اندازهٔ ثابت** (``fixed_size_usdt`` > 0): کاربر گفته هر پوزیشن دقیقاً
-      چند دلار باشد. این عدد هرگز کوچک نمی‌شود — یا دقیقاً همان مقدار باز
-      می‌شود، یا اگر موجودی آزاد کافی نباشد صفر برمی‌گردد و ورود انجام
-      نمی‌شود. مبنای موجودی آزاد در این حالت کل سرمایه است، نه درصد آن،
-      چون خودِ کاربر با تعیین عدد، ریسکش را انتخاب کرده.
-
-    • **خودکار** (صفر): سرمایهٔ مجاز (``MAX_CAPITAL_ENGAGED_RATE`` × سرمایه)
-      بین اسلات‌ها پخش می‌شود و با پر شدن اسلات‌ها کوچک‌تر می‌شود.
+    از 40$ با 10$ شروع می‌شود و به ازای هر 20$ رشد Equity، 5$ به
+    مارجین ورودی‌های جدید اضافه می‌شود. 10$ رزرو ترجیحاً دست‌نخورده می‌ماند،
+    ولی اگر برای کامل شدن یک پوزیشن لازم باشد قابل استفاده است. دستور قدیمی
+    «دلار N» همچنان override دستی و ثابت است.
     """
     capital = max(0.0, safe_float(capital_usdt))
-    slots = max(1, int(max_positions))
     used = max(0.0, safe_float(open_margin_usdt))
     fixed = max(0.0, safe_float(fixed_size_usdt))
 
     if fixed > 0:
-        free = capital - used
-        # یا دقیقاً همان عدد، یا هیچ. هرگز نصفه‌نیمه.
-        return fixed if free >= fixed else 0.0
+        wanted = fixed
+    else:
+        growth = max(0.0, capital - config.DYNAMIC_MARGIN_START_EQUITY_USDT)
+        steps = int(growth // max(0.01, config.DYNAMIC_MARGIN_STEP_EQUITY_USDT))
+        wanted = config.DYNAMIC_MARGIN_BASE_USDT + steps * config.DYNAMIC_MARGIN_STEP_USDT
+        wanted = min(config.DYNAMIC_MARGIN_MAX_USDT, max(config.DYNAMIC_MARGIN_BASE_USDT, wanted))
 
-    budget = capital * config.MAX_CAPITAL_ENGAGED_RATE
-    remaining = max(0.0, budget - used)
-    return min(budget / slots, remaining)
-
+    free = max(0.0, capital - used)
+    # رزرو 10$ اول کنار گذاشته می‌شود؛ اگر بدون آن پوزیشن کامل نشود،
+    # فقط به اندازهٔ لازم از رزرو استفاده می‌شود. هیچ پوزیشن نصفه باز نمی‌شود.
+    normal_free = max(0.0, free - config.CASH_RESERVE_USDT)
+    if normal_free >= wanted:
+        return wanted
+    return wanted if free >= wanted else 0.0
 
 def position_snapshot(
     *,

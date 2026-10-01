@@ -48,6 +48,25 @@ class BotEngine:
     #  راه‌اندازی
     # ------------------------------------------------------------------
     def startup(self) -> None:
+        # مهاجرت یک‌باره به تنظیمات فریز V4. موجودی/تاریخچه عمداً پاک نمی‌شود؛
+        # برای Paper Test تازه، دستور قدیمی «ریست آمار» همچنان همان کار را می‌کند.
+        if self.storage.get_setting("strategy_build", "") != config.BUILD_VERSION:
+            frozen = {
+                "max_positions": 4,
+                "position_size": 0.0,          # dynamic margin
+                "leverage": 3,
+                "watchlist_threshold": 50.0,
+                "top_n_count": 0,
+                "pullback_entry_pct": 7.0,
+                "staleness_minutes": 1.0,     # legacy command kept; V4 ignores it
+                "cooldown_hours": 0.0,
+                "fixed_tp_usd": 0.0,          # V4 default is 20% raw price
+                "fixed_sl_usd": 0.0,          # V4 default is 20% raw price
+                "capital_cap": 0.0,
+            }
+            for key, value in frozen.items():
+                self.storage.set_setting(key, value)
+            self.storage.set_setting("strategy_build", config.BUILD_VERSION)
         self.storage.set_setting("startup_phase", "اتصال به صرافی")
         contracts = self._refresh_contracts(force=True)
         if not contracts:
@@ -302,25 +321,11 @@ class BotEngine:
 
     # --- مدیریت پوزیشن‌های باز -------------------------------------------
     def manage_open_positions(self) -> None:
-        """پایش پوزیشن‌های باز -- فقط دو راه خروج، هیچ‌کدام دیگر به کندل یا
-        زمان نیاز ندارد؛ پوزیشن تا برخورد به یکی از این دو باز می‌ماند،
-        حتی اگر چند روز طول بکشد:
-
-        ۱. حد ضرر (سخت یا دلاری دستی) -- محافظت مطلق حساب، بدون تأیید.
-        ۲. تیپی+تریل شناور: به محض رسیدن سود به آستانه‌ی «تیپی N» (دلار)،
-           همون سطح قفل و محافظت می‌شه (هیچ‌وقت پایین‌تر از اون نمی‌بندیم)؛
-           بعدش سود می‌تونه هرجا بره، فقط وقتی از بالاترین سودِ لمس‌شده به
-           اندازه‌ی «تریل N» (دلار) برگرده، می‌بندیم. قبل از لمس تیپی، این
-           لایه اصلاً کاری نمی‌کنه -- فقط حد ضرر فعاله.
-
-        برگشت ساختاری و مهلت ایمنی زمانی (MAX_HOLD) دیگر بخشی از خروج
-        نیستند -- طبق تصمیم صریح: پوزیشن تا استاپ یا تیپی نخورده باز می‌ماند.
-        """
+        """V4 exits: SL 20%، TP 20%، یا TIME پس از 48h؛ هرکدام زودتر."""
         if bool(self.storage.get_setting("close_all_execute", False)):
             self.storage.set_setting("close_all_execute", False)
             self._close_all_open_positions()
             return
-
         cycles = self.storage.open_cycles()
         if not cycles:
             return
@@ -329,7 +334,8 @@ class BotEngine:
         except Exception as exc:
             logger.warning("PRICE_FETCH_FAIL | %s", exc)
             return
-
+        now = now_ms()
+        max_hold_ms = int(self.max_hold_seconds() * 1000)
         for cycle in cycles:
             symbol = str(cycle.get("symbol"))
             price = safe_float(prices.get(symbol))
@@ -340,72 +346,32 @@ class BotEngine:
                     continue
             if price <= 0:
                 continue
+            entry = safe_float(cycle.get("avg_entry_price"))
+            qty = safe_float(cycle.get("total_quantity"))
+            stop = safe_float(cycle.get("hard_stop_price"))
+            tp = safe_float(cycle.get("take_profit_price"))
+            opened_at = safe_int(cycle.get("opened_at") or cycle.get("created_at"))
 
-            entry_price = safe_float(cycle.get("avg_entry_price"))
-            quantity = safe_float(cycle.get("total_quantity"))
-            notional = safe_float(cycle.get("total_notional"))
-            position_margin = safe_float(cycle.get("total_margin"))
-            trail_usd = position_margin * config.TRAIL_RETRACE_MARGIN_PCT / 100.0
-            hard_stop = safe_float(cycle.get("hard_stop_price"))
+            # محافظه‌کارانه: Stop قبل از TP بررسی می‌شود.
+            reason = None
+            if stop > 0 and price >= stop:
+                reason = "HARD_STOP"
+            elif tp > 0 and price <= tp:
+                reason = "TAKE_PROFIT"
+            elif max_hold_ms > 0 and opened_at > 0 and now - opened_at >= max_hold_ms:
+                reason = "MAX_HOLD"
 
-            # بهترین قیمت (کمترین برای شورت) -- هم برای گزارش MFE، هم برای
-            # تعیین اینکه کف «تیپی» لمس شده یا نه و تریل چقدر تنگ شده.
-            best_price = safe_float(cycle.get("best_price"))
-            new_best = min(best_price, price) if best_price > 0 else price
-
-            # حد ضرر سخت (یا دلاری دستی -- هر دو تو hard_stop_price ذخیره
-            # می‌شن) را بدون نیاز به کندل می‌سنجیم (سریع‌ترین و مطمئن‌ترین مسیر).
-            if hard_stop > 0 and price >= hard_stop:
-                gross = risk_engine.unrealized_pnl(
-                    side="SHORT", avg_entry=entry_price,
-                    quantity=quantity, current_price=price,
-                )
-                self.close_position(
-                    cycle, exit_price=price, exit_reason="HARD_STOP", gross_pnl=gross,
-                )
-                continue
-
-            # تیپی+تریل شناور -- فقط وقتی «تیپی» روشن باشه (take_profit_price>0).
-            floor_price = safe_float(cycle.get("take_profit_price"))
-            dynamic_stop = 0.0
-            if floor_price > 0 and notional > 0 and new_best <= floor_price:
-                gross_best = risk_engine.unrealized_pnl(
-                    side="SHORT", avg_entry=entry_price,
-                    quantity=quantity, current_price=new_best,
-                )
-                net_best_usd = risk_engine.net_pnl_after_costs(gross_best, notional)
-                gross_floor = risk_engine.unrealized_pnl(
-                    side="SHORT", avg_entry=entry_price,
-                    quantity=quantity, current_price=floor_price,
-                )
-                floor_usd = risk_engine.net_pnl_after_costs(gross_floor, notional)
-                trail_target_usd = net_best_usd - trail_usd
-                dynamic_stop = floor_price
-                if trail_target_usd > floor_usd:
-                    trail_price = risk_engine.dollar_target_price(
-                        entry_price=entry_price, notional_usdt=notional,
-                        target_usd=trail_target_usd, favorable=True,
-                    )
-                    if trail_price > 0:
-                        dynamic_stop = trail_price
-
-                if price >= dynamic_stop:
-                    reason = "TRAIL_FLOAT" if dynamic_stop < floor_price else "TAKE_PROFIT"
-                    gross = risk_engine.unrealized_pnl(
-                        side="SHORT", avg_entry=entry_price,
-                        quantity=quantity, current_price=price,
-                    )
-                    self.close_position(
-                        cycle, exit_price=price, exit_reason=reason, gross_pnl=gross,
-                    )
-                    continue
-
+            best = safe_float(cycle.get("best_price"))
             self.storage.update_trailing(
-                safe_int(cycle.get("id")),
-                best_price=new_best, active_stop=hard_stop,
+                safe_int(cycle.get("id")), best_price=min(best, price) if best > 0 else price,
+                active_stop=stop,
             )
+            if reason:
+                gross = risk_engine.unrealized_pnl(
+                    side="SHORT", avg_entry=entry, quantity=qty, current_price=price,
+                )
+                self.close_position(cycle, exit_price=price, exit_reason=reason, gross_pnl=gross)
 
-    # --- اسکن و ورود ------------------------------------------------------
     def scan_watchlist(self) -> None:
         """اسکن هر ۱۵ دقیقه: چه نمادهایی شرط کاندید را دارند؟
 
@@ -518,144 +484,84 @@ class BotEngine:
             self.storage.watchlist_upsert(symbol=symbol, gain_pct=change, price=price, now_ts=now)
 
     def monitor_peak_pullback(self) -> None:
-        """FAST1 live entry: Peak -> pullback -> additional drop -> SHORT.
-
-        No breathing timer and no peak-staleness gate.  A setup arms when price
-        reaches the configured pullback from the current peak.  Entry happens
-        only after a further FAST_CONFIRM_PCT drop from that pullback trigger.
-        A rebound FAST_CANCEL_REBOUND_PCT above the trigger resolves the setup;
-        after entry/cancel, a genuinely new peak is required before re-arming.
-        State is persisted in SQLite so a restart cannot duplicate a setup.
-        """
+        """V4: بررسی Watchlist با کندل بسته‌شدهٔ 5m و ورود causal."""
         mode = self.mode()
         if mode is None:
             return
         watch = self.storage.watchlist_active()
         if not watch:
             return
-        if (time.monotonic() - self._last_gain_refresh) >= config.GAIN_REFRESH_SECONDS:
-            self._last_gain_refresh = time.monotonic()
-            self._refresh_watchlist_gains(watch)
-            watch = self.storage.watchlist_active()
         watch = sorted(watch, key=lambda r: safe_float(r.get("last_gain_pct")), reverse=True)
-        focus_n = self.top_n_count()
-        if focus_n > 0:
-            watch = watch[:focus_n]
         capital = self.effective_capital(real_mode=(mode == "real"))
-        if capital < config.MIN_CAPITAL_TO_TRADE_USDT:
-            return
         max_positions = self.max_positions(capital=capital)
-        open_count = self.storage.open_position_count()
-        free_slots = max_positions - open_count
-        reserve_th = self.reserve_threshold()
-        has_reserved_candidate = any(safe_float(r.get("last_gain_pct")) >= reserve_th for r in watch)
-        if free_slots <= 0 and not has_reserved_candidate:
+        free_slots = max_positions - self.storage.open_position_count()
+        if free_slots <= 0:
             return
-        try:
-            prices = self.toobit.get_all_prices()
-        except Exception as exc:
-            logger.debug("FAST1_PRICE_FAIL | %s", exc)
-            return
-
         busy = self.storage.open_symbols()
         pullback_pct = self.pullback_entry_pct()
-        fast_pct = config.FAST_CONFIRM_PCT
-        cancel_pct = config.FAST_CANCEL_REBOUND_PCT
         watch_th = self.watchlist_threshold()
         now = now_ms()
         opened = checked = setups = 0
         rejects: dict[str, int] = {}
 
         for row in watch:
+            if free_slots <= 0:
+                break
             symbol = str(row.get("symbol"))
             gain_pct = safe_float(row.get("last_gain_pct"))
-            is_reserved_tier = gain_pct >= reserve_th
-            if free_slots <= 0 and not is_reserved_tier:
-                break
             if gain_pct < watch_th:
                 rejects["below_watch_threshold_now"] = rejects.get("below_watch_threshold_now", 0) + 1
                 continue
             if config.ONE_POSITION_PER_SYMBOL and symbol in busy:
                 continue
-
-            price = safe_float(prices.get(canonical_symbol(symbol)))
-            if price <= 0:
-                try:
-                    price = safe_float(self.toobit.get_mark_price(symbol))
-                except Exception:
-                    price = 0.0
-            if price <= 0:
+            cooling, _ = self.storage.in_cooldown(symbol)
+            if cooling:
+                rejects["cooldown"] = rejects.get("cooldown", 0) + 1
+                continue
+            try:
+                candles = self.toobit.get_klines(
+                    symbol, interval=config.ENTRY_TIMEFRAME, limit=config.ENTRY_CANDLE_LIMIT
+                )
+            except Exception as exc:
+                logger.debug("V4_KLINES_FAIL | %s | %s", symbol, exc)
+                continue
+            if len(candles) < 31:
+                continue
+            closed = strategy._closed_candles(candles)
+            if not closed:
                 continue
             checked += 1
 
+            # running peak فقط با اطلاعات کندل بسته‌شده جلو می‌رود.
             peak_price = safe_float(row.get("peak_price"))
-            if price > peak_price:
-                peak_price = price
-                self.storage.watchlist_bump_peak(symbol, price, now)
-                # A real new high creates a fresh episode and clears any resolved/armed setup.
-                self.storage.watchlist_set_fast_state(symbol, armed=False, resolved_peak=0.0)
-                row["fast_armed"] = 0
-                row["fast_trigger_price"] = 0.0
-                row["fast_resolved_peak"] = 0.0
+            closed_high = safe_float(closed[-1].get("high"))
+            if closed_high > peak_price:
+                peak_price = closed_high
+                self.storage.watchlist_bump_peak(symbol, peak_price, now)
 
-            resolved_peak = safe_float(row.get("fast_resolved_peak"))
-            if resolved_peak > 0 and peak_price <= resolved_peak:
-                rejects["fast_wait_new_peak"] = rejects.get("fast_wait_new_peak", 0) + 1
+            # اجرای لایو بلافاصله بعد از close کندل؛ قیمت فعلی تقریب open کندل بعدی است.
+            try:
+                price = safe_float(self.toobit.get_mark_price(symbol))
+            except Exception:
+                price = safe_float(closed[-1].get("close"))
+            if price <= 0:
                 continue
-
-            trigger_price = peak_price * (1.0 - pullback_pct / 100.0)
-            armed = bool(safe_int(row.get("fast_armed")))
-            stored_trigger = safe_float(row.get("fast_trigger_price"))
-
-            if not armed:
-                if price > trigger_price:
-                    rejects["pullback_not_reached"] = rejects.get("pullback_not_reached", 0) + 1
-                    continue
-                armed = True
-                stored_trigger = trigger_price
-                self.storage.watchlist_set_fast_state(symbol, armed=True, trigger_price=stored_trigger)
-
-            # Conservative invalidation: rebound wins if observed before FAST continuation.
-            cancel_price = stored_trigger * (1.0 + cancel_pct / 100.0)
-            if price >= cancel_price:
-                self.storage.watchlist_set_fast_state(symbol, armed=False, resolved_peak=peak_price)
-                rejects["fast_cancel_rebound"] = rejects.get("fast_cancel_rebound", 0) + 1
-                continue
-
-            fast_entry_price = stored_trigger * (1.0 - fast_pct / 100.0)
-            if price > fast_entry_price:
-                rejects["fast_not_reached"] = rejects.get("fast_not_reached", 0) + 1
-                continue
-
-            # FAST1 reached: resolve this peak before attempting entry. A failed slot/risk
-            # attempt is not repeatedly retried on every 5-second tick.
-            self.storage.watchlist_set_fast_state(symbol, armed=False, resolved_peak=peak_price)
-            setups += 1
-            self.storage.watchlist_touch_counter(symbol, "setup_count")
 
             signal = strategy.evaluate_peak_pullback_entry(
-                symbol=symbol, candles=[], current_price=price,
+                symbol=symbol, candles=candles, current_price=price,
                 peak_price=peak_price, pullback_pct=pullback_pct,
                 change_24h=gain_pct, trigger_time_ms=now,
             )
             if not signal.ok:
                 code = signal.reject_code or "unknown"
                 rejects[code] = rejects.get(code, 0) + 1
+                self.storage.watchlist_set_reject(symbol, code)
                 continue
-            signal.entry_type = "FAST1"
-            signal.reason = (
-                f"Peak→{pullback_pct:.1f}% pullback→FAST {fast_pct:.1f}% additional drop "
-                f"(trigger {stored_trigger:.8g})"
-            )
 
-            if free_slots <= 0:
-                freed = self._preempt_for_reserved(symbol=symbol, candidate_gain_pct=gain_pct)
-                if not freed:
-                    rejects["no_slot_reserved"] = rejects.get("no_slot_reserved", 0) + 1
-                    continue
-                free_slots += 1
+            setups += 1
             cycle_id = self.open_position(
-                symbol=symbol, signal=signal, mode=mode, capital=capital, max_positions=max_positions,
+                symbol=symbol, signal=signal, mode=mode, capital=capital,
+                max_positions=max_positions,
             )
             if cycle_id:
                 opened += 1
@@ -664,14 +570,180 @@ class BotEngine:
                 self.storage.watchlist_touch_counter(symbol, "trade_count")
 
         self.storage.set_setting("last_monitor_report", {
-            "ts": now, "watchlist": len(watch), "checked": checked, "setups": setups,
-            "opened": opened, "free_slots": free_slots, "rejects": rejects,
+            "ts": now, "watchlist": len(watch), "checked": checked,
+            "setups": setups, "opened": opened, "free_slots": free_slots,
+            "rejects": rejects,
+        })
+        self.storage.set_health(
+            "monitor", "ok",
+            f"V4 | {checked} بررسی | {setups} ستاپ | {opened} ورود | "
+            f"PB={pullback_pct:.1f}% lower≤{config.ENTRY_LOWER_WICK_MAX_PCT:.2f}% "
+            f"vol6≥{config.ENTRY_VOL6_RATIO_MIN:.2f}",
+        )
+
+    def monitor_watchlist(self) -> None:
+        """بررسی هر ۵ دقیقه: آیا شرایط ورود SHORT برقرار است؟
+
+        فقط اعضای Watchlist بررسی می‌شوند. برای هر نماد، عکس لحظه‌ای کامل
+        شرایط ذخیره می‌شود — چه ورود انجام شود چه نشود — تا بعداً بتوان
+        قیف را تحلیل کرد (از چند کاندید، چند Setup، چند معامله).
+        """
+        mode = self.mode()
+        if mode is None:
+            self.storage.set_health(
+                "monitor", "ok",
+                "ترید واقعی و مجازی هر دو خاموش‌اند — با «ترید مجازی فعال» روشن کنید",
+            )
+            return
+
+        watch = self.storage.watchlist_active()
+        if not watch:
+            self.storage.set_health("monitor", "ok", "Watchlist خالی است")
+            return
+
+        # اولویت با نمادی‌ست که همین الان بیشتر پمپ کرده (صدر لیست ۲۴ساعته) --
+        # وقتی اسلات محدوده، این‌ها زودتر بررسی و در صورت واجد شرایط بودن باز
+        # می‌شوند؛ بقیه فقط برای همین دور رد می‌شوند و دور بعد دوباره دیده می‌شوند.
+        watch = sorted(watch, key=lambda r: safe_float(r.get("last_gain_pct")), reverse=True)
+
+        capital = self.effective_capital(real_mode=(mode == "real"))
+        if capital < config.MIN_CAPITAL_TO_TRADE_USDT:
+            self.storage.set_health(
+                "monitor", "warning",
+                f"سرمایه ({capital:.2f}$) کمتر از حداقل "
+                f"({config.MIN_CAPITAL_TO_TRADE_USDT:.2f}$) است",
+            )
+            return
+
+        max_positions = self.max_positions(capital=capital)
+        open_count = self.storage.open_position_count()
+        free_slots = max_positions - open_count
+        reserve_th = self.reserve_threshold()
+        has_reserved_candidate = any(
+            safe_float(r.get("last_gain_pct")) >= reserve_th for r in watch
+        )
+        if free_slots <= 0 and not has_reserved_candidate:
+            self.storage.set_health(
+                "monitor", "ok",
+                f"همهٔ {max_positions} اسلات پر است — منتظر بسته شدن",
+            )
+            return
+
+        busy = self.storage.open_symbols()
+        bar_seconds = float(timeframe_seconds(config.ENTRY_TIMEFRAME))
+        now = now_ms()
+        checked = 0
+        setups = 0
+        opened = 0
+        rejects: dict[str, int] = {}
+
+        for row in watch:
+            symbol = str(row.get("symbol"))
+            gain_pct = safe_float(row.get("last_gain_pct"))
+            is_reserved_tier = gain_pct >= reserve_th
+
+            if free_slots <= 0 and not is_reserved_tier:
+                # چون watch نزولی مرتبه، از اینجا به بعد هیچ نماد رزرو-سطحی
+                # نمونده -- امن می‌شه کل بقیهٔ حلقه رو رد کرد.
+                break
+
+            if config.ONE_POSITION_PER_SYMBOL and symbol in busy:
+                continue
+
+            # استراحت: مطلق است. حتی سیگنال قوی هم نادیده گرفته می‌شود.
+            cooling, until = self.storage.in_cooldown(symbol)
+            if cooling:
+                rejects["cooldown"] = rejects.get("cooldown", 0) + 1
+                continue
+
+            try:
+                candles = self.toobit.get_klines(
+                    symbol, interval=config.ENTRY_TIMEFRAME, limit=config.ENTRY_CANDLE_LIMIT
+                )
+                price = safe_float(self.toobit.get_mark_price(symbol))
+            except Exception as exc:
+                logger.debug("MONITOR_SKIP | %s | %s", symbol, exc)
+                continue
+            if not candles or price <= 0:
+                continue
+
+            checked += 1
+
+            # کندل جاری (ناقص) — برای ارزیابی intra-candle لازم است.
+            live = candles[-1] if candles else {}
+            live_open_ms = safe_int(live.get("ts"))  # کلید صحیح از get_klines: "ts" نه "time"
+            elapsed = max(0.0, (now - live_open_ms) / 1000.0) if live_open_ms else 0.0
+            live_high = safe_float(live.get("high"))
+            live_low = safe_float(live.get("low"))
+            live_volume = safe_float(live.get("volume"))
+            volume_ok = live_volume > 0
+
+            signal = strategy.evaluate_entry(
+                symbol=symbol,
+                candles=candles,
+                current_price=price,
+                change_24h=safe_float(row.get("last_gain_pct")),
+                current_high=live_high,
+                current_low=live_low,
+                current_volume=live_volume,
+                elapsed_seconds=elapsed,
+                volume_data_available=volume_ok,
+                bar_seconds=bar_seconds,
+                trigger_time_ms=now,
+            )
+
+            if not signal.ok:
+                code = signal.reject_code or "unknown"
+                rejects[code] = rejects.get(code, 0) + 1
+                self.storage.watchlist_set_reject(symbol, code)
+                # فقط ردهای «نزدیک به ورود» ذخیره می‌شوند تا دیتابیس پر
+                # از ردهای بی‌اهمیت (مثل نبود کندل) نشود.
+                if code in {"no_structure_break", "no_deceleration",
+                            "cascade_no_volume_expansion", "cascade_no_range_expansion",
+                            "spread_too_wide", "stop_unavailable"}:
+                    self.storage.save_snapshot(
+                        symbol=symbol, trigger_ts=now, accepted=False,
+                        payload=signal.snapshot.as_dict(), reject_code=code,
+                    )
+                continue
+
+            setups += 1
+            self.storage.watchlist_touch_counter(symbol, "setup_count")
+
+            if free_slots <= 0:
+                # فقط نمادهای رزرو-سطح به اینجا با اسلات خالی صفر می‌رسند.
+                freed = self._preempt_for_reserved(
+                    symbol=symbol, candidate_gain_pct=gain_pct,
+                )
+                if not freed:
+                    rejects["no_slot_reserved"] = rejects.get("no_slot_reserved", 0) + 1
+                    continue
+                free_slots += 1
+
+            cycle_id = self.open_position(
+                symbol=symbol, signal=signal, mode=mode, capital=capital,
+                max_positions=max_positions,
+            )
+            if cycle_id:
+                opened += 1
+                free_slots -= 1
+                busy.add(symbol)
+                self.storage.watchlist_touch_counter(symbol, "trade_count")
+
+        self.storage.set_setting("last_monitor_report", {
+            "ts": now,
+            "watchlist": len(watch),
+            "checked": checked,
+            "setups": setups,
+            "opened": opened,
+            "free_slots": free_slots,
+            "rejects": rejects,
         })
         top_reject = max(rejects.items(), key=lambda kv: kv[1])[0] if rejects else "-"
         self.storage.set_health(
             "monitor", "ok",
-            f"{checked} نماد | {setups} FAST1 | {opened} ورود | "
-            f"PB={pullback_pct:.1f}% + FAST={fast_pct:.1f}% | رد غالب: {top_reject}",
+            f"{checked} نماد بررسی شد | {setups} ستاپ | {opened} ورود | "
+            f"بیشترین دلیل رد: {top_reject}",
         )
 
     def open_position(
@@ -685,8 +757,8 @@ class BotEngine:
     ) -> int | None:
         """پوزیشن SHORT را باز می‌کند. خروجی: شناسهٔ چرخه یا None.
 
-        FAST1 locked risk: stop = 38% of position margin (net of modeled costs),
-        trail activation = 30% of margin, retrace = 10% of margin.
+        حد ضرر از خود سیگنال می‌آید (سقف تأییدشده + بافر ATR) و همان‌جا
+        فریز می‌شود؛ اینجا هیچ استاپی ساخته یا حدس زده نمی‌شود.
         """
         contracts = self._refresh_contracts()
         info = contracts.get(symbol, {})
@@ -724,28 +796,6 @@ class BotEngine:
             self.storage.set_health("risk", "ok", detail)
             return None
 
-        # FAST1 fixed percentage exits, scaled to this position's margin.
-        leverage = self.leverage()
-        planned_notional = margin * leverage
-        stop_usd = margin * config.STOP_MARGIN_PCT / 100.0
-        trail_start_usd = margin * config.TRAIL_START_MARGIN_PCT / 100.0
-        # Exact NET-loss stop: for a SHORT, net = gross_pnl - round-trip costs.
-        # To finish at -stop_usd, adverse gross loss must be (stop_usd - costs),
-        # not (stop_usd + costs).  This matches the validated backtest semantics.
-        modeled_cost = planned_notional * risk_engine.round_trip_cost_rate()
-        adverse_gross_loss = stop_usd - modeled_cost
-        stop_target = (
-            price * (1.0 + adverse_gross_loss / planned_notional)
-            if planned_notional > 0 and adverse_gross_loss > 0 else 0.0
-        )
-        if stop_target <= price:
-            self.storage.set_health("risk", "warning", f"{canonical_base(symbol)}: FAST1 stop unavailable")
-            return None
-        signal.stop_price = stop_target
-        signal.stop_distance_pct = (stop_target - price) / price * 100.0
-        signal.snapshot.initial_stop = stop_target
-        signal.snapshot.stop_distance_pct = signal.stop_distance_pct
-
         # لوریج دقیقاً همانی است که کاربر تعیین کرده — نه بیشتر، نه کمتر.
         plan = risk_engine.plan_entry(
             symbol=symbol,
@@ -753,7 +803,7 @@ class BotEngine:
             entry_price=price,
             stop_price=signal.stop_price,
             slot_margin_usdt=margin,
-            leverage=leverage,
+            leverage=self.leverage(),
             min_qty=min_qty,
             min_notional=min_notional,
         )
@@ -769,13 +819,25 @@ class BotEngine:
             )
             return None
 
-        # FAST1 exits are locked percentages of the entry margin; legacy dollar
-        # TP/SL settings do not override this live-test configuration.
-        stop_price = plan.stop_price
-        take_profit_price = risk_engine.dollar_target_price(
-            entry_price=price, notional_usdt=plan.notional_usdt,
-            target_usd=trail_start_usd, favorable=True,
-        )
+        # اگر تی‌پی/استاپ دلاری دستی (دستورات «تیپی»/«استاپ دلاری» تو تلگرام)
+        # روشن باشه، همینجا جایگزین منطق پیش‌فرض میشه -- فقط برای پوزیشن‌های
+        # جدید؛ پوزیشن‌های باز فعلی با همون دستور به‌صورت جداگانه آپدیت میشن.
+        # V4: TP/SL درصدی خام قیمت، دقیقاً مطابق بک‌تست. دستورات قدیمی
+        # «تیپی N» و «استاپ N» همچنان override دلاری اختیاری هستند.
+        take_profit_price = price * (1.0 - config.TAKE_PROFIT_PRICE_PCT / 100.0)
+        stop_price = price * (1.0 + config.STOP_LOSS_PRICE_PCT / 100.0)
+        fixed_tp_usd = safe_float(self.storage.get_setting("fixed_tp_usd", config.DEFAULT_FIXED_TP_USD))
+        fixed_sl_usd = safe_float(self.storage.get_setting("fixed_sl_usd", 0.0))
+        if fixed_tp_usd > 0:
+            take_profit_price = risk_engine.dollar_target_price(
+                entry_price=price, notional_usdt=plan.notional_usdt,
+                target_usd=fixed_tp_usd, favorable=True,
+            ) or take_profit_price
+        if fixed_sl_usd > 0:
+            stop_price = risk_engine.dollar_target_price(
+                entry_price=price, notional_usdt=plan.notional_usdt,
+                target_usd=fixed_sl_usd, favorable=False,
+            ) or stop_price
 
         cycle_id = self.storage.create_cycle(
             symbol=symbol,
@@ -809,7 +871,7 @@ class BotEngine:
                     entry_price=price,
                     margin_usdt=plan.margin_usdt,
                     leverage=plan.leverage,
-                    tp_price=0.0,  # activation is internal; do NOT close at trail-start level
+                    tp_price=take_profit_price,
                     sl_price=stop_price,
                     client_order_id=f"scan-{cycle_id}-{now_ms()}",
                     symbol_info=info,
@@ -857,7 +919,12 @@ class BotEngine:
     # --- بستن پوزیشن ------------------------------------------------------
     def close_position(self, cycle: dict[str, Any], *, exit_price: float,
                        exit_reason: str, gross_pnl: float, detail: str = "") -> None:
-        """بستن پوزیشن و ثبت کامل نتیجه. FAST1 هیچ cooldown زمانی ندارد."""
+        """بستن پوزیشن، ثبت کامل نتیجه، و شروع استراحت نماد.
+
+        استراحت بدون استثنا اعمال می‌شود: تا پایان آن، هیچ معاملهٔ جدیدی
+        روی این نماد باز نمی‌شود — حتی اگر دوباره پامپ کند یا سیگنال
+        قوی‌تری بدهد. هدف: جلوگیری از چند معامله روی یک Pump Episode.
+        """
         cycle_id = safe_int(cycle.get("id"))
         symbol = str(cycle.get("symbol"))
         notional = safe_float(cycle.get("total_notional"))
@@ -881,6 +948,10 @@ class BotEngine:
         self.storage.queue_message(
             result_panel(closed), reply_to=cycle.get("tg_message_id"), cycle_id=cycle_id
         )
+        # --- استراحت نماد ---
+        hours = self.cooldown_hours()
+        until = self.storage.set_cooldown(symbol, hours=hours, reason=exit_reason)
+
         # --- MFE/MAE فقط برای تحلیل بعد از معامله ---
         # این اعداد هیچ نقشی در تصمیم ورود یا خروج نداشتند و ندارند؛
         # صرفاً برای فهمیدن اینکه بهترین و بدترین لحظهٔ معامله کجا بود.
@@ -902,10 +973,12 @@ class BotEngine:
             "hard_stop": hard_stop,
             "mfe_pct": round(mfe_pct, 4),
             "duration_ms": now_ms() - safe_int(cycle.get("opened_at")),
+            "cooldown_until": until,
+            "cooldown_hours": hours,
         })
         logger.info(
-            "POSITION_CLOSED | %s reason=%s net=%.2f mfe=%.2f%% cooldown=OFF",
-            symbol, exit_reason, net, mfe_pct,
+            "POSITION_CLOSED | %s reason=%s net=%.2f mfe=%.2f%% cooldown=%.0fh",
+            symbol, exit_reason, net, mfe_pct, hours,
         )
 
     def _close_all_open_positions(self) -> None:

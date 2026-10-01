@@ -79,7 +79,7 @@ def _load_project_environment() -> None:
 
 _load_project_environment()
 
-BUILD_VERSION = "2026.09.11-v3-pumpfade-paper"
+BUILD_VERSION = "2026.10.01-v4-dumpstate-paper"
 RUNTIME_DB = Path(os.getenv("RUNTIME_DB", str(ROOT / "runtime.db")))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
@@ -182,10 +182,10 @@ ENTRY_CANDLE_LIMIT = int(os.getenv("ENTRY_CANDLE_LIMIT", "150"))
 # --- سرمایه ---
 FALLBACK_CAPITAL_USDT = float(os.getenv("FALLBACK_CAPITAL_USDT", "0"))
 BALANCE_REFRESH_SECONDS = int(os.getenv("BALANCE_REFRESH_SECONDS", "60"))
-VIRTUAL_START_CAPITAL_USDT = float(os.getenv("VIRTUAL_START_CAPITAL_USDT", "50"))
+VIRTUAL_START_CAPITAL_USDT = float(os.getenv("VIRTUAL_START_CAPITAL_USDT", "40"))
 MIN_CAPITAL_TO_TRADE_USDT = float(os.getenv("MIN_CAPITAL_TO_TRADE_USDT", "10"))
 # سقف درصدی از کل سرمایه که همهٔ پوزیشن‌های باز روی هم مجازند درگیر کنند.
-MAX_CAPITAL_ENGAGED_RATE = float(os.getenv("MAX_CAPITAL_ENGAGED_RATE", "0.6"))
+MAX_CAPITAL_ENGAGED_RATE = float(os.getenv("MAX_CAPITAL_ENGAGED_RATE", "1.0"))
 
 # --- اندازهٔ هر پوزیشن ---
 # دلار مارجین هر پوزیشن. صفر = خودکار (سرمایه بین اسلات‌ها پخش می‌شود).
@@ -202,7 +202,7 @@ MAX_CONCURRENT_LIMIT = 30
 ONE_POSITION_PER_SYMBOL = True
 
 # --- لوریج و مارجین ---
-DEFAULT_LEVERAGE = int(os.getenv("DEFAULT_LEVERAGE", "5"))
+DEFAULT_LEVERAGE = int(os.getenv("DEFAULT_LEVERAGE", "3"))
 LEVERAGE_MIN = 1
 # سقف مجاز تنظیم کاربر. لوریج بالا فاصلهٔ لیکوئید را کوچک می‌کند
 # (فاصله ≈ ۱÷لوریج)، ولی حد ضرر همیشه خیلی زودتر از لیکوئید فعال می‌شود.
@@ -210,7 +210,7 @@ LEVERAGE_MAX = int(os.getenv("LEVERAGE_MAX", "100"))
 MARGIN_MODE = os.getenv("MARGIN_MODE", "ISOLATED").strip().upper()
 MAINTENANCE_MARGIN_RATE = float(os.getenv("MAINTENANCE_MARGIN_RATE", "0.005"))
 # حد ضرر باید همیشه خیلی زودتر از لیکوئید فعال شود.
-LIQUIDATION_TO_STOP_BUFFER = float(os.getenv("LIQUIDATION_TO_STOP_BUFFER", "2.0"))
+LIQUIDATION_TO_STOP_BUFFER = float(os.getenv("LIQUIDATION_TO_STOP_BUFFER", "1.25"))
 
 # ============================================================
 #  استراتژی V3: Extreme Pump Fade  (FROZEN — تغییر ممنوع)
@@ -230,7 +230,7 @@ LIQUIDATION_TO_STOP_BUFFER = float(os.getenv("LIQUIDATION_TO_STOP_BUFFER", "2.0"
 # WATCHLIST_MIN_GAIN_PCT فقط مقدار پیش‌فرض/اولیه است -- با دستور «واچ N»
 # تو تلگرام در زمان اجرا قابل تغییره (۱ تا ۱۰۰۰٪)؛ خود الگوریتم ورود
 # (Wick + Deceleration + Structure Break) هم‌چنان کاملاً فریز و دست‌نخورده است.
-WATCHLIST_MIN_GAIN_PCT = float(os.getenv("WATCHLIST_MIN_GAIN_PCT", "15.0"))
+WATCHLIST_MIN_GAIN_PCT = float(os.getenv("WATCHLIST_MIN_GAIN_PCT", "50.0"))
 WATCHLIST_THRESHOLD_MIN = 1.0
 WATCHLIST_THRESHOLD_MAX = 1000.0
 # اگر نماد زیر آستانه برگشت، فوراً حذف نمی‌شود؛ ممکن است دقیقاً وارد فاز
@@ -260,11 +260,11 @@ RESERVE_MIN_HOLD_MINUTES = float(os.getenv("RESERVE_MIN_HOLD_MINUTES", "15.0"))
 # --- تی‌پی دلاری پیش‌فرض ---
 # برخلاف قبل که پیش‌فرض خاموش بود، حالا خروج فقط دلاریه و از همون اول
 # روشنه (کاربر می‌تونه با «تیپی N» عوضش کنه یا «تیپی خاموش» کاملاً خاموش کنه).
-DEFAULT_FIXED_TP_USD = float(os.getenv("DEFAULT_FIXED_TP_USD", "5.0"))
+DEFAULT_FIXED_TP_USD = float(os.getenv("DEFAULT_FIXED_TP_USD", "0.0"))
 
 # --- تاپ N: فقط N تای برتر واچ‌لیست معامله بشن ---
 # ۰ = خاموش (هیچ محدودیتی، هر نماد واجد شرایط واچ‌لیست قابل معامله‌ست).
-TOP_N_COUNT = int(os.getenv("TOP_N_COUNT", "4"))
+TOP_N_COUNT = int(os.getenv("TOP_N_COUNT", "0"))
 TOP_N_MIN = 0
 TOP_N_MAX = 18
 # چرخه‌ی تازه‌سازی درصد پامپ (برای رتبه‌بندی «تاپ») -- جدا از چک قیمت هر
@@ -276,9 +276,25 @@ GAIN_REFRESH_SECONDS = float(os.getenv("GAIN_REFRESH_SECONDS", "20.0"))
 # به محض این‌که قیمت لحظه‌ای از سقف ردیابی‌شده (از لحظه‌ی ورود به واچ‌لیست)
 # به این‌اندازه برگرده، بلافاصله وارد میشیم -- بدون نیاز به بسته‌شدن کندل،
 # بدون تأیید چندکندلی. از پنل: «برگشت N».
-PULLBACK_ENTRY_PCT = float(os.getenv("PULLBACK_ENTRY_PCT", "3.0"))
+PULLBACK_ENTRY_PCT = float(os.getenv("PULLBACK_ENTRY_PCT", "7.0"))
 PULLBACK_ENTRY_MIN = 0.5
 PULLBACK_ENTRY_MAX = 30.0
+
+# --- فیلترهای V4 استخراج‌شده از بک‌تست 270روزه ---
+# کندل تریگر باید کاملاً بسته شده باشد.
+ENTRY_LOWER_WICK_MAX_PCT = float(os.getenv("ENTRY_LOWER_WICK_MAX_PCT", "1.82"))
+# میانگین حجم 6 کندل آخر / میانگین حجم 24 کندل قبل از آن.
+ENTRY_VOL6_RATIO_MIN = float(os.getenv("ENTRY_VOL6_RATIO_MIN", "1.10"))
+# خروج خام قیمتی؛ مستقل از دلار مارجین و لوریج.
+TAKE_PROFIT_PRICE_PCT = float(os.getenv("TAKE_PROFIT_PRICE_PCT", "20.0"))
+STOP_LOSS_PRICE_PCT = float(os.getenv("STOP_LOSS_PRICE_PCT", "20.0"))
+# مدیریت سرمایهٔ بک‌تست نهایی.
+DYNAMIC_MARGIN_BASE_USDT = float(os.getenv("DYNAMIC_MARGIN_BASE_USDT", "10"))
+DYNAMIC_MARGIN_STEP_EQUITY_USDT = float(os.getenv("DYNAMIC_MARGIN_STEP_EQUITY_USDT", "20"))
+DYNAMIC_MARGIN_STEP_USDT = float(os.getenv("DYNAMIC_MARGIN_STEP_USDT", "5"))
+DYNAMIC_MARGIN_MAX_USDT = float(os.getenv("DYNAMIC_MARGIN_MAX_USDT", "100"))
+DYNAMIC_MARGIN_START_EQUITY_USDT = float(os.getenv("DYNAMIC_MARGIN_START_EQUITY_USDT", "40"))
+CASH_RESERVE_USDT = float(os.getenv("CASH_RESERVE_USDT", "10"))
 
 # چرخه‌ی چک ورود Peak-Pullback (ثانیه) -- سریع و مستقل از اسکن ۱۵دقیقه‌ای
 # واچ‌لیست، چون کل هدف همینه که منتظر چیزی نمونیم.
@@ -289,7 +305,7 @@ PEAK_PULLBACK_CHECK_SECONDS = float(os.getenv("PEAK_PULLBACK_CHECK_SECONDS", "5.
 # باشه -- یعنی از آخرین باری که این نماد رکورد قیمتی جدید زده، این‌همه دقیقه
 # گذشته باشه (بدون رکورد جدید). هدف: صبر برای اینکه پامپ واقعاً نفس بریده
 # باشه، نه یه مکث موقت. از پنل: «کهنگی N» (۱ تا ۵۰۰ دقیقه).
-STALENESS_MINUTES_DEFAULT = float(os.getenv("STALENESS_MINUTES_DEFAULT", "30.0"))
+STALENESS_MINUTES_DEFAULT = float(os.getenv("STALENESS_MINUTES_DEFAULT", "1.0"))
 STALENESS_MINUTES_MIN = 1.0
 STALENESS_MINUTES_MAX = 500.0
 
@@ -300,15 +316,6 @@ STALENESS_MINUTES_MAX = 500.0
 TRAIL_USD_DEFAULT = float(os.getenv("TRAIL_USD_DEFAULT", "1.0"))
 TRAIL_USD_MIN = 1.0
 TRAIL_USD_MAX = 100.0
-
-
-# --- FAST1 locked live-test parameters (validated backtest configuration) ---
-# Peak -> 3% pullback -> additional 1% drop -> SHORT. No time breathing / staleness gate.
-FAST_CONFIRM_PCT = float(os.getenv("FAST_CONFIRM_PCT", "1.0"))
-FAST_CANCEL_REBOUND_PCT = float(os.getenv("FAST_CANCEL_REBOUND_PCT", "1.0"))
-STOP_MARGIN_PCT = float(os.getenv("STOP_MARGIN_PCT", "38.0"))
-TRAIL_START_MARGIN_PCT = float(os.getenv("TRAIL_START_MARGIN_PCT", "30.0"))
-TRAIL_RETRACE_MARGIN_PCT = float(os.getenv("TRAIL_RETRACE_MARGIN_PCT", "10.0"))
 
 # --- تایم‌فریم‌ها ---
 # 15m = کشف کاندید / زمینه | 5m = مانیتور و اجرا
@@ -357,14 +364,14 @@ ALLOW_SHORT = True
 # بعد از هر خروج، همان نماد این تعداد ساعت قابل معامله نیست — حتی اگر
 # دوباره پامپ کند یا سیگنال جدید بدهد. جلوگیری از Overtrading روی یک
 # Pump Episode. از تلگرام با «استراحت ۲» تنظیم می‌شود.
-COOLDOWN_HOURS = float(os.getenv("COOLDOWN_HOURS", "2"))
-COOLDOWN_HOURS_MIN = 1
+COOLDOWN_HOURS = float(os.getenv("COOLDOWN_HOURS", "0"))
+COOLDOWN_HOURS_MIN = 0
 COOLDOWN_HOURS_MAX = 12
 
 # --- مهلت نگه‌داشتن ---
 # صفر = بدون مهلت. خروج فقط با حد ضرر یا برگشت ساختاری. این عدد صرفاً
 # یک شبکهٔ ایمنی برای پوزیشن‌های فراموش‌شده است، نه بخشی از استراتژی.
-MAX_HOLD_HOURS = float(os.getenv("MAX_HOLD_HOURS", "0"))
+MAX_HOLD_HOURS = float(os.getenv("MAX_HOLD_HOURS", "48"))
 
 # --- ایمنی اجرا ---
 MAX_ENTRY_SPREAD_RATE = float(os.getenv("MAX_ENTRY_SPREAD_RATE", "0.0015"))
@@ -376,8 +383,8 @@ DEFAULT_VIRTUAL_TRADING_ENABLED = True
 
 # --- اقتصاد معامله ---
 TAKER_FEE_RATE = float(os.getenv("TOOBIT_TAKER_FEE_RATE", "0.0005"))
-ROUND_TRIP_SLIPPAGE_RATE = float(os.getenv("ROUND_TRIP_SLIPPAGE_RATE", "0.0010"))
-FUNDING_RESERVE_RATE = float(os.getenv("FUNDING_RESERVE_RATE", "0.0"))
+ROUND_TRIP_SLIPPAGE_RATE = float(os.getenv("ROUND_TRIP_SLIPPAGE_RATE", "0.0006"))
+FUNDING_RESERVE_RATE = float(os.getenv("FUNDING_RESERVE_RATE", "0.0002"))
 
 # --- گزارش‌دهی تلگرام ---
 # گزارش لحظه‌ای پوزیشن‌های باز؛ صفر = خاموش. از تلگرام: «گزارش ۱۰»
