@@ -440,3 +440,8 @@ ENDPOINT_WEIGHTS = {
     PATH_TRADING_STOP: 1,
     PATH_FLASH_CLOSE: 1,
 }
+
+# Analysis-only bot (no trading)
+AUTO_SCAN_SECONDS = int(os.getenv("AUTO_SCAN_SECONDS", "60"))
+AUTO_ALERT_SCORE = int(os.getenv("AUTO_ALERT_SCORE", "72"))
+AUTO_ALERT_COOLDOWN_SECONDS = int(os.getenv("AUTO_ALERT_COOLDOWN_SECONDS", "900"))
