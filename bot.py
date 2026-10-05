@@ -22,16 +22,16 @@ class BotEngine:
                 s,ch,p=fut[f]
                 try: results.append((f.result(),ch,p,None))
                 except Exception as e: results.append((None,ch,p,(s,str(e))))
-        rank={'PRE-DUMP':0,'DUMP STARTING':1,'PEAK FORMING':2,'WATCH':3,'PUMPING':4,'DUMP ACTIVE / LATE':5}
+        rank={'PRE-DUMP':0,'DUMP STARTING':1,'EXTREME PUMP / REVERSAL WATCH':2,'PEAK FORMING':3,'WATCH':4,'PUMPING':5,'DUMP ACTIVE / LATE':6}
         results.sort(key=lambda x:(rank.get(x[0].stage,9) if x[0] else 9, -(x[0].dump_score if x[0] else -1)))
         lines=['🚀 اسکن تحلیلی Top 10 — Toobit USDT-M Futures','']
         for r,ch,p,err in results:
             if not r:
                 lines.append(f'⚪ {canonical_base(err[0])} {ch:+.2f}% — تحلیل ناموفق')
                 continue
-            icon='🔴' if r.stage=='PRE-DUMP' else '🟠' if r.stage=='DUMP STARTING' else '🟡' if r.stage in ('PEAK FORMING','WATCH') else '⚫' if r.stage=='DUMP ACTIVE / LATE' else '⚪'
+            icon='🔴' if r.stage=='PRE-DUMP' else '🟠' if r.stage=='DUMP STARTING' else '🔥' if r.stage=='EXTREME PUMP / REVERSAL WATCH' else '🟡' if r.stage in ('PEAK FORMING','WATCH') else '⚫' if r.stage=='DUMP ACTIVE / LATE' else '⚪'
             lines.append(f'{icon} {canonical_base(r.symbol)} {ch:+.2f}% | {r.stage} | Dump {r.dump_score} | Entry {r.entry_score}')
-        lines += ['','🔴 PRE-DUMP = کاندیدای هشدار قبل از ریزش','🟠 DUMP STARTING = ریزش در حال شروع','⚫ DUMP ACTIVE / LATE = بخش مهم ریزش انجام شده','', 'برای تحلیل کامل + چارت فقط اسم ارز را بفرست؛ مثال: RLC']
+        lines += ['','🔴 PRE-DUMP = کاندیدای هشدار قبل از ریزش','🟠 DUMP STARTING = ریزش در حال شروع','🔥 EXTREME PUMP / REVERSAL WATCH = پامپ شدید با احتمال خستگی؛ هشدار زودهنگام','⚫ DUMP ACTIVE / LATE = بخش مهم ریزش انجام شده','', 'برای تحلیل کامل + چارت فقط اسم ارز را بفرست؛ مثال: RLC']
         return '\n'.join(lines)
     def format_analysis(self,r):
         lines=[f'🧠 {canonical_base(r.symbol)} — تحلیل Pump → Reversal',f'مرحله: {r.stage}',f'Peak Probability: {r.peak_score}/100',f'Dump Imminence: {r.dump_score}/100',f'Short Entry Quality: {r.entry_score}/100',f'نتیجه: {r.verdict}','',f'قیمت: {r.price:.8g}',f'Pump start: {r.pump_start:.8g}',f'Peak احتمالی: {r.peak:.8g}','','📍 حمایت / مقاومت چندتایم‌فریم']
@@ -57,3 +57,5 @@ class BotEngine:
             except Exception: continue
             if r.stage in ('PRE-DUMP','DUMP STARTING') and r.dump_score>=config.AUTO_ALERT_SCORE and r.entry_score>=58:
                 self.telegram.send_photo(r.chart_path,self.format_analysis(r)); self.last_auto[base]=now
+            elif r.stage=='EXTREME PUMP / REVERSAL WATCH' and r.peak_score>=60 and r.dump_score>=58:
+                self.telegram.send_photo(r.chart_path,'🔥 هشدار پامپ شدید / خستگی احتمالی\n\n'+self.format_analysis(r)); self.last_auto[base]=now

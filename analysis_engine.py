@@ -118,6 +118,9 @@ class MarketAnalyzer:
         if off>=12 or (off>=8 and r10<=-3): return 'DUMP ACTIVE / LATE'
         if off>=5 and dump_score>=58: return 'DUMP STARTING'
         if peak_score>=62 and dump_score>=62: return 'PRE-DUMP'
+        # Extreme pumps get their own watch state: strong green momentum does NOT automatically veto exhaustion.
+        # This is an early-warning state only; it does not itself authorize a short.
+        if pump_pct>=30 and off<7 and peak_score>=52: return 'EXTREME PUMP / REVERSAL WATCH'
         if pump_pct>=15 and (off<5 or r3>0): return 'PEAK FORMING' if peak_score>=48 else 'PUMPING'
         return 'WATCH'
 
@@ -182,6 +185,18 @@ class MarketAnalyzer:
         peak_w=(1.0,1.3,1.0,1.25,.7); dump_w=(1.35,.8,1.15,1.15,1.35,1.1,1.25)
         peak_score=round(sum(scores[i][1]*w for i,w in zip(peak_idx,peak_w))/sum(peak_w))
         dump_score=round(sum(scores[i][1]*w for i,w in zip(dump_idx,dump_w))/sum(dump_w))
+        # Extreme-pump exhaustion overlay. It rewards independent evidence of saturation near a violent pump,
+        # while positive momentum alone cannot suppress the warning. No bearish candle confirmation is used.
+        extreme = pump_pct >= 30 and off < 7
+        exhaustion_hits = sum(1 for i in (3,4,5,7,8,9) if scores[i][1] >= 62)
+        exhaustion_critical = sum(1 for i in (4,5,8,9) if scores[i][1] >= 70)
+        if extreme:
+            pump_ext=self._clamp((pump_pct-20)*2.0)
+            exhaustion_core=sum(scores[i][1] for i in (3,4,5,7,8,9))/6
+            peak_score=round(self._clamp(max(peak_score, pump_ext*.35 + exhaustion_core*.65)))
+            # Only boost dump imminence when several independent exhaustion layers agree.
+            if exhaustion_hits>=3:
+                dump_score=round(self._clamp(max(dump_score, exhaustion_core*.78 + pump_ext*.22)))
         stage=self._classify_stage(price,peak,pump_pct,peak_score,dump_score,k1)
         strong=sum(1 for i in dump_idx if scores[i][1]>=65)
         critical=sum(1 for i in (1,4,5,6,8,9) if scores[i][1]>=70)
@@ -221,11 +236,16 @@ class MarketAnalyzer:
                 if len(tps)==3: break
         while len(tps)<3: tps.append(min(tps[-1] if tps else pump_start,pump_start))
         rr1=max(0,(entry_low-tps[0])/risk)
-        stage_factor={'PRE-DUMP':95,'DUMP STARTING':82,'PEAK FORMING':58,'PUMPING':25,'DUMP ACTIVE / LATE':18,'WATCH':35}.get(stage,35)
+        stage_factor={'PRE-DUMP':95,'DUMP STARTING':82,'EXTREME PUMP / REVERSAL WATCH':68,'PEAK FORMING':58,'PUMPING':25,'DUMP ACTIVE / LATE':18,'WATCH':35}.get(stage,35)
         entry_score=round(self._clamp(dump_score*.55 + stage_factor*.30 + min(100,rr1*50)*.15))
         if stage=='DUMP ACTIVE / LATE': verdict='ریزش انجام شده/در حال اجرا — برای ورود زودهنگام دیر است'
         elif stage=='PRE-DUMP' and dump_score>=62 and strong>=4 and critical>=2 and entry_score>=65: verdict='کاندیدای ریزش زودهنگام — شورت قابل بررسی'
         elif stage=='DUMP STARTING' and entry_score>=58: verdict='ریزش در حال شروع — ورود فقط با نسبت ریسک/بازده مناسب'
+        elif stage=='EXTREME PUMP / REVERSAL WATCH':
+            if exhaustion_hits>=4 and exhaustion_critical>=2 and dump_score>=60:
+                verdict='پامپ شدید + خستگی چندلایه — هشدار زودهنگام؛ آماده تبدیل به PRE-DUMP'
+            else:
+                verdict='پامپ شدید نزدیک ناحیه حساس — زیر نظر؛ هنوز مجوز شورت نیست'
         elif stage in ('PEAK FORMING','WATCH') and dump_score>=55: verdict='زیر نظر — شواهد هنوز برای ورود کافی نیست'
         else: verdict='فعلاً ورود نکن'
         path=self._chart(symbol,k5,peak,pump_start,(entry_low,entry_high),invalid,tps,dump_score,verdict,levels) if make_chart else ''
