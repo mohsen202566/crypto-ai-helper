@@ -15,32 +15,10 @@ class AnalysisResult:
     entry_low: float; entry_high: float; invalidation: float; tps: list[float]
     reasons: list[str]; against: list[str]; layers: list[tuple[str,float,str]]; chart_path: str
     levels: dict[str, dict[str, list[float]]]
+    peak_score: int; dump_score: int; entry_score: int; stage: str
 
 class MarketAnalyzer:
     def __init__(self, client): self.client=client; self._contracts_cache=set(); self._contracts_at=0.0
-
-    @staticmethod
-    def _is_crypto_contract(info):
-        """Reject Toobit TradFi/stock/index/forex contracts before Top ranking.
-
-        Toobit may expose these products through the same USDT-M contract API, so
-        `USDT + TRADING` alone is not enough to prove that an instrument is crypto.
-        We intentionally use several metadata fields because exchangeInfo field names
-        can differ between product generations. Unknown/empty metadata remains allowed
-        so newly listed crypto coins are not accidentally lost.
-        """
-        deny = ('STOCK','EQUITY','SHARE','INDEX','INDICES','FOREX','FX','TRADFI',
-                'COMMODITY','ETF','CFD','PRECIOUS','METAL')
-        fields = ('type','contractType','assetType','productType','category','sector',
-                  'marketType','underlyingType','tag','tags','label','labels')
-        vals=[]
-        for k in fields:
-            v=info.get(k)
-            if isinstance(v,(list,tuple,set)): vals.extend(str(x).upper() for x in v)
-            elif v is not None: vals.append(str(v).upper())
-        blob=' '.join(vals)
-        return not any(word in blob for word in deny)
-
     @staticmethod
     def _change(row):
         for k in ('pcp','priceChangePercent','changeRate','rose'):
@@ -54,10 +32,7 @@ class MarketAnalyzer:
         now=time.time()
         if not self._contracts_cache or now-self._contracts_at>300:
             contracts=self.client.get_contracts()
-            # IMPORTANT: rank Top 24h only AFTER removing Toobit non-crypto products.
-            # This prevents Stock / Indices / TradFi / Forex contracts from occupying
-            # Top slots that belong to actual crypto futures.
-            self._contracts_cache={canonical_symbol(v.get('canonical') or k) for k,v in contracts.items() if self._is_crypto_contract(v)}
+            self._contracts_cache={canonical_symbol(v.get('canonical') or k) for k,v in contracts.items()}
             self._contracts_at=now
         return self._contracts_cache
 
@@ -122,7 +97,31 @@ class MarketAnalyzer:
     def _nearest(levels, side, price):
         vals=levels.get(side,[])
         return vals[0] if vals else None
-    def analyze(self,name):
+    @staticmethod
+    def _clamp(v): return max(0.0,min(100.0,float(v)))
+
+    @staticmethod
+    def _merge_levels(levels, price, tol_pct=0.006):
+        vals=sorted([v for v in levels if v>0])
+        groups=[]
+        for v in vals:
+            if groups and abs(v-sum(groups[-1])/len(groups[-1]))/max(price,1e-12)<=tol_pct:
+                groups[-1].append(v)
+            else: groups.append([v])
+        return [sum(g)/len(g) for g in groups]
+
+    def _classify_stage(self, price, peak, pump_pct, peak_score, dump_score, k1):
+        off=max(0.0,(peak-price)/max(peak,1e-12)*100)
+        r3=self._ret(k1[-4]['close'],k1[-1]['close'])
+        r10=self._ret(k1[-11]['close'],k1[-1]['close'])
+        # Stage is descriptive, not a mandatory entry rule. No bearish candle confirmation is required.
+        if off>=12 or (off>=8 and r10<=-3): return 'DUMP ACTIVE / LATE'
+        if off>=5 and dump_score>=58: return 'DUMP STARTING'
+        if peak_score>=62 and dump_score>=62: return 'PRE-DUMP'
+        if pump_pct>=15 and (off<5 or r3>0): return 'PEAK FORMING' if peak_score>=48 else 'PUMPING'
+        return 'WATCH'
+
+    def analyze(self,name,make_chart=True):
         symbol=self.resolve(name)
         k1=self.client.get_klines(symbol,'1m',240); k5=self.client.get_klines(symbol,'5m',180); k15=self.client.get_klines(symbol,'15m',120); k60=self.client.get_klines(symbol,'1h',96)
         if min(len(k1),len(k5),len(k15),len(k60))<20: raise RuntimeError('داده کندلی کافی نیست')
@@ -134,18 +133,12 @@ class MarketAnalyzer:
         # 2 acceleration exhaustion: recent 1m slope vs prior
         r_recent=self._ret(k1[-11]['close'],k1[-1]['close']); r_prior=self._ret(k1[-31]['close'],k1[-11]['close'])
         s2=max(0,min(100,50+(r_prior-r_recent)*10)); scores.append(('افت شتاب',s2,f'مومنتوم 10m={r_recent:+.2f}% در برابر 20m قبل={r_prior:+.2f}%'))
-        # 3 local-top failure. The historical pump peak is REFERENCE ONLY.
-        # A reversal may start after price has already slipped below the exact peak;
-        # therefore neither touching the peak nor making a fresh high is required.
+        # 3 peak behavior: distance is informational only and NEVER earns reversal points by itself
         off=(peak-price)/peak*100
-        local_anchor=max(x['high'] for x in k1[-30:])
-        anchor_off=(local_anchor-price)/max(local_anchor,1e-12)*100
         last_high=max(x['high'] for x in k1[-8:]); prior_high=max(x['high'] for x in k1[-20:-8])
         failed=max(0.0,(prior_high-last_high)/max(prior_high,1e-12)*100)
-        # No free points for merely being X% below the old peak. Score comes from
-        # actual short-term failure; distance is only reported as context.
-        s3=min(100,failed*35)
-        scores.append(('شکست سقف محلی',s3,f'فاصله از Peak مرجع {off:.2f}%؛ فاصله از سقف 30m {anchor_off:.2f}%؛ ضعف سقف کوتاه‌مدت {failed:.2f}%'))
+        s3=min(100,35+failed*25)
+        scores.append(('رفتار نزدیک پیک',s3,f'فاصله از پیک {off:.2f}% (فقط اطلاعاتی)؛ ضعف سقف کوتاه‌مدت {failed:.2f}%'))
         # 4 upper wick pressure last 1m/5m
         def wick_ratio(c):
             rng=max(c['high']-c['low'],1e-12); return (c['high']-max(c['open'],c['close']))/rng
@@ -183,41 +176,65 @@ class MarketAnalyzer:
             sr=sell/(sell+buy) if sell+buy else .5; s10=sr*100; detail=f'فشار فروش معاملات اخیر {sr*100:.0f}%'
         except Exception: s10=50; detail='Trades در دسترس نبود؛ خنثی'
         scores.append(('Order Flow',s10,detail))
-        weights=[1.25,1.35,1.0,1.0,1.2,1.15,1.3,.8,1.1,1.25]
-        score=round(sum(s*w for (_,s,_),w in zip(scores,weights))/sum(weights))
-        strong=sum(1 for _,s,_ in scores if s>=65); critical=sum(1 for i,(_,s,_) in enumerate(scores) if i in (1,4,5,6,8,9) and s>=70)
-        if score>=72 and strong>=5 and critical>=2: verdict='ورود شورت قابل بررسی'
-        elif score>=58 and strong>=4: verdict='هشدار زودهنگام — هنوز ورود پرریسک'
-        else: verdict='فعلاً ورود نکن'
-        reasons=[f'{n}: {d}' for n,s,d in scores if s>=65][:6]; against=[f'{n}: {d}' for n,s,d in scores if s<45][:4]
-        # Multi-timeframe structural support/resistance. These levels also drive SL/TP selection.
-        levels={'5m':self._sr_levels(k5[-120:],price),'15m':self._sr_levels(k15[-100:],price),'1h':self._sr_levels(k60[-72:],price)}
+        # Three separate scores: being near an exhausted peak != dump imminence != entry quality.
+        # Peak distance itself has zero direct scoring weight.
+        peak_idx=(0,1,3,5,7); dump_idx=(1,3,4,5,6,8,9)
+        peak_w=(1.0,1.3,1.0,1.25,.7); dump_w=(1.35,.8,1.15,1.15,1.35,1.1,1.25)
+        peak_score=round(sum(scores[i][1]*w for i,w in zip(peak_idx,peak_w))/sum(peak_w))
+        dump_score=round(sum(scores[i][1]*w for i,w in zip(dump_idx,dump_w))/sum(dump_w))
+        stage=self._classify_stage(price,peak,pump_pct,peak_score,dump_score,k1)
+        strong=sum(1 for i in dump_idx if scores[i][1]>=65)
+        critical=sum(1 for i in (1,4,5,6,8,9) if scores[i][1]>=70)
+        # Entry quality is finalized after structural SL/TP are known.
+        score=dump_score
+        verdict='در حال محاسبه کیفیت ورود'
+        reasons=[f'{n}: {d}' for n,v,d in scores if v>=65][:6]; against=[f'{n}: {d}' for n,v,d in scores if v<45][:4]
+        # Multi-timeframe structural S/R, merged into zones so duplicated levels do not masquerade as independent evidence.
+        levels={'5m':self._sr_levels(k5[-150:],price),'15m':self._sr_levels(k15[-120:],price),'1h':self._sr_levels(k60[-96:],price)}
+        # Always expose the live pump peak as a major resistance when it is above price.
+        if peak>price:
+            for tf in ('15m','1h'):
+                vals=levels[tf]['resistance']+[peak]
+                levels[tf]['resistance']=sorted(self._merge_levels(vals,price))[:3]
         local_high=max(x['high'] for x in k1[-12:]); entry_low=min(x['low'] for x in k1[-3:]); entry_high=max(x['high'] for x in k1[-3:])
         resist=[]
         for tf in ('5m','15m','1h'): resist += levels[tf]['resistance']
-        invalid=min(resist, key=lambda x:abs(x-price)) if resist else max(peak,local_high)
-        invalid=max(invalid,entry_high)
-        # TP1/2/3 are actual supports across 5m -> 15m -> 1h, de-duplicated and below entry.
+        merged_r=[v for v in self._merge_levels(resist+[peak,local_high],price) if v>entry_high]
+        # Invalidation for a short must be ABOVE the active structural resistance/peak zone, never below the pump peak.
+        base_invalid=max([peak,local_high,entry_high]+merged_r[:2])
+        recent_ranges=[x['high']-x['low'] for x in k1[-20:]]
+        buffer=max(price*0.0015,(sum(recent_ranges)/len(recent_ranges))*0.20)
+        invalid=base_invalid+buffer
+        risk=max(invalid-entry_high,price*0.001)
+        # Structural TP candidates; require useful reward/risk, otherwise skip the too-near support.
         candidates=[]
         for tf in ('5m','15m','1h'):
             for v in levels[tf]['support']:
-                if v < entry_low and all(abs(v-x)/price>0.004 for x in candidates): candidates.append(v)
-        candidates=sorted(candidates, reverse=True)
-        tps=candidates[:3]
-        # If structure exposes fewer than 3 meaningful supports, do not invent tiny fixed-percent TPs; use broader swing lows.
+                if v<entry_low and all(abs(v-x)/price>0.004 for x in candidates): candidates.append(v)
+        candidates=sorted(candidates,reverse=True)
+        rr_candidates=[v for v in candidates if (entry_low-v)/risk>=0.75]
+        tps=rr_candidates[:3]
         if len(tps)<3:
-            swings=sorted({x['low'] for x in k60[-72:]+k15[-100:] if x['low']<entry_low}, reverse=True)
+            swings=sorted({x['low'] for x in k60[-96:]+k15[-120:] if x['low']<entry_low},reverse=True)
             for v in swings:
-                if all(abs(v-x)/price>0.008 for x in tps): tps.append(v)
+                if (entry_low-v)/risk>=0.75 and all(abs(v-x)/price>0.008 for x in tps): tps.append(v)
                 if len(tps)==3: break
-        while len(tps)<3: tps.append(min(tps[-1] if tps else entry_low, pump_start))
-        path=self._chart(symbol,k5,peak,pump_start,(entry_low,entry_high),invalid,tps,score,verdict,levels)
-        return AnalysisResult(symbol,score,verdict,price,peak,pump_start,entry_low,entry_high,invalid,tps,reasons,against,scores,path,levels)
+        while len(tps)<3: tps.append(min(tps[-1] if tps else pump_start,pump_start))
+        rr1=max(0,(entry_low-tps[0])/risk)
+        stage_factor={'PRE-DUMP':95,'DUMP STARTING':82,'PEAK FORMING':58,'PUMPING':25,'DUMP ACTIVE / LATE':18,'WATCH':35}.get(stage,35)
+        entry_score=round(self._clamp(dump_score*.55 + stage_factor*.30 + min(100,rr1*50)*.15))
+        if stage=='DUMP ACTIVE / LATE': verdict='ریزش انجام شده/در حال اجرا — برای ورود زودهنگام دیر است'
+        elif stage=='PRE-DUMP' and dump_score>=62 and strong>=4 and critical>=2 and entry_score>=65: verdict='کاندیدای ریزش زودهنگام — شورت قابل بررسی'
+        elif stage=='DUMP STARTING' and entry_score>=58: verdict='ریزش در حال شروع — ورود فقط با نسبت ریسک/بازده مناسب'
+        elif stage in ('PEAK FORMING','WATCH') and dump_score>=55: verdict='زیر نظر — شواهد هنوز برای ورود کافی نیست'
+        else: verdict='فعلاً ورود نکن'
+        path=self._chart(symbol,k5,peak,pump_start,(entry_low,entry_high),invalid,tps,dump_score,verdict,levels) if make_chart else ''
+        return AnalysisResult(symbol,dump_score,verdict,price,peak,pump_start,entry_low,entry_high,invalid,tps,reasons,against,scores,path,levels,peak_score,dump_score,entry_score,stage)
     def _chart(self,symbol,ks,peak,start,entry,invalid,tps,score,verdict,levels):
         data=ks[-90:]; fig,ax=plt.subplots(figsize=(12,7));
         for i,c in enumerate(data):
             up=c['close']>=c['open']; col='green' if up else 'red'; ax.vlines(i,c['low'],c['high'],color=col,linewidth=.8); lo=min(c['open'],c['close']); h=max(abs(c['close']-c['open']),1e-10); ax.add_patch(Rectangle((i-.32,lo),.64,h,facecolor=col,edgecolor=col,alpha=.75))
-        ax.axhline(peak,linestyle='--',linewidth=1,label=f'Reference peak {peak:.6g}'); ax.axhspan(entry[0],entry[1],alpha=.12,label='Entry zone'); ax.axhline(invalid,linestyle=':',linewidth=1,label='Invalidation')
+        ax.axhline(peak,linestyle='--',linewidth=1,label=f'Peak {peak:.6g}'); ax.axhspan(entry[0],entry[1],alpha=.12,label='Entry zone'); ax.axhline(invalid,linestyle=':',linewidth=1,label='Invalidation')
         for i,tp in enumerate(tps,1): ax.axhline(tp,linestyle='--',linewidth=.8,label=f'TP{i} {tp:.6g}')
         # Show nearest S/R from each timeframe on the 5m chart.
         for tf in ('5m','15m','1h'):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import config
 from analysis_engine import MarketAnalyzer
 from utils import canonical_base
@@ -12,12 +13,28 @@ class BotEngine:
         self.storage.set_setting('startup_ready',True)
         if self.storage.get_setting('auto_analysis_enabled',None) is None: self.storage.set_setting('auto_analysis_enabled',False)
     def scan_text(self):
-        rows=self.analyzer.top_pumps(10); lines=['🚀 ۱۰ ارز صدر Top 24h — کاندیدای بررسی','']
-        for i,(s,ch,p) in enumerate(rows,1): lines.append(f'{i}. {canonical_base(s)}  {ch:+.2f}%  | {p:.8g}')
-        lines+=['','برای تحلیل فوری فقط اسم ارز را بفرست؛ مثال: RLC']
+        rows=self.analyzer.top_pumps(10)
+        results=[]
+        # Analyze the actual Toobit USDT-M Top 10, not merely list their names. Parallelism keeps /scan responsive.
+        with ThreadPoolExecutor(max_workers=5) as ex:
+            fut={ex.submit(self.analyzer.analyze,s,False):(s,ch,p) for s,ch,p in rows}
+            for f in as_completed(fut):
+                s,ch,p=fut[f]
+                try: results.append((f.result(),ch,p,None))
+                except Exception as e: results.append((None,ch,p,(s,str(e))))
+        rank={'PRE-DUMP':0,'DUMP STARTING':1,'PEAK FORMING':2,'WATCH':3,'PUMPING':4,'DUMP ACTIVE / LATE':5}
+        results.sort(key=lambda x:(rank.get(x[0].stage,9) if x[0] else 9, -(x[0].dump_score if x[0] else -1)))
+        lines=['🚀 اسکن تحلیلی Top 10 — Toobit USDT-M Futures','']
+        for r,ch,p,err in results:
+            if not r:
+                lines.append(f'⚪ {canonical_base(err[0])} {ch:+.2f}% — تحلیل ناموفق')
+                continue
+            icon='🔴' if r.stage=='PRE-DUMP' else '🟠' if r.stage=='DUMP STARTING' else '🟡' if r.stage in ('PEAK FORMING','WATCH') else '⚫' if r.stage=='DUMP ACTIVE / LATE' else '⚪'
+            lines.append(f'{icon} {canonical_base(r.symbol)} {ch:+.2f}% | {r.stage} | Dump {r.dump_score} | Entry {r.entry_score}')
+        lines += ['','🔴 PRE-DUMP = کاندیدای هشدار قبل از ریزش','🟠 DUMP STARTING = ریزش در حال شروع','⚫ DUMP ACTIVE / LATE = بخش مهم ریزش انجام شده','', 'برای تحلیل کامل + چارت فقط اسم ارز را بفرست؛ مثال: RLC']
         return '\n'.join(lines)
     def format_analysis(self,r):
-        lines=[f'🧠 {canonical_base(r.symbol)} — تحلیل Pump → Reversal',f'امتیاز احتمال ریزش: {r.score}/100',f'نتیجه: {r.verdict}','',f'قیمت: {r.price:.8g}',f'Pump start: {r.pump_start:.8g}',f'Peak مرجع (شرط ورود نیست): {r.peak:.8g}','','📍 حمایت / مقاومت چندتایم‌فریم']
+        lines=[f'🧠 {canonical_base(r.symbol)} — تحلیل Pump → Reversal',f'مرحله: {r.stage}',f'Peak Probability: {r.peak_score}/100',f'Dump Imminence: {r.dump_score}/100',f'Short Entry Quality: {r.entry_score}/100',f'نتیجه: {r.verdict}','',f'قیمت: {r.price:.8g}',f'Pump start: {r.pump_start:.8g}',f'Peak احتمالی: {r.peak:.8g}','','📍 حمایت / مقاومت چندتایم‌فریم']
         for tf in ('5m','15m','1h'):
             lv=r.levels.get(tf,{})
             ss=' | '.join(f'S{i+1}: {v:.8g}' for i,v in enumerate(lv.get('support',[])[:3])) or 'S: یافت نشد'
@@ -26,7 +43,7 @@ class BotEngine:
         lines += ['',f'Entry zone: {r.entry_low:.8g} — {r.entry_high:.8g}',f'Invalidation / SL: {r.invalidation:.8g}',f'TP1: {r.tps[0]:.8g} | TP2: {r.tps[1]:.8g} | TP3: {r.tps[2]:.8g}','','✅ دلایل موافق:']
         lines += [f'• {x}' for x in r.reasons] or ['• تأیید قوی کافی نیست']
         if r.against: lines += ['','⚠️ دلایل مخالف:']+[f'• {x}' for x in r.against]
-        lines += ['','نکته: گرفتن دقیق Peak یا ثبت سقف جدید شرط نیست؛ اگر قیمت کمی پایین‌تر از Peak باشد و لایه‌های مستقل ضعف/ریزش را تأیید کنند، هشدار صادر می‌شود. هیچ تأیید کندل نزولی اجباری نیست.']
+        lines += ['','نکته: هیچ تأیید کندل نزولی اجباری نیست؛ امتیاز از ۱۰ لایه مستقل و داده زنده ساخته می‌شود.']
         return '\n'.join(lines)
     def analyze_now(self,name):
         r=self.analyzer.analyze(name); return self.format_analysis(r),r.chart_path
@@ -38,5 +55,5 @@ class BotEngine:
             if now-self.last_auto.get(base,0)<config.AUTO_ALERT_COOLDOWN_SECONDS: continue
             try: r=self.analyzer.analyze(s)
             except Exception: continue
-            if r.score>=config.AUTO_ALERT_SCORE:
+            if r.stage in ('PRE-DUMP','DUMP STARTING') and r.dump_score>=config.AUTO_ALERT_SCORE and r.entry_score>=58:
                 self.telegram.send_photo(r.chart_path,self.format_analysis(r)); self.last_auto[base]=now
