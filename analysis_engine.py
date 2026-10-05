@@ -7,16 +7,17 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 import config
-from utils import canonical_base, canonical_symbol, safe_float
+from utils import canonical_base, canonical_symbol, toobit_contract_symbol, safe_float
 
 @dataclass
 class AnalysisResult:
     symbol: str; score: int; verdict: str; price: float; peak: float; pump_start: float
     entry_low: float; entry_high: float; invalidation: float; tps: list[float]
     reasons: list[str]; against: list[str]; layers: list[tuple[str,float,str]]; chart_path: str
+    levels: dict[str, dict[str, list[float]]]
 
 class MarketAnalyzer:
-    def __init__(self, client): self.client=client
+    def __init__(self, client): self.client=client; self._contracts_cache=set(); self._contracts_at=0.0
     @staticmethod
     def _change(row):
         for k in ('pcp','priceChangePercent','changeRate','rose'):
@@ -24,25 +25,77 @@ class MarketAnalyzer:
                 v=safe_float(row.get(k)); return v*100 if abs(v)<=1.5 else v
         o=safe_float(row.get('o') or row.get('openPrice')); c=safe_float(row.get('c') or row.get('lastPrice'))
         return ((c/o)-1)*100 if o and c else 0
+    def _active_usdtm_contracts(self):
+        # Source of truth for scanner: Toobit exchangeInfo contracts only.
+        # get_contracts() already excludes non-TRADING, inverse and non-USDT contracts.
+        now=time.time()
+        if not self._contracts_cache or now-self._contracts_at>300:
+            contracts=self.client.get_contracts()
+            self._contracts_cache={canonical_symbol(v.get('canonical') or k) for k,v in contracts.items()}
+            self._contracts_at=now
+        return self._contracts_cache
+
     def top_pumps(self,n=10):
-        rows=[]
+        allowed=self._active_usdtm_contracts()
+        blacklist=set(config.SYMBOL_BLACKLIST)
+        rows=[]; seen=set()
         for r in self.client.get_24h_tickers():
-            s=str(r.get('s') or r.get('symbol') or '').upper()
-            if not s or canonical_base(s) in set(config.SYMBOL_BLACKLIST): continue
-            ch=self._change(r); p=safe_float(r.get('c') or r.get('lastPrice') or r.get('close'))
-            if p>0: rows.append((s,ch,p))
+            raw=str(r.get('s') or r.get('symbol') or r.get('symbolId') or '').upper()
+            if not raw: continue
+            s=canonical_symbol(raw)
+            # STRICT: only active Toobit USDT-M perpetual contracts from exchangeInfo.
+            if s not in allowed or canonical_base(s) in blacklist or s in seen: continue
+            ch=self._change(r); p=safe_float(r.get('c') or r.get('lastPrice') or r.get('close') or r.get('p') or r.get('price'))
+            if p>0:
+                rows.append((s,ch,p)); seen.add(s)
         return sorted(rows,key=lambda x:x[1],reverse=True)[:n]
+
     def resolve(self,name):
         raw=name.strip().upper().replace('/','').replace('-','').replace('_','')
-        base=raw.removesuffix('USDT').removesuffix('PERP')
-        tops=self.client.get_24h_tickers()
-        candidates=[]
-        for r in tops:
-            s=str(r.get('s') or r.get('symbol') or '').upper()
-            if canonical_base(s)==base: candidates.append(s)
-        return candidates[0] if candidates else canonical_symbol(base+'USDT')
+        base=raw.removesuffix('USDT').removesuffix('PERP').removesuffix('SWAP')
+        target=canonical_symbol(base)
+        if target not in self._active_usdtm_contracts():
+            raise RuntimeError(f'{base} قرارداد فعال Toobit USDT-M Futures نیست')
+        return target
     @staticmethod
     def _ret(a,b): return (b/a-1)*100 if a else 0
+
+    @staticmethod
+    def _sr_levels(ks, price, max_each=3):
+        # Pivot-based S/R with clustering. Recent touches and repeated reactions get priority.
+        piv=[]
+        n=len(ks)
+        for i in range(2,n-2):
+            h=ks[i]['high']; l=ks[i]['low']
+            if h>=max(ks[j]['high'] for j in range(i-2,i+3)): piv.append((h,'R',i))
+            if l<=min(ks[j]['low'] for j in range(i-2,i+3)): piv.append((l,'S',i))
+        tol=max(price*0.0025, 1e-12)
+        clusters=[]
+        for val,typ,idx in piv:
+            found=None
+            for c in clusters:
+                if abs(val-c['v']) <= tol:
+                    found=c; break
+            if found:
+                w=1.0 + idx/max(1,n)
+                found['v']=(found['v']*found['w']+val*w)/(found['w']+w); found['w']+=w; found['touch']+=1; found['last']=max(found['last'],idx)
+            else:
+                clusters.append({'v':val,'w':1.0+idx/max(1,n),'touch':1,'last':idx})
+        def rank(side):
+            arr=[c for c in clusters if (c['v']<price if side=='S' else c['v']>price)]
+            arr.sort(key=lambda c:(-(c['touch']*2+c['last']/max(1,n)), abs(c['v']-price)))
+            chosen=[]
+            # Prefer useful nearby levels while retaining reaction strength.
+            for c in sorted(arr[:10], key=lambda c:abs(c['v']-price)):
+                if not chosen or all(abs(c['v']-x)/price>0.003 for x in chosen): chosen.append(c['v'])
+                if len(chosen)>=max_each: break
+            return sorted(chosen, reverse=(side=='S'))
+        return {'support':rank('S'), 'resistance':rank('R')}
+
+    @staticmethod
+    def _nearest(levels, side, price):
+        vals=levels.get(side,[])
+        return vals[0] if vals else None
     def analyze(self,name):
         symbol=self.resolve(name)
         k1=self.client.get_klines(symbol,'1m',240); k5=self.client.get_klines(symbol,'5m',180); k15=self.client.get_klines(symbol,'15m',120); k60=self.client.get_klines(symbol,'1h',96)
@@ -55,8 +108,12 @@ class MarketAnalyzer:
         # 2 acceleration exhaustion: recent 1m slope vs prior
         r_recent=self._ret(k1[-11]['close'],k1[-1]['close']); r_prior=self._ret(k1[-31]['close'],k1[-11]['close'])
         s2=max(0,min(100,50+(r_prior-r_recent)*10)); scores.append(('افت شتاب',s2,f'مومنتوم 10m={r_recent:+.2f}% در برابر 20m قبل={r_prior:+.2f}%'))
-        # 3 distance/rejection from live peak (continuous, not threshold gate)
-        off=(peak-price)/peak*100; scores.append(('رفتار نزدیک پیک',max(0,min(100,35+off*12)),f'فاصله فعلی از پیک {off:.2f}%'))
+        # 3 peak behavior: distance is informational only and NEVER earns reversal points by itself
+        off=(peak-price)/peak*100
+        last_high=max(x['high'] for x in k1[-8:]); prior_high=max(x['high'] for x in k1[-20:-8])
+        failed=max(0.0,(prior_high-last_high)/max(prior_high,1e-12)*100)
+        s3=min(100,35+failed*25)
+        scores.append(('رفتار نزدیک پیک',s3,f'فاصله از پیک {off:.2f}% (فقط اطلاعاتی)؛ ضعف سقف کوتاه‌مدت {failed:.2f}%'))
         # 4 upper wick pressure last 1m/5m
         def wick_ratio(c):
             rng=max(c['high']-c['low'],1e-12); return (c['high']-max(c['open'],c['close']))/rng
@@ -101,21 +158,39 @@ class MarketAnalyzer:
         elif score>=58 and strong>=4: verdict='هشدار زودهنگام — هنوز ورود پرریسک'
         else: verdict='فعلاً ورود نکن'
         reasons=[f'{n}: {d}' for n,s,d in scores if s>=65][:6]; against=[f'{n}: {d}' for n,s,d in scores if s<45][:4]
-        # structural levels, not fixed-percent triggers
-        local_high=max(x['high'] for x in k1[-12:]); entry_low=min(x['low'] for x in k1[-3:]); entry_high=max(x['high'] for x in k1[-3:]); invalid=max(peak,local_high)
-        supports=sorted({x['low'] for x in k5[-60:] if x['low']<price}, reverse=True)
-        tps=[]
-        for v in supports:
-            if not tps or abs(v-tps[-1])/price>.012: tps.append(v)
-            if len(tps)==3: break
-        while len(tps)<3: tps.append(price*(1-[.04,.08,.13][len(tps)]))
-        path=self._chart(symbol,k5,peak,pump_start,(entry_low,entry_high),invalid,tps,score,verdict)
-        return AnalysisResult(symbol,score,verdict,price,peak,pump_start,entry_low,entry_high,invalid,tps,reasons,against,scores,path)
-    def _chart(self,symbol,ks,peak,start,entry,invalid,tps,score,verdict):
+        # Multi-timeframe structural support/resistance. These levels also drive SL/TP selection.
+        levels={'5m':self._sr_levels(k5[-120:],price),'15m':self._sr_levels(k15[-100:],price),'1h':self._sr_levels(k60[-72:],price)}
+        local_high=max(x['high'] for x in k1[-12:]); entry_low=min(x['low'] for x in k1[-3:]); entry_high=max(x['high'] for x in k1[-3:])
+        resist=[]
+        for tf in ('5m','15m','1h'): resist += levels[tf]['resistance']
+        invalid=min(resist, key=lambda x:abs(x-price)) if resist else max(peak,local_high)
+        invalid=max(invalid,entry_high)
+        # TP1/2/3 are actual supports across 5m -> 15m -> 1h, de-duplicated and below entry.
+        candidates=[]
+        for tf in ('5m','15m','1h'):
+            for v in levels[tf]['support']:
+                if v < entry_low and all(abs(v-x)/price>0.004 for x in candidates): candidates.append(v)
+        candidates=sorted(candidates, reverse=True)
+        tps=candidates[:3]
+        # If structure exposes fewer than 3 meaningful supports, do not invent tiny fixed-percent TPs; use broader swing lows.
+        if len(tps)<3:
+            swings=sorted({x['low'] for x in k60[-72:]+k15[-100:] if x['low']<entry_low}, reverse=True)
+            for v in swings:
+                if all(abs(v-x)/price>0.008 for x in tps): tps.append(v)
+                if len(tps)==3: break
+        while len(tps)<3: tps.append(min(tps[-1] if tps else entry_low, pump_start))
+        path=self._chart(symbol,k5,peak,pump_start,(entry_low,entry_high),invalid,tps,score,verdict,levels)
+        return AnalysisResult(symbol,score,verdict,price,peak,pump_start,entry_low,entry_high,invalid,tps,reasons,against,scores,path,levels)
+    def _chart(self,symbol,ks,peak,start,entry,invalid,tps,score,verdict,levels):
         data=ks[-90:]; fig,ax=plt.subplots(figsize=(12,7));
         for i,c in enumerate(data):
             up=c['close']>=c['open']; col='green' if up else 'red'; ax.vlines(i,c['low'],c['high'],color=col,linewidth=.8); lo=min(c['open'],c['close']); h=max(abs(c['close']-c['open']),1e-10); ax.add_patch(Rectangle((i-.32,lo),.64,h,facecolor=col,edgecolor=col,alpha=.75))
         ax.axhline(peak,linestyle='--',linewidth=1,label=f'Peak {peak:.6g}'); ax.axhspan(entry[0],entry[1],alpha=.12,label='Entry zone'); ax.axhline(invalid,linestyle=':',linewidth=1,label='Invalidation')
         for i,tp in enumerate(tps,1): ax.axhline(tp,linestyle='--',linewidth=.8,label=f'TP{i} {tp:.6g}')
+        # Show nearest S/R from each timeframe on the 5m chart.
+        for tf in ('5m','15m','1h'):
+            for kind,label in (('support','S'),('resistance','R')):
+                vals=levels.get(tf,{}).get(kind,[])[:2]
+                for j,v in enumerate(vals,1): ax.axhline(v,linestyle=':',linewidth=.65,alpha=.55,label=f'{tf} {label}{j} {v:.6g}')
         ax.set_title(f'{canonical_base(symbol)} | 5m | Reversal score {score}/100 | {verdict}'); ax.grid(alpha=.18); ax.legend(loc='best',fontsize=8); fig.tight_layout()
         os.makedirs('/tmp/staged_analysis',exist_ok=True); path=f'/tmp/staged_analysis/{canonical_base(symbol)}_{int(time.time())}.png'; fig.savefig(path,dpi=150); plt.close(fig); return path

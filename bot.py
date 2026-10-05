@@ -17,7 +17,13 @@ class BotEngine:
         lines+=['','برای تحلیل فوری فقط اسم ارز را بفرست؛ مثال: RLC']
         return '\n'.join(lines)
     def format_analysis(self,r):
-        lines=[f'🧠 {canonical_base(r.symbol)} — تحلیل Pump → Reversal',f'امتیاز احتمال ریزش: {r.score}/100',f'نتیجه: {r.verdict}','',f'قیمت: {r.price:.8g}',f'Pump start: {r.pump_start:.8g}',f'Peak احتمالی: {r.peak:.8g}',f'Entry zone: {r.entry_low:.8g} — {r.entry_high:.8g}',f'Invalidation / SL: {r.invalidation:.8g}',f'TP1: {r.tps[0]:.8g} | TP2: {r.tps[1]:.8g} | TP3: {r.tps[2]:.8g}','','✅ دلایل موافق:']
+        lines=[f'🧠 {canonical_base(r.symbol)} — تحلیل Pump → Reversal',f'امتیاز احتمال ریزش: {r.score}/100',f'نتیجه: {r.verdict}','',f'قیمت: {r.price:.8g}',f'Pump start: {r.pump_start:.8g}',f'Peak احتمالی: {r.peak:.8g}','','📍 حمایت / مقاومت چندتایم‌فریم']
+        for tf in ('5m','15m','1h'):
+            lv=r.levels.get(tf,{})
+            ss=' | '.join(f'S{i+1}: {v:.8g}' for i,v in enumerate(lv.get('support',[])[:3])) or 'S: یافت نشد'
+            rr=' | '.join(f'R{i+1}: {v:.8g}' for i,v in enumerate(lv.get('resistance',[])[:3])) or 'R: یافت نشد'
+            lines += [f'{tf} → {ss}',f'{tf} → {rr}']
+        lines += ['',f'Entry zone: {r.entry_low:.8g} — {r.entry_high:.8g}',f'Invalidation / SL: {r.invalidation:.8g}',f'TP1: {r.tps[0]:.8g} | TP2: {r.tps[1]:.8g} | TP3: {r.tps[2]:.8g}','','✅ دلایل موافق:']
         lines += [f'• {x}' for x in r.reasons] or ['• تأیید قوی کافی نیست']
         if r.against: lines += ['','⚠️ دلایل مخالف:']+[f'• {x}' for x in r.against]
         lines += ['','نکته: هیچ تأیید کندل نزولی اجباری نیست؛ امتیاز از ۱۰ لایه مستقل و داده زنده ساخته می‌شود.']
