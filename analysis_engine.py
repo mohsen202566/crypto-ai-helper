@@ -18,6 +18,29 @@ class AnalysisResult:
 
 class MarketAnalyzer:
     def __init__(self, client): self.client=client; self._contracts_cache=set(); self._contracts_at=0.0
+
+    @staticmethod
+    def _is_crypto_contract(info):
+        """Reject Toobit TradFi/stock/index/forex contracts before Top ranking.
+
+        Toobit may expose these products through the same USDT-M contract API, so
+        `USDT + TRADING` alone is not enough to prove that an instrument is crypto.
+        We intentionally use several metadata fields because exchangeInfo field names
+        can differ between product generations. Unknown/empty metadata remains allowed
+        so newly listed crypto coins are not accidentally lost.
+        """
+        deny = ('STOCK','EQUITY','SHARE','INDEX','INDICES','FOREX','FX','TRADFI',
+                'COMMODITY','ETF','CFD','PRECIOUS','METAL')
+        fields = ('type','contractType','assetType','productType','category','sector',
+                  'marketType','underlyingType','tag','tags','label','labels')
+        vals=[]
+        for k in fields:
+            v=info.get(k)
+            if isinstance(v,(list,tuple,set)): vals.extend(str(x).upper() for x in v)
+            elif v is not None: vals.append(str(v).upper())
+        blob=' '.join(vals)
+        return not any(word in blob for word in deny)
+
     @staticmethod
     def _change(row):
         for k in ('pcp','priceChangePercent','changeRate','rose'):
@@ -31,7 +54,10 @@ class MarketAnalyzer:
         now=time.time()
         if not self._contracts_cache or now-self._contracts_at>300:
             contracts=self.client.get_contracts()
-            self._contracts_cache={canonical_symbol(v.get('canonical') or k) for k,v in contracts.items()}
+            # IMPORTANT: rank Top 24h only AFTER removing Toobit non-crypto products.
+            # This prevents Stock / Indices / TradFi / Forex contracts from occupying
+            # Top slots that belong to actual crypto futures.
+            self._contracts_cache={canonical_symbol(v.get('canonical') or k) for k,v in contracts.items() if self._is_crypto_contract(v)}
             self._contracts_at=now
         return self._contracts_cache
 
@@ -108,12 +134,18 @@ class MarketAnalyzer:
         # 2 acceleration exhaustion: recent 1m slope vs prior
         r_recent=self._ret(k1[-11]['close'],k1[-1]['close']); r_prior=self._ret(k1[-31]['close'],k1[-11]['close'])
         s2=max(0,min(100,50+(r_prior-r_recent)*10)); scores.append(('افت شتاب',s2,f'مومنتوم 10m={r_recent:+.2f}% در برابر 20m قبل={r_prior:+.2f}%'))
-        # 3 peak behavior: distance is informational only and NEVER earns reversal points by itself
+        # 3 local-top failure. The historical pump peak is REFERENCE ONLY.
+        # A reversal may start after price has already slipped below the exact peak;
+        # therefore neither touching the peak nor making a fresh high is required.
         off=(peak-price)/peak*100
+        local_anchor=max(x['high'] for x in k1[-30:])
+        anchor_off=(local_anchor-price)/max(local_anchor,1e-12)*100
         last_high=max(x['high'] for x in k1[-8:]); prior_high=max(x['high'] for x in k1[-20:-8])
         failed=max(0.0,(prior_high-last_high)/max(prior_high,1e-12)*100)
-        s3=min(100,35+failed*25)
-        scores.append(('رفتار نزدیک پیک',s3,f'فاصله از پیک {off:.2f}% (فقط اطلاعاتی)؛ ضعف سقف کوتاه‌مدت {failed:.2f}%'))
+        # No free points for merely being X% below the old peak. Score comes from
+        # actual short-term failure; distance is only reported as context.
+        s3=min(100,failed*35)
+        scores.append(('شکست سقف محلی',s3,f'فاصله از Peak مرجع {off:.2f}%؛ فاصله از سقف 30m {anchor_off:.2f}%؛ ضعف سقف کوتاه‌مدت {failed:.2f}%'))
         # 4 upper wick pressure last 1m/5m
         def wick_ratio(c):
             rng=max(c['high']-c['low'],1e-12); return (c['high']-max(c['open'],c['close']))/rng
@@ -185,7 +217,7 @@ class MarketAnalyzer:
         data=ks[-90:]; fig,ax=plt.subplots(figsize=(12,7));
         for i,c in enumerate(data):
             up=c['close']>=c['open']; col='green' if up else 'red'; ax.vlines(i,c['low'],c['high'],color=col,linewidth=.8); lo=min(c['open'],c['close']); h=max(abs(c['close']-c['open']),1e-10); ax.add_patch(Rectangle((i-.32,lo),.64,h,facecolor=col,edgecolor=col,alpha=.75))
-        ax.axhline(peak,linestyle='--',linewidth=1,label=f'Peak {peak:.6g}'); ax.axhspan(entry[0],entry[1],alpha=.12,label='Entry zone'); ax.axhline(invalid,linestyle=':',linewidth=1,label='Invalidation')
+        ax.axhline(peak,linestyle='--',linewidth=1,label=f'Reference peak {peak:.6g}'); ax.axhspan(entry[0],entry[1],alpha=.12,label='Entry zone'); ax.axhline(invalid,linestyle=':',linewidth=1,label='Invalidation')
         for i,tp in enumerate(tps,1): ax.axhline(tp,linestyle='--',linewidth=.8,label=f'TP{i} {tp:.6g}')
         # Show nearest S/R from each timeframe on the 5m chart.
         for tf in ('5m','15m','1h'):
