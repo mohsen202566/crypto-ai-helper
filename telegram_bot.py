@@ -23,17 +23,17 @@ class TelegramBot:
             if len(caption)>1024:self.send_message(caption[1024:])
         except Exception as e: self.send_message(f'تحلیل انجام شد ولی ارسال چارت خطا داد: {e}\n{caption}')
     def help_text(self):
-        auto='فعال' if self.storage.get_setting('auto_analysis_enabled',False) else 'خاموش'
-        return '\n'.join(['📋 دستورات ربات تحلیلگر','','اسکن — ۱۰ ارز صدر Top 24h و کاندیداها','RLC — تحلیل فوری هر ارز فقط با فرستادن اسم آن','تحلیل RLC — همان تحلیل فوری با دستور کامل',f'تحلیل خودکار فعال / تحلیل خودکار خاموش — الان: {auto}','وضعیت — وضعیت موتور تحلیل','لایه‌ها — نمایش ۱۰ لایه تحلیل','دستورات / راهنما — همین فهرست','','ترید، پوزیشن‌گیری و ارسال سفارش کاملاً حذف شده‌اند.'])
-    def layers(self): return '🧩 ۱۰ لایه\n1) شدت/ساختار Pump 1H\n2) افت شتاب Momentum\n3) رفتار زنده نزدیک Peak\n4) عرضه و Upper Wick\n5) Volume/Sell pressure\n6) کارایی خریدار و Exhaustion\n7) Micro structure 1m\n8) کشیدگی 5m/15m\n9) Order Book imbalance\n10) Recent Trades / Order Flow\n\nتأیید کندل نزولی شرط نیست؛ وزن لایه‌های مهم بیشتر است.'
+        return '🚀 دیده‌بان پامپ\nاسکن — ۴۰ ارز اول\nواچ — ارزهای زیر نظر\nRLC یا تحلیل BTC — شدت و عکس چارت\nتحلیل خودکار فعال / خاموش'
+    def layers(self):return '1H اصلی، 4H مکمل، خستگی 5m، رشد موج و فاصله از سقف؛ کندل بسته‌شده شرط نیست.'
     def handle(self,text):
         t=text.strip(); n=t.lower().replace('/','')
         if n in ('اسکن','scan'): return self.engine.scan_text(),None
+        if n in ('واچ','watch','واچ لیست','واچ‌لیست'): return self.engine.watch_text(),None
         if n in ('دستورات','راهنما','help','start'): return self.help_text(),None
         if n=='لایه‌ها': return self.layers(),None
         if n=='وضعیت': return f"🩺 موتور تحلیل: آماده\nتحلیل خودکار: {'فعال' if self.storage.get_setting('auto_analysis_enabled',False) else 'خاموش'}\nترید: حذف‌شده",None
         if n in ('تحلیل خودکار فعال','خودکار فعال'):
-            self.storage.set_setting('auto_analysis_enabled',True); return '✅ تحلیل خودکار فعال شد. Top 10 پایش می‌شود و فقط هشدارهای قوی با چارت ارسال می‌شوند.',None
+            self.storage.set_setting('auto_analysis_enabled',True); return '✅ تحلیل خودکار فعال شد. Top 40 پایش می‌شود؛ هشدار فوری و چارت ارسال می‌شوند.',None
         if n in ('تحلیل خودکار خاموش','خودکار خاموش'):
             self.storage.set_setting('auto_analysis_enabled',False); return '⏸ تحلیل خودکار خاموش شد. تحلیل دستی با اسم ارز همچنان فعال است.',None
         coin=t
